@@ -59,6 +59,7 @@ class PublicReadinessSmokeTests(unittest.TestCase):
             """
             import json
             import os
+            import stat
             import config
             import user_paths
 
@@ -66,6 +67,7 @@ class PublicReadinessSmokeTests(unittest.TestCase):
                 "data_dir": user_paths.data_dir(),
                 "env_path": config._ENV_PATH,
                 "env_exists": os.path.exists(config._ENV_PATH),
+                "env_mode": stat.S_IMODE(os.stat(config._ENV_PATH).st_mode),
             }))
             """
         )
@@ -86,6 +88,8 @@ class PublicReadinessSmokeTests(unittest.TestCase):
             self.assertEqual(Path(payload["data_dir"]), Path(data_dir))
             self.assertEqual(Path(payload["env_path"]), Path(data_dir) / ".env")
             self.assertTrue(payload["env_exists"])
+            if os.name != "nt":
+                self.assertEqual(payload["env_mode"], 0o600)
 
     def test_missing_wallet_fingerprints_return_safe_generic_error(self):
         with patch(

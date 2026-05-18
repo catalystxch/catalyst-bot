@@ -1,6 +1,6 @@
 # catalyst.spec
 #
-# PyInstaller spec file for CATalyst — Windows (onedir bundle)
+# PyInstaller spec file for CATalyst (onedir bundle plus macOS .app on Darwin)
 #
 # Usage:
 #   pyinstaller catalyst.spec
@@ -8,7 +8,7 @@
 # Or via the helper script:
 #   python build.py
 #
-# Output: dist/Catalyst/Catalyst.exe  (plus all supporting files)
+# Output: dist/Catalyst/Catalyst(.exe)  (plus all supporting files)
 #
 # Design notes:
 #   - onedir mode: all files sit in dist/Catalyst/.  Simpler to debug
@@ -18,7 +18,9 @@
 #     out of the box.  SplashNode.find_binary() searches sys._MEIPASS (the
 #     bundle root) automatically because it looks in the same dir as the
 #     running script.
-#   - .env is never bundled — it lives alongside the exe and holds secrets.
+#   - .env is never bundled; runtime config lives in the per-user data dir.
+#     .env.example is bundled so first-run config can be seeded inside .app,
+#     AppImage, deb, zip, and installer layouts without manual user edits.
 #   - PyWebView on Windows requires edgechromium (WebView2) which ships with
 #     Windows 11 and is auto-installed on Windows 10 via Windows Update.
 #     The winforms backend is included as a fallback.
@@ -85,11 +87,15 @@ _splash_name = 'splash.exe' if sys.platform == 'win32' else 'splash'
 _splash_path = os.path.join(_HERE, _splash_name)
 _splash_files = [(_splash_path, '.')] if os.path.isfile(_splash_path) else []
 
+# First-run config template. This is not user config and contains no secrets.
+_env_example_path = os.path.join(_HERE, '.env.example')
+_env_example_files = [(_env_example_path, '.')] if os.path.isfile(_env_example_path) else []
+
 # Coin prep worker — launched as a subprocess, needs the .py file in the bundle
 _worker_path = os.path.join(_SRC, 'coin_prep_worker.py')
 _worker_files = [(_worker_path, '.')] if os.path.isfile(_worker_path) else []
 
-_datas = _html_files + _image_files + _splash_files + _worker_files
+_datas = _html_files + _image_files + _splash_files + _env_example_files + _worker_files
 
 # ---------------------------------------------------------------------------
 # Hidden imports

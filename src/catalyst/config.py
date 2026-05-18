@@ -54,6 +54,16 @@ def _find_env_example_path(install_dir: str) -> str:
     return ""
 
 
+def _restrict_env_file_permissions(path: str) -> None:
+    """Keep user config private on POSIX systems."""
+    if os.name == "nt" or not path or not os.path.exists(path):
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        print(f"[config] Could not restrict .env permissions: {exc}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Load .env from the user data directory (writable across install types).
 #
@@ -92,6 +102,7 @@ try:
                     f"[config] Could not seed .env from .env.example: {_copy_err}",
                     flush=True,
                 )
+    _restrict_env_file_permissions(_ENV_PATH)
 except Exception as _e:
     # Fallback: legacy behaviour if user_paths import fails during an
     # unusual dev setup.  Should never happen in a packaged build.

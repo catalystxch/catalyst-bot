@@ -48,6 +48,8 @@ jobs:
           # use the 4.1 variant, falling back to 4.0 for older runner images.
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
             || sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+          sudo apt-get install -y desktop-file-utils file dpkg-dev fakeroot curl
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
 
       - name: Install dependencies
         run: |
@@ -95,9 +97,14 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: python scripts/packaged_sage_rpc_smoke.py --exe dist/Catalyst/Catalyst.exe
 
-      - name: Smoke test packaged API runtime (Windows)
-        if: matrix.os == 'windows-latest'
-        run: python scripts/packaged_api_smoke.py --exe dist/Catalyst/Catalyst.exe
+      - name: Smoke test packaged API runtime
+        shell: bash
+        run: |
+          exe="dist/Catalyst/Catalyst"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            exe="dist/Catalyst/Catalyst.exe"
+          fi
+          python scripts/packaged_api_smoke.py --exe "$exe"
 
       - name: Package (Windows zip)
         if: matrix.os == 'windows-latest'
@@ -205,6 +212,34 @@ jobs:
             cd dist && zip -r "$package" Catalyst/
           fi
 
+      - name: Package macOS DMG
+        if: matrix.os == 'macos-latest'
+        # scripts/package_macos.sh signs with Developer ID when configured,
+        # submits with notarytool when Apple credentials are present, staples
+        # the ticket, and otherwise falls back to an ad-hoc signed DMG.
+        env:
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_CERTIFICATE_B64: ${{ secrets.MACOS_CERTIFICATE_B64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: scripts/package_macos.sh "$RELEASE_REF"
+
+      - name: Smoke test macOS DMG payload
+        if: matrix.os == 'macos-latest'
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          mount_dir="${RUNNER_TEMP}/catalyst-dmg"
+          dmg_path="Catalyst-macos-${RELEASE_REF}.dmg"
+          mkdir -p "$mount_dir"
+          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -readonly
+          trap 'hdiutil detach "$mount_dir" || true' EXIT
+          python scripts/packaged_api_smoke.py --exe "$mount_dir/CATalyst.app/Contents/MacOS/Catalyst"
+
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         env:
@@ -226,10 +261,52 @@ jobs:
           package="../${ARTIFACT_NAME}-${RELEASE_REF}${PACKAGE_EXT}"
           cd dist && tar -czf "$package" Catalyst/
 
+      - name: Package Linux AppImage and deb
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: scripts/package_linux.sh "$RELEASE_REF"
+
+      - name: Smoke test Linux packages
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          appimage_path="Catalyst-linux-${RELEASE_REF}-x86_64.AppImage"
+          deb_path="catalyst_${RELEASE_REF}_amd64.deb"
+          APPIMAGE_EXTRACT_AND_RUN=1 python scripts/packaged_api_smoke.py --exe "$appimage_path"
+          extract_dir="${RUNNER_TEMP}/catalyst-deb"
+          mkdir -p "$extract_dir"
+          dpkg-deb --info "$deb_path"
+          dpkg-deb -x "$deb_path" "$extract_dir"
+          python scripts/packaged_api_smoke.py --exe "$extract_dir/opt/catalyst/Catalyst"
+
       - name: Upload zip/tar to Release
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload macOS DMG to Release
+        if: matrix.os == 'macos-latest'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            Catalyst-macos-${{ github.ref_name }}.dmg
+            Catalyst-macos-${{ github.ref_name }}.dmg.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Linux packages to Release
+        if: matrix.os == 'ubuntu-latest'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage
+            Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage.sha256
+            catalyst_${{ github.ref_name }}_amd64.deb
+            catalyst_${{ github.ref_name }}_amd64.deb.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

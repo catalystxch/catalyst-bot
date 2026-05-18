@@ -212,12 +212,15 @@ For wallet safety, the browser/API interface is loopback-only by default.
 `127.0.0.1` means "this computer", so open the dashboard from the same machine
 where CATalyst is running.
 
-### From the Installer (Recommended)
+### From Packaged Downloads (Recommended)
 
-1. Download `Catalyst-Setup-v*.exe` from the
+1. Download the package for your operating system from the
    [latest release](https://github.com/catalystxch/catalyst-bot/releases/latest).
-2. Run the installer. It places CATalyst in Program Files and adds a desktop
-   shortcut.
+   Windows uses `Catalyst-Setup-v*.exe`, macOS uses the `.dmg`, and Linux users
+   can use either the `.AppImage` or the `.deb` package.
+2. Install or open the package using the normal flow for your operating system.
+   The packaged app includes Python and the app defaults; no manual `.env`
+   editing is needed for normal use.
 3. Launch CATalyst on the same computer as Sage wallet. On first run it checks
    the Sage connection, asks you to choose a wallet fingerprint, and guides you
    through Smart Settings.
@@ -448,8 +451,9 @@ python build.py --no-clean   # skip cleaning for faster iteration
 
 The local build output stays on the machine that ran `python build.py`. To share
 builds with users, publish a GitHub Release or push a `v*` tag. The release
-workflow builds Windows, macOS, and Linux packages, plus a Windows installer,
-`.sha256` checksum sidecar, and signed update manifests.
+workflow builds Windows installers, macOS DMGs, Linux AppImages and `.deb`
+packages, archive fallbacks, `.sha256` checksum sidecars, and signed update
+manifests.
 
 The in-app updater does not need the source repo to be public. It reads only the
 public release-channel manifest at
