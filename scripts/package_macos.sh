@@ -51,13 +51,22 @@ else
   echo "MACOS_CERTIFICATE_B64 not configured; using ad-hoc signature."
 fi
 
-codesign \
-  --force \
-  --deep \
-  --options runtime \
-  "${timestamp_args[@]}" \
-  --sign "$sign_identity" \
-  "$app_path"
+if [[ ${#timestamp_args[@]} -gt 0 ]]; then
+  codesign \
+    --force \
+    --deep \
+    --options runtime \
+    "${timestamp_args[@]}" \
+    --sign "$sign_identity" \
+    "$app_path"
+else
+  codesign \
+    --force \
+    --deep \
+    --options runtime \
+    --sign "$sign_identity" \
+    "$app_path"
+fi
 codesign --verify --deep --strict --verbose=2 "$app_path"
 
 rm -rf "$dmg_stage"

@@ -48,6 +48,16 @@ def test_packaging_scripts_create_normal_desktop_downloads():
     assert '$(basename "$deb_path")' in linux_script
 
 
+def test_macos_package_supports_ad_hoc_signing_without_timestamp_args():
+    macos_script = (ROOT / "scripts" / "package_macos.sh").read_text(encoding="utf-8")
+
+    assert "if [[ ${#timestamp_args[@]} -gt 0 ]]; then" in macos_script
+    assert (
+        "MACOS_CERTIFICATE_B64 not configured; using ad-hoc signature." in macos_script
+    )
+    assert "else\n  codesign \\" in macos_script
+
+
 def test_pyinstaller_bundle_includes_env_template_for_app_bundles():
     spec_text = (ROOT / "catalyst.spec").read_text(encoding="utf-8")
 
