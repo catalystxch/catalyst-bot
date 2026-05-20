@@ -17,6 +17,8 @@ Categories and cooldowns are configurable; defaults are chosen to favour
 signal over noise (short cooldown on fills, longer on errors and breakers).
 """
 
+import shutil
+import sys
 import time
 import threading
 
@@ -116,6 +118,8 @@ class NotificationManager:
     def __init__(self, app_name: str = "CATalyst"):
         if not PLYER_AVAILABLE:
             raise ImportError("plyer is not installed")
+        if sys.platform.startswith("linux") and shutil.which("notify-send") is None:
+            raise ImportError("notify-send is not installed")
 
         self.app_name = app_name
         self.enabled = True  # Master switch

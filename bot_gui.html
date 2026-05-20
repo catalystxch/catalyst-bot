@@ -12249,7 +12249,7 @@
                     <div>
                         <div class="v4-modal-kicker">Update Available</div>
                         <h2 class="v4-modal-title">Upgrade CATalyst?</h2>
-                        <p class="v4-modal-copy">CATalyst found a newer signed release manifest. Automatic upgrade downloads the Windows installer, verifies its SHA-256 digest, launches the installer, closes this app, and lets the installer reopen the updated app.</p>
+                        <p class="v4-modal-copy">CATalyst found a newer signed release manifest. Windows builds can upgrade automatically. macOS and Linux builds should open the release page and download the latest package.</p>
                     </div>
                 </div>
 
@@ -23704,6 +23704,10 @@
             return n + ' bytes';
         }
 
+        function isAutomaticUpdateSupported(info = _latestUpdateInfo || {}) {
+            return info.platform === 'win32';
+        }
+
         async function checkForUpdates({ force = false, reason = 'manual' } = {}) {
             try {
                 const resp = await apiFetch(`${API_URL}/check-update${force ? '?force=1' : ''}`);
@@ -23800,26 +23804,34 @@
             const security = document.getElementById('appUpdateSecurity');
             const notes = document.getElementById('appUpdateNotes');
             const upgradeBtn = document.getElementById('appUpdateUpgradeBtn');
+            const automaticUpdateSupported = isAutomaticUpdateSupported(info);
+            const automaticInstallerReady = !!(automaticUpdateSupported && info.installer_ready);
 
             if (current) current.textContent = info.current ? 'v' + info.current : 'unknown';
             if (latest) latest.textContent = info.latest ? 'v' + info.latest : 'unknown';
             if (published) published.textContent = info.published_at || 'unknown';
             if (installer) {
-                installer.textContent = info.installer_ready
+                installer.textContent = automaticUpdateSupported && info.installer_ready
                     ? `${info.installer_name || 'Windows installer'} (${formatUpdateSize(info.installer_size)})`
-                    : 'Signed manifest does not publish a verified Windows installer yet';
+                    : automaticUpdateSupported
+                        ? 'Signed manifest does not publish a verified Windows installer yet'
+                        : 'Manual package download available from the release page';
             }
             if (security) security.textContent = info.security || '';
             if (notes) notes.textContent = info.release_notes || 'No release notes were published for this release.';
 
             const running = !!(bot_state && bot_state.running);
             if (upgradeBtn) {
-                upgradeBtn.disabled = !info.installer_ready;
-                upgradeBtn.textContent = info.installer_ready
+                upgradeBtn.disabled = automaticUpdateSupported && !info.installer_ready;
+                upgradeBtn.textContent = automaticInstallerReady
                     ? (running ? 'Upgrade & Restart Bot' : 'Upgrade')
-                    : 'Open Release Page';
+                    : automaticUpdateSupported
+                        ? 'Open Release Page'
+                        : 'Manual Download';
             }
-            if (!info.installer_ready) {
+            if (!automaticUpdateSupported) {
+                setAppUpdateStatus('Automatic upgrade is available on Windows only. Open the release page to download the latest macOS or Linux package.', 'info');
+            } else if (!info.installer_ready) {
                 setAppUpdateStatus('This release can be viewed manually, but automatic upgrade is blocked until the signed manifest publishes a verified Windows installer.', 'error');
             } else if (running) {
                 setAppUpdateStatus('Ready. CATalyst will keep managing the bot while the installer downloads, then close, upgrade, reopen, and resume this session.', 'info');
@@ -23892,6 +23904,10 @@
 
         async function startAppUpgrade() {
             const info = _latestUpdateInfo || {};
+            if (!isAutomaticUpdateSupported(info)) {
+                openUpdateReleasePage();
+                return;
+            }
             if (!info.installer_ready) {
                 openUpdateReleasePage();
                 return;

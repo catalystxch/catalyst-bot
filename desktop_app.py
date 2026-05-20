@@ -778,8 +778,8 @@ def run_desktop_mode(dev_mode: bool = False):
 
         notifier = NotificationManager(app_name=APP_NAME)
         print("  Notifications enabled.")
-    except ImportError:
-        print("  Notifications disabled (plyer not installed).")
+    except ImportError as e:
+        print(f"  Notifications disabled ({e}).")
         notifier = None
     except Exception as e:
         print(f"  Notifications failed: {e}")

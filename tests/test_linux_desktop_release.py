@@ -66,6 +66,16 @@ def test_linux_qt_xcb_runtime_dependencies_are_declared():
         assert package in package_script
 
 
+def test_linux_notification_runtime_dependencies_are_declared():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+    package_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
+
+    assert "libnotify-bin" in workflow
+    assert "libnotify-bin" in package_script
+
+
 def test_linux_detect_gui_backend_prefers_qt_when_available(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")

@@ -2053,6 +2053,7 @@ def api_check_update():
             "error": "Update check failed",
             "checked_at": time.time(),
         }
+    result["platform"] = sys.platform
     return jsonify(result)
 
 

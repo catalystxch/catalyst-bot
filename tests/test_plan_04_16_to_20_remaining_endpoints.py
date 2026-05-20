@@ -185,6 +185,83 @@ class TestSpacescanSetup(_FlaskBase):
         )
         self.assertIn(resp.status_code, (400, 415))
 
+    def test_rejected_api_key_is_logged_without_secret(self):
+        logged = []
+
+        def capture(severity, event_type, message, data=None):
+            logged.append(
+                {
+                    "severity": severity,
+                    "event_type": event_type,
+                    "message": message,
+                    "data": data or {},
+                }
+            )
+
+        probe_response = MagicMock(status_code=403, text='{"error":"bad key"}')
+
+        with (
+            patch("requests.get", return_value=probe_response),
+            patch("blueprints.spacescan.log_event", side_effect=capture),
+        ):
+            resp = self._post(
+                "/api/spacescan/setup",
+                {"api_key": "sk_spacescan_super_secret"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        matches = [
+            event
+            for event in logged
+            if event["event_type"] == "spacescan_key_validation_rejected"
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["severity"], "warning")
+        self.assertEqual(matches[0]["data"]["status_code"], 403)
+        self.assertIn("response_preview", matches[0]["data"])
+        self.assertNotIn("sk_spacescan_super_secret", repr(logged))
+
+    def test_accepted_api_key_probe_is_logged_without_secret(self):
+        logged = []
+
+        def capture(severity, event_type, message, data=None):
+            logged.append(
+                {
+                    "severity": severity,
+                    "event_type": event_type,
+                    "message": message,
+                    "data": data or {},
+                }
+            )
+
+        # Spacescan may return 400 for the null-address probe while still
+        # accepting the API key; the setup path treats that as authenticated.
+        probe_response = MagicMock(status_code=400, text='{"error":"not found"}')
+
+        with (
+            patch("requests.get", return_value=probe_response),
+            patch("user_secrets.set_secret"),
+            patch.object(api_server.cfg, "SPACESCAN_API_KEY", ""),
+            patch.object(api_server.cfg, "update"),
+            patch("blueprints.spacescan.log_event", side_effect=capture),
+        ):
+            resp = self._post(
+                "/api/spacescan/setup",
+                {"api_key": "sk_spacescan_super_secret"},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        matches = [
+            event
+            for event in logged
+            if event["event_type"] == "spacescan_key_validation_accepted"
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["severity"], "info")
+        self.assertEqual(matches[0]["data"]["status_code"], 400)
+        self.assertIn("response_preview", matches[0]["data"])
+        self.assertNotIn("sk_spacescan_super_secret", repr(logged))
+
 
 # ---------------------------------------------------------------------------
 # 04-18: GET /api/fees/status

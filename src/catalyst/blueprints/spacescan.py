@@ -19,6 +19,27 @@ from database import log_event
 bp = Blueprint("spacescan", __name__)
 
 
+def _spacescan_validation_log_data(resp, api_key: str) -> dict:
+    """Summarise a validation probe response without exposing the API key."""
+    status_code = getattr(resp, "status_code", None)
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        status_code = None
+
+    preview = str(getattr(resp, "text", "") or "")
+    if api_key:
+        preview = preview.replace(api_key, "[redacted]")
+    if len(preview) > 240:
+        preview = preview[:237] + "..."
+
+    return {
+        "status_code": status_code,
+        "probe_endpoint": "/address/xch-balance/<null-address>",
+        "response_preview": preview,
+    }
+
+
 @bp.route("/api/spacescan/status")
 def api_spacescan_status():
     """Check current Spacescan configuration and tier.
@@ -103,7 +124,14 @@ def api_spacescan_setup():
                 headers={"Accept": "application/json", "x-api-key": api_key},
                 timeout=10,
             )
+            validation_log_data = _spacescan_validation_log_data(test_resp, api_key)
             if test_resp.status_code == 403:
+                log_event(
+                    "warning",
+                    "spacescan_key_validation_rejected",
+                    "Spacescan rejected the configured API key during validation",
+                    validation_log_data,
+                )
                 return jsonify(
                     {
                         "success": False,
@@ -111,6 +139,12 @@ def api_spacescan_setup():
                     }
                 ), 400
             if test_resp.status_code == 429:
+                log_event(
+                    "warning",
+                    "spacescan_key_validation_rate_limited",
+                    "Spacescan rate limited the API key validation probe",
+                    validation_log_data,
+                )
                 return jsonify(
                     {
                         "success": False,
@@ -118,6 +152,12 @@ def api_spacescan_setup():
                     }
                 ), 429
             if test_resp.status_code >= 500:
+                log_event(
+                    "warning",
+                    "spacescan_key_validation_failed",
+                    "Spacescan API key validation probe hit a server error",
+                    validation_log_data,
+                )
                 return jsonify(
                     {
                         "success": False,
@@ -126,6 +166,12 @@ def api_spacescan_setup():
                 ), 502
             # 200 or 400 both mean the key passed authentication (400 = key accepted
             # but the null-address probe returned "not found" — that is fine).
+            log_event(
+                "info",
+                "spacescan_key_validation_accepted",
+                "Spacescan accepted the API key validation probe",
+                validation_log_data,
+            )
         except Exception as e:
             log_event("warning", "spacescan_key_validation_unreachable", str(e))
             return jsonify(

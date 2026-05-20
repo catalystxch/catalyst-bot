@@ -367,6 +367,15 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         self.assertLessEqual(len(kwargs["title"]), 64)
         self.assertLessEqual(len(kwargs["message"]), 240)
 
+    def test_linux_without_notify_send_is_not_reported_available(self):
+        with (
+            patch.object(_nm, "PLYER_AVAILABLE", True),
+            patch.object(sys, "platform", "linux"),
+            patch("shutil.which", return_value=None),
+        ):
+            with self.assertRaisesRegex(ImportError, "notify-send"):
+                _nm.NotificationManager()
+
 
 class TestDesktopNotificationBridge(unittest.TestCase):
     def test_fill_notification_uses_size_xch_payload(self):
