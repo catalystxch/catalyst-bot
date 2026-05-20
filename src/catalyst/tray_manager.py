@@ -192,7 +192,7 @@ class TrayManager:
         else:
             label = "Stopped"
 
-        tooltip = f"{self.app_name} — {label}"
+        tooltip = f"{self.app_name} - {label}"
 
         # Legacy _tooltip_extra support (set by set_status calls)
         if self._tooltip_extra:
@@ -215,9 +215,9 @@ class TrayManager:
         """
         status_text = self._status.capitalize()
         if self._cat_name and self._status in ("running", "paused"):
-            status_text += f" · {self._cat_name}"
+            status_text += f" - {self._cat_name}"
         if self._tooltip_extra:
-            status_text += f" · {self._tooltip_extra}"
+            status_text += f" - {self._tooltip_extra}"
 
         items = [
             MenuItem(
@@ -228,20 +228,20 @@ class TrayManager:
             ),
             MenuItem(f"Status: {status_text}", action=None, enabled=False),
             Menu.SEPARATOR,
-            MenuItem("📊 Show Dashboard", self._on_show),
+            MenuItem("Show Dashboard", self._on_show),
         ]
 
         # Dynamic bot-control items — Start when idle, Stop when active.
         if self._status in ("running", "warning", "paused"):
-            items.append(MenuItem("⏹ Stop Bot", self._on_stop_bot))
+            items.append(MenuItem("Stop Bot", self._on_stop_bot))
         else:
             # stopped / error / unknown
-            items.append(MenuItem("▶ Start Bot", self._on_start_bot))
+            items.append(MenuItem("Start Bot", self._on_start_bot))
 
         items.extend(
             [
                 Menu.SEPARATOR,
-                MenuItem("❌ Exit", self._on_quit),
+                MenuItem("Exit", self._on_quit),
             ]
         )
 

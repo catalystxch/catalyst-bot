@@ -25,6 +25,7 @@ import threading
 import time
 import argparse
 import subprocess
+import importlib.util
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -1068,7 +1069,9 @@ def _detect_gui_backend():
     elif sys.platform == "darwin":
         return None  # Default WebKit on macOS
     else:
-        return None  # Default GTK WebKit on Linux
+        if importlib.util.find_spec("qtpy") is not None:
+            return "qt"
+        return None  # Default GTK WebKit on Linux when Qt is not bundled
 
 
 def _show_window(webview_module):

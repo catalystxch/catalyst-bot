@@ -15719,6 +15719,18 @@
             updateSettingsLock();
         }
 
+        function safeLocalStorageSet(key, value) {
+            try {
+                const storage = (typeof window !== 'undefined') ? window.localStorage : null;
+                if (!storage) return false;
+                storage.setItem(key, value);
+                return true;
+            } catch (e) {
+                debugWarn('[STORAGE] localStorage write failed:', e);
+                return false;
+            }
+        }
+
         // ======================================================
         // Configuration Presets — localStorage-backed save/recall
         // for the whole Setup form. Users can capture a "perfect
@@ -33065,7 +33077,7 @@
                     setFreshStartTemplateState(false);
                     setSettingsReviewedState(true);
                     userHasSavedSettings = true;
-                    localStorage.setItem('botConfig', JSON.stringify(config));
+                    safeLocalStorageSet('botConfig', JSON.stringify(config));
 
                     // A1: clear unsaved badge; A2: run inline validation after save
                     clearUnsavedBadge();

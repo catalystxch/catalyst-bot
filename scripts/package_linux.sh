@@ -114,7 +114,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: MonkeyZoo <support@catalystxch.com>
 Installed-Size: ${installed_size}
-Depends: ca-certificates, libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libnotify4, xdg-utils
+Depends: ca-certificates, libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libnotify4, xdg-utils, libdbus-1-3, libegl1, libgl1, libgbm1, libnss3, libx11-xcb1, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-shm0, libxcb-sync1, libxcb-xfixes0, libxcb-xinerama0, libxcb-xkb1, libxcomposite1, libxdamage1, libxkbcommon-x11-0, libxrandr2
 Homepage: https://catalystxch.com/
 Description: CATalyst Chia CAT liquidity market maker
  CATalyst is a local desktop market-making app for Chia CAT tokens.

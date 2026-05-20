@@ -1,0 +1,6 @@
+# Linux desktop backend for pywebview/PyInstaller release artifacts.
+# The AppImage and deb bundle these Python packages so users do not have
+# to symlink system site-packages into /opt/catalyst.
+qtpy>=2.4.3,<3
+PyQt6>=6.10,<7
+PyQt6-WebEngine>=6.10,<7

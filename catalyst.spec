@@ -119,7 +119,12 @@ _hiddenimports = [
     *(['webview.platforms.winforms', 'webview.platforms.mshtml',
        'webview.platforms.edgechromium'] if sys.platform == 'win32' else []),
     *(['webview.platforms.cocoa'] if sys.platform == 'darwin' else []),
-    *(['webview.platforms.gtk'] if sys.platform == 'linux' else []),
+    *(['webview.platforms.gtk', 'webview.platforms.qt',
+       'qtpy', 'qtpy.QtCore', 'qtpy.QtGui', 'qtpy.QtNetwork',
+       'qtpy.QtWebChannel', 'qtpy.QtWebEngineWidgets', 'qtpy.QtWidgets',
+       'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtNetwork',
+       'PyQt6.QtWebChannel', 'PyQt6.QtWebEngineCore',
+       'PyQt6.QtWebEngineWidgets', 'PyQt6.QtWidgets'] if sys.platform == 'linux' else []),
 
     # System tray
     'pystray',
