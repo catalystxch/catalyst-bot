@@ -272,7 +272,10 @@ class TestGetCategoryMap(unittest.TestCase):
 @unittest.skipIf(_SKIP_NM is not None, f"notification_manager unavailable: {_SKIP_NM}")
 class TestNotificationManagerRateLimit(unittest.TestCase):
     def _make_nm(self):
-        with patch.object(_nm, "PLYER_AVAILABLE", True):
+        with (
+            patch.object(_nm, "PLYER_AVAILABLE", True),
+            patch("shutil.which", return_value="/usr/bin/notify-send"),
+        ):
             mgr = _nm.NotificationManager()
         mgr._send = MagicMock()  # Suppress actual OS notifications
         return mgr
@@ -357,7 +360,10 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         self.assertTrue(mgr.notify("Bot Error", "different message", category="error"))
 
     def test_send_truncates_windows_balloon_text_limits(self):
-        with patch.object(_nm, "PLYER_AVAILABLE", True):
+        with (
+            patch.object(_nm, "PLYER_AVAILABLE", True),
+            patch("shutil.which", return_value="/usr/bin/notify-send"),
+        ):
             mgr = _nm.NotificationManager()
 
         with patch.object(_nm.plyer_notification, "notify") as notify:
