@@ -53,9 +53,7 @@ def test_linux_release_ci_runs_desktop_smoke_test():
 
 def test_release_build_and_linux_package_purge_runtime_sidecars():
     build_source = (ROOT / "build.py").read_text(encoding="utf-8")
-    package_source = (ROOT / "scripts" / "package_linux.sh").read_text(
-        encoding="utf-8"
-    )
+    package_source = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
 
     for source in (build_source, package_source):
         assert "coin_prep_status.json" in source
@@ -101,7 +99,7 @@ def test_desktop_tray_start_waits_before_claiming_active():
     assert "def _start_system_tray" in source
     assert "settle_seconds" in source
     assert "desktop tray unavailable" in source
-    assert "not getattr(tray, \"is_running\", False)" in source
+    assert 'not getattr(tray, "is_running", False)' in source
     assert "not tray_thread.is_alive()" in source
 
 

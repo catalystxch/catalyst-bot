@@ -275,7 +275,9 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         with (
             patch.object(_nm, "PLYER_AVAILABLE", True),
             patch("shutil.which", return_value="/usr/bin/notify-send"),
-            patch.object(_nm, "_linux_notification_service_available", return_value=True),
+            patch.object(
+                _nm, "_linux_notification_service_available", return_value=True
+            ),
         ):
             mgr = _nm.NotificationManager()
         mgr._send = MagicMock()  # Suppress actual OS notifications
@@ -364,7 +366,9 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         with (
             patch.object(_nm, "PLYER_AVAILABLE", True),
             patch("shutil.which", return_value="/usr/bin/notify-send"),
-            patch.object(_nm, "_linux_notification_service_available", return_value=True),
+            patch.object(
+                _nm, "_linux_notification_service_available", return_value=True
+            ),
         ):
             mgr = _nm.NotificationManager()
 
@@ -389,10 +393,42 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
             patch.object(_nm, "PLYER_AVAILABLE", True),
             patch.object(sys, "platform", "linux"),
             patch("shutil.which", return_value="/usr/bin/notify-send"),
-            patch.object(_nm, "_linux_notification_service_available", return_value=False),
+            patch.object(
+                _nm, "_linux_notification_service_available", return_value=False
+            ),
         ):
             with self.assertRaisesRegex(ImportError, "notification service"):
                 _nm.NotificationManager()
+
+    def test_linux_notification_probe_does_not_require_dbus_env(self):
+        def which(name):
+            return "/usr/bin/gdbus" if name == "gdbus" else None
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(_nm.shutil, "which", side_effect=which),
+            patch.object(_nm.subprocess, "run") as run,
+        ):
+            run.return_value = SimpleNamespace(returncode=0)
+
+            self.assertTrue(_nm._linux_notification_service_available())
+
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/gdbus")
+
+    def test_linux_notification_probe_fails_when_dbus_call_fails(self):
+        def which(name):
+            return "/usr/bin/gdbus" if name == "gdbus" else None
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(_nm.shutil, "which", side_effect=which),
+            patch.object(_nm.subprocess, "run") as run,
+        ):
+            run.return_value = SimpleNamespace(returncode=1)
+
+            self.assertFalse(_nm._linux_notification_service_available())
 
 
 class TestDesktopNotificationBridge(unittest.TestCase):

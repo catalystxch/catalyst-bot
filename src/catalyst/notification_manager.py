@@ -17,9 +17,8 @@ Categories and cooldowns are configurable; defaults are chosen to favour
 signal over noise (short cooldown on fills, longer on errors and breakers).
 """
 
-import shutil
-import os
 import subprocess
+import shutil
 import sys
 import time
 import threading
@@ -227,8 +226,6 @@ def _linux_notification_service_available() -> bool:
     """Return True only when the Linux desktop notification bus is reachable."""
     if not sys.platform.startswith("linux"):
         return True
-    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        return False
 
     gdbus = shutil.which("gdbus")
     dbus_send = shutil.which("dbus-send")
