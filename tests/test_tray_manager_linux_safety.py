@@ -45,3 +45,32 @@ def test_tray_tooltips_and_menu_labels_are_x11_latin1_safe(monkeypatch):
 
     for label in labels:
         label.encode("latin-1")
+
+
+def test_tray_run_degrades_when_x11_dock_is_unavailable(monkeypatch):
+    class DockFailingIcon:
+        def __init__(self, *args, **kwargs):
+            self.stopped = False
+
+        def run(self):
+            raise AssertionError("failed to dock icon")
+
+        def stop(self):
+            self.stopped = True
+
+    fake_pystray = types.SimpleNamespace(
+        Icon=DockFailingIcon,
+        Menu=_FakeMenu,
+        MenuItem=_FakeMenuItem,
+    )
+    monkeypatch.setitem(sys.modules, "pystray", fake_pystray)
+    sys.modules.pop("tray_manager", None)
+
+    import tray_manager
+
+    tray = tray_manager.TrayManager(app_name="CATalyst", app_version="1.2.36")
+
+    tray.run()
+
+    assert tray.is_running is False
+    assert tray._icon is None

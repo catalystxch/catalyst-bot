@@ -158,6 +158,16 @@ def _coin_prep_worker_command(worker_path: str) -> list[str]:
     return [sys.executable, worker_path]
 
 
+def _coin_prep_worker_cwd() -> str:
+    """Return the writable cwd used by coin_prep_worker sidecar files."""
+    try:
+        from user_paths import data_dir
+
+        return data_dir()
+    except Exception:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
 def _set_sage_data_dir_from_cert_env(env: dict, cert_path: str) -> None:
     if (env.get("SAGE_DATA_DIR") or "").strip():
         return
@@ -10680,7 +10690,7 @@ class CoinManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # Merge into stdout to prevent pipe deadlock
                 stdin=subprocess.DEVNULL,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
+                cwd=_coin_prep_worker_cwd(),
                 env=env,
                 **hidden_subprocess_kwargs(),
             )

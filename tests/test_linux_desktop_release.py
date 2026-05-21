@@ -37,10 +37,17 @@ def test_linux_release_ci_runs_desktop_smoke_test():
         encoding="utf-8"
     )
     smoke_script = ROOT / "scripts" / "linux_desktop_smoke.sh"
+    smoke_source = smoke_script.read_text(encoding="utf-8")
 
     assert smoke_script.is_file()
     assert "scripts/linux_desktop_smoke.sh" in workflow
-    assert "xvfb-run" in smoke_script.read_text(encoding="utf-8")
+    assert "xvfb-run" in smoke_source
+    assert "xdotool search" in smoke_source
+    assert "CATALYST_GUI_PROOF_SCREENSHOT" in smoke_source
+    assert "nonblank" in smoke_source
+    assert "xdotool" in workflow
+    assert "x11-apps" in workflow
+    assert "openbox" in workflow
 
 
 def test_linux_qt_xcb_runtime_dependencies_are_declared():
@@ -88,3 +95,50 @@ def test_linux_detect_gui_backend_prefers_qt_when_available(monkeypatch):
     )
 
     assert desktop_app._detect_gui_backend() == "qt"
+
+
+def test_linux_saved_window_position_is_not_restored_by_default(monkeypatch):
+    sys.modules.pop("desktop_app", None)
+    original_platform = sys.platform
+    try:
+        sys.platform = "linux"
+        desktop_app = importlib.import_module("desktop_app")
+        should_restore = desktop_app._should_restore_saved_window_position()
+    finally:
+        sys.platform = original_platform
+
+    assert should_restore is False
+
+
+def test_windows_saved_window_position_is_restored_by_default(monkeypatch):
+    sys.modules.pop("desktop_app", None)
+    original_platform = sys.platform
+    try:
+        sys.platform = "linux"
+        desktop_app = importlib.import_module("desktop_app")
+        desktop_app.sys.platform = "win32"
+        should_restore = desktop_app._should_restore_saved_window_position()
+    finally:
+        sys.platform = original_platform
+
+    assert should_restore is True
+
+
+def test_coin_prep_runtime_sidecars_use_user_data_dir():
+    import user_paths
+    import api_server  # noqa: F401 - load blueprints through the app entry point
+    from blueprints import coin_prep
+
+    data_dir = Path(user_paths.data_dir())
+
+    paths = [
+        Path(user_paths.coin_prep_status_file()),
+        Path(user_paths.coin_prep_output_log_file()),
+        Path(user_paths.coin_prep_last_file()),
+        Path(coin_prep._coin_prep_status_file()),
+        Path(coin_prep._coin_prep_output_log_file()),
+        Path(coin_prep._coin_prep_last_file()),
+    ]
+
+    for path in paths:
+        assert path.parent == data_dir

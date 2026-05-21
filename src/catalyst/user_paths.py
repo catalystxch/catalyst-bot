@@ -115,6 +115,21 @@ def protected_offers_file() -> str:
     return os.path.join(data_dir(), "protected_offers.json")
 
 
+def coin_prep_status_file() -> str:
+    """Path to the live coin-prep worker status JSON."""
+    return os.path.join(data_dir(), "coin_prep_status.json")
+
+
+def coin_prep_last_file() -> str:
+    """Path to the last successful coin-prep settings JSON."""
+    return os.path.join(data_dir(), "coin_prep_last.json")
+
+
+def coin_prep_output_log_file() -> str:
+    """Path to the coin-prep subprocess output log."""
+    return os.path.join(data_dir(), "coin_prep_output.log")
+
+
 def log_dir() -> str:
     """Directory where bot_superlog_*.log files are written."""
     return data_dir()
@@ -141,6 +156,9 @@ _LEGACY_FILES = [
     (".window_state.json", window_state_file),
     ("crash.log", crash_log_file),
     ("worker_cancelled_ids.json", worker_cancelled_ids_file),
+    ("coin_prep_status.json", coin_prep_status_file),
+    ("coin_prep_last.json", coin_prep_last_file),
+    ("coin_prep_output.log", coin_prep_output_log_file),
 ]
 
 _MIGRATION_MARKER_NAME = ".migration_complete"

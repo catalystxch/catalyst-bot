@@ -205,6 +205,16 @@ def _save_window_state(window) -> None:
         print(f"[WINDOW] Could not save window state: {e}", flush=True)
 
 
+def _should_restore_saved_window_position() -> bool:
+    """Return True when saved x/y coordinates should be passed to PyWebView."""
+    override = os.environ.get("CATALYST_RESTORE_WINDOW_POSITION", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    return sys.platform in {"win32", "darwin"}
+
+
 def _apply_window_icon_win32(ico_path: str) -> None:
     """Set the CATalyst .ico as the Win32 window icon (taskbar + Alt+Tab).
 
@@ -871,8 +881,12 @@ def run_desktop_mode(dev_mode: bool = False):
     _saved_state = _load_window_state()
     _win_width = _saved_state.get("width", WINDOW_WIDTH)
     _win_height = _saved_state.get("height", WINDOW_HEIGHT)
-    _win_x = _saved_state.get("x")
-    _win_y = _saved_state.get("y")
+    if _should_restore_saved_window_position():
+        _win_x = _saved_state.get("x")
+        _win_y = _saved_state.get("y")
+    else:
+        _win_x = None
+        _win_y = None
 
     # Show a local splash page first (logo + "created by MonkeyZoo") so the
     # window doesn't flash black while the WebView2 backend boots and Flask's

@@ -92,6 +92,13 @@ class WindowsProcessLifetimeTests(unittest.TestCase):
 
         self.assertEqual(command, [exe_path, "--coin-prep-worker"])
 
+    def test_coin_prep_worker_cwd_uses_user_data_dir(self):
+        import user_paths
+
+        cwd = coin_manager._coin_prep_worker_cwd()
+
+        self.assertEqual(Path(cwd), Path(user_paths.data_dir()))
+
     def test_no_coin_prep_launcher_uses_plain_python_worker_script(self):
         repo_root = Path(__file__).resolve().parent.parent
         sources = [
