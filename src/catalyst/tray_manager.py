@@ -115,6 +115,8 @@ class TrayManager:
             try:
                 print(f"System tray unavailable: {exc}", file=sys.stderr, flush=True)
             except Exception:
+                # Deliberately ignore secondary failures while reporting tray errors
+                # (for example, when stderr is unavailable in headless environments).
                 pass
         finally:
             self.is_running = False
