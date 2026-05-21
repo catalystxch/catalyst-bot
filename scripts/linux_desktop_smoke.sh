@@ -64,8 +64,10 @@ window_id=""
 geometry=""
 for _ in $(seq 1 35); do
   if ! kill -0 "$app_pid" >/dev/null 2>&1; then
-    wait "$app_pid"
-    exit $?
+    app_code=0
+    wait "$app_pid" || app_code=$?
+    echo "Linux desktop smoke failed: executable exited before visible window proof (code $app_code)" >&2
+    exit 1
   fi
 
   for candidate in $(xdotool search --name "CATalyst" 2>/dev/null || true); do

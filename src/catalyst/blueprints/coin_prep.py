@@ -67,7 +67,13 @@ def _coin_prep_last_file() -> str:
     try:
         from user_paths import coin_prep_last_file
 
-        return coin_prep_last_file()
+        path = coin_prep_last_file()
+        if os.path.exists(path):
+            return path
+        legacy_path = os.path.join(_PACKAGE_DIR, "coin_prep_last.json")
+        if os.path.exists(legacy_path):
+            return legacy_path
+        return path
     except Exception:
         return os.path.join(_coin_prep_runtime_dir(), "coin_prep_last.json")
 

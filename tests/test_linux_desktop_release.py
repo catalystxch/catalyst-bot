@@ -45,6 +45,7 @@ def test_linux_release_ci_runs_desktop_smoke_test():
     assert "xdotool search" in smoke_source
     assert "CATALYST_GUI_PROOF_SCREENSHOT" in smoke_source
     assert "nonblank" in smoke_source
+    assert "exited before visible window proof" in smoke_source
     assert "xdotool" in workflow
     assert "x11-apps" in workflow
     assert "openbox" in workflow
@@ -142,3 +143,20 @@ def test_coin_prep_runtime_sidecars_use_user_data_dir():
 
     for path in paths:
         assert path.parent == data_dir
+
+
+def test_coin_prep_last_file_falls_back_to_legacy_install_copy(tmp_path, monkeypatch):
+    import api_server  # noqa: F401 - load blueprints through the app entry point
+    import user_paths
+    from blueprints import coin_prep
+
+    data_last = tmp_path / "data" / "coin_prep_last.json"
+    legacy_dir = tmp_path / "install"
+    legacy_dir.mkdir()
+    legacy_last = legacy_dir / "coin_prep_last.json"
+    legacy_last.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(user_paths, "coin_prep_last_file", lambda: str(data_last))
+    monkeypatch.setattr(coin_prep, "_PACKAGE_DIR", str(legacy_dir))
+
+    assert Path(coin_prep._coin_prep_last_file()) == legacy_last
