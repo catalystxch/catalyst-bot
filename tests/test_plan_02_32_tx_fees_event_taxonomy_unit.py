@@ -275,6 +275,7 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         with (
             patch.object(_nm, "PLYER_AVAILABLE", True),
             patch("shutil.which", return_value="/usr/bin/notify-send"),
+            patch.object(_nm, "_linux_notification_service_available", return_value=True),
         ):
             mgr = _nm.NotificationManager()
         mgr._send = MagicMock()  # Suppress actual OS notifications
@@ -363,6 +364,7 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
         with (
             patch.object(_nm, "PLYER_AVAILABLE", True),
             patch("shutil.which", return_value="/usr/bin/notify-send"),
+            patch.object(_nm, "_linux_notification_service_available", return_value=True),
         ):
             mgr = _nm.NotificationManager()
 
@@ -380,6 +382,16 @@ class TestNotificationManagerRateLimit(unittest.TestCase):
             patch("shutil.which", return_value=None),
         ):
             with self.assertRaisesRegex(ImportError, "notify-send"):
+                _nm.NotificationManager()
+
+    def test_linux_without_notification_service_is_not_reported_available(self):
+        with (
+            patch.object(_nm, "PLYER_AVAILABLE", True),
+            patch.object(sys, "platform", "linux"),
+            patch("shutil.which", return_value="/usr/bin/notify-send"),
+            patch.object(_nm, "_linux_notification_service_available", return_value=False),
+        ):
+            with self.assertRaisesRegex(ImportError, "notification service"):
                 _nm.NotificationManager()
 
 

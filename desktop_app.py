@@ -767,20 +767,7 @@ def run_desktop_mode(dev_mode: bool = False):
     print("  Flask is ready.")
 
     # Start system tray in background
-    tray_thread = None
-    try:
-        from tray_manager import TrayManager
-
-        tray = TrayManager(app_name=APP_NAME, app_version=APP_VERSION)
-        tray_thread = threading.Thread(target=tray.run, daemon=True, name="SystemTray")
-        tray_thread.start()
-        print("  System tray icon active.")
-    except ImportError:
-        print("  System tray disabled (pystray not installed).")
-        tray = None
-    except Exception as e:
-        print(f"  System tray failed: {e}")
-        tray = None
+    tray, tray_thread = _start_system_tray()
 
     # Start notification manager
     try:
@@ -1086,6 +1073,29 @@ def _detect_gui_backend():
         if importlib.util.find_spec("qtpy") is not None:
             return "qt"
         return None  # Default GTK WebKit on Linux when Qt is not bundled
+
+
+def _start_system_tray(settle_seconds: float = 0.35):
+    """Start the optional tray and avoid claiming success after fast failures."""
+    try:
+        from tray_manager import TrayManager
+
+        tray = TrayManager(app_name=APP_NAME, app_version=APP_VERSION)
+        tray_thread = threading.Thread(target=tray.run, daemon=True, name="SystemTray")
+        tray_thread.start()
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+        if not getattr(tray, "is_running", False) and not tray_thread.is_alive():
+            print("  System tray disabled (desktop tray unavailable).")
+            return None, tray_thread
+        print("  System tray icon active.")
+        return tray, tray_thread
+    except ImportError:
+        print("  System tray disabled (pystray not installed).")
+        return None, None
+    except Exception as e:
+        print(f"  System tray failed: {e}")
+        return None, None
 
 
 def _show_window(webview_module):

@@ -18,6 +18,8 @@ signal over noise (short cooldown on fills, longer on errors and breakers).
 """
 
 import shutil
+import os
+import subprocess
 import sys
 import time
 import threading
@@ -118,8 +120,11 @@ class NotificationManager:
     def __init__(self, app_name: str = "CATalyst"):
         if not PLYER_AVAILABLE:
             raise ImportError("plyer is not installed")
-        if sys.platform.startswith("linux") and shutil.which("notify-send") is None:
-            raise ImportError("notify-send is not installed")
+        if sys.platform.startswith("linux"):
+            if shutil.which("notify-send") is None:
+                raise ImportError("notify-send is not installed")
+            if not _linux_notification_service_available():
+                raise ImportError("Linux notification service is not available")
 
         self.app_name = app_name
         self.enabled = True  # Master switch
@@ -216,3 +221,49 @@ class NotificationManager:
         if max_len <= 1:
             return text[:max_len]
         return text[: max_len - 1] + "…"
+
+
+def _linux_notification_service_available() -> bool:
+    """Return True only when the Linux desktop notification bus is reachable."""
+    if not sys.platform.startswith("linux"):
+        return True
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return False
+
+    gdbus = shutil.which("gdbus")
+    dbus_send = shutil.which("dbus-send")
+    if gdbus:
+        cmd = [
+            gdbus,
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.GetServerInformation",
+        ]
+    elif dbus_send:
+        cmd = [
+            dbus_send,
+            "--session",
+            "--dest=org.freedesktop.Notifications",
+            "--type=method_call",
+            "--print-reply",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications.GetServerInformation",
+        ]
+    else:
+        return True
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False

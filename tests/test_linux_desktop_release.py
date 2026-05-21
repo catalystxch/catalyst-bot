@@ -51,6 +51,60 @@ def test_linux_release_ci_runs_desktop_smoke_test():
     assert "openbox" in workflow
 
 
+def test_release_build_and_linux_package_purge_runtime_sidecars():
+    build_source = (ROOT / "build.py").read_text(encoding="utf-8")
+    package_source = (ROOT / "scripts" / "package_linux.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for source in (build_source, package_source):
+        assert "coin_prep_status.json" in source
+        assert "coin_prep_last.json" in source
+        assert "coin_prep_output.log" in source
+        assert "bot_superlog_*.log" in source
+        assert "user_secrets.json" in source
+
+    assert "_purge_runtime_artifacts(OUTPUT_DIR)" in build_source
+    assert 'purge_runtime_artifacts "$bundle_dir"' in package_source
+    assert 'purge_runtime_artifacts "$appdir/usr/lib/catalyst"' in package_source
+    assert 'purge_runtime_artifacts "$deb_root/opt/catalyst"' in package_source
+
+
+def test_build_runtime_artifact_purge_keeps_worker_source(tmp_path):
+    import build
+
+    internal = tmp_path / "_internal"
+    internal.mkdir()
+    for name in (
+        "coin_prep_status.json",
+        "coin_prep_last.json",
+        "coin_prep_output.log",
+        "bot_superlog_20260521_000000.log",
+        "user_secrets.json",
+    ):
+        (internal / name).write_text("stale", encoding="utf-8")
+    worker = internal / "coin_prep_worker.py"
+    worker.write_text("print('worker')\n", encoding="utf-8")
+
+    removed = build._purge_runtime_artifacts(str(tmp_path))
+
+    assert removed == 5
+    assert worker.exists()
+    assert not (internal / "coin_prep_status.json").exists()
+    assert not (internal / "coin_prep_last.json").exists()
+    assert not (internal / "coin_prep_output.log").exists()
+
+
+def test_desktop_tray_start_waits_before_claiming_active():
+    source = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
+
+    assert "def _start_system_tray" in source
+    assert "settle_seconds" in source
+    assert "desktop tray unavailable" in source
+    assert "not getattr(tray, \"is_running\", False)" in source
+    assert "not tray_thread.is_alive()" in source
+
+
 def test_linux_qt_xcb_runtime_dependencies_are_declared():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"

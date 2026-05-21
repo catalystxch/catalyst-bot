@@ -15,10 +15,36 @@ if [[ ! -x "$bundle_dir/Catalyst" ]]; then
   exit 1
 fi
 
+purge_runtime_artifacts() {
+  local root_dir="${1:?root dir required}"
+  [[ -d "$root_dir" ]] || return 0
+  find "$root_dir" -type f \( \
+    -name ".env" -o \
+    -name ".window_state.json" -o \
+    -name "bot.db" -o \
+    -name "bot.db-shm" -o \
+    -name "bot.db-wal" -o \
+    -name "crash.log" -o \
+    -name "worker_cancelled_ids.json" -o \
+    -name "protected_offers.json" -o \
+    -name "coin_prep_status.json" -o \
+    -name "coin_prep_last.json" -o \
+    -name "coin_prep_output.log" -o \
+    -name "user_secrets.json" -o \
+    -name "bot_superlog_*.log" -o \
+    -name "bot_backup_*.db" -o \
+    -name "bot.db.corrupt_*" -o \
+    -name "bot.db.recovered" \
+  \) -delete
+}
+
+purge_runtime_artifacts "$bundle_dir"
+
 rm -rf "$appdir" "$deb_root" "$appimage_path" "${appimage_path}.sha256" "$deb_path" "${deb_path}.sha256"
 
 install -d "$appdir/usr/lib/catalyst"
 cp -a "$bundle_dir/." "$appdir/usr/lib/catalyst/"
+purge_runtime_artifacts "$appdir/usr/lib/catalyst"
 chmod +x "$appdir/usr/lib/catalyst/Catalyst"
 
 cat > "$appdir/AppRun" <<'APPRUN'
@@ -86,6 +112,7 @@ printf "%s  %s\n" "$appimage_digest" "$(basename "$appimage_path")" > "${appimag
 
 install -d "$deb_root/DEBIAN" "$deb_root/opt/catalyst" "$deb_root/usr/bin" "$deb_root/usr/share/applications" "$deb_root/usr/share/icons/hicolor/256x256/apps"
 cp -a "$bundle_dir/." "$deb_root/opt/catalyst/"
+purge_runtime_artifacts "$deb_root/opt/catalyst"
 chmod +x "$deb_root/opt/catalyst/Catalyst"
 cat > "$deb_root/usr/bin/catalyst" <<'WRAPPER'
 #!/usr/bin/env sh

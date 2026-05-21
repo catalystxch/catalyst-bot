@@ -32,6 +32,7 @@ import sys
 import shutil
 import subprocess
 import argparse
+import fnmatch
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,27 @@ DIST_DIR = os.path.join(HERE, "dist")
 BUILD_DIR = os.path.join(HERE, "build")
 OUTPUT_DIR = os.path.join(DIST_DIR, "Catalyst")
 ENV_EXAMPLE = os.path.join(HERE, ".env.example")
+
+_RUNTIME_ARTIFACT_NAMES = {
+    ".env",
+    ".window_state.json",
+    "bot.db",
+    "bot.db-shm",
+    "bot.db-wal",
+    "crash.log",
+    "worker_cancelled_ids.json",
+    "protected_offers.json",
+    "coin_prep_status.json",
+    "coin_prep_last.json",
+    "coin_prep_output.log",
+    "user_secrets.json",
+}
+_RUNTIME_ARTIFACT_GLOBS = (
+    "bot_superlog_*.log",
+    "bot_backup_*.db",
+    "bot.db.corrupt_*",
+    "bot.db.recovered",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +130,10 @@ def _post_build():
         print(f"\n  ERROR: Expected output directory not found: {OUTPUT_DIR}")
         sys.exit(1)
 
+    removed = _purge_runtime_artifacts(OUTPUT_DIR)
+    if removed:
+        print(f"  Removed {removed} runtime artifact(s) from bundle.")
+
     # Copy .env.example so users know what to configure
     if os.path.isfile(ENV_EXAMPLE):
         dest = os.path.join(OUTPUT_DIR, ".env.example")
@@ -136,6 +162,31 @@ def _post_build():
         print("  The app may fail to load the GUI. Check the .spec datas list.")
     else:
         print("  HTML assets verified in bundle.")
+
+
+def _purge_runtime_artifacts(root: str) -> int:
+    """Remove user-writable runtime files that PyInstaller may collect.
+
+    Release artifacts must not ship stale coin-prep status, logs, databases, or
+    local config from the build machine. Runtime files are created under the
+    platform user data dir on first launch.
+    """
+    removed = 0
+    if not root or not os.path.isdir(root):
+        return removed
+
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name in _RUNTIME_ARTIFACT_NAMES or any(
+                fnmatch.fnmatch(name, pattern) for pattern in _RUNTIME_ARTIFACT_GLOBS
+            ):
+                path = os.path.join(dirpath, name)
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError as exc:
+                    print(f"  Warning: could not remove runtime artifact {path}: {exc}")
+    return removed
 
 
 def _print_success():

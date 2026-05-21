@@ -2054,6 +2054,18 @@ def api_check_update():
             "checked_at": time.time(),
         }
     result["platform"] = sys.platform
+    if sys.platform != "win32":
+        result["installer_ready"] = False
+        result["installer_name"] = None
+        result["installer_size"] = None
+        result["checksum_name"] = None
+        result["automatic_update_supported"] = False
+        result["security"] = (
+            "Automatic upgrade is available on Windows only. On Linux and macOS, "
+            "open the release page and download the latest package manually."
+        )
+    else:
+        result["automatic_update_supported"] = True
     return jsonify(result)
 
 
