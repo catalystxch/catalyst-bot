@@ -11,4 +11,4 @@ pyinstaller>=6.20.0,<7
 # E2E browser tests against the live Flask GUI. After install run:
 #     python -m playwright install chromium
 playwright>=1.59.0,<2
-pytest-playwright>=0.7.2,<1
+pytest-playwright>=0.8.0,<1
