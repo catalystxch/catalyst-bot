@@ -648,17 +648,10 @@ class Config:
         # consume its own balance minus reserve. Fall back to the shared
         # legacy keys when per-side values are zero (upgrade path).
         #
-        # ⚠ F77 audit note (2026-04-17): the per-side size values are
-        # WRITTEN by Smart Settings and LOADED by the GUI but NOT actually
-        # consumed by the trading code path — the ladder planner and offer
-        # manager still read INNER_SIZE_XCH etc. (unified). This means
-        # editing a per-side value in the GUI has no runtime effect.
-        # F62 is incomplete; completing it requires threading the
-        # per-side resolution (see get_buy_tier_size_xch /
-        # get_sell_tier_size_xch helpers below) through ladder_planner
-        # and offer_manager's coin-selection path. Left in config for
-        # forward compatibility; Smart Settings still writes them so a
-        # future wire-up can light them up without schema migration.
+        # Per-side values are consumed through get_buy_tier_size_xch /
+        # get_sell_tier_size_xch below. Keep legacy INNER_* values populated
+        # for upgrade compatibility, but new runtime paths should use the
+        # helpers so buy/sell sizing stays independent.
         self.BUY_INNER_SIZE_XCH = _decimal("BUY_INNER_SIZE_XCH", "0")
         self.BUY_MID_SIZE_XCH = _decimal("BUY_MID_SIZE_XCH", "0")
         self.BUY_OUTER_SIZE_XCH = _decimal("BUY_OUTER_SIZE_XCH", "0")

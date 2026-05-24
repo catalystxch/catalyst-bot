@@ -10779,12 +10779,6 @@
                                 </label>
                             </div>
                         </div>
-                        <div class="form-group" style="margin-bottom: 8px;">
-                            <label style="font-size: 0.85em;">Max Price Move (%) <span class="cc-help">?<span class="cc-tooltip">If the mid-price changes by more than this percentage in a single loop, the bot pauses. Protects against flash crashes or price manipulation.</span></span></label>
-                            <input type="number" id="configMaxMidMove" value="5" min="0" max="100" step="0.5" oninput="checkRiskWarnings()">
-                            <div class="v4-settings-hint">Emergency brake — stop if price jumps more than this in one loop</div>
-                            <div id="maxMidMoveWarning" style="display: none; margin-top: 4px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em;"></div>
-                        </div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Dynamic Band (±%) <span class="cc-help">?<span class="cc-tooltip">The bot tracks the average price and rejects fetched prices that fall outside this band around the moving average. Higher values allow more volatility. Smart Settings sets this from 30-day price history. Set 0 to disable.</span></span></label>
@@ -17930,7 +17924,6 @@
                 // Price rails (30-day range derived)
                 'configMinMid',
                 'configMaxMid',
-                'configMaxMidMove',
                 'configTibetShockCancelPct',
                 'configArbThreshold',
                 // Requote (spread-derived)
@@ -19254,8 +19247,7 @@
                 // Auto-Requote — Batch Size
                 if (data.requote_batch_size) document.getElementById('configRequoteBatchSize').value = data.requote_batch_size;
 
-                // Safety & Limits — Emergency Brake
-                document.getElementById('configMaxMidMove').value = data.max_mid_move;
+                // Safety & Limits
                 if (data.dynamic_limit_pct > 0) document.getElementById('configDynamicLimitPct').value = data.dynamic_limit_pct;
                 if (data.max_step_change_pct >= 0) document.getElementById('configMaxStepChange').value = data.max_step_change_pct;
                 if (data.tibet_shock_cancel_trigger_pct !== undefined) document.getElementById('configTibetShockCancelPct').value = Number(data.tibet_shock_cancel_trigger_pct || 0).toFixed(2);
@@ -22450,28 +22442,7 @@
                 }
             }
 
-            // 2. Max Price Move disabled or very high.
-            // A BLANK field is the fresh-start state (before the user
-            // either enters a value or runs Smart Settings) and should
-            // stay neutral — no warning. The red "circuit breaker
-            // disabled" alarm only fires when the user has EXPLICITLY
-            // set the value to 0, which is a genuinely dangerous
-            // operator decision worth flagging. Matches the pattern
-            // used by every other warning in this function.
-            const maxMidMoveRaw = document.getElementById('configMaxMidMove')?.value;
-            const maxMidMove = parseFloat(maxMidMoveRaw);
-            if (maxMidMoveRaw === undefined || maxMidMoveRaw === '' || isNaN(maxMidMove)) {
-                // Field is blank / not yet configured — stay quiet.
-                setWarning('maxMidMoveWarning', null, null);
-            } else if (maxMidMove === 0) {
-                setWarning('maxMidMoveWarning', 'red', 'Circuit breaker disabled \u2014 bot will trade through flash crashes and oracle failures.');
-            } else if (maxMidMove > 30) {
-                setWarning('maxMidMoveWarning', 'amber', 'Very high \u2014 bot will continue trading through large price swings. Recommended: 10-20%.');
-            } else {
-                setWarning('maxMidMoveWarning', null, null);
-            }
-
-            // 3. Max Position vs wallet balance
+            // 2. Max Position vs wallet balance
             const maxPosition = parseFloat(document.getElementById('configMaxPositionXch')?.value) || 0;
             if (xchBalance > 0 && maxPosition > 0 && maxPosition > xchBalance * 0.5) {
                 setWarning('maxPositionWarning', 'amber', 'Max position exceeds 50% of your XCH balance \u2014 limits flexibility for emergency exits.');
@@ -22479,7 +22450,7 @@
                 setWarning('maxPositionWarning', null, null);
             }
 
-            // 4. Individual trade size warning (> 3 XCH)
+            // 3. Individual trade size warning (> 3 XCH)
             const tradeSize = parseFloat(document.getElementById('configTradeXch')?.value) || 0;
             const tradeSizeWarnEl = document.getElementById('tradeSizeWarning');
             // Only show trade size risk warning when the element is not already used by other logic
@@ -22496,7 +22467,7 @@
                 }
             }
 
-            // 5. Min Spread >= Base Spread warning
+            // 4. Min Spread >= Base Spread warning
             const minSpread = parseFloat(document.getElementById('configMinSpreadBps')?.value) || 0;
             const baseSpread = parseFloat(document.getElementById('configSpreadBps')?.value) || 0;
             if (minSpread > 0 && baseSpread > 0 && minSpread >= baseSpread) {
@@ -32115,7 +32086,7 @@
             // User-facing trading-control toggles
             'configEnableBuy','configEnableSell',
             'configAutoRequote','configRequoteBps','configRequoteCooldown','configRequoteBatchSize',
-            'configMaxMidMove','configTibetShockCancelPct','configArbThreshold','configDynamicLimitPct','configMaxStepChange',
+            'configTibetShockCancelPct','configArbThreshold','configDynamicLimitPct','configMaxStepChange',
             'configMinMid','configMaxMid',
             'configDynamicSpreadEnabled','configBaseSpreadBps','configMinEdgeBps',
             'configMinSpreadBps','configMaxSpreadBps','configVolatilityWindow',
@@ -32123,6 +32094,8 @@
             'configToxicityMaxSpreadMultiplier','configToxicityThrottleSecs',
             'configInventoryEnabled','configSkewIntensity','configMaxPositionXch',
             'configTierEnabled','configBuyLadderReversed',
+            'configTopupPoolPct','configTopupPoolXch','configTopupPoolCat',
+            'configBuyInnerSizeXch','configBuyMidSizeXch','configBuyOuterSizeXch','configBuyExtremeSizeXch',
             'configInnerSizeXch','configMidSizeXch','configOuterSizeXch','configExtremeSizeXch',
             'configInnerTierCount','configMidTierCount','configOuterTierCount','configExtremeTierCount',
             'configInnerTierCountXch','configMidTierCountXch','configOuterTierCountXch','configExtremeTierCountXch',

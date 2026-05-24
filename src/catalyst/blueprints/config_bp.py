@@ -742,6 +742,9 @@ def api_settings_validate():
     shock_trigger_pct = _decimal_value(
         "tibet_shock_cancel_trigger_pct", "TIBET_SHOCK_CANCEL_TRIGGER_PCT"
     )
+    topup_pool_pct = _decimal_value("topup_pool_pct", "TOPUP_POOL_PCT")
+    topup_pool_xch = _decimal_value("topup_pool_xch", "TOPUP_POOL_XCH")
+    topup_pool_cat = _decimal_value("topup_pool_cat", "TOPUP_POOL_CAT")
     dynamic_enabled = _bool_value("dynamic_spread_enabled", "DYNAMIC_SPREAD_ENABLED")
     inventory_enabled = _bool_value("inventory_enabled", "INVENTORY_ENABLED")
     competitor_enabled = _bool_value(
@@ -901,6 +904,18 @@ def api_settings_validate():
             warnings.append(
                 "Tibet shock cancel threshold above 20% may react too late to stale offers"
             )
+
+    if topup_pool_pct is not None:
+        if topup_pool_pct < 0:
+            errors.append("Topup pool percent must be zero or greater")
+        elif topup_pool_pct > Decimal("1"):
+            errors.append("Topup pool percent must be sent as a decimal fraction")
+
+    if topup_pool_xch is not None and topup_pool_xch < 0:
+        errors.append("Topup XCH budget must be zero or greater")
+
+    if topup_pool_cat is not None and topup_pool_cat < 0:
+        errors.append("Topup CAT budget must be zero or greater")
 
     if dynamic_enabled is False and (inventory_enabled or competitor_enabled):
         warnings.append(
