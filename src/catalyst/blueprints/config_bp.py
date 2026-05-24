@@ -289,6 +289,37 @@ def api_config_update():
     if not isinstance(data, dict):
         return jsonify({"success": False, "error": "Invalid request body"}), 400
 
+    _bot_running = bool(bot and bot.is_running())
+    _defer_runtime = _bot_running
+    _deferred_note = "Saved from Setup while bot was running; applies on next bot restart"
+
+    def _write_setting(env_key, raw_value):
+        if _defer_runtime:
+            writer = getattr(cfg, "update_persisted", None)
+            if writer is None:
+                return False
+            return writer(
+                env_key,
+                str(raw_value),
+                source="api_settings_save_deferred",
+                note=_deferred_note,
+            )
+        return cfg.update(env_key, str(raw_value), source="api_settings_save")
+
+    def _apply_deferred_notice(response, event_payload=None):
+        if not _defer_runtime:
+            return response
+        warning = (
+            "Saved to .env only — restart the bot to apply these Setup changes. "
+            "Current live offers were left on the running config."
+        )
+        response["apply_mode"] = "next_restart"
+        response["warning"] = warning
+        if event_payload is not None:
+            event_payload["apply_mode"] = "next_restart"
+            event_payload["warning"] = warning
+        return response
+
     if "key" in data and "value" in data:
         # --- Single key-value format ---
         key = data["key"]
@@ -298,17 +329,20 @@ def api_config_update():
                 {"success": False, "error": f"Cannot modify {key} via API"}
             ), 403
 
-        _bot_running = bool(bot and bot.is_running())
         if key == "LIQUIDITY_MODE":
             _allowed = ("two_sided", "buy_only", "sell_only")
-            if str(value).lower().strip() not in _allowed:
+            _new_mode = str(value).lower().strip()
+            _current_mode = str(
+                getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
+            ).lower().strip()
+            if _new_mode not in _allowed:
                 return jsonify(
                     {
                         "success": False,
                         "error": f"LIQUIDITY_MODE must be one of: {', '.join(_allowed)}",
                     }
                 ), 400
-            if _bot_running:
+            if _bot_running and _new_mode != _current_mode:
                 return jsonify(
                     {
                         "success": False,
@@ -342,18 +376,32 @@ def api_config_update():
                     }
                 ), 400
 
-        ok = cfg.update(key, str(value), source="api_settings_save")
+        ok = _write_setting(key, value)
         if ok:
             extra = None
-            if key == "SAGE_SET_CHANGE_ADDRESS" and str(value).strip().lower() in (
+            if (
+                not _defer_runtime
+                and key == "SAGE_SET_CHANGE_ADDRESS"
+                and str(value).strip().lower()
+                in (
                 "true",
                 "1",
                 "yes",
                 "on",
+                )
             ):
                 extra = _apply_sage_change_address_setting()
             safe_value = "***" if api_server._is_sensitive_key(key) else value
-            log_event("info", "config_changed", f"Config updated: {key} = {safe_value}")
+            event_type = "config_deferred" if _defer_runtime else "config_changed"
+            log_event(
+                "info",
+                event_type,
+                (
+                    f"Config saved for next restart: {key} = {safe_value}"
+                    if _defer_runtime
+                    else f"Config updated: {key} = {safe_value}"
+                ),
+            )
             response = {
                 "success": True,
                 "status": "updated",
@@ -361,7 +409,8 @@ def api_config_update():
                 "change_address_result": extra,
             }
             event_payload = {"key": key, "value": safe_value}
-            notice = api_server._get_live_requote_notice([key])
+            _apply_deferred_notice(response, event_payload)
+            notice = None if _defer_runtime else api_server._get_live_requote_notice([key])
             if notice:
                 response["apply_mode"] = notice["apply_mode"]
                 response["warning"] = notice["warning"]
@@ -372,7 +421,6 @@ def api_config_update():
         return jsonify({"success": False, "error": f"Failed to update {key}"}), 500
 
     # --- Bulk format ---
-    _bot_running = bool(bot and bot.is_running())
     updated = []
     errors = []
     validation_warnings = []
@@ -383,10 +431,14 @@ def api_config_update():
 
         if env_key == "LIQUIDITY_MODE":
             _allowed = ("two_sided", "buy_only", "sell_only")
-            if str(value).lower().strip() not in _allowed:
+            _new_mode = str(value).lower().strip()
+            _current_mode = str(
+                getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
+            ).lower().strip()
+            if _new_mode not in _allowed:
                 errors.append(f"LIQUIDITY_MODE must be one of: {', '.join(_allowed)}")
                 continue
-            if _bot_running:
+            if _bot_running and _new_mode != _current_mode:
                 errors.append(
                     "LIQUIDITY_MODE cannot be changed while bot is running — stop the bot first"
                 )
@@ -418,7 +470,7 @@ def api_config_update():
                     "dynamic spread will always clamp to the maximum"
                 )
 
-        ok = cfg.update(env_key, str(value), source="api_settings_save")
+        ok = _write_setting(env_key, value)
         if ok:
             updated.append(env_key)
         else:
@@ -453,10 +505,10 @@ def api_config_update():
         # Legacy key clearing — HARD_* takes precedence over MAX_MID / MIN_MID.
         legacy_cleared = []
         if "HARD_MAX_PRICE_XCH" in updated:
-            if cfg.update("MAX_MID", ""):
+            if _write_setting("MAX_MID", ""):
                 legacy_cleared.append("MAX_MID")
         if "HARD_MIN_PRICE_XCH" in updated:
-            if cfg.update("MIN_MID", ""):
+            if _write_setting("MIN_MID", ""):
                 legacy_cleared.append("MIN_MID")
         if legacy_cleared:
             log_event(
@@ -468,10 +520,17 @@ def api_config_update():
             updated.extend(legacy_cleared)
 
         log_event(
-            "info", "config_changed", f"Bulk config updated: {', '.join(updated)}"
+            "info",
+            "config_deferred" if _defer_runtime else "config_changed",
+            (
+                f"Bulk config saved for next restart: {', '.join(updated)}"
+                if _defer_runtime
+                else f"Bulk config updated: {', '.join(updated)}"
+            ),
         )
         event_payload = {"keys": updated}
-        notice = api_server._get_live_requote_notice(updated)
+        _apply_deferred_notice(response, event_payload)
+        notice = None if _defer_runtime else api_server._get_live_requote_notice(updated)
         if notice:
             response["apply_mode"] = notice["apply_mode"]
             response["warning"] = notice["warning"]
@@ -481,6 +540,8 @@ def api_config_update():
 
     extra = None
     if (
+        not _defer_runtime
+        and
         "SAGE_SET_CHANGE_ADDRESS" in updated
         and str(getattr(cfg, "SAGE_SET_CHANGE_ADDRESS", False)).lower() == "true"
     ):
@@ -550,14 +611,18 @@ def api_config_live():
 
     if key == "LIQUIDITY_MODE":
         _allowed = ("two_sided", "buy_only", "sell_only")
-        if str(value).lower().strip() not in _allowed:
+        _new_mode = str(value).lower().strip()
+        _current_mode = str(
+            getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
+        ).lower().strip()
+        if _new_mode not in _allowed:
             return jsonify(
                 {
                     "success": False,
                     "error": f"LIQUIDITY_MODE must be one of: {', '.join(_allowed)}",
                 }
             ), 400
-        if bot and bot.is_running():
+        if bot and bot.is_running() and _new_mode != _current_mode:
             return jsonify(
                 {
                     "success": False,

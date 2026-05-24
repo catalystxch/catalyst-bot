@@ -190,7 +190,26 @@ class TestApiLocalGuard(unittest.TestCase):
         self.assertEqual(calls[1][1].get("requested_asset_id"), "test-cat")
         self.assertNotIn("requested", calls[1][1])
 
-    def test_quote_setting_update_returns_next_requote_notice(self):
+    def test_setup_quote_setting_update_while_running_returns_next_restart_notice(self):
+        headers = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
+        fake_bot = SimpleNamespace(is_running=lambda: True)
+        with (
+            patch.object(api_server, "bot", fake_bot),
+            patch.object(api_server.cfg, "update_persisted", return_value=True),
+        ):
+            resp = self.client.post(
+                "/api/config",
+                json={"key": "BASE_SPREAD_BPS", "value": "920"},
+                headers=headers,
+                environ_base=self.loopback,
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body.get("apply_mode"), "next_restart")
+        self.assertIn("restart the bot", body.get("warning", ""))
+
+    def test_live_quote_setting_update_returns_next_requote_notice(self):
         headers = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         fake_bot = SimpleNamespace(is_running=lambda: True)
         with (
@@ -198,7 +217,7 @@ class TestApiLocalGuard(unittest.TestCase):
             patch.object(api_server.cfg, "update", return_value=True),
         ):
             resp = self.client.post(
-                "/api/config",
+                "/api/config/live",
                 json={"key": "BASE_SPREAD_BPS", "value": "920"},
                 headers=headers,
                 environ_base=self.loopback,

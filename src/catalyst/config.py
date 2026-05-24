@@ -21,7 +21,7 @@ import sys
 import threading
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
-from dotenv import load_dotenv, set_key
+from dotenv import dotenv_values, load_dotenv, set_key
 
 
 def _find_env_example_path(install_dir: str) -> str:
@@ -200,6 +200,7 @@ class Config:
         # RLock so update() can hold the lock across set_key() + reload(),
         # and reload() can still re-acquire from the same thread.
         self._lock = threading.RLock()
+        self._pending_restart_changes = False
         self.reload()
 
     def reload(self):
@@ -226,9 +227,15 @@ class Config:
                 self._validation_report = validate_config(self)
             except Exception:
                 self._validation_report = None
+            self._pending_restart_changes = False
         finally:
             if lock:
                 lock.release()
+
+    def has_pending_restart_changes(self) -> bool:
+        """Return whether disk-only Setup saves need a bot restart/reload."""
+        with self._lock:
+            return bool(self._pending_restart_changes)
 
     def _reload_inner(self):
         """Internal reload — called under lock."""
@@ -1330,6 +1337,70 @@ class Config:
                 from database import log_event as _log_cfg
 
                 _log_cfg("error", "config_error", f"Failed to update {key}: {e}")
+            except Exception:
+                pass
+            return False
+
+    def update_persisted(
+        self, key: str, value: str, source: str = "api", note: str = ""
+    ) -> bool:
+        """Write a setting to .env without refreshing the running config.
+
+        Used for Setup-tab saves while the bot is already running. Those
+        changes should survive to disk but only affect trading after the next
+        bot restart, leaving the current live book governed by the config it
+        started with.
+        """
+        if key not in self._UPDATABLE_KEYS:
+            print(f"[CONFIG] Blocked update of non-updatable key: {key}")
+            return False
+
+        if any(c in str(value) for c in ("\n", "\r", "\x00")):
+            print(
+                f"[CONFIG] Blocked update of {key}: value contains control characters"
+            )
+            return False
+
+        try:
+            with self._lock:
+                try:
+                    disk_values = dotenv_values(_ENV_PATH)
+                except Exception:
+                    disk_values = {}
+                old_value = str(disk_values.get(key, getattr(self, key, "")))
+
+                set_key(_ENV_PATH, key, value)
+                self._pending_restart_changes = True
+
+                try:
+                    from database import record_config_change
+
+                    record_config_change(
+                        key, old_value, value, source=source, note=note
+                    )
+                except ImportError:
+                    pass
+
+                try:
+                    if key in ("TOPUP_POOL_XCH", "TOPUP_POOL_CAT"):
+                        from database import set_setting as _set_setting
+
+                        spend_key = (
+                            "topup_pool_cat_spent_mojos"
+                            if key == "TOPUP_POOL_CAT"
+                            else "topup_pool_xch_spent_mojos"
+                        )
+                        _set_setting(spend_key, "0")
+                except Exception:
+                    pass
+
+            return True
+        except Exception as e:
+            print(f"[CONFIG] Failed to persist {key}: {e}")
+            try:
+                from database import log_event as _log_cfg
+
+                _log_cfg("error", "config_error", f"Failed to persist {key}: {e}")
             except Exception:
                 pass
             return False

@@ -120,6 +120,24 @@ def api_bot_start():
     if bot.is_running():
         return jsonify({"success": True, "status": "already_running"})
 
+    try:
+        has_pending_restart_changes = getattr(
+            cfg, "has_pending_restart_changes", lambda: False
+        )
+        if has_pending_restart_changes():
+            cfg.reload()
+            log_event(
+                "info",
+                "config_reload",
+                "Config reloaded before bot start so pending Setup changes apply",
+            )
+    except Exception as e:
+        log_event(
+            "warning",
+            "config_reload_failed",
+            f"Config reload before bot start failed: {e}",
+        )
+
     # ---- Pre-start validation (V1 parity) ----
     warnings = []
     errors = []

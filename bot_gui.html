@@ -15285,6 +15285,7 @@
                 'DYNAMIC_SPREAD_ENABLED',
                 'INVENTORY_ENABLED',
                 'COMPETITOR_AWARE_ENABLED',
+                'SNIPER_ENABLED',
             ]);
             const endpoint = quoteOnlyKeys.has(configKey) ? '/config/live' : '/config';
             const payload = quoteOnlyKeys.has(configKey)
@@ -33116,7 +33117,7 @@
                         if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                         debugLog(`[SAVE] Skipping coin prep check — ${activeOffers} active offers exist`);
                         setCoinPrepStatus('done');
-                        showToast(`Settings updated. ${activeOffers} offers still active — new spreads apply on next requote.`, 'success');
+                        showToast(`Settings saved. ${activeOffers} offers still active — restart the bot to apply Setup changes.`, 'warning', 6000);
                         setSaveConfigButtonState(false);
                         return;
                     }
