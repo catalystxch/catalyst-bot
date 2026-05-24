@@ -14224,8 +14224,8 @@
         }
 
         function v4ApplyOfferFilter() {
-            const buySec = document.querySelector('#activeTab .offers-section:first-child');
-            const sellSec = document.querySelector('#activeTab .offers-section:last-child');
+            const buySec = document.getElementById('buyOffersSection');
+            const sellSec = document.getElementById('sellOffersSection');
             if (!buySec || !sellSec) return;
 
             if (_v4OfferFilter === 'buy') {
