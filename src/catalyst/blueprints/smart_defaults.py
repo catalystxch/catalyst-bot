@@ -60,6 +60,16 @@ def _nonnegative_int_or_none(value):
     return parsed if parsed >= 0 else None
 
 
+def _cat_prep_units_floor(value) -> int:
+    try:
+        parsed = Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError, TypeError):
+        return 0
+    if parsed <= 0:
+        return 0
+    return int(parsed)
+
+
 def _smart_float(value, default: float = 0.0) -> float:
     try:
         parsed = float(value)
@@ -2067,6 +2077,9 @@ def _calculate_smart_defaults(
         _TOPUP_BUFFER_PCT = 0.15  # Moderate: 15% — standard buffer
     else:
         _TOPUP_BUFFER_PCT = 0.15  # Quiet: 15% — minimum healthy buffer
+    _topup_buffer_cat = (
+        round(_avail_cat * _TOPUP_BUFFER_PCT, 3) if _avail_cat > 0 else 0
+    )
     _topup_buffer_reserve = round(_bottleneck_xch * _TOPUP_BUFFER_PCT, 4)
     if _topup_buffer_reserve > _bottleneck_xch:
         _topup_buffer_reserve = round(_bottleneck_xch, 4)
@@ -2642,7 +2655,7 @@ def _calculate_smart_defaults(
                 if mid_price > 0
                 else 0
             )
-            _topup_cat_prep = round(_avail_cat * _TOPUP_BUFFER_PCT)
+            _topup_cat_prep = round(_topup_buffer_cat)
             # Match the XCH-side's implicit 2% safety margin (see
             # _safe_tier_budget = _tier_warning_budget * 0.98 below) so
             # both sides leave identical rounding-noise buffer.
@@ -3778,7 +3791,7 @@ def _calculate_smart_defaults(
             if _smart_sniper_size > 0
             else 0
         )
-        _f65_topup_cat = round(_avail_cat * _TOPUP_BUFFER_PCT)
+        _f65_topup_cat = round(_topup_buffer_cat)
         _f65_total_cat = _f65_tier_cat + _f65_sniper_cat + _f65_topup_cat
 
         if _f65_total_cat > _avail_cat:
@@ -3826,6 +3839,57 @@ def _calculate_smart_defaults(
                 _c * round((_s / mid_price) * _f65_hm) for _c, _s in _f65_tiers2
             )
             _f65_new_total = _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
+            if _f65_new_total > _avail_cat:
+                _f65_per_sniper_cat = (
+                    round((_smart_sniper_size / mid_price) * _f65_hm)
+                    if _smart_sniper_size > 0
+                    else 0
+                )
+                if _f65_per_sniper_cat > 0 and _smart_sniper_prep > 0:
+                    _sniper_budget_cat = max(
+                        0.0, _avail_cat - _f65_new_tier - _f65_topup_cat
+                    )
+                    _max_sniper_prep = int(_sniper_budget_cat // _f65_per_sniper_cat)
+                    if _max_sniper_prep < _smart_sniper_prep:
+                        _old_sniper_prep = _smart_sniper_prep
+                        _smart_sniper_prep = max(0, _max_sniper_prep)
+                        _sniper_pool_xch = round(
+                            _smart_sniper_size * _smart_sniper_prep, 4
+                        )
+                        _f65_sniper_cat = _f65_per_sniper_cat * _smart_sniper_prep
+                        _f65_new_total = (
+                            _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
+                        )
+                        if "_capital_plan" in dir() and isinstance(_capital_plan, dict):
+                            _capital_plan["sniper_pool_xch"] = _sniper_pool_xch
+                        messages.append(
+                            f"CAT-side sniper pool capped: {_old_sniper_prep} -> "
+                            f"{_smart_sniper_prep} coins so sniper, topup, and "
+                            f"sell tiers fit the CAT balance."
+                        )
+                        print(
+                            f"[SMART_DEFAULTS] F65 CAT sniper cap: "
+                            f"{_old_sniper_prep} -> {_smart_sniper_prep}, "
+                            f"total now {_f65_new_total:,.0f}/{_avail_cat:,.0f}"
+                        )
+
+                if _f65_new_total > _avail_cat and _f65_topup_cat > 0:
+                    _old_topup_cat = _topup_buffer_cat
+                    _f65_topup_cat = _cat_prep_units_floor(
+                        _avail_cat - _f65_new_tier - _f65_sniper_cat
+                    )
+                    _topup_buffer_cat = float(_f65_topup_cat)
+                    _f65_new_total = _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
+                    messages.append(
+                        f"CAT topup budget capped: {_old_topup_cat:,.0f} -> "
+                        f"{_topup_buffer_cat:,.0f} tokens so the coin-prep "
+                        f"plan fits the CAT balance."
+                    )
+                    print(
+                        f"[SMART_DEFAULTS] F65 CAT topup cap: "
+                        f"{_old_topup_cat:,.0f} -> {_topup_buffer_cat:,.0f}, "
+                        f"total now {_f65_new_total:,.0f}/{_avail_cat:,.0f}"
+                    )
             messages.append(
                 f"F65 sell-side CAT safety clamp: "
                 f"inner {_f65_old_inner:.4f} → {_smart_sell_inner:.4f} "
@@ -4060,14 +4124,9 @@ def _calculate_smart_defaults(
         # budget.
         "topup_pool_pct": _TOPUP_BUFFER_PCT,
         "topup_pool_xch": round(_topup_buffer_xch, 4) if _topup_buffer_xch > 0 else 0,
-        # CAT side: 10% of the user's available CAT (per-side computation,
-        # matches the user's "10% of remaining" design intent). Capped at
-        # avail so it never exceeds what they actually have.
-        "topup_pool_cat": (
-            round(min(_avail_cat, _avail_cat * _TOPUP_BUFFER_PCT), 3)
-            if _avail_cat > 0
-            else 0
-        ),
+        # CAT side: per-side computation, capped by the final F65 verifier
+        # when sniper/topup/tier prep would otherwise exceed the balance.
+        "topup_pool_cat": _topup_buffer_cat if _topup_buffer_cat > 0 else 0,
         # Ladder Strategy
         # Reversed (True) is the recommended default. Under reverse-buy the
         # buy ladder is asymmetric to the sell ladder:
