@@ -55,6 +55,12 @@ from tx_fees import (
     get_effective_transaction_fee_mojos,
     get_fee_tier_name,
 )
+from amount_utils import (
+    cat_display_amount_to_mojos_ceil,
+    cat_mojos_to_display_amount,
+    format_cat_display_amount,
+    round_cat_display_amount_up_to_mojo,
+)
 
 # Load environment
 from dotenv import load_dotenv
@@ -237,6 +243,13 @@ def _wallet_total_mojos_from_balance_response(response, label: str) -> int:
         raise CoinPrepRpcUnavailable(
             f"{label} balance response had invalid balance value: {raw!r}"
         ) from exc
+
+
+def _cat_pool_reserve_floor(cat_reserve: Decimal, cat_decimals: int) -> Decimal:
+    """Minimum CAT left behind when capping a pool to wallet balance."""
+    reserve = Decimal(str(cat_reserve or 0))
+    one_mojo = cat_mojos_to_display_amount(1, cat_decimals)
+    return max(reserve, one_mojo)
 
 
 class ApiMirrorStream:
@@ -638,7 +651,8 @@ class CoinPrepWorker:
                 csz = self.tier_cat_sizes.get(tn, Decimal("0"))
                 if csz > 0:
                     self.log(
-                        f"     {tn}: XCH={xcnt} × {prep_xsz} / CAT={ccnt} × {csz:,.0f} "
+                        f"     {tn}: XCH={xcnt} × {prep_xsz} / "
+                        f"CAT={ccnt} × {self._format_cat_amount(csz)} "
                         f"(live size {live_xsz} XCH)"
                     )
                 else:
@@ -698,8 +712,14 @@ class CoinPrepWorker:
 
         self.log("🪙 Coin Prep Worker initialized (PARALLEL MODE)")
         self.log(f"   XCH: {self.xch_target_coins} coins @ {self.xch_coin_size} each")
-        self.log(f"   CAT: {self.cat_target_coins} coins @ {self.cat_coin_size} each")
+        self.log(
+            f"   CAT: {self.cat_target_coins} coins @ "
+            f"{self._format_cat_amount(self.cat_coin_size)} each"
+        )
         self.log("   ⚡ Parallel optimization enabled!")
+
+    def _format_cat_amount(self, amount) -> str:
+        return format_cat_display_amount(amount, self.cat_decimals)
 
     def _fee_pool_enabled(self) -> bool:
         return fee_pool_enabled()
@@ -1567,9 +1587,10 @@ class CoinPrepWorker:
         price = self._get_live_price()
         if price and price > 0:
             cat_per_offer = trade_size_xch / price
-            cat_coin_size = (
-                cat_per_offer * self.coin_prep_headroom_multiplier
-            ).quantize(Decimal("1"))
+            cat_coin_size = round_cat_display_amount_up_to_mojo(
+                cat_per_offer * self.coin_prep_headroom_multiplier,
+                self.cat_decimals,
+            )
             self.log(
                 f"   CAT prep coin size: {cat_coin_size} "
                 f"(derived: {trade_size_xch} XCH / {price} price × "
@@ -1610,9 +1631,10 @@ class CoinPrepWorker:
                     result[tier_name] = Decimal("0")
                     continue
                 cat_per_offer = xch_size / price
-                cat_coin_size = (
-                    cat_per_offer * self.coin_prep_headroom_multiplier
-                ).quantize(Decimal("1"))
+                cat_coin_size = round_cat_display_amount_up_to_mojo(
+                    cat_per_offer * self.coin_prep_headroom_multiplier,
+                    self.cat_decimals,
+                )
                 result[tier_name] = cat_coin_size
             self.log(
                 f"   Tier CAT sizes derived from SELL sizes at price {price} "
@@ -3236,7 +3258,9 @@ class CoinPrepWorker:
             if xch_count <= 0 and cat_count <= 0:
                 continue
             xch_mojos_each = int(xch_size * Decimal("1000000000000"))
-            cat_mojos_each = int(cat_size * (10**self.cat_decimals))
+            cat_mojos_each = cat_display_amount_to_mojos_ceil(
+                cat_size, self.cat_decimals
+            )
             xch_mojos_total = xch_mojos_each * xch_count
             cat_mojos_total = cat_mojos_each * cat_count
             tier_info.append(
@@ -3251,7 +3275,8 @@ class CoinPrepWorker:
             )
             self.log(
                 f"   {tier_name}: XCH={xch_count} × {xch_size} ({xch_mojos_total:,} mojos) / "
-                f"CAT={cat_count} × {cat_size:,.0f} ({cat_mojos_total:,} mojos)"
+                f"CAT={cat_count} × {self._format_cat_amount(cat_size)} "
+                f"({cat_mojos_total:,} mojos)"
             )
             if xch_count > 0 and xch_mojos_total > 0:
                 xch_tier_info.append(
@@ -6106,7 +6131,8 @@ class CoinPrepWorker:
         # Calculate total mojos needed for this split
         if is_cat:
             _mojos_needed = (
-                int(Decimal(str(coin_size)) * (10**self.cat_decimals)) * num_coins
+                cat_display_amount_to_mojos_ceil(coin_size, self.cat_decimals)
+                * num_coins
             )
         else:
             _mojos_needed = (
@@ -6135,7 +6161,9 @@ class CoinPrepWorker:
         # --- Check if the coin is big enough for the requested split ---
         # Convert coin_size (display units) to mojos for comparison
         if is_cat:
-            mojos_per_coin = int(Decimal(str(coin_size)) * (10**self.cat_decimals))
+            mojos_per_coin = cat_display_amount_to_mojos_ceil(
+                coin_size, self.cat_decimals
+            )
         else:
             mojos_per_coin = int(Decimal(str(coin_size)) * Decimal("1000000000000"))
         total_mojos_needed = mojos_per_coin * num_coins
@@ -6343,7 +6371,8 @@ class CoinPrepWorker:
         self.update_status(
             PrepPhase.CREATING_POOL,
             0.35,
-            f"💰 Creating CAT pool: {self.cat_target_coins * self.cat_coin_size:,.0f} tokens...",
+            f"💰 Creating CAT pool: "
+            f"{self._format_cat_amount(self.cat_target_coins * self.cat_coin_size)} tokens...",
         )
         results["cat"] = self.create_trading_pool(
             self.cat_wallet_id, "CAT", cat_pool_amount
@@ -6579,9 +6608,13 @@ class CoinPrepWorker:
             self.update_status(
                 PrepPhase.SPLITTING,
                 progress,
-                f"✂️ CAT {tier_name}: {count} coins × {cat_size:,.0f} each...",
+                f"✂️ CAT {tier_name}: {count} coins × "
+                f"{self._format_cat_amount(cat_size)} each...",
             )
-            self.log(f"\n   🔹 CAT {tier_name}: {count} coins × {cat_size:,.0f} tokens")
+            self.log(
+                f"\n   🔹 CAT {tier_name}: {count} coins × "
+                f"{self._format_cat_amount(cat_size)} tokens"
+            )
 
             success = self.split_coin_cli(
                 self.cat_wallet_id, f"CAT-{tier_name}", count, cat_size
@@ -6734,7 +6767,8 @@ class CoinPrepWorker:
                 )
                 retry_cat_size = self.tier_cat_sizes[smallest_cat_tier]
                 self.log(
-                    f"\n   🔹 CAT retry: {cat_short} coins × {retry_cat_size:,.0f} each "
+                    f"\n   🔹 CAT retry: {cat_short} coins × "
+                    f"{self._format_cat_amount(retry_cat_size)} each "
                     f"(using {smallest_cat_tier} tier size)"
                 )
                 self._log_coin_snapshot(self.cat_wallet_id, "CAT", "BEFORE CAT RETRY")
@@ -6836,7 +6870,9 @@ class CoinPrepWorker:
         self.update_status(
             PrepPhase.SPLITTING,
             0.75,
-            f"✂️ Splitting {self.cat_target_coins * self.cat_coin_size:,.0f} tokens → {self.cat_target_coins} coins of {self.cat_coin_size:,.0f} each...",
+            f"✂️ Splitting "
+            f"{self._format_cat_amount(self.cat_target_coins * self.cat_coin_size)} tokens → "
+            f"{self.cat_target_coins} coins of {self._format_cat_amount(self.cat_coin_size)} each...",
         )
         cat_success = self.split_coin_cli(
             self.cat_wallet_id, "CAT", self.cat_target_coins, self.cat_coin_size
@@ -6976,9 +7012,14 @@ class CoinPrepWorker:
                     ccnt = int(self.cat_tier_counts.get(tn, 0) or 0)
                     xs = self.tier_xch_sizes.get(tn, Decimal("0"))
                     cs = self.tier_cat_sizes.get(tn, Decimal("0"))
-                    self.log(f"  {tn}: {xcnt} × {xs} XCH + {ccnt} × {cs:,.0f} CAT")
+                    self.log(
+                        f"  {tn}: {xcnt} × {xs} XCH + "
+                        f"{ccnt} × {self._format_cat_amount(cs)} CAT"
+                    )
                 self.log(f"  Total XCH pool: {xch_pool_amount}")
-                self.log(f"  Total CAT pool: {cat_pool_amount:,.0f}")
+                self.log(
+                    f"  Total CAT pool: {self._format_cat_amount(cat_pool_amount)}"
+                )
             else:
                 xch_pool_amount = self.xch_target_coins * self.xch_coin_size
                 cat_pool_amount = self.cat_target_coins * self.cat_coin_size
@@ -7015,8 +7056,8 @@ class CoinPrepWorker:
                     (_xch_reserve_xch * Decimal("1000000000000")).quantize(Decimal("1"))
                 )
                 _cat_scale = Decimal(10) ** Decimal(self.cat_decimals)
-                _cat_reserve_mojos = int(
-                    (Decimal(str(self.cat_reserve)) * _cat_scale).quantize(Decimal("1"))
+                _cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
+                    self.cat_reserve, self.cat_decimals
                 )
                 _xch_avail_mojos = max(0, _xch_total_mojos - _xch_reserve_mojos)
                 _cat_avail_mojos = max(0, _cat_total_mojos - _cat_reserve_mojos)
@@ -7025,8 +7066,8 @@ class CoinPrepWorker:
                         Decimal("1")
                     )
                 )
-                _cat_pool_mojos = int(
-                    (Decimal(str(cat_pool_amount)) * _cat_scale).quantize(Decimal("1"))
+                _cat_pool_mojos = cat_display_amount_to_mojos_ceil(
+                    cat_pool_amount, self.cat_decimals
                 )
 
                 _xch_overshoot = _xch_pool_mojos > _xch_avail_mojos
@@ -7043,11 +7084,12 @@ class CoinPrepWorker:
                             f"(total {_xch_total_mojos / 1e12:.4f} - reserve {_xch_reserve_mojos / 1e12:.4f})"
                         )
                     if _cat_overshoot:
-                        _sf = float(_cat_scale)
                         self.log(
-                            f"  CAT: pool wants {_cat_pool_mojos / _sf:,.0f} tokens, "
-                            f"wallet has {_cat_avail_mojos / _sf:,.0f} avail "
-                            f"(total {_cat_total_mojos / _sf:,.0f} - reserve {_cat_reserve_mojos / _sf:,.0f})"
+                            "  CAT: pool wants "
+                            f"{self._format_cat_amount(Decimal(_cat_pool_mojos) / _cat_scale)} tokens, "
+                            f"wallet has {self._format_cat_amount(Decimal(_cat_avail_mojos) / _cat_scale)} avail "
+                            f"(total {self._format_cat_amount(Decimal(_cat_total_mojos) / _cat_scale)} - "
+                            f"reserve {self._format_cat_amount(Decimal(_cat_reserve_mojos) / _cat_scale)})"
                         )
                     self.log("")
                     self.log("This usually means Smart Settings ran against a")
@@ -7420,7 +7462,8 @@ class CoinPrepWorker:
                     f"   Waiting for consolidated XCH to become spendable: "
                     f"{xch_bal} / {xch_pool_amount} XCH "
                     f"({'ready' if xch_ready else 'pending'}), "
-                    f"CAT: {cat_bal:,.0f} / {cat_pool_amount:,.0f} "
+                    f"CAT: {self._format_cat_amount(cat_bal)} / "
+                    f"{self._format_cat_amount(cat_pool_amount)} "
                     f"({'ready' if cat_ready else 'pending'}) "
                     f"({spendable_wait_elapsed}s)"
                 )
@@ -7428,7 +7471,7 @@ class CoinPrepWorker:
                 if xch_ready and cat_ready:
                     self.log(
                         f"   ✅ Spendable balances confirmed after {spendable_wait_elapsed}s "
-                        f"— XCH: {xch_bal}, CAT: {cat_bal:,.0f}"
+                        f"— XCH: {xch_bal}, CAT: {self._format_cat_amount(cat_bal)}"
                     )
                     break
 
@@ -7452,7 +7495,8 @@ class CoinPrepWorker:
                     f"   ⚠️ Consolidated coin not yet spendable after {spendable_wait_max}s "
                     f"— blockchain may be slow. "
                     f"Available: XCH {xch_bal} / {xch_pool_amount}, "
-                    f"CAT {cat_bal:,.0f} / {cat_pool_amount:,.0f}. "
+                    f"CAT {self._format_cat_amount(cat_bal)} / "
+                    f"{self._format_cat_amount(cat_pool_amount)}. "
                     f"Continuing with available balance."
                 )
 
@@ -7463,7 +7507,8 @@ class CoinPrepWorker:
             self.log("\n📊 Post-consolidation balances:")
             self.log(f"   XCH: {post_xch_balance}  |  Pool target: {xch_pool_amount}")
             self.log(
-                f"   CAT: {post_cat_balance:,.0f}  |  Pool target: {cat_pool_amount:,.0f}"
+                f"   CAT: {self._format_cat_amount(post_cat_balance)}  |  "
+                f"Pool target: {self._format_cat_amount(cat_pool_amount)}"
             )
 
             if xch_pool_amount > post_xch_balance and post_xch_balance > 0:
@@ -7537,16 +7582,21 @@ class CoinPrepWorker:
 
             if cat_pool_amount > post_cat_balance and post_cat_balance > 0:
                 self.log(
-                    f"⚠️ CAT pool ({cat_pool_amount:,.0f}) exceeds balance ({post_cat_balance:,.0f}) — capping to balance"
+                    f"⚠️ CAT pool ({self._format_cat_amount(cat_pool_amount)}) "
+                    f"exceeds balance ({self._format_cat_amount(post_cat_balance)}) — capping to balance"
                 )
-                # Leave at least CAT_RESERVE as the floor (minimum 1 unit for tx)
-                _cat_floor = max(self.cat_reserve, Decimal("1"))
+                # Leave at least CAT_RESERVE as the floor, or one CAT mojo.
+                _cat_floor = _cat_pool_reserve_floor(
+                    self.cat_reserve, self.cat_decimals
+                )
                 cat_pool_amount = post_cat_balance - _cat_floor
                 if cat_pool_amount <= 0:
                     raise Exception(
                         f"CAT balance too low ({post_cat_balance}) for pool creation"
                     )
-                self.log(f"   Adjusted CAT pool: {cat_pool_amount:,.0f}")
+                self.log(
+                    f"   Adjusted CAT pool: {self._format_cat_amount(cat_pool_amount)}"
+                )
 
                 # CRITICAL: Also reduce CAT-side tier COUNTS proportionally so the
                 # actual per-tier payments fit within the capped CAT balance.
@@ -7556,10 +7606,17 @@ class CoinPrepWorker:
                     for tn in self.cat_tier_counts:
                         cs = self.tier_cat_sizes.get(tn, Decimal("0"))
                         cnt = int(self.cat_tier_counts.get(tn, 0) or 0)
-                        total_cat_mojos_orig += cs * (10**self.cat_decimals) * cnt
+                        total_cat_mojos_orig += (
+                            Decimal(
+                                cat_display_amount_to_mojos_ceil(cs, self.cat_decimals)
+                            )
+                            * cnt
+                        )
 
                     if total_cat_mojos_orig > 0:
-                        available_mojos = int(cat_pool_amount * (10**self.cat_decimals))
+                        available_mojos = cat_display_amount_to_mojos_ceil(
+                            cat_pool_amount, self.cat_decimals
+                        )
                         scale = Decimal(str(available_mojos)) / total_cat_mojos_orig
                         self.log(
                             f"   Scaling CAT tier counts by {float(scale):.2f} to fit CAT balance"
@@ -7595,7 +7652,8 @@ class CoinPrepWorker:
                             cs = self.tier_cat_sizes.get(tn, Decimal("0"))
                             new_cat_total += cs * cnt
                         self.log(
-                            f"   New CAT total: {new_cat_total:,.0f} (balance: {post_cat_balance:,.0f})"
+                            f"   New CAT total: {self._format_cat_amount(new_cat_total)} "
+                            f"(balance: {self._format_cat_amount(post_cat_balance)})"
                         )
                         cat_pool_amount = new_cat_total
 
@@ -8142,7 +8200,8 @@ def main():
             prep_size = worker.tier_xch_sizes.get(tier_name, Decimal("0"))
             cat_size = worker.tier_cat_sizes.get(tier_name, Decimal("0"))
             print(
-                f"   {tier_name}: XCH={xcnt} × {prep_size} / CAT={ccnt} × {cat_size:,.0f} "
+                f"   {tier_name}: XCH={xcnt} × {prep_size} / "
+                f"CAT={ccnt} × {worker._format_cat_amount(cat_size)} "
                 f"(live size {live_size} XCH)"
             )
         print(f"   Total: {total_xch_coins} XCH coins + {total_cat_coins} CAT coins")
@@ -8152,7 +8211,8 @@ def main():
             f"→ {worker.xch_coin_size} prep"
         )
         print(
-            f"   CAT: {worker.cat_target_coins} coins @ {worker.cat_coin_size} prep each"
+            f"   CAT: {worker.cat_target_coins} coins @ "
+            f"{worker._format_cat_amount(worker.cat_coin_size)} prep each"
         )
     print()
 

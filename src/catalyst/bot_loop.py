@@ -75,6 +75,7 @@ from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
 from shock_protection import evaluate_tibet_shock
+from amount_utils import format_cat_display_amount, format_signed_cat_display_amount
 from wallet import get_all_offers, get_chia_health
 
 try:
@@ -11867,7 +11868,10 @@ class BotLoop:
                     scale = Decimal(10) ** Decimal(
                         int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
                     )
-                    amount_str = f"{Decimal(amount) / scale:.2f} CAT"
+                    amount_str = (
+                        f"{format_cat_display_amount(Decimal(amount) / scale, cfg.CAT_DECIMALS)} "
+                        "CAT"
+                    )
                 previews.append(
                     f"{str(row.get('trade_id'))[:12]}... {row.get('side')}/{row.get('tier')} "
                     f"{amount_str} ratio={row.get('ratio')} reason={row.get('reason')}"
@@ -13452,8 +13456,11 @@ class BotLoop:
                     log_event(
                         "debug",
                         "position_baseline_set",
-                        f"Position sanity baseline: wallet={_baseline:.2f} CAT, "
-                        f"bot_net={self._position_baseline_net_cat:+.2f} CAT "
+                        "Position sanity baseline: wallet="
+                        f"{format_cat_display_amount(_baseline, cfg.CAT_DECIMALS)} CAT, "
+                        "bot_net="
+                        f"{format_signed_cat_display_amount(self._position_baseline_net_cat, cfg.CAT_DECIMALS)} "
+                        "CAT "
                         f"at session start",
                     )
             except Exception:
@@ -13563,9 +13570,11 @@ class BotLoop:
                 log_event(
                     "info",
                     "position_sanity_external_deposit",
-                    f"Wallet CAT balance changed by {delta:+.2f} CAT, "
+                    "Wallet CAT balance changed by "
+                    f"{format_signed_cat_display_amount(delta, cfg.CAT_DECIMALS)} CAT, "
                     f"matching external deposit {short_id} "
-                    f"({amount_cat:.3f} CAT). Re-snapped position sanity "
+                    f"({format_cat_display_amount(amount_cat, cfg.CAT_DECIMALS)} CAT). "
+                    "Re-snapped position sanity "
                     f"baseline instead of treating it as missing PnL.",
                 )
                 try:
@@ -13578,8 +13587,11 @@ class BotLoop:
                 "info",
                 "position_sanity_drift",
                 f"Position sanity check: bot estimate since baseline "
-                f"{net_position_since_baseline:+.2f} CAT (all-time "
-                f"{net_position_cat:+.2f}), wallet delta {delta:+.2f} CAT "
+                f"{format_signed_cat_display_amount(net_position_since_baseline, cfg.CAT_DECIMALS)} "
+                "CAT "
+                f"(all-time {format_signed_cat_display_amount(net_position_cat, cfg.CAT_DECIMALS)}), "
+                "wallet delta "
+                f"{format_signed_cat_display_amount(delta, cfg.CAT_DECIMALS)} CAT "
                 f"(tolerance ±{tolerance:.0f}). This usually means the bot "
                 f"silently missed a fill (likely a Spacescan-deferred fill "
                 f"that never confirmed) or a phantom fill was recorded. "
@@ -13591,7 +13603,9 @@ class BotLoop:
                     "warning",
                     "Position drift detected",
                     f"The bot's tracked position differs from your wallet's actual "
-                    f"CAT balance change by {delta:+.0f} CAT. Some fills may be "
+                    "CAT balance change by "
+                    f"{format_signed_cat_display_amount(delta, cfg.CAT_DECIMALS)} CAT. "
+                    "Some fills may be "
                     f"missing from PnL. Run a manual reconciliation.",
                     action="run_doctor",
                     action_label="Run Doctor",

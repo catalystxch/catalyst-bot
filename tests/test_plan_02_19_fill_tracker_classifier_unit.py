@@ -9,6 +9,7 @@ should_protect_side, time_since_last_fill, get_fill_history, set_baseline).
 import sys
 import time
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -344,6 +345,20 @@ class TestFillTrackerStateHelpers(unittest.TestCase):
 
         self.assertIn("mempool-hit", msg)
         self.assertNotIn("mempool-miss", msg)
+
+    def test_offer_filled_log_message_preserves_sub_one_cat_amounts(self):
+        msg = FillTracker._format_offer_filled_log_message(
+            side="buy",
+            coin_id="0xabcdef1234567890",
+            price=250,
+            size_xch="0.5",
+            size_cat=Decimal("0.002"),
+            tier="inner",
+            mempool_warned=False,
+        )
+
+        self.assertIn("0.002 CAT", msg)
+        self.assertNotIn("0.00 CAT", msg)
 
     @patch("fill_tracker.log_event")
     def test_get_fill_history_empty(self, _mock_log):

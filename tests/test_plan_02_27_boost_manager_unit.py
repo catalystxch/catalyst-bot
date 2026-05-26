@@ -135,6 +135,44 @@ class TestFindStaleOffers(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, _SKIP_MSG)
 class TestFlexibleProbeSize(unittest.TestCase):
+    def test_gap_closer_created_log_preserves_sub_one_cat_amounts(self):
+        class OfferManager:
+            def __init__(self):
+                self._cycle_used_coin_ids = set()
+                self._offer_details_cache = {}
+
+            def create_offer_with_retry(self, *_args, **_kwargs):
+                return {
+                    "success": True,
+                    "trade_id": "tid-low-decimal",
+                    "offer": "offer-low-decimal",
+                    "locked_coin_id": "coin-low-decimal",
+                }
+
+        fake_cfg = SimpleNamespace(
+            CAT_DECIMALS=3,
+            CAT_ASSET_ID="asset",
+            CAT_WALLET_ID=2,
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=False,
+            DRY_RUN=False,
+            SNIPER_EXPIRY_SECS=600,
+            WALLET_ID_XCH=1,
+        )
+        mgr = BoostManager(offer_manager=OfferManager())
+
+        with (
+            patch.object(_bm_mod, "cfg", fake_cfg),
+            patch.object(_bm_mod, "add_offer", return_value=True),
+            patch.object(_bm_mod, "lock_coin"),
+            patch.object(_bm_mod, "log_event") as log_event_mock,
+        ):
+            mgr._create_single_offer("buy", Decimal("250"), Decimal("0.5"))
+
+        messages = [call.args[2] for call in log_event_mock.call_args_list]
+        self.assertTrue(any("0.002 CAT" in msg for msg in messages))
+        self.assertFalse(any("0.00 CAT" in msg for msg in messages))
+
     def test_sell_probe_retries_with_smaller_sniper_coin(self):
         class FlexibleOfferManager:
             def __init__(self):

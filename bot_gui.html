@@ -10226,7 +10226,7 @@
                         <div>
                             <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Est. Slippage <span class="cc-help">?<span class="cc-tooltip">Estimated price impact if you traded your default size through TibetSwap. Calculated from the constant product formula (x×y=k).</span></span></div>
                             <div id="intelSlippage" style="font-size: 16px; font-weight: 600; color: var(--status-warning);">—</div>
-                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">For a 0.01 XCH test trade</div>
+                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">For a 1 XCH test trade</div>
                         </div>
                     </div>
                     <div id="intelTibetContext" style="margin-top: 10px; color: rgba(255,255,255,0.58); font-size: 11px;">Waiting for TibetSwap pool data...</div>
@@ -11234,7 +11234,7 @@
                             </div>
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Sniper Size (XCH) <span class="cc-help">?<span class="cc-tooltip">Size of each tiny discovery probe. Keep this small so a taken probe reveals the edge cheaply.</span></span></label>
+                                    <label style="font-size: 0.85em;">Sniper Size (XCH) <span class="cc-help">?<span class="cc-tooltip">Size of each discovery probe. Smart Settings derives this from wallet size, fill rate, visible orderbook depth, arb gap, and fee-coin size.</span></span></label>
                                     <input type="number" id="configSniperSizeXch" value="0.001" step="0.0001" min="0.00000001" oninput="updateCoinPrepPreview()">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
@@ -11862,7 +11862,7 @@
                             </select>
                         </div>
                         <div class="v4-modal-field">
-                            <label for="gapSizeInput">Sniper probe size (XCH each) <span class="cc-help">?<span class="cc-tooltip">Uses your sniper pool coins. Size comes from SNIPER_SIZE_XCH in Settings.</span></span></label>
+                            <label for="gapSizeInput">Sniper probe size (XCH each) <span class="cc-help">?<span class="cc-tooltip">Uses your sniper pool coins. Smart Settings derives SNIPER_SIZE_XCH from current market and wallet conditions.</span></span></label>
                             <input type="number" id="gapSizeInput" step="0.001" min="0.001" max="5" value="0.001">
                         </div>
                     </div>
@@ -24638,12 +24638,13 @@
             if (!data || !el('intelCompSpread')) return;
 
             const compSpread = parseFloat(data.competitor_spread_bps || 0);
-            el('intelCompSpread').textContent = compSpread > 0 ? bps2pct(compSpread) : '-';
-
             const bestBid = parseFloat(data.overall_best_bid || data.best_bid || 0);
-            el('intelBestBid').textContent = bestBid > 0 ? bestBid.toFixed(8) : '-';
-
             const bestAsk = parseFloat(data.overall_best_ask || data.best_ask || 0);
+            const crossedPublicBook = bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk;
+            el('intelCompSpread').textContent = compSpread > 0 ? bps2pct(compSpread) : crossedPublicBook ? 'Crossed' : '-';
+            el('intelCompSpread').style.color = crossedPublicBook ? 'var(--status-warning)' : 'var(--accent-secondary)';
+
+            el('intelBestBid').textContent = bestBid > 0 ? bestBid.toFixed(8) : '-';
             el('intelBestAsk').textContent = bestAsk > 0 ? bestAsk.toFixed(8) : '-';
 
             const thin = data.thin_side || '';
@@ -24824,7 +24825,7 @@
             refreshDbxPending();
 
             // Also fetch slippage data
-            apiFetch('/api/market/slippage?amount=0.01&side=buy')
+            apiFetch('/api/market/slippage?amount=1&side=buy')
                 .then(r => r.json())
                 .then(data => {
                     const el = id => document.getElementById(id);
@@ -24835,14 +24836,14 @@
                     }
                     if (data.pool_depth_xch) {
                         const depth = parseFloat(data.pool_depth_xch);
-                        const ratio = 0.01 / depth * 100;
+                        const ratio = 1 / depth * 100;
                         el('intelPoolRatio').textContent = ratio.toFixed(2) + '%';
                         el('intelPoolRatio').style.color = ratio < 1 ? 'var(--status-success)' : ratio < 5 ? 'var(--status-warning)' : 'var(--status-danger)';
                         if (el('intelTibetContext')) {
                             const slipBps = parseFloat(data.slippage_bps || 0) || 0;
                             const slipText = slipBps > 0 ? bps2pct(slipBps) + ' estimated slippage' : 'slippage unavailable';
                             el('intelTibetContext').textContent =
-                                'Pool depth ' + depth.toFixed(2) + ' XCH. A 0.01 XCH test trade is ' +
+                                'Pool depth ' + depth.toFixed(2) + ' XCH. A 1 XCH test trade is ' +
                                 ratio.toFixed(2) + '% of pool depth with ' + slipText + '.';
                         }
                     } else if (el('intelTibetContext')) {

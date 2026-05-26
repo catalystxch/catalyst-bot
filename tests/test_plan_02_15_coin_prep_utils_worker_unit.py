@@ -103,6 +103,52 @@ class TestWalletBalanceResponseParsing(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Low-decimal / high-price CAT sizing
+# ---------------------------------------------------------------------------
+
+
+class TestCoinPrepWorkerLowDecimalCatSizing(unittest.TestCase):
+    def _worker_with_price(self, price: Decimal):
+        worker = object.__new__(CoinPrepWorker)
+        worker.cat_decimals = 3
+        worker.coin_prep_headroom_pct = Decimal("10")
+        worker.coin_prep_headroom_multiplier = Decimal("1.1")
+        worker.offer_tier_xch_sizes_sell = {
+            "inner": Decimal("2"),
+            "mid": Decimal("1.5"),
+            "outer": Decimal("1"),
+            "extreme": Decimal("1"),
+        }
+        worker.offer_tier_xch_sizes = dict(worker.offer_tier_xch_sizes_sell)
+        worker.tier_xch_sizes = dict(worker.offer_tier_xch_sizes_sell)
+        worker._get_live_price = lambda: price
+        worker.log = lambda *_args, **_kwargs: None
+        return worker
+
+    def test_uniform_cat_size_rounds_up_to_smallest_mojo_unit(self):
+        worker = self._worker_with_price(Decimal("200"))
+
+        size = worker._derive_cat_coin_size(Decimal("0.5"))
+
+        self.assertEqual(size, Decimal("0.003"))
+
+    def test_tier_cat_sizes_do_not_round_sub_one_cat_amounts_to_zero(self):
+        worker = self._worker_with_price(Decimal("200"))
+
+        sizes = worker._derive_tier_cat_sizes()
+
+        self.assertEqual(sizes["inner"], Decimal("0.011"))
+        self.assertEqual(sizes["mid"], Decimal("0.009"))
+        self.assertEqual(sizes["outer"], Decimal("0.006"))
+        self.assertEqual(sizes["extreme"], Decimal("0.006"))
+
+    def test_low_decimal_cat_pool_cap_keeps_one_mojo_not_one_cat(self):
+        floor = _worker_module._cat_pool_reserve_floor(Decimal("0"), 3)
+
+        self.assertEqual(floor, Decimal("0.001"))
+
+
+# ---------------------------------------------------------------------------
 # should_retry_unconsumed_split
 # ---------------------------------------------------------------------------
 

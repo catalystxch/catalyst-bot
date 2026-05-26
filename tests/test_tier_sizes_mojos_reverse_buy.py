@@ -228,6 +228,27 @@ class TierSizesReverseBuyTests(unittest.TestCase):
         self.assertGreater(sizes["mid"], sizes["outer"])
         self.assertGreater(sizes["outer"], sizes["extreme"])
 
+    def test_high_price_cat_tier_sizes_round_up_to_mojo_units(self):
+        """High-price CATs can need less than one display CAT per offer.
+
+        The tier-size helper must round in CAT mojos, not whole display CATs,
+        otherwise every sell-side tier becomes zero and no CAT coins are
+        prepared for thin limited-supply markets.
+        """
+        from coin_manager import get_tier_sizes_mojos_from_cfg
+
+        stub = _StubCfg(reversed_buy=False)
+        stub.COIN_PREP_HEADROOM_PCT = Decimal("10")
+        self._patch_cfg(stub)
+
+        with patch.dict(os.environ, {"_CLI_LIVE_PRICE": "200"}):
+            sizes = get_tier_sizes_mojos_from_cfg(is_cat=True)
+
+        self.assertEqual(sizes["inner"], 12)
+        self.assertEqual(sizes["mid"], 7)
+        self.assertEqual(sizes["outer"], 4)
+        self.assertEqual(sizes["extreme"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

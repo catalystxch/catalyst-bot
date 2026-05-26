@@ -113,8 +113,9 @@ def test_setup_config_save_while_running_is_deferred_to_restart():
     fake_cfg.MAX_ACTIVE_BUY_OFFERS = 1
     fake_cfg.MAX_ACTIVE_SELL_OFFERS = 1
 
-    with patch.object(api_server, "bot", fake_bot), patch.object(
-        api_server, "cfg", fake_cfg
+    with (
+        patch.object(api_server, "bot", fake_bot),
+        patch.object(api_server, "cfg", fake_cfg),
     ):
         resp = client.post(
             "/api/config",
@@ -149,8 +150,9 @@ def test_setup_save_while_running_allows_unchanged_liquidity_mode():
     fake_cfg.MAX_ACTIVE_BUY_OFFERS = 1
     fake_cfg.MAX_ACTIVE_SELL_OFFERS = 1
 
-    with patch.object(api_server, "bot", fake_bot), patch.object(
-        api_server, "cfg", fake_cfg
+    with (
+        patch.object(api_server, "bot", fake_bot),
+        patch.object(api_server, "cfg", fake_cfg),
     ):
         resp = client.post(
             "/api/config",
@@ -199,7 +201,10 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
         patch.object(api_server, "bot", fake_bot),
         patch.object(api_server, "cfg", fake_cfg),
         patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),
-        patch("wallet.get_wallet_sync_status", return_value={"reachable": True, "sync_state": "synced"}),
+        patch(
+            "wallet.get_wallet_sync_status",
+            return_value={"reachable": True, "sync_state": "synced"},
+        ),
         patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
     ):
         resp = client.post(

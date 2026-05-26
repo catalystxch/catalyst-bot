@@ -291,7 +291,9 @@ def api_config_update():
 
     _bot_running = bool(bot and bot.is_running())
     _defer_runtime = _bot_running
-    _deferred_note = "Saved from Setup while bot was running; applies on next bot restart"
+    _deferred_note = (
+        "Saved from Setup while bot was running; applies on next bot restart"
+    )
 
     def _write_setting(env_key, raw_value):
         if _defer_runtime:
@@ -332,9 +334,11 @@ def api_config_update():
         if key == "LIQUIDITY_MODE":
             _allowed = ("two_sided", "buy_only", "sell_only")
             _new_mode = str(value).lower().strip()
-            _current_mode = str(
-                getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
-            ).lower().strip()
+            _current_mode = (
+                str(getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided")
+                .lower()
+                .strip()
+            )
             if _new_mode not in _allowed:
                 return jsonify(
                     {
@@ -384,10 +388,10 @@ def api_config_update():
                 and key == "SAGE_SET_CHANGE_ADDRESS"
                 and str(value).strip().lower()
                 in (
-                "true",
-                "1",
-                "yes",
-                "on",
+                    "true",
+                    "1",
+                    "yes",
+                    "on",
                 )
             ):
                 extra = _apply_sage_change_address_setting()
@@ -410,7 +414,9 @@ def api_config_update():
             }
             event_payload = {"key": key, "value": safe_value}
             _apply_deferred_notice(response, event_payload)
-            notice = None if _defer_runtime else api_server._get_live_requote_notice([key])
+            notice = (
+                None if _defer_runtime else api_server._get_live_requote_notice([key])
+            )
             if notice:
                 response["apply_mode"] = notice["apply_mode"]
                 response["warning"] = notice["warning"]
@@ -432,9 +438,11 @@ def api_config_update():
         if env_key == "LIQUIDITY_MODE":
             _allowed = ("two_sided", "buy_only", "sell_only")
             _new_mode = str(value).lower().strip()
-            _current_mode = str(
-                getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
-            ).lower().strip()
+            _current_mode = (
+                str(getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided")
+                .lower()
+                .strip()
+            )
             if _new_mode not in _allowed:
                 errors.append(f"LIQUIDITY_MODE must be one of: {', '.join(_allowed)}")
                 continue
@@ -530,7 +538,9 @@ def api_config_update():
         )
         event_payload = {"keys": updated}
         _apply_deferred_notice(response, event_payload)
-        notice = None if _defer_runtime else api_server._get_live_requote_notice(updated)
+        notice = (
+            None if _defer_runtime else api_server._get_live_requote_notice(updated)
+        )
         if notice:
             response["apply_mode"] = notice["apply_mode"]
             response["warning"] = notice["warning"]
@@ -541,8 +551,7 @@ def api_config_update():
     extra = None
     if (
         not _defer_runtime
-        and
-        "SAGE_SET_CHANGE_ADDRESS" in updated
+        and "SAGE_SET_CHANGE_ADDRESS" in updated
         and str(getattr(cfg, "SAGE_SET_CHANGE_ADDRESS", False)).lower() == "true"
     ):
         extra = _apply_sage_change_address_setting()
@@ -612,9 +621,11 @@ def api_config_live():
     if key == "LIQUIDITY_MODE":
         _allowed = ("two_sided", "buy_only", "sell_only")
         _new_mode = str(value).lower().strip()
-        _current_mode = str(
-            getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
-        ).lower().strip()
+        _current_mode = (
+            str(getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided")
+            .lower()
+            .strip()
+        )
         if _new_mode not in _allowed:
             return jsonify(
                 {

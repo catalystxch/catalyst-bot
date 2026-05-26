@@ -124,6 +124,21 @@ class SniperCoinIdTests(unittest.TestCase):
         self.assertEqual(om.calls[0]["preferred_tier"], "sniper")
         self.assertTrue(om.calls[0]["strict_preferred_tier"])
 
+    def test_sniper_created_log_preserves_sub_one_cat_amounts(self):
+        om = _FakeOfferManager()
+        sniper = Sniper(offer_manager=om, risk_manager=None, dexie_manager=None)
+
+        with (
+            patch("sniper.add_offer", return_value=True),
+            patch("sniper.lock_coin"),
+            patch("sniper.log_event") as log_event_mock,
+        ):
+            sniper._create_snipe_offer("buy", Decimal("250"), Decimal("0.5"))
+
+        messages = [call.args[2] for call in log_event_mock.call_args_list]
+        self.assertTrue(any("0.002 CAT" in msg for msg in messages))
+        self.assertFalse(any("0.00 CAT" in msg for msg in messages))
+
     def test_sniper_uses_dedicated_sniper_size(self):
         om = _FakeOfferManager()
         sniper = Sniper(offer_manager=om, risk_manager=None, dexie_manager=None)

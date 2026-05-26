@@ -247,6 +247,24 @@ class TestAnalyseOrderbook(_MI):
         self.assertEqual(self._mi._competitors["sell_depth_xch"], Decimal("7"))
         self.assertEqual(self._mi._competitors["thin_side"], "")
 
+    def test_v3_keeps_legitimately_wide_low_decimal_book(self):
+        buys = [
+            self._make_offer("150", "139.95", side="buy"),
+            self._make_offer("110", "55", side="buy"),
+        ]
+        sells = [
+            self._make_offer("350", "1.4", side="sell"),
+            self._make_offer("400", "1.2", side="sell"),
+        ]
+
+        self._mi._analyse_orderbook(buys, sells, source="dexie_v3_orderbook")
+
+        self.assertEqual(self._mi._competitors["best_bid"], Decimal("150"))
+        self.assertEqual(self._mi._competitors["best_ask"], Decimal("350"))
+        self.assertEqual(self._mi._competitors["buy_depth_xch"], Decimal("194.95"))
+        self.assertEqual(self._mi._competitors["sell_depth_xch"], Decimal("2.6"))
+        self.assertEqual(self._mi._competitors["thin_side"], "sell")
+
     def test_whale_orders_captured(self):
         buys = [self._make_offer(0.010, 2.0, side="buy")]  # xch_amount >= 1 → whale
         sells = [self._make_offer(0.011, 0.5, side="sell")]  # not whale
@@ -258,6 +276,97 @@ class TestAnalyseOrderbook(_MI):
         buys = [self._make_offer(0.010 - i * 0.001, 2.0, side="buy") for i in range(7)]
         self._mi._analyse_orderbook(buys, [])
         self.assertLessEqual(len(self._mi._competitors["whale_orders"]), 5)
+
+    def test_v3_orderbook_levels_are_converted_to_xch_depth(self):
+        raw = {
+            "success": True,
+            "orderbook": {
+                "bids": [["0.00016", "1000"]],
+                "asks": [["0.00017", "2000"]],
+            },
+        }
+
+        buy_offers, sell_offers = self._mi._parse_v3_orderbook(raw)
+
+        self.assertEqual(buy_offers[0]["price"], Decimal("0.00016"))
+        self.assertEqual(buy_offers[0]["cat_amount"], Decimal("1000"))
+        self.assertEqual(buy_offers[0]["xch_amount"], Decimal("0.16000"))
+        self.assertEqual(sell_offers[0]["xch_amount"], Decimal("0.34000"))
+
+    def test_refresh_uses_v3_orderbook_when_v1_depth_is_filtered_empty(self):
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_get(_url, params=None, timeout=None):
+            calls.append(dict(params or {}))
+            if "ticker_id" in (params or {}):
+                return FakeResponse(
+                    {
+                        "success": True,
+                        "orderbook": {
+                            "bids": [["0.000161", "1500"]],
+                            "asks": [["0.000162", "2000"]],
+                        },
+                    }
+                )
+            if (params or {}).get("offered") == "xch":
+                return FakeResponse(
+                    {
+                        "offers": [
+                            {
+                                "id": "dust-bid",
+                                "offered": [
+                                    {"code": "XCH", "id": "xch", "amount": "0.1"}
+                                ],
+                                "requested": [
+                                    {
+                                        "code": "CAT",
+                                        "id": _FAKE_CFG.CAT_ASSET_ID,
+                                        "amount": "250000",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+            return FakeResponse(
+                {
+                    "offers": [
+                        {
+                            "id": "best-ask",
+                            "offered": [
+                                {
+                                    "code": "CAT",
+                                    "id": _FAKE_CFG.CAT_ASSET_ID,
+                                    "amount": "1000",
+                                }
+                            ],
+                            "requested": [
+                                {"code": "XCH", "id": "xch", "amount": "0.162"}
+                            ],
+                        }
+                    ]
+                }
+            )
+
+        self._mi._session.get = fake_get
+
+        summary = self._mi.refresh_orderbook(force=True)
+
+        self.assertEqual(summary["buy_depth_xch"], Decimal("0.241500"))
+        self.assertEqual(summary["sell_depth_xch"], Decimal("0.324000"))
+        self.assertEqual(summary["num_buy_offers"], 1)
+        self.assertEqual(summary["num_sell_offers"], 1)
+        self.assertEqual(summary["orderbook_source"], "dexie_v3_orderbook")
+        self.assertTrue(any("ticker_id" in params for params in calls))
 
 
 # ===========================================================================

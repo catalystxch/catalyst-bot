@@ -136,6 +136,17 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json(), dict)
 
+    def test_slippage_endpoint_defaults_to_one_xch(self):
+        bot = _make_bot()
+        bot.price_engine.get_tibet_quote.return_value = {"slippage_bps": "10"}
+        with patch.object(api_server, "bot", bot):
+            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        bot.price_engine.get_tibet_quote.assert_called_once_with(
+            amount_xch=Decimal("1"), side="buy"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 04-17: GET /api/spacescan/status + POST /api/spacescan/setup

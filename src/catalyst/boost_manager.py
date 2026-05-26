@@ -30,6 +30,7 @@ from database import (
     get_open_offers as db_get_open_offers,
 )
 from offer_manager import xch_to_mojos, cat_to_mojos, mojos_to_cat
+from amount_utils import format_cat_display_amount
 
 
 def _bps_to_pct(val):
@@ -1850,7 +1851,8 @@ class BoostManager:
             "info",
             "gap_closer_created",
             f"📈 Gap closer {side.upper()} at {price:.8f} XCH "
-            f"({size_xch} XCH / {cat_amount:.2f} CAT)",
+            f"({size_xch} XCH / "
+            f"{format_cat_display_amount(cat_amount, cfg.CAT_DECIMALS)} CAT)",
         )
 
         return {

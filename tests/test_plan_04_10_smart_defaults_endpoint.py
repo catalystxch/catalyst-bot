@@ -464,6 +464,87 @@ class TestSmartDefaultsSmallWalletSizing(unittest.TestCase):
         self.assertLessEqual(sniper["count"], 12)
         self.assertLessEqual(sniper["pool_xch"], 0.12)
 
+    def test_sniper_size_scales_with_market_conditions(self):
+        from blueprints.smart_defaults import _smart_sniper_size_xch
+
+        thin_market_size = _smart_sniper_size_xch(
+            avail_xch=5,
+            fills_per_day=0.2,
+            daily_volume_xch=0.03,
+            orderbook={
+                "has_data": True,
+                "buy_depth_xch": 0.12,
+                "sell_depth_xch": 0.10,
+                "competitor_spread_bps": 1200,
+            },
+            arb_gap_bps=20,
+            fee_coin_size_xch=0.001,
+        )
+        liquid_market_size = _smart_sniper_size_xch(
+            avail_xch=80,
+            fills_per_day=14,
+            daily_volume_xch=8,
+            orderbook={
+                "has_data": True,
+                "buy_depth_xch": 80,
+                "sell_depth_xch": 100,
+                "competitor_spread_bps": 250,
+            },
+            arb_gap_bps=300,
+            fee_coin_size_xch=0.001,
+        )
+
+        self.assertEqual(thin_market_size, 0.01)
+        self.assertGreater(liquid_market_size, thin_market_size * 10)
+        self.assertGreaterEqual(liquid_market_size, 0.2)
+
+    def test_sniper_size_keeps_fee_coins_smaller(self):
+        from blueprints.smart_defaults import _smart_sniper_size_xch
+
+        sniper_size = _smart_sniper_size_xch(
+            avail_xch=50,
+            fills_per_day=6,
+            daily_volume_xch=3,
+            orderbook={
+                "has_data": True,
+                "buy_depth_xch": 25,
+                "sell_depth_xch": 30,
+                "competitor_spread_bps": 500,
+            },
+            arb_gap_bps=100,
+            fee_coin_size_xch=0.02,
+        )
+
+        self.assertGreater(sniper_size, 0.02)
+        self.assertGreaterEqual(sniper_size, 0.04)
+
+    def test_liquid_market_sniper_plan_uses_the_allocated_pool(self):
+        from blueprints.smart_defaults import (
+            _smart_sniper_prep_plan,
+            _smart_sniper_size_xch,
+        )
+
+        sniper_size = _smart_sniper_size_xch(
+            avail_xch=80,
+            fills_per_day=14,
+            daily_volume_xch=8,
+            orderbook={
+                "has_data": True,
+                "buy_depth_xch": 80,
+                "sell_depth_xch": 100,
+                "competitor_spread_bps": 250,
+            },
+            arb_gap_bps=300,
+            fee_coin_size_xch=0.001,
+        )
+        sniper_plan = _smart_sniper_prep_plan(
+            80, fills_per_day=14, sniper_size_xch=sniper_size
+        )
+
+        self.assertGreaterEqual(
+            sniper_plan["pool_xch"], sniper_plan["target_xch"] * 0.75
+        )
+
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):

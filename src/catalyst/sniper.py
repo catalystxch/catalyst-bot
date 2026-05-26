@@ -25,6 +25,7 @@ from typing import Optional, Dict, List
 from config import cfg
 from database import log_event, add_offer, lock_coin
 from offer_manager import xch_to_mojos, cat_to_mojos, mojos_to_cat
+from amount_utils import format_cat_display_amount
 
 
 def _bps_to_pct(val):
@@ -512,7 +513,8 @@ class Sniper:
             "info",
             "sniper_created",
             f"⚡ Sniper {side.upper()} at {price:.8f} XCH "
-            f"({trade_xch} XCH / {cat_amount:.2f} CAT)",
+            f"({trade_xch} XCH / "
+            f"{format_cat_display_amount(cat_amount, cfg.CAT_DECIMALS)} CAT)",
         )
 
         return {

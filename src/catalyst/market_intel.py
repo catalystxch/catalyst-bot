@@ -78,6 +78,7 @@ class MarketIntel:
             "num_competitor_sells": 0,  # Non-bot sell offers only
             "whale_orders": [],  # Orders > 1 XCH
             "thin_side": "",  # "buy", "sell", or "" (balanced)
+            "orderbook_source": "",  # dexie_v1_offers or dexie_v3_orderbook
         }
 
         # ---- DBX Rewards tracking ----
@@ -223,7 +224,17 @@ class MarketIntel:
                 self._orderbook["refresh_count"] += 1
 
             # Analyse the orderbook
-            self._analyse_orderbook(buy_offers, sell_offers)
+            self._analyse_orderbook(buy_offers, sell_offers, source="dexie_v1_offers")
+            v3_buy_offers, v3_sell_offers = self._fetch_v3_orderbook(cfg.CAT_ASSET_ID)
+            if self._should_use_v3_orderbook(v3_buy_offers, v3_sell_offers):
+                with self._lock:
+                    self._orderbook["buy_offers"] = v3_buy_offers
+                    self._orderbook["sell_offers"] = v3_sell_offers
+                self._analyse_orderbook(
+                    v3_buy_offers,
+                    v3_sell_offers,
+                    source="dexie_v3_orderbook",
+                )
 
             if self._orderbook["refresh_count"] % 10 == 1:  # Log periodically
                 log_event(
@@ -244,6 +255,86 @@ class MarketIntel:
                     "debug", "orderbook_error", f"Dexie orderbook fetch failed: {e}"
                 )
             return self._competitors
+
+    def _fetch_v3_orderbook(self, asset_id: str) -> tuple[List[Dict], List[Dict]]:
+        """Fetch Dexie's aggregated v3 price orderbook for the CAT/XCH pair."""
+        asset = str(asset_id or "").strip().lower().replace("0x", "")
+        if not asset:
+            return [], []
+
+        url = f"{cfg.DEXIE_API_BASE.rstrip('/')}/v3/prices/orderbook"
+        params = {
+            "ticker_id": f"{asset}_xch",
+            "depth": min(max(int(self._orderbook_page_size or 50), 5), 100),
+        }
+        try:
+            resp = self._session.get(url, params=params, timeout=10)
+        except requests.RequestException:
+            return [], []
+        if resp.status_code != 200:
+            return [], []
+        try:
+            return self._parse_v3_orderbook(resp.json())
+        except Exception:
+            return [], []
+
+    def _parse_v3_orderbook(self, payload: Dict) -> tuple[List[Dict], List[Dict]]:
+        """Convert Dexie v3 aggregated levels into MarketIntel offer rows.
+
+        v3 levels are `[price_xch_per_cat, cat_amount]`. Market Intel stores
+        depth in XCH terms, so multiply price by CAT amount for each level.
+        """
+        if not isinstance(payload, dict) or not payload.get("success", False):
+            return [], []
+        book = payload.get("orderbook") or {}
+        if not isinstance(book, dict):
+            return [], []
+
+        def _levels(rows, side: str) -> List[Dict]:
+            parsed = []
+            for idx, row in enumerate(rows or []):
+                try:
+                    price = Decimal(str(row[0]))
+                    cat_amount = Decimal(str(row[1]))
+                except (InvalidOperation, ValueError, TypeError, IndexError):
+                    continue
+                if price <= 0 or cat_amount <= 0:
+                    continue
+                parsed.append(
+                    {
+                        "offer_id": f"v3:{side}:{idx}",
+                        "side": side,
+                        "price": price,
+                        "xch_amount": price * cat_amount,
+                        "cat_amount": cat_amount,
+                        "is_ours": False,
+                        "created_at": "",
+                        "age_secs": None,
+                        "source": "dexie_v3_orderbook",
+                    }
+                )
+            return parsed
+
+        buy_offers = _levels(book.get("bids"), "buy")
+        sell_offers = _levels(book.get("asks"), "sell")
+        buy_offers.sort(key=lambda x: x["price"], reverse=True)
+        sell_offers.sort(key=lambda x: x["price"])
+        return buy_offers, sell_offers
+
+    def _should_use_v3_orderbook(
+        self, v3_buy_offers: List[Dict], v3_sell_offers: List[Dict]
+    ) -> bool:
+        """Use v3 when v1 was filtered down to a non-actionable public book."""
+        if not v3_buy_offers and not v3_sell_offers:
+            return False
+        with self._lock:
+            best_bid = self._competitors.get("best_bid", Decimal("0"))
+            best_ask = self._competitors.get("best_ask", Decimal("0"))
+            buy_depth = self._competitors.get("buy_depth_xch", Decimal("0"))
+            sell_depth = self._competitors.get("sell_depth_xch", Decimal("0"))
+        return (v3_buy_offers and (best_bid <= 0 or buy_depth <= 0)) or (
+            v3_sell_offers and (best_ask <= 0 or sell_depth <= 0)
+        )
 
     def _parse_dexie_offer(self, offer: Dict, expected_side: str) -> Optional[Dict]:
         """Parse a Dexie offer into our internal format.
@@ -303,7 +394,12 @@ class MarketIntel:
         except Exception:
             return None
 
-    def _analyse_orderbook(self, buy_offers: List[Dict], sell_offers: List[Dict]):
+    def _analyse_orderbook(
+        self,
+        buy_offers: List[Dict],
+        sell_offers: List[Dict],
+        source: str = "dexie_v1_offers",
+    ):
         """Analyse the orderbook to extract competitive intelligence.
 
         Key metrics:
@@ -316,34 +412,38 @@ class MarketIntel:
         competitor_buys = [o for o in buy_offers if not o.get("is_ours")]
         competitor_sells = [o for o in sell_offers if not o.get("is_ours")]
 
-        # Junk-offer guard: thin pairs accumulate dust/lowball offers (e.g.
-        # someone bidding 1% of market). Including them in best_bid drags
-        # competitor_spread to nonsensical values like 194% and makes the
-        # advisor recommend "probe the arb floor" against an opponent that
-        # doesn't exist. Filter each side using the cleanest cross-side
-        # reference: a buy is sane only if it's at least half the lowest
-        # competitor sell price (and vice versa). When no sane reference
-        # is available on either side, we leave the lists alone so we
-        # don't blank the orderbook on healthy thin markets.
+        # Junk-offer guard for raw v1 offers: thin pairs accumulate
+        # dust/lowball offers (e.g. someone bidding 1% of market). The
+        # aggregated Dexie price orderbook has already collapsed the book
+        # into executable levels, so keep legitimately wide low-supply CAT
+        # markets visible instead of blanking their depth.
+        trust_aggregated_book = source in {
+            "dexie_v2_orderbook",
+            "dexie_v3_orderbook",
+        }
         _raw_best_buy = competitor_buys[0]["price"] if competitor_buys else Decimal("0")
         _raw_best_sell = (
             competitor_sells[0]["price"] if competitor_sells else Decimal("0")
         )
-        if _raw_best_sell > 0:
+        if not trust_aggregated_book and _raw_best_sell > 0:
             _buy_floor = _raw_best_sell * Decimal("0.5")
             competitor_buys = [o for o in competitor_buys if o["price"] >= _buy_floor]
-        if _raw_best_buy > 0:
+        if not trust_aggregated_book and _raw_best_buy > 0:
             _sell_ceiling = _raw_best_buy * Decimal("2")
             competitor_sells = [
                 o for o in competitor_sells if o["price"] <= _sell_ceiling
             ]
 
         def _is_sane_depth_buy(offer: Dict) -> bool:
+            if trust_aggregated_book:
+                return True
             return _raw_best_sell <= 0 or offer["price"] >= _raw_best_sell * Decimal(
                 "0.5"
             )
 
         def _is_sane_depth_sell(offer: Dict) -> bool:
+            if trust_aggregated_book:
+                return True
             return _raw_best_buy <= 0 or offer["price"] <= _raw_best_buy * Decimal("2")
 
         depth_buys = [o for o in buy_offers if _is_sane_depth_buy(o)]
@@ -444,6 +544,7 @@ class MarketIntel:
             self._competitors["num_competitor_sells"] = len(competitor_sells)
             self._competitors["whale_orders"] = whales[:5]  # Cap at 5
             self._competitors["thin_side"] = thin_side
+            self._competitors["orderbook_source"] = source
 
     @staticmethod
     def _offer_age_secs(created_at) -> Optional[float]:

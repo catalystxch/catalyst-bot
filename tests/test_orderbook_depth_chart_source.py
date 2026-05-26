@@ -19,3 +19,19 @@ def test_orderbook_depth_chart_uses_independent_side_price_lanes():
     assert "drawStep(sellCum, sellFill, sellLine, xAtSell)" in html
     assert "ctx.fillText(buyLow.toFixed(6), padL, h - padB + 8)" in html
     assert "ctx.fillText(sellHigh.toFixed(6), w - padR, h - padB + 8)" in html
+
+
+def test_market_intel_slippage_uses_one_xch_default_trade():
+    html = GUI.read_text(encoding="utf-8")
+
+    assert "/api/market/slippage?amount=1&side=buy" in html
+    assert "A 1 XCH test trade is " in html
+    assert "For a 1 XCH test trade" in html
+    assert "/api/market/slippage?amount=0.01&side=buy" not in html
+
+
+def test_market_intel_shows_crossed_public_book_instead_of_blank_spread():
+    html = GUI.read_text(encoding="utf-8")
+
+    assert "bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk" in html
+    assert "Crossed" in html

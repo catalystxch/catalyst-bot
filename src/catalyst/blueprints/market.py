@@ -408,7 +408,7 @@ def api_market_slippage():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    amount = request.args.get("amount", "0.01")
+    amount = request.args.get("amount", "1")
     side = request.args.get("side", "buy")
 
     try:

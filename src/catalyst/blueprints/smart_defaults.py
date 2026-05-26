@@ -136,6 +136,115 @@ def _smart_sniper_pool_pct(avail_xch: float, fills_per_day: float) -> float:
     return base
 
 
+def _smart_sniper_count_bounds(
+    avail_xch: float, fills_per_day: float
+) -> tuple[int, int]:
+    """Return (cap, minimum) for sniper prep coins."""
+    fills_per_day = _smart_float(fills_per_day)
+    if fills_per_day > 10:
+        activity_cap = 30
+    elif fills_per_day > 3:
+        activity_cap = 25
+    else:
+        activity_cap = 20
+
+    avail_xch = max(0.0, _smart_float(avail_xch))
+    if avail_xch < 3:
+        return min(activity_cap, 6), 2
+    if avail_xch < 10:
+        return min(activity_cap, 12), 2
+    if avail_xch < 25:
+        return min(activity_cap, 18), 5
+    return activity_cap, 5
+
+
+def _round_smart_sniper_size_xch(value: float) -> float:
+    """Round sniper offer sizes up to clean XCH increments."""
+    import math
+
+    value = max(0.0, _smart_float(value))
+    if value <= 0:
+        return 0.0
+
+    if value < 0.05:
+        step = 0.001
+    elif value < 0.25:
+        step = 0.005
+    elif value < 1:
+        step = 0.01
+    else:
+        step = 0.05
+
+    return round(math.ceil((value - 1e-12) / step) * step, 6)
+
+
+def _smart_sniper_size_xch(
+    avail_xch: float,
+    fills_per_day: float,
+    daily_volume_xch: float = 0,
+    orderbook: dict | None = None,
+    arb_gap_bps: float = 0,
+    fee_coin_size_xch: float = 0.001,
+    min_size_xch: float = 0.01,
+) -> float:
+    """Derive each sniper probe size from wallet, activity, and visible depth."""
+    avail_xch = max(0.0, _smart_float(avail_xch))
+    if avail_xch <= 0:
+        return 0.0
+
+    orderbook = orderbook if isinstance(orderbook, dict) else {}
+    fee_coin_size_xch = max(0.0, _smart_float(fee_coin_size_xch))
+    min_size = max(
+        _smart_float(min_size_xch, 0.01),
+        fee_coin_size_xch * 2 if fee_coin_size_xch > 0 else 0,
+    )
+
+    pool_pct = _smart_sniper_pool_pct(avail_xch, fills_per_day)
+    target_xch = avail_xch * pool_pct
+    if target_xch <= 0:
+        return _round_smart_sniper_size_xch(min_size)
+
+    cap, _minimum = _smart_sniper_count_bounds(avail_xch, fills_per_day)
+    target_count = max(1, cap)
+    raw_size = target_xch / target_count
+
+    # Avoid making one probe a meaningful share of a thin market's daily flow.
+    daily_volume_xch = max(0.0, _smart_float(daily_volume_xch))
+    if daily_volume_xch > 0:
+        raw_size = min(raw_size, max(min_size, daily_volume_xch * 0.08))
+
+    # Avoid posting a probe that is too large for the thinner side of the book.
+    visible_depths = []
+    for key in ("buy_depth_xch", "sell_depth_xch"):
+        value = max(0.0, _smart_float(orderbook.get(key)))
+        if value > 0:
+            visible_depths.append(value)
+    visible_depth = min(visible_depths) if visible_depths else 0.0
+    if orderbook.get("has_data") and visible_depth > 0:
+        raw_size = min(raw_size, max(min_size, visible_depth * 0.05))
+
+    arb_gap_bps = max(0.0, _smart_float(arb_gap_bps))
+    if arb_gap_bps >= 500:
+        raw_size *= 1.5
+    elif arb_gap_bps >= 200:
+        raw_size *= 1.25
+    elif arb_gap_bps <= 50:
+        raw_size *= 0.85
+
+    comp_spread = max(0.0, _smart_float(orderbook.get("competitor_spread_bps")))
+    if comp_spread > 0:
+        if comp_spread < 300:
+            raw_size *= 1.15
+        elif comp_spread > 1000:
+            raw_size *= 0.85
+
+    pool_cap = max(min_size, target_xch * 0.5)
+    wallet_cap = max(min_size, avail_xch * 0.02)
+    raw_size = min(raw_size, pool_cap, wallet_cap, 2.0)
+    raw_size = max(raw_size, min_size)
+    return _round_smart_sniper_size_xch(raw_size)
+
+
 def _smart_sniper_prep_plan(
     avail_xch: float, fills_per_day: float, sniper_size_xch: float = 0.01
 ) -> dict:
@@ -145,23 +254,7 @@ def _smart_sniper_prep_plan(
     pct = _smart_sniper_pool_pct(avail_xch, fills_per_day)
     target_xch = avail_xch * pct
 
-    fills_per_day = _smart_float(fills_per_day)
-    if fills_per_day > 10:
-        activity_cap = 30
-    elif fills_per_day > 3:
-        activity_cap = 25
-    else:
-        activity_cap = 20
-
-    if avail_xch < 3:
-        cap, minimum = min(activity_cap, 6), 2
-    elif avail_xch < 10:
-        cap, minimum = min(activity_cap, 12), 2
-    elif avail_xch < 25:
-        cap, minimum = min(activity_cap, 18), 5
-    else:
-        cap, minimum = activity_cap, 5
-
+    cap, minimum = _smart_sniper_count_bounds(avail_xch, fills_per_day)
     count = _prep_count_from_budget(target_xch, sniper_size_xch, cap, minimum)
     return {
         "pct": pct,
@@ -1869,31 +1962,30 @@ def _calculate_smart_defaults(
 
     # ── Percentage-based pool allocation ──
     # Fee pool:    3% of available → buy fee coins at Coinset-estimated size
-    # Sniper pool: 4% of available → split into prep coins
+    # Sniper pool: market-scaled % of available → split into prep coins
     # Trading:     remaining ~93%
     _FEE_PCT = 0.03
-    # Sniper pool scales with fill rate: busier markets need more sniper coins
-    # for rapid rearm after each probe fills.
-    if fills_per_day > 10:
-        _SNIPER_PCT = 0.07  # Very active: 7% — frequent probes, fast rearm
-    elif fills_per_day > 3:
-        _SNIPER_PCT = 0.06  # Active: 6%
-    else:
-        _SNIPER_PCT = 0.04  # Normal/quiet: 4%
-
     _SNIPER_MIN_SIZE_XCH = 0.01
-    _smart_sniper_size = _SNIPER_MIN_SIZE_XCH
+    _smart_sniper_size = _smart_sniper_size_xch(
+        avail_xch=_avail_xch,
+        fills_per_day=fills_per_day,
+        daily_volume_xch=daily_volume,
+        orderbook=orderbook,
+        arb_gap_bps=arb_gap_bps,
+        fee_coin_size_xch=_fee_coin_size,
+        min_size_xch=_SNIPER_MIN_SIZE_XCH,
+    )
 
     # ── Fee < Sniper enforcement ──
     # Sage auto-picks the smallest available coin for fees.  Fee coins MUST
     # be smaller than sniper coins so Sage always grabs the right pool.
     # If Coinset-estimated fee size is ≥ sniper size, clamp it to half the
     # sniper size — still large enough for ~10 reuses but clearly smaller.
-    if _fee_coin_size >= _SNIPER_MIN_SIZE_XCH:
-        _fee_coin_size = round(_SNIPER_MIN_SIZE_XCH / 2, 6)  # 0.005 XCH
+    if _smart_sniper_size > 0 and _fee_coin_size >= _smart_sniper_size:
+        _fee_coin_size = round(max(0.001, _smart_sniper_size / 2), 6)
         messages.append(
             f"Fee coin size clamped to {_fee_coin_size} XCH "
-            f"(must be < sniper min {_SNIPER_MIN_SIZE_XCH} XCH)"
+            f"(must be < sniper size {_smart_sniper_size} XCH)"
         )
 
     _fee_pool_target = _avail_xch * _FEE_PCT
@@ -1903,17 +1995,23 @@ def _calculate_smart_defaults(
     _SNIPER_PCT = _smart_sniper_pool_pct(_avail_xch, fills_per_day)
     _sniper_pool_raw = _avail_xch * _SNIPER_PCT
     # Sniper offers are expendable probes — keep them at Dexie's minimum
-    # displayable size (0.01 XCH) so they show up on the book without wasting
-    # capital. The pool carries many cheap coins rather than fewer large ones.
+    # displayable size only in thin markets. Liquid active markets get larger
+    # probes so the allocated sniper pool is not stranded in the top-up budget.
 
     # Prep count: more fills = faster sniper coin burn = need more ready.
     # Cap scales with the sniper pool so we never prep more than the pool
-    # can fund at the fixed minimum size.
+    # can fund at the derived probe size.
     _sniper_plan = _smart_sniper_prep_plan(
         _avail_xch, fills_per_day, _smart_sniper_size
     )
     _smart_sniper_prep = int(_sniper_plan.get("count") or 0)
     _sniper_pool_xch = float(_sniper_plan.get("pool_xch") or 0.0)
+    if _smart_sniper_prep > 0:
+        messages.append(
+            f"Sniper pool: {_smart_sniper_prep} coins at "
+            f"{_smart_sniper_size:.4f} XCH "
+            f"({_sniper_pool_xch:.4f}/{_sniper_pool_raw:.4f} XCH target)"
+        )
 
     # ── Bottleneck-driven capital allocation ─────────────────────────────────
     # The bot is symmetric: every buy needs XCH, every sell needs CAT.

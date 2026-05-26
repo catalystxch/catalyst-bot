@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Dict, List, Set, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from amount_utils import format_cat_display_amount
 from config import cfg
 from database import (
     record_fill,
@@ -109,7 +110,9 @@ class FillTracker:
         coin_str = f" coin={str(coin_id)[:16]}..." if coin_id != "unknown" else ""
         warned_tag = " (mempool-hit)" if mempool_warned else " (mempool-miss)"
         price_display = f"{Decimal(str(price or 0)):.8f}"
-        size_cat_display = f"{Decimal(str(size_cat or 0)):.2f}"
+        size_cat_display = format_cat_display_amount(
+            Decimal(str(size_cat or 0)), getattr(cfg, "CAT_DECIMALS", 3)
+        )
         return (
             f"{str(side).upper()} offer filled!{coin_str} "
             f"Price: {price_display} XCH, Size: {size_xch} XCH / "

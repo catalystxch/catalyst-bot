@@ -18,7 +18,7 @@ def _function_body(name: str) -> str:
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return html[brace_start + 1:index]
+                return html[brace_start + 1 : index]
     raise AssertionError(f"Could not parse {name} body")
 
 
