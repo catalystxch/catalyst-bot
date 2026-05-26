@@ -47,7 +47,13 @@ def _write_env(path: str, **kwargs):
 
 class _TempEnv(unittest.TestCase):
     # Settings to clear from os.environ during the test (restored in tearDown)
-    _ENV_KEYS = ("DRY_RUN", "CAT_TICKER_ID", "SNIPER_COOLDOWN_SECS")
+    _ENV_KEYS = (
+        "DRY_RUN",
+        "CAT_TICKER_ID",
+        "SNIPER_COOLDOWN_SECS",
+        "LOOP_SECONDS",
+        "SPREAD_BPS",
+    )
 
     def setUp(self):
         self._tmp = tempfile.NamedTemporaryFile(
@@ -145,6 +151,34 @@ class TestConfigReload(_TempEnv):
 
 @unittest.skipIf(_SKIP is not None, f"config unavailable: {_SKIP}")
 class TestConfigUpdate(_TempEnv):
+    def test_live_update_does_not_apply_pending_setup_save_before_reload(self):
+        cfg = self._make_config(LOOP_SECONDS="30", SPREAD_BPS="500")
+
+        self.assertEqual(cfg.LOOP_SECONDS, 30)
+        self.assertEqual(cfg.SPREAD_BPS, 500)
+
+        self.assertTrue(
+            cfg.update_persisted(
+                "LOOP_SECONDS",
+                "46",
+                source="api_settings_save_deferred",
+                note="applies on next bot restart",
+            )
+        )
+        self.assertTrue(cfg.has_pending_restart_changes())
+        self.assertEqual(cfg.LOOP_SECONDS, 30)
+
+        self.assertTrue(cfg.update("SPREAD_BPS", "920", source="gui_live_control"))
+
+        self.assertEqual(cfg.SPREAD_BPS, 920)
+        self.assertEqual(cfg.LOOP_SECONDS, 30)
+        self.assertTrue(cfg.has_pending_restart_changes())
+
+        cfg.reload()
+
+        self.assertEqual(cfg.LOOP_SECONDS, 46)
+        self.assertFalse(cfg.has_pending_restart_changes())
+
     def test_update_blocked_on_newline_injection(self):
         cfg = self._make_config(CAT_TICKER_ID="ORIGINAL")
         result = cfg.update("CAT_TICKER_ID", "abc\ndef")

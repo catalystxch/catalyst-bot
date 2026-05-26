@@ -201,6 +201,7 @@ class Config:
         # and reload() can still re-acquire from the same thread.
         self._lock = threading.RLock()
         self._pending_restart_changes = False
+        self._pending_restart_keys = set()
         self.reload()
 
     def reload(self):
@@ -228,6 +229,7 @@ class Config:
             except Exception:
                 self._validation_report = None
             self._pending_restart_changes = False
+            self._pending_restart_keys = set()
         finally:
             if lock:
                 lock.release()
@@ -1294,12 +1296,32 @@ class Config:
             with self._lock:
                 # Record old value for change tracking
                 old_value = str(getattr(self, key, ""))
+                pending_restart_keys = set(
+                    getattr(self, "_pending_restart_keys", set()) or set()
+                )
+                pending_live_values = {
+                    pending_key: getattr(self, pending_key)
+                    for pending_key in pending_restart_keys
+                    if pending_key != key and hasattr(self, pending_key)
+                }
 
                 # Write to .env file
                 set_key(_ENV_PATH, key, value)
 
                 # Reload all settings from disk (RLock re-entry is fine)
                 self.reload()
+                if pending_live_values:
+                    for pending_key, pending_live_value in pending_live_values.items():
+                        setattr(self, pending_key, pending_live_value)
+                    pending_restart_keys.difference_update({key})
+                    self._pending_restart_keys = pending_restart_keys
+                    self._pending_restart_changes = bool(pending_restart_keys)
+                    try:
+                        from config_validator import validate_config
+
+                        self._validation_report = validate_config(self)
+                    except Exception:
+                        self._validation_report = None
 
                 # Record the change (import here to avoid circular import)
                 try:
@@ -1371,6 +1393,7 @@ class Config:
 
                 set_key(_ENV_PATH, key, value)
                 self._pending_restart_changes = True
+                self._pending_restart_keys.add(key)
 
                 try:
                     from database import record_config_change
@@ -1379,7 +1402,7 @@ class Config:
                         key, old_value, value, source=source, note=note
                     )
                 except ImportError:
-                    pass
+                    pass  # Database audit table may not exist during early startup.
 
                 try:
                     if key in ("TOPUP_POOL_XCH", "TOPUP_POOL_CAT"):
@@ -1391,8 +1414,10 @@ class Config:
                             else "topup_pool_xch_spent_mojos"
                         )
                         _set_setting(spend_key, "0")
-                except Exception:
-                    pass
+                except Exception as spend_exc:
+                    print(
+                        f"[CONFIG] Failed to reset topup spend counter for {key}: {spend_exc}"
+                    )
 
             return True
         except Exception as e:
@@ -1401,8 +1426,8 @@ class Config:
                 from database import log_event as _log_cfg
 
                 _log_cfg("error", "config_error", f"Failed to persist {key}: {e}")
-            except Exception:
-                pass
+            except Exception as log_exc:
+                print(f"[CONFIG] Failed to log persist error for {key}: {log_exc}")
             return False
 
     def validate(self) -> dict:
