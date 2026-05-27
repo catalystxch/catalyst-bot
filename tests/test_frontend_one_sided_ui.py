@@ -176,3 +176,48 @@ def test_dashboard_price_limits_use_guard_price_formatter():
     assert "formatPriceGuardInput(sa.hard_min_price)" in body
     assert "formatPriceGuardInput(sa.hard_max_price)" in body
     assert "sa.hard_min_price + ' - ' + sa.hard_max_price" not in body
+
+
+def test_close_gap_observation_note_is_info_until_action_is_ready():
+    html = _html()
+
+    waiting_block = re.search(
+        r"if\s*\(\s*arbGapBps\s*>=\s*100\s*&&\s*!closeGapReady\s*\)\s*\{(?P<body>[\s\S]*?)\n\s*\}\n\s*\n\s*// Smart action",
+        html,
+    )
+    assert waiting_block, "Close-the-gap waiting advisory block not found"
+    body = waiting_block.group("body")
+
+    assert "Waiting for the gap to hold" in body
+    assert "type: 'info'" in body
+    assert "arbGapBps >= 200 ? 'warning' : 'info'" not in body
+
+
+def test_live_activity_filters_routine_topup_breadcrumbs_from_dashboard_feed():
+    html = _html()
+
+    translate = re.search(
+        r"function\s+laTranslate\s*\([^)]*\)\s*\{(?P<body>[\s\S]*?)\n\s*\}\n\s*function\s+laHandleEvent",
+        html,
+    )
+    assert translate, "laTranslate() not found"
+    body = translate.group("body")
+
+    for event_type in (
+        "topup_source_unavailable",
+        "topup_trigger_recovery",
+        "topup_missing_offers_prioritized",
+        "topup_single_action_done",
+        "topup_cat-inner_start",
+        "topup_cat_inner",
+        "topup_cat-inner_osstep_submitted",
+        "topup_cat-inner_osstep_confirmed",
+        "topup_xch-sniper_start",
+        "topup_xch_sniper",
+        "topup_split_blocked",
+        "drip_source_unavailable",
+    ):
+        assert event_type in body
+
+    assert "routineTopupBreadcrumbs" in body
+    assert "return null;" in body[body.index("routineTopupBreadcrumbs") :]

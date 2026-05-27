@@ -16601,7 +16601,7 @@
                         ? ' Waiting for the gap to hold across multiple cycles before recommending Close the Gap.'
                         : ' Let the gap settle before changing spreads aggressively.';
                     pushSuggestion({
-                        type: arbGapBps >= 200 ? 'warning' : 'info',
+                        type: 'info',
                         icon: '<>',
                         msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap.' + edgeMsg + gapAdvice,
                         action: null
@@ -27130,6 +27130,30 @@
         // Returns { icon, msg, cls } or null to skip the event.
         function laTranslate(eventType, severity, rawMsg, data) {
             const m = rawMsg || '';
+            const routineTopupBreadcrumbs = new Set([
+                'topup_source_unavailable',
+                'topup_trigger_recovery',
+                'topup_missing_offers_prioritized',
+                'topup_single_action_done',
+                'topup_cat-inner_start',
+                'topup_cat_inner',
+                'topup_cat-inner_osstep_submitted',
+                'topup_cat-inner_osstep_confirmed',
+                'topup_xch-sniper_osstep_submitted',
+                'topup_xch-sniper_osstep_confirmed',
+                'topup_xch-sniper_start',
+                'topup_xch_sniper',
+                'topup_cat-inner_pool_rebuild',
+                'topup_cat-inner_pool_rebuild_wait',
+                'topup_cat-inner_reserve_gone',
+                'topup_cat-inner_budget_bypass_floor_priority',
+                'topup_cat-inner_pool_rebuild_priority_borrow',
+                'topup_cat-inner_split_ok',
+                'topup_xch-sniper_split_ok',
+                'topup_split_blocked',
+                'drip_source_unavailable',
+            ]);
+            if (routineTopupBreadcrumbs.has(eventType)) return null;
 
             // --- Bot lifecycle ---
             if (eventType === 'bot_starting')

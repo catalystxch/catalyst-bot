@@ -337,6 +337,39 @@ class TestDashboard(_FlaskBase):
         self.assertIn("allocate an incoming CAT coin", rec["message"])
         self.assertNotIn("Coin Prep", rec["message"])
 
+    def test_cat_topup_pool_empty_recommendation_waits_during_live_topup(self):
+        cfg = types.SimpleNamespace(
+            TIER_ENABLED=True,
+            ENABLE_SELL=True,
+            SNIPER_ENABLED=True,
+            SNIPER_PREP_COUNT=25,
+            SNIPER_SIZE_XCH="0.001",
+            SELL_INNER_TIER_SPARE_COUNT=8,
+            SELL_MID_TIER_SPARE_COUNT=4,
+            SELL_OUTER_TIER_SPARE_COUNT=5,
+            SELL_EXTREME_TIER_SPARE_COUNT=2,
+        )
+        coins = {
+            "topup_running": True,
+            "tier_counts": {
+                "enabled": True,
+                "cat": {
+                    "inner": 1,
+                    "mid": 4,
+                    "outer": 5,
+                    "extreme": 2,
+                    "sniper": 24,
+                    "reserve": 0,
+                    "dust": 0,
+                },
+                "xch": {},
+            },
+        }
+
+        recs = dashboard_bp._build_coin_recommendations(cfg, coins, is_running=True)
+
+        self.assertEqual(recs, [])
+
     def test_shape_fix_coin_prep_halt_copy_is_explicitly_nuclear(self):
         with open(
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
