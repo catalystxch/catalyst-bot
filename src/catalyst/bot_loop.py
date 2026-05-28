@@ -3611,12 +3611,31 @@ class BotLoop:
         except Exception:
             return
 
-        # Count DB-locked coins per wallet type.
+        # Count DB-locked coins per wallet type. Locks tied to non-book trade
+        # ids can be legitimate external Sage activity, such as NFT offers
+        # made from the same wallet; keep them out of the active-book invariant.
         try:
-            xch_locked = len(get_locked_coins("xch") or [])
-            cat_locked = len(get_locked_coins("cat") or [])
+            xch_locked_rows = get_locked_coins("xch") or []
+            cat_locked_rows = get_locked_coins("cat") or []
+            xch_locked = len(xch_locked_rows)
+            cat_locked = len(cat_locked_rows)
+            buy_trade_ids = {o.get("trade_id") for o in db_buys if o.get("trade_id")}
+            sell_trade_ids = {
+                o.get("trade_id") for o in db_sells if o.get("trade_id")
+            }
+            xch_external_locked = sum(
+                1
+                for row in xch_locked_rows
+                if (row.get("trade_id") or "") not in buy_trade_ids
+            )
+            cat_external_locked = sum(
+                1
+                for row in cat_locked_rows
+                if (row.get("trade_id") or "") not in sell_trade_ids
+            )
         except Exception:
             xch_locked = cat_locked = 0
+            xch_external_locked = cat_external_locked = 0
 
         # Per-side layout detection. The watchdog's "reversed" mode expects
         # inner to be the LARGEST tier; "standard" expects inner SMALLEST.
@@ -3685,6 +3704,10 @@ class BotLoop:
             wallet_totals=wallet_totals,
             inventory=inventory_dict,
             db_locked_count={"xch": xch_locked, "cat": cat_locked},
+            external_locked_count={
+                "xch": xch_external_locked,
+                "cat": cat_external_locked,
+            },
         )
 
         # Persistence: track (side, code) → consecutive-pass streak.

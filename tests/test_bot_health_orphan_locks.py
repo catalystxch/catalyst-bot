@@ -100,6 +100,22 @@ class CheckOrphanLocksTests(_ModuleStubMixin, unittest.TestCase):
         fake.get_connection = lambda: conn
         fake.free_coin = MagicMock(return_value=True)
         sys.modules["database"] = fake
+        if "wallet" not in sys.modules:
+            wallet = types.ModuleType("wallet")
+            wallet.get_wallet_type = lambda: "chia"
+            wallet.get_owned_coins_detailed = MagicMock(return_value=None)
+            sys.modules["wallet"] = wallet
+        return fake
+
+    def _patch_wallet_locked(self, *coin_ids):
+        fake = types.ModuleType("wallet")
+        fake.get_wallet_type = lambda: "sage"
+        locked = {
+            cid: {"amount": 1_000_000, "offer_id": "external-wallet-offer"}
+            for cid in coin_ids
+        }
+        fake.get_owned_coins_detailed = MagicMock(return_value=locked)
+        sys.modules["wallet"] = fake
         return fake
 
     def test_no_orphans_returns_pass(self):
@@ -144,6 +160,20 @@ class CheckOrphanLocksTests(_ModuleStubMixin, unittest.TestCase):
         fake_db = self._patch_db(orphans)
         c = bot_health.check_orphan_locks(auto_repair=True)
         self.assertEqual(c.repaired_count, 1)
+
+    def test_wallet_confirmed_external_lock_is_not_freed(self):
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        orphans = [_orphan("0xcoin1", last_seen=old, trade_id="external_tid", wt="xch")]
+        fake_db = self._patch_db(orphans)
+        fake_wallet = self._patch_wallet_locked("0xcoin1")
+
+        c = bot_health.check_orphan_locks(auto_repair=True)
+
+        fake_db.free_coin.assert_not_called()
+        fake_wallet.get_owned_coins_detailed.assert_called()
+        self.assertEqual(c.repaired_count, 0)
+        self.assertEqual(c.anomaly_count, 0)
+        self.assertIn("wallet-confirmed", c.message)
 
 
 class CheckStaleDexiePostsTests(_ModuleStubMixin, unittest.TestCase):

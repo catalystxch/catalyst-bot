@@ -287,6 +287,20 @@ class TestCoinInvariants:
         codes = [i.code for i in result.issues]
         assert "xch_locked_vs_buys_mismatch" in codes
 
+    def test_wallet_external_locks_are_ignored_for_active_book_mismatch(self):
+        result = check_coin_invariants(
+            wallet_totals={"xch_total": 166, "cat_total": 73},
+            inventory={
+                "xch": {"free": 100, "locked": 23},
+                "cat": {"free": 51, "locked": 22},
+            },
+            open_offers_count={"buy": 23, "sell": 22},
+            db_locked_count={"xch": 66, "cat": 22},
+            external_locked_count={"xch": 43, "cat": 0},
+        )
+        codes = [i.code for i in result.issues]
+        assert "xch_locked_vs_buys_mismatch" not in codes
+
     def test_small_divergence_tolerated(self):
         """±2 tolerance for sniper probes and transient states."""
         result = check_coin_invariants(

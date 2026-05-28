@@ -502,6 +502,41 @@ def _seconds_since(iso_ts: Optional[str], now: float) -> Optional[float]:
 _ORPHAN_LOCK_AGE_SECS = 300
 
 
+def _normalize_coin_id(coin_id: object) -> str:
+    cid = str(coin_id or "").strip().lower()
+    if cid and not cid.startswith("0x"):
+        cid = "0x" + cid
+    return cid
+
+
+def _wallet_confirmed_locked_coin_ids() -> set:
+    """Return coin ids Sage still reports as locked by any wallet offer."""
+    try:
+        from wallet import get_owned_coins_detailed, get_wallet_type
+
+        if get_wallet_type() != "sage":
+            return set()
+
+        locked_ids = set()
+        for wallet_id in (cfg.WALLET_ID_XCH, cfg.CAT_WALLET_ID):
+            detailed = get_owned_coins_detailed(wallet_id) or {}
+            for raw_coin_id, info in detailed.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("offer_id") or info.get("offer_hash"):
+                    cid = _normalize_coin_id(raw_coin_id)
+                    if cid:
+                        locked_ids.add(cid)
+        return locked_ids
+    except Exception as e:
+        slog(
+            "BOT_HEALTH",
+            f"Could not fetch wallet-confirmed locked coins: {e}",
+            level="debug",
+        )
+        return set()
+
+
 def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
     """Find coins marked locked in DB whose trade_id points to no open offer.
 
@@ -543,12 +578,18 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
             message="No orphan coin locks.",
         )
 
-    # Filter by age — only act on locks older than the threshold so we
-    # don't race in-flight reconcile updates.
+    # Wallet-confirmed locks may belong to NFT/off-wallet offers; leave those alone.
+    wallet_locked_ids = _wallet_confirmed_locked_coin_ids()
+
+    # Only act on old DB-only locks so we do not race in-flight reconcile updates.
     now = time.time()
     actionable = []
     too_fresh = 0
+    wallet_confirmed = 0
     for o in orphans:
+        if _normalize_coin_id(o.get("coin_id")) in wallet_locked_ids:
+            wallet_confirmed += 1
+            continue
         age = _seconds_since(o.get("last_seen"), now)
         if age is None or age >= _ORPHAN_LOCK_AGE_SECS:
             actionable.append(o)
@@ -577,7 +618,20 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
                     level="warn",
                 )
 
-    if not actionable and too_fresh:
+    if not actionable and wallet_confirmed and not too_fresh:
+        return HealthCheck(
+            name="orphan_locks",
+            category="coins",
+            status="pass",
+            severity="info",
+            message=(
+                f"{wallet_confirmed} wallet-confirmed external locks - "
+                "no cleanup needed."
+            ),
+            anomaly_count=0,
+        )
+
+    if not actionable and (too_fresh or wallet_confirmed):
         return HealthCheck(
             name="orphan_locks",
             category="coins",
@@ -593,7 +647,10 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
         category="coins",
         status="warn" if (actionable and not auto_repair) else "pass",
         severity="warning" if (actionable and not auto_repair) else "info",
-        message=(f"{len(actionable)} orphan locks ({too_fresh} too fresh to act on)"),
+        message=(
+            f"{len(actionable)} orphan locks ({too_fresh} too fresh, "
+            f"{wallet_confirmed} wallet-confirmed)"
+        ),
         anomaly_count=len(actionable),
         repaired_count=repaired,
         repair_log=repair_log,
