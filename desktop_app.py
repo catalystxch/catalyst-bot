@@ -722,6 +722,13 @@ def start_flask_server():
 
 def run_desktop_mode(dev_mode: bool = False):
     """Main desktop app flow."""
+    # WebKit2GTK 4.1+ runs the WebProcess inside a bubblewrap sandbox that
+    # puts it in a separate network namespace, blocking access to the host's
+    # loopback interface (127.0.0.1). Setting this env var before the first
+    # import of webview disables that sandbox so localhost works.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("WEBKIT_DISABLE_SANDBOX", "1")
+
     try:
         import webview
     except ImportError:
@@ -881,7 +888,13 @@ def run_desktop_mode(dev_mode: bool = False):
     # after a brief delay (see splash.html).
     _splash_path = _bundle_path("splash.html")
     if os.path.exists(_splash_path):
-        _initial_url = "file:///" + _splash_path.replace("\\", "/")
+        # pathlib.as_uri() produces the correct file:// URL on all platforms
+        # ("file:///C:/..." on Windows, "file:///opt/..." on Linux/macOS).
+        # The manual "file:///" + path approach produces four slashes on Linux
+        # because absolute paths already start with "/".
+        import pathlib
+
+        _initial_url = pathlib.Path(_splash_path).as_uri()
     else:
         _initial_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
 
