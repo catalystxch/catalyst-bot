@@ -112,6 +112,46 @@ def _format_sage_cleanup_skip_summary(total: int, new: int, repeated: int) -> st
     )
 
 
+def _normalize_coin_id_value(coin_id: object) -> str:
+    cid = str(coin_id or "").strip().lower()
+    if cid and not cid.startswith("0x"):
+        cid = "0x" + cid
+    return cid
+
+
+def _count_wallet_confirmed_external_locks(
+    locked_rows, active_trade_ids, wallet_confirmed_locked_ids
+) -> int:
+    """Count DB locks that are both non-book and wallet-confirmed locked."""
+    active_trade_ids = {str(tid or "") for tid in (active_trade_ids or set())}
+    wallet_locked_ids = {
+        _normalize_coin_id_value(cid) for cid in (wallet_confirmed_locked_ids or set())
+    }
+    count = 0
+    for row in locked_rows or []:
+        trade_id = str(row.get("trade_id") or "")
+        coin_id = _normalize_coin_id_value(row.get("coin_id"))
+        if trade_id in active_trade_ids:
+            continue
+        if coin_id and coin_id in wallet_locked_ids:
+            count += 1
+    return count
+
+
+def _get_wallet_confirmed_locked_coin_ids() -> set:
+    try:
+        from bot_health import _wallet_confirmed_locked_coin_ids
+
+        return _wallet_confirmed_locked_coin_ids()
+    except Exception as e:
+        slog(
+            "BOT_HEALTH",
+            f"Could not fetch wallet-confirmed locked coins for invariant check: {e}",
+            level="debug",
+        )
+        return set()
+
+
 def _find_cat_deposit_for_position_delta(delta_cat, scale, baseline_at=0):
     """Return a recent external CAT deposit coin matching a positive delta."""
     try:
@@ -3613,7 +3653,9 @@ class BotLoop:
 
         # Count DB-locked coins per wallet type. Locks tied to non-book trade
         # ids can be legitimate external Sage activity, such as NFT offers
-        # made from the same wallet; keep them out of the active-book invariant.
+        # made from the same wallet, but only subtract them from the
+        # active-book invariant when Sage still confirms the coin is
+        # offer-locked. Stale Catalyst DB locks must remain visible here.
         try:
             xch_locked_rows = get_locked_coins("xch") or []
             cat_locked_rows = get_locked_coins("cat") or []
@@ -3621,15 +3663,12 @@ class BotLoop:
             cat_locked = len(cat_locked_rows)
             buy_trade_ids = {o.get("trade_id") for o in db_buys if o.get("trade_id")}
             sell_trade_ids = {o.get("trade_id") for o in db_sells if o.get("trade_id")}
-            xch_external_locked = sum(
-                1
-                for row in xch_locked_rows
-                if (row.get("trade_id") or "") not in buy_trade_ids
+            wallet_confirmed_locked_ids = _get_wallet_confirmed_locked_coin_ids()
+            xch_external_locked = _count_wallet_confirmed_external_locks(
+                xch_locked_rows, buy_trade_ids, wallet_confirmed_locked_ids
             )
-            cat_external_locked = sum(
-                1
-                for row in cat_locked_rows
-                if (row.get("trade_id") or "") not in sell_trade_ids
+            cat_external_locked = _count_wallet_confirmed_external_locks(
+                cat_locked_rows, sell_trade_ids, wallet_confirmed_locked_ids
             )
         except Exception:
             xch_locked = cat_locked = 0
