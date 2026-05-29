@@ -16,6 +16,7 @@ from flask import Blueprint, jsonify, request
 
 import api_server
 from database import get_stats
+from super_log import slog
 
 
 bp = Blueprint("dashboard", __name__)
@@ -509,8 +510,14 @@ def api_dashboard():
                     coin_status = bot.coin_manager.get_status() or {}
                     coins["prep_running"] = bool(coin_status.get("prep_running"))
                     coins["topup_running"] = bool(coin_status.get("topup_running"))
-            except Exception:
-                pass
+            except Exception as e:
+                coins["prep_running"] = False
+                coins["topup_running"] = False
+                slog(
+                    "API_STATUS",
+                    f"Dashboard coin manager status fetch error: {e}",
+                    level="debug",
+                )
             try:
                 is_running = bool(bot and bot.is_running())
             except Exception:

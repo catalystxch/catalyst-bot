@@ -3620,9 +3620,7 @@ class BotLoop:
             xch_locked = len(xch_locked_rows)
             cat_locked = len(cat_locked_rows)
             buy_trade_ids = {o.get("trade_id") for o in db_buys if o.get("trade_id")}
-            sell_trade_ids = {
-                o.get("trade_id") for o in db_sells if o.get("trade_id")
-            }
+            sell_trade_ids = {o.get("trade_id") for o in db_sells if o.get("trade_id")}
             xch_external_locked = sum(
                 1
                 for row in xch_locked_rows
