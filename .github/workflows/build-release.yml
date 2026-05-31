@@ -206,21 +206,6 @@ jobs:
             ) -Wait | Out-Null
           }
 
-      - name: Package (macOS)
-        if: matrix.os == 'macos-latest'
-        env:
-          ARTIFACT_NAME: ${{ matrix.artifact }}
-          RELEASE_REF: ${{ github.ref_name }}
-          PACKAGE_EXT: ${{ matrix.ext }}
-        run: |
-          package="../${ARTIFACT_NAME}-${RELEASE_REF}${PACKAGE_EXT}"
-          # If PyInstaller produced a .app bundle, package it; otherwise fall back to folder
-          if [ -d "dist/CATalyst.app" ]; then
-            cd dist && zip -r "$package" CATalyst.app/
-          else
-            cd dist && zip -r "$package" Catalyst/
-          fi
-
       - name: Package macOS DMG
         if: matrix.os == 'macos-latest'
         # Public macOS release assets must be Developer ID signed and notarized
@@ -292,7 +277,8 @@ jobs:
           python scripts/packaged_api_smoke.py --exe "$extract_dir/opt/catalyst/Catalyst"
           bash scripts/linux_desktop_smoke.sh "$extract_dir/opt/catalyst/Catalyst" deb-desktop-smoke.log
 
-      - name: Upload zip/tar to Release
+      - name: Upload Windows zip/Linux tar to Release
+        if: matrix.os != 'macos-latest'
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}

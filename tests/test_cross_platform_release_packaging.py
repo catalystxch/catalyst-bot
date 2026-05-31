@@ -33,6 +33,16 @@ def test_release_workflow_requires_macos_notarization_for_public_dmg():
     assert "MACOS_REQUIRE_NOTARIZATION" in macos_script
 
 
+def test_release_workflow_does_not_publish_unsigned_macos_zip():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "- name: Package (macOS)" not in workflow
+    assert "- name: Upload Windows zip/Linux tar to Release" in workflow
+    assert "if: matrix.os != 'macos-latest'" in workflow
+
+
 def test_release_workflow_keeps_github_context_out_of_shell_scripts():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"
