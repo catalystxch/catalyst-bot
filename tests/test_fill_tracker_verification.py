@@ -89,6 +89,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         self.fake_spacescan = types.ModuleType("spacescan")
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: None
+        self.fake_spacescan.get_verify_backoff_remaining = lambda: 0
         sys.modules["spacescan"] = self.fake_spacescan
 
         sys.modules.pop("fill_tracker", None)
@@ -145,6 +146,79 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertTrue(
             any(evt == "fill_verify_pending" for _, evt, _, _ in self.logged)
         )
+
+    def test_spacescan_backoff_does_not_consume_reverify_attempt_budget(self):
+        self.fake_spacescan.verify_fill = lambda coin_id, our_address: None
+        self.fake_spacescan.get_verify_backoff_remaining = lambda: 45
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-backoff-pending"
+        live_trade_id = "trade-still-live"
+        tracker._previous_ids["buy"] = {live_trade_id}
+        tracker._previous_ids["sell"] = set()
+        tracker._pending_reverify[trade_id] = {
+            "side": "sell",
+            "attempts": 5,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+
+        result = tracker.detect_fills({live_trade_id}, set(), {})
+
+        self.assertEqual(result["sell_fills"], [])
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertEqual(tracker._pending_reverify[trade_id]["attempts"], 5)
+        self.assertNotIn((trade_id, "cancelled"), self.status_updates)
+        self.assertFalse(
+            any(evt == "fill_verify_exhausted" for _, evt, _, _ in self.logged)
+        )
+        self.assertTrue(
+            any(
+                evt == "fill_verify_deferred_spacescan_backoff"
+                for _, evt, _, _ in self.logged
+            )
+        )
+
+    def test_pending_reverify_below_attempt_budget_stays_parked(self):
+        self.fake_spacescan.verify_fill = lambda coin_id, our_address: None
+        self.fake_spacescan.get_verify_backoff_remaining = lambda: 0
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-retry-under-budget"
+        live_trade_id = "trade-still-live"
+        tracker._previous_ids["buy"] = {live_trade_id}
+        tracker._previous_ids["sell"] = set()
+        tracker._pending_reverify[trade_id] = {
+            "side": "sell",
+            "attempts": 2,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+
+        result = tracker.detect_fills({live_trade_id}, set(), {})
+
+        self.assertEqual(result["sell_fills"], [])
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertEqual(tracker._pending_reverify[trade_id]["attempts"], 3)
+        self.assertNotIn((trade_id, "cancelled"), self.status_updates)
+        self.assertFalse(
+            any(evt == "fill_verify_exhausted" for _, evt, _, _ in self.logged)
+        )
+
+    def test_new_unverified_fill_during_spacescan_backoff_starts_at_zero_attempts(
+        self,
+    ):
+        self.fake_spacescan.verify_fill = lambda coin_id, our_address: None
+        self.fake_spacescan.get_verify_backoff_remaining = lambda: 45
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-backoff-new"
+        tracker._previous_ids["buy"] = {trade_id}
+        tracker._previous_ids["sell"] = set()
+
+        result = tracker.detect_fills(set(), set(), {})
+
+        self.assertEqual(result["buy_fills"], [])
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertEqual(tracker._pending_reverify[trade_id]["attempts"], 0)
+        self.assertNotIn((trade_id, "cancelled"), self.status_updates)
 
     def test_verified_spacescan_result_records_fill(self):
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
