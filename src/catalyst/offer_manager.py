@@ -221,6 +221,8 @@ class OfferManager:
             "last_success_at": 0.0,
             "last_failure_at": 0.0,
             "cache_size": 0,
+            "last_suspicious_empty_log_key": "",
+            "suspicious_empty_suppressed": 0,
         }
         self._expected_empty_wallet_book: Dict[str, Any] = {
             "until": 0.0,
@@ -4867,6 +4869,8 @@ class OfferManager:
                     f"accepting empty book instead of cached {prev_total}-offer view",
                 )
             else:
+                suspicious_error = f"suspicious_empty_offers (prev={prev_total})"
+                suspicious_log_key = f"suspicious_empty_offers:{prev_total}"
                 self._wallet_sync_meta.update(
                     {
                         "fresh": False,
@@ -4875,17 +4879,32 @@ class OfferManager:
                             self._wallet_sync_meta.get("consecutive_failures", 0) or 0
                         )
                         + 1,
-                        "last_error": f"suspicious_empty_offers (prev={prev_total})",
+                        "last_error": suspicious_error,
                         "last_failure_at": _now,
                         "cache_size": prev_total,
                     }
                 )
-                log_event(
-                    "warning",
-                    "wallet_sync_suspicious_empty",
-                    f"Wallet returned 0 offers but had {prev_total} a moment ago - "
-                    f"treating as Sage sync hiccup, using cached view this cycle",
-                )
+                if (
+                    self._wallet_sync_meta.get("last_suspicious_empty_log_key")
+                    != suspicious_log_key
+                ):
+                    self._wallet_sync_meta["last_suspicious_empty_log_key"] = (
+                        suspicious_log_key
+                    )
+                    self._wallet_sync_meta["suspicious_empty_suppressed"] = 0
+                    log_event(
+                        "warning",
+                        "wallet_sync_suspicious_empty",
+                        f"Wallet returned 0 offers but had {prev_total} a moment ago - "
+                        f"treating as Sage sync hiccup, using cached view this cycle",
+                    )
+                else:
+                    self._wallet_sync_meta["suspicious_empty_suppressed"] = int(
+                        self._wallet_sync_meta.get(
+                            "suspicious_empty_suppressed", 0
+                        )
+                        or 0
+                    ) + 1
                 return (
                     [dict(o) for o in self._wallet_sync_cache["buy"]],
                     [dict(o) for o in self._wallet_sync_cache["sell"]],
@@ -4906,6 +4925,8 @@ class OfferManager:
                 "last_error": "",
                 "last_success_at": time.time(),
                 "cache_size": len(open_buy) + len(open_sell),
+                "last_suspicious_empty_log_key": "",
+                "suspicious_empty_suppressed": 0,
             }
         )
         if expected_empty_reason:

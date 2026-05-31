@@ -4,6 +4,7 @@ import unittest
 import io
 import contextlib
 import time
+import threading
 from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
@@ -16,6 +17,7 @@ class _FakeCfg:
     ENABLE_SELL = True
     AUTO_REQUOTE = True
     DEXIE_AUTO_POST = True
+    LOOP_SECONDS = 45
     SPLASH_ENABLED = True
     COIN_IDS_ENABLED = True
     CAT_ASSET_ID = "test-cat"
@@ -31,6 +33,10 @@ class _FakeCfg:
     SNIPER_TOP_BOOK_BPS = Decimal("1")
     SNIPER_RETRY_BACKOFF_BPS = Decimal("50")
     SNIPER_MAIN_BOOK_GUARD_BPS = Decimal("1")
+    SNIPER_MIN_GAP_BPS = Decimal("200")
+    SNIPER_BUFFER_BPS = Decimal("50")
+    OFFER_EXPIRY_SECS = 86400
+    OFFER_REFRESH_BEFORE = 1800
     ADAPTIVE_LADDER_TARGETS = True
     DB_ONLY_OFFER_CONFIRM_GRACE_SECS = 90
     DB_ONLY_OFFER_RETRY_BACKOFF_SECS = 300
@@ -89,6 +95,13 @@ class _DummyOfferManager:
         self.requote_calls = []
         self._recently_created = {}
         self._offer_details_cache = {}
+        self._pending_cancel_retries = {}
+
+    def sync_from_wallet(self):
+        return ([], [], [])
+
+    def get_wallet_sync_meta(self):
+        return {"fresh": True, "using_cache": False}
 
     def get_recently_created_count(self, side):
         return 0
@@ -118,6 +131,19 @@ class _DummyOfferManager:
     def unsuspend_slots_if_coins_available(self, side):
         pass
 
+    def detect_expiring_offers(self, *args, **kwargs):
+        return []
+
+    def retry_failed_cancels(self):
+        return 0
+
+    def cancel_offers(self, trade_ids, **kwargs):
+        del kwargs
+        return {trade_id: {"success": True} for trade_id in trade_ids}
+
+    def clean_visible_recently_created(self, visible_trade_ids):
+        del visible_trade_ids
+
 
 class _DummyFillTracker:
     def __init__(self, offer_manager=None):
@@ -125,6 +151,12 @@ class _DummyFillTracker:
 
     def should_protect_side(self, side):
         return False
+
+    def detect_fills(self, *args, **kwargs):
+        return {"buy_fills": [], "sell_fills": []}
+
+    def match_round_trips(self):
+        return []
 
 
 class _DummyDexieManager:
@@ -181,6 +213,12 @@ class _DummyCoinManager:
     def get_status(self):
         return {"inventory": {}}
 
+    def reset_backoff(self):
+        pass
+
+    def refresh_fee_pool_from_wallet(self):
+        pass
+
 
 class _DummyRiskManager:
     def __init__(self, price_engine=None, market_intel=None):
@@ -195,6 +233,24 @@ class _DummyRiskManager:
     def update_arb_gap(self, arb_gap):
         pass
 
+    def check_circuit_breakers(self, mid_price):
+        return False
+
+    def is_full_halt(self):
+        return False
+
+    def get_circuit_breaker_blocked_side(self):
+        return ""
+
+    def update_fill_rate(self, fills_hour):
+        pass
+
+    def update_inventory(self):
+        pass
+
+    def get_inventory_state(self):
+        return {"net_position_cat": "0"}
+
 
 class _DummySniper:
     def __init__(
@@ -206,6 +262,14 @@ class _DummySniper:
     ):
         self._active_snipe_ids = []
         self._active_snipe_sides = {}
+        self._snipe_lock = threading.Lock()
+        self._last_snipe_time = 0
+
+    def try_snipe_single(self, side, price, arb_gap):
+        return []
+
+    def prune_active_snipes(self, all_open_ids):
+        del all_open_ids
 
 
 class _DummyBoostManager:
@@ -217,6 +281,10 @@ class _DummyBoostManager:
         splash_manager=None,
     ):
         del offer_manager, dexie_manager, risk_manager, splash_manager
+        self._boost_active = False
+
+    def prune_active_boosts(self, all_open_ids):
+        del all_open_ids
 
 
 class _DummyAMMMonitor:
@@ -246,6 +314,9 @@ class _DummyAMMMonitor:
 
     def notify_quoted_price(self, buy=None, sell=None):
         pass
+
+    def get_arb_pressure(self):
+        return 0.0
 
     def check_amm_buffer(self, price, side):
         return True
@@ -2126,6 +2197,63 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(arb_gap, Decimal("1818.18"))
         self.assertEqual(price_data["tibet_price"], Decimal("1.30"))
         self.assertEqual(price_data["dexie_price"], Decimal("1.10"))
+
+    def test_startup_probe_launches_with_tibet_price_when_dexie_missing(self):
+        loop = bot_loop.BotLoop()
+        tibet_price = Decimal("0.0001077595337536394661718975617")
+        calls = []
+
+        class _ProbeLaunched(Exception):
+            pass
+
+        class _PriceEngine:
+            def get_price(self, *args, **kwargs):
+                del args, kwargs
+                return {
+                    "mid_price": tibet_price,
+                    "dexie_price": None,
+                    "tibet_price": tibet_price,
+                    "arb_gap_bps": Decimal("0"),
+                }
+
+        def _try_snipe_single(side, price, arb_gap):
+            trade_id = f"{side}-startup-probe"
+            calls.append((side, price, arb_gap))
+            with loop.sniper._snipe_lock:
+                loop.sniper._active_snipe_ids.append(trade_id)
+                loop.sniper._active_snipe_sides[trade_id] = side
+            return [{"trade_id": trade_id}]
+
+        def _probe_launched(*args, **kwargs):
+            del args, kwargs
+            raise _ProbeLaunched()
+
+        def _main_ladder_reached(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("startup main ladder was reached before probe launch")
+
+        loop.price_engine = _PriceEngine()
+        loop.sniper.try_snipe_single = _try_snipe_single
+
+        with (
+            patch.object(loop, "_update_market_toxicity", return_value={}),
+            patch.object(
+                loop,
+                "_cancel_toxicity_throttled_offers",
+                return_value={"buy": set(), "sell": set()},
+            ),
+            patch.object(loop, "_handle_requoting", return_value=None),
+            patch.object(loop, "_create_offers_if_needed", side_effect=_main_ladder_reached),
+            patch.object(loop, "_process_active_probe", side_effect=_probe_launched),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(_ProbeLaunched):
+                loop._run_one_cycle()
+
+        self.assertEqual({side for side, _, _ in calls}, {"buy", "sell"})
+        self.assertTrue(loop._probe_state["active"])
+        self.assertEqual(loop._probe_state["tibet_price"], tibet_price)
+        self.assertEqual(loop._probe_state["last_discovery_reason"], "startup_empty_book")
 
     def test_handle_requoting_updates_baseline_to_anchored_mid(self):
         loop = bot_loop.BotLoop()

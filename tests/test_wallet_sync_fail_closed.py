@@ -296,6 +296,65 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertEqual(meta["cache_size"], 0)
         self.assertEqual(meta.get("expected_empty_reason"), "coin_prep_cancel_all")
 
+    def test_suspicious_empty_wallet_book_warning_logs_once_per_stale_run(self):
+        manager = self.offer_manager.OfferManager()
+
+        def fake_get_all_offers(*args, **kwargs):
+            if not hasattr(fake_get_all_offers, "_calls"):
+                fake_get_all_offers._calls = 0
+            fake_get_all_offers._calls += 1
+            if fake_get_all_offers._calls == 1:
+                return [{"trade_id": "seed"}]
+            return []
+
+        def fake_classify(all_offers, _asset_id):
+            if all_offers:
+                return (
+                    [{"trade_id": f"buy-live-{i}"} for i in range(3)],
+                    [{"trade_id": f"sell-live-{i}"} for i in range(3)],
+                    [],
+                )
+            return ([], [], [])
+
+        db_active = [
+            {"trade_id": f"buy-live-{i}", "side": "buy"} for i in range(3)
+        ] + [
+            {"trade_id": f"sell-live-{i}", "side": "sell"} for i in range(3)
+        ]
+
+        with (
+            patch.object(self.offer_manager, "get_all_offers", new=fake_get_all_offers),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                side_effect=fake_classify,
+            ),
+            patch.object(self.offer_manager, "get_open_offers", return_value=db_active),
+        ):
+            fresh_buy, fresh_sell, _ = manager.sync_from_wallet()
+            stale_1_buy, stale_1_sell, _ = manager.sync_from_wallet()
+            stale_2_buy, stale_2_sell, _ = manager.sync_from_wallet()
+            stale_3_buy, stale_3_sell, _ = manager.sync_from_wallet()
+
+        self.assertEqual(len(fresh_buy), 3)
+        self.assertEqual(len(fresh_sell), 3)
+        self.assertEqual(len(stale_1_buy), 3)
+        self.assertEqual(len(stale_1_sell), 3)
+        self.assertEqual(len(stale_2_buy), 3)
+        self.assertEqual(len(stale_2_sell), 3)
+        self.assertEqual(len(stale_3_buy), 3)
+        self.assertEqual(len(stale_3_sell), 3)
+
+        suspicious_events = [
+            evt for _, evt, _, _ in self.logged if evt == "wallet_sync_suspicious_empty"
+        ]
+        self.assertEqual(len(suspicious_events), 1)
+
+        meta = manager.get_wallet_sync_meta()
+        self.assertFalse(meta["fresh"])
+        self.assertTrue(meta["using_cache"])
+        self.assertEqual(meta["consecutive_failures"], 3)
+
     def test_mass_disappearance_is_blocked_while_wallet_sync_is_stale(self):
         class _FakeOfferManager:
             @staticmethod
