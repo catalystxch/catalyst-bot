@@ -335,6 +335,11 @@ def _spacescan_get(endpoint: str) -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 
 
+def get_verify_backoff_remaining() -> float:
+    """Return seconds remaining in the global Spacescan verification backoff."""
+    return max(0.0, float(_rate_limited_until or 0.0) - time.time())
+
+
 def is_coin_spent(coin_id: str) -> Optional[Dict]:
     """Check if a specific coin has been spent on-chain.
 

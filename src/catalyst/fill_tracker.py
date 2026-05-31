@@ -84,6 +84,15 @@ def _dexie_detail_confirms_cancel(detail: Dict) -> bool:
     )
 
 
+def _spacescan_verify_backoff_remaining() -> float:
+    try:
+        from spacescan import get_verify_backoff_remaining
+
+        return max(0.0, float(get_verify_backoff_remaining() or 0))
+    except Exception:
+        return 0.0
+
+
 class FillTracker:
     """Detects fills and matches round-trip PnL.
 
@@ -616,6 +625,29 @@ class FillTracker:
                 )
                 self._pending_reverify.pop(trade_id, None)
             else:
+                backoff_remaining = _spacescan_verify_backoff_remaining()
+                if backoff_remaining > 0:
+                    now = time.time()
+                    last_backoff_log_at = float(meta.get("last_backoff_log_at") or 0)
+                    if now - last_backoff_log_at >= 60:
+                        meta["last_backoff_log_at"] = now
+                        log_event(
+                            "info",
+                            "fill_verify_deferred_spacescan_backoff",
+                            f"{side.upper()} offer {trade_id[:16]}... still "
+                            f"unverified while Spacescan is backing off "
+                            f"({backoff_remaining:.0f}s remaining) - "
+                            f"attempt budget stays at {meta.get('attempts', 0)}/"
+                            f"{self._pending_reverify_max_attempts}",
+                            data={
+                                "trade_id": trade_id,
+                                "side": side,
+                                "attempts": int(meta.get("attempts", 0) or 0),
+                                "backoff_remaining_secs": round(backoff_remaining, 1),
+                            },
+                        )
+                    continue
+
                 attempts = int(meta.get("attempts", 0)) + 1
                 meta["attempts"] = attempts
                 if attempts >= self._pending_reverify_max_attempts:
@@ -683,8 +715,9 @@ class FillTracker:
                         self._pending_reverify.pop(trade_id, None)
                         continue
 
-                    # Dexie also inconclusive (404, still-open, pending, rate-limited,
-                    # or network error). Retire conservatively and alert operator.
+                    # Dexie also inconclusive (404, still-open, pending,
+                    # rate-limited, or network error). Retire conservatively
+                    # and alert operator.
                     status = (
                         "expired" if meta.get("local_clock_expired") else "cancelled"
                     )
@@ -1117,9 +1150,11 @@ class FillTracker:
                 # they resolve or the attempt budget is exhausted.
                 existing = self._pending_reverify.get(trade_id)
                 if existing is None:
+                    backoff_remaining = _spacescan_verify_backoff_remaining()
+                    initial_attempts = 0 if backoff_remaining > 0 else 1
                     self._pending_reverify[trade_id] = {
                         "side": side,
-                        "attempts": 1,
+                        "attempts": initial_attempts,
                         "first_seen": time.time(),
                         "local_clock_expired": local_clock_expired,
                     }
@@ -1136,13 +1171,32 @@ class FillTracker:
                         "fill_verify_pending",
                         f"{side.upper()} offer {trade_id[:16]}... disappeared "
                         f"but Spacescan unverified — parked for retry "
-                        f"(1/{self._pending_reverify_max_attempts})",
+                        f"({initial_attempts}/{self._pending_reverify_max_attempts})",
                         data={
                             "trade_id": trade_id,
                             "local_clock_expired": local_clock_expired,
+                            "spacescan_backoff_remaining_secs": round(
+                                backoff_remaining, 1
+                            ),
                         },
                     )
                 else:
+                    backoff_remaining = _spacescan_verify_backoff_remaining()
+                    if backoff_remaining > 0:
+                        existing["local_clock_expired"] = (
+                            existing.get("local_clock_expired") or local_clock_expired
+                        )
+                        log_event(
+                            "info",
+                            "fill_verify_deferred_spacescan_backoff",
+                            f"{side.upper()} offer {trade_id[:16]}... still "
+                            f"unverified while Spacescan is backing off "
+                            f"({backoff_remaining:.0f}s remaining) - "
+                            f"attempt budget stays at "
+                            f"{existing.get('attempts', 0)}/"
+                            f"{self._pending_reverify_max_attempts}",
+                        )
+                        continue
                     existing["attempts"] = int(existing.get("attempts", 0)) + 1
                     existing["local_clock_expired"] = (
                         existing.get("local_clock_expired") or local_clock_expired
