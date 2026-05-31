@@ -415,7 +415,7 @@ These are the backend systems that tutorial videos should explain even when they
 | Logs and debug bundle | `super_log.py`, API diagnostics routes | Streams logs, creates debug bundles, API stats, doctor checks. |
 | Data reset | API reset routes, `database.py` | Clears selected tracking data without touching wallet coins/settings unless explicitly intended. |
 | App update | update API/build scripts | Checks release, downloads upgrade, restarts into newer build. |
-| Cross-platform packaging | `build.py`, requirements files, release workflows | Builds Windows and Linux app distributions. |
+| Cross-platform packaging | `build.py`, requirements files, release workflows | Builds Windows and Linux app distributions; macOS is source-only for now. |
 
 ## Known Tutorial Gaps To Capture Later
 

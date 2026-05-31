@@ -34,6 +34,15 @@ def test_release_workflow_does_not_publish_macos_assets():
     assert "APPLE_ID" not in workflow
 
 
+def test_readme_describes_macos_as_source_only():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "macOS packages are not currently" in readme
+    assert "Mac users can use the GitHub source code path below" in readme
+    assert "### From Source on macOS or Linux" in readme
+    assert "macOS release builds are currently not" in readme
+
+
 def test_release_workflow_keeps_github_context_out_of_shell_scripts():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"

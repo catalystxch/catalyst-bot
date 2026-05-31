@@ -188,7 +188,9 @@ fill detector and toxicity guard can react before the next normal cycle.
 
 ## Requirements
 
-- Windows 10/11 (64-bit) or Linux.
+- Windows 10/11 (64-bit) or Linux for packaged releases.
+- macOS can run from source from the GitHub repository, but packaged macOS
+  releases are not currently published.
 - [Sage wallet](https://sagewallet.net/) installed with RPC enabled
   (Settings -> Advanced -> Enable RPC).
 - XCH for fees and inventory, plus the CAT token you want to trade.
@@ -226,6 +228,9 @@ where CATalyst is running.
    the Sage connection, asks you to choose a wallet fingerprint, and guides you
    through Smart Settings.
 
+Mac users can use the GitHub source code path below. We do not currently publish
+a signed/notarized macOS installer or DMG.
+
 ### From Source on Windows
 
 Use this path if you want the current source code or plan to develop the app.
@@ -248,7 +253,7 @@ native desktop window instead, run:
 python desktop_app.py
 ```
 
-### From Source on Linux
+### From Source on macOS or Linux
 
 ```bash
 git clone https://github.com/catalystxch/catalyst-bot.git
@@ -261,6 +266,13 @@ python desktop_app.py --flask
 ```
 
 Then open `http://127.0.0.1:5000/` in a browser on that same machine.
+
+On macOS, port `5000` might already be used by Control Center. If startup says
+the port is in use, choose another port:
+
+```bash
+CATALYST_FLASK_PORT=5010 python desktop_app.py --flask
+```
 
 ### First Launch
 
@@ -287,7 +299,7 @@ $env:CATALYST_FLASK_PORT = "5010"
 python desktop_app.py --flask
 ```
 
-Linux:
+macOS/Linux:
 
 ```bash
 CATALYST_FLASK_PORT=5010 python desktop_app.py --flask
@@ -427,6 +439,7 @@ CATalyst stores its SQLite database, logs, and runtime state in the OS standard
 app-data directory:
 
 - **Windows:** `%APPDATA%\Catalyst\`
+- **macOS:** `~/Library/Application Support/Catalyst/`
 - **Linux:** `~/.local/share/Catalyst/`
 
 Override with the `CMM_DATA_DIR` environment variable.
@@ -445,7 +458,8 @@ The local build output stays on the machine that ran `python build.py`. To share
 builds with users, publish a GitHub Release or push a `v*` tag. The release
 workflow builds Windows installers, Linux AppImages and `.deb` packages,
 archive fallbacks, `.sha256` checksum sidecars, and signed update manifests.
-macOS release builds are currently not published.
+macOS users can run from source, but macOS release builds are currently not
+published.
 
 The in-app updater does not need the source repo to be public. It reads only the
 public release-channel manifest at
