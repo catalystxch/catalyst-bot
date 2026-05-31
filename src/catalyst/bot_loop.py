@@ -9273,7 +9273,10 @@ class BotLoop:
                 launch_reason = None  # existing guard below uses this to no-op
             dexie_p = Decimal(str(price_data.get("dexie_price", 0) or 0))
             tibet_p = Decimal(str(price_data.get("tibet_price", 0) or 0))
-            if dexie_p > 0 and tibet_p > 0:
+            startup_probe = bool(
+                launch_reason and launch_reason.startswith("startup_empty_book")
+            )
+            if tibet_p > 0 and (dexie_p > 0 or startup_probe):
                 if self.sniper._active_snipe_ids:
                     retired = _retire_probe_offers("probe_rearm")
                     if not retired:
