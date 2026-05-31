@@ -415,7 +415,7 @@ These are the backend systems that tutorial videos should explain even when they
 | Logs and debug bundle | `super_log.py`, API diagnostics routes | Streams logs, creates debug bundles, API stats, doctor checks. |
 | Data reset | API reset routes, `database.py` | Clears selected tracking data without touching wallet coins/settings unless explicitly intended. |
 | App update | update API/build scripts | Checks release, downloads upgrade, restarts into newer build. |
-| Cross-platform packaging | `build.py`, requirements files, release workflows | Builds Windows, Linux, and macOS app distributions. |
+| Cross-platform packaging | `build.py`, requirements files, release workflows | Builds Windows and Linux app distributions. |
 
 ## Known Tutorial Gaps To Capture Later
 
@@ -435,4 +435,3 @@ For a complete video/screenshot bank, capture these separately:
 12. Live Controls while the bot is running, because buttons become enabled and applied states change.
 13. Data reset confirmation dialogs.
 14. Crash recovery panel after a simulated crash log.
-

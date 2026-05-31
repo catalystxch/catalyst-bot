@@ -19,9 +19,6 @@ jobs:
           - os: windows-latest
             artifact: Catalyst-windows
             ext: .zip
-          - os: macos-latest
-            artifact: Catalyst-macos
-            ext: .zip
           - os: ubuntu-latest
             artifact: Catalyst-linux
             ext: .tar.gz
@@ -80,7 +77,7 @@ jobs:
         run: |
           cd dist/Catalyst
           # Run in --flask mode so the smoke test doesn't require a display
-          # on headless Linux/macOS CI runners. We're testing /api/health, not
+          # on headless Linux CI runners. We're testing /api/health, not
           # the native window.
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             ./Catalyst.exe --flask &
@@ -206,34 +203,6 @@ jobs:
             ) -Wait | Out-Null
           }
 
-      - name: Package macOS DMG
-        if: matrix.os == 'macos-latest'
-        # Public macOS release assets must be Developer ID signed and notarized
-        # so Gatekeeper can open the app after download.
-        env:
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          MACOS_CERTIFICATE_B64: ${{ secrets.MACOS_CERTIFICATE_B64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-          MACOS_REQUIRE_NOTARIZATION: "1"
-          RELEASE_REF: ${{ github.ref_name }}
-        run: scripts/package_macos.sh "$RELEASE_REF"
-
-      - name: Smoke test macOS DMG payload
-        if: matrix.os == 'macos-latest'
-        env:
-          RELEASE_REF: ${{ github.ref_name }}
-        run: |
-          mount_dir="${RUNNER_TEMP}/catalyst-dmg"
-          dmg_path="Catalyst-macos-${RELEASE_REF}.dmg"
-          mkdir -p "$mount_dir"
-          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -readonly
-          trap 'hdiutil detach "$mount_dir" || true' EXIT
-          python scripts/packaged_api_smoke.py --exe "$mount_dir/CATalyst.app/Contents/MacOS/Catalyst"
-
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         env:
@@ -278,20 +247,9 @@ jobs:
           bash scripts/linux_desktop_smoke.sh "$extract_dir/opt/catalyst/Catalyst" deb-desktop-smoke.log
 
       - name: Upload Windows zip/Linux tar to Release
-        if: matrix.os != 'macos-latest'
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload macOS DMG to Release
-        if: matrix.os == 'macos-latest'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            Catalyst-macos-${{ github.ref_name }}.dmg
-            Catalyst-macos-${{ github.ref_name }}.dmg.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
