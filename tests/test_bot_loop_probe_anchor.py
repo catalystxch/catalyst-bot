@@ -2243,7 +2243,9 @@ class ProbeAnchorTests(unittest.TestCase):
                 return_value={"buy": set(), "sell": set()},
             ),
             patch.object(loop, "_handle_requoting", return_value=None),
-            patch.object(loop, "_create_offers_if_needed", side_effect=_main_ladder_reached),
+            patch.object(
+                loop, "_create_offers_if_needed", side_effect=_main_ladder_reached
+            ),
             patch.object(loop, "_process_active_probe", side_effect=_probe_launched),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -2253,7 +2255,9 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual({side for side, _, _ in calls}, {"buy", "sell"})
         self.assertTrue(loop._probe_state["active"])
         self.assertEqual(loop._probe_state["tibet_price"], tibet_price)
-        self.assertEqual(loop._probe_state["last_discovery_reason"], "startup_empty_book")
+        self.assertEqual(
+            loop._probe_state["last_discovery_reason"], "startup_empty_book"
+        )
 
     def test_handle_requoting_updates_baseline_to_anchored_mid(self):
         loop = bot_loop.BotLoop()
