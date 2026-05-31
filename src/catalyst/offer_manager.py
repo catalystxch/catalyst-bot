@@ -4899,12 +4899,13 @@ class OfferManager:
                         f"treating as Sage sync hiccup, using cached view this cycle",
                     )
                 else:
-                    self._wallet_sync_meta["suspicious_empty_suppressed"] = int(
-                        self._wallet_sync_meta.get(
-                            "suspicious_empty_suppressed", 0
+                    self._wallet_sync_meta["suspicious_empty_suppressed"] = (
+                        int(
+                            self._wallet_sync_meta.get("suspicious_empty_suppressed", 0)
+                            or 0
                         )
-                        or 0
-                    ) + 1
+                        + 1
+                    )
                 return (
                     [dict(o) for o in self._wallet_sync_cache["buy"]],
                     [dict(o) for o in self._wallet_sync_cache["sell"]],

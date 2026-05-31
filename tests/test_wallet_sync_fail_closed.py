@@ -316,9 +316,7 @@ class WalletSyncFailClosedTests(unittest.TestCase):
                 )
             return ([], [], [])
 
-        db_active = [
-            {"trade_id": f"buy-live-{i}", "side": "buy"} for i in range(3)
-        ] + [
+        db_active = [{"trade_id": f"buy-live-{i}", "side": "buy"} for i in range(3)] + [
             {"trade_id": f"sell-live-{i}", "side": "sell"} for i in range(3)
         ]
 
