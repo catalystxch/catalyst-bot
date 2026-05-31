@@ -223,9 +223,8 @@ jobs:
 
       - name: Package macOS DMG
         if: matrix.os == 'macos-latest'
-        # scripts/package_macos.sh signs with Developer ID when configured,
-        # submits with notarytool when Apple credentials are present, staples
-        # the ticket, and otherwise falls back to an ad-hoc signed DMG.
+        # Public macOS release assets must be Developer ID signed and notarized
+        # so Gatekeeper can open the app after download.
         env:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -234,6 +233,7 @@ jobs:
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
           MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_REQUIRE_NOTARIZATION: "1"
           RELEASE_REF: ${{ github.ref_name }}
         run: scripts/package_macos.sh "$RELEASE_REF"
 

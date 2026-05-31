@@ -14,6 +14,21 @@ if [[ ! -d "$app_path" ]]; then
   exit 1
 fi
 
+require_notarization="${MACOS_REQUIRE_NOTARIZATION:-0}"
+if [[ "$require_notarization" == "1" ]]; then
+  missing=()
+  [[ -n "${MACOS_CERTIFICATE_B64:-}" ]] || missing+=("MACOS_CERTIFICATE_B64")
+  [[ -n "${APPLE_ID:-}" ]] || missing+=("APPLE_ID")
+  [[ -n "${APPLE_TEAM_ID:-}" ]] || missing+=("APPLE_TEAM_ID")
+  [[ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]] || missing+=("APPLE_APP_SPECIFIC_PASSWORD")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "macOS release packaging requires notarization credentials." >&2
+    printf 'Missing required environment variables: %s\n' "${missing[*]}" >&2
+    exit 1
+  fi
+fi
+
 cleanup_keychain() {
   if [[ -n "${_CATALYST_SIGNING_KEYCHAIN:-}" ]]; then
     security delete-keychain "$_CATALYST_SIGNING_KEYCHAIN" >/dev/null 2>&1 || true

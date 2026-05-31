@@ -14,12 +14,23 @@ def test_release_workflow_builds_native_macos_and_linux_downloads():
     assert "scripts/package_macos.sh" in workflow
     assert 'scripts/package_macos.sh "$RELEASE_REF"' in workflow
     assert "Catalyst-macos-${{ github.ref_name }}.dmg" in workflow
-    assert "notarytool" in workflow
+    assert "MACOS_REQUIRE_NOTARIZATION" in workflow
     assert "scripts/package_linux.sh" in workflow
     assert 'scripts/package_linux.sh "$RELEASE_REF"' in workflow
     assert "Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage" in workflow
     assert "catalyst_${{ github.ref_name }}_amd64.deb" in workflow
     assert "packaged_api_smoke.py --exe" in workflow
+
+
+def test_release_workflow_requires_macos_notarization_for_public_dmg():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+    macos_script = (ROOT / "scripts" / "package_macos.sh").read_text(encoding="utf-8")
+
+    assert 'MACOS_REQUIRE_NOTARIZATION: "1"' in workflow
+    assert "macOS release packaging requires notarization credentials." in macos_script
+    assert "MACOS_REQUIRE_NOTARIZATION" in macos_script
 
 
 def test_release_workflow_keeps_github_context_out_of_shell_scripts():
