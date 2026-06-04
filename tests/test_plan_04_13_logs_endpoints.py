@@ -158,6 +158,74 @@ class TestLogsDownload(_FlaskBase):
         content_type = resp.content_type or ""
         self.assertIn("zip", content_type.lower())
 
+    def test_bundle_includes_pc_diagnostics_snapshot(self):
+        diagnostics = {
+            "schema_version": 1,
+            "system": {"platform": "Windows-11", "cpu_count_logical": 8},
+            "memory": {
+                "total_physical_bytes": 16_000_000_000,
+                "available_physical_bytes": 4_000_000_000,
+                "memory_load_percent": 75,
+            },
+            "disk": [
+                {
+                    "label": "data_dir",
+                    "root": "C:\\",
+                    "total_bytes": 512_000_000_000,
+                    "free_bytes": 90_000_000_000,
+                    "used_percent": 82.4,
+                }
+            ],
+            "app_process": {
+                "pid": 1234,
+                "tree_process_count": 3,
+                "tree_private_bytes": 900_000_000,
+                "tree_working_set_bytes": 1_100_000_000,
+            },
+        }
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch(
+                "blueprints.coin_prep._collect_pc_diagnostics",
+                return_value=diagnostics,
+            ),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_fills", return_value=[]),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.get_config_history", return_value=[]),
+            patch("database.get_all_settings", return_value=[]),
+            patch("super_log.get_archive_summary", return_value=[]),
+            patch("super_log.get_log_path", return_value=None),
+            patch("super_log.get_log_stats", return_value={}),
+        ):
+            resp = self.client.get("/api/logs/download", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            self.assertIn("snapshots/pc_diagnostics.json", zf.namelist())
+            snapshot = json.loads(zf.read("snapshots/pc_diagnostics.json"))
+            readme = zf.read("README.txt").decode("utf-8", errors="replace")
+
+        self.assertEqual(snapshot, diagnostics)
+        self.assertIn("pc_diagnostics.json", readme)
+
+    def test_pc_diagnostics_collector_reports_system_and_app_memory_shape(self):
+        from blueprints import coin_prep as coin_prep_routes
+
+        diagnostics = coin_prep_routes._collect_pc_diagnostics()
+
+        self.assertEqual(diagnostics["schema_version"], 1)
+        self.assertIn("system", diagnostics)
+        self.assertIn("memory", diagnostics)
+        self.assertIn("disk", diagnostics)
+        self.assertIn("app_process", diagnostics)
+        self.assertEqual(diagnostics["app_process"]["pid"], os.getpid())
+        self.assertIsInstance(diagnostics["disk"], list)
+        self.assertGreaterEqual(diagnostics["app_process"]["tree_process_count"], 1)
+
     def test_bundle_includes_market_toxicity_snapshot(self):
         toxicity = {
             "score": 82,

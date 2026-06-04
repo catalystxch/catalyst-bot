@@ -31,6 +31,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 import api_server
 from config import cfg
 from database import log_event, get_stats, backup_database, get_connection
+from pc_diagnostics import collect_pc_diagnostics as _collect_pc_diagnostics
 
 
 # Package directory — the parent of blueprints/ (i.e. src/catalyst/).
@@ -2510,6 +2511,11 @@ def api_logs_download():
         # Config snapshot — cfg.to_dict() already excludes secrets
         # (SPACESCAN_API_KEY, SAGE_FINGERPRINT, RPC TLS paths, etc.).
         try:
+            snapshots["pc_diagnostics"] = _collect_pc_diagnostics()
+        except Exception as e:
+            snapshots["pc_diagnostics"] = {"error": str(e)}
+
+        try:
             snapshots["config"] = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
         except Exception as e:
             snapshots["config"] = {"error": str(e)}
@@ -2722,6 +2728,7 @@ def api_logs_download():
                 "    config_history.json   recent settings changes (secrets stripped)",
                 "    bot_settings.json     persistent app state/settings",
                 "    system_info.json      Python / OS / platform",
+                "    pc_diagnostics.json   PC memory, disk, CPU, app process tree",
                 "    api_calls.json        external API call counters",
                 "    coin_inventory.json   tier-group counts + topup-pool totals",
                 "    open_offers.json      live open offers (with trade_ids)",
@@ -2750,6 +2757,8 @@ def api_logs_download():
                 "  passwords, seed phrases, and private keys are redacted",
                 "  recursively.",
                 "* User-home path prefixes are redacted from log text.",
+                "* PC diagnostics include drive roots and CATalyst child",
+                "  process names, not full command lines or user paths.",
                 "* Configuration excludes SPACESCAN_API_KEY, RPC TLS paths, and",
                 "  wallet fingerprints (filtered by cfg.to_dict()).",
                 "* The DB file, .env, user_secrets.json, and TLS keys are NOT",
