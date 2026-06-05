@@ -3804,7 +3804,7 @@ def _is_no_spendable_coin_error(result: Optional[Dict]) -> bool:
     return "no spendable coins" in error or "coin selection error" in error
 
 
-def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
+def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | str:
     """Cancel multiple offers using the same 3-step path the Sage GUI uses.
 
     The Sage 'Cancel All Active' button does NOT use auto_submit=True.  It uses:
@@ -3816,7 +3816,11 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
     code path that silently produces an invalid/incomplete signature, causing the
     transaction to fail on-chain.  The explicit sign+submit path always works.
 
-    Returns True if all three steps succeeded, False otherwise.
+    Returns True if all three steps succeeded, "already_in_mempool" when Sage
+    proves this exact transaction is already pending, or False for
+    fallback-worthy failures. A generic MEMPOOL_CONFLICT can mean only one input
+    in the batch is already spent, so the caller must keep sequential fallback
+    available for the remaining offers.
     """
     num = len(offer_ids)
     print(f"   [Bulk] Step 1: cancel_offers(auto_submit=False, fee=0, n={num})...")
@@ -3830,6 +3834,12 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
             },
             timeout=max(30, num * 2),
         )
+    except SageMempoolConflict as e:
+        print(f"   [Bulk] cancel_offers mempool conflict; falling back: {e}")
+        return False
+    except SageAlreadyIncluding as e:
+        print(f"   [Bulk] cancel_offers already including transaction: {e}")
+        return "already_in_mempool"
     except Exception as e:
         print(f"   [Bulk] cancel_offers failed: {e}")
         return False
@@ -3857,6 +3867,12 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
             },
             timeout=sign_timeout,
         )
+    except SageMempoolConflict as e:
+        print(f"   [Bulk] sign_coin_spends mempool conflict; falling back: {e}")
+        return False
+    except SageAlreadyIncluding as e:
+        print(f"   [Bulk] sign_coin_spends already including transaction: {e}")
+        return "already_in_mempool"
     except Exception as e:
         print(f"   [Bulk] sign_coin_spends failed: {e}")
         return False
@@ -3883,6 +3899,12 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
             },
             timeout=30,
         )
+    except SageMempoolConflict as e:
+        print(f"   [Bulk] submit_transaction mempool conflict; falling back: {e}")
+        return False
+    except SageAlreadyIncluding as e:
+        print(f"   [Bulk] submit_transaction already including transaction: {e}")
+        return "already_in_mempool"
     except Exception as e:
         print(f"   [Bulk] submit_transaction failed: {e}")
         return False
@@ -3901,6 +3923,13 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool:
         return False
     _sub_err = submit_resp.get("error") or submit_resp.get("reason")
     _sub_status = str(submit_resp.get("status", "") or "").lower()
+    _sub_text = f"{_sub_err or ''} {_sub_status}".upper()
+    if "MEMPOOL_CONFLICT" in _sub_text:
+        print("   [Bulk] submit_transaction mempool conflict - falling back")
+        return False
+    if "ALREADY_INCLUDING_TRANSACTION" in _sub_text:
+        print("   [Bulk] submit_transaction already in mempool - marking pending")
+        return "already_in_mempool"
     if _sub_err or _sub_status in ("failed", "error", "rejected"):
         print(
             f"   [Bulk] submit_transaction rejected payload "
@@ -4025,11 +4054,14 @@ def cancel_offers_batch(
     # _cancel_offers_bulk_proper() replicates the exact GUI path.
     cancel_submitted = False
 
-    def _mark_bulk_submitted(batch_ids: list) -> None:
+    def _mark_bulk_submitted(
+        batch_ids: list,
+        method: str = "submitted_pending_confirm",
+    ) -> None:
         for tid in batch_ids:
             results[tid] = {
                 "success": True,
-                "method": "submitted_pending_confirm",
+                "method": method,
                 "submission_path": "bulk_3step",
             }
 
@@ -4098,14 +4130,22 @@ def cancel_offers_batch(
                 f"{len(batch_ids)} offers (GUI 3-step path)..."
             )
             try:
-                bulk_ok = _cancel_offers_bulk_proper(batch_ids, fee_mojos=0)
-                if bulk_ok:
+                bulk_result = _cancel_offers_bulk_proper(batch_ids, fee_mojos=0)
+                if bulk_result is True:
                     print(
                         f"   ✅ [Sage] Bulk cancel {batch_label} submitted successfully"
                     )
                     cancel_submitted = True
                     batch_submitted = True
                     _mark_bulk_submitted(batch_ids)
+                elif bulk_result == "already_in_mempool":
+                    print(
+                        f"   [Sage] Bulk cancel {batch_label} is pending in mempool "
+                        f"({bulk_result})"
+                    )
+                    cancel_submitted = True
+                    batch_submitted = True
+                    _mark_bulk_submitted(batch_ids, method=bulk_result)
                 else:
                     print(
                         f"   ⚠️ [Sage] Bulk cancel {batch_label} failed — falling back to sequential"

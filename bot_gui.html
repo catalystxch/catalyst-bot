@@ -14338,9 +14338,53 @@
             const parsedLocal = Date.parse(raw);
             return Number.isFinite(parsedLocal) ? parsedLocal : Date.now();
         }
+        function _v4HasPriceHistoryPairContext() {
+            if (currentCAT && currentCAT.asset_id) return true;
+            const statusCatAssetId =
+                bot_state && bot_state.current_cat && bot_state.current_cat.asset_id;
+            const dashboardCatAssetId =
+                typeof _dashboardData !== 'undefined'
+                && _dashboardData
+                && _dashboardData.current_cat
+                && _dashboardData.current_cat.asset_id;
+            if (!statusCatAssetId && !dashboardCatAssetId) return false;
+            if (typeof shouldRequireExplicitPairSelection === 'function') {
+                return !shouldRequireExplicitPairSelection(bot_state);
+            }
+            return true;
+        }
+        function _v4MergePriceHistoryPoints(points) {
+            const loadedPoints = [];
+            (points || []).forEach(point => {
+                const y = parseFloat(point.mid || point.combined_price || 0);
+                const t = _v4ParsePriceHistoryTimestamp(point.timestamp);
+                if (y > 0 && Number.isFinite(y)) {
+                    loadedPoints.push({ t, y });
+                }
+            });
+            if (!loadedPoints.length) {
+                _v4TrimPriceHistory();
+                return;
+            }
+
+            const existingLiveSamples = _v4PriceHistory.slice();
+            const combined = loadedPoints.concat(existingLiveSamples)
+                .filter(point => point && point.y > 0 && Number.isFinite(point.y));
+            combined.sort((a, b) => a.t - b.t);
+
+            _v4PriceHistory.length = 0;
+            const seen = new Set();
+            combined.forEach(point => {
+                const key = Math.round(point.t) + ':' + point.y;
+                if (seen.has(key)) return;
+                seen.add(key);
+                _v4PriceHistory.push(point);
+            });
+            _v4TrimPriceHistory();
+        }
         async function v4LoadPriceHistory(force = false) {
             if (_v4PriceHistoryLoading && !force) return;
-            if (!currentCAT || !currentCAT.asset_id) {
+            if (!_v4HasPriceHistoryPairContext()) {
                 _v4PriceHistory.length = 0;
                 v4RenderPriceHistoryChart();
                 return;
@@ -14352,15 +14396,7 @@
                 const response = await apiFetch(url, { signal: AbortSignal.timeout(12000) });
                 const data = await response.json();
                 if (data && data.success && Array.isArray(data.points)) {
-                    _v4PriceHistory.length = 0;
-                    data.points.forEach(point => {
-                        const y = parseFloat(point.mid || point.combined_price || 0);
-                        const t = _v4ParsePriceHistoryTimestamp(point.timestamp);
-                        if (y > 0 && Number.isFinite(y)) {
-                            _v4PriceHistory.push({ t, y });
-                        }
-                    });
-                    _v4TrimPriceHistory();
+                    _v4MergePriceHistoryPoints(data.points);
                 }
             } catch (err) {
                 debugWarn('[PRICE HISTORY] Fetch failed:', err.message || err);
