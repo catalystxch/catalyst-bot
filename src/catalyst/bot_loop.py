@@ -437,6 +437,8 @@ class BotLoop:
         # ---- Loop state ----
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+        self._stop_finalize_thread: Optional[threading.Thread] = None
+        self._stop_finalize_lock = threading.Lock()
         self._loop_count: int = 0
         self._start_time: float = 0  # Set when bot starts, used for uptime
         self._last_loop_duration: float = 0
@@ -4331,6 +4333,14 @@ class BotLoop:
         """
         if self._running:
             return False
+        if self._stop_finalize_thread and self._stop_finalize_thread.is_alive():
+            self._set_state(running=False, status="stopping")
+            log_event(
+                "warning",
+                "bot_start_blocked_stopping",
+                "Bot is still finishing the previous stop; wait for it to fully stop before starting again",
+            )
+            return False
 
         self._reset_runtime_state()
 
@@ -4569,12 +4579,18 @@ class BotLoop:
         )
         return True
 
-    def stop(self) -> bool:
+    def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
 
         Returns True if stopped, False if not running.
         """
         if not self._running:
+            if (
+                wait
+                and self._stop_finalize_thread
+                and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread.join(timeout=90)
             return False
 
         self._running = False
@@ -4585,6 +4601,22 @@ class BotLoop:
         # minutes after stop() returns, because the 10s join timeout
         # expires but the thread is still alive creating offers.
         self.offer_manager._stop_requested = True
+
+        # Wake sleeping threads promptly. For GUI/API stop we return after
+        # this signal and let the finalizer perform joins/cleanup.
+        self._watcher_event.set()
+        if not wait:
+            if not (
+                self._stop_finalize_thread and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+            return True
+
         try:
             self.coin_manager.stop_topup(wait_secs=10)
         except Exception as e:
@@ -4665,6 +4697,91 @@ class BotLoop:
 
         log_event("info", "bot_stopped", "Bot loop stopped")
         return True
+
+    def _finalize_stop(self) -> None:
+        """Finish stop cleanup after the running flag has been cleared."""
+        with self._stop_finalize_lock:
+            try:
+                self.coin_manager.stop_topup(wait_secs=10)
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "stop_topup_failed",
+                    f"stop_topup raised during shutdown: {e}",
+                )
+
+            self._watcher_event.set()
+
+            try:
+                self.amm_monitor.stop()
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "amm_monitor_stop_failed",
+                    f"AMM Monitor stop raised during shutdown: {e}",
+                )
+
+            if _mempool_watcher_mod:
+                try:
+                    _mempool_watcher_mod.stop_watcher()
+                except Exception as e:
+                    log_event(
+                        "debug",
+                        "mempool_watcher_stop_failed",
+                        f"Mempool watcher stop raised during shutdown: {e}",
+                    )
+
+            if (
+                self._thread
+                and self._thread.is_alive()
+                and self._thread is not threading.current_thread()
+            ):
+                self._thread.join(timeout=30)
+
+            if self._splash_receive_thread and self._splash_receive_thread.is_alive():
+                self._splash_receive_thread.join(timeout=5)
+
+            for _t_name, _t_ref in [
+                ("health_monitor", self._health_thread),
+                ("price_watcher", self._watcher_thread),
+                ("coin_watcher", self._coin_watcher_thread),
+                ("dexie_repost", self._startup_repost_thread),
+            ]:
+                if _t_ref and _t_ref.is_alive():
+                    _t_ref.join(timeout=10)
+                    if _t_ref.is_alive():
+                        log_event(
+                            "warning",
+                            "thread_join_timeout",
+                            f"{_t_name} thread did not exit within 10s",
+                        )
+
+            try:
+                splash_running = bool(self.splash_node.is_running())
+            except Exception:
+                splash_running = False
+            if splash_running:
+                try:
+                    self.splash_node.stop()
+                except Exception as e:
+                    log_event(
+                        "debug",
+                        "splash_node_stop_failed",
+                        f"Splash node stop raised during shutdown: {e}",
+                    )
+
+            self._set_state(running=False, status="stopped")
+
+            for alert_id in (
+                "circuit_breaker",
+                "bot_recovery",
+                "cancel_retries",
+                "buy_disabled",
+                "sell_disabled",
+            ):
+                self._clear_alert(alert_id)
+
+            log_event("info", "bot_stopped", "Bot loop stopped")
 
     def is_running(self) -> bool:
         """Check if the bot loop is running."""
@@ -6887,6 +7004,29 @@ class BotLoop:
                     "warning", "db_cleanup_failed", f"DB offer cleanup failed: {e}"
                 )
 
+            locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
+            if locally_expired_ids:
+                open_buys = [
+                    o for o in open_buys if o.get("trade_id") not in locally_expired_ids
+                ]
+                open_sells = [
+                    o
+                    for o in open_sells
+                    if o.get("trade_id") not in locally_expired_ids
+                ]
+                buy_ids = {
+                    o.get("trade_id", "") for o in open_buys if o.get("trade_id")
+                }
+                sell_ids = {
+                    o.get("trade_id", "") for o in open_sells if o.get("trade_id")
+                }
+                wallet_open_ids = buy_ids | sell_ids
+                log_event(
+                    "info",
+                    "startup_local_expired_filtered",
+                    f"Retired and filtered {len(locally_expired_ids)} locally expired open offer(s) after startup reconciliation",
+                )
+
             recovered_startup_trade_ids = set()
 
             # ---- Recover unknown offers ----
@@ -7723,6 +7863,7 @@ class BotLoop:
 
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
+        self._cycle_started_running = bool(self._running)
         self._recovery_state["cycle_probe_churn"] = False
         self._recovery_state["cycle_create_stalled"] = False
         self._requoted_this_cycle: set = set()  # sides requoted in step 9
@@ -7998,6 +8139,9 @@ class BotLoop:
             log_event("warning", "no_price", "Could not fetch price — skipping cycle")
             return
 
+        if self._cycle_stop_requested("price_fetch"):
+            return
+
         self._current_mid_price = mid_price
         self._set_state(mid_price=str(mid_price))
 
@@ -8209,6 +8353,9 @@ class BotLoop:
             self._clear_alert("circuit_breaker")
             self._circuit_breaker_offer_safed = False
 
+        if self._cycle_stop_requested("pre_wallet_sync"):
+            return
+
         # ---- Step 3: Get current offers from wallet ----
         self._set_cycle_step("step3_wallet_sync")
         print("   [3] Syncing offers from wallet...", end="", flush=True)
@@ -8216,6 +8363,22 @@ class BotLoop:
         open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
         wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
+        locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
+        if locally_expired_ids:
+            open_buys = [
+                o for o in open_buys if o.get("trade_id") not in locally_expired_ids
+            ]
+            open_sells = [
+                o for o in open_sells if o.get("trade_id") not in locally_expired_ids
+            ]
+            closed = list(closed or []) + [
+                {"trade_id": tid, "status": "expired"} for tid in locally_expired_ids
+            ]
+            log_event(
+                "info",
+                "wallet_open_expired_filtered",
+                f"Filtered {len(locally_expired_ids)} locally expired offer(s) out of the live wallet book",
+            )
         self._last_live_offer_edges = self._get_live_offer_edges(open_buys, open_sells)
 
         current_buy_ids = {
@@ -8496,6 +8659,9 @@ class BotLoop:
             self._clear_alert("wallet_offer_sync")
             self._wallet_sync_was_stale = False
 
+        if self._cycle_stop_requested("post_wallet_sync"):
+            return
+
         # ---- Step 4: Detect fills ----
         self._set_cycle_step("step4_fill_detection")
         # F11 fix (2026-04-08): drain any pending mempool watcher signals
@@ -8766,7 +8932,15 @@ class BotLoop:
             and not getattr(self, "_graceful_in_progress", False)
             and not self._recovery_is_active()
         ):
-            all_open = open_buys + open_sells
+            all_open = list(open_buys) + list(open_sells)
+            try:
+                all_open.extend(list(_db_buy_all) + list(_db_sell_all))
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "expiry_refresh_db_merge_failed",
+                    f"Expiry refresh proceeding with wallet-open offers only: {e}",
+                )
             expiring_tids = self.offer_manager.detect_expiring_offers(
                 all_open, refresh_before_secs=cfg.OFFER_REFRESH_BEFORE
             )
@@ -9970,6 +10144,9 @@ class BotLoop:
                     flush=True,
                 )
 
+        if self._cycle_stop_requested("pre_requote"):
+            return
+
         # ---- Step 9: Requote if price moved or forced by convergence ----
         self._set_cycle_step("step9_requote")
         force_buy = self._force_requote.get("buy", False)
@@ -10135,6 +10312,9 @@ class BotLoop:
                 f"Reserve floor check failed (non-fatal): {_rf_err}",
             )
 
+        if self._cycle_stop_requested("pre_create"):
+            return
+
         # ---- Step 10: Create new offers if needed ----
         self._set_cycle_step("step10_create_offers")
         # Cap is based on DB-open count (_db_open_*_ids) so zombie wallet offers
@@ -10184,6 +10364,9 @@ class BotLoop:
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
         )
+
+        if self._cycle_stop_requested("post_create"):
+            return
 
         self._flush_public_offer_queues()
 
@@ -13048,6 +13231,18 @@ class BotLoop:
                 self._clear_alert("step_sla")
             except Exception:
                 pass
+
+    def _cycle_stop_requested(self, step_name: str) -> bool:
+        """Return True when the current cycle should stop immediately."""
+        if self._running or not getattr(self, "_cycle_started_running", False):
+            return False
+        self._set_cycle_step("idle")
+        log_event(
+            "info",
+            "cycle_stop_requested",
+            f"Stop requested during {step_name}; ending current cycle before more trading actions",
+        )
+        return True
 
     def _check_step_sla(self) -> None:
         """F27 (2026-04-08): SLA timer for individual cycle steps.

@@ -2,6 +2,7 @@ import itertools
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch, call
 
@@ -1787,6 +1788,24 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             ),
             Decimal("0.001"),
         )
+
+
+class ExpiryDetectionTests(unittest.TestCase):
+    def test_detect_expiring_offers_uses_db_expires_at_fallback(self):
+        manager = offer_manager.OfferManager()
+        now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+        soon = (now + timedelta(minutes=10)).isoformat()
+        later = (now + timedelta(hours=3)).isoformat()
+
+        offers = [
+            {"trade_id": "soon-db-expiry", "expires_at": soon},
+            {"trade_id": "later-db-expiry", "expires_at": later},
+        ]
+
+        with patch.object(offer_manager.time, "time", return_value=now.timestamp()):
+            expiring = manager.detect_expiring_offers(offers, refresh_before_secs=1800)
+
+        self.assertEqual(expiring, ["soon-db-expiry"])
 
 
 class CancelPendingMempoolTests(unittest.TestCase):

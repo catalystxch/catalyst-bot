@@ -4181,52 +4181,21 @@ class OfferManager:
         We must check valid_times.max_time manually and cancel stale ones.
         """
         count = cleanup_expired_offers()
+        return count + len(self.cleanup_expired_db_offers())
 
-        # Also update our database for any that expired
-        open_offers = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
-        expired_count = 0
-        for offer in open_offers:
-            expires_at = offer.get("expires_at")
-            if expires_at:
-                from datetime import datetime, timezone
+    def cleanup_expired_db_offers(self) -> List[str]:
+        """Retire DB-open offers whose local expires_at has elapsed."""
+        try:
+            from database import expire_open_offers_by_time
 
-                try:
-                    exp_time = datetime.fromisoformat(expires_at)
-                    # Ensure timezone-aware comparison
-                    if exp_time.tzinfo is None:
-                        exp_time = exp_time.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) > exp_time:
-                        update_offer_status(offer["trade_id"], "expired")
-                        # Expired offers unlock the coin (no on-chain tx for expiry).
-                        # Mark the coin as free so it can be reused.
-                        _expired_coin_id = offer.get("coin_id")
-                        if _expired_coin_id:
-                            try:
-                                from database import free_coin as _free_coin
-
-                                _free_coin(_expired_coin_id)
-                                log_event(
-                                    "debug",
-                                    "coin_freed_on_expire",
-                                    f"Coin {_expired_coin_id[:16]}... freed "
-                                    f"(offer {offer['trade_id'][:12]}... expired)",
-                                )
-                            except Exception as e:
-                                log_event(
-                                    "debug",
-                                    "coin_free_on_expire_failed",
-                                    f"Could not free coin on offer expiry (non-critical): {e}",
-                                )
-                        expired_count += 1
-                except (ValueError, TypeError):
-                    pass
-
-        if expired_count > 0:
+            return expire_open_offers_by_time(cat_asset_id=cfg.CAT_ASSET_ID)
+        except Exception as e:
             log_event(
-                "info", "offers_expired", f"Cleaned up {expired_count} expired offers"
+                "warning",
+                "local_expired_offer_cleanup_failed",
+                f"Could not retire locally expired offers: {e}",
             )
-
-        return count + expired_count
+            return []
 
     # -------------------------------------------------------------------
     # Offer state queries
@@ -4279,14 +4248,38 @@ class OfferManager:
         for offer in open_offers:
             # Check valid_times.max_time from the wallet RPC record
             valid_times = offer.get("valid_times") or {}
-            max_time = valid_times.get("max_time", 0)
+            max_time = (
+                valid_times.get("max_time", 0)
+                or offer.get("max_time", 0)
+                or offer.get("expires_at_second", 0)
+            )
 
-            if max_time and max_time > 0:
-                time_left = max_time - now
+            if not max_time and offer.get("expires_at"):
+                try:
+                    from datetime import datetime, timezone
+
+                    exp_time = datetime.fromisoformat(
+                        str(offer.get("expires_at")).replace("Z", "+00:00")
+                    )
+                    if exp_time.tzinfo is None:
+                        exp_time = exp_time.replace(tzinfo=timezone.utc)
+                    max_time = int(exp_time.timestamp())
+                except Exception:
+                    max_time = 0
+
+            try:
+                max_time_int = int(max_time or 0)
+            except Exception:
+                max_time_int = 0
+
+            if max_time_int > 0:
+                time_left = max_time_int - now
                 if 0 < time_left < refresh_before_secs:
                     tid = offer.get("trade_id", "")
                     if tid:
                         expiring.append(tid)
+
+        expiring = list(dict.fromkeys(expiring))
 
         if expiring:
             log_event(

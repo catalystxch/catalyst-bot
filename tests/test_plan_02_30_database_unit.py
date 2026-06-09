@@ -10,6 +10,7 @@ get_recent_prices, log_event/get_recent_events, get_setting/set_setting.
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 try:
@@ -244,6 +245,73 @@ class TestGetOpenOffers(_TempDB):
         _db.update_offer_status("b1", "cancelled")
         buys = _db.get_open_offers(side="buy", cat_asset_id="assetA")
         self.assertNotIn("b1", {o["trade_id"] for o in buys})
+
+    def test_expire_open_offers_by_time_marks_elapsed_rows_and_frees_coin(self):
+        now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+        past = (now - timedelta(seconds=1)).isoformat()
+        future = (now + timedelta(hours=1)).isoformat()
+
+        _db.upsert_coin("0xexpiredcoin", "cat", 123456, designation="tier_spare")
+        _db.add_offer(
+            "expired-row",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+            coin_id="0xexpiredcoin",
+        )
+        _db.lock_coin("0xexpiredcoin", "expired-row")
+        _db.add_offer(
+            "future-row",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=future,
+        )
+
+        expired = _db.expire_open_offers_by_time(
+            cat_asset_id="assetA", now_ts=now.timestamp()
+        )
+
+        self.assertEqual(expired, ["expired-row"])
+        self.assertEqual(_db.get_offer("expired-row")["status"], "expired")
+        self.assertEqual(_db.get_offer("future-row")["status"], "open")
+        open_ids = {o["trade_id"] for o in _db.get_open_offers(cat_asset_id="assetA")}
+        self.assertNotIn("expired-row", open_ids)
+        self.assertIn("future-row", open_ids)
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xexpiredcoin",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(coin["status"], "free")
+        self.assertIsNone(coin["trade_id"])
+
+    def test_init_database_does_not_expire_rows_before_startup_reconcile(self):
+        expired_at = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        _db.add_offer(
+            "expired-but-unreconciled",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=expired_at,
+        )
+
+        _db._db_initialized_path = ""
+        _db.init_database()
+
+        offer = _db.get_offer("expired-but-unreconciled")
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
 
     def test_excludes_pending_fill_verification_by_default(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")

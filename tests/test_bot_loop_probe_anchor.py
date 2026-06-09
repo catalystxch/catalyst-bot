@@ -134,6 +134,9 @@ class _DummyOfferManager:
     def detect_expiring_offers(self, *args, **kwargs):
         return []
 
+    def cleanup_expired_db_offers(self):
+        return []
+
     def retry_failed_cancels(self):
         return 0
 
@@ -399,6 +402,30 @@ class ProbeAnchorTests(unittest.TestCase):
 
     def tearDown(self):
         self._cfg_patcher.stop()
+
+    def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
+        self,
+    ):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+
+        class _StopAfterPrice:
+            def get_price(self, *args, **kwargs):
+                del args, kwargs
+                loop._running = False
+                return {"mid_price": Decimal("1.10"), "arb_gap_bps": 0}
+
+        class _FailingSyncOfferManager(_DummyOfferManager):
+            def sync_from_wallet(self):
+                raise AssertionError("wallet sync should not run after stop")
+
+        loop.price_engine = _StopAfterPrice()
+        loop.offer_manager = _FailingSyncOfferManager()
+
+        with patch.object(bot_loop, "log_event"):
+            loop._run_one_cycle()
+
+        self.assertEqual(loop._current_cycle_step, "idle")
 
     def test_watchdog_warning_noise_is_suppressed_between_milestones(self):
         loop = bot_loop.BotLoop()

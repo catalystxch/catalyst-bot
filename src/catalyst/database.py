@@ -2121,6 +2121,78 @@ def get_open_offers(
     return [dict(row) for row in rows]
 
 
+def _parse_offer_expiry_ts(expires_at) -> Optional[float]:
+    """Parse an offer expires_at value into a UTC timestamp."""
+    if expires_at is None:
+        return None
+    if isinstance(expires_at, (int, float)):
+        return float(expires_at) if expires_at > 0 else None
+
+    text = str(expires_at).strip()
+    if not text or text in {"0", "None", "null"}:
+        return None
+    try:
+        expiry_dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if expiry_dt.tzinfo is None:
+        expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+    return expiry_dt.timestamp()
+
+
+def expire_open_offers_by_time(
+    cat_asset_id: str = None,
+    now_ts: float = None,
+    include_pending_cancel: bool = False,
+    include_mempool_observed: bool = False,
+) -> List[str]:
+    """Mark locally elapsed open offers expired and free their locked coins.
+
+    Wallets and public indices can keep displaying time-expired offers as
+    OPEN. CATalyst's local ``expires_at`` is the authoritative cap-counting
+    source: once it has elapsed, the offer is no longer actionable and must
+    not occupy a live ladder slot.
+    """
+    now = float(now_ts if now_ts is not None else time.time())
+    try:
+        offers = get_open_offers(
+            cat_asset_id=cat_asset_id,
+            include_pending_cancel=include_pending_cancel,
+            include_mempool_observed=include_mempool_observed,
+        )
+    except Exception as e:
+        log_event(
+            "warning",
+            "offer_expiry_query_failed",
+            f"Could not query open offers for local expiry sweep: {e}",
+        )
+        return []
+
+    elapsed_trade_ids: List[str] = []
+    for offer in offers:
+        trade_id = str(offer.get("trade_id") or "").strip()
+        if not trade_id:
+            continue
+        expiry_ts = _parse_offer_expiry_ts(offer.get("expires_at"))
+        if expiry_ts is not None and expiry_ts <= now:
+            elapsed_trade_ids.append(trade_id)
+
+    expired_trade_ids: List[str] = []
+    for trade_id in elapsed_trade_ids:
+        if update_offer_status(trade_id, "expired"):
+            expired_trade_ids.append(trade_id)
+
+    if expired_trade_ids:
+        log_event(
+            "info",
+            "local_expired_offers_retired",
+            f"Retired {len(expired_trade_ids)} locally expired open offer(s)",
+            data={"trade_ids": expired_trade_ids[:50]},
+        )
+
+    return expired_trade_ids
+
+
 def get_offer_lifecycle_summary(cat_asset_id: str = None) -> Dict:
     """Return compact offer status/lifecycle counts for GUI diagnostics."""
     empty_side = {"open": 0, "filled": 0, "cancelled": 0, "expired": 0}

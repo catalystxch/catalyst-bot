@@ -337,7 +337,7 @@ def api_bot_stop():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    bot.stop()
+    bot.stop(wait=False)
     server.events.emit("bot_control", {"action": "stopped"})
     return jsonify({"status": "stopped"})
 
