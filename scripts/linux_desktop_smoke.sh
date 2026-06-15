@@ -99,9 +99,15 @@ if ! command -v xwd >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$screenshot")"
-xwd -silent -root -out "$screenshot"
+xdotool windowactivate --sync "$window_id" >/dev/null 2>&1 || true
 
-python3 - "$screenshot" <<'PY'
+painted=""
+last_capture_error=""
+for _ in $(seq 1 15); do
+  xwd -silent -root -out "$screenshot"
+
+  set +e
+  capture_result="$(python3 - "$screenshot" 2>&1 <<'PY'
 import struct
 import sys
 from pathlib import Path
@@ -146,6 +152,29 @@ if unique_values < 4 or nonzero < max(128, len(sample) // 100):
 
 print(f"Linux desktop smoke screenshot nonblank: {path} ({width}x{height})")
 PY
+)"
+  capture_code=$?
+  set -e
+
+  if [[ "$capture_code" -eq 0 ]]; then
+    printf '%s\n' "$capture_result"
+    painted=1
+    break
+  fi
+
+  last_capture_error="$capture_result"
+  if [[ "$capture_result" != *"screenshot is blank or nearly blank"* ]]; then
+    printf '%s\n' "$capture_result" >&2
+    exit "$capture_code"
+  fi
+
+  sleep 1
+done
+
+if [[ -z "$painted" ]]; then
+  printf '%s\n' "$last_capture_error" >&2
+  exit 1
+fi
 
 echo "Linux desktop smoke passed: visible CATalyst window captured"
 RUNNER
