@@ -10190,16 +10190,16 @@
 
                 <!-- Orderbook Depth -->
                 <div style="background: var(--bg-surface); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">📊 Orderbook Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH value of all buy and sell offers on Dexie. Deeper books mean more liquidity and less price impact per trade.</span></span></div>
+                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">📊 Orderbook Depth <span class="cc-help">?<span class="cc-tooltip">Dexie-style visible book totals: buy depth is XCH in bids, sell depth is CAT available in asks. The pressure bar uses near-market XCH depth after ignoring far-out offers.</span></span></div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                         <div id="intelBuyDepthPanel">
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Buy Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH sitting in buy offers. Higher = stronger buying support.</span></span></div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Buy Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH sitting in visible buy offers on Dexie. Higher = stronger buying support.</span></span></div>
                             <div id="intelBuyDepth" style="font-size: 16px; font-weight: 600; color: var(--status-success);">0.00 XCH</div>
                             <div style="color: rgba(255,255,255,0.4); font-size: 11px;"><span id="intelBuyCount">0</span> offers</div>
                         </div>
                         <div id="intelSellDepthPanel">
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Sell Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH value of sell offers. Higher = more tokens available to buy.</span></span></div>
-                            <div id="intelSellDepth" style="font-size: 16px; font-weight: 600; color: var(--status-danger);">0.00 XCH</div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Sell Depth <span class="cc-help">?<span class="cc-tooltip">Total CAT available in visible sell offers on Dexie. Higher = more tokens available to buy.</span></span></div>
+                            <div id="intelSellDepth" style="font-size: 16px; font-weight: 600; color: var(--status-danger);">0 CAT</div>
                             <div style="color: rgba(255,255,255,0.4); font-size: 11px;"><span id="intelSellCount">0</span> offers</div>
                         </div>
                     </div>
@@ -24669,6 +24669,21 @@
             }
         }
 
+        function marketIntelCatTicker() {
+            const raw = currentCAT?.ticker_id || currentCAT?.ticker || currentCAT?.name || 'CAT';
+            const label = String(raw || 'CAT')
+                .replace(/_XCH$/i, '')
+                .replace(/\/XCH$/i, '')
+                .trim();
+            return label || 'CAT';
+        }
+
+        function formatMarketIntelDepth(value, maximumFractionDigits = 2) {
+            const n = Number(value || 0);
+            if (!Number.isFinite(n)) return '0';
+            return n.toLocaleString(undefined, { maximumFractionDigits });
+        }
+
         function renderMarketIntel(data) {
             const el = id => document.getElementById(id);
             if (!data || !el('intelCompSpread')) return;
@@ -24762,10 +24777,18 @@
                 }
             }
 
-            const buyDepth = parseFloat(data.buy_depth_xch || 0);
-            const sellDepth = parseFloat(data.sell_depth_xch || 0);
-            el('intelBuyDepth').textContent = buyDepth.toFixed(2) + ' XCH';
-            el('intelSellDepth').textContent = sellDepth.toFixed(2) + ' XCH';
+            const displayBuyDepth = parseFloat(data.dexie_total_buy_depth_xch ?? data.buy_depth_xch ?? 0) || 0;
+            const displaySellDepthXch = parseFloat(data.dexie_total_sell_depth_xch ?? data.sell_depth_xch ?? 0) || 0;
+            const displaySellDepthCat = parseFloat(data.dexie_total_sell_depth_cat ?? 0) || 0;
+            const sellDepthUnit = marketIntelCatTicker();
+            const buyDepth = parseFloat(data.buy_depth_xch ?? displayBuyDepth ?? 0) || 0;
+            const sellDepth = parseFloat(data.sell_depth_xch ?? displaySellDepthXch ?? 0) || 0;
+            el('intelBuyDepth').textContent = formatMarketIntelDepth(displayBuyDepth, 2) + ' XCH';
+            el('intelBuyDepth').title = 'Near-market depth used by the bot: ' + buyDepth.toFixed(2) + ' XCH';
+            el('intelSellDepth').textContent = displaySellDepthCat > 0
+                ? formatMarketIntelDepth(displaySellDepthCat, displaySellDepthCat >= 1000 ? 0 : 2) + ' ' + sellDepthUnit
+                : formatMarketIntelDepth(displaySellDepthXch, 2) + ' XCH';
+            el('intelSellDepth').title = 'Near-market depth used by the bot: ' + sellDepth.toFixed(2) + ' XCH';
             el('intelBuyCount').textContent = data.num_buy_offers || 0;
             el('intelSellCount').textContent = data.num_sell_offers || 0;
 

@@ -70,8 +70,12 @@ class MarketIntel:
             "overall_best_bid": Decimal("0"),  # Highest buy price (anyone)
             "overall_best_ask": Decimal("0"),  # Lowest sell price (anyone)
             "overall_spread_bps": Decimal("0"),  # Full orderbook spread
-            "buy_depth_xch": Decimal("0"),  # Total XCH depth on buy side
-            "sell_depth_xch": Decimal("0"),  # Total XCH depth on sell side
+            "buy_depth_xch": Decimal("0"),  # Actionable XCH depth near market
+            "sell_depth_xch": Decimal("0"),  # Actionable XCH depth near market
+            "dexie_total_buy_depth_xch": Decimal("0"),  # Raw fetched buy XCH
+            "dexie_total_buy_depth_cat": Decimal("0"),  # Raw fetched buy CAT
+            "dexie_total_sell_depth_xch": Decimal("0"),  # Raw fetched sell XCH
+            "dexie_total_sell_depth_cat": Decimal("0"),  # Raw fetched sell CAT
             "num_buy_offers": 0,  # Total offers (including ours)
             "num_sell_offers": 0,  # Total offers (including ours)
             "num_competitor_buys": 0,  # Non-bot buy offers only
@@ -449,6 +453,20 @@ class MarketIntel:
         depth_buys = [o for o in buy_offers if _is_sane_depth_buy(o)]
         depth_sells = [o for o in sell_offers if _is_sane_depth_sell(o)]
 
+        def _sum_amount(offers: List[Dict], key: str) -> Decimal:
+            total = Decimal("0")
+            for offer in offers:
+                try:
+                    total += Decimal(str(offer.get(key, "0") or "0"))
+                except (InvalidOperation, ValueError, TypeError):
+                    continue
+            return total
+
+        raw_buy_depth_xch = _sum_amount(buy_offers, "xch_amount")
+        raw_buy_depth_cat = _sum_amount(buy_offers, "cat_amount")
+        raw_sell_depth_xch = _sum_amount(sell_offers, "xch_amount")
+        raw_sell_depth_cat = _sum_amount(sell_offers, "cat_amount")
+
         # Best bid/ask from competitors (post-junk-filter)
         best_bid = competitor_buys[0]["price"] if competitor_buys else Decimal("0")
         best_ask = competitor_sells[0]["price"] if competitor_sells else Decimal("0")
@@ -538,6 +556,10 @@ class MarketIntel:
             self._competitors["overall_spread_bps"] = overall_spread_bps
             self._competitors["buy_depth_xch"] = buy_depth
             self._competitors["sell_depth_xch"] = sell_depth
+            self._competitors["dexie_total_buy_depth_xch"] = raw_buy_depth_xch
+            self._competitors["dexie_total_buy_depth_cat"] = raw_buy_depth_cat
+            self._competitors["dexie_total_sell_depth_xch"] = raw_sell_depth_xch
+            self._competitors["dexie_total_sell_depth_cat"] = raw_sell_depth_cat
             self._competitors["num_buy_offers"] = len(buy_offers)
             self._competitors["num_sell_offers"] = len(sell_offers)
             self._competitors["num_competitor_buys"] = len(competitor_buys)
@@ -826,6 +848,18 @@ class MarketIntel:
             "best_ask": str(self._competitors.get("best_ask", "0")),
             "buy_depth_xch": str(self._competitors.get("buy_depth_xch", "0")),
             "sell_depth_xch": str(self._competitors.get("sell_depth_xch", "0")),
+            "dexie_total_buy_depth_xch": str(
+                self._competitors.get("dexie_total_buy_depth_xch", "0")
+            ),
+            "dexie_total_buy_depth_cat": str(
+                self._competitors.get("dexie_total_buy_depth_cat", "0")
+            ),
+            "dexie_total_sell_depth_xch": str(
+                self._competitors.get("dexie_total_sell_depth_xch", "0")
+            ),
+            "dexie_total_sell_depth_cat": str(
+                self._competitors.get("dexie_total_sell_depth_cat", "0")
+            ),
             "thin_side": self._competitors.get("thin_side", ""),
         }
 

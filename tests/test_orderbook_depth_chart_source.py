@@ -35,3 +35,13 @@ def test_market_intel_shows_crossed_public_book_instead_of_blank_spread():
 
     assert "bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk" in html
     assert "Crossed" in html
+
+
+def test_market_intel_depth_card_prefers_dexie_totals_for_display():
+    html = GUI.read_text(encoding="utf-8")
+
+    assert "data.dexie_total_buy_depth_xch ?? data.buy_depth_xch" in html
+    assert "data.dexie_total_sell_depth_cat" in html
+    assert "marketIntelCatTicker()" in html
+    assert "data.buy_depth_xch ?? displayBuyDepth" in html
+    assert "data.sell_depth_xch ?? displaySellDepthXch" in html

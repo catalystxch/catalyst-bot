@@ -247,6 +247,36 @@ class TestAnalyseOrderbook(_MI):
         self.assertEqual(self._mi._competitors["sell_depth_xch"], Decimal("7"))
         self.assertEqual(self._mi._competitors["thin_side"], "")
 
+    def test_depth_exposes_raw_dexie_totals_separately_from_actionable_depth(self):
+        lowball_buy = self._make_offer("0.000040", "4", side="buy")
+        lowball_buy["cat_amount"] = Decimal("1000")
+        normal_buy = self._make_offer("0.000114", "10", side="buy")
+        normal_buy["cat_amount"] = Decimal("2000")
+        normal_sell = self._make_offer("0.000123", "7", side="sell")
+        normal_sell["cat_amount"] = Decimal("3000")
+        far_out_sell = self._make_offer("0.0022", "10000", side="sell")
+        far_out_sell["cat_amount"] = Decimal("4500")
+
+        self._mi._analyse_orderbook(
+            [normal_buy, lowball_buy],
+            [normal_sell, far_out_sell],
+        )
+
+        self.assertEqual(self._mi._competitors["buy_depth_xch"], Decimal("10"))
+        self.assertEqual(self._mi._competitors["sell_depth_xch"], Decimal("7"))
+        self.assertEqual(
+            self._mi._competitors["dexie_total_buy_depth_xch"], Decimal("14")
+        )
+        self.assertEqual(
+            self._mi._competitors["dexie_total_buy_depth_cat"], Decimal("3000")
+        )
+        self.assertEqual(
+            self._mi._competitors["dexie_total_sell_depth_xch"], Decimal("10007")
+        )
+        self.assertEqual(
+            self._mi._competitors["dexie_total_sell_depth_cat"], Decimal("7500")
+        )
+
     def test_v3_keeps_legitimately_wide_low_decimal_book(self):
         buys = [
             self._make_offer("150", "139.95", side="buy"),
