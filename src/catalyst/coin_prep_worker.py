@@ -1268,15 +1268,19 @@ class CoinPrepWorker:
                     _mark_coin_already_advised(_rc.get("coin_id") or "")
                     try:
                         _total_mojos += int(_rc.get("amount_mojos") or 0)
-                    except Exception:
+                    except (TypeError, ValueError):
+                        # Best-effort advisory baseline: skip malformed amounts.
                         pass
                 try:
                     _set_setting(
                         f"last_prep_reserve_total_mojos_{_wtype}",
                         str(int(_total_mojos)),
                     )
-                except Exception:
-                    pass
+                except Exception as _e:
+                    self.log(
+                        f"   DB: deposit-advisory reserve baseline write skipped "
+                        f"for {_wtype}: {_e}"
+                    )
         except Exception as _e:
             self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
 
@@ -8319,7 +8323,8 @@ class CoinPrepWorker:
                         _mark_coin_already_advised(_rc.get("coin_id") or "")
                         try:
                             _total_mojos += int(_rc.get("amount_mojos") or 0)
-                        except Exception:
+                        except (TypeError, ValueError):
+                            # Best-effort advisory baseline: skip malformed amounts.
                             pass
                     # Record the post-prep reserve total in mojos so the
                     # advisor can recognise prep's intentional leftover
@@ -8330,8 +8335,11 @@ class CoinPrepWorker:
                             f"last_prep_reserve_total_mojos_{_wtype}",
                             str(int(_total_mojos)),
                         )
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        self.log(
+                            f"   DB: deposit-advisory reserve baseline write skipped "
+                            f"for {_wtype}: {_e}"
+                        )
             except Exception as _e:
                 self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
 
