@@ -99,7 +99,7 @@ if ! command -v xwd >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$screenshot")"
-xdotool windowactivate --sync "$window_id" >/dev/null 2>&1 || true
+xdotool windowactivate "$window_id" >/dev/null 2>&1 || true
 
 painted=""
 last_capture_error=""
