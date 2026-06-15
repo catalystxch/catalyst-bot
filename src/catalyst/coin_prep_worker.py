@@ -1137,6 +1137,167 @@ class CoinPrepWorker:
         unmatched.sort(key=lambda c: c.get("amount", 0), reverse=True)
         return assigned, unmatched
 
+    def _tier_plan_satisfied_by_wallet(
+        self, wallet_id: int, wallet_type: str
+    ) -> Tuple[bool, dict]:
+        """Return whether selectable coins already satisfy the current tier plan."""
+        if not self.tier_enabled:
+            return False, {"reason": "tiers_disabled"}
+
+        expected_counts = (
+            self.xch_tier_counts if wallet_type == "xch" else self.cat_tier_counts
+        )
+        expected_counts = {
+            tier_name: int(count or 0)
+            for tier_name, count in (expected_counts or {}).items()
+            if int(count or 0) > 0
+        }
+        expected_total = sum(expected_counts.values())
+        if expected_total <= 0:
+            return True, {
+                "assigned": {},
+                "missing": {},
+                "prepared_count": 0,
+                "expected_total": 0,
+                "reserve_count": 0,
+                "visible_count": 0,
+            }
+
+        coins = self._get_coins_via_rpc(
+            wallet_id, f"{wallet_type}-prepared-plan-check", selectable_only=True
+        )
+        visible_count = len(coins or [])
+        if not coins:
+            return False, {
+                "assigned": {},
+                "missing": dict(expected_counts),
+                "prepared_count": 0,
+                "expected_total": expected_total,
+                "reserve_count": 0,
+                "visible_count": visible_count,
+            }
+
+        assigned, unmatched = self._partition_coins_for_designation(
+            coins, wallet_type
+        )
+        assigned_counts = {
+            tier_name: len(assigned.get(tier_name, []))
+            for tier_name in expected_counts
+        }
+        missing = {
+            tier_name: expected - assigned_counts.get(tier_name, 0)
+            for tier_name, expected in expected_counts.items()
+            if assigned_counts.get(tier_name, 0) < expected
+        }
+        prepared_count = sum(assigned_counts.values())
+        reserve_count = len(unmatched or [])
+        satisfied = not missing and prepared_count >= expected_total and reserve_count >= 1
+
+        return satisfied, {
+            "assigned": assigned_counts,
+            "missing": missing,
+            "prepared_count": prepared_count,
+            "expected_total": expected_total,
+            "reserve_count": reserve_count,
+            "visible_count": visible_count,
+        }
+
+    def _save_successful_prep_settings(self, xch_final: int, cat_final: int) -> None:
+        """Persist the successful prep shape for the GUI already-prepped check."""
+        try:
+            _per_side = self.cat_target_coins // 2 if self.cat_target_coins > 0 else 0
+            last_prep = {
+                "tier_enabled": self.tier_enabled,
+                "trade_size": float(getattr(self, "offer_xch_size", self.xch_coin_size)),
+                "prepared_trade_size_xch": float(self.xch_coin_size),
+                "prep_headroom_pct": float(self.coin_prep_headroom_pct),
+                "max_buy": _per_side,
+                "max_sell": _per_side,
+                "cat_asset_id": os.getenv("CAT_ASSET_ID", ""),
+                "xch_coins_total": xch_final,
+                "cat_coins_total": cat_final,
+                "xch_target": self.xch_target_coins,
+                "cat_target": self.cat_target_coins,
+                "timestamp": time.time(),
+            }
+            if self.tier_enabled:
+                last_prep["tier_sizes_xch"] = {
+                    k: float(v) for k, v in self.tier_xch_sizes.items()
+                }
+                last_prep["offer_tier_sizes_xch"] = {
+                    k: float(v)
+                    for k, v in getattr(self, "offer_tier_xch_sizes", {}).items()
+                }
+                last_prep["tier_sizes_cat"] = {
+                    k: float(v) for k, v in self.tier_cat_sizes.items()
+                }
+                last_prep["tier_counts"] = dict(self.tier_counts)
+                last_prep["tier_counts_xch"] = dict(self.xch_tier_counts)
+                last_prep["tier_counts_cat"] = dict(self.cat_tier_counts)
+            else:
+                last_prep["xch_coin_size"] = float(self.xch_coin_size)
+                last_prep["cat_coin_size"] = float(self.cat_coin_size)
+
+            last_prep["designations_written"] = self._db_ready
+
+            try:
+                from user_paths import data_dir as _dd
+
+                prep_json_path = os.path.join(_dd(), "coin_prep_last.json")
+            except Exception:
+                prep_json_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "coin_prep_last.json",
+                )
+            with open(prep_json_path, "w", encoding="utf-8") as f:
+                json.dump(last_prep, f, indent=2)
+            self.log("Saved prep settings to coin_prep_last.json")
+        except Exception as e:
+            self.log(f"Could not save prep settings: {e}")
+
+    def _record_prep_reserve_advisory_baseline(self) -> None:
+        """Remember reserve totals so prep leftovers do not trigger deposit alerts."""
+        try:
+            from database import set_setting as _set_setting
+
+            for _wtype in ("xch", "cat"):
+                _coins = get_reserve_coins(_wtype) or []
+                _total_mojos = 0
+                for _rc in _coins:
+                    _mark_coin_already_advised(_rc.get("coin_id") or "")
+                    try:
+                        _total_mojos += int(_rc.get("amount_mojos") or 0)
+                    except Exception:
+                        pass
+                try:
+                    _set_setting(
+                        f"last_prep_reserve_total_mojos_{_wtype}",
+                        str(int(_total_mojos)),
+                    )
+                except Exception:
+                    pass
+        except Exception as _e:
+            self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
+
+    def _complete_existing_tier_preparation(self) -> bool:
+        """Finish a prep run when current selectable tier coins are already valid."""
+        self.update_status(
+            PrepPhase.VERIFYING,
+            0.95,
+            "Existing tier coins already satisfy target - refreshing designations...",
+        )
+        xch_final, cat_final = self.verify_coins()
+        self._designate_final_sweep()
+        self._record_prep_reserve_advisory_baseline()
+        self.update_status(
+            PrepPhase.COMPLETE,
+            1.0,
+            f"Complete! XCH: {self._prepared_coin_count_from_total(xch_final)}/{self.xch_target_coins} (+reserve), "
+            f"CAT: {self._prepared_coin_count_from_total(cat_final)}/{self.cat_target_coins} (+reserve)",
+        )
+        self._save_successful_prep_settings(xch_final, cat_final)
+        return True
+
     def _merge_xch_fee_change_into_reserve(self) -> bool:
         """Merge leftover XCH fee-funding change back into reserve before final DB sweep.
 
@@ -3094,6 +3255,96 @@ class CoinPrepWorker:
                     f"Submitting {name} balance self-send in {len(batches)} "
                     f"batches ({before_count} input coins, max {max_inputs} per tx)..."
                 )
+                if wallet_id == self.xch_wallet_id:
+                    while len(batches) > 1:
+                        batch = batches[0]
+                        fee_mojos = self._priority_combine_fee_mojos(len(batch))
+                        source_coin_ids = [cid for cid, _amount in batch]
+                        send_amount = sum(amount for _cid, amount in batch) - fee_mojos
+                        if send_amount <= 0:
+                            self.log(
+                                f"ERROR: {name} staged batch balance is too low "
+                                f"for fee {fee_mojos:,}"
+                            )
+                            return False
+
+                        target_count = max(1, before_count - len(batch) + 1)
+                        self.log(
+                            f"Submitting {name} staged self-send batch "
+                            f"({len(batch)} input coins, amount={send_amount:,} mojos, "
+                            f"fee={fee_mojos:,}); waiting for wallet to reach <= "
+                            f"{target_count} coins before the next batch..."
+                        )
+                        result = send_transaction(
+                            wallet_id=wallet_id,
+                            amount_mojos=int(send_amount),
+                            address=address,
+                            fee_mojos=int(fee_mojos),
+                            source_coin_ids=source_coin_ids,
+                        )
+                        if not self._sage_submit_succeeded(result):
+                            self.log(
+                                f"ERROR: Sage {name} staged self-send batch was not accepted"
+                            )
+                            return False
+
+                        self._sage_consolidation_submitted = True
+                        if not self._wait_for_sage_coin_count_at_most(
+                            wallet_id, name, before_count, target_count
+                        ):
+                            return False
+
+                        refreshed_inputs = _spendable_inputs(wallet_id, name)
+                        if not refreshed_inputs:
+                            self.log(
+                                f"{name} has no spendable coins after staged batch; "
+                                "wallet may still be settling"
+                            )
+                            return False
+                        if len(refreshed_inputs) >= before_count:
+                            self.log(
+                                f"ERROR: {name} staged batch made no visible progress "
+                                f"({before_count} -> {len(refreshed_inputs)} coins)"
+                            )
+                            return False
+
+                        target_inputs = refreshed_inputs
+                        before_count = len(target_inputs)
+                        batches = self._chunk_sequence(target_inputs, max_inputs)
+
+                    source_coin_ids = [cid for cid, _amount in target_inputs]
+                    fee_mojos = self._priority_combine_fee_mojos(before_count)
+                    send_amount = sum(amount for _cid, amount in target_inputs) - fee_mojos
+                    if send_amount <= 0:
+                        self.log(f"ERROR: {name} balance is too low for fee {fee_mojos:,}")
+                        return False
+
+                    self.log(
+                        f"Submitting final {name} staged self-send "
+                        f"({before_count} input coins, amount={send_amount:,} mojos, "
+                        f"fee={fee_mojos:,})..."
+                    )
+                    result = send_transaction(
+                        wallet_id=wallet_id,
+                        amount_mojos=int(send_amount),
+                        address=address,
+                        fee_mojos=int(fee_mojos),
+                        source_coin_ids=source_coin_ids,
+                    )
+                    if not self._sage_submit_succeeded(result):
+                        self.log(
+                            f"ERROR: Sage final {name} staged self-send was not accepted"
+                        )
+                        return False
+
+                    self._sage_consolidation_submitted = True
+                    self.log(
+                        f"OK: {name} staged self-send submitted; waiting for one-coin reset"
+                    )
+                    return self._wait_for_sage_consolidation(
+                        wallet_id, name, before_count
+                    )
+
                 for index, batch in enumerate(batches, start=1):
                     fee_mojos = self._priority_combine_fee_mojos(len(batch))
                     source_coin_ids = [cid for cid, _amount in batch]
@@ -7394,6 +7645,24 @@ class CoinPrepWorker:
             # Push updated counts to status so GUI reflects post-cancellation reality
             self._set_status_coin_counts(xch_total=xch_coins, cat_total=cat_coins)
             self.update_status(message=f"Post-cancel: XCH={xch_coins}, CAT={cat_coins}")
+
+            if self.tier_enabled:
+                xch_prepared_ok, xch_prepared_detail = (
+                    self._tier_plan_satisfied_by_wallet(self.xch_wallet_id, "xch")
+                )
+                cat_prepared_ok, cat_prepared_detail = (
+                    self._tier_plan_satisfied_by_wallet(self.cat_wallet_id, "cat")
+                )
+                self.log(
+                    "Prepared tier coin check: "
+                    f"XCH {xch_prepared_detail}, CAT {cat_prepared_detail}"
+                )
+                if xch_prepared_ok and cat_prepared_ok:
+                    self.log(
+                        "Existing selectable tier coins already satisfy the current "
+                        "prep target; skipping full consolidation and split."
+                    )
+                    return self._complete_existing_tier_preparation()
 
             self.log(f"\n{'=' * 60}")
             self.log("⚡ PARALLEL CONSOLIDATION")
