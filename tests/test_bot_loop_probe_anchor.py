@@ -674,6 +674,37 @@ class ProbeAnchorTests(unittest.TestCase):
 
         self.assertEqual(targets["sell"], 4)
 
+    def test_local_expiry_rebuild_guard_overrides_zero_spare_adaptive_cap(self):
+        loop = bot_loop.BotLoop()
+        loop.coin_manager._tier_spares = {
+            "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+            "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+        }
+        loop._adaptive_target_backoff_until["sell"] = 1300.0
+
+        with (
+            patch.object(bot_loop.time, "time", return_value=1000.0),
+            patch.object(
+                bot_loop,
+                "get_offers_by_trade_ids",
+                return_value=[
+                    {"trade_id": "expired-sell", "side": "sell", "tier": "mid"},
+                    {"trade_id": "expired-probe", "side": "sell", "tier": "sniper"},
+                ],
+            ),
+        ):
+            marked = loop._mark_local_expiry_rebuild_needed({"expired-sell"})
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=1,
+            )
+
+        self.assertEqual(marked, {"sell": 1})
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
+        self.assertGreater(loop._expiry_rebuild_until["sell"], 1000.0)
+        self.assertEqual(targets["sell"], 4)
+
     def test_confirmed_fills_clear_db_only_backoff_before_rebuild_targeting(self):
         loop = bot_loop.BotLoop()
         loop._adaptive_target_backoff_until["sell"] = 1300.0

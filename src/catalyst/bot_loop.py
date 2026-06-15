@@ -814,6 +814,10 @@ class BotLoop:
             "buy": 0.0,
             "sell": 0.0,
         }
+        self._expiry_rebuild_until: Dict[str, float] = {
+            "buy": 0.0,
+            "sell": 0.0,
+        }
         self._last_adaptive_target_log: Dict[str, Dict] = {
             "buy": {"at": 0.0, "signature": ""},
             "sell": {"at": 0.0, "signature": ""},
@@ -1576,6 +1580,15 @@ class BotLoop:
             live_count = min(current[side], full_target)
             spare_count = self._available_tier_spares_for_side(side)
             if spare_count is None:
+                targets[side] = full_target
+                continue
+            expiry_rebuild_remaining = max(
+                0.0, float(self._expiry_rebuild_until.get(side, 0.0) or 0.0) - now
+            )
+            if expiry_rebuild_remaining > 0 and live_count >= full_target:
+                self._expiry_rebuild_until[side] = 0.0
+                expiry_rebuild_remaining = 0.0
+            if expiry_rebuild_remaining > 0:
                 targets[side] = full_target
                 continue
             affordable_target = min(full_target, live_count + spare_count)
@@ -2812,6 +2825,93 @@ class BotLoop:
                     ]
                 },
             )
+
+    def _mark_local_expiry_rebuild_needed(
+        self, trade_ids, now_ts: Optional[float] = None
+    ) -> Dict[str, int]:
+        """Temporarily keep expired sides at full target while freed coins settle."""
+        ids = {
+            str(tid or "").strip()
+            for tid in (trade_ids or [])
+            if str(tid or "").strip()
+        }
+        if not ids:
+            return {}
+
+        rows = []
+        try:
+            rows = list(get_offers_by_trade_ids(sorted(ids)) or [])
+        except Exception as e:
+            log_event(
+                "debug",
+                "local_expiry_rebuild_lookup_failed",
+                f"Could not batch-load expired offer rows for rebuild targeting: {e}",
+            )
+            rows = []
+
+        seen = {
+            str((row or {}).get("trade_id") or "").strip()
+            for row in rows
+            if (row or {}).get("trade_id")
+        }
+        for tid in sorted(ids - seen):
+            try:
+                row = get_offer(tid) or {}
+            except Exception:
+                row = {}
+            if row:
+                rows.append(row)
+
+        counts = {"buy": 0, "sell": 0}
+        for row in rows:
+            tid = str((row or {}).get("trade_id") or "").strip()
+            if tid and tid not in ids:
+                continue
+            side = str((row or {}).get("side") or "").strip().lower()
+            if side not in counts:
+                continue
+            tier = str((row or {}).get("tier") or "").strip().lower()
+            if tier in {"sniper", "boost"}:
+                continue
+            counts[side] += 1
+
+        counts = {side: count for side, count in counts.items() if count > 0}
+        if not counts:
+            return {}
+
+        now = float(now_ts if now_ts is not None else time.time())
+        try:
+            configured_grace = float(
+                getattr(cfg, "EXPIRY_REBUILD_TARGET_GRACE_SECS", 600) or 600
+            )
+        except Exception:
+            configured_grace = 600.0
+        try:
+            min_grace = 2.0 * float(getattr(cfg, "LOOP_SECONDS", 60) or 60)
+        except Exception:
+            min_grace = 120.0
+        grace_secs = max(60.0, min_grace, configured_grace)
+
+        for side in counts:
+            current_until = float(self._expiry_rebuild_until.get(side, 0.0) or 0.0)
+            self._expiry_rebuild_until[side] = max(current_until, now + grace_secs)
+            if float(self._adaptive_target_backoff_until.get(side, 0.0) or 0.0) > 0:
+                self._adaptive_target_backoff_until[side] = 0.0
+
+        summary = ", ".join(f"{side}={count}" for side, count in sorted(counts.items()))
+        log_event(
+            "warning",
+            "local_expiry_rebuild_target_guard",
+            f"Locally expired offer(s) retired ({summary}); holding affected "
+            f"side target(s) at full ladder size for {grace_secs:.0f}s so "
+            "the bot can rebuild from the coins released by expiry.",
+            data={
+                "expired_counts": counts,
+                "trade_ids": sorted(ids)[:50],
+                "grace_secs": round(grace_secs, 1),
+            },
+        )
+        return counts
 
     def _probe_has_matured(
         self, probe: Optional[Dict] = None, now_ts: Optional[float] = None
@@ -4309,6 +4409,7 @@ class BotLoop:
         except Exception as exc:
             note_reset_failure("dynamic_amm_buffer", exc)
         self._adaptive_target_backoff_until = {"buy": 0.0, "sell": 0.0}
+        self._expiry_rebuild_until = {"buy": 0.0, "sell": 0.0}
         self._last_adaptive_offer_targets = {"buy": 0, "sell": 0}
         self._last_pricing_success_ts = 0
         # Reset position baselines so stale wallet comparisons from the
@@ -7006,6 +7107,7 @@ class BotLoop:
 
             locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
             if locally_expired_ids:
+                self._mark_local_expiry_rebuild_needed(locally_expired_ids)
                 open_buys = [
                     o for o in open_buys if o.get("trade_id") not in locally_expired_ids
                 ]
@@ -8365,6 +8467,7 @@ class BotLoop:
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
         locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
         if locally_expired_ids:
+            self._mark_local_expiry_rebuild_needed(locally_expired_ids)
             open_buys = [
                 o for o in open_buys if o.get("trade_id") not in locally_expired_ids
             ]
