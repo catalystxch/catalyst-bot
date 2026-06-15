@@ -8365,6 +8365,18 @@ class BotLoop:
                     "overall_best_ask": str(intel_data.get("overall_best_ask", "0")),
                     "buy_depth_xch": str(intel_data.get("buy_depth_xch", "0")),
                     "sell_depth_xch": str(intel_data.get("sell_depth_xch", "0")),
+                    "dexie_total_buy_depth_xch": str(
+                        intel_data.get("dexie_total_buy_depth_xch", "0")
+                    ),
+                    "dexie_total_buy_depth_cat": str(
+                        intel_data.get("dexie_total_buy_depth_cat", "0")
+                    ),
+                    "dexie_total_sell_depth_xch": str(
+                        intel_data.get("dexie_total_sell_depth_xch", "0")
+                    ),
+                    "dexie_total_sell_depth_cat": str(
+                        intel_data.get("dexie_total_sell_depth_cat", "0")
+                    ),
                     "num_buy_offers": intel_data.get("num_buy_offers", 0),
                     "num_sell_offers": intel_data.get("num_sell_offers", 0),
                     "thin_side": intel_data.get("thin_side", ""),

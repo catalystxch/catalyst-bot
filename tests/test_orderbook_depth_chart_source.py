@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GUI = ROOT / "bot_gui.html"
+BOT_LOOP = ROOT / "src" / "catalyst" / "bot_loop.py"
 
 
 def test_orderbook_depth_chart_uses_independent_side_price_lanes():
@@ -45,3 +46,12 @@ def test_market_intel_depth_card_prefers_dexie_totals_for_display():
     assert "marketIntelCatTicker()" in html
     assert "data.buy_depth_xch ?? displayBuyDepth" in html
     assert "data.sell_depth_xch ?? displaySellDepthXch" in html
+
+
+def test_market_intel_sse_payload_includes_dexie_totals():
+    bot_loop = BOT_LOOP.read_text(encoding="utf-8")
+
+    assert '"dexie_total_buy_depth_xch"' in bot_loop
+    assert '"dexie_total_buy_depth_cat"' in bot_loop
+    assert '"dexie_total_sell_depth_xch"' in bot_loop
+    assert '"dexie_total_sell_depth_cat"' in bot_loop
