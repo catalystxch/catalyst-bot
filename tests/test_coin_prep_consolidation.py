@@ -386,7 +386,9 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 10
         worker._sage_consolidation_max_inputs_per_tx = lambda: 50
 
-        def wait_for_stage(wallet_id, name, before_count, target_count, *args, **kwargs):
+        def wait_for_stage(
+            wallet_id, name, before_count, target_count, *args, **kwargs
+        ):
             waits.append((wallet_id, name, before_count, target_count))
             state["first_batch_confirmed"] = True
             return True

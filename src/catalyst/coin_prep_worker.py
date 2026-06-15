@@ -1177,12 +1177,9 @@ class CoinPrepWorker:
                 "visible_count": visible_count,
             }
 
-        assigned, unmatched = self._partition_coins_for_designation(
-            coins, wallet_type
-        )
+        assigned, unmatched = self._partition_coins_for_designation(coins, wallet_type)
         assigned_counts = {
-            tier_name: len(assigned.get(tier_name, []))
-            for tier_name in expected_counts
+            tier_name: len(assigned.get(tier_name, [])) for tier_name in expected_counts
         }
         missing = {
             tier_name: expected - assigned_counts.get(tier_name, 0)
@@ -1191,7 +1188,9 @@ class CoinPrepWorker:
         }
         prepared_count = sum(assigned_counts.values())
         reserve_count = len(unmatched or [])
-        satisfied = not missing and prepared_count >= expected_total and reserve_count >= 1
+        satisfied = (
+            not missing and prepared_count >= expected_total and reserve_count >= 1
+        )
 
         return satisfied, {
             "assigned": assigned_counts,
@@ -1208,7 +1207,9 @@ class CoinPrepWorker:
             _per_side = self.cat_target_coins // 2 if self.cat_target_coins > 0 else 0
             last_prep = {
                 "tier_enabled": self.tier_enabled,
-                "trade_size": float(getattr(self, "offer_xch_size", self.xch_coin_size)),
+                "trade_size": float(
+                    getattr(self, "offer_xch_size", self.xch_coin_size)
+                ),
                 "prepared_trade_size_xch": float(self.xch_coin_size),
                 "prep_headroom_pct": float(self.coin_prep_headroom_pct),
                 "max_buy": _per_side,
@@ -3314,9 +3315,13 @@ class CoinPrepWorker:
 
                     source_coin_ids = [cid for cid, _amount in target_inputs]
                     fee_mojos = self._priority_combine_fee_mojos(before_count)
-                    send_amount = sum(amount for _cid, amount in target_inputs) - fee_mojos
+                    send_amount = (
+                        sum(amount for _cid, amount in target_inputs) - fee_mojos
+                    )
                     if send_amount <= 0:
-                        self.log(f"ERROR: {name} balance is too low for fee {fee_mojos:,}")
+                        self.log(
+                            f"ERROR: {name} balance is too low for fee {fee_mojos:,}"
+                        )
                         return False
 
                     self.log(
