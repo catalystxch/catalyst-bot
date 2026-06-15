@@ -729,7 +729,9 @@ class BoostManager:
             missing_side = "sell"
 
         if missing_side:
-            result = self._create_inverted_probe_side(missing_side, self._boost_mid_price)
+            result = self._create_inverted_probe_side(
+                missing_side, self._boost_mid_price
+            )
             if not result:
                 return False
             self._post_inverted_probe_offers([result])
