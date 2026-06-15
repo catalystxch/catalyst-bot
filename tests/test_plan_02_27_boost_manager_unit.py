@@ -135,6 +135,122 @@ class TestFindStaleOffers(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, _SKIP_MSG)
 class TestFlexibleProbeSize(unittest.TestCase):
+    def test_activate_creates_only_one_inverted_probe_side(self):
+        class OfferManager:
+            def __init__(self):
+                self.created_sides = []
+                self._cycle_used_coin_ids = set()
+                self._offer_details_cache = {}
+
+            def create_offer_with_retry(self, offer_dict, **_kwargs):
+                side = "buy" if offer_dict.get("1", 0) < 0 else "sell"
+                self.created_sides.append(side)
+                return {
+                    "success": True,
+                    "trade_id": f"tid-{side}-{len(self.created_sides)}",
+                    "offer": f"offer-{side}-{len(self.created_sides)}",
+                    "locked_coin_id": f"coin-{side}-{len(self.created_sides)}",
+                }
+
+        class DexiePoster:
+            def __init__(self):
+                self.posted = []
+
+            def _post_single(self, bech32, trade_id, force=False):
+                self.posted.append((bech32, trade_id, force))
+
+        fake_cfg = SimpleNamespace(
+            CAT_DECIMALS=3,
+            CAT_ASSET_ID="asset",
+            CAT_WALLET_ID=2,
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=True,
+            DRY_RUN=False,
+            ENABLE_BUY=True,
+            ENABLE_SELL=True,
+            GAP_PROBE_INITIAL_PAST_FEE_BPS=10,
+            SNIPER_EXPIRY_SECS=600,
+            SNIPER_SIZE_XCH="0.001",
+            TIBETSWAP_FEE_BPS=70,
+            WALLET_ID_XCH=1,
+        )
+        offer_manager = OfferManager()
+        dexie = DexiePoster()
+        mgr = BoostManager(offer_manager=offer_manager, dexie_manager=dexie)
+
+        with (
+            patch.object(_bm_mod, "cfg", fake_cfg),
+            patch.object(_bm_mod, "add_offer", return_value=True),
+            patch.object(_bm_mod, "lock_coin"),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            result = mgr.activate(Decimal("0.0001"))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(offer_manager.created_sides, ["buy"])
+        self.assertEqual(len(dexie.posted), 1)
+        self.assertEqual(mgr._buy_probe_tid, "tid-buy-1")
+        self.assertEqual(mgr._sell_probe_tid, "")
+
+    def test_step_creates_missing_alternating_inverted_probe_side(self):
+        class OfferManager:
+            def __init__(self):
+                self.created_sides = []
+                self._cycle_used_coin_ids = set()
+                self._offer_details_cache = {}
+
+            def create_offer_with_retry(self, offer_dict, **_kwargs):
+                side = "buy" if offer_dict.get("1", 0) < 0 else "sell"
+                self.created_sides.append(side)
+                return {
+                    "success": True,
+                    "trade_id": f"tid-{side}-{len(self.created_sides)}",
+                    "offer": f"offer-{side}-{len(self.created_sides)}",
+                    "locked_coin_id": f"coin-{side}-{len(self.created_sides)}",
+                }
+
+        fake_cfg = SimpleNamespace(
+            CAT_DECIMALS=3,
+            CAT_ASSET_ID="asset",
+            CAT_WALLET_ID=2,
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=False,
+            DRY_RUN=False,
+            ENABLE_BUY=True,
+            ENABLE_SELL=True,
+            GAP_CLOSE_STEP_COOLDOWN_SECS=60,
+            GAP_PROBE_MAX_PAST_FEE_BPS=500,
+            GAP_PROBE_STEP_BPS=30,
+            SNIPER_EXPIRY_SECS=600,
+            SNIPER_SIZE_XCH="0.001",
+            TIBETSWAP_FEE_BPS=70,
+            WALLET_ID_XCH=1,
+        )
+        offer_manager = OfferManager()
+        mgr = BoostManager(offer_manager=offer_manager)
+        mgr._boost_active = True
+        mgr._boost_mid_price = Decimal("0.0001")
+        mgr._buy_offset_bps = 80
+        mgr._sell_offset_bps = 80
+        mgr._next_step_is_buy = False
+        mgr._stable_since = 1
+        mgr._last_step_time = 1
+
+        with (
+            patch.object(_bm_mod, "cfg", fake_cfg),
+            patch.object(_bm_mod, "add_offer", return_value=True),
+            patch.object(_bm_mod, "lock_coin"),
+            patch.object(_bm_mod, "log_event"),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+        ):
+            acted = mgr.step_tighter(Decimal("0"))
+
+        self.assertTrue(acted)
+        self.assertEqual(offer_manager.created_sides, ["sell"])
+        self.assertEqual(mgr._sell_probe_tid, "tid-sell-1")
+        self.assertIn("tid-sell-1", mgr._active_boost_ids)
+
     def test_gap_closer_created_log_preserves_sub_one_cat_amounts(self):
         class OfferManager:
             def __init__(self):

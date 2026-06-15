@@ -65,6 +65,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         sys.modules["database"] = fake_database
 
         fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.dotenv_values = lambda *args, **kwargs: {}
         fake_dotenv.load_dotenv = lambda *args, **kwargs: True
         fake_dotenv.set_key = lambda *args, **kwargs: True
         sys.modules["dotenv"] = fake_dotenv
@@ -327,6 +328,85 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         self.assertEqual(calls[0]["amount_mojos"], 4500 - 20)
         self.assertEqual(calls[0]["fee_mojos"], 20)
         self.assertEqual(len(calls[0]["source_coin_ids"]), 45)
+
+    def test_sage_large_cat_consolidation_batches_self_send_inputs(self):
+        records = [
+            {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
+            for i in range(1, 200)
+        ]
+        calls = []
+
+        fake_wallet_sage = types.ModuleType("wallet_sage")
+        fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
+        fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
+            "address": "xch1self",
+        }
+        fake_wallet_sage.get_spendable_coins_rpc = lambda wallet_id: {
+            "success": True,
+            "confirmed_records": list(records),
+        }
+
+        def send_transaction(
+            wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
+        ):
+            calls.append(
+                {
+                    "wallet_id": wallet_id,
+                    "amount_mojos": amount_mojos,
+                    "address": address,
+                    "fee_mojos": fee_mojos,
+                    "source_coin_ids": list(source_coin_ids or []),
+                }
+            )
+            return {"success": True, "submitted": True}
+
+        fake_wallet_sage.send_transaction = send_transaction
+        sys.modules["wallet_sage"] = fake_wallet_sage
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.cat_wallet_id = 2
+        counts = iter([199, 1])
+        worker.get_coin_count = lambda wallet_id: next(counts, 1)
+        worker._tx_fee_mojos = lambda: 0
+        worker._wait_for_sage_consolidation = lambda *args, **kwargs: True
+        worker._wait_for_sage_coin_count_at_most = lambda *args, **kwargs: True
+
+        self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
+
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(len(call["source_coin_ids"]) <= 50 for call in calls))
+        self.assertEqual(sum(len(call["source_coin_ids"]) for call in calls), 199)
+
+    def test_sage_large_combine_batches_coin_ids(self):
+        records = [
+            {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
+            for i in range(1, 200)
+        ]
+        calls = []
+
+        fake_wallet_sage = types.ModuleType("wallet_sage")
+        fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
+        fake_wallet_sage.get_spendable_coins_rpc = lambda wallet_id: {
+            "success": True,
+            "confirmed_records": list(records),
+        }
+
+        def combine_coins(coin_ids, fee_mojos=0):
+            calls.append(list(coin_ids))
+            return {"success": True, "submitted": True}
+
+        fake_wallet_sage.combine_coins = combine_coins
+        sys.modules["wallet_sage"] = fake_wallet_sage
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker._consolidate_wallet_sage_fallback = lambda wallet_id, name: False
+        worker._tx_fee_mojos = lambda: 0
+
+        self.assertTrue(worker._consolidate_wallet_sage_combine(2, "CAT"))
+
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(len(batch) <= 50 for batch in calls))
+        self.assertEqual(sum(len(batch) for batch in calls), 199)
 
     def test_sage_consolidation_rejects_transient_pending_lock_that_restores_old_count(
         self,
