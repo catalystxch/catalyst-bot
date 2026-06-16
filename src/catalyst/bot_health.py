@@ -1640,10 +1640,11 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
 
 _spacescan_refresh_inflight: bool = False
 _spacescan_refresh_last_at: float = 0.0
+_SPACESCAN_STALE_REFRESH_SECS = 12 * 3600
 
 
 def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
-    """Refresh the Spacescan cache when it's missing or expired.
+    """Refresh the Spacescan cache when it's missing, expired, or UI-stale.
 
     Read-only when auto_repair=False; otherwise spawns a single-shot
     background thread that calls `refresh_spacescan_cache(asset_id)`.
@@ -1676,15 +1677,26 @@ def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
         )
 
     # Peek at cache age. An expired cache will appear as None here because
-    # get_market_analysis_cache filters by expires_at.
+    # get_market_analysis_cache filters by expires_at. The UI marks token
+    # context stale after 12h even though the DB TTL is longer, so refresh
+    # once the UI would start suppressing Spacescan-derived guidance.
     try:
-        from database import get_market_analysis_cache
+        from database import (
+            get_market_analysis_cache,
+            get_market_analysis_cache_age_secs,
+        )
 
         cached = get_market_analysis_cache(asset_id, "spacescan")
+        cache_age_secs = get_market_analysis_cache_age_secs(asset_id, "spacescan")
     except Exception:
         cached = None
+        cache_age_secs = None
 
-    if cached:
+    cache_is_ui_stale = (
+        cache_age_secs is not None and cache_age_secs > _SPACESCAN_STALE_REFRESH_SECS
+    )
+
+    if cached and not cache_is_ui_stale:
         return HealthCheck(
             name="spacescan_cache",
             category="wallet",
@@ -1718,12 +1730,13 @@ def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
         )
 
     if not auto_repair:
+        state = "stale" if cache_is_ui_stale else "missing/expired"
         return HealthCheck(
             name="spacescan_cache",
             category="wallet",
             status="warn",
             severity="warning",
-            message=f"Spacescan cache missing/expired for {asset_id[:16]}...",
+            message=f"Spacescan cache {state} for {asset_id[:16]}...",
             anomaly_count=1,
         )
 
