@@ -42,16 +42,28 @@ purge_runtime_artifacts "$bundle_dir"
 
 rm -rf "$appdir" "$deb_root" "$appimage_path" "${appimage_path}.sha256" "$deb_path" "${deb_path}.sha256"
 
+read -r -d '' LINUX_LAUNCHER_PRELUDE <<'PRELUDE' || true
+if [ -f /etc/fonts/fonts.conf ]; then
+  export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+fi
+if [ -d /etc/fonts ]; then
+  export FONTCONFIG_PATH=/etc/fonts
+fi
+export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:+$QTWEBENGINE_CHROMIUM_FLAGS }--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults --allow-insecure-localhost"
+PRELUDE
+
 install -d "$appdir/usr/lib/catalyst"
 cp -a "$bundle_dir/." "$appdir/usr/lib/catalyst/"
 purge_runtime_artifacts "$appdir/usr/lib/catalyst"
 chmod +x "$appdir/usr/lib/catalyst/Catalyst"
+rm -f "$appdir/usr/lib/catalyst/splash.html"
 
-cat > "$appdir/AppRun" <<'APPRUN'
+cat > "$appdir/AppRun" <<APPRUN
 #!/usr/bin/env sh
 set -eu
-HERE="$(dirname "$(readlink -f "$0")")"
-exec "$HERE/usr/lib/catalyst/Catalyst" "$@"
+HERE="\$(dirname "\$(readlink -f "\$0")")"
+${LINUX_LAUNCHER_PRELUDE}
+exec "\$HERE/usr/lib/catalyst/Catalyst" "\$@"
 APPRUN
 chmod +x "$appdir/AppRun"
 
@@ -114,10 +126,12 @@ install -d "$deb_root/DEBIAN" "$deb_root/opt/catalyst" "$deb_root/usr/bin" "$deb
 cp -a "$bundle_dir/." "$deb_root/opt/catalyst/"
 purge_runtime_artifacts "$deb_root/opt/catalyst"
 chmod +x "$deb_root/opt/catalyst/Catalyst"
-cat > "$deb_root/usr/bin/catalyst" <<'WRAPPER'
+rm -f "$deb_root/opt/catalyst/splash.html"
+cat > "$deb_root/usr/bin/catalyst" <<WRAPPER
 #!/usr/bin/env sh
 set -eu
-exec /opt/catalyst/Catalyst "$@"
+${LINUX_LAUNCHER_PRELUDE}
+exec /opt/catalyst/Catalyst "\$@"
 WRAPPER
 chmod +x "$deb_root/usr/bin/catalyst"
 install -m 0644 "$root/assets/bot_icon_new.png" "$deb_root/usr/share/icons/hicolor/256x256/apps/catalyst.png"
@@ -141,7 +155,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: MonkeyZoo <support@catalystxch.com>
 Installed-Size: ${installed_size}
-Depends: ca-certificates, libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libnotify4, libnotify-bin, xdg-utils, libdbus-1-3, libegl1, libgl1, libgbm1, libnss3, libx11-xcb1, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-shm0, libxcb-sync1, libxcb-xfixes0, libxcb-xinerama0, libxcb-xkb1, libxcomposite1, libxdamage1, libxkbcommon-x11-0, libxrandr2
+Depends: ca-certificates, fontconfig, libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libnotify4, libnotify-bin, xdg-utils, libdbus-1-3, libegl1, libgl1, libgbm1, libnss3, libx11-xcb1, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-shm0, libxcb-sync1, libxcb-xfixes0, libxcb-xinerama0, libxcb-xkb1, libxcomposite1, libxdamage1, libxkbcommon-x11-0, libxrandr2
 Homepage: https://catalystxch.com/
 Description: CATalyst Chia CAT liquidity market maker
  CATalyst is a local desktop market-making app for Chia CAT tokens.
