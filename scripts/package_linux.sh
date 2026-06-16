@@ -17,19 +17,30 @@ fi
 
 rm -rf "$appdir" "$deb_root" "$appimage_path" "${appimage_path}.sha256" "$deb_path" "${deb_path}.sha256"
 
-install -d "$appdir/usr/lib/catalyst"
-cp -a "$bundle_dir/." "$appdir/usr/lib/catalyst/"
-chmod +x "$appdir/usr/lib/catalyst/Catalyst"
-
-cat > "$appdir/AppRun" <<'APPRUN'
-#!/usr/bin/env sh
-set -eu
-HERE="$(dirname "$(readlink -f "$0")")"
+read -r -d '' LINUX_LAUNCHER_PRELUDE <<'PRELUDE' || true
 if [ -f /etc/fonts/fonts.conf ]; then
   export FONTCONFIG_FILE=/etc/fonts/fonts.conf
 fi
-export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:+$QTWEBENGINE_CHROMIUM_FLAGS }--disable-features=BlockInsecurePrivateNetworkRequests --allow-insecure-localhost"
-exec "$HERE/usr/lib/catalyst/Catalyst" "$@"
+if [ -d /etc/fonts ]; then
+  export FONTCONFIG_PATH=/etc/fonts
+fi
+export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:+$QTWEBENGINE_CHROMIUM_FLAGS }--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults --allow-insecure-localhost"
+PRELUDE
+
+install -d "$appdir/usr/lib/catalyst"
+cp -a "$bundle_dir/." "$appdir/usr/lib/catalyst/"
+chmod +x "$appdir/usr/lib/catalyst/Catalyst"
+# Pre-fix binaries load file:// splash.html and redirect to localhost, which
+# Qt WebEngine blocks (ERR_NETWORK_ACCESS_DENIED). Without splash.html they
+# fall back to loading Flask directly.
+rm -f "$appdir/usr/lib/catalyst/splash.html"
+
+cat > "$appdir/AppRun" <<APPRUN
+#!/usr/bin/env sh
+set -eu
+HERE="\$(dirname "\$(readlink -f "\$0")")"
+${LINUX_LAUNCHER_PRELUDE}
+exec "\$HERE/usr/lib/catalyst/Catalyst" "\$@"
 APPRUN
 chmod +x "$appdir/AppRun"
 
@@ -91,14 +102,12 @@ printf "%s  %s\n" "$appimage_digest" "$(basename "$appimage_path")" > "${appimag
 install -d "$deb_root/DEBIAN" "$deb_root/opt/catalyst" "$deb_root/usr/bin" "$deb_root/usr/share/applications" "$deb_root/usr/share/icons/hicolor/256x256/apps"
 cp -a "$bundle_dir/." "$deb_root/opt/catalyst/"
 chmod +x "$deb_root/opt/catalyst/Catalyst"
-cat > "$deb_root/usr/bin/catalyst" <<'WRAPPER'
+rm -f "$deb_root/opt/catalyst/splash.html"
+cat > "$deb_root/usr/bin/catalyst" <<WRAPPER
 #!/usr/bin/env sh
 set -eu
-if [ -f /etc/fonts/fonts.conf ]; then
-  export FONTCONFIG_FILE=/etc/fonts/fonts.conf
-fi
-export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:+$QTWEBENGINE_CHROMIUM_FLAGS }--disable-features=BlockInsecurePrivateNetworkRequests --allow-insecure-localhost"
-exec /opt/catalyst/Catalyst "$@"
+${LINUX_LAUNCHER_PRELUDE}
+exec /opt/catalyst/Catalyst "\$@"
 WRAPPER
 chmod +x "$deb_root/usr/bin/catalyst"
 install -m 0644 "$root/assets/bot_icon_new.png" "$deb_root/usr/share/icons/hicolor/256x256/apps/catalyst.png"

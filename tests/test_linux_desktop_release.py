@@ -76,6 +76,44 @@ def test_linux_notification_runtime_dependencies_are_declared():
     assert "libnotify-bin" in package_script
 
 
+def test_linux_deb_wrapper_exports_qt_webengine_loopback_flags():
+    package_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
+    deb_wrapper_start = package_script.index('cat > "$deb_root/usr/bin/catalyst"')
+    deb_wrapper = package_script[deb_wrapper_start:]
+
+    assert "FONTCONFIG_FILE" in package_script
+    assert "FONTCONFIG_PATH" in package_script
+    assert "QTWEBENGINE_CHROMIUM_FLAGS" in deb_wrapper
+    assert "--disable-features=BlockInsecurePrivateNetworkRequests" in deb_wrapper
+    assert "PrivateNetworkAccessSendPreflights" in deb_wrapper
+    assert "--allow-insecure-localhost" in deb_wrapper
+    assert "fontconfig" in package_script
+
+
+def test_linux_appimage_launcher_exports_same_runtime_env():
+    package_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
+    apprun_start = package_script.index('cat > "$appdir/AppRun"')
+    apprun = package_script[apprun_start:]
+
+    assert "FONTCONFIG_FILE" in apprun
+    assert "QTWEBENGINE_CHROMIUM_FLAGS" in apprun
+    assert "PrivateNetworkAccessSendPreflights" in apprun
+
+
+def test_linux_packages_drop_splash_html_workaround():
+    package_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
+
+    assert 'rm -f "$appdir/usr/lib/catalyst/splash.html"' in package_script
+    assert 'rm -f "$deb_root/opt/catalyst/splash.html"' in package_script
+
+
+def test_linux_desktop_window_wires_loopback_initial_url():
+    text = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
+    assert "_initial_desktop_url()" in text
+    assert "_configure_linux_webengine_env()" in text
+    assert "_splash_path = _bundle_path" not in text
+
+
 def test_linux_detect_gui_backend_prefers_qt_when_available(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")

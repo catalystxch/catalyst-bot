@@ -141,7 +141,9 @@ def _configure_linux_webengine_env() -> None:
         return
     existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
     flags = (
-        "--disable-features=BlockInsecurePrivateNetworkRequests",
+        "--disable-features=BlockInsecurePrivateNetworkRequests,"
+        "PrivateNetworkAccessSendPreflights,"
+        "PrivateNetworkAccessRespectPreflightResults",
         "--allow-insecure-localhost",
     )
     for flag in flags:
