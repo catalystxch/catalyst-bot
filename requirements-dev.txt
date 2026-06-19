@@ -1,5 +1,5 @@
 -r requirements.txt
-pytest>=9.0.3,<10
+pytest>=9.1.0,<10
 pytest-xdist>=3.8.0,<4
 pytest-cov>=7.1.0,<8
 ruff>=0.15.17,<1
