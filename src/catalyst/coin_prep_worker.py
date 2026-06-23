@@ -61,6 +61,7 @@ from amount_utils import (
     format_cat_display_amount,
     round_cat_display_amount_up_to_mojo,
 )
+from ladder_sizing import TIER_ORDER, summarize_sell_ladder_cat
 
 # Load environment
 from dotenv import load_dotenv
@@ -94,6 +95,22 @@ def _env_int(name: str, default: int, *fallback_names: str) -> int:
         except ValueError:
             continue
     return default
+
+
+def _env_decimal(name: str, default: str, *fallback_names: str) -> Decimal:
+    """Read a Decimal env setting, treating blank template values as unset."""
+    for key in (name, *fallback_names):
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            return Decimal(raw)
+        except Exception:
+            continue
+    return Decimal(default)
 
 
 # Database integration for coin designations (V3)
@@ -1792,19 +1809,44 @@ class CoinPrepWorker:
                 or self.offer_tier_xch_sizes
                 or self.tier_xch_sizes
             )
+            sell_tier_counts = {
+                tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
+                for tier_name in TIER_ORDER
+            }
+            max_sell_offers = _env_int(
+                "MAX_ACTIVE_SELL_OFFERS",
+                sum(sell_tier_counts.values()),
+                "MAX_ACTIVE_SELL",
+            )
+            if max_sell_offers <= 0:
+                max_sell_offers = sum(sell_tier_counts.values())
+            spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
+            min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
+            ladder_summary = summarize_sell_ladder_cat(
+                mid_price=price,
+                spread_fraction=spread_fraction,
+                max_offers=max_sell_offers,
+                tier_counts=sell_tier_counts,
+                tier_sizes_xch=live_sizes,
+                min_edge_bps=min_edge_bps,
+            )
             for tier_name, xch_size in live_sizes.items():
                 if tier_name == get_fee_tier_name():
                     result[tier_name] = Decimal("0")
                     continue
-                cat_per_offer = xch_size / price
+                cat_per_offer = ladder_summary.max_cat_per_tier.get(
+                    tier_name, Decimal("0")
+                )
+                if cat_per_offer <= 0:
+                    cat_per_offer = xch_size / price
                 cat_coin_size = round_cat_display_amount_up_to_mojo(
                     cat_per_offer * self.coin_prep_headroom_multiplier,
                     self.cat_decimals,
                 )
                 result[tier_name] = cat_coin_size
             self.log(
-                f"   Tier CAT sizes derived from SELL sizes at price {price} "
-                f"with +{self.coin_prep_headroom_pct}% headroom"
+                f"   Tier CAT sizes derived from generated SELL ladder prices "
+                f"at mid {price} with +{self.coin_prep_headroom_pct}% headroom"
             )
         else:
             # Fallback: use uniform CAT_COIN_SIZE for all tiers

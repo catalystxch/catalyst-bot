@@ -24,6 +24,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
+from ladder_sizing import classify_slot_tier, ladder_price_for_slot
 from database import (
     add_offer,
     update_offer_status,
@@ -2862,35 +2863,14 @@ class OfferManager:
         This creates a smooth orderbook: tight offers near mid price
         (where most fills happen) and wider offers at the extremes.
         """
-        if max_offers <= 0:
-            return None
-
-        # Inner edge: minimum distance from mid (closest offer)
-        inner_edge = cfg.MIN_EDGE_BPS / Decimal("10000")
-
-        # Outer edge: the full adjusted spread (farthest offer)
-        outer_edge = half_spread
-
-        # Safety: if min edge >= full spread, just use the full spread everywhere
-        if inner_edge >= outer_edge:
-            distance = outer_edge
-        elif max_offers == 1:
-            # Single offer: place at inner edge (tight)
-            distance = inner_edge
-        else:
-            # Steady linear increase from inner_edge to outer_edge
-            step = (outer_edge - inner_edge) / Decimal(max_offers - 1)
-            distance = inner_edge + step * Decimal(slot)
-
-        if side == "buy":
-            price = mid_price * (Decimal("1") - distance)
-        else:
-            price = mid_price * (Decimal("1") + distance)
-
-        if price <= 0:
-            return None
-
-        return price
+        return ladder_price_for_slot(
+            slot,
+            side,
+            mid_price,
+            half_spread,
+            max_offers,
+            min_edge_bps=getattr(cfg, "MIN_EDGE_BPS", Decimal("0")),
+        )
 
     def _interpolate_refill_price(
         self,
@@ -3116,34 +3096,7 @@ class OfferManager:
                 tier: int(getattr(cfg, f"{prefix}{tier.upper()}_TIER_COUNT", 0) or 0)
                 for tier in ("inner", "mid", "outer", "extreme")
             }
-        if any(v > 0 for v in configured.values()):
-            remaining = total
-            running = 0
-            tier_dist = {}
-            for tier in ("inner", "mid", "outer", "extreme"):
-                take = min(max(0, configured[tier]), remaining)
-                tier_dist[tier] = take
-                running += take
-                remaining -= take
-            if remaining > 0:
-                tier_dist["extreme"] += remaining
-
-            running = 0
-            for tier in ("inner", "mid", "outer", "extreme"):
-                running += tier_dist[tier]
-                if slot < running:
-                    return tier
-            return "extreme"
-
-        ratio = slot / total
-        if ratio < 0.1:
-            return "inner"
-        elif ratio < 0.4:
-            return "mid"
-        elif ratio < 0.7:
-            return "outer"
-        else:
-            return "extreme"
+        return classify_slot_tier(slot, total, tier_counts=configured)
 
     # -------------------------------------------------------------------
     # Requoting (cancel + recreate when price moves)

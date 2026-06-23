@@ -20386,6 +20386,63 @@
             return dist;
         }
 
+        function getLadderPriceForSlot(slot, side, midPrice, spreadBps, maxOffers, minEdgeBps = 0) {
+            const total = Math.max(0, parseInt(maxOffers) || 0);
+            const mid = Number(midPrice || 0);
+            if (total <= 0 || mid <= 0) return 0;
+
+            const spreadFraction = Math.max(0, Number(spreadBps || 0)) / 10000;
+            const innerEdge = Math.max(0, Number(minEdgeBps || 0)) / 10000;
+            let distance = 0;
+            if (innerEdge >= spreadFraction) {
+                distance = spreadFraction;
+            } else if (total === 1) {
+                distance = innerEdge;
+            } else {
+                const step = (spreadFraction - innerEdge) / (total - 1);
+                distance = innerEdge + step * Math.max(0, parseInt(slot) || 0);
+            }
+
+            return String(side || '').toLowerCase() === 'buy'
+                ? mid * (1 - distance)
+                : mid * (1 + distance);
+        }
+
+        function buildSellLadderCatPlan({
+            midPrice,
+            spreadBps,
+            minEdgeBps,
+            maxSell,
+            tierCounts,
+            sellTierSizes
+        }) {
+            const tiers = ['inner', 'mid', 'outer', 'extreme'];
+            const dist = getCoinPrepTierDistribution(maxSell, tierCounts);
+            const tierLiveCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            const tierMaxCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            let liveCatTotal = 0;
+            let slot = 0;
+
+            for (const tier of tiers) {
+                const count = Math.max(0, parseInt(dist[tier]) || 0);
+                const sizeXch = Math.max(0, Number(sellTierSizes?.[tier] || 0));
+                for (let i = 0; i < count; i++) {
+                    const price = getLadderPriceForSlot(
+                        slot, 'sell', midPrice, spreadBps, maxSell, minEdgeBps
+                    );
+                    if (price > 0 && sizeXch > 0) {
+                        const cat = sizeXch / price;
+                        tierLiveCat[tier] += cat;
+                        tierMaxCat[tier] = Math.max(tierMaxCat[tier], cat);
+                        liveCatTotal += cat;
+                    }
+                    slot += 1;
+                }
+            }
+
+            return {tierLiveCat, tierMaxCat, liveCatTotal, tierCounts: dist};
+        }
+
         function clampCoinPrepMultiplier(value) {
             const parsed = parseFloat(value);
             const safe = Number.isFinite(parsed) ? parsed : 1;
@@ -20610,9 +20667,16 @@
                         ? (parseFloat(getWalletBalance('cat')) || 0) : 0;
                     const catReserve = parseFloat(document.getElementById('configCatReserve')?.value) || 0;
                     const catAvailable = Math.max(0, catBalance - catReserve);
-                    const sellTierCatSize = {};
-                    for (const t of tiers) sellTierCatSize[t] = (tierSizes[t] || 0) / midPrice;
-                    const sellLiveCat = sumCost(tierCounts, sellTierCatSize) * prepFactor;
+                    const sellLadderCatPlan = buildSellLadderCatPlan({
+                        midPrice,
+                        spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                        minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
+                        maxSell,
+                        tierCounts,
+                        sellTierSizes: tierSizes
+                    });
+                    const sellTierCatSize = sellLadderCatPlan.tierMaxCat || {};
+                    const sellLiveCat = (sellLadderCatPlan.liveCatTotal || 0) * prepFactor;
                     const sellSpareCat = sumCost(sellRecommended, sellTierCatSize) * prepFactor;
                     const usableCatForSpares = Math.max(0, (catAvailable * 0.92) - sellLiveCat);
                     if (sellSpareCat > 0 && sellSpareCat > usableCatForSpares) {
@@ -20961,6 +21025,8 @@
             coinPrepMultiplier,
             tierEnabled,
             midPrice,
+            spreadBps = 0,
+            minEdgeBps = 0,
             headroomPct,
             innerSize,
             midSize,
@@ -21074,6 +21140,20 @@
                 const sellDist = sellSideActive
                     ? getCoinPrepTierDistribution(maxSell, configuredTierCountsSell)
                     : { inner: 0, mid: 0, outer: 0, extreme: 0 };
+                const sellLadderCatPlan = sellSideActive ? buildSellLadderCatPlan({
+                    midPrice,
+                    spreadBps,
+                    minEdgeBps,
+                    maxSell,
+                    tierCounts: configuredTierCountsSell,
+                    sellTierSizes: plan.sellTierSizesXch,
+                }) : {
+                    tierLiveCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
+                    tierMaxCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
+                    liveCatTotal: 0,
+                };
+                plan.sellLadderCatPlan = sellLadderCatPlan;
+                plan.sellLiveCatForOffers = sellLadderCatPlan.liveCatTotal;
                 const buyWeightedCounts = buySideActive ? getCoinPrepPreparedTierCounts(
                     maxBuy, coinPrepMultiplier, plan.offerTierSizesXch,
                     configuredTierCountsBuy, configuredTierSparesBuy
@@ -21133,17 +21213,17 @@
                 for (const tier of plan.tierSequence) {
                     plan.tierCounts[tier] = buySizeCounts[tier] || 0;
                     const _buySizeXch = _sizeOrientedBuy[tier] || 0;
-                    const _sellSizeXch = plan.sellTierSizesXch[tier] || 0;
+                    const _sellTierCat = sellLadderCatPlan.tierMaxCat[tier] || 0;
                     plan.preparedTierSizesXch[tier] = _buySizeXch * prepMult;
                     plan.preparedTierSizesCat[tier] = midPrice > 0
-                        ? Math.round((_sellSizeXch / midPrice) * prepMult)
+                        ? Math.round(_sellTierCat * prepMult)
                         : 0;
                     plan.xchCoinsNeeded += plan.tierCounts[tier];
                     plan.catCoinsNeeded += sellWeightedCounts[tier] || 0;
                     plan.totalXchForCoinPrep += plan.tierCounts[tier] * plan.preparedTierSizesXch[tier];
                     plan.totalCatForCoinPrep += (sellWeightedCounts[tier] || 0) * plan.preparedTierSizesCat[tier];
                     plan.minXchForOffers += (buySizeDist[tier] || 0) * plan.preparedTierSizesXch[tier];
-                    plan.minCatForOffers += sellDist[tier] * plan.preparedTierSizesCat[tier];
+                    plan.minCatForOffers += sellLadderCatPlan.tierLiveCat[tier] || 0;
                 }
                 // Sell-side tier counts (no flip — sell ladder is identity-mapped)
                 plan.sellTierCounts = sellWeightedCounts;
@@ -21816,6 +21896,8 @@
                 coinPrepMultiplier,
                 tierEnabled,
                 midPrice,
+                spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(document.getElementById('configInnerSizeXch')?.value) || tradeSize * 2,
                 midSize: parseFloat(document.getElementById('configMidSizeXch')?.value) || tradeSize,
@@ -22400,13 +22482,21 @@
                 const cMid   = _i('configMidTierCount');
                 const cOuter = _i('configOuterTierCount');
                 const cExt   = _i('configExtremeTierCount');
-                const tierXchSum =
-                    cInner * innerSize +
-                    cMid   * midSize   +
-                    cOuter * outerSize +
-                    cExt   * extremeSize;
-                catNeededForOffers = tierXchSum > 0
-                    ? Math.round(tierXchSum / midPrice)
+                const sellLadderCatPlan = buildSellLadderCatPlan({
+                    midPrice,
+                    spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                    minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
+                    maxSell,
+                    tierCounts: { inner: cInner, mid: cMid, outer: cOuter, extreme: cExt },
+                    sellTierSizes: {
+                        inner: innerSize,
+                        mid: midSize,
+                        outer: outerSize,
+                        extreme: extremeSize
+                    }
+                });
+                catNeededForOffers = (sellLadderCatPlan.liveCatTotal || 0) > 0
+                    ? Math.round(sellLadderCatPlan.liveCatTotal)
                     : Math.round(catPerOfferBase * maxSell);
             } else {
                 const catPerOffer = midPrice > 0 ? Math.round(catPerOfferBase) : 0;
@@ -33351,24 +33441,44 @@ function closeCtgErrorModal() {
                     const tiers = ['inner', 'mid', 'outer', 'extreme'];
                     const sizeKey = (t) => t + '_size_xch';
                     const countKey = (t) => t + '_tier_count';
+                    const sellTierSizesForVerify = {};
+                    const sellTierCountsForVerify = {};
+                    for (const t of tiers) {
+                        sellTierSizesForVerify[t] = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
+                        sellTierCountsForVerify[t] = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
+                    }
+                    const configuredMaxSell = parseInt(config.max_active_sell || config.MAX_ACTIVE_SELL_OFFERS || 0)
+                        || tiers.reduce((sum, t) => sum + (parseInt(sellTierCountsForVerify[t]) || 0), 0);
+                    const sellLadderCatPlan = buildSellLadderCatPlan({
+                        midPrice,
+                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
+                            || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
+                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
+                            || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                        maxSell: configuredMaxSell,
+                        tierCounts: sellTierCountsForVerify,
+                        sellTierSizes: sellTierSizesForVerify,
+                    });
+                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     for (const t of tiers) {
                         const buyXch = Number(config[`buy_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const sellXch = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const buyCnt = parseInt(config[`buy_${t}_tier_count`] || config[countKey(t)] || 0);
                         const sellCnt = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
+                        const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
                         if (liquidityMode === 'buy_only') {
                             if (buyXch > 0) params.set(`${t}_xch`, String(buyXch));
                             if (buyCnt > 0) params.set(`${t}_count`, String(buyCnt));
                         } else if (liquidityMode === 'sell_only') {
-                            if (midPrice > 0 && sellXch > 0) params.set(`${t}_cat`, String(sellXch / midPrice));
+                            if (sellCatSize > 0) params.set(`${t}_cat`, String(sellCatSize * prepFactor));
                             if (sellCnt > 0) params.set(`${t}_count`, String(sellCnt));
                         } else {
                             const xch = Number(config[sizeKey(t)] || sellXch || 0);
                             const cnt = parseInt(config[countKey(t)] || sellCnt || 0);
                             if (xch > 0) params.set(`${t}_xch`, String(xch));
                             if (cnt > 0) params.set(`${t}_count`, String(cnt));
-                            if (midPrice > 0 && xch > 0) {
-                                params.set(`${t}_cat`, String(xch / midPrice));
+                            if (sellCatSize > 0) {
+                                params.set(`${t}_cat`, String(sellCatSize * prepFactor));
                             }
                         }
                     }
@@ -33463,6 +33573,10 @@ function closeCtgErrorModal() {
                 coinPrepMultiplier: Math.max(0.5, Math.min(3.0, parseFloat(config.coin_prep_multiplier) || 1)),
                 tierEnabled,
                 midPrice,
+                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
+                    || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
+                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
+                    || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(config.inner_size_xch) || tradeSize * 2,
                 midSize: parseFloat(config.mid_size_xch) || tradeSize,
