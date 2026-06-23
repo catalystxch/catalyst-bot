@@ -3823,6 +3823,37 @@ def _calculate_smart_defaults(
                 _capital_plan["strategy"] = _strategy
     # ═══ END SELL-SIDE INDEPENDENT SIZING ═════════════════════════════════
 
+    # ═══ DBX cap clamp (opt-in via the pre-prompt) ════════════════════════
+    # When the user picks "Maximize DBX" before Smart Settings runs, clamp
+    # the spread + requote so every tier of the resulting ladder lands
+    # inside Dexie's incentive cap and stays reward-eligible. The cap is
+    # the tighter of the two sides' caps (already computed in
+    # _smart_dbx_defaults). Only applies if the calculated spread is wider
+    # than the cap — otherwise the result already qualifies and we leave
+    # everything alone. Keep this before F65 so the CAT budget verifier uses
+    # the same final spread that gets returned to the GUI and worker.
+    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
+    if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
+        _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
+        if _cap_bps > 0:
+            _orig_base = base_spread_bps
+            if base_spread_bps > _cap_bps:
+                base_spread_bps = _cap_bps
+            if max_spread_bps > _cap_bps:
+                max_spread_bps = _cap_bps
+            if min_spread_bps > _cap_bps:
+                min_spread_bps = _cap_bps
+            # Requote scales with the (now tighter) spread so requotes
+            # don't slingshot offers outside the cap. Floor at 25 bps so
+            # we don't end up requoting on every micro-move.
+            if _orig_base > _cap_bps and _orig_base > 0:
+                _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
+                requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
+            messages.append(
+                f"DBX cap applied: spread tightened to {_cap_bps / 100:.1f}% "
+                f"(from {_orig_base / 100:.1f}%) so all tiers stay reward-eligible"
+            )
+
     # ═══ F65 FINAL SELL-SIDE CAT VERIFICATION ═════════════════════════════
     # Belt-and-suspenders check: compute the EXACT coin-prep total using
     # the same formula the frontend uses (tiers + sniper + topup), and
@@ -4022,36 +4053,6 @@ def _calculate_smart_defaults(
         and float(_smart_sniper_size or 0) > 0
         and int(_smart_sniper_prep or 0) > 0
     )
-
-    # ═══ DBX cap clamp (opt-in via the pre-prompt) ════════════════════════
-    # When the user picks "Maximize DBX" before Smart Settings runs, clamp
-    # the spread + requote so every tier of the resulting ladder lands
-    # inside Dexie's incentive cap and stays reward-eligible. The cap is
-    # the tighter of the two sides' caps (already computed in
-    # _smart_dbx_defaults). Only applies if the calculated spread is wider
-    # than the cap — otherwise the result already qualifies and we leave
-    # everything alone.
-    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
-    if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
-        _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
-        if _cap_bps > 0:
-            _orig_base = base_spread_bps
-            if base_spread_bps > _cap_bps:
-                base_spread_bps = _cap_bps
-            if max_spread_bps > _cap_bps:
-                max_spread_bps = _cap_bps
-            if min_spread_bps > _cap_bps:
-                min_spread_bps = _cap_bps
-            # Requote scales with the (now tighter) spread so requotes
-            # don't slingshot offers outside the cap. Floor at 25 bps so
-            # we don't end up requoting on every micro-move.
-            if _orig_base > _cap_bps and _orig_base > 0:
-                _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
-                requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
-            messages.append(
-                f"DBX cap applied: spread tightened to {_cap_bps / 100:.1f}% "
-                f"(from {_orig_base / 100:.1f}%) so all tiers stay reward-eligible"
-            )
 
     _toxicity_defaults = _smart_toxicity_defaults(
         avail_xch=_avail_xch,

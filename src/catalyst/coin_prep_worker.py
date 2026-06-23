@@ -1809,17 +1809,31 @@ class CoinPrepWorker:
                 or self.offer_tier_xch_sizes
                 or self.tier_xch_sizes
             )
-            sell_tier_counts = {
-                tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
+            cli_sell_tier_counts = {
+                tier_name: max(
+                    0,
+                    int(
+                        (getattr(self, "cat_tier_counts", {}) or {}).get(tier_name, 0)
+                        or 0
+                    ),
+                )
                 for tier_name in TIER_ORDER
             }
-            max_sell_offers = _env_int(
-                "MAX_ACTIVE_SELL_OFFERS",
-                sum(sell_tier_counts.values()),
-                "MAX_ACTIVE_SELL",
-            )
-            if max_sell_offers <= 0:
-                max_sell_offers = sum(sell_tier_counts.values())
+            if any(cli_sell_tier_counts.values()):
+                sell_tier_counts = cli_sell_tier_counts
+                max_sell_offers = sum(cli_sell_tier_counts.values())
+            else:
+                sell_tier_counts = {
+                    tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
+                    for tier_name in TIER_ORDER
+                }
+                max_sell_offers = _env_int(
+                    "MAX_ACTIVE_SELL_OFFERS",
+                    sum(sell_tier_counts.values()),
+                    "MAX_ACTIVE_SELL",
+                )
+                if max_sell_offers <= 0:
+                    max_sell_offers = sum(sell_tier_counts.values())
             spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
             min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
             ladder_summary = summarize_sell_ladder_cat(

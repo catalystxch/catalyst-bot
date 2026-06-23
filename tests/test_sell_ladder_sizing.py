@@ -89,6 +89,42 @@ def test_coin_prep_worker_derives_sell_cat_tier_sizes_from_ladder_prices(monkeyp
     )
 
 
+def test_coin_prep_worker_uses_cli_cat_tier_counts_for_ladder_prices(monkeypatch):
+    import coin_prep_worker as cpw
+    from amount_utils import round_cat_display_amount_up_to_mojo
+
+    mid = Decimal("0.000170")
+    spread_fraction = (Decimal("0.000400") / mid) - Decimal("1")
+    worker = object.__new__(cpw.CoinPrepWorker)
+    worker.offer_tier_xch_sizes_sell = _sbx_sizes()
+    worker.offer_tier_xch_sizes = _sbx_sizes()
+    worker.tier_xch_sizes = _sbx_sizes()
+    worker.cat_tier_counts = _sbx_counts()
+    worker.coin_prep_headroom_multiplier = Decimal("1.10")
+    worker.coin_prep_headroom_pct = Decimal("10")
+    worker.cat_decimals = 3
+    worker._get_live_price = lambda: mid
+    worker.log = lambda *_args, **_kwargs: None
+
+    monkeypatch.setenv("MIN_EDGE_BPS", "0")
+    monkeypatch.setenv("SPREAD_BPS", str(spread_fraction * Decimal("10000")))
+    monkeypatch.setenv("MAX_ACTIVE_SELL_OFFERS", "1")
+    monkeypatch.setenv("SELL_INNER_TIER_COUNT", "1")
+    monkeypatch.setenv("SELL_MID_TIER_COUNT", "0")
+    monkeypatch.setenv("SELL_OUTER_TIER_COUNT", "0")
+    monkeypatch.setenv("SELL_EXTREME_TIER_COUNT", "0")
+
+    result = worker._derive_tier_cat_sizes()
+
+    expected_extreme_start_price = _price_for_slot(mid, spread_fraction, 200, 140)
+    expected_extreme = round_cat_display_amount_up_to_mojo(
+        (Decimal("15") / expected_extreme_start_price) * Decimal("1.10"),
+        3,
+    )
+
+    assert result["extreme"] == expected_extreme
+
+
 def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
     from ladder_sizing import prepared_sell_ladder_cat_total
 
@@ -129,9 +165,19 @@ def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
 
 
 def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():
-    html = open("bot_gui.html", encoding="utf-8").read()
+    with open("bot_gui.html", encoding="utf-8") as f:
+        html = f.read()
 
     assert "function buildSellLadderCatPlan" in html
     assert "sellLadderCatPlan" in html
     assert "plan.sellLiveCatForOffers" in html
     assert "sellXch / midPrice" not in html
+
+
+def test_smart_defaults_dbx_cap_runs_before_cat_budget_validation():
+    with open("src/catalyst/blueprints/smart_defaults.py", encoding="utf-8") as f:
+        source = f.read()
+
+    assert source.index("DBX cap clamp") < source.index(
+        "F65 FINAL SELL-SIDE CAT VERIFICATION"
+    )
