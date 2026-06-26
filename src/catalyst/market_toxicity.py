@@ -19,6 +19,13 @@ except Exception:  # pragma: no cover - only used during isolated import failure
 
 
 SIDES = ("buy", "sell")
+PUBLIC_BOOTSTRAP_SIGNAL_KEYS = {
+    "dexie_tibet_dislocation",
+    "market_data_quality",
+    "public_depth_imbalance",
+    "thin_public_depth",
+    "whale_public_offer",
+}
 
 
 def _dec(value: Any, default: str = "0") -> Decimal:
@@ -53,6 +60,7 @@ class ToxicityContext:
     wallet_health: Dict[str, Any] = field(default_factory=dict)
     recent_sweep_events: List[Dict[str, Any]] = field(default_factory=list)
     liquidity_mode: str = "two_sided"
+    book_bootstrap: bool = False
 
 
 @dataclass
@@ -166,6 +174,24 @@ class MarketToxicityGuard:
         self._score_public_depth(context, add, add_both)
         self._score_data_quality(context, add_both)
 
+        bootstrap_suppressed_sides = self._bootstrap_suppressed_sides(
+            context=context,
+            buy_evidence=buy_evidence,
+            sell_evidence=sell_evidence,
+            signal_keys=signal_keys,
+        )
+        if bootstrap_suppressed_sides:
+            bootstrap_cap = Decimal(
+                max(
+                    0,
+                    int(_dec(getattr(cfg, "TOXICITY_THROTTLE_START", 75), "75")) - 1,
+                )
+            )
+            if "buy" in bootstrap_suppressed_sides:
+                buy_evidence = min(buy_evidence, bootstrap_cap)
+            if "sell" in bootstrap_suppressed_sides:
+                sell_evidence = min(sell_evidence, bootstrap_cap)
+
         buy_score = max(buy_memory, buy_evidence)
         sell_score = max(sell_memory, sell_evidence)
         buy_i = _bounded_score(buy_score)
@@ -192,7 +218,11 @@ class MarketToxicityGuard:
             throttled_sides=throttled_sides,
             throttle_until=throttle_until,
             reasons=reasons[:12],
-            suggested_action=self._suggested_action(level, throttled_sides),
+            suggested_action=self._suggested_action(
+                level,
+                throttled_sides,
+                bootstrap_suppressed_sides=bootstrap_suppressed_sides,
+            ),
             clear_condition=self._clear_condition(reasons),
             cooldown_secs_if_clear=self._cooldown_secs_if_clear(score),
             updated_at=now,
@@ -200,6 +230,28 @@ class MarketToxicityGuard:
         )
         self._snapshot = snap
         return snap
+
+    def _bootstrap_suppressed_sides(
+        self,
+        context: ToxicityContext,
+        buy_evidence: Decimal,
+        sell_evidence: Decimal,
+        signal_keys: Dict[str, set],
+    ) -> List[str]:
+        if not bool(getattr(context, "book_bootstrap", False)):
+            return []
+        threshold = int(_dec(getattr(cfg, "TOXICITY_THROTTLE_START", 75), "75"))
+        evidence_scores = {"buy": buy_evidence, "sell": sell_evidence}
+        suppressed = []
+        for side in SIDES:
+            keys = set(signal_keys.get(side) or set())
+            if not keys:
+                continue
+            if not keys.issubset(PUBLIC_BOOTSTRAP_SIGNAL_KEYS):
+                continue
+            if _bounded_score(evidence_scores.get(side, 0)) >= threshold:
+                suppressed.append(side)
+        return suppressed
 
     def _score_fast_fills(self, context: ToxicityContext, add) -> None:
         counts = {"buy": 0, "sell": 0}
@@ -744,9 +796,19 @@ class MarketToxicityGuard:
         return "normal"
 
     @staticmethod
-    def _suggested_action(level: str, throttled_sides: List[str]) -> str:
+    def _suggested_action(
+        level: str,
+        throttled_sides: List[str],
+        bootstrap_suppressed_sides: Optional[List[str]] = None,
+    ) -> str:
         if throttled_sides:
             return f"Throttle new {', '.join(throttled_sides)} offers until toxicity cools."
+        if bootstrap_suppressed_sides:
+            sides = ", ".join(bootstrap_suppressed_sides)
+            return (
+                f"Bootstrap caution on {sides}: widen spreads and let the first "
+                "ladder seed before throttling public-book signals."
+            )
         if level in ("elevated", "high", "extreme"):
             return "Widen spreads and monitor fills before adding more exposure."
         if level == "mild":

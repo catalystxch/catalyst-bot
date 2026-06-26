@@ -2605,6 +2605,47 @@ class BotLoop:
                 _fill_payload(fill, "buy") for fill in (buy_fills or [])
             ] + [_fill_payload(fill, "sell") for fill in (sell_fills or [])]
 
+            wallet_open = list(open_buys or []) + list(open_sells or [])
+            wallet_trade_ids = [
+                str((offer or {}).get("trade_id") or "")
+                for offer in wallet_open
+                if (offer or {}).get("trade_id")
+            ]
+            db_offer_by_id = {}
+            if wallet_trade_ids:
+                try:
+                    db_offer_by_id = {
+                        str((offer or {}).get("trade_id") or ""): offer
+                        for offer in get_offers_by_trade_ids(wallet_trade_ids)
+                        if (offer or {}).get("trade_id")
+                    }
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "toxicity_bootstrap_tier_lookup_failed",
+                        f"Could not load offer tiers for toxicity bootstrap check: {e}",
+                    )
+
+            def _is_normal_book_offer(offer: Dict) -> bool:
+                trade_id = str((offer or {}).get("trade_id") or "")
+                db_offer = db_offer_by_id.get(trade_id) or {}
+                tier = (
+                    str((offer or {}).get("tier") or db_offer.get("tier") or "")
+                    .strip()
+                    .lower()
+                )
+                return tier not in {"sniper", "boost"}
+
+            normal_book_count = sum(
+                1 for offer in wallet_open if _is_normal_book_offer(offer)
+            )
+            recovery_state = getattr(self, "_recovery_state", {}) or {}
+            book_bootstrap = (
+                not bool(recovery_state.get("book_ever_at_target"))
+                and normal_book_count <= 0
+                and not recent_fills
+            )
+
             open_offers = []
             for side, offers in (("buy", open_buys or []), ("sell", open_sells or [])):
                 for offer in offers:
@@ -2656,6 +2697,7 @@ class BotLoop:
                 liquidity_mode=str(
                     getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
                 ),
+                book_bootstrap=book_bootstrap,
             )
             snapshot = self.market_toxicity_guard.update(context)
             self.risk_manager.set_market_toxicity(snapshot)

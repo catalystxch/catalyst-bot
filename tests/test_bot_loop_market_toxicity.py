@@ -137,6 +137,49 @@ def test_update_market_toxicity_builds_context_and_updates_risk_manager(monkeypa
     assert loop._bot_state["market_toxicity"]["score"] == 42
 
 
+def test_update_market_toxicity_marks_empty_unseeded_book_as_bootstrap(monkeypatch):
+    loop = _loop()
+    loop._recovery_state = {"book_ever_at_target": False}
+    monkeypatch.setattr(bot_loop.time, "time", lambda: 1000.0)
+
+    loop._update_market_toxicity(
+        price_data={"dexie_price": "0.00008875", "tibet_price": "0.00010096"},
+        mid_price=Decimal("0.00009913"),
+        arb_gap=Decimal("1375.75"),
+        open_buys=[],
+        open_sells=[],
+        buy_fills=[],
+        sell_fills=[],
+    )
+
+    ctx = loop.market_toxicity_guard.last_context
+    assert ctx.book_bootstrap is True
+
+
+def test_update_market_toxicity_uses_db_tier_for_bootstrap_probe_count(monkeypatch):
+    loop = _loop()
+    loop._recovery_state = {"book_ever_at_target": False}
+    monkeypatch.setattr(bot_loop.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_offers_by_trade_ids",
+        lambda trade_ids: [{"trade_id": "probe-buy", "tier": "sniper"}],
+    )
+
+    loop._update_market_toxicity(
+        price_data={"dexie_price": "0.00008875", "tibet_price": "0.00010096"},
+        mid_price=Decimal("0.00009913"),
+        arb_gap=Decimal("1375.75"),
+        open_buys=[{"trade_id": "probe-buy"}],
+        open_sells=[],
+        buy_fills=[],
+        sell_fills=[],
+    )
+
+    ctx = loop.market_toxicity_guard.last_context
+    assert ctx.book_bootstrap is True
+
+
 def test_update_market_toxicity_failure_keeps_loop_alive(monkeypatch):
     loop = _loop()
     loop.market_toxicity_guard.update = lambda context: (_ for _ in ()).throw(
