@@ -404,21 +404,40 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         self.assertEqual(waits, [(1, "XCH", 60, 11)])
 
     def test_sage_large_cat_consolidation_batches_self_send_inputs(self):
-        records = [
-            {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
-            for i in range(1, 200)
+        def records_for(prefix, count):
+            return [
+                {
+                    "coin_id": "0x" + f"{prefix:02x}{i:062x}",
+                    "spent_block_index": 0,
+                    "amount": 100,
+                }
+                for i in range(1, count + 1)
+            ]
+
+        record_stages = [
+            records_for(1, 199),
+            records_for(2, 150),
+            records_for(3, 101),
+            records_for(4, 52),
+            records_for(5, 3),
         ]
         calls = []
+        waits = []
+        state = {"stage": 0}
 
         fake_wallet_sage = types.ModuleType("wallet_sage")
         fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
         fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
             "address": "xch1self",
         }
-        fake_wallet_sage.get_spendable_coins_rpc = lambda wallet_id: {
-            "success": True,
-            "confirmed_records": list(records),
-        }
+
+        def get_spendable_coins_rpc(wallet_id):
+            return {
+                "success": True,
+                "confirmed_records": list(record_stages[state["stage"]]),
+            }
+
+        fake_wallet_sage.get_spendable_coins_rpc = get_spendable_coins_rpc
 
         def send_transaction(
             wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
@@ -439,17 +458,130 @@ class CoinPrepConsolidationTests(unittest.TestCase):
 
         worker = self.coin_prep_worker.CoinPrepWorker()
         worker.cat_wallet_id = 2
-        counts = iter([199, 1])
-        worker.get_coin_count = lambda wallet_id: next(counts, 1)
+        worker.get_coin_count = lambda wallet_id: len(record_stages[state["stage"]])
         worker._tx_fee_mojos = lambda: 0
         worker._wait_for_sage_consolidation = lambda *args, **kwargs: True
-        worker._wait_for_sage_coin_count_at_most = lambda *args, **kwargs: True
+
+        def wait_for_stage(
+            wallet_id, name, before_count, target_count, *args, **kwargs
+        ):
+            waits.append((before_count, target_count))
+            state["stage"] += 1
+            return len(record_stages[state["stage"]]) <= target_count
+
+        worker._wait_for_sage_coin_count_at_most = wait_for_stage
 
         self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
 
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertTrue(all(len(call["source_coin_ids"]) <= 50 for call in calls))
-        self.assertEqual(sum(len(call["source_coin_ids"]) for call in calls), 199)
+        self.assertEqual(
+            waits,
+            [
+                (199, 150),
+                (150, 101),
+                (101, 52),
+                (52, 3),
+            ],
+        )
+        self.assertEqual(len(calls[-1]["source_coin_ids"]), 3)
+
+    def test_sage_large_cat_consolidation_waits_and_refreshes_between_batches(self):
+        initial_records = [
+            {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
+            for i in range(1, 66)
+        ]
+        refreshed_records = [
+            {"coin_id": "0x" + "aa" * 32, "spent_block_index": 0, "amount": 5000},
+            *[
+                {
+                    "coin_id": "0x" + f"{i:064x}",
+                    "spent_block_index": 0,
+                    "amount": 100,
+                }
+                for i in range(51, 66)
+            ],
+        ]
+        calls = []
+        waits = []
+        state = {"first_batch_settled": False}
+
+        fake_wallet_sage = types.ModuleType("wallet_sage")
+        fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
+        fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
+            "address": "xch1self",
+        }
+
+        def get_spendable_coins_rpc(wallet_id):
+            return {
+                "success": True,
+                "confirmed_records": list(
+                    refreshed_records
+                    if state["first_batch_settled"]
+                    else initial_records
+                ),
+            }
+
+        fake_wallet_sage.get_spendable_coins_rpc = get_spendable_coins_rpc
+
+        def send_transaction(
+            wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
+        ):
+            source_ids = list(source_coin_ids or [])
+            calls.append(
+                {
+                    "wallet_id": wallet_id,
+                    "amount_mojos": amount_mojos,
+                    "address": address,
+                    "fee_mojos": fee_mojos,
+                    "source_coin_ids": source_ids,
+                }
+            )
+            if len(calls) == 2 and not state["first_batch_settled"]:
+                return {"success": False, "error": "second CAT batch used stale inputs"}
+            return {"success": True, "submitted": True}
+
+        fake_wallet_sage.send_transaction = send_transaction
+        sys.modules["wallet_sage"] = fake_wallet_sage
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.cat_wallet_id = 2
+        worker._tx_fee_mojos = lambda: 10
+        worker._sage_consolidation_max_inputs_per_tx = lambda: 50
+        worker._wait_for_sage_consolidation = lambda *args, **kwargs: True
+
+        def wait_for_stage(
+            wallet_id, name, before_count, target_count, *args, **kwargs
+        ):
+            waits.append((wallet_id, name, before_count, target_count))
+            state["first_batch_settled"] = True
+            return True
+
+        worker._wait_for_sage_coin_count_at_most = wait_for_stage
+
+        self.assertTrue(worker._consolidate_wallet_sage_fallback(2, "CAT"))
+
+        self.assertEqual(waits, [(2, "CAT", 65, 16)])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls[0]["source_coin_ids"]), 50)
+        self.assertEqual(calls[1]["amount_mojos"], 6500)
+        self.assertEqual(calls[1]["source_coin_ids"][0], "aa" * 32)
+        self.assertEqual(len(calls[1]["source_coin_ids"]), 16)
+
+    def test_sage_xch_consolidation_accepts_small_fee_change_set(self):
+        counts = iter([0, 3])
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.xch_wallet_id = 1
+        worker.get_coin_count = lambda wallet_id: next(counts, 3)
+        worker._tx_fee_mojos = lambda: 10
+
+        with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
+            self.assertTrue(
+                worker._wait_for_sage_consolidation(
+                    1, "XCH", before_count=36, max_wait_seconds=10
+                )
+            )
 
     def test_sage_large_combine_batches_coin_ids(self):
         records = [
