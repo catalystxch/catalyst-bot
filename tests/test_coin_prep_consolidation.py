@@ -583,6 +583,19 @@ class CoinPrepConsolidationTests(unittest.TestCase):
                 )
             )
 
+    def test_sage_xch_consolidation_does_not_accept_pre_submit_compact_count(self):
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.xch_wallet_id = 1
+        worker.get_coin_count = lambda wallet_id: 3
+        worker._tx_fee_mojos = lambda: 10
+
+        with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
+            self.assertFalse(
+                worker._wait_for_sage_consolidation(
+                    1, "XCH", before_count=3, max_wait_seconds=10
+                )
+            )
+
     def test_sage_large_combine_batches_coin_ids(self):
         records = [
             {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}

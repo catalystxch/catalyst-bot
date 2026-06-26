@@ -3020,7 +3020,12 @@ class CoinPrepWorker:
                 f"Consolidating {name}: {observed_count} coins",
             )
 
-            if 0 < observed_count <= target_count:
+            compact_reduced = (
+                target_count > 1
+                and before_count > target_count
+                and 0 < observed_count <= target_count
+            )
+            if observed_count == 1 or compact_reduced:
                 if target_count == 1:
                     self.log(
                         f"OK: {name} consolidation confirmed: {before_count} -> 1 coin"
@@ -7702,7 +7707,10 @@ class CoinPrepWorker:
             self.log(f"{'=' * 60}")
 
             # ALWAYS consolidate after cancellation (cancels release locked coins)
-            xch_needs_consolidation = xch_coins > 1 or xch_coins == 0
+            xch_success_max = self._sage_consolidation_success_max_count(
+                self.xch_wallet_id
+            )
+            xch_needs_consolidation = xch_coins > xch_success_max or xch_coins == 0
             cat_needs_consolidation = cat_coins > 1
 
             # Track whether consolidation was actually submitted
@@ -7784,9 +7792,6 @@ class CoinPrepWorker:
             max_verify_wait = 300  # 5 minute timeout - don't wait forever
             verify_interval = 5
             elapsed_verify = 0
-            xch_success_max = self._sage_consolidation_success_max_count(
-                self.xch_wallet_id
-            )
             xch_target_label = f"1-{xch_success_max}" if xch_success_max > 1 else "1"
 
             prev_xch_check = None
