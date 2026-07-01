@@ -258,6 +258,7 @@ jobs:
             gh release create "$RELEASE_REF" \
               --title "CATalyst $RELEASE_REF" \
               --generate-notes \
+              --draft \
               --latest || true
           fi
           for attempt in $(seq 1 10); do
@@ -282,6 +283,7 @@ jobs:
             gh release create "$RELEASE_REF" \
               --title "CATalyst $RELEASE_REF" \
               --generate-notes \
+              --draft \
               --latest || true
           fi
           assets=(
@@ -312,6 +314,7 @@ jobs:
             gh release create "$($env:RELEASE_REF)" `
               --title "CATalyst $($env:RELEASE_REF)" `
               --generate-notes `
+              --draft `
               --latest
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "Release may already exist; upload step will retry."
@@ -365,3 +368,16 @@ jobs:
               --notes-file release_notes.md `
               --latest
           }
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_REF" --draft=false --latest
