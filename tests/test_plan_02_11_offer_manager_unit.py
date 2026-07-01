@@ -515,9 +515,7 @@ class TestCleanupExpiredDbOffers(_OM):
 
         self.assertEqual(expired, ["plain-expired"])
         self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "expired")
-        self.assertEqual(
-            _db_mod.get_offer("pending-cancel-expired")["status"], "open"
-        )
+        self.assertEqual(_db_mod.get_offer("pending-cancel-expired")["status"], "open")
         self.assertEqual(
             _db_mod.get_offer("pending-cancel-expired")["lifecycle_state"],
             "cancel_requested",
