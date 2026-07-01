@@ -14,8 +14,9 @@ def test_release_workflow_builds_windows_and_linux_downloads_only():
     assert "windows-latest" in workflow
     assert "scripts/package_linux.sh" in workflow
     assert 'scripts/package_linux.sh "$RELEASE_REF"' in workflow
-    assert "Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage" in workflow
-    assert "catalyst_${{ github.ref_name }}_amd64.deb" in workflow
+    assert "Catalyst-linux-${RELEASE_REF}-x86_64.AppImage" in workflow
+    assert "catalyst_${RELEASE_REF}_amd64.deb" in workflow
+    assert 'gh release upload "$RELEASE_REF" "${assets[@]}" --clobber' in workflow
     assert "packaged_api_smoke.py --exe" in workflow
     assert "macos-latest" not in workflow
     assert "Catalyst-macos" not in workflow

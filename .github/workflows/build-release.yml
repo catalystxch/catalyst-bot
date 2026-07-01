@@ -247,37 +247,96 @@ jobs:
           bash scripts/linux_desktop_smoke.sh "$extract_dir/opt/catalyst/Catalyst" deb-desktop-smoke.log
 
       - name: Upload Windows zip/Linux tar to Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
-        with:
-          files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_ASSET: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            gh release create "$RELEASE_REF" \
+              --title "CATalyst $RELEASE_REF" \
+              --generate-notes \
+              --draft \
+              --latest || true
+          fi
+          for attempt in $(seq 1 10); do
+            if gh release upload "$RELEASE_REF" "$RELEASE_ASSET" --clobber; then
+              exit 0
+            fi
+            echo "Release upload retry $attempt for $RELEASE_ASSET"
+            sleep 3
+          done
+          echo "Failed to upload $RELEASE_ASSET to $RELEASE_REF"
+          exit 1
 
       - name: Upload Linux packages to Release
         if: matrix.os == 'ubuntu-latest'
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
-        with:
-          files: |
-            Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage
-            Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage.sha256
-            catalyst_${{ github.ref_name }}_amd64.deb
-            catalyst_${{ github.ref_name }}_amd64.deb.sha256
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            gh release create "$RELEASE_REF" \
+              --title "CATalyst $RELEASE_REF" \
+              --generate-notes \
+              --draft \
+              --latest || true
+          fi
+          assets=(
+            "Catalyst-linux-${RELEASE_REF}-x86_64.AppImage"
+            "Catalyst-linux-${RELEASE_REF}-x86_64.AppImage.sha256"
+            "catalyst_${RELEASE_REF}_amd64.deb"
+            "catalyst_${RELEASE_REF}_amd64.deb.sha256"
+          )
+          for attempt in $(seq 1 10); do
+            if gh release upload "$RELEASE_REF" "${assets[@]}" --clobber; then
+              exit 0
+            fi
+            echo "Release upload retry $attempt for Linux packages"
+            sleep 3
+          done
+          echo "Failed to upload Linux packages to $RELEASE_REF"
+          exit 1
 
       - name: Upload Windows Installer to Release
         if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
-        with:
-          files: |
-            Catalyst-Setup-${{ github.ref_name }}.exe
-            Catalyst-Setup-${{ github.ref_name }}.exe.sha256
-            latest.json
-            latest.json.sig
-            update-manifest-${{ github.ref_name }}.json
-            update-manifest-${{ github.ref_name }}.json.sig
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          gh release view "$($env:RELEASE_REF)" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$($env:RELEASE_REF)" `
+              --title "CATalyst $($env:RELEASE_REF)" `
+              --generate-notes `
+              --draft `
+              --latest
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Release may already exist; upload step will retry."
+            }
+          }
+          $assets = @(
+            "Catalyst-Setup-$($env:RELEASE_REF).exe",
+            "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256",
+            "latest.json",
+            "latest.json.sig",
+            "update-manifest-$($env:RELEASE_REF).json",
+            "update-manifest-$($env:RELEASE_REF).json.sig"
+          )
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+            gh release upload "$($env:RELEASE_REF)" @assets --clobber
+            if ($LASTEXITCODE -eq 0) {
+              exit 0
+            }
+            Write-Host "Release upload retry $attempt for Windows installer assets"
+            Start-Sleep -Seconds 3
+          }
+          throw "Failed to upload Windows installer assets to $($env:RELEASE_REF)"
 
       - name: Publish public update channel
         if: matrix.os == 'windows-latest'
@@ -309,3 +368,16 @@ jobs:
               --notes-file release_notes.md `
               --latest
           }
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_REF" --draft=false --latest
