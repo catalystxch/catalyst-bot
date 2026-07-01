@@ -54,6 +54,17 @@ def test_release_workflow_keeps_github_context_out_of_shell_scripts():
     assert 'deb_path="catalyst_${RELEASE_REF}_amd64.deb"' in workflow
 
 
+def test_release_publish_job_uses_explicit_repository_context():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'gh release edit "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" --draft=false --latest'
+        in workflow
+    )
+
+
 def test_packaging_scripts_create_normal_desktop_downloads():
     linux_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
 
