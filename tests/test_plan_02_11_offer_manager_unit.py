@@ -439,6 +439,8 @@ class TestCleanupExpiredDbOffers(_OM):
             try:
                 _db_mod._local.conn.close()
             except Exception:
+                # Best-effort cleanup: a stale test connection must not mask
+                # the fixture setup failure this test is trying to expose.
                 pass
         _db_mod._local.conn = None
         _db_mod.init_database()
@@ -448,6 +450,8 @@ class TestCleanupExpiredDbOffers(_OM):
             try:
                 _db_mod._local.conn.close()
             except Exception:
+                # Best-effort cleanup: close errors during teardown should not
+                # hide the assertion failure that produced this cleanup path.
                 pass
         _db_mod._local.conn = None
         _db_mod.DB_PATH = self._orig_db_path
@@ -455,14 +459,27 @@ class TestCleanupExpiredDbOffers(_OM):
         try:
             os.unlink(self._tmp_path)
         except OSError:
+            # The temporary DB may already be gone on Windows cleanup races.
             pass
         super().tearDown()
 
-    def test_cleanup_expired_db_offers_retires_pending_cancel_rows(self):
+    def test_cleanup_expired_db_offers_skips_pending_cancel_rows(self):
         now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
         past = (now - timedelta(seconds=1)).isoformat()
         future = (now + timedelta(hours=1)).isoformat()
 
+        _db_mod.upsert_coin("0xplainexpiredcoin", "cat", 777, designation="tier_spare")
+        _db_mod.add_offer(
+            "plain-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            _FAKE_CFG.CAT_ASSET_ID,
+            expires_at=past,
+            coin_id="0xplainexpiredcoin",
+        )
+        _db_mod.lock_coin("0xplainexpiredcoin", "plain-expired")
         _db_mod.upsert_coin(
             "0xpendingcancelcoin", "cat", 123456, designation="tier_spare"
         )
@@ -496,9 +513,14 @@ class TestCleanupExpiredDbOffers(_OM):
         with patch.object(_db_mod.time, "time", return_value=now.timestamp()):
             expired = self._manager.cleanup_expired_db_offers()
 
-        self.assertEqual(expired, ["pending-cancel-expired"])
+        self.assertEqual(expired, ["plain-expired"])
+        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "expired")
         self.assertEqual(
-            _db_mod.get_offer("pending-cancel-expired")["status"], "expired"
+            _db_mod.get_offer("pending-cancel-expired")["status"], "open"
+        )
+        self.assertEqual(
+            _db_mod.get_offer("pending-cancel-expired")["lifecycle_state"],
+            "cancel_requested",
         )
         self.assertEqual(_db_mod.get_offer("pending-cancel-future")["status"], "open")
         open_with_pending = {
@@ -508,9 +530,20 @@ class TestCleanupExpiredDbOffers(_OM):
                 include_pending_cancel=True,
             )
         }
-        self.assertNotIn("pending-cancel-expired", open_with_pending)
+        self.assertNotIn("plain-expired", open_with_pending)
+        self.assertIn("pending-cancel-expired", open_with_pending)
         self.assertIn("pending-cancel-future", open_with_pending)
-        coin = (
+        plain_coin = (
+            _db_mod.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xplainexpiredcoin",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(plain_coin["status"], "free")
+        self.assertIsNone(plain_coin["trade_id"])
+        pending_coin = (
             _db_mod.get_connection()
             .execute(
                 "SELECT status, trade_id FROM coins WHERE coin_id=?",
@@ -518,8 +551,8 @@ class TestCleanupExpiredDbOffers(_OM):
             )
             .fetchone()
         )
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
+        self.assertEqual(pending_coin["status"], "locked")
+        self.assertEqual(pending_coin["trade_id"], "pending-cancel-expired")
 
 
 # ===========================================================================
