@@ -6,14 +6,18 @@ lifecycle, bot-cancel tracking, detect_expiring_offers, _classify_tier,
 should_requote, and _allocate_unique_requested_mojos.
 """
 
+import os
+import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
     import offer_manager as _om_mod
+    import database as _db_mod
     from offer_manager import (
         OfferManager,
         xch_to_mojos,
@@ -25,6 +29,7 @@ try:
 
     _SKIP = None
 except ModuleNotFoundError as exc:
+    _db_mod = None
     _SKIP = str(exc)
 
 _FAKE_CFG = SimpleNamespace(
@@ -418,6 +423,134 @@ class TestDetectExpiringOffers(_OM):
         result = self._manager.detect_expiring_offers(offers, refresh_before_secs=300)
         self.assertIn("soon", result)
         self.assertNotIn("far", result)
+
+
+class TestCleanupExpiredDbOffers(_OM):
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self._tmp_path = self._tmp.name
+        self._orig_db_path = _db_mod.DB_PATH
+        self._orig_init_path = _db_mod._db_initialized_path
+        _db_mod.DB_PATH = self._tmp_path
+        _db_mod._db_initialized_path = ""
+        if hasattr(_db_mod._local, "conn") and _db_mod._local.conn:
+            try:
+                _db_mod._local.conn.close()
+            except Exception:
+                # Best-effort cleanup: a stale test connection must not mask
+                # the fixture setup failure this test is trying to expose.
+                pass
+        _db_mod._local.conn = None
+        _db_mod.init_database()
+
+    def tearDown(self):
+        if hasattr(_db_mod._local, "conn") and _db_mod._local.conn:
+            try:
+                _db_mod._local.conn.close()
+            except Exception:
+                # Best-effort cleanup: close errors during teardown should not
+                # hide the assertion failure that produced this cleanup path.
+                pass
+        _db_mod._local.conn = None
+        _db_mod.DB_PATH = self._orig_db_path
+        _db_mod._db_initialized_path = self._orig_init_path
+        try:
+            os.unlink(self._tmp_path)
+        except OSError:
+            # The temporary DB may already be gone on Windows cleanup races.
+            pass
+        super().tearDown()
+
+    def test_cleanup_expired_db_offers_skips_pending_cancel_rows(self):
+        now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+        past = (now - timedelta(seconds=1)).isoformat()
+        future = (now + timedelta(hours=1)).isoformat()
+
+        _db_mod.upsert_coin("0xplainexpiredcoin", "cat", 777, designation="tier_spare")
+        _db_mod.add_offer(
+            "plain-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            _FAKE_CFG.CAT_ASSET_ID,
+            expires_at=past,
+            coin_id="0xplainexpiredcoin",
+        )
+        _db_mod.lock_coin("0xplainexpiredcoin", "plain-expired")
+        _db_mod.upsert_coin(
+            "0xpendingcancelcoin", "cat", 123456, designation="tier_spare"
+        )
+        _db_mod.add_offer(
+            "pending-cancel-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            _FAKE_CFG.CAT_ASSET_ID,
+            expires_at=past,
+            coin_id="0xpendingcancelcoin",
+        )
+        _db_mod.lock_coin("0xpendingcancelcoin", "pending-cancel-expired")
+        _db_mod.update_offer_lifecycle_state(
+            "pending-cancel-expired", "cancel_requested"
+        )
+        _db_mod.add_offer(
+            "pending-cancel-future",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            _FAKE_CFG.CAT_ASSET_ID,
+            expires_at=future,
+        )
+        _db_mod.update_offer_lifecycle_state(
+            "pending-cancel-future", "cancel_requested"
+        )
+
+        with patch.object(_db_mod.time, "time", return_value=now.timestamp()):
+            expired = self._manager.cleanup_expired_db_offers()
+
+        self.assertEqual(expired, ["plain-expired"])
+        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "expired")
+        self.assertEqual(_db_mod.get_offer("pending-cancel-expired")["status"], "open")
+        self.assertEqual(
+            _db_mod.get_offer("pending-cancel-expired")["lifecycle_state"],
+            "cancel_requested",
+        )
+        self.assertEqual(_db_mod.get_offer("pending-cancel-future")["status"], "open")
+        open_with_pending = {
+            offer["trade_id"]
+            for offer in _db_mod.get_open_offers(
+                cat_asset_id=_FAKE_CFG.CAT_ASSET_ID,
+                include_pending_cancel=True,
+            )
+        }
+        self.assertNotIn("plain-expired", open_with_pending)
+        self.assertIn("pending-cancel-expired", open_with_pending)
+        self.assertIn("pending-cancel-future", open_with_pending)
+        plain_coin = (
+            _db_mod.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xplainexpiredcoin",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(plain_coin["status"], "free")
+        self.assertIsNone(plain_coin["trade_id"])
+        pending_coin = (
+            _db_mod.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xpendingcancelcoin",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(pending_coin["status"], "locked")
+        self.assertEqual(pending_coin["trade_id"], "pending-cancel-expired")
 
 
 # ===========================================================================

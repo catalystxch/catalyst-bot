@@ -4137,7 +4137,11 @@ class OfferManager:
         return count + len(self.cleanup_expired_db_offers())
 
     def cleanup_expired_db_offers(self) -> List[str]:
-        """Retire DB-open offers whose local expires_at has elapsed."""
+        """Retire DB-open offers whose local expires_at has elapsed.
+
+        Pending-cancel rows deliberately stay open until Dexie/Spacescan
+        verification resolves them as cancelled, expired, or filled.
+        """
         try:
             from database import expire_open_offers_by_time
 
