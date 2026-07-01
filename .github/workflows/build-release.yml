@@ -380,4 +380,4 @@ jobs:
           RELEASE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release edit "$RELEASE_REF" --draft=false --latest
+          gh release edit "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" --draft=false --latest
