@@ -4141,7 +4141,10 @@ class OfferManager:
         try:
             from database import expire_open_offers_by_time
 
-            return expire_open_offers_by_time(cat_asset_id=cfg.CAT_ASSET_ID)
+            return expire_open_offers_by_time(
+                cat_asset_id=cfg.CAT_ASSET_ID,
+                include_pending_cancel=True,
+            )
         except Exception as e:
             log_event(
                 "warning",
