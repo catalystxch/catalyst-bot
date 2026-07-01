@@ -247,7 +247,7 @@ jobs:
           bash scripts/linux_desktop_smoke.sh "$extract_dir/opt/catalyst/Catalyst" deb-desktop-smoke.log
 
       - name: Upload Windows zip/Linux tar to Release
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
         with:
           files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
         env:
@@ -255,7 +255,7 @@ jobs:
 
       - name: Upload Linux packages to Release
         if: matrix.os == 'ubuntu-latest'
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
         with:
           files: |
             Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage
@@ -267,7 +267,7 @@ jobs:
 
       - name: Upload Windows Installer to Release
         if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
         with:
           files: |
             Catalyst-Setup-${{ github.ref_name }}.exe
