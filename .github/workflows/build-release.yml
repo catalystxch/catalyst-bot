@@ -28,12 +28,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
 
@@ -247,7 +247,7 @@ jobs:
           bash scripts/linux_desktop_smoke.sh "$extract_dir/opt/catalyst/Catalyst" deb-desktop-smoke.log
 
       - name: Upload Windows zip/Linux tar to Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           files: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
         env:
@@ -255,7 +255,7 @@ jobs:
 
       - name: Upload Linux packages to Release
         if: matrix.os == 'ubuntu-latest'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           files: |
             Catalyst-linux-${{ github.ref_name }}-x86_64.AppImage
@@ -267,7 +267,7 @@ jobs:
 
       - name: Upload Windows Installer to Release
         if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d
         with:
           files: |
             Catalyst-Setup-${{ github.ref_name }}.exe
