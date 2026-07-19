@@ -1648,6 +1648,7 @@ def _api_coin_prep_trigger_locked():
                 # popping a Windows terminal in front of the GUI.
                 import subprocess as _sp
                 from coin_manager import (
+                    _coin_prep_active_cat_wallet_id,
                     _coin_prep_worker_command,
                     _coin_prep_worker_environment,
                 )
@@ -1665,6 +1666,7 @@ def _api_coin_prep_trigger_locked():
                     return
 
                 env = _coin_prep_worker_environment()
+                cat_wallet_id = _coin_prep_active_cat_wallet_id(env)
 
                 # Build CLI args from LIVE config so the worker uses the
                 # actual GUI settings, not stale .env values.
@@ -1968,6 +1970,8 @@ def _api_coin_prep_trigger_locked():
                         f"({max_buy}+{max_sell} × {coin_multiplier}), "
                         f"XCH size {trade_xch} (+{getattr(cfg, 'COIN_PREP_HEADROOM_PCT', Decimal('10'))}% headroom)",
                     )
+
+                cmd += ["--cat-wallet", str(cat_wallet_id)]
 
                 log_path = _coin_prep_output_log_file()
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
