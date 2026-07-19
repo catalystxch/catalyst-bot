@@ -226,6 +226,68 @@ class TestLogsDownload(_FlaskBase):
         self.assertIsInstance(diagnostics["disk"], list)
         self.assertGreaterEqual(diagnostics["app_process"]["tree_process_count"], 1)
 
+    def test_bundle_inventory_summary_falls_back_to_db_counts_when_manager_cold(self):
+        coin_summary = {
+            "xch_free_count": 5,
+            "xch_locked_count": 2,
+            "xch_locked_mojos": 3_000_000_000_000,
+            "xch_total": 7,
+            "cat_free_count": 4,
+            "cat_locked_count": 3,
+            "cat_locked_mojos": 12_345,
+            "cat_total": 7,
+        }
+        cold_inventory = {
+            "xch_locked_coins": 0,
+            "xch_locked_amount": "0.0000",
+            "xch_locked_amount_raw": 0,
+            "cat_locked_coins": 0,
+            "cat_locked_amount": "0.00",
+            "cat_locked_amount_raw": 0,
+            "xch_total_coins": 0,
+            "cat_total_coins": 0,
+        }
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.coin_manager.get_inventory_summary.return_value = cold_inventory
+        bot._recovery_state = {}
+        bot._probe_state = {}
+        bot.get_price_info.return_value = {}
+        bot.risk_manager = None
+        bot.sniper = None
+        bot.market_intel.get_market_summary.return_value = {}
+        bot.runtime_monitor.get_state.return_value = {}
+        bot.splash_manager.get_stats.return_value = {}
+        bot.splash_node.get_status.return_value = {}
+        bot.get_splash_receive_stats.return_value = {}
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_fills", return_value=[]),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_coin_summary", return_value=coin_summary),
+            patch("database.get_config_history", return_value=[]),
+            patch("database.get_all_settings", return_value=[]),
+            patch("super_log.get_archive_summary", return_value=[]),
+            patch("super_log.get_log_path", return_value=None),
+            patch("super_log.get_log_stats", return_value={}),
+        ):
+            resp = self.client.get("/api/logs/download", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            snapshot = json.loads(zf.read("snapshots/coin_inventory.json"))
+
+        inv = snapshot["inventory_summary"]
+        self.assertEqual(inv["xch_locked_coins"], 2)
+        self.assertEqual(inv["xch_locked_amount_raw"], 3_000_000_000_000)
+        self.assertEqual(inv["cat_locked_coins"], 3)
+        self.assertEqual(inv["cat_locked_amount_raw"], 12_345)
+        self.assertEqual(inv["xch_total_coins"], 7)
+        self.assertEqual(inv["cat_total_coins"], 7)
+
     def test_sage_log_discovery_reads_recent_app_logs_from_data_log_dir(self):
         from blueprints import coin_prep as coin_prep_routes
 

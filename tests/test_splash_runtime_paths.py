@@ -136,3 +136,72 @@ def test_splash_output_reader_keeps_reading_lines(monkeypatch):
         "connected to peer one",
         "connected to peer two",
     ]
+
+
+def test_splash_output_reader_suppresses_hook_connection_refused_burst(monkeypatch):
+    import splash_node
+
+    class FakeProcess:
+        stdout = iter(
+            [
+                "failed POST http://127.0.0.1:5000/api/splash/incoming: Connection refused\n",
+                "failed POST http://127.0.0.1:5000/api/splash/incoming: Connection refused\n",
+                "failed POST http://127.0.0.1:5000/api/splash/incoming: Connection refused\n",
+            ]
+        )
+
+    events = []
+    monkeypatch.setattr(
+        splash_node,
+        "log_event",
+        lambda severity, event_type, message: events.append(
+            (severity, event_type, message)
+        ),
+    )
+    node = splash_node.SplashNode()
+    node._process = FakeProcess()
+    node._last_start_time = time.time()
+
+    node._read_output()
+
+    warnings = [event for event in events if event[0] == "warning"]
+    assert len(warnings) <= 1
+
+
+def test_splash_output_reader_suppresses_windows_hook_refused_burst(monkeypatch):
+    import splash_node
+
+    class FakeProcess:
+        stdout = iter(
+            [
+                "Error posting to offer hook: error sending request for url "
+                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
+                "to connect: tcp connect error: No connection could be made "
+                "because the target machine actively refused it. (os error 10061)\n",
+                "Error posting to offer hook: error sending request for url "
+                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
+                "to connect: tcp connect error: No connection could be made "
+                "because the target machine actively refused it. (os error 10061)\n",
+                "Error posting to offer hook: error sending request for url "
+                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
+                "to connect: tcp connect error: No connection could be made "
+                "because the target machine actively refused it. (os error 10061)\n",
+            ]
+        )
+
+    events = []
+    monkeypatch.setattr(
+        splash_node,
+        "log_event",
+        lambda severity, event_type, message: events.append(
+            (severity, event_type, message)
+        ),
+    )
+    node = splash_node.SplashNode()
+    node._process = FakeProcess()
+    node._last_start_time = time.time()
+
+    node._read_output()
+
+    warnings = [event for event in events if event[0] == "warning"]
+    assert len(warnings) <= 1

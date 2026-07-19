@@ -148,6 +148,65 @@ class TestMarketIntel(_FlaskBase):
         )
 
 
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestMarketSummary(_FlaskBase):
+    def test_reuses_tibet_pairs_for_immediate_dashboard_polls(self):
+        from blueprints import market as market_routes
+
+        with market_routes._TIBET_PAIRS_CACHE_LOCK:
+            market_routes._TIBET_PAIRS_CACHE.update(
+                {"base": "", "fetched_at": 0.0, "pairs": []}
+            )
+
+        asset_id = "abc123cat"
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "ABC_XCH",
+                "decimals": 3,
+                "name": "ABC",
+            }
+        )
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append(str(url))
+            if "tibetswap" in str(url):
+                return FakeResponse(
+                    [
+                        {
+                            "asset_id": asset_id,
+                            "xch_reserve": 1_000_000_000_000,
+                            "token_reserve": 1_000,
+                        }
+                    ]
+                )
+            if "prices/tickers" in str(url):
+                return FakeResponse({"tickers": []})
+            return FakeResponse({"offers": []})
+
+        try:
+            with patch("requests.get", side_effect=fake_get):
+                self.client.get("/api/market/summary", environ_base=self._LOOPBACK)
+                self.client.get("/api/market/summary", environ_base=self._LOOPBACK)
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        tibet_calls = [url for url in calls if "tibetswap" in url]
+        self.assertEqual(len(tibet_calls), 1)
+
+
 # ---------------------------------------------------------------------------
 # 04-17: GET /api/spacescan/status + POST /api/spacescan/setup
 # ---------------------------------------------------------------------------

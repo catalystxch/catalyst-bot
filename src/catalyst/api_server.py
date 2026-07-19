@@ -926,6 +926,25 @@ def _history_age_label(timestamp_value: str) -> str:
 # _build_fill_history_for_gui moved to blueprint
 
 
+def _live_wallet_reads_allowed(bot_obj=None) -> bool:
+    """True only when both public bot state and thread state are running."""
+    if bot_obj is None:
+        return False
+    state_running = False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
+    try:
+        method_running = (
+            bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
+        )
+    except Exception:
+        method_running = False
+    return bool(state_running and method_running)
+
+
 def _get_live_local_offer_edges(asset_id: str) -> dict:
     """Get our current best live bid/ask from wallet-open offers.
 
@@ -944,7 +963,7 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
         return result
 
     trade_ids = None
-    if bot and getattr(bot, "offer_manager", None):
+    if _live_wallet_reads_allowed(bot) and getattr(bot, "offer_manager", None):
         try:
             wallet_open_buys, wallet_open_sells, _ = (
                 bot.offer_manager.sync_from_wallet()
@@ -2239,6 +2258,31 @@ def api_sage_latest_release():
 # api_bot_state moved to blueprint
 
 
+def _health_consecutive_failures(raw_health: dict) -> int:
+    """Count a live health probe as failed when wallet or node is unreachable."""
+    if not isinstance(raw_health, dict):
+        return 1
+    existing = raw_health.get("consecutive_failures")
+    if existing is not None:
+        try:
+            return max(0, int(existing))
+        except (TypeError, ValueError):
+            pass
+    if raw_health.get("healthy") is True:
+        return 0
+    wallet = raw_health.get("wallet") or {}
+    node = raw_health.get("node") or {}
+    wallet_bad = wallet.get("reachable") is False
+    node_bad = node.get("reachable") is False
+    status_bad = str(raw_health.get("status", "")).lower() in {
+        "unreachable",
+        "rpc_failed",
+        "error",
+        "unknown",
+    }
+    return 1 if wallet_bad or node_bad or status_bad else 0
+
+
 def _get_health_snapshot() -> dict:
     """Quick health check for /api/status when bot hasn't started yet."""
     import chia_node
@@ -2259,11 +2303,11 @@ def _get_health_snapshot() -> dict:
             "wallet_sync_state": wallet.get("sync_state", "unknown"),
             "node_reachable": node.get("reachable", False),
             "node_synced": node.get("synced", False),
-            "consecutive_failures": 0,
+            "consecutive_failures": _health_consecutive_failures(h),
             "last_check": time.time(),
         }
     except Exception:
-        return {"status": "unknown", "consecutive_failures": 0}
+        return {"status": "unknown", "consecutive_failures": 1}
 
 
 # api_status moved to blueprint

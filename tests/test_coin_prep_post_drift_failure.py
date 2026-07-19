@@ -1,0 +1,117 @@
+import sys
+import types
+from decimal import Decimal
+from unittest.mock import MagicMock
+
+import coin_prep_worker
+
+
+def test_post_prep_tier_drift_is_a_hard_failure(monkeypatch):
+    fake_coin_manager = types.ModuleType("coin_manager")
+    fake_coin_manager.check_tier_size_drift_standalone = lambda: [
+        {
+            "side": "cat",
+            "tier": "outer",
+            "ratio": "0.917",
+            "coin_count": 3,
+        }
+    ]
+
+    events = []
+    fake_database = types.ModuleType("database")
+    fake_database.log_event = lambda severity, event_type, message: events.append(
+        (severity, event_type, message)
+    )
+
+    monkeypatch.setitem(sys.modules, "coin_manager", fake_coin_manager)
+    monkeypatch.setitem(sys.modules, "database", fake_database)
+
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.log = MagicMock()
+    worker.update_status = MagicMock()
+
+    assert worker._verify_post_prep_tier_drift() is False
+    worker.update_status.assert_called_once()
+    args, kwargs = worker.update_status.call_args
+    phase = kwargs.get("phase") if kwargs else None
+    if phase is None and args:
+        phase = args[0]
+    assert phase == coin_prep_worker.PrepPhase.ERROR
+    assert "POST_PREP_TIER_DRIFT" in str(kwargs.get("error", ""))
+    assert events
+    assert events[0][1] == "tier_size_post_prep_drift"
+
+
+def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
+    monkeypatch,
+):
+    fake_coin_manager = types.ModuleType("coin_manager")
+    fake_coin_manager.reclassify_tier_spare_coins = lambda: {}
+    fake_coin_manager.check_tier_size_drift_standalone = lambda: [
+        {
+            "side": "cat",
+            "tier": "outer",
+            "ratio": "0.917",
+            "coin_count": 3,
+        }
+    ]
+
+    fake_database = types.ModuleType("database")
+    fake_database.log_event = lambda *args, **kwargs: None
+
+    fake_wallet_sage = types.ModuleType("wallet_sage")
+    fake_wallet_sage.get_wallet_balance = lambda wallet_id: {
+        "success": True,
+        "wallet_balance": {
+            "confirmed_wallet_balance": 10**15,
+            "unconfirmed_wallet_balance": 10**15,
+            "spendable_balance": 10**15,
+        },
+    }
+
+    monkeypatch.setitem(sys.modules, "coin_manager", fake_coin_manager)
+    monkeypatch.setitem(sys.modules, "database", fake_database)
+    monkeypatch.setitem(sys.modules, "wallet_sage", fake_wallet_sage)
+    monkeypatch.setattr(coin_prep_worker.time, "sleep", lambda *_args, **_kwargs: None)
+
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.xch_wallet_id = 1
+    worker.cat_wallet_id = 2
+    worker.tier_enabled = False
+    worker.is_sage = False
+    worker._db_ready = False
+    worker.xch_target_coins = 1
+    worker.cat_target_coins = 1
+    worker.xch_expected_total_coins = 2
+    worker.cat_expected_total_coins = 2
+    worker.xch_coin_size = Decimal("1")
+    worker.cat_coin_size = Decimal("1")
+    worker.xch_reserve = Decimal("0")
+    worker.cat_reserve = Decimal("0")
+    worker.cat_decimals = 3
+    worker.log = MagicMock()
+    worker.update_status = MagicMock()
+    worker.get_coin_count = MagicMock(return_value=1)
+    worker.get_balance = MagicMock(return_value=Decimal("10"))
+    worker._log_coin_snapshot = MagicMock()
+    worker._set_status_coin_counts = MagicMock()
+    worker.cancel_all_offers = MagicMock(return_value=True)
+    worker._tx_fee_mojos = MagicMock(return_value=0)
+    worker.consolidate_wallet = MagicMock()
+    worker._designate_reserve_after_consolidation = MagicMock()
+    worker.create_pools_parallel = MagicMock(return_value=True)
+    worker.split_coins_parallel = MagicMock(return_value=True)
+    worker.verify_coins = MagicMock(return_value=(2, 2))
+    worker._merge_xch_fee_change_into_reserve = MagicMock(return_value=False)
+    worker._designate_final_sweep = MagicMock()
+    worker._format_cat_amount = lambda value: str(value)
+
+    assert worker.run_full_preparation() is False
+    worker.update_status.assert_any_call(
+        coin_prep_worker.PrepPhase.ERROR,
+        0.99,
+        "Post-prep tier drift detected - manual re-prep required",
+        error="POST_PREP_TIER_DRIFT: cat/outer=0.917x (n=3)",
+    )
+    logged = "\n".join(str(call) for call in worker.log.mock_calls)
+    assert "COIN PREPARATION COMPLETE" not in logged

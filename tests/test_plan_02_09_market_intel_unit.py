@@ -465,6 +465,11 @@ class TestStateQueryMethods(_MI):
         self.assertIn("orderbook_refreshes", summary)
         self.assertIn("orderbook_errors", summary)
 
+    def test_get_market_summary_never_refreshed_orderbook_has_no_age(self):
+        summary = self._mi.get_market_summary()
+        self.assertIsNone(summary["orderbook_age_secs"])
+        self.assertEqual(summary["orderbook_refreshes"], 0)
+
     def test_get_orderbook_snapshot_empty(self):
         snap = self._mi.get_orderbook_snapshot()
         self.assertEqual(snap["buy_count"], 0)

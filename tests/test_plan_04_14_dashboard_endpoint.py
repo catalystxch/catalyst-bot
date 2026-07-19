@@ -210,6 +210,17 @@ class TestDashboard(_FlaskBase):
         body = resp.get_json()
         self.assertIsInstance(body["current_cat"], dict)
 
+    def test_dashboard_does_not_read_wallet_when_bot_stopped(self):
+        with (
+            patch("wallet.get_wallet_balance") as get_wallet_balance,
+            patch("wallet.rpc") as wallet_rpc,
+        ):
+            resp = self._get_dashboard()
+
+        self.assertEqual(resp.status_code, 200)
+        get_wallet_balance.assert_not_called()
+        wallet_rpc.assert_not_called()
+
     def test_market_health_uses_live_offer_edges_for_inner_spread(self):
         risk_manager = MagicMock()
         risk_manager.get_inventory_state.return_value = {}
@@ -298,6 +309,29 @@ class TestDashboard(_FlaskBase):
         self.assertAlmostEqual(
             float(metrics["your_spread_bps"]), float(expected_bps), places=6
         )
+
+    def test_live_offer_edges_does_not_sync_wallet_when_state_stopped(self):
+        sync_from_wallet = MagicMock(return_value=([], [], None))
+        stopped_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": False},
+            is_running=lambda: True,
+            offer_manager=types.SimpleNamespace(sync_from_wallet=sync_from_wallet),
+        )
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch.object(
+                api_server,
+                "get_connection",
+                return_value=_make_mock_db_conn(),
+            ),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        sync_from_wallet.assert_not_called()
+        self.assertEqual(result["source"], "db_open_offers")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_open_sells"], 0)
 
     def test_cat_topup_pool_empty_recommendation_does_not_suggest_coin_prep(self):
         cfg = types.SimpleNamespace(
