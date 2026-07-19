@@ -2321,6 +2321,7 @@ def _calculate_smart_defaults(
     _smart_extreme = 0.0
     _smart_trade_size = 0.0
     _capital_plan = {}
+    _n_final = 0
     _n_sell_cap = 0  # F64: CAT-backed sell capacity (set inside capital plan)
 
     if _avail_xch > 0 and _trading_xch >= (_MIN_OFFER_XCH * 2) and _target_n > 0:

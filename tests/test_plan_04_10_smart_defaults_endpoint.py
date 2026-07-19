@@ -956,6 +956,113 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
         self.assertGreater(float(body["min_trade_xch"]), 0)
         self.assertGreaterEqual(float(body["max_trade_xch"]), max(generated_sizes))
 
+    def test_wallet_balance_unavailable_does_not_crash(self):
+        from blueprints import smart_defaults
+
+        raw_market = {
+            "dexie_ticker": {
+                "price": 0.000081965,
+                "volume_30d": 12,
+                "high_30d": 0.00009,
+                "low_30d": 0.000075,
+            },
+            "dexie_trades": {
+                "total_count": 75,
+                "volume_trend": "stable",
+                "trades": [
+                    {"price": 0.000081965, "xch_amount": 1.0},
+                    {"price": 0.000081965, "xch_amount": 1.0},
+                    {"price": 0.000081965, "xch_amount": 1.0},
+                ],
+            },
+            "tibet_pool": {
+                "has_data": True,
+                "price": 0.000081965,
+                "xch_reserve": 100,
+            },
+            "tibet_quote": {},
+            "spacescan": {"has_data": True, "price_xch": 0.000081965},
+            "internal_db": {"price_count": 60, "fill_count": 0, "pool_trend": "stable"},
+        }
+        analysis = {
+            "volatility": {
+                "regime": "quiet",
+                "range_30d_pct": 12,
+                "range_90d_pct": 20,
+                "max_single_move_pct": 3,
+                "confidence": "high",
+                "std_dev_pct": 2,
+            },
+            "liquidity": {
+                "fills_per_day": 2.5,
+                "daily_volume_xch": 4.0,
+                "level": "moderate",
+            },
+            "token_health": {
+                "risk_level": "healthy",
+                "activity_level": "active",
+                "holder_count": 100,
+            },
+            "bot_performance": {"has_history": False},
+            "data_quality": {"score": 100, "quality": "excellent"},
+        }
+
+        with (
+            patch(
+                "wallet.get_wallet_balance",
+                return_value={"success": False, "error": "rpc unavailable"},
+            ),
+            patch(
+                "market_data_collector.collect_all_market_data",
+                return_value=raw_market,
+            ),
+            patch("market_data_collector.analyze_market_data", return_value=analysis),
+            patch.object(
+                smart_defaults,
+                "_fetch_dexie_orderbook_standalone",
+                return_value={
+                    "has_data": False,
+                    "api_ok": True,
+                    "num_buy_offers": 0,
+                    "num_sell_offers": 0,
+                    "competitor_spread_bps": 0,
+                    "best_bid": 0,
+                    "best_ask": 0,
+                },
+            ),
+            patch.object(
+                smart_defaults,
+                "_smart_dbx_defaults",
+                return_value={
+                    "dbx_max_spread_bps": 500,
+                    "pair_incentivized": False,
+                    "dbx_buy_incentive": None,
+                    "dbx_sell_incentive": None,
+                },
+            ),
+            patch(
+                "tx_fees.get_suggested_transaction_fee",
+                return_value={"available": False},
+            ),
+        ):
+            with api_server.app.test_request_context("/api/smart-defaults"):
+                resp = smart_defaults._calculate_smart_defaults(
+                    xch_reserve=0,
+                    cat_reserve=0,
+                    risk_profile="balanced",
+                    asset_id="asset",
+                    cat_wallet_id=2,
+                    cat_decimals=3,
+                    cat_ticker_id="MZ_XCH",
+                    cat_name="Monkeyzoo Token",
+                )
+
+        body = resp.get_json()
+        self.assertIsNone(body["default_trade_xch"])
+        self.assertIsNone(body["max_trade_xch"])
+        self.assertFalse(body["_data_sources"]["has_wallet_balance"])
+        self.assertEqual(body["_capital_plan"]["available_xch"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
