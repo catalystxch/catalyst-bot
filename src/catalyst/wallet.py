@@ -101,6 +101,10 @@ if WALLET_TYPE == "chia":
         """Chia backend stub — message signing for Dexie claims is Sage-only."""
         return {"success": False, "error": "claim_unsupported_on_chia_backend"}
 
+    def notify_cat_asset_id_changed(asset_id: str) -> None:
+        """Chia backend compatibility stub for Sage active CAT cache updates."""
+        return None
+
     # Chia's spendable RPC is already the exact selectable view.
     get_exact_spendable_coins_rpc = get_spendable_coins_rpc
 else:
@@ -185,6 +189,7 @@ else:
         delete_offers_batch as sage_delete_offers_batch,
         # Sage-specific: message signing for Dexie liquidity-rewards claims
         sign_message_by_address,
+        notify_cat_asset_id_changed,
     )
 
 

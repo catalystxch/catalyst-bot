@@ -172,6 +172,7 @@ _CAT_ASSET_ID = os.getenv("CAT_ASSET_ID", "")
 # Populated by get_wallets() when Sage's get_cats endpoint returns results.
 # Allows get_wallet_balance() etc. to resolve any CAT, not just the configured one.
 _wallet_id_to_asset_id: dict = {}
+SAGE_ACTIVE_CAT_WALLET_ID = 2
 
 HEADERS = {"Content-Type": "application/json"}
 
@@ -1016,7 +1017,7 @@ def notify_cat_asset_id_changed(asset_id: str) -> None:
     Also clears any per-wallet-id mismatch-warned flags so the first access
     after a switch gets a clean cross-check.
     """
-    global _CAT_ASSET_ID
+    global _CAT_ASSET_ID, _wallet_id_to_asset_id
     new_id = (asset_id or "").strip().lower().replace("0x", "")
     old_id = (_CAT_ASSET_ID or "").strip().lower().replace("0x", "")
     if new_id != old_id:
@@ -1033,6 +1034,14 @@ def notify_cat_asset_id_changed(asset_id: str) -> None:
             f"[Sage] Active CAT updated: {new_id[:16] if new_id else 'none'}",
             flush=True,
         )
+    if new_id:
+        _wallet_id_to_asset_id = {
+            wid: aid
+            for wid, aid in _wallet_id_to_asset_id.items()
+            if wid == SAGE_ACTIVE_CAT_WALLET_ID
+            or (aid or "").strip().lower().replace("0x", "") != new_id
+        }
+        _wallet_id_to_asset_id[SAGE_ACTIVE_CAT_WALLET_ID] = (asset_id or "").strip()
 
 
 def _is_cat_wallet(wallet_id: int) -> bool:
@@ -2426,7 +2435,7 @@ def get_wallets():
             # We then update cfg.CAT_WALLET_ID to match, so all modules
             # use the correct ID regardless of what .env says.
             # ─────────────────────────────────────────────────────────
-            CONFIGURED_CAT_WID = 2  # Fixed ID for the active trading CAT
+            CONFIGURED_CAT_WID = SAGE_ACTIVE_CAT_WALLET_ID
             next_synthetic_id = 1000  # Other CATs — far away, no collision risk
 
             new_mapping = {}
@@ -2512,7 +2521,7 @@ def get_wallets():
 
     # Fallback: get_cats didn't work — use single CAT from .env config
     asset_id = _get_cat_asset_id()
-    cat_wallet_id = 2  # Same fixed ID as dynamic path
+    cat_wallet_id = SAGE_ACTIVE_CAT_WALLET_ID
     cat_name = os.getenv("CAT_NAME", "MZ")
 
     if asset_id:

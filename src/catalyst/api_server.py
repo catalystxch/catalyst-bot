@@ -1031,6 +1031,27 @@ _active_cat = {
 # Lock for multi-key mutations of _active_cat so readers never see a
 # half-updated pair (e.g. asset_id from the new CAT but decimals from the old).
 _active_cat_lock = threading.Lock()
+SAGE_ACTIVE_CAT_WALLET_ID = 2
+
+
+def active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
+    if asset_id and get_wallet_type() == "sage":
+        return SAGE_ACTIVE_CAT_WALLET_ID
+    try:
+        return int(wallet_id)
+    except (TypeError, ValueError):
+        return int(getattr(cfg, "CAT_WALLET_ID", SAGE_ACTIVE_CAT_WALLET_ID))
+
+
+def sync_active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
+    resolved_wallet_id = active_cat_wallet_id(wallet_id, asset_id)
+    with _active_cat_lock:
+        _active_cat["wallet_id"] = resolved_wallet_id
+    if asset_id and get_wallet_type() == "sage":
+        cfg.CAT_WALLET_ID = resolved_wallet_id
+    return resolved_wallet_id
+
+
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
 if _active_cat["ticker_id"] and "_" not in _active_cat["ticker_id"]:
     _active_cat["ticker_id"] = f"{_active_cat['ticker_id']}_XCH"

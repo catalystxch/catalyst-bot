@@ -586,8 +586,13 @@ def api_bot_state():
                     from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
                     xch_free = int(get_spendable_coin_count(WALLET_ID_XCH) or 0)
-                    cat_wallet_id = api_server._active_cat.get("wallet_id") or getattr(
-                        cfg, "CAT_WALLET_ID", 2
+                    active_asset_id = api_server._active_cat.get("asset_id") or getattr(
+                        cfg, "CAT_ASSET_ID", ""
+                    )
+                    cat_wallet_id = api_server.active_cat_wallet_id(
+                        api_server._active_cat.get("wallet_id")
+                        or getattr(cfg, "CAT_WALLET_ID", 2),
+                        active_asset_id,
                     )
                     cat_free = int(get_spendable_coin_count(cat_wallet_id) or 0)
 
@@ -1002,8 +1007,10 @@ def api_status():
                 from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
                 xch_free = int(get_spendable_coin_count(WALLET_ID_XCH) or 0)
-                cat_wid_coins = api_server._active_cat.get("wallet_id") or getattr(
-                    cfg, "CAT_WALLET_ID", 2
+                cat_wid_coins = api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", 2),
+                    asset_id,
                 )
                 cat_free = int(get_spendable_coin_count(cat_wid_coins) or 0)
             except StopIteration:
@@ -1059,8 +1066,11 @@ def api_status():
                         "current_cat": {
                             "name": cat_name,
                             "asset_id": asset_id,
-                            "wallet_id": api_server._active_cat.get("wallet_id")
-                            or getattr(cfg, "CAT_WALLET_ID", None),
+                            "wallet_id": api_server.active_cat_wallet_id(
+                                api_server._active_cat.get("wallet_id")
+                                or getattr(cfg, "CAT_WALLET_ID", None),
+                                asset_id,
+                            ),
                             "decimals": api_server._active_cat.get("decimals")
                             or getattr(cfg, "CAT_DECIMALS", 3),
                             "ticker_id": api_server._active_cat.get("ticker_id")
@@ -1129,8 +1139,11 @@ def api_status():
                 from wallet import get_wallet_balance
 
                 # Use actively selected CAT wallet_id, fall back to config
-                cat_wallet_id = api_server._active_cat.get("wallet_id") or getattr(
-                    cfg, "CAT_WALLET_ID", 2
+                cat_wallet_id = api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", 2),
+                    api_server._active_cat.get("asset_id")
+                    or getattr(cfg, "CAT_ASSET_ID", ""),
                 )
                 cat_result = get_wallet_balance(cat_wallet_id)
                 if cat_result and cat_result.get("success"):
@@ -1795,8 +1808,12 @@ def api_status():
                 or (cfg.CAT_NAME if hasattr(cfg, "CAT_NAME") else ""),
                 "asset_id": api_server._active_cat.get("asset_id")
                 or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""),
-                "wallet_id": api_server._active_cat.get("wallet_id")
-                or getattr(cfg, "CAT_WALLET_ID", None),
+                "wallet_id": api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", None),
+                    api_server._active_cat.get("asset_id")
+                    or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""),
+                ),
                 "decimals": api_server._active_cat.get("decimals")
                 or getattr(cfg, "CAT_DECIMALS", 3),
                 "ticker_id": api_server._active_cat.get("ticker_id")

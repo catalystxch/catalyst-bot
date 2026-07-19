@@ -109,6 +109,30 @@ class TestIsCatWallet(unittest.TestCase):
         self.assertTrue(_is_cat_wallet(2))
 
 
+@unittest.skipIf(_SKIP is not None, _SKIP_MSG)
+class TestSageActiveCatMapping(unittest.TestCase):
+    def setUp(self):
+        self._orig_cat_asset_id = _ws._CAT_ASSET_ID
+        self._orig_mapping = dict(_ws._wallet_id_to_asset_id)
+
+    def tearDown(self):
+        _ws._CAT_ASSET_ID = self._orig_cat_asset_id
+        _ws._wallet_id_to_asset_id = self._orig_mapping
+
+    def test_notify_rebinds_fixed_active_cat_wallet_id(self):
+        old_asset = "a" * 64
+        new_asset = "b" * 64
+        _ws._CAT_ASSET_ID = old_asset
+        _ws._wallet_id_to_asset_id = {
+            2: old_asset,
+            1000: new_asset,
+        }
+
+        _ws.notify_cat_asset_id_changed(new_asset)
+
+        self.assertEqual(_ws._resolve_asset_id(2), new_asset)
+
+
 # ---------------------------------------------------------------------------
 # _extract_sage_coin_list
 # ---------------------------------------------------------------------------

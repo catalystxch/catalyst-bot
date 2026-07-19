@@ -48,6 +48,24 @@ def _normalize_asset_id(asset_id: str) -> str:
     return cleaned
 
 
+def _active_cat_wallet_id(wallet_id, asset_id: str = "") -> int:
+    return api_server.active_cat_wallet_id(wallet_id, asset_id)
+
+
+def _notify_cat_asset_id_changed(asset_id: str) -> None:
+    try:
+        from wallet import notify_cat_asset_id_changed
+
+        notify_cat_asset_id_changed(asset_id)
+    except Exception as e:
+        slog(
+            "WALLET",
+            "Active CAT wallet notification failed",
+            {"asset_id": str(asset_id or "")[:16], "error": str(e)},
+            level="warning",
+        )
+
+
 def _get_dexie_pairs() -> list:
     """Fetch all trading pairs from Dexie API.
 
@@ -526,6 +544,8 @@ def api_cat_select():
         except (ValueError, TypeError):
             return jsonify({"success": False, "error": "Invalid decimals"}), 400
 
+    selected_wallet_id = _active_cat_wallet_id(wallet_id, asset_id)
+
     # Safety: never change the trading pair while the bot is running.
     try:
         if bot is not None and bot.is_running():
@@ -544,8 +564,7 @@ def api_cat_select():
         api_server._active_cat["name"] = name
         api_server._active_cat["decimals"] = int(decimals) if decimals else 3
         api_server._active_cat["ticker_id"] = ticker_id
-        if wallet_id is not None:
-            api_server._active_cat["wallet_id"] = int(wallet_id)
+        api_server._active_cat["wallet_id"] = selected_wallet_id
 
     # Persist to .env so it survives restarts.
     # CAT_WALLET_ID is intentionally NOT saved — it's resolved dynamically.
@@ -557,6 +576,9 @@ def api_cat_select():
         cfg.update("CAT_DECIMALS", str(int(decimals)))
     if ticker_id:
         cfg.update("CAT_TICKER_ID", ticker_id)
+    selected_wallet_id = api_server.sync_active_cat_wallet_id(
+        selected_wallet_id, asset_id
+    )
 
     # Reset risk manager so stale inventory/CB state doesn't leak into the new CAT.
     if bot is not None:
@@ -609,6 +631,8 @@ def api_cat_select():
                     "cat_tibet_resolve_error",
                     f"TIBET_PAIR_ID auto-resolve failed after CAT select: {e}",
                 )
+            finally:
+                api_server.sync_active_cat_wallet_id(selected_wallet_id, asset_id)
 
         threading.Thread(
             target=_resolve_new_cat_tibet, daemon=True, name="cat-tibet-resolve"
@@ -616,18 +640,20 @@ def api_cat_select():
 
     # Notify the Sage wallet adapter so _get_cat_asset_id() returns the new
     # asset ID immediately — without waiting for .env to be re-read.
-    try:
-        from wallet_sage import notify_cat_asset_id_changed
+    _notify_cat_asset_id_changed(asset_id)
 
-        notify_cat_asset_id_changed(asset_id)
-    except Exception:
-        pass
-
-    print(f"🔄 CAT selected: {name} (wallet_id={wallet_id}, asset={asset_id[:12]}...)")
-    log_event(
-        "info", "cat_selected", f"Trading pair selected: {name} (wallet {wallet_id})"
+    print(
+        f"🔄 CAT selected: {name} "
+        f"(wallet_id={selected_wallet_id}, asset={asset_id[:12]}...)"
     )
-    return jsonify({"success": True, "asset_id": asset_id, "wallet_id": wallet_id})
+    log_event(
+        "info",
+        "cat_selected",
+        f"Trading pair selected: {name} (wallet {selected_wallet_id})",
+    )
+    return jsonify(
+        {"success": True, "asset_id": asset_id, "wallet_id": selected_wallet_id}
+    )
 
 
 @bp.route("/api/cat/refresh", methods=["POST"])
@@ -656,9 +682,19 @@ def api_balances_refresh():
                 xch_bal["spendable"] = (
                     api_server._safe_float(wb.get("spendable_balance", 0)) / 1e12
                 )
-            cat_wid = api_server._active_cat.get("wallet_id") or getattr(
-                cfg, "CAT_WALLET_ID", 2
+            active_asset_id = str(
+                api_server._active_cat.get("asset_id")
+                or getattr(cfg, "CAT_ASSET_ID", "")
+                or ""
+            ).strip()
+            cat_wid = _active_cat_wallet_id(
+                api_server._active_cat.get("wallet_id")
+                or getattr(cfg, "CAT_WALLET_ID", 2),
+                active_asset_id,
             )
+            if active_asset_id and api_server.get_wallet_type() == "sage":
+                cat_wid = api_server.sync_active_cat_wallet_id(cat_wid, active_asset_id)
+                _notify_cat_asset_id_changed(active_asset_id)
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
