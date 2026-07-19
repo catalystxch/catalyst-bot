@@ -499,8 +499,10 @@ def api_dashboard():
                     Decimal(str(wb.get("spendable_balance", 0)))
                     / Decimal("1000000000000")
                 )
-            cat_wid = api_server._active_cat.get("wallet_id") or getattr(
-                cfg, "CAT_WALLET_ID", 2
+            cat_wid = api_server.active_cat_wallet_id(
+                api_server._active_cat.get("wallet_id")
+                or getattr(cfg, "CAT_WALLET_ID", 2),
+                active_asset_id,
             )
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
