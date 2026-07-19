@@ -432,6 +432,11 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         for tier in ("Inner", "Mid", "Outer", "Extreme"):
             self.assertIn(f"config{tier}TierCountXch", reserve_fn)
             self.assertNotIn(f"configBuy{tier}TierCount", reserve_fn)
+        self.assertIn("const _buyTierCount", reserve_fn)
+        self.assertNotRegex(
+            reserve_fn,
+            r"_i\('config(?:Inner|Mid|Outer|Extreme)TierCountXch'\)\s*\|\|",
+        )
 
 
 class TestSmartDefaultsSmallWalletSizing(unittest.TestCase):
