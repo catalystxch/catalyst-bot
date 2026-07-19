@@ -422,6 +422,17 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertIn('id="settings-section-reserves"', html)
         self.assertIn("getElementById('settings-section-reserves')", html)
 
+    def test_frontend_reserve_warning_uses_buy_side_tier_count_ids(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "bot_gui.html").read_text(encoding="utf-8")
+        reserve_fn = html.split("function checkReserveWarnings()", 1)[1].split(
+            "function checkRiskWarnings()", 1
+        )[0]
+
+        for tier in ("Inner", "Mid", "Outer", "Extreme"):
+            self.assertIn(f"config{tier}TierCountXch", reserve_fn)
+            self.assertNotIn(f"configBuy{tier}TierCount", reserve_fn)
+
 
 class TestSmartDefaultsSmallWalletSizing(unittest.TestCase):
     def test_small_wallet_position_limit_has_no_five_xch_floor(self):

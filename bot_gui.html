@@ -22416,10 +22416,10 @@
                 const outerSize = _f('configBuyOuterSizeXch')   || _f('configOuterSizeXch')   || tradeSize * 0.5;
                 const extremeSize = _f('configBuyExtremeSizeXch') || _f('configExtremeSizeXch') || tradeSize * 0.2;
                 // Position counts for the buy ladder (per-side when set).
-                const cInner = _i('configBuyInnerTierCount')   || _i('configInnerTierCount');
-                const cMid   = _i('configBuyMidTierCount')     || _i('configMidTierCount');
-                const cOuter = _i('configBuyOuterTierCount')   || _i('configOuterTierCount');
-                const cExt   = _i('configBuyExtremeTierCount') || _i('configExtremeTierCount');
+                const cInner = _i('configInnerTierCountXch')   || _i('configInnerTierCount');
+                const cMid   = _i('configMidTierCountXch')     || _i('configMidTierCount');
+                const cOuter = _i('configOuterTierCountXch')   || _i('configOuterTierCount');
+                const cExt   = _i('configExtremeTierCountXch') || _i('configExtremeTierCount');
                 // The per-side fields are already position-indexed in the
                 // orientation the bot will actually deploy, so a direct
                 // count × size product is the buy ladder's true XCH draw.
