@@ -148,6 +148,7 @@ _TOPUP_BACKOFF_MAX = 3600  # 60 minutes — ceiling for exponential backoff
 # attempt 0 → 5 min, 1 → 10 min, 2 → 20 min, 3 → 40 min, 4+ → 60 min (capped)
 _TOPUP_DRIP_INTERVAL = 90  # 90 seconds between proactive drip checks
 _DRIP_SOURCE_NOTICE_INTERVAL = 3600  # 60 minutes between optional no-source notices
+_SAGE_ACTIVE_CAT_WALLET_ID = 2
 
 
 def _coin_prep_worker_command(worker_path: str) -> list[str]:
@@ -170,6 +171,26 @@ def _coin_prep_worker_cwd() -> str:
         return data_dir()
     except Exception:
         return os.path.dirname(os.path.abspath(__file__))
+
+
+def _coin_prep_active_cat_wallet_id(env: Optional[dict] = None) -> int:
+    """Return the CAT wallet id the prep worker must use for the active CAT."""
+    env = env or {}
+    wallet_type = (
+        (env.get("WALLET_TYPE") or getattr(cfg, "WALLET_TYPE", "sage") or "sage")
+        .strip()
+        .lower()
+    )
+    raw_wallet_id = env.get("CAT_WALLET_ID", getattr(cfg, "CAT_WALLET_ID", 2))
+    asset_id = (
+        env.get("CAT_ASSET_ID") or getattr(cfg, "CAT_ASSET_ID", "") or ""
+    ).strip()
+    if wallet_type == "sage" and asset_id:
+        return _SAGE_ACTIVE_CAT_WALLET_ID
+    try:
+        return int(raw_wallet_id)
+    except (TypeError, ValueError):
+        return _SAGE_ACTIVE_CAT_WALLET_ID
 
 
 def _set_sage_data_dir_from_cert_env(env: dict, cert_path: str) -> None:
@@ -208,6 +229,7 @@ def _coin_prep_worker_environment(base_env: Optional[dict] = None) -> dict:
     env = dict(os.environ if base_env is None else base_env)
     env["PYTHONIOENCODING"] = "utf-8"
     env["_CATALYST_PRESERVE_PROCESS_ENV"] = "1"
+    env["CAT_WALLET_ID"] = str(_coin_prep_active_cat_wallet_id(env))
 
     wallet_type = (
         (env.get("WALLET_TYPE") or getattr(cfg, "WALLET_TYPE", "sage") or "sage")
@@ -10506,6 +10528,7 @@ class CoinManager:
                     self._prep_running = False
                 return False
             env = _coin_prep_worker_environment()
+            cat_wallet_id = _coin_prep_active_cat_wallet_id(env)
 
             # Build CLI args to pass correct config to the worker.
             # This ensures the worker uses the ACTUAL bot settings
@@ -10662,6 +10685,8 @@ class CoinManager:
                     f"{target_xch_size} each, {total_coins} CAT coins "
                     f"(+{prep_headroom_pct}% headroom)",
                 )
+
+            cmd.extend(["--cat-wallet", str(cat_wallet_id)])
 
             # Pass the bot's current weighted mid to the worker so CAT sizing
             # reflects what the bot is actually quoting, not Dexie's last_price

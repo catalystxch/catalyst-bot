@@ -10,6 +10,7 @@ Tests /api/coin-prep/status, /api/coin-prep/verify,
 
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
@@ -423,6 +424,71 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertTrue(first.get_json().get("success"))
         self.assertEqual(second.get_json().get("status"), "already_running")
         self.assertEqual(mock_thread.call_count, 1)
+
+    def test_trigger_passes_sage_active_cat_wallet_to_worker(self):
+        captured = {}
+
+        class ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class DoneProcess:
+            pid = 12345
+            returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(kwargs.get("env") or {})
+            return DoneProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "coin_prep_output.log")
+            env = {
+                "WALLET_TYPE": "sage",
+                "CAT_ASSET_ID": "abc123",
+                "CAT_WALLET_ID": "1000",
+            }
+            with (
+                patch.object(
+                    api_server,
+                    "_reset_fresh_run_session",
+                    return_value=self._FAKE_SUMMARY,
+                ),
+                patch.object(api_server, "bot", None),
+                patch.object(coin_prep_blueprint.threading, "Thread", ImmediateThread),
+                patch(
+                    "coin_manager._coin_prep_worker_command", return_value=["worker"]
+                ),
+                patch("coin_manager._coin_prep_worker_environment", return_value=env),
+                patch("subprocess.Popen", side_effect=fake_popen),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_runtime_dir",
+                    return_value=temp_dir,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_output_log_file",
+                    return_value=log_path,
+                ),
+                patch.object(api_server, "_get_live_mid_price_str", return_value=None),
+                patch.object(coin_prep_blueprint.cfg, "WALLET_TYPE", "sage"),
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "abc123"),
+                patch.object(coin_prep_blueprint.cfg, "CAT_WALLET_ID", 1000),
+                patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", False),
+            ):
+                resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("--cat-wallet", captured["cmd"])
+        index = captured["cmd"].index("--cat-wallet")
+        self.assertEqual(captured["cmd"][index + 1], "2")
 
 
 # ---------------------------------------------------------------------------
