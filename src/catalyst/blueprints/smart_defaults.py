@@ -2321,6 +2321,7 @@ def _calculate_smart_defaults(
     _smart_extreme = 0.0
     _smart_trade_size = 0.0
     _capital_plan = {}
+    _n_final = 0
     _n_sell_cap = 0  # F64: CAT-backed sell capacity (set inside capital plan)
 
     if _avail_xch > 0 and _trading_xch >= (_MIN_OFFER_XCH * 2) and _target_n > 0:
@@ -4071,6 +4072,30 @@ def _calculate_smart_defaults(
         f"{_toxicity_defaults['toxicity_protection_level']} protection"
     )
 
+    _smart_trade_bound_candidates = [
+        _smart_trade_size,
+        _smart_inner,
+        _smart_mid,
+        _smart_outer,
+        _smart_extreme,
+        _smart_buy_inner,
+        _smart_buy_mid,
+        _smart_buy_outer,
+        _smart_buy_extreme,
+        _smart_sell_inner,
+        _smart_sell_mid,
+        _smart_sell_outer,
+        _smart_sell_extreme,
+        _smart_sniper_size if _sniper_auto else 0,
+    ]
+    _smart_max_trade_xch = round(
+        max(
+            (float(v) for v in _smart_trade_bound_candidates if float(v or 0) > 0),
+            default=0.0,
+        ),
+        4,
+    )
+
     result = {
         # Smart Pricing
         "dynamic_spread_enabled": has_both_prices,
@@ -4233,6 +4258,8 @@ def _calculate_smart_defaults(
         "default_trade_xch": round(_smart_trade_size, 4)
         if _smart_trade_size > 0
         else None,
+        "min_trade_xch": round(_MIN_OFFER_XCH, 4),
+        "max_trade_xch": _smart_max_trade_xch if _smart_max_trade_xch > 0 else None,
         # Legacy single-shared size fields (kept in sync with the SELL
         # side so pre-F62 callers continue to work).
         "inner_size_xch": _smart_inner if _smart_inner > 0 else None,
