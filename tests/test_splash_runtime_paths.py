@@ -171,23 +171,15 @@ def test_splash_output_reader_suppresses_hook_connection_refused_burst(monkeypat
 def test_splash_output_reader_suppresses_windows_hook_refused_burst(monkeypatch):
     import splash_node
 
+    refused_line = (
+        "Error posting to offer hook: error sending request for url "
+        "(http://127.0.0.1:5000/api/splash/incoming): error trying "
+        "to connect: tcp connect error: No connection could be made "
+        "because the target machine actively refused it. (os error 10061)\n"
+    )
+
     class FakeProcess:
-        stdout = iter(
-            [
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-            ]
-        )
+        stdout = iter([refused_line, refused_line, refused_line])
 
     events = []
     monkeypatch.setattr(

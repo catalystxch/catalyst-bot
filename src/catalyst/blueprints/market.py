@@ -73,8 +73,12 @@ def _get_tibet_pairs_cached(base: str = None, timeout: int = 8) -> list:
                     _TIBET_PAIRS_CACHE["pairs"] = list(pairs)
                     _TIBET_PAIRS_CACHE["fetched_at"] = time.time()
                 return list(pairs)
-    except Exception:
-        pass
+    except Exception as e:
+        log_event(
+            "warning",
+            "tibet_pairs_cache_fetch_failed",
+            f"Failed to fetch TibetSwap pair cache: {e}",
+        )
     return []
 
 

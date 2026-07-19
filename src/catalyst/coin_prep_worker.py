@@ -7479,8 +7479,8 @@ class CoinPrepWorker:
                 "tier_size_post_prep_drift",
                 f"Coin prep finished with residual drift: {summary}",
             )
-        except Exception:
-            pass
+        except Exception as event_err:
+            self.log(f"Post-prep drift event log failed: {event_err}")
 
         try:
             self.update_status(
@@ -7489,8 +7489,8 @@ class CoinPrepWorker:
                 "Post-prep tier drift detected - manual re-prep required",
                 error=f"POST_PREP_TIER_DRIFT: {summary}",
             )
-        except Exception:
-            pass
+        except Exception as status_err:
+            self.log(f"Post-prep drift status update failed: {status_err}")
         return False
 
     def run_full_preparation(self) -> bool:
@@ -8394,8 +8394,8 @@ class CoinPrepWorker:
                         "Post-prep tier drift detected - manual re-prep required",
                         error=f"POST_PREP_TIER_DRIFT: {_summary}",
                     )
-                except Exception:
-                    pass
+                except Exception as status_err:
+                    self.log(f"Post-prep drift status update failed: {status_err}")
                 return False
 
             self.log(f"\n{'=' * 60}")
