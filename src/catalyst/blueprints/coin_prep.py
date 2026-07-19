@@ -46,6 +46,52 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _inventory_summary_from_coin_summary(
+    coin_summary: dict, manager_summary: dict = None
+) -> dict:
+    """Merge DB coin counts into a cold CoinManager inventory summary."""
+    summary = dict(manager_summary or {})
+    coin_summary = coin_summary or {}
+
+    def _int_value(key: str) -> int:
+        try:
+            return int(coin_summary.get(key, 0) or 0)
+        except Exception:
+            return 0
+
+    def _empty(value) -> bool:
+        return value in (None, "", 0, "0", "0.0", "0.00", "0.0000")
+
+    cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+    xch_locked_mojos = _int_value("xch_locked_mojos")
+    cat_locked_mojos = _int_value("cat_locked_mojos")
+    cat_divisor = Decimal(10) ** cat_decimals
+    derived = {
+        "xch_locked_coins": _int_value("xch_locked_count"),
+        "xch_locked_amount": (
+            f"{Decimal(xch_locked_mojos) / Decimal('1000000000000'):.4f}"
+        ),
+        "xch_locked_amount_raw": xch_locked_mojos,
+        "cat_locked_coins": _int_value("cat_locked_count"),
+        "cat_locked_amount": f"{Decimal(cat_locked_mojos) / cat_divisor:.2f}",
+        "cat_locked_amount_raw": cat_locked_mojos,
+        "xch_total_coins": _int_value("xch_total"),
+        "cat_total_coins": _int_value("cat_total"),
+    }
+
+    applied = False
+    for key, value in derived.items():
+        if _empty(summary.get(key)) and not _empty(value):
+            summary[key] = value
+            applied = True
+        elif key not in summary:
+            summary[key] = value
+
+    if applied:
+        summary["db_summary_fallback_applied"] = True
+    return summary
+
+
 def _read_text_tail(path: str, max_bytes: int = 400_000) -> str:
     if not path or not os.path.exists(path):
         return ""
@@ -2735,10 +2781,17 @@ def api_logs_download():
             if bot is not None and getattr(bot, "coin_manager", None):
                 try:
                     _coin_inv["inventory_summary"] = (
-                        bot.coin_manager.get_inventory_summary() or {}
+                        _inventory_summary_from_coin_summary(
+                            _coin_summary,
+                            bot.coin_manager.get_inventory_summary() or {},
+                        )
                     )
                 except Exception as _ce:
                     _coin_inv["inventory_summary_error"] = str(_ce)
+            else:
+                _coin_inv["inventory_summary"] = _inventory_summary_from_coin_summary(
+                    _coin_summary
+                )
             snapshots["coin_inventory"] = api_server._serialize_dict(_coin_inv)
         except Exception as e:
             snapshots["coin_inventory"] = {"error": str(e)}

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from decimal import Decimal
 
@@ -32,6 +33,56 @@ except Exception:
 
 
 bp = Blueprint("market", __name__)
+
+_TIBET_PAIRS_CACHE_LOCK = threading.RLock()
+_TIBET_PAIRS_CACHE = {"base": "", "fetched_at": 0.0, "pairs": []}
+_TIBET_PAIRS_CACHE_TTL_SECS = 60.0
+
+
+def _get_tibet_pairs_cached(base: str = None, timeout: int = 8) -> list:
+    """Return a short-lived cached TibetSwap /pairs list for GUI polling."""
+    base_url = (
+        base
+        or getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
+        or "https://api.v2.tibetswap.io"
+    ).rstrip("/")
+    now = time.time()
+    with _TIBET_PAIRS_CACHE_LOCK:
+        if (
+            _TIBET_PAIRS_CACHE.get("base") == base_url
+            and _TIBET_PAIRS_CACHE.get("pairs")
+            and now - float(_TIBET_PAIRS_CACHE.get("fetched_at") or 0)
+            < _TIBET_PAIRS_CACHE_TTL_SECS
+        ):
+            return list(_TIBET_PAIRS_CACHE.get("pairs") or [])
+
+    try:
+        import requests as _req
+
+        _record_api_call("tibetswap", "/pairs")
+        resp = _req.get(
+            f"{base_url}/pairs",
+            params={"skip": 0, "limit": 200},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            pairs = resp.json()
+            if isinstance(pairs, list):
+                with _TIBET_PAIRS_CACHE_LOCK:
+                    _TIBET_PAIRS_CACHE["base"] = base_url
+                    _TIBET_PAIRS_CACHE["pairs"] = list(pairs)
+                    _TIBET_PAIRS_CACHE["fetched_at"] = time.time()
+                return list(pairs)
+    except Exception as e:
+        try:
+            log_event(
+                "warning",
+                "tibet_pairs_cache_fetch_failed",
+                f"Failed to fetch TibetSwap pair cache: {e}",
+            )
+        except Exception:
+            return []
+    return []
 
 
 def _fetch_dbx_pair_status(asset_id: str, ticker_id: str) -> dict:
@@ -650,24 +701,21 @@ def api_market_summary():
         pass
 
     try:
-        _record_api_call("tibetswap", "/pairs")
-        resp = _req.get(
-            "https://api.v2.tibetswap.io/pairs",
-            params={"skip": 0, "limit": 200},
+        norm_id = asset_id.lower().strip().replace("0x", "")
+        pairs = _get_tibet_pairs_cached(
+            getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
             timeout=8,
         )
-        if resp.status_code == 200:
-            norm_id = asset_id.lower().strip().replace("0x", "")
-            for p in resp.json():
-                p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                if p_id == norm_id:
-                    xr = float(p.get("xch_reserve", 0)) / 1e12
-                    tr = float(p.get("token_reserve", 0)) / (10**decimals)
-                    if tr > 0:
-                        result["tibet_price"] = xr / tr
-                        result["pool_xch"] = round(xr, 2)
-                        result["pool_cat"] = round(tr, 0)
-                    break
+        for p in pairs:
+            p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
+            if p_id == norm_id:
+                xr = float(p.get("xch_reserve", 0)) / 1e12
+                tr = float(p.get("token_reserve", 0)) / (10**decimals)
+                if tr > 0:
+                    result["tibet_price"] = xr / tr
+                    result["pool_xch"] = round(xr, 2)
+                    result["pool_cat"] = round(tr, 0)
+                break
     except Exception:
         pass
 

@@ -585,8 +585,31 @@ class SplashNode:
                         _since_start < 30
                         and "insufficientpeers" in lower.replace(" ", "")
                     )
+                    _is_hook_refused = "/api/splash/incoming" in lower and (
+                        "connection refused" in lower
+                        or "actively refused" in lower
+                        or "os error 10061" in lower
+                    )
                     if "duplicate" in lower:
                         log_event("debug", "splash_node_output", f"Splash: {line}")
+                    elif _is_hook_refused:
+                        now = time.time()
+                        last_logged = float(
+                            getattr(self, "_last_hook_refused_log_time", 0.0) or 0.0
+                        )
+                        if now - last_logged >= 60.0:
+                            self._last_hook_refused_log_time = now
+                            severity = "debug" if _since_start < 30 else "warning"
+                            prefix = (
+                                "Splash webhook waiting for Flask"
+                                if _since_start < 30
+                                else "Splash webhook unreachable"
+                            )
+                            log_event(
+                                severity,
+                                "splash_node_output",
+                                f"{prefix}: {line}",
+                            )
                     elif _is_startup_burst:
                         log_event(
                             "debug", "splash_node_output", f"Splash (startup): {line}"

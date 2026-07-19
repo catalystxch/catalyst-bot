@@ -88,6 +88,22 @@ def _missing_splash_table(exc: Exception) -> bool:
     )
 
 
+def _missing_offers_table(exc: Exception) -> bool:
+    """Return True when a narrow test DB has no offers table."""
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and "no such table: offers" in str(exc).lower()
+    )
+
+
+def _sqlite_locked(exc: Exception) -> bool:
+    """Return True for transient SQLite lock/busy errors."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
 def get_connection() -> sqlite3.Connection:
     """Get a thread-local database connection.
 
@@ -2057,7 +2073,7 @@ def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
     Used during startup to repost offers without calling wallet RPC.
     """
     conn = get_connection()
-    query = f"""SELECT trade_id, offer_bech32, dexie_id, side
+    query = f"""SELECT trade_id, offer_bech32, dexie_id, side, expires_at
                 FROM offers
                 WHERE status='open'
                   AND offer_bech32 IS NOT NULL
@@ -2067,7 +2083,15 @@ def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
         query += " AND cat_asset_id=?"
         params.append(cat_asset_id)
     rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    now_dt = datetime.now(timezone.utc)
+    repostable = []
+    for row in rows:
+        offer = dict(row)
+        if _expiry_has_elapsed(offer.get("expires_at"), now_dt):
+            continue
+        offer.pop("expires_at", None)
+        repostable.append(offer)
+    return repostable
 
 
 def get_open_offers(
@@ -2075,6 +2099,7 @@ def get_open_offers(
     cat_asset_id: str = None,
     include_pending_cancel: bool = False,
     include_mempool_observed: bool = False,
+    include_elapsed: bool = False,
 ) -> List[Dict]:
     """Get all open offers, optionally filtered by side and/or CAT pair.
 
@@ -2090,6 +2115,9 @@ def get_open_offers(
     Pass include_mempool_observed=True only when investigating parked
     fill-verification rows; they are protected in DB but hidden from normal
     active-book views by default.
+    Pass include_elapsed=True for startup reconciliation only. Normal live-book
+    views hide locally elapsed offers without mutating the row so offline fills
+    can still be recovered before an explicit expiry pass marks them terminal.
 
     Returns list of dicts with all offer fields.
     """
@@ -2118,26 +2146,147 @@ def get_open_offers(
 
     query += " ORDER BY created_at DESC"
     rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    offers = [dict(row) for row in rows]
+    if not include_elapsed:
+        now_dt = datetime.now(timezone.utc)
+        offers = [
+            offer
+            for offer in offers
+            if str(offer.get("lifecycle_state") or "open").lower()
+            in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+            or not _expiry_has_elapsed(offer.get("expires_at"), now_dt)
+        ]
+    return offers
 
 
-def _parse_offer_expiry_ts(expires_at) -> Optional[float]:
-    """Parse an offer expires_at value into a UTC timestamp."""
+def _parse_offer_expiry(expires_at) -> Optional[datetime]:
     if expires_at is None:
         return None
-    if isinstance(expires_at, (int, float)):
-        return float(expires_at) if expires_at > 0 else None
-
     text = str(expires_at).strip()
     if not text or text in {"0", "None", "null"}:
         return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
     try:
-        expiry_dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except Exception:
-        return None
-    if expiry_dt.tzinfo is None:
-        expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-    return expiry_dt.timestamp()
+        expiry = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            expiry = datetime.strptime(_sqlite_ts(text), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    else:
+        expiry = expiry.astimezone(timezone.utc)
+    return expiry
+
+
+def _expiry_has_elapsed(expires_at, now_dt: datetime) -> bool:
+    expiry = _parse_offer_expiry(expires_at)
+    return bool(expiry and expiry <= now_dt)
+
+
+def _elapsed_open_offer_ids(
+    cat_asset_id: str = None,
+    include_pending_cancel: bool = False,
+    include_mempool_observed: bool = False,
+    now_dt: datetime = None,
+) -> List[str]:
+    conn = get_connection()
+    query = (
+        "SELECT trade_id, expires_at FROM offers "
+        "WHERE status='open' "
+        "AND expires_at IS NOT NULL "
+        "AND TRIM(expires_at) != ''"
+    )
+    params = []
+
+    excluded_lifecycle_states = []
+    if not include_pending_cancel:
+        excluded_lifecycle_states.extend(("cancel_requested", "cancel_sent"))
+    if not include_mempool_observed:
+        excluded_lifecycle_states.append("mempool_observed")
+    if excluded_lifecycle_states:
+        placeholders = ", ".join("?" for _ in excluded_lifecycle_states)
+        query += (
+            f" AND (lifecycle_state IS NULL OR lifecycle_state NOT IN ({placeholders}))"
+        )
+        params.extend(excluded_lifecycle_states)
+
+    if cat_asset_id:
+        query += " AND cat_asset_id=?"
+        params.append(cat_asset_id)
+
+    rows = conn.execute(query, params).fetchall()
+    now_dt = now_dt or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    return [
+        str(row["trade_id"])
+        for row in rows
+        if row["trade_id"] and _expiry_has_elapsed(row["expires_at"], now_dt)
+    ]
+
+
+def expire_elapsed_open_offers(cat_asset_id: str = None, now: datetime = None) -> int:
+    """Retire actionable open offers whose local expires_at has elapsed.
+
+    This is explicit wallet-independent cleanup for paths that have already
+    reconciled terminal wallet state. Ordinary live-book reads hide elapsed
+    offers non-mutatingly so startup can still recover offline fills first.
+    """
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+
+    try:
+        conn = get_connection()
+        query = (
+            "SELECT trade_id, expires_at FROM offers "
+            "WHERE status='open' "
+            "AND expires_at IS NOT NULL "
+            "AND TRIM(expires_at) != '' "
+            f"AND {_actionable_open_lifecycle_clause()}"
+        )
+        params = []
+        if cat_asset_id:
+            query += " AND cat_asset_id=?"
+            params.append(cat_asset_id)
+        rows = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError as e:
+        if _sqlite_locked(e) or _missing_offers_table(e):
+            return 0
+        log_event("warning", "db_elapsed_expiry_failed", f"Expiry scan failed: {e}")
+        return 0
+    except Exception as e:
+        log_event("warning", "db_elapsed_expiry_failed", f"Expiry scan failed: {e}")
+        return 0
+
+    elapsed_trade_ids = [
+        row["trade_id"]
+        for row in rows
+        if row["trade_id"] and _expiry_has_elapsed(row["expires_at"], now_dt)
+    ]
+    if not elapsed_trade_ids:
+        return 0
+
+    retired = 0
+    for trade_id in elapsed_trade_ids:
+        if update_offer_status(trade_id, "expired"):
+            retired += 1
+
+    if retired:
+        log_event(
+            "info",
+            "db_elapsed_expiry_retired",
+            f"Retired {retired} elapsed open offer(s) from local expires_at",
+            data={"count": retired, "cat_asset_id": cat_asset_id},
+        )
+    return retired
 
 
 def expire_open_offers_by_time(
@@ -2148,18 +2297,27 @@ def expire_open_offers_by_time(
 ) -> List[str]:
     """Mark locally elapsed open offers expired and free their locked coins.
 
-    Wallets and public indices can keep displaying time-expired offers as
-    OPEN. CATalyst's local ``expires_at`` is the authoritative cap-counting
-    source: once it has elapsed, the offer is no longer actionable and must
-    not occupy a live ladder slot.
+    Compatibility API for offer manager callers that need the retired IDs.
     """
-    now = float(now_ts if now_ts is not None else time.time())
     try:
-        offers = get_open_offers(
+        now_dt = datetime.fromtimestamp(
+            float(now_ts if now_ts is not None else time.time()), tz=timezone.utc
+        )
+        elapsed_trade_ids = _elapsed_open_offer_ids(
             cat_asset_id=cat_asset_id,
             include_pending_cancel=include_pending_cancel,
             include_mempool_observed=include_mempool_observed,
+            now_dt=now_dt,
         )
+    except sqlite3.OperationalError as e:
+        if _sqlite_locked(e) or _missing_offers_table(e):
+            return []
+        log_event(
+            "warning",
+            "offer_expiry_query_failed",
+            f"Could not query open offers for local expiry sweep: {e}",
+        )
+        return []
     except Exception as e:
         log_event(
             "warning",
@@ -2168,19 +2326,12 @@ def expire_open_offers_by_time(
         )
         return []
 
-    elapsed_trade_ids: List[str] = []
-    for offer in offers:
-        trade_id = str(offer.get("trade_id") or "").strip()
-        if not trade_id:
-            continue
-        expiry_ts = _parse_offer_expiry_ts(offer.get("expires_at"))
-        if expiry_ts is not None and expiry_ts <= now:
-            elapsed_trade_ids.append(trade_id)
-
     expired_trade_ids: List[str] = []
     for trade_id in elapsed_trade_ids:
-        if update_offer_status(trade_id, "expired"):
-            expired_trade_ids.append(trade_id)
+        offer = get_offer(trade_id)
+        if offer and _expiry_has_elapsed(offer.get("expires_at"), now_dt):
+            if update_offer_status(trade_id, "expired"):
+                expired_trade_ids.append(trade_id)
 
     if expired_trade_ids:
         log_event(
@@ -2209,20 +2360,27 @@ def get_offer_lifecycle_summary(cat_asset_id: str = None) -> Dict:
 
     conn = get_connection()
     query = (
-        "SELECT side, status, COALESCE(lifecycle_state, status, 'open') AS lifecycle_state, "
-        "COUNT(*) AS count FROM offers"
+        "SELECT side, status, expires_at, "
+        "COALESCE(lifecycle_state, status, 'open') AS lifecycle_state FROM offers"
     )
     params = []
     if cat_asset_id:
         query += " WHERE cat_asset_id=?"
         params.append(cat_asset_id)
-    query += " GROUP BY side, status, COALESCE(lifecycle_state, status, 'open')"
 
+    now_dt = datetime.now(timezone.utc)
     for row in conn.execute(query, params).fetchall():
         side = str(row["side"] or "").lower()
         status = str(row["status"] or "open").lower()
         lifecycle = str(row["lifecycle_state"] or status or "open").lower()
-        count = int(row["count"] or 0)
+        if (
+            status == "open"
+            and lifecycle not in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+            and _expiry_has_elapsed(row["expires_at"], now_dt)
+        ):
+            status = "expired"
+            lifecycle = "expired"
+        count = 1
 
         summary["total"] += count
         if status not in summary["by_status"]:
@@ -4843,38 +5001,14 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     stats = {}
 
     # Open offers count
-    open_lifecycle_clause = _actionable_open_lifecycle_clause()
-    if cat_asset_id:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM offers "
-            f"WHERE status='open' AND {open_lifecycle_clause} AND cat_asset_id=?",
-            (cat_asset_id,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM offers "
-            f"WHERE status='open' AND {open_lifecycle_clause}"
-        ).fetchone()
-    stats["open_offers"] = row["cnt"]
-
-    # Open offers by side
-    query_base = (
-        "SELECT side, COUNT(*) as cnt FROM offers "
-        f"WHERE status='open' AND {open_lifecycle_clause}"
+    live_open_offers = get_open_offers(cat_asset_id=cat_asset_id)
+    stats["open_offers"] = len(live_open_offers)
+    stats["open_buys"] = sum(
+        1 for offer in live_open_offers if offer.get("side") == "buy"
     )
-    params = []
-    if cat_asset_id:
-        query_base += " AND cat_asset_id=?"
-        params.append(cat_asset_id)
-    query_base += " GROUP BY side"
-    rows = conn.execute(query_base, params).fetchall()
-    stats["open_buys"] = 0
-    stats["open_sells"] = 0
-    for row in rows:
-        if row["side"] == "buy":
-            stats["open_buys"] = row["cnt"]
-        elif row["side"] == "sell":
-            stats["open_sells"] = row["cnt"]
+    stats["open_sells"] = sum(
+        1 for offer in live_open_offers if offer.get("side") == "sell"
+    )
 
     economic_fill_ids = _get_economic_verified_fill_ids(conn, cat_asset_id, since)
 

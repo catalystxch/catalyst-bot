@@ -6841,7 +6841,7 @@ class BotLoop:
             try:
                 from database import get_open_offers, batch_cancel_stale_offers
 
-                db_open = get_open_offers()
+                db_open = get_open_offers(include_elapsed=True)
                 log_event(
                     "info",
                     "db_cleanup_start",

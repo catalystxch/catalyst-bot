@@ -22,6 +22,25 @@ from super_log import slog
 bp = Blueprint("dashboard", __name__)
 
 
+def _live_wallet_reads_allowed(bot_obj=None) -> bool:
+    """Dashboard live RPC is only allowed during an active bot run."""
+    if bot_obj is None:
+        return False
+    state_running = False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
+    try:
+        method_running = (
+            bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
+        )
+    except Exception:
+        method_running = False
+    return bool(state_running and method_running)
+
+
 def _get_cfg_int(cfg, name: str, fallback: str | None = None) -> int:
     value = getattr(cfg, name, None)
     if value is None and fallback:
@@ -317,7 +336,11 @@ def api_dashboard():
 
                 best_bid = _edge_decimal(live_edges, "our_best_bid")
                 best_ask = _edge_decimal(live_edges, "our_best_ask")
-                if active_asset_id and (best_bid <= 0 or best_ask <= 0):
+                if (
+                    active_asset_id
+                    and (best_bid <= 0 or best_ask <= 0)
+                    and _live_wallet_reads_allowed(bot)
+                ):
                     local_edges = (
                         api_server._get_live_local_offer_edges(active_asset_id) or {}
                     )
@@ -459,8 +482,10 @@ def api_dashboard():
             "cat_total": 0,
         }
 
-        # Fetch wallet balances directly from RPC (works whether bot is running or not)
+        # Fetch wallet balances directly from RPC only during an active run.
         try:
+            if not _live_wallet_reads_allowed(bot):
+                raise StopIteration
             from wallet import get_wallet_balance, WALLET_ID_XCH
 
             xr = get_wallet_balance(WALLET_ID_XCH)
@@ -490,6 +515,8 @@ def api_dashboard():
                 wallet["cat_spendable"] = str(
                     Decimal(str(wb.get("spendable_balance", 0))) / _cat_divisor
                 )
+        except StopIteration:
+            pass
         except Exception as e:
             print(f"[DASHBOARD] Wallet balance fetch error: {e}", flush=True)
 
@@ -532,7 +559,11 @@ def api_dashboard():
 
         # Sage RPC fallback: if bot isn't running (or coin_manager returned zeros),
         # query Sage directly so the dashboard always shows real coin counts.
-        if coins["xch_free"] == 0 and coins["xch_total"] == 0:
+        if (
+            coins["xch_free"] == 0
+            and coins["xch_total"] == 0
+            and _live_wallet_reads_allowed(bot)
+        ):
             try:
                 from wallet import rpc as wallet_rpc
 

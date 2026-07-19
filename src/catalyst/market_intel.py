@@ -791,10 +791,14 @@ class MarketIntel:
             else:
                 serialized[k] = v
 
-        serialized["orderbook_age_secs"] = round(
-            time.time() - self._orderbook.get("last_refresh", 0), 1
+        orderbook_refreshes = int(self._orderbook.get("refresh_count", 0) or 0)
+        last_refresh = float(self._orderbook.get("last_refresh", 0) or 0)
+        serialized["orderbook_age_secs"] = (
+            round(time.time() - last_refresh, 1)
+            if orderbook_refreshes > 0 and last_refresh > 0
+            else None
         )
-        serialized["orderbook_refreshes"] = self._orderbook.get("refresh_count", 0)
+        serialized["orderbook_refreshes"] = orderbook_refreshes
         serialized["orderbook_errors"] = self._orderbook.get("errors", 0)
 
         # Add DBX info — per-direction details come from /v1/incentives
