@@ -116,7 +116,6 @@ def api_wallets_switch():
         from config import _ENV_PATH
 
         _set_key(_ENV_PATH, "WALLET_TYPE", new_type)
-        api_server.clear_balance_snapshot()
         log_event(
             "info", "wallet_switch", f"Wallet switched to {new_type} — restart required"
         )
