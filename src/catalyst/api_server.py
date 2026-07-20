@@ -1164,7 +1164,10 @@ def cache_balance_snapshot(
                 level="warning",
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Failed to log transient zero balance read warning",
+                exc_info=True,
+            )
     return result
 
 
