@@ -651,29 +651,44 @@ def api_status():
                 }
 
             pricing = {"bid": 0, "mid": 0, "ask": 0}
-            asset_id = api_server._active_cat.get("asset_id") or (
-                cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
+            active_asset_id = str(
+                api_server._active_cat.get("asset_id")
+                or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
+                or ""
+            ).strip()
+            cat_wallet_id = api_server.active_cat_wallet_id(
+                api_server._active_cat.get("wallet_id")
+                or getattr(cfg, "CAT_WALLET_ID", 2),
+                active_asset_id,
             )
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
+            cached_balances = api_server.get_cached_balance_snapshot(
+                asset_id=active_asset_id,
+                cat_wallet_id=cat_wallet_id,
+            )
+            if cached_balances:
+                xch_bal = cached_balances.get("xch") or xch_bal
+                cat_bal = cached_balances.get("cat") or cat_bal
 
             _cache_ttl = 60.0
             _now_ts = time.time()
             _use_cache = (
                 _prebot_price_cache.get("pricing") is not None
-                and _prebot_price_cache.get("asset_id") == asset_id
+                and _prebot_price_cache.get("asset_id") == active_asset_id
                 and (_now_ts - _prebot_price_cache.get("fetched_at", 0.0)) < _cache_ttl
             )
+            pricing_asset_id = active_asset_id
             if _use_cache:
                 pricing = dict(_prebot_price_cache["pricing"])
                 # Skip all HTTP fetches and logging below for this poll —
                 # the cache is fresh enough for a pre-bot dashboard.
-                asset_id = ""
+                pricing_asset_id = ""
 
-            if asset_id:
+            if pricing_asset_id:
                 print(
-                    f"[STATUS] Pricing lookup: asset_id={asset_id!r}, decimals={cat_dec}",
+                    f"[STATUS] Pricing lookup: asset_id={pricing_asset_id!r}, decimals={cat_dec}",
                     flush=True,
                 )
                 log_event(
@@ -681,7 +696,7 @@ def api_status():
                     "price_lookup",
                     f"Looking up price for {api_server._active_cat.get('name', 'unknown')}",
                 )
-            if asset_id:
+            if pricing_asset_id:
                 import requests as _req
 
                 mid = 0
@@ -694,7 +709,7 @@ def api_status():
                         getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
                         timeout=8,
                     )
-                    norm_id = asset_id.lower().strip().replace("0x", "")
+                    norm_id = pricing_asset_id.lower().strip().replace("0x", "")
                     for p in pairs:
                         p_id = (
                             str(p.get("asset_id", "")).lower().strip().replace("0x", "")
@@ -805,7 +820,7 @@ def api_status():
                             resp = _req.get(
                                 f"{dexie_base}/v1/offers",
                                 params={
-                                    "offered": asset_id,
+                                    "offered": pricing_asset_id,
                                     "requested": "xch",
                                     "status": 0,
                                     "page_size": 1,
@@ -851,7 +866,7 @@ def api_status():
                     log_event(
                         "error", "price_lookup", "No price available from any source"
                     )
-            else:
+            elif not active_asset_id:
                 print("[STATUS] No asset_id available for pricing", flush=True)
                 log_event(
                     "warning",
@@ -906,9 +921,7 @@ def api_status():
                     raise StopIteration
                 from wallet import get_all_offers, classify_offers_from_list
 
-                asset_id_for_offers = api_server._active_cat.get("asset_id") or getattr(
-                    cfg, "CAT_ASSET_ID", ""
-                )
+                asset_id_for_offers = active_asset_id
                 pre_offers = get_all_offers(include_completed=False, start=0, end=500)
                 if pre_offers and isinstance(pre_offers, list) and asset_id_for_offers:
                     open_buys, open_sells, _ = classify_offers_from_list(
@@ -1010,7 +1023,7 @@ def api_status():
                 cat_wid_coins = api_server.active_cat_wallet_id(
                     api_server._active_cat.get("wallet_id")
                     or getattr(cfg, "CAT_WALLET_ID", 2),
-                    asset_id,
+                    active_asset_id,
                 )
                 cat_free = int(get_spendable_coin_count(cat_wid_coins) or 0)
             except StopIteration:
@@ -1057,7 +1070,9 @@ def api_status():
                         "offers": {
                             "buy": offers_buy_pre,
                             "sell": offers_sell_pre,
-                            "history": _build_fill_history_for_gui(asset_id, limit=20),
+                            "history": _build_fill_history_for_gui(
+                                active_asset_id, limit=20
+                            ),
                         },
                         "coin_tracking": coin_tracking_pre,
                         "logs": [],
@@ -1065,11 +1080,11 @@ def api_status():
                         "wallet_type": api_server.get_wallet_type(),
                         "current_cat": {
                             "name": cat_name,
-                            "asset_id": asset_id,
+                            "asset_id": active_asset_id,
                             "wallet_id": api_server.active_cat_wallet_id(
                                 api_server._active_cat.get("wallet_id")
                                 or getattr(cfg, "CAT_WALLET_ID", None),
-                                asset_id,
+                                active_asset_id,
                             ),
                             "decimals": api_server._active_cat.get("decimals")
                             or getattr(cfg, "CAT_DECIMALS", 3),

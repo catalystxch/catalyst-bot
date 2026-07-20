@@ -9,6 +9,7 @@ Tests GET /api/cats, POST /api/cat/select, POST /api/cat/refresh:
 
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -195,6 +196,7 @@ class TestCatSelect(_FlaskBase):
             self.assertEqual(api_server._active_cat.get("wallet_id"), 2)
             self.assertEqual(api_server.cfg.CAT_WALLET_ID, 2)
         finally:
+            api_server.clear_balance_snapshot()
             api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
             api_server._active_cat.clear()
             api_server._active_cat.update(original_active_cat)
@@ -282,6 +284,80 @@ class TestBalanceRefresh(_FlaskBase):
             api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
             api_server._active_cat.clear()
             api_server._active_cat.update(original_active_cat)
+
+    def test_status_keeps_refreshed_sage_cat_balance_before_bot_start(self):
+        import blueprints.bot as bot_blueprint
+
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        original_price_cache = getattr(bot_blueprint, "_prebot_price_cache", None)
+        api_server.cfg.CAT_WALLET_ID = 1000
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": _VALID_ASSET_ID,
+                "wallet_id": 1000,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+        bot_blueprint._prebot_price_cache = {
+            "fetched_at": time.time(),
+            "pricing": {"bid": 0, "mid": 0, "ask": 0},
+            "asset_id": _VALID_ASSET_ID,
+        }
+
+        calls = []
+
+        def fake_balance(wallet_id):
+            calls.append(wallet_id)
+            if wallet_id == 1:
+                mojos = 5_000_000_000_000
+            elif wallet_id == 2:
+                mojos = 1_000_000 * 1_000
+            else:
+                mojos = 0
+            return {
+                "success": True,
+                "wallet_balance": {
+                    "confirmed_wallet_balance": mojos,
+                    "spendable_balance": mojos,
+                },
+            }
+
+        try:
+            with (
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(api_server, "bot", None),
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch("wallet.get_wallet_balance", side_effect=fake_balance),
+                patch("wallet.notify_cat_asset_id_changed"),
+            ):
+                refresh_resp = self._post("/api/balances/refresh")
+                status_resp = self.client.get(
+                    "/api/status", environ_base=self._LOOPBACK
+                )
+
+            self.assertEqual(refresh_resp.status_code, 200)
+            self.assertEqual(status_resp.status_code, 200)
+            self.assertEqual(calls, [1, 2])
+            body = status_resp.get_json()
+            self.assertEqual(body["balances"]["cat"]["total"], 1_000_000)
+            self.assertEqual(body["balances"]["cat"]["spendable"], 1_000_000)
+            self.assertEqual(body["current_cat"]["asset_id"], _VALID_ASSET_ID)
+            self.assertEqual(body["current_cat"]["wallet_id"], 2)
+        finally:
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+            if original_price_cache is None:
+                try:
+                    delattr(bot_blueprint, "_prebot_price_cache")
+                except AttributeError:
+                    pass
+            else:
+                bot_blueprint._prebot_price_cache = original_price_cache
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")

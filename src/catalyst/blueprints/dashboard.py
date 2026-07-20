@@ -466,6 +466,27 @@ def api_dashboard():
             "cat_spendable": 0,
             "cat_total": 0,
         }
+        cat_wid = api_server.active_cat_wallet_id(
+            api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2),
+            active_asset_id,
+        )
+        cached_balances = api_server.get_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wid,
+        )
+        if cached_balances:
+            wallet["xch_total"] = str(
+                (cached_balances.get("xch") or {}).get("total", 0)
+            )
+            wallet["xch_spendable"] = str(
+                (cached_balances.get("xch") or {}).get("spendable", 0)
+            )
+            wallet["cat_total"] = str(
+                (cached_balances.get("cat") or {}).get("total", 0)
+            )
+            wallet["cat_spendable"] = str(
+                (cached_balances.get("cat") or {}).get("spendable", 0)
+            )
         # tier_counts is intentionally OMITTED here. We only populate it
         # below when TIER_ENABLED is true AND we successfully read the
         # coin summary. Sending a placeholder {"enabled": False, ...}
@@ -499,11 +520,6 @@ def api_dashboard():
                     Decimal(str(wb.get("spendable_balance", 0)))
                     / Decimal("1000000000000")
                 )
-            cat_wid = api_server.active_cat_wallet_id(
-                api_server._active_cat.get("wallet_id")
-                or getattr(cfg, "CAT_WALLET_ID", 2),
-                active_asset_id,
-            )
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )

@@ -301,6 +301,30 @@ class TestSageStartWithFingerprint(_FlaskBase):
             self._post("/api/sage/start-with-fingerprint", {"fingerprint": "12345678"})
         mock_trigger.assert_called_once_with("12345678")
 
+    def test_valid_fingerprint_clears_balance_snapshot(self):
+        with (
+            patch("chia_node.trigger_start", return_value={"success": True}),
+            patch.object(api_server, "clear_balance_snapshot") as clear_snapshot,
+        ):
+            resp = self._post(
+                "/api/sage/start-with-fingerprint", {"fingerprint": "12345678"}
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        clear_snapshot.assert_called_once_with()
+
+    def test_failed_fingerprint_start_keeps_balance_snapshot(self):
+        with (
+            patch("chia_node.trigger_start", return_value={"success": False}),
+            patch.object(api_server, "clear_balance_snapshot") as clear_snapshot,
+        ):
+            resp = self._post(
+                "/api/sage/start-with-fingerprint", {"fingerprint": "12345678"}
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        clear_snapshot.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 5a. POST /api/sage/fingerprint
@@ -682,6 +706,18 @@ class TestWalletsSwitch(_FlaskBase):
         body = resp.get_json()
         self.assertTrue(body.get("success"))
         self.assertTrue(body.get("restart_required"))
+
+    def test_deferred_wallet_switch_keeps_current_balance_snapshot(self):
+        with (
+            patch("dotenv.set_key"),
+            patch("api_server.log_event"),
+            patch.object(api_server, "clear_balance_snapshot") as clear_snapshot,
+        ):
+            resp = self._post("/api/wallets/switch", {"wallet_type": "chia"})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json().get("success"))
+        clear_snapshot.assert_not_called()
 
     def test_valid_sage_switch_returns_success(self):
         with patch("dotenv.set_key"), patch("api_server.log_event"):

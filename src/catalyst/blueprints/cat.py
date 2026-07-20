@@ -579,6 +579,7 @@ def api_cat_select():
     selected_wallet_id = api_server.sync_active_cat_wallet_id(
         selected_wallet_id, asset_id
     )
+    api_server.clear_balance_snapshot()
 
     # Reset risk manager so stale inventory/CB state doesn't leak into the new CAT.
     if bot is not None:
@@ -673,6 +674,8 @@ def api_balances_refresh():
         try:
             from wallet import get_wallet_balance, WALLET_ID_XCH
 
+            xch_ok = False
+            cat_ok = False
             xr = get_wallet_balance(WALLET_ID_XCH)
             if xr and xr.get("success"):
                 wb = xr.get("wallet_balance") or {}
@@ -682,6 +685,7 @@ def api_balances_refresh():
                 xch_bal["spendable"] = (
                     api_server._safe_float(wb.get("spendable_balance", 0)) / 1e12
                 )
+                xch_ok = True
             active_asset_id = str(
                 api_server._active_cat.get("asset_id")
                 or getattr(cfg, "CAT_ASSET_ID", "")
@@ -707,6 +711,14 @@ def api_balances_refresh():
                 cat_bal["spendable"] = api_server._safe_float(
                     wb.get("spendable_balance", 0)
                 ) / (10**cat_dec)
+                cat_ok = True
+            if (active_asset_id and cat_ok) or (not active_asset_id and xch_ok):
+                api_server.cache_balance_snapshot(
+                    asset_id=active_asset_id,
+                    cat_wallet_id=cat_wid,
+                    balances={"xch": xch_bal, "cat": cat_bal},
+                    source="manual_refresh",
+                )
         except Exception:
             pass
         return jsonify(
