@@ -483,6 +483,7 @@ def api_sage_set_fingerprint():
             ), 500
 
         os.environ["SAGE_FINGERPRINT"] = fingerprint
+        api_server.clear_balance_snapshot()
 
         return jsonify(
             {

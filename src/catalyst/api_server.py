@@ -1032,6 +1032,8 @@ _active_cat = {
 # half-updated pair (e.g. asset_id from the new CAT but decimals from the old).
 _active_cat_lock = threading.Lock()
 SAGE_ACTIVE_CAT_WALLET_ID = 2
+_balance_snapshot_lock = threading.Lock()
+_latest_balance_snapshot: dict[str, Any] = {}
 
 
 def active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
@@ -1050,6 +1052,82 @@ def sync_active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
     if asset_id and get_wallet_type() == "sage":
         cfg.CAT_WALLET_ID = resolved_wallet_id
     return resolved_wallet_id
+
+
+def _balance_snapshot_payload(balances: dict | None) -> dict:
+    balances = balances or {}
+    xch = balances.get("xch") or {}
+    cat = balances.get("cat") or {}
+    return {
+        "xch": {
+            "spendable": _safe_float(xch.get("spendable", 0)),
+            "total": _safe_float(xch.get("total", 0)),
+        },
+        "cat": {
+            "spendable": _safe_float(cat.get("spendable", 0)),
+            "total": _safe_float(cat.get("total", 0)),
+        },
+    }
+
+
+def cache_balance_snapshot(
+    *,
+    asset_id: str = "",
+    cat_wallet_id=None,
+    balances: dict | None = None,
+    source: str = "",
+) -> None:
+    """Remember the last wallet-verified balance for status polls.
+
+    /api/status avoids live wallet RPCs while the bot is idle. This cache lets
+    it echo an explicit balance refresh instead of overwriting the GUI with
+    synthetic zeroes on the next poll.
+    """
+    try:
+        normalized_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        normalized_wallet_id = None
+    snapshot = {
+        "asset_id": str(asset_id or "").strip().lower(),
+        "cat_wallet_id": normalized_wallet_id,
+        "balances": _balance_snapshot_payload(balances),
+        "source": str(source or ""),
+        "updated_at": time.time(),
+    }
+    with _balance_snapshot_lock:
+        _latest_balance_snapshot.clear()
+        _latest_balance_snapshot.update(snapshot)
+
+
+def clear_balance_snapshot() -> None:
+    with _balance_snapshot_lock:
+        _latest_balance_snapshot.clear()
+
+
+def get_cached_balance_snapshot(
+    *, asset_id: str = "", cat_wallet_id=None
+) -> dict | None:
+    requested_asset_id = str(asset_id or "").strip().lower()
+    try:
+        requested_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        requested_wallet_id = None
+    with _balance_snapshot_lock:
+        snapshot = dict(_latest_balance_snapshot)
+        balances = dict(snapshot.get("balances") or {})
+    if not snapshot or not balances:
+        return None
+    cached_asset_id = str(snapshot.get("asset_id") or "").strip().lower()
+    if requested_asset_id != cached_asset_id:
+        return None
+    cached_wallet_id = snapshot.get("cat_wallet_id")
+    if (
+        requested_wallet_id is not None
+        and cached_wallet_id is not None
+        and requested_wallet_id != cached_wallet_id
+    ):
+        return None
+    return _balance_snapshot_payload(balances)
 
 
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
