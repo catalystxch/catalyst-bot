@@ -359,6 +359,67 @@ class TestBalanceRefresh(_FlaskBase):
             else:
                 bot_blueprint._prebot_price_cache = original_price_cache
 
+    def test_balance_refresh_ignores_transient_cat_zero_after_verified_balance(self):
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        api_server.cfg.CAT_WALLET_ID = 1000
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": _VALID_ASSET_ID,
+                "wallet_id": 1000,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+
+        xch_ok = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 5_000_000_000_000,
+                "spendable_balance": 4_000_000_000_000,
+            },
+        }
+        cat_ok = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 6_500_000_000,
+                "spendable_balance": 6_400_000_000,
+            },
+        }
+        cat_zero = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 0,
+                "spendable_balance": 0,
+            },
+        }
+
+        try:
+            with (
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch(
+                    "wallet.get_wallet_balance",
+                    side_effect=[xch_ok, cat_ok, xch_ok, cat_zero],
+                ),
+                patch("wallet.notify_cat_asset_id_changed"),
+            ):
+                first = self._post("/api/balances/refresh")
+                second = self._post("/api/balances/refresh")
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            body = second.get_json()
+            self.assertEqual(body["balances"]["cat"]["total"], 6_500_000)
+            self.assertEqual(body["balances"]["cat"]["spendable"], 6_400_000)
+        finally:
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+            api_server.clear_balance_snapshot()
+
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestSageWalletIdNormalization(unittest.TestCase):

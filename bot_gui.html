@@ -17593,6 +17593,7 @@
             offers: { buy: [], sell: [] },
             stats: { loop_count: 0, uptime_seconds: 0 }
         };
+        let _lastVerifiedWalletBalances = { asset_id: '', balances: null };
         let _catSwitchInProgress = false;
         let _catSwitchTargetAssetId = '';
         let _catSwitchGateTimer = null;
@@ -17605,6 +17606,70 @@
 
         function isWalletSwitchBusy() {
             return !!_walletSwitchInProgress;
+        }
+
+        function _walletBalanceNumber(value) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : 0;
+        }
+
+        function _normalizeWalletBalanceSide(side = {}) {
+            return {
+                spendable: _walletBalanceNumber(side?.spendable),
+                total: _walletBalanceNumber(side?.total),
+            };
+        }
+
+        function _normalizeWalletBalances(balances = {}) {
+            return {
+                xch: _normalizeWalletBalanceSide(balances?.xch || {}),
+                cat: _normalizeWalletBalanceSide(balances?.cat || {}),
+            };
+        }
+
+        function _walletBalanceSideIsZero(side = {}) {
+            return _walletBalanceNumber(side?.spendable) <= 0
+                && _walletBalanceNumber(side?.total) <= 0;
+        }
+
+        function _walletBalanceSideHasValue(side = {}) {
+            return _walletBalanceNumber(side?.spendable) > 0
+                || _walletBalanceNumber(side?.total) > 0;
+        }
+
+        function resetVerifiedWalletBalances() {
+            _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+        }
+
+        function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '') {
+            const activeAssetId = String(
+                assetId
+                || currentCAT?.asset_id
+                || bot_state?.current_cat?.asset_id
+                || ''
+            ).trim();
+            const incoming = _normalizeWalletBalances(incomingBalances);
+            const cached = _lastVerifiedWalletBalances || {};
+            const cacheMatches = cached.balances && String(cached.asset_id || '') === activeAssetId;
+            const merged = _normalizeWalletBalances(incoming);
+
+            if (cacheMatches) {
+                for (const sideName of ['xch', 'cat']) {
+                    const cachedSide = cached.balances?.[sideName] || {};
+                    if (_walletBalanceSideIsZero(merged[sideName]) && _walletBalanceSideHasValue(cachedSide)) {
+                        merged[sideName] = { ...cachedSide };
+                    }
+                }
+            }
+
+            if (activeAssetId || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat)) {
+                _lastVerifiedWalletBalances = {
+                    asset_id: activeAssetId,
+                    balances: _normalizeWalletBalances(merged),
+                };
+            }
+
+            return merged;
         }
 
         function getCatMetaByAssetId(assetId) {
@@ -17855,6 +17920,7 @@
             }
             _pairDataReadyAssetId = '';
             _dashboardData = null;
+            resetVerifiedWalletBalances();
             coinPrepStatus = 'none';
 
             const selector = document.getElementById('catSelector');
@@ -23263,19 +23329,21 @@
                     return data;
                 }
                 if (data.success && data.balances) {
+                    const mergedBalances = mergeVerifiedWalletBalances(data.balances, requestAssetId);
+                    data.balances = mergedBalances;
                     // Update bot_state so everything stays in sync
-                    bot_state.balances = data.balances;
+                    bot_state.balances = mergedBalances;
                     if (requestAssetId && (!currentCAT?.asset_id || currentCAT.asset_id === requestAssetId)) {
                         acceptPairDataRefresh(requestAssetId, 'wallet balances');
                     }
                     // Update display
-                    document.getElementById('xchSpendable').textContent = data.balances.xch.spendable.toFixed(4);
-                    document.getElementById('xchTotal').textContent = data.balances.xch.total.toFixed(4);
+                    document.getElementById('xchSpendable').textContent = mergedBalances.xch.spendable.toFixed(4);
+                    document.getElementById('xchTotal').textContent = mergedBalances.xch.total.toFixed(4);
                     const showCatBalances = !!(requestAssetId || currentCAT?.asset_id);
                     updateCatBalanceVisibility(showCatBalances);
                     if (showCatBalances) {
-                        document.getElementById('catSpendable').textContent = Math.floor(data.balances.cat.spendable).toLocaleString();
-                        document.getElementById('catTotal').textContent = Math.floor(data.balances.cat.total).toLocaleString();
+                        document.getElementById('catSpendable').textContent = Math.floor(mergedBalances.cat.spendable).toLocaleString();
+                        document.getElementById('catTotal').textContent = Math.floor(mergedBalances.cat.total).toLocaleString();
                     }
                     // Re-validate settings form (updates warnings based on new balances)
                     if (typeof refreshReserveDisplays === 'function') refreshReserveDisplays();
@@ -23368,9 +23436,15 @@
                         preserved[f] = bot_state[f];
                     }
                 }
-            bot_state = data;
-            Object.assign(bot_state, preserved);
-            updateWalletPickerAvailability();
+                if (data.balances) {
+                    data.balances = mergeVerifiedWalletBalances(
+                        data.balances,
+                        data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                    );
+                }
+                bot_state = data;
+                Object.assign(bot_state, preserved);
+                updateWalletPickerAvailability();
                 updateUI(data);
                 syncCommandCentreFromStatus(data);
                 
@@ -23629,13 +23703,18 @@
             }
 
             // Balances
-            document.getElementById('xchSpendable').textContent = data.balances.xch.spendable.toFixed(4);
-            document.getElementById('xchTotal').textContent = data.balances.xch.total.toFixed(4);
+            const displayBalances = mergeVerifiedWalletBalances(
+                data.balances || {},
+                data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+            );
+            data.balances = displayBalances;
+            document.getElementById('xchSpendable').textContent = displayBalances.xch.spendable.toFixed(4);
+            document.getElementById('xchTotal').textContent = displayBalances.xch.total.toFixed(4);
             const showCatBalances = hasSelectedTradingPair(data);
             updateCatBalanceVisibility(showCatBalances);
             if (showCatBalances) {
-                document.getElementById('catSpendable').textContent = Math.floor(data.balances.cat.spendable).toLocaleString();
-                document.getElementById('catTotal').textContent = Math.floor(data.balances.cat.total).toLocaleString();
+                document.getElementById('catSpendable').textContent = Math.floor(displayBalances.cat.spendable).toLocaleString();
+                document.getElementById('catTotal').textContent = Math.floor(displayBalances.cat.total).toLocaleString();
             }
 
             // Coin tracking (free vs locked)
@@ -25564,17 +25643,22 @@
                 _dashboardData = payload;
                 const activeDashboardAssetId = returnedAssetId || requestAssetId || currentCAT?.asset_id || '';
                 if (payload?.wallet && activeDashboardAssetId) {
-                    bot_state = bot_state || {};
-                    bot_state.balances = {
+                    const dashboardBalances = mergeVerifiedWalletBalances({
                         xch: {
-                            spendable: Number(payload.wallet.xch_spendable || 0),
-                            total: Number(payload.wallet.xch_total || 0),
+                            spendable: payload.wallet.xch_spendable,
+                            total: payload.wallet.xch_total,
                         },
                         cat: {
-                            spendable: Number(payload.wallet.cat_spendable || 0),
-                            total: Number(payload.wallet.cat_total || 0),
+                            spendable: payload.wallet.cat_spendable,
+                            total: payload.wallet.cat_total,
                         },
-                    };
+                    }, activeDashboardAssetId);
+                    payload.wallet.xch_spendable = dashboardBalances.xch.spendable;
+                    payload.wallet.xch_total = dashboardBalances.xch.total;
+                    payload.wallet.cat_spendable = dashboardBalances.cat.spendable;
+                    payload.wallet.cat_total = dashboardBalances.cat.total;
+                    bot_state = bot_state || {};
+                    bot_state.balances = dashboardBalances;
                     acceptPairDataRefresh(activeDashboardAssetId, 'dashboard payload');
                 }
                 // Normalize field names: API returns fill_rate_per_hour,
@@ -25789,6 +25873,20 @@
 
             if (d.wallet) {
                 const w = d.wallet;
+                const walletBalances = mergeVerifiedWalletBalances({
+                    xch: {
+                        spendable: w.xch_spendable,
+                        total: w.xch_total,
+                    },
+                    cat: {
+                        spendable: w.cat_spendable,
+                        total: w.cat_total,
+                    },
+                }, d?.current_cat?.asset_id || currentCAT?.asset_id || '');
+                w.xch_spendable = walletBalances.xch.spendable;
+                w.xch_total = walletBalances.xch.total;
+                w.cat_spendable = walletBalances.cat.spendable;
+                w.cat_total = walletBalances.cat.total;
                 if (w.xch_spendable !== undefined) el('xchSpendable').textContent = parseFloat(w.xch_spendable).toFixed(4);
                 if (w.xch_total !== undefined) el('xchTotal').textContent = parseFloat(w.xch_total).toFixed(4);
                 const showCatBalances = hasSelectedTradingPair(d);
@@ -26585,12 +26683,16 @@
             }
 
             if (data.balances) {
+                const statusBalances = mergeVerifiedWalletBalances(
+                    data.balances,
+                    data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                );
                 _dashboardData.wallet = {
                     ...(_dashboardData.wallet || {}),
-                    xch_spendable: Number(data.balances?.xch?.spendable || 0),
-                    xch_total: Number(data.balances?.xch?.total || 0),
-                    cat_spendable: Number(data.balances?.cat?.spendable || 0),
-                    cat_total: Number(data.balances?.cat?.total || 0),
+                    xch_spendable: statusBalances.xch.spendable,
+                    xch_total: statusBalances.xch.total,
+                    cat_spendable: statusBalances.cat.spendable,
+                    cat_total: statusBalances.cat.total,
                 };
             }
 

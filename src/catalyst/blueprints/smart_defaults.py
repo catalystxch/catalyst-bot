@@ -1188,6 +1188,18 @@ def _calculate_smart_defaults(
                 _raw_total = api_server._safe_float(wb.get("spendable_balance", 0))
             cat_spendable = _raw_total / (10**decimals)
             _pending_tx_count += int(wb.get("pending_coin_removal_count", 0) or 0)
+        wallet_balances = api_server.cache_balance_snapshot(
+            asset_id=asset_id,
+            cat_wallet_id=cat_wid,
+            balances={
+                "xch": {"total": xch_spendable, "spendable": xch_spendable},
+                "cat": {"total": cat_spendable, "spendable": cat_spendable},
+            },
+            source="smart_defaults",
+        )
+        xch_spendable = wallet_balances["xch"]["total"]
+        cat_spendable = wallet_balances["cat"]["total"]
+        has_wallet = has_wallet or xch_spendable > 0 or cat_spendable > 0
         if has_wallet:
             messages.append(f"Wallet: {xch_spendable:.2f} XCH (total)")
             print(

@@ -538,6 +538,26 @@ def api_dashboard():
         except Exception as e:
             print(f"[DASHBOARD] Wallet balance fetch error: {e}", flush=True)
 
+        merged_balances = api_server.merge_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wid,
+            balances={
+                "xch": {
+                    "total": wallet["xch_total"],
+                    "spendable": wallet["xch_spendable"],
+                },
+                "cat": {
+                    "total": wallet["cat_total"],
+                    "spendable": wallet["cat_spendable"],
+                },
+            },
+        )
+        if merged_balances:
+            wallet["xch_total"] = str(merged_balances["xch"]["total"])
+            wallet["xch_spendable"] = str(merged_balances["xch"]["spendable"])
+            wallet["cat_total"] = str(merged_balances["cat"]["total"])
+            wallet["cat_spendable"] = str(merged_balances["cat"]["spendable"])
+
         try:
             db_coin_summary = get_coin_summary()
             coins["xch_free"] = db_coin_summary.get("xch_free_count", 0)
