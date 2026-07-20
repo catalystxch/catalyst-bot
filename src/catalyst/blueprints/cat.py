@@ -671,6 +671,7 @@ def api_balances_refresh():
     try:
         xch_bal = {"spendable": 0, "total": 0}
         cat_bal = {"spendable": 0, "total": 0}
+        balances = {"xch": xch_bal, "cat": cat_bal}
         try:
             from wallet import get_wallet_balance, WALLET_ID_XCH
 
@@ -712,11 +713,12 @@ def api_balances_refresh():
                     wb.get("spendable_balance", 0)
                 ) / (10**cat_dec)
                 cat_ok = True
+            balances = {"xch": xch_bal, "cat": cat_bal}
             if (active_asset_id and cat_ok) or (not active_asset_id and xch_ok):
-                api_server.cache_balance_snapshot(
+                balances = api_server.cache_balance_snapshot(
                     asset_id=active_asset_id,
                     cat_wallet_id=cat_wid,
-                    balances={"xch": xch_bal, "cat": cat_bal},
+                    balances=balances,
                     source="manual_refresh",
                 )
         except Exception:
@@ -724,10 +726,7 @@ def api_balances_refresh():
         return jsonify(
             {
                 "success": True,
-                "balances": {
-                    "xch": xch_bal,
-                    "cat": cat_bal,
-                },
+                "balances": balances,
             }
         )
     except Exception:

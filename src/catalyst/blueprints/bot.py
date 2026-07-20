@@ -1175,6 +1175,21 @@ def api_status():
             except Exception:
                 pass
 
+        active_asset_id = str(
+            api_server._active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        ).strip()
+        cat_wallet_id = api_server.active_cat_wallet_id(
+            api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2),
+            active_asset_id,
+        )
+        cached_balances = api_server.merge_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wallet_id,
+            balances=balances_out,
+        )
+        if cached_balances:
+            balances_out = cached_balances
+
         # --- Pricing ---
         price_info = bot.get_price_info() if hasattr(bot, "get_price_info") else {}
         mid = api_server._safe_float(raw.get("mid_price", 0))

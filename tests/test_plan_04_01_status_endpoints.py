@@ -316,6 +316,69 @@ class TestStatusEndpointSmoke(_FlaskBase):
         body = resp.get_json()
         self.assertIn("balances", body)
 
+    def test_running_status_reuses_verified_cat_balance_on_transient_zero(self):
+        asset_id = "ab" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "ABC_XCH",
+                "name": "ABC",
+            }
+        )
+        api_server.clear_balance_snapshot()
+        api_server.cache_balance_snapshot(
+            asset_id=asset_id,
+            cat_wallet_id=2,
+            balances={
+                "xch": {"total": 5.0, "spendable": 4.0},
+                "cat": {"total": 6_500_000.0, "spendable": 6_400_000.0},
+            },
+            source="test",
+        )
+
+        zero_bot = _fake_bot_running()
+        zero_state = zero_bot.get_state()
+        zero_state["coins"] = {
+            "xch_coins": 0,
+            "cat_coins": 0,
+            "xch_total_coins": 0,
+            "cat_total_coins": 0,
+            "xch_locked_coins": 0,
+            "cat_locked_coins": 0,
+            "xch_balance": {"spendable": 0, "total": 0},
+            "cat_balance": {"spendable": 0, "total": 0},
+            "inventory": {},
+        }
+        zero_bot.get_state = lambda: zero_state
+        zero_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 0,
+                "spendable_balance": 0,
+            },
+        }
+
+        try:
+            with (
+                patch.object(api_server, "bot", zero_bot),
+                patch("wallet.get_wallet_balance", return_value=zero_balance),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_recent_events", return_value=[]),
+                patch("database.get_events_since", return_value=[]),
+                patch("database.get_coin_summary", return_value={}),
+                patch("database.get_offer_lifecycle_summary", return_value={}),
+            ):
+                resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+        finally:
+            api_server.clear_balance_snapshot()
+
+        self.assertEqual(resp.status_code, 200)
+        balances = resp.get_json()["balances"]
+        self.assertEqual(balances["cat"]["total"], 6_500_000.0)
+        self.assertEqual(balances["cat"]["spendable"], 6_400_000.0)
+
     def test_offers_key_present(self):
         with patch.object(api_server, "bot", None):
             resp = self.client.get("/api/status", environ_base=self._LOOPBACK)

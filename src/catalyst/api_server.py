@@ -1070,13 +1070,48 @@ def _balance_snapshot_payload(balances: dict | None) -> dict:
     }
 
 
+def _balance_side_zero(balance: dict | None) -> bool:
+    balance = balance or {}
+    return (
+        _safe_float(balance.get("total", 0)) <= 0
+        and _safe_float(balance.get("spendable", 0)) <= 0
+    )
+
+
+def _balance_side_nonzero(balance: dict | None) -> bool:
+    balance = balance or {}
+    return (
+        _safe_float(balance.get("total", 0)) > 0
+        or _safe_float(balance.get("spendable", 0)) > 0
+    )
+
+
+def _balance_snapshot_context_matches(
+    snapshot: dict, *, asset_id: str = "", cat_wallet_id=None
+) -> bool:
+    cached_asset_id = str((snapshot or {}).get("asset_id") or "").strip().lower()
+    requested_asset_id = str(asset_id or "").strip().lower()
+    if requested_asset_id != cached_asset_id:
+        return False
+    try:
+        requested_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        requested_wallet_id = None
+    cached_wallet_id = (snapshot or {}).get("cat_wallet_id")
+    return not (
+        requested_wallet_id is not None
+        and cached_wallet_id is not None
+        and requested_wallet_id != cached_wallet_id
+    )
+
+
 def cache_balance_snapshot(
     *,
     asset_id: str = "",
     cat_wallet_id=None,
     balances: dict | None = None,
     source: str = "",
-) -> None:
+) -> dict:
     """Remember the last wallet-verified balance for status polls.
 
     /api/status avoids live wallet RPCs while the bot is idle. This cache lets
@@ -1087,16 +1122,53 @@ def cache_balance_snapshot(
         normalized_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
     except (TypeError, ValueError):
         normalized_wallet_id = None
-    snapshot = {
-        "asset_id": str(asset_id or "").strip().lower(),
-        "cat_wallet_id": normalized_wallet_id,
-        "balances": _balance_snapshot_payload(balances),
-        "source": str(source or ""),
-        "updated_at": time.time(),
-    }
+    incoming = _balance_snapshot_payload(balances)
+    suspicious_zero_sides = []
     with _balance_snapshot_lock:
+        previous = dict(_latest_balance_snapshot)
+        merged = _balance_snapshot_payload(incoming)
+        if previous and _balance_snapshot_context_matches(
+            previous, asset_id=asset_id, cat_wallet_id=normalized_wallet_id
+        ):
+            previous_balances = _balance_snapshot_payload(
+                previous.get("balances") or {}
+            )
+            for side in ("xch", "cat"):
+                if _balance_side_zero(merged[side]) and _balance_side_nonzero(
+                    previous_balances[side]
+                ):
+                    merged[side] = dict(previous_balances[side])
+                    suspicious_zero_sides.append(side)
+        snapshot = {
+            "asset_id": str(asset_id or "").strip().lower(),
+            "cat_wallet_id": normalized_wallet_id,
+            "balances": _balance_snapshot_payload(merged),
+            "source": str(source or ""),
+            "updated_at": time.time(),
+        }
         _latest_balance_snapshot.clear()
         _latest_balance_snapshot.update(snapshot)
+        result = _balance_snapshot_payload(snapshot["balances"])
+
+    if suspicious_zero_sides:
+        try:
+            slog(
+                "BALANCE",
+                "Ignored transient zero balance read for "
+                + ", ".join(suspicious_zero_sides),
+                {
+                    "source": source,
+                    "asset_id": snapshot["asset_id"],
+                    "cat_wallet_id": normalized_wallet_id,
+                },
+                level="warning",
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to log transient zero balance read warning",
+                exc_info=True,
+            )
+    return result
 
 
 def clear_balance_snapshot() -> None:
@@ -1128,6 +1200,24 @@ def get_cached_balance_snapshot(
     ):
         return None
     return _balance_snapshot_payload(balances)
+
+
+def merge_cached_balance_snapshot(
+    *, asset_id: str = "", cat_wallet_id=None, balances: dict | None = None
+) -> dict | None:
+    cached = get_cached_balance_snapshot(
+        asset_id=asset_id,
+        cat_wallet_id=cat_wallet_id,
+    )
+    if not cached:
+        return None
+    merged = _balance_snapshot_payload(balances)
+    for side in ("xch", "cat"):
+        if _balance_side_zero(merged[side]) and _balance_side_nonzero(
+            cached.get(side) or {}
+        ):
+            merged[side] = dict(cached[side])
+    return merged
 
 
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)

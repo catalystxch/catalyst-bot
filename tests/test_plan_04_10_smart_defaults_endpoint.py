@@ -717,6 +717,146 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
         body = resp.get_json()
         self.assertLessEqual(self._cat_coin_prep_total(body), available_cat)
 
+    def test_smart_defaults_reuses_verified_cat_balance_on_transient_zero(self):
+        from blueprints import smart_defaults
+
+        asset_id = "e" * 64
+        cached_cat = 6_500_000.0
+        original_cat = dict(api_server._active_cat)
+        api_server.clear_balance_snapshot()
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "ticker_id": "TST_XCH",
+                "decimals": 3,
+                "name": "TestCAT",
+            }
+        )
+        api_server.cache_balance_snapshot(
+            asset_id=asset_id,
+            cat_wallet_id=2,
+            balances={
+                "xch": {"total": 5.0, "spendable": 4.5},
+                "cat": {"total": cached_cat, "spendable": cached_cat - 1000},
+            },
+            source="test",
+        )
+
+        def fake_balance(wallet_id):
+            mojos = 5_000_000_000_000 if wallet_id == 1 else 0
+            return {
+                "success": True,
+                "wallet_balance": {
+                    "unconfirmed_wallet_balance": mojos,
+                    "confirmed_wallet_balance": mojos,
+                    "spendable_balance": mojos,
+                    "pending_coin_removal_count": 0,
+                },
+            }
+
+        raw_market = {
+            "dexie_ticker": {
+                "price": 0.0001,
+                "volume_30d": 10,
+                "high_30d": 0.00012,
+                "low_30d": 0.00009,
+            },
+            "dexie_trades": {
+                "total_count": 100,
+                "volume_trend": "stable",
+                "trades": [{"price": 0.0001, "xch_amount": 1.0}],
+            },
+            "tibet_pool": {"has_data": True, "price": 0.0001, "xch_reserve": 200},
+            "tibet_quote": {},
+            "spacescan": {"has_data": True, "price_xch": 0.0001},
+            "internal_db": {"price_count": 0, "fill_count": 0, "pool_trend": "stable"},
+        }
+        analysis = {
+            "volatility": {
+                "regime": "normal",
+                "range_30d_pct": 10,
+                "range_90d_pct": 20,
+                "max_single_move_pct": 3,
+                "confidence": "high",
+                "std_dev_pct": 1,
+                "quiet_phase": False,
+            },
+            "liquidity": {
+                "fills_per_day": 5,
+                "daily_volume_xch": 10,
+                "pool_depth_xch": 200,
+                "level": "deep",
+                "volume_trend": "stable",
+            },
+            "token_health": {
+                "risk_level": "healthy",
+                "activity_level": "active",
+                "holder_count": 1000,
+            },
+            "bot_performance": {"has_history": False},
+            "data_quality": {"score": 100, "quality": "excellent"},
+        }
+        orderbook = {
+            "has_data": True,
+            "api_ok": True,
+            "num_buy_offers": 10,
+            "num_sell_offers": 10,
+            "competitor_spread_bps": 500,
+            "best_bid": 0.00009,
+            "best_ask": 0.00011,
+        }
+
+        try:
+            with (
+                patch("wallet.get_wallet_balance", side_effect=fake_balance),
+                patch(
+                    "market_data_collector.collect_all_market_data",
+                    return_value=raw_market,
+                ),
+                patch(
+                    "market_data_collector.analyze_market_data", return_value=analysis
+                ),
+                patch.object(
+                    smart_defaults,
+                    "_fetch_dexie_orderbook_standalone",
+                    return_value=orderbook,
+                ),
+                patch.object(
+                    smart_defaults,
+                    "_smart_dbx_defaults",
+                    return_value={
+                        "dbx_max_spread_bps": 500,
+                        "pair_incentivized": False,
+                        "dbx_buy_incentive": None,
+                        "dbx_sell_incentive": None,
+                    },
+                ),
+                patch(
+                    "tx_fees.get_suggested_transaction_fee",
+                    return_value={"available": False},
+                ),
+            ):
+                with api_server.app.test_request_context("/api/smart-defaults"):
+                    resp = smart_defaults._calculate_smart_defaults(
+                        xch_reserve=0,
+                        cat_reserve=0,
+                        risk_profile="balanced",
+                        asset_id=asset_id,
+                        cat_wallet_id=2,
+                        cat_decimals=3,
+                        cat_ticker_id="TST_XCH",
+                        cat_name="TestCAT",
+                    )
+        finally:
+            api_server.clear_balance_snapshot()
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        body = resp.get_json()
+        self.assertEqual(body["_capital_plan"]["available_cat"], cached_cat)
+        self.assertGreater(body["max_active_sell"], 0)
+
     def test_large_xch_balance_is_not_stranded_in_topup_when_cat_is_smaller(self):
         from blueprints import smart_defaults
 
