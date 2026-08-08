@@ -158,6 +158,228 @@ class TestLogsDownload(_FlaskBase):
         content_type = resp.content_type or ""
         self.assertIn("zip", content_type.lower())
 
+    def test_bundle_includes_pc_diagnostics_snapshot(self):
+        diagnostics = {
+            "schema_version": 1,
+            "system": {"platform": "Windows-11", "cpu_count_logical": 8},
+            "memory": {
+                "total_physical_bytes": 16_000_000_000,
+                "available_physical_bytes": 4_000_000_000,
+                "memory_load_percent": 75,
+            },
+            "disk": [
+                {
+                    "label": "data_dir",
+                    "root": "C:\\",
+                    "total_bytes": 512_000_000_000,
+                    "free_bytes": 90_000_000_000,
+                    "used_percent": 82.4,
+                }
+            ],
+            "app_process": {
+                "pid": 1234,
+                "tree_process_count": 3,
+                "tree_private_bytes": 900_000_000,
+                "tree_working_set_bytes": 1_100_000_000,
+            },
+        }
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch(
+                "blueprints.coin_prep._collect_pc_diagnostics",
+                return_value=diagnostics,
+            ),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_fills", return_value=[]),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.get_config_history", return_value=[]),
+            patch("database.get_all_settings", return_value=[]),
+            patch("super_log.get_archive_summary", return_value=[]),
+            patch("super_log.get_log_path", return_value=None),
+            patch("super_log.get_log_stats", return_value={}),
+        ):
+            resp = self.client.get("/api/logs/download", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            self.assertIn("snapshots/pc_diagnostics.json", zf.namelist())
+            snapshot = json.loads(zf.read("snapshots/pc_diagnostics.json"))
+            readme = zf.read("README.txt").decode("utf-8", errors="replace")
+
+        self.assertEqual(snapshot, diagnostics)
+        self.assertIn("pc_diagnostics.json", readme)
+
+    def test_pc_diagnostics_collector_reports_system_and_app_memory_shape(self):
+        from blueprints import coin_prep as coin_prep_routes
+
+        diagnostics = coin_prep_routes._collect_pc_diagnostics()
+
+        self.assertEqual(diagnostics["schema_version"], 1)
+        self.assertIn("system", diagnostics)
+        self.assertIn("memory", diagnostics)
+        self.assertIn("disk", diagnostics)
+        self.assertIn("app_process", diagnostics)
+        self.assertEqual(diagnostics["app_process"]["pid"], os.getpid())
+        self.assertIsInstance(diagnostics["disk"], list)
+        self.assertGreaterEqual(diagnostics["app_process"]["tree_process_count"], 1)
+
+    def test_bundle_inventory_summary_falls_back_to_db_counts_when_manager_cold(self):
+        coin_summary = {
+            "xch_free_count": 5,
+            "xch_locked_count": 2,
+            "xch_locked_mojos": 3_000_000_000_000,
+            "xch_total": 7,
+            "cat_free_count": 4,
+            "cat_locked_count": 3,
+            "cat_locked_mojos": 12_345,
+            "cat_total": 7,
+        }
+        cold_inventory = {
+            "xch_locked_coins": 0,
+            "xch_locked_amount": "0.0000",
+            "xch_locked_amount_raw": 0,
+            "cat_locked_coins": 0,
+            "cat_locked_amount": "0.00",
+            "cat_locked_amount_raw": 0,
+            "xch_total_coins": 0,
+            "cat_total_coins": 0,
+        }
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.coin_manager.get_inventory_summary.return_value = cold_inventory
+        bot._recovery_state = {}
+        bot._probe_state = {}
+        bot.get_price_info.return_value = {}
+        bot.risk_manager = None
+        bot.sniper = None
+        bot.market_intel.get_market_summary.return_value = {}
+        bot.runtime_monitor.get_state.return_value = {}
+        bot.splash_manager.get_stats.return_value = {}
+        bot.splash_node.get_status.return_value = {}
+        bot.get_splash_receive_stats.return_value = {}
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_fills", return_value=[]),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_coin_summary", return_value=coin_summary),
+            patch("database.get_config_history", return_value=[]),
+            patch("database.get_all_settings", return_value=[]),
+            patch("super_log.get_archive_summary", return_value=[]),
+            patch("super_log.get_log_path", return_value=None),
+            patch("super_log.get_log_stats", return_value={}),
+        ):
+            resp = self.client.get("/api/logs/download", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            snapshot = json.loads(zf.read("snapshots/coin_inventory.json"))
+
+        inv = snapshot["inventory_summary"]
+        self.assertEqual(inv["xch_locked_coins"], 2)
+        self.assertEqual(inv["xch_locked_amount_raw"], 3_000_000_000_000)
+        self.assertEqual(inv["cat_locked_coins"], 3)
+        self.assertEqual(inv["cat_locked_amount_raw"], 12_345)
+        self.assertEqual(inv["xch_total_coins"], 7)
+        self.assertEqual(inv["cat_total_coins"], 7)
+
+    def test_sage_log_discovery_reads_recent_app_logs_from_data_log_dir(self):
+        from blueprints import coin_prep as coin_prep_routes
+
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = os.path.join(td, "log")
+            os.makedirs(log_dir)
+            older = os.path.join(log_dir, "app.log.2026-06-04")
+            newer = os.path.join(log_dir, "app.log.2026-06-05")
+            ignored = os.path.join(td, "wallets", "mainnet.sqlite")
+            os.makedirs(os.path.dirname(ignored))
+            for path, text in (
+                (older, "older sage log"),
+                (newer, "newer sage log"),
+                (ignored, "not a log"),
+            ):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            os.utime(older, (100, 100))
+            os.utime(newer, (200, 200))
+
+            with patch.object(
+                coin_prep_routes,
+                "_candidate_sage_data_dirs_for_bundle",
+                return_value=[td],
+            ):
+                found = coin_prep_routes._discover_sage_log_paths(max_files=2)
+
+        self.assertEqual(
+            [os.path.basename(path) for path in found],
+            ["app.log.2026-06-05", "app.log.2026-06-04"],
+        )
+
+    def test_bundle_includes_redacted_native_sage_log_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = os.path.join(td, "log")
+            os.makedirs(log_dir)
+            sage_log = os.path.join(log_dir, "app.log.2026-06-04")
+            with open(sage_log, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "2026-06-04T15:49:24Z MEMPOOL_CONFLICT coin=abc123 "
+                    "address=xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq "
+                    "fingerprint: 1234567890 "
+                    r"path=C:\Users\alice\AppData\Roaming\com.rigidnetwork.sage\ssl\wallet.key"
+                )
+
+            with (
+                patch.object(api_server, "bot", None),
+                patch(
+                    "blueprints.coin_prep._candidate_sage_data_dirs_for_bundle",
+                    return_value=[td],
+                ),
+                patch(
+                    "blueprints.coin_prep._collect_pc_diagnostics",
+                    return_value={"schema_version": 1},
+                ),
+                patch("database.get_recent_events", return_value=[]),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_fills", return_value=[]),
+                patch("database.get_live_tier_group_counts", return_value={}),
+                patch("database.get_coin_summary", return_value={}),
+                patch("database.get_config_history", return_value=[]),
+                patch("database.get_all_settings", return_value=[]),
+                patch("super_log.get_archive_summary", return_value=[]),
+                patch("super_log.get_log_path", return_value=None),
+                patch("super_log.get_log_stats", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/logs/download", environ_base=self._LOOPBACK
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            names = zf.namelist()
+            sage_entries = [
+                name
+                for name in names
+                if name.startswith("logs/sage/") and name.endswith("_tail.log")
+            ]
+            self.assertEqual(len(sage_entries), 1)
+            sage_text = zf.read(sage_entries[0]).decode("utf-8", errors="replace")
+            sage_snapshot = json.loads(zf.read("snapshots/sage_logs.json"))
+            readme = zf.read("README.txt").decode("utf-8", errors="replace")
+
+        self.assertIn("MEMPOOL_CONFLICT", sage_text)
+        self.assertIn("coin=abc123", sage_text)
+        self.assertNotIn("xch1qqqq", sage_text)
+        self.assertNotIn("1234567890", sage_text)
+        self.assertNotIn("Users\\alice", sage_text)
+        self.assertEqual(sage_snapshot["included_count"], 1)
+        self.assertEqual(sage_snapshot["files"][0]["filename"], "app.log.2026-06-04")
+        self.assertIn("native Sage wallet log tails", readme)
+
     def test_bundle_includes_market_toxicity_snapshot(self):
         toxicity = {
             "score": 82,

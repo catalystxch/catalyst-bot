@@ -1153,6 +1153,16 @@ def _calculate_smart_defaults(
                 _raw_total = api_server._safe_float(wb.get("spendable_balance", 0))
             cat_spendable = _raw_total / (10**decimals)
             _pending_tx_count += int(wb.get("pending_coin_removal_count", 0) or 0)
+        wallet_balances = api_server.cache_balance_snapshot(
+            {
+                "xch": {"total": xch_spendable, "spendable": xch_spendable},
+                "cat": {"total": cat_spendable, "spendable": cat_spendable},
+            },
+            source="smart_defaults",
+        )
+        xch_spendable = wallet_balances["xch"]["total"]
+        cat_spendable = wallet_balances["cat"]["total"]
+        has_wallet = has_wallet or xch_spendable > 0 or cat_spendable > 0
         if has_wallet:
             messages.append(f"Wallet: {xch_spendable:.2f} XCH (total)")
             print(
@@ -2749,6 +2759,7 @@ def _calculate_smart_defaults(
 
         _capital_plan = {
             "total_xch": round(xch_spendable, 4),
+            "total_cat": round(cat_spendable, 2),
             "xch_reserve": _xch_reserve,
             "cat_reserve": _cat_reserve,
             "available_xch": round(_avail_xch, 4),
@@ -2793,6 +2804,7 @@ def _calculate_smart_defaults(
     else:
         _capital_plan = {
             "total_xch": round(xch_spendable, 4),
+            "total_cat": round(cat_spendable, 2),
             "xch_reserve": _xch_reserve,
             "cat_reserve": _cat_reserve,
             "available_xch": round(_avail_xch, 4),
@@ -3850,9 +3862,7 @@ def _calculate_smart_defaults(
                         _f65_new_total = (
                             _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
                         )
-                        if "_capital_plan" in dir() and isinstance(
-                            _capital_plan, dict
-                        ):
+                        if "_capital_plan" in dir() and isinstance(_capital_plan, dict):
                             _capital_plan["sniper_pool_xch"] = _sniper_pool_xch
                         messages.append(
                             f"CAT-side sniper pool capped: {_old_sniper_prep} -> "

@@ -312,6 +312,241 @@ class TestStatusEndpointSmoke(_FlaskBase):
         body = resp.get_json()
         self.assertFalse(body.get("running"))
 
+    def test_no_bot_status_does_not_read_wallet(self):
+        with (
+            patch.object(api_server, "bot", None),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch("wallet.get_spendable_coin_count") as get_spendable_coin_count,
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        get_all_offers.assert_not_called()
+        get_spendable_coin_count.assert_not_called()
+
+    def test_idle_health_snapshot_counts_unreachable_live_check_as_failure(self):
+        raw_health = {
+            "status": "unreachable",
+            "healthy": False,
+            "wallet": {
+                "reachable": False,
+                "synced": False,
+                "syncing": False,
+                "sync_state": "rpc_failed",
+            },
+            "node": {"reachable": False, "synced": False},
+        }
+
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch("wallet.get_chia_health", return_value=raw_health),
+        ):
+            health = api_server._get_health_snapshot()
+
+        self.assertEqual(health["status"], "unreachable")
+        self.assertGreaterEqual(health["consecutive_failures"], 1)
+
+    def test_status_state_stopped_does_not_read_wallet_even_if_method_true(self):
+        stopped_state_bot = _fake_bot_stopped()
+        stopped_state_bot.is_running = lambda: True
+
+        with (
+            patch.object(api_server, "bot", stopped_state_bot),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch("wallet.get_spendable_coin_count") as get_spendable_coin_count,
+            patch("wallet.get_wallet_balance") as get_wallet_balance,
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.get_json().get("running"))
+        get_all_offers.assert_not_called()
+        get_spendable_coin_count.assert_not_called()
+        get_wallet_balance.assert_not_called()
+
+    def test_stopped_bot_state_does_not_read_wallet_for_zero_db_snapshot(self):
+        zero_bot = _fake_bot_stopped()
+        zero_state = zero_bot.get_state()
+        zero_state["coins"] = {
+            "xch_coins": 0,
+            "cat_coins": 0,
+            "xch_total_coins": 0,
+            "cat_total_coins": 0,
+            "xch_locked_coins": 0,
+            "cat_locked_coins": 0,
+            "xch_balance": {"spendable": 0, "total": 0},
+            "cat_balance": {"spendable": 0, "total": 0},
+            "inventory": {},
+        }
+        zero_bot.get_state = lambda: zero_state
+
+        with (
+            patch.object(api_server, "bot", zero_bot),
+            patch("database.get_coin_summary", return_value={}),
+            patch("wallet.get_spendable_coin_count") as get_spendable_coin_count,
+        ):
+            resp = self.client.get("/api/bot/state", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        get_spendable_coin_count.assert_not_called()
+
+    def test_stopped_status_reuses_tibet_pairs_for_immediate_polls(self):
+        from blueprints import market as market_routes
+
+        with market_routes._TIBET_PAIRS_CACHE_LOCK:
+            market_routes._TIBET_PAIRS_CACHE.update(
+                {"base": "", "fetched_at": 0.0, "pairs": []}
+            )
+
+        asset_id = "abc123cat"
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "ABC_XCH",
+                "decimals": 3,
+                "name": "ABC",
+            }
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return [
+                    {
+                        "asset_id": asset_id,
+                        "xch_reserve": 1_000_000_000_000,
+                        "token_reserve": 1_000,
+                    }
+                ]
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append(str(url))
+            return FakeResponse()
+
+        try:
+            with (
+                patch.object(api_server, "bot", _fake_bot_stopped()),
+                patch("database.get_coin_summary", return_value={}),
+                patch("requests.get", side_effect=fake_get),
+            ):
+                self.client.get("/api/status", environ_base=self._LOOPBACK)
+                self.client.get("/api/status", environ_base=self._LOOPBACK)
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        tibet_calls = [url for url in calls if "tibetswap" in url]
+        self.assertEqual(len(tibet_calls), 1)
+
+    def test_stopped_status_keeps_active_cat_when_prebot_price_cache_is_used(self):
+        from blueprints import bot as bot_routes
+
+        asset_id = "b" * 64
+        original_cat = dict(api_server._active_cat)
+        original_cache = getattr(bot_routes, "_prebot_price_cache", None)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 7,
+                "ticker_id": "BBC_XCH",
+                "decimals": 3,
+                "name": "BBC",
+            }
+        )
+        bot_routes._prebot_price_cache = {
+            "fetched_at": 9_999_999_999.0,
+            "pricing": {"bid": 1, "mid": 2, "ask": 3},
+            "asset_id": asset_id,
+        }
+
+        try:
+            with patch.object(api_server, "bot", None):
+                resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+        finally:
+            if original_cache is None:
+                try:
+                    delattr(bot_routes, "_prebot_price_cache")
+                except AttributeError:
+                    pass
+            else:
+                bot_routes._prebot_price_cache = original_cache
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["current_cat"]["asset_id"], asset_id)
+
+    def test_stopped_status_reuses_verified_balance_after_refresh(self):
+        from blueprints import bot as bot_routes
+
+        asset_id = "c" * 64
+        original_cat = dict(api_server._active_cat)
+        original_cache = getattr(bot_routes, "_prebot_price_cache", None)
+        if hasattr(api_server, "clear_balance_snapshot"):
+            api_server.clear_balance_snapshot()
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 9,
+                "ticker_id": "CBC_XCH",
+                "decimals": 3,
+                "name": "CBC",
+            }
+        )
+        bot_routes._prebot_price_cache = {
+            "fetched_at": 9_999_999_999.0,
+            "pricing": {"bid": 1, "mid": 2, "ask": 3},
+            "asset_id": asset_id,
+        }
+        xch_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 3_000_000_000_000,
+                "spendable_balance": 2_500_000_000_000,
+            },
+        }
+        cat_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 4_200_000_000,
+                "spendable_balance": 4_100_000_000,
+            },
+        }
+
+        try:
+            with patch(
+                "wallet.get_wallet_balance", side_effect=[xch_balance, cat_balance]
+            ):
+                refresh = self.client.post(
+                    "/api/balances/refresh",
+                    headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+                    environ_base=self._LOOPBACK,
+                )
+            with patch.object(api_server, "bot", None):
+                resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+        finally:
+            if hasattr(api_server, "clear_balance_snapshot"):
+                api_server.clear_balance_snapshot()
+            if original_cache is None:
+                try:
+                    delattr(bot_routes, "_prebot_price_cache")
+                except AttributeError:
+                    pass
+            else:
+                bot_routes._prebot_price_cache = original_cache
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(refresh.status_code, 200)
+        self.assertEqual(resp.status_code, 200)
+        balances = resp.get_json()["balances"]
+        self.assertEqual(balances["xch"]["total"], 3.0)
+        self.assertEqual(balances["cat"]["total"], 4_200_000.0)
+
 
 # ---------------------------------------------------------------------------
 # 4. Write-guard — POST without token returns 401 (before Flask method-check)

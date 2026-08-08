@@ -10,7 +10,9 @@ get_recent_prices, log_event/get_recent_events, get_setting/set_setting.
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 try:
     import database as _db
@@ -255,6 +257,99 @@ class TestGetOpenOffers(_TempDB):
             include_mempool_observed=True,
         )
         self.assertIn("b1", {o["trade_id"] for o in with_pending})
+
+    def test_elapsed_offer_expiry_is_retired_before_open_query(self):
+        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
+        _db.upsert_coin(
+            "0xexpiredcoin",
+            "xch",
+            123456,
+            designation="tier_spare",
+            tier="inner",
+        )
+        _db.add_offer(
+            "expired-open",
+            "buy",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+            coin_id="0xexpiredcoin",
+        )
+        _db.lock_coin("0xexpiredcoin", "expired-open")
+
+        offers = _db.get_open_offers(cat_asset_id="assetA")
+
+        offer = _db.get_offer("expired-open")
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xexpiredcoin",),
+            )
+            .fetchone()
+        )
+        self.assertNotIn("expired-open", {o["trade_id"] for o in offers})
+        self.assertEqual(offer["status"], "expired")
+        self.assertEqual(offer["lifecycle_state"], "expired")
+        self.assertEqual(coin["status"], "free")
+        self.assertIsNone(coin["trade_id"])
+
+    def test_get_stats_retires_elapsed_expiry_before_counting_open_offers(self):
+        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE offers SET expires_at=? WHERE cat_asset_id=?",
+            (past, "assetA"),
+        )
+        conn.commit()
+
+        stats = _db.get_stats(cat_asset_id="assetA")
+
+        self.assertEqual(stats["open_offers"], 0)
+        self.assertEqual(stats["open_buys"], 0)
+        self.assertEqual(stats["open_sells"], 0)
+        self.assertEqual(_db.get_offer("b1")["status"], "expired")
+        self.assertEqual(_db.get_offer("s1")["status"], "expired")
+
+    def test_init_database_retires_elapsed_expiry_before_idle_snapshots(self):
+        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
+        _db.upsert_coin(
+            "0xbootexpired",
+            "cat",
+            123456,
+            designation="tier_spare",
+            tier="inner",
+        )
+        _db.add_offer(
+            "boot-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+            coin_id="0xbootexpired",
+        )
+        _db.lock_coin("0xbootexpired", "boot-expired")
+        _db._db_initialized_path = ""
+
+        _db.init_database()
+
+        offer = _db.get_offer("boot-expired")
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xbootexpired",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(offer["status"], "expired")
+        self.assertEqual(offer["lifecycle_state"], "expired")
+        self.assertEqual(coin["status"], "free")
+        self.assertIsNone(coin["trade_id"])
 
     def test_get_stats_excludes_non_actionable_open_rows(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
@@ -548,6 +643,69 @@ class TestSplashIncomingMissingTable(_TempDB):
         self.assertEqual(stats["total"], 0)
         self.assertEqual(stats["new"], 0)
         self.assertEqual(stats["relevant"], 0)
+
+
+@unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
+class TestElapsedExpiryMissingTable(_TempDB):
+    """Elapsed-expiry repair tolerates narrow test DBs without offers."""
+
+    def test_missing_offers_table_is_quiet_noop(self):
+        import sqlite3
+
+        class MissingOffersConnection:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("no such table: offers")
+
+        events = []
+        with patch.object(
+            _db, "get_connection", return_value=MissingOffersConnection()
+        ):
+            with patch.object(
+                _db,
+                "log_event",
+                side_effect=lambda severity, event_type, message, *args, **kwargs: (
+                    events.append((severity, event_type, message))
+                ),
+            ):
+                retired = _db.expire_elapsed_open_offers()
+
+        self.assertEqual(retired, 0)
+        self.assertFalse(
+            [event for event in events if event[0] in ("warning", "error")]
+        )
+
+
+@unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
+class TestSplashIncomingLockContention(_TempDB):
+    """Splash incoming writes tolerate transient SQLite contention."""
+
+    def test_record_locked_database_is_non_warning_best_effort_drop(self):
+        import sqlite3
+
+        class LockedConnection:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            def rollback(self):
+                pass
+
+        events = []
+        with patch.object(_db, "get_connection", return_value=LockedConnection()):
+            with patch.object(
+                _db,
+                "log_event",
+                side_effect=lambda severity, event_type, message, *args, **kwargs: (
+                    events.append((severity, event_type, message))
+                ),
+            ):
+                recorded = _db.record_splash_incoming(
+                    "offer1abc", "fingerprint", source_ip="127.0.0.1"
+                )
+
+        self.assertFalse(recorded)
+        self.assertFalse(
+            [event for event in events if event[0] in ("warning", "error")]
+        )
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

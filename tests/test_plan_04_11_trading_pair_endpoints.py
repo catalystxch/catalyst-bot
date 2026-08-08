@@ -201,5 +201,63 @@ class TestCatRefresh(_FlaskBase):
         mock_reload.assert_called_once()
 
 
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestBalanceRefresh(_FlaskBase):
+    def test_transient_cat_zero_reuses_last_verified_balance(self):
+        original_cat = dict(api_server._active_cat)
+        if hasattr(api_server, "clear_balance_snapshot"):
+            api_server.clear_balance_snapshot()
+        api_server._active_cat.update(
+            {
+                "asset_id": _VALID_ASSET_ID,
+                "wallet_id": 7,
+                "ticker_id": "TST_XCH",
+                "decimals": 3,
+                "name": "TestCAT",
+            }
+        )
+        xch_ok = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 5_000_000_000_000,
+                "spendable_balance": 4_000_000_000_000,
+            },
+        }
+        cat_ok = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 6_500_000_000,
+                "spendable_balance": 6_400_000_000,
+            },
+        }
+        cat_zero = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 0,
+                "spendable_balance": 0,
+            },
+        }
+
+        try:
+            with patch(
+                "wallet.get_wallet_balance",
+                side_effect=[xch_ok, cat_ok, xch_ok, cat_zero],
+            ):
+                first = self._post("/api/balances/refresh")
+                second = self._post("/api/balances/refresh")
+        finally:
+            if hasattr(api_server, "clear_balance_snapshot"):
+                api_server.clear_balance_snapshot()
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        body = second.get_json()
+        self.assertTrue(body.get("success"))
+        self.assertEqual(body["balances"]["cat"]["total"], 6_500_000.0)
+        self.assertEqual(body["balances"]["cat"]["spendable"], 6_400_000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

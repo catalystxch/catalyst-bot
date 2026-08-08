@@ -101,6 +101,64 @@ def test_offer_history_reset_preserves_pnl_chart_history():
     assert "{ clearPnlCharts: false });" in html
 
 
+def test_smart_settings_preview_uses_smart_balance_snapshot_when_bot_stopped():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    gate_start = html.index("const _previewDepsReady = () => {")
+    gate_end = html.index("if (!_previewDepsReady())", gate_start)
+    gate_block = html[gate_start:gate_end]
+    assert "getWalletBalance('xch')" in gate_block
+    assert "getWalletBalance('cat')" in gate_block
+
+    preview_start = html.index("function updateCoinPrepPreview()")
+    preview_end = html.index("const _liveMid", preview_start)
+    preview_block = html[preview_start:preview_end]
+    assert "getWalletBalance('xch')" in preview_block
+    assert "getWalletBalance('cat')" in preview_block
+    assert "bot_state?.balances?.xch?.total || 0" not in preview_block
+    assert "bot_state?.balances?.cat?.total || 0" not in preview_block
+
+
+def test_smart_settings_snapshots_wallet_balances_from_response_sources():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    snapshot_start = html.index("const _xchBal")
+    snapshot_end = html.index("window._smartMidPrice", snapshot_start)
+    snapshot_block = html[snapshot_start:snapshot_end]
+    assert "data.xch_balance" in snapshot_block
+    assert "data?._data_sources?.xch_balance" in snapshot_block
+    assert "data._capital_plan?.total_xch" in snapshot_block
+    assert "_cp.total_cat" in snapshot_block
+    assert "_cp.available_cat" in snapshot_block
+    assert "_cp.cat_reserve" in snapshot_block
+
+
+def test_settings_review_state_survives_reload_before_blank_template_gate():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "function readStoredSettingsReviewed()" in html
+    assert "localStorage.getItem('settingsReviewed') === 'true'" in html
+    assert "function isSettingsReviewedForCurrentPair()" in html
+    assert (
+        "localStorage.setItem('settingsReviewedAssetId', currentCAT.asset_id)" in html
+    )
+    assert "let settingsReviewed = readStoredSettingsReviewed();" in html
+    assert "let _freshStartBlankTierTemplates = !settingsReviewed;" in html
+
+    gate_start = html.index("function shouldUseFreshStartBlankTierTemplates()")
+    gate_end = html.index(
+        "function resetCoreOrderBookInputsForFreshStart()", gate_start
+    )
+    gate_block = html[gate_start:gate_end]
+    assert "!isSettingsReviewedForCurrentPair()" in gate_block
+    assert "!settingsReviewed" not in gate_block
+
+    start_gate = html.index("function canAttemptBotStart()")
+    start_end = html.index("function _getPairFromSelector", start_gate)
+    start_block = html[start_gate:start_end]
+    assert "isSettingsReviewedForCurrentPair()" in start_block
+
+
 def test_desktop_bridge_covers_reset_routes_used_by_data_buttons():
     html = GUI.read_text(encoding="utf-8", errors="replace")
     bridge = APP_BRIDGE.read_text(encoding="utf-8", errors="replace")
@@ -149,6 +207,22 @@ def test_market_price_history_treats_sql_timestamps_as_utc():
     assert "function _v4ParsePriceHistoryTimestamp" in html
     assert "normalized + 'Z'" in html
     assert "const t = _v4ParsePriceHistoryTimestamp(point.timestamp);" in html
+
+
+def test_market_price_history_preserves_live_samples_when_server_history_empty():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "function _v4MergePriceHistoryPoints" in html
+    assert "const existingLiveSamples = _v4PriceHistory.slice();" in html
+    assert "if (!loadedPoints.length)" in html
+
+
+def test_market_price_history_accepts_running_bot_pair_context():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "function _v4HasPriceHistoryPairContext" in html
+    assert "bot_state.current_cat.asset_id" in html
+    assert "!shouldRequireExplicitPairSelection(bot_state)" in html
 
 
 def test_dry_run_is_not_user_facing_setting():

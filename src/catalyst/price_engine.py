@@ -183,8 +183,15 @@ class PriceEngine:
                     f"Mid={mid_price:.8f}",
                 )
             else:
+                _provider_availability_flip = strategy in (
+                    "weighted",
+                    "average",
+                ) and (
+                    strategy_used in ("dexie_only", "tibet_only")
+                    or _prev_strategy in ("dexie_only", "tibet_only")
+                )
                 log_event(
-                    "warning",
+                    "info" if _provider_availability_flip else "warning",
                     "price_strategy",
                     f"Pricing strategy changed: {_prev_strategy} → {strategy_used}{_weight_info} — "
                     f"Dexie={dexie_price}, Tibet={tibet_price}, "

@@ -57,6 +57,25 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
+def _live_wallet_reads_allowed(bot_obj=None) -> bool:
+    """Only poll wallet RPC while an authorised bot run is active."""
+    if bot_obj is None:
+        return False
+    state_running = False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
+    try:
+        method_running = (
+            bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
+        )
+    except Exception:
+        method_running = False
+    return bool(state_running and method_running)
+
+
 @bp.route("/api/events")
 def api_events():
     """SSE endpoint — GUI connects here for real-time updates.
@@ -562,6 +581,7 @@ def api_bot_state():
                 if (
                     int(coins.get("xch_coins", 0) or 0) == 0
                     and int(coins.get("xch_total_coins", 0) or 0) == 0
+                    and _live_wallet_reads_allowed(bot)
                 ):
                     from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
@@ -610,6 +630,12 @@ def api_status():
         if not bot:
             xch_bal = {"spendable": 0, "total": 0}
             cat_bal = {"spendable": 0, "total": 0}
+            cached_balances = api_server.merge_cached_balance_snapshot(
+                {"xch": xch_bal, "cat": cat_bal}
+            )
+            if cached_balances:
+                xch_bal = cached_balances["xch"]
+                cat_bal = cached_balances["cat"]
 
             # Pre-start pricing cache. Without this, every /api/status poll
             # (every 5 s) fires a live TibetSwap and Dexie fetch AND writes
@@ -629,6 +655,7 @@ def api_status():
             asset_id = api_server._active_cat.get("asset_id") or (
                 cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
             )
+            price_lookup_asset_id = asset_id
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
@@ -644,11 +671,11 @@ def api_status():
                 pricing = dict(_prebot_price_cache["pricing"])
                 # Skip all HTTP fetches and logging below for this poll —
                 # the cache is fresh enough for a pre-bot dashboard.
-                asset_id = ""
+                price_lookup_asset_id = ""
 
-            if asset_id:
+            if price_lookup_asset_id:
                 print(
-                    f"[STATUS] Pricing lookup: asset_id={asset_id!r}, decimals={cat_dec}",
+                    f"[STATUS] Pricing lookup: asset_id={price_lookup_asset_id!r}, decimals={cat_dec}",
                     flush=True,
                 )
                 log_event(
@@ -656,58 +683,52 @@ def api_status():
                     "price_lookup",
                     f"Looking up price for {api_server._active_cat.get('name', 'unknown')}",
                 )
-            if asset_id:
+            if price_lookup_asset_id:
                 import requests as _req
 
                 mid = 0
 
                 # --- Try TibetSwap ---
                 try:
-                    _record_api_call("tibetswap", "/pairs")
-                    resp = _req.get(
-                        "https://api.v2.tibetswap.io/pairs",
-                        params={"skip": 0, "limit": 200},
+                    from blueprints.market import _get_tibet_pairs_cached
+
+                    pairs = _get_tibet_pairs_cached(
+                        getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
                         timeout=8,
                     )
-                    if resp.status_code == 200:
-                        norm_id = asset_id.lower().strip().replace("0x", "")
-                        for p in resp.json():
-                            p_id = (
-                                str(p.get("asset_id", ""))
-                                .lower()
-                                .strip()
-                                .replace("0x", "")
+                    norm_id = price_lookup_asset_id.lower().strip().replace("0x", "")
+                    for p in pairs:
+                        p_id = (
+                            str(p.get("asset_id", "")).lower().strip().replace("0x", "")
+                        )
+                        if p_id == norm_id:
+                            xr = Decimal(str(p.get("xch_reserve", 0))) / Decimal(
+                                "1000000000000"
                             )
-                            if p_id == norm_id:
-                                xr = Decimal(str(p.get("xch_reserve", 0))) / Decimal(
-                                    "1000000000000"
+                            tr = Decimal(str(p.get("token_reserve", 0))) / (
+                                Decimal(10) ** int(cat_dec)
+                            )
+                            if tr > 0:
+                                mid = xr / tr
+                                pricing = {
+                                    "bid": mid,
+                                    "mid": mid,
+                                    "ask": mid,
+                                    "tibet_price": mid,
+                                    "tibet_enabled": True,
+                                    "source": "tibetswap",
+                                    "liquidity": {
+                                        "xch_reserve": str(xr),
+                                        "token_reserve": str(tr),
+                                    },
+                                }
+                                print(f"[STATUS] TibetSwap price: {mid}", flush=True)
+                                log_event(
+                                    "success",
+                                    "price_found",
+                                    f"TibetSwap price: {mid:.8f} XCH",
                                 )
-                                tr = Decimal(str(p.get("token_reserve", 0))) / (
-                                    Decimal(10) ** int(cat_dec)
-                                )
-                                if tr > 0:
-                                    mid = xr / tr
-                                    pricing = {
-                                        "bid": mid,
-                                        "mid": mid,
-                                        "ask": mid,
-                                        "tibet_price": mid,
-                                        "tibet_enabled": True,
-                                        "source": "tibetswap",
-                                        "liquidity": {
-                                            "xch_reserve": str(xr),
-                                            "token_reserve": str(tr),
-                                        },
-                                    }
-                                    print(
-                                        f"[STATUS] TibetSwap price: {mid}", flush=True
-                                    )
-                                    log_event(
-                                        "success",
-                                        "price_found",
-                                        f"TibetSwap price: {mid:.8f} XCH",
-                                    )
-                                break
+                            break
                 except Exception as e:
                     print(f"[STATUS] TibetSwap failed: {e}")
                     slog(
@@ -786,7 +807,7 @@ def api_status():
                             resp = _req.get(
                                 f"{dexie_base}/v1/offers",
                                 params={
-                                    "offered": asset_id,
+                                    "offered": price_lookup_asset_id,
                                     "requested": "xch",
                                     "status": 0,
                                     "page_size": 1,
@@ -883,6 +904,8 @@ def api_status():
             offers_buy_pre = []
             offers_sell_pre = []
             try:
+                if not _live_wallet_reads_allowed(bot):
+                    raise StopIteration
                 from wallet import get_all_offers, classify_offers_from_list
 
                 asset_id_for_offers = api_server._active_cat.get("asset_id") or getattr(
@@ -972,6 +995,8 @@ def api_status():
                         f"{len(offers_sell_pre)} sells",
                         flush=True,
                     )
+            except StopIteration:
+                pass
             except Exception as e:
                 slog("API_STATUS", f"Pre-bot offer fetch error: {e}", level="warning")
 
@@ -979,6 +1004,8 @@ def api_status():
             xch_free = 0
             cat_free = 0
             try:
+                if not _live_wallet_reads_allowed(bot):
+                    raise StopIteration
                 from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
                 xch_free = int(get_spendable_coin_count(WALLET_ID_XCH) or 0)
@@ -986,6 +1013,8 @@ def api_status():
                     cfg, "CAT_WALLET_ID", 2
                 )
                 cat_free = int(get_spendable_coin_count(cat_wid_coins) or 0)
+            except StopIteration:
+                pass
             except Exception:
                 pass
             xch_locked = len(offers_buy_pre)
@@ -1085,7 +1114,7 @@ def api_status():
         }
 
         # If balances are all zero (bot hasn't run yet), try direct wallet RPC
-        if balances_out["xch"]["total"] == 0:
+        if balances_out["xch"]["total"] == 0 and _live_wallet_reads_allowed(bot):
             try:
                 from wallet import get_wallet_balance, WALLET_ID_XCH
 
@@ -1102,7 +1131,7 @@ def api_status():
             except Exception:
                 pass
 
-        if balances_out["cat"]["total"] == 0:
+        if balances_out["cat"]["total"] == 0 and _live_wallet_reads_allowed(bot):
             try:
                 from wallet import get_wallet_balance
 
@@ -1124,6 +1153,10 @@ def api_status():
                     balances_out["cat"]["spendable"] = spendable / (10**cat_decimals)
             except Exception:
                 pass
+
+        cached_balances = api_server.merge_cached_balance_snapshot(balances_out)
+        if cached_balances:
+            balances_out = cached_balances
 
         # --- Pricing ---
         price_info = bot.get_price_info() if hasattr(bot, "get_price_info") else {}
@@ -1151,8 +1184,6 @@ def api_status():
         # Without this, the settings/coin-prep page can't calculate sell amounts.
         if mid == 0:
             try:
-                import requests as _req
-
                 asset_id = api_server._active_cat.get("asset_id") or (
                     cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
                 )
@@ -1160,33 +1191,27 @@ def api_status():
                     cfg, "CAT_DECIMALS", 3
                 )
                 if asset_id:
-                    _record_api_call("tibetswap", "/pairs")
-                    resp = _req.get(
-                        "https://api.v2.tibetswap.io/pairs",
-                        params={"skip": 0, "limit": 200},
+                    from blueprints.market import _get_tibet_pairs_cached
+
+                    pairs = _get_tibet_pairs_cached(
+                        getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
                         timeout=8,
                     )
-                    if resp.status_code == 200:
-                        norm_id = asset_id.lower().strip().replace("0x", "")
-                        for p in resp.json():
-                            p_id = (
-                                str(p.get("asset_id", ""))
-                                .lower()
-                                .strip()
-                                .replace("0x", "")
-                            )
-                            if p_id == norm_id:
-                                xr = float(p.get("xch_reserve", 0)) / 1e12
-                                tr = float(p.get("token_reserve", 0)) / (
-                                    10 ** int(cat_dec)
+                    norm_id = asset_id.lower().strip().replace("0x", "")
+                    for p in pairs:
+                        p_id = (
+                            str(p.get("asset_id", "")).lower().strip().replace("0x", "")
+                        )
+                        if p_id == norm_id:
+                            xr = float(p.get("xch_reserve", 0)) / 1e12
+                            tr = float(p.get("token_reserve", 0)) / (10 ** int(cat_dec))
+                            if tr > 0:
+                                mid = xr / tr
+                                print(
+                                    f"[STATUS] TibetSwap fallback price: {mid:.8f}",
+                                    flush=True,
                                 )
-                                if tr > 0:
-                                    mid = xr / tr
-                                    print(
-                                        f"[STATUS] TibetSwap fallback price: {mid:.8f}",
-                                        flush=True,
-                                    )
-                                break
+                            break
             except Exception as e:
                 print(f"[STATUS] TibetSwap fallback failed: {e}", flush=True)
 
@@ -1243,6 +1268,8 @@ def api_status():
             offers_buy = []
             offers_sell = []
             try:
+                if not _live_wallet_reads_allowed(bot):
+                    raise StopIteration
                 from wallet import get_all_offers, classify_offers_from_list
 
                 asset_id_for_classify = api_server._active_cat.get(
@@ -1302,6 +1329,8 @@ def api_status():
                     for tr in sells_raw:
                         offers_sell.append(_extract_offer_data(tr, "sell"))
 
+            except StopIteration:
+                pass
             except Exception as e:
                 slog(
                     "API_STATUS",
@@ -1604,7 +1633,11 @@ def api_status():
         # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
         # "selectable" = free/spendable coins, "owned" = free + offer-locked
         # Locked = owned - selectable
-        if coin_tracking["xch_free"] == 0 and coin_tracking["xch_total"] == 0:
+        if (
+            coin_tracking["xch_free"] == 0
+            and coin_tracking["xch_total"] == 0
+            and _live_wallet_reads_allowed(bot)
+        ):
             try:
                 from wallet import rpc as wallet_rpc
 

@@ -138,6 +138,7 @@ class TestCheckResume(_TempDB):
         with (
             patch("api_server.bot", None),
             patch("api_server._fresh_start_is_set", return_value=False),
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=wallet_offers),
             patch(
                 "wallet.classify_offers_from_list",
@@ -177,6 +178,7 @@ class TestCheckResume(_TempDB):
         api_server._fresh_start_set()
         with (
             patch("api_server.bot", None),
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[{"trade_id": "b1"}]),
             patch(
                 "wallet.classify_offers_from_list",

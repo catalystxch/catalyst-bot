@@ -68,7 +68,7 @@ _terminal_level = LEVELS["info"]
 # State
 # ---------------------------------------------------------------------------
 _log_file = None
-_log_lock = threading.Lock()
+_log_lock = threading.RLock()
 _log_path = ""
 _log_dir = ""
 _start_time = time.time()

@@ -65,6 +65,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         sys.modules["database"] = fake_database
 
         fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.dotenv_values = lambda *args, **kwargs: {}
         fake_dotenv.load_dotenv = lambda *args, **kwargs: True
         fake_dotenv.set_key = lambda *args, **kwargs: True
         sys.modules["dotenv"] = fake_dotenv
@@ -443,6 +444,113 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         joined = "\n".join(logs).lower()
         self.assertIn("sage wallet is still settling", joined)
         self.assertNotIn("rejected or dropped", joined)
+
+    def test_sage_consolidation_runs_follow_up_pass_after_partial_reduction(self):
+        calls = {"send": [], "wait": 0}
+        visible_count = {"value": 15}
+        coin_batches = [
+            [
+                {
+                    "coin_id": "0x" + f"{i:064x}",
+                    "spent_block_index": 0,
+                    "amount": 100,
+                }
+                for i in range(1, 16)
+            ],
+            [
+                {
+                    "coin_id": "0x" + f"{i:064x}",
+                    "spent_block_index": 0,
+                    "amount": 100,
+                }
+                for i in range(101, 103)
+            ],
+        ]
+
+        fake_wallet_sage = types.ModuleType("wallet_sage")
+        fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
+        fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
+            "address": "xch1self",
+        }
+
+        def get_spendable_coins_rpc(wallet_id):
+            batch = coin_batches[min(len(calls["send"]), len(coin_batches) - 1)]
+            return {"success": True, "confirmed_records": list(batch)}
+
+        def send_transaction(
+            wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
+        ):
+            calls["send"].append(
+                {
+                    "wallet_id": wallet_id,
+                    "amount_mojos": amount_mojos,
+                    "source_coin_ids": list(source_coin_ids or []),
+                }
+            )
+            return {"success": True, "submitted": True}
+
+        fake_wallet_sage.get_spendable_coins_rpc = get_spendable_coins_rpc
+        fake_wallet_sage.send_transaction = send_transaction
+        sys.modules["wallet_sage"] = fake_wallet_sage
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.cat_wallet_id = 2
+        worker.get_coin_count = lambda wallet_id: visible_count["value"]
+        worker._tx_fee_mojos = lambda: 0
+
+        def wait_for_consolidation(wallet_id, name, before_count):
+            calls["wait"] += 1
+            if calls["wait"] == 1:
+                self.assertEqual(before_count, 15)
+                visible_count["value"] = 2
+                return False
+            self.assertEqual(before_count, 2)
+            visible_count["value"] = 1
+            return True
+
+        worker._wait_for_sage_consolidation = wait_for_consolidation
+
+        with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
+            self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
+
+        self.assertEqual(calls["wait"], 2)
+        self.assertEqual(len(calls["send"]), 2)
+        self.assertEqual(len(calls["send"][0]["source_coin_ids"]), 15)
+        self.assertEqual(len(calls["send"][1]["source_coin_ids"]), 2)
+
+    def test_sage_consolidation_resyncs_partial_reduction_before_timeout_failure(
+        self,
+    ):
+        calls = {"resync": 0}
+
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker.xch_wallet_id = 1
+        worker.cat_wallet_id = 2
+        worker.get_coin_count = lambda wallet_id: 2
+        worker._set_status_coin_counts = lambda **kwargs: None
+        worker.update_status = lambda *args, **kwargs: None
+        worker.log = lambda message: None
+
+        def recover(wallet_id, name):
+            calls["resync"] += 1
+            self.assertEqual(wallet_id, 2)
+            self.assertEqual(name, "CAT")
+            return True
+
+        worker._resync_sage_after_stale_consolidation = recover
+
+        with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
+            self.assertTrue(
+                worker._wait_for_sage_consolidation(
+                    2,
+                    "CAT",
+                    before_count=15,
+                    max_wait_seconds=10,
+                    poll_interval=5,
+                )
+            )
+
+        self.assertEqual(calls["resync"], 1)
 
     def test_worker_aborts_when_consolidation_never_verifies(self):
         source = (

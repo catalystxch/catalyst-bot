@@ -159,6 +159,53 @@ class BulkCancelMethodTagTests(unittest.TestCase):
             self.assertTrue(results[tid]["success"])
             self.assertEqual(results[tid]["method"], "submitted_pending_confirm")
 
+    def test_bulk_submit_mempool_conflict_returns_inflight_marker(self):
+        calls = []
+
+        def fake_sage_post(endpoint, payload, timeout=0):
+            calls.append(endpoint)
+            if endpoint == "cancel_offers":
+                return {"coin_spends": [{"coin": "offer-coin"}]}
+            if endpoint == "sign_coin_spends":
+                return {"spend_bundle": {"aggregated_signature": "0xabc"}}
+            if endpoint == "submit_transaction":
+                raise wallet_sage.SageMempoolConflict("MEMPOOL_CONFLICT")
+            raise AssertionError(endpoint)
+
+        with (
+            patch.object(wallet_sage, "_sage_post", side_effect=fake_sage_post),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage._cancel_offers_bulk_proper(["aaaa", "bbbb"])
+
+        self.assertEqual(result, "mempool_conflict_inflight")
+        self.assertEqual(
+            calls,
+            ["cancel_offers", "sign_coin_spends", "submit_transaction"],
+        )
+
+    def test_bulk_mempool_conflict_marks_batch_pending_without_sequential_retry(self):
+        trade_ids = ["aaaa", "bbbb", "cccc"]
+
+        with (
+            patch.object(
+                wallet_sage,
+                "_cancel_offers_bulk_proper",
+                return_value="mempool_conflict_inflight",
+            ),
+            patch.object(wallet_sage, "cancel_offer") as cancel_offer,
+            patch.object(wallet_sage, "get_spendable_coin_count", return_value=10),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                trade_ids, secure=True, skip_confirmation=True
+            )
+
+        cancel_offer.assert_not_called()
+        for tid in trade_ids:
+            self.assertTrue(results[tid]["success"])
+            self.assertEqual(results[tid]["method"], "mempool_conflict_inflight")
+            self.assertIn(results[tid]["method"], CANCEL_PENDING_METHODS)
+
 
 if __name__ == "__main__":
     unittest.main()

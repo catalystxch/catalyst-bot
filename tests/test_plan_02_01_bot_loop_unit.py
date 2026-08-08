@@ -463,6 +463,38 @@ class TestBotLoopWiring(_PatchedCfg):
         self.assertEqual(loop._bot_state["our_best_bid"], "1.00")
         self.assertEqual(loop._bot_state["our_best_ask"], "1.05")
 
+    def test_splash_receive_marks_unviewable_offer_ignored(self):
+        loop = _make_loop()
+        updates = []
+
+        fake_db = types.ModuleType("database")
+        fake_db.get_splash_incoming_offers = lambda status=None, limit=50: [
+            {"id": 7, "offer_bech32": "offer1bad"}
+        ]
+        fake_db.update_splash_incoming_status = (
+            lambda offer_id, status, pair_hint=None: (
+                updates.append((offer_id, status, pair_hint)) or True
+            )
+        )
+
+        def view_offer(_offer):
+            raise RuntimeError("cannot decode offer")
+
+        with (
+            patch.dict(sys.modules, {"database": fake_db}),
+            patch.object(bot_loop.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch.object(
+                loop,
+                "_resolve_splash_view_offer",
+                return_value=("sage", view_offer),
+            ),
+            patch.object(loop, "_emit"),
+            patch.object(bot_loop, "log_event"),
+        ):
+            loop._process_splash_incoming_batch()
+
+        self.assertEqual(updates, [(7, "ignored", "view_error")])
+
     def test_toxicity_cancel_disabled_leaves_live_offers_on_book(self):
         loop = _make_loop()
         calls = []

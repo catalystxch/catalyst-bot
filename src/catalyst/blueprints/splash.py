@@ -262,13 +262,18 @@ def api_splash_incoming():
     if not offer_bech32.lower().startswith("offer1"):
         return jsonify({"error": "Invalid offer format"}), 400
 
+    if server._splash_incoming_backlog_full():
+        return jsonify({"error": "backlog_full"}), 429
+
     try:
         fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
         source_ip = request.remote_addr
 
         from database import record_splash_incoming
 
-        was_new = record_splash_incoming(offer_bech32, fp, source_ip=source_ip)
+        with server._SPLASH_INCOMING_WRITE_LOCK:
+            was_new = record_splash_incoming(offer_bech32, fp, source_ip=source_ip)
+        server._splash_incoming_note_recorded(was_new)
 
         if was_new:
             log_event(

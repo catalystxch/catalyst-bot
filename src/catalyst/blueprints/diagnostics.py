@@ -60,14 +60,14 @@ def api_health():
             "node_reachable": node_info.get("reachable", False),
             "node_synced": node_info.get("synced", False),
             "peer_count": raw_health.get("peer_count", -1),
-            "consecutive_failures": 0,
+            "consecutive_failures": api_server._health_consecutive_failures(raw_health),
         }
     except Exception as e:
         log_event("warning", "health_check_unreachable", str(e))
         health_data = {
             "status": "unreachable",
             "error": "health_check_unreachable",
-            "consecutive_failures": 0,
+            "consecutive_failures": 1,
         }
 
     bot = api_server.bot

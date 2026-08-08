@@ -4737,9 +4737,17 @@ class BotLoop:
                     "splash_receive_view_error",
                     f"Could not inspect inbound Splash offer {offer_id}: {e}",
                 )
+                update_splash_incoming_status(
+                    offer_id, "ignored", pair_hint="view_error"
+                )
+                processed_any = True
                 continue
 
             if not viewed:
+                update_splash_incoming_status(
+                    offer_id, "ignored", pair_hint="view_empty"
+                )
+                processed_any = True
                 continue
 
             classified = classify_offer_for_asset(viewed, asset_id)

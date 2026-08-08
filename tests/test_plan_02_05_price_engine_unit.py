@@ -340,6 +340,46 @@ class TestPricingStrategySelection(unittest.TestCase):
         self.assertEqual(result["arb_gap_bps"], Decimal("0"))
         self.assertIsNone(result["arb_opportunity"])
 
+    def test_provider_fallback_strategy_change_logs_info_not_warning(self):
+        eng = _make_engine()
+        prices = [
+            (Decimal("1.00"), Decimal("1.20")),
+            (None, Decimal("1.20")),
+            (Decimal("1.00"), Decimal("1.20")),
+        ]
+        eng._fetch_dexie_price = lambda *a, **kw: prices.pop(0)[0]
+        eng._fetch_tibet_price = lambda *a, **kw: (
+            prices[0][1] if prices else Decimal("1.20")
+        )
+        eng._apply_safety_guards = lambda p: p
+        eng._update_reference_price = lambda p: None
+        events = []
+
+        def capture(severity, event_type, message, *args, **kwargs):
+            if event_type == "price_strategy":
+                events.append((severity, message))
+
+        with (
+            patch.object(_pe_mod, "log_event", side_effect=capture),
+            patch("database.record_price"),
+        ):
+            eng.get_price()
+            eng.get_price()
+            eng.get_price()
+
+        self.assertTrue(events)
+        self.assertFalse(
+            [
+                event
+                for event in events
+                if event[0] == "warning"
+                and (
+                    "weighted → tibet_only" in event[1]
+                    or "tibet_only → weighted" in event[1]
+                )
+            ]
+        )
+
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
 class TestDexieTickerFreshness(unittest.TestCase):

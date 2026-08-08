@@ -2618,45 +2618,70 @@ class CoinPrepWorker:
         so the primary Sage path is the same operation an operator would
         perform manually: send the wallet balance back to our own address.
         """
-        coin_count = self.get_coin_count(wallet_id)
-        self.log(f"Current {name} coins: {coin_count}")
+        max_self_send_attempts = 3
 
-        if coin_count <= 1:
-            self.log(f"✅ {name} already consolidated ({coin_count} coin)")
-            return True
-
-        large_threshold = 40 if wallet_id == self.xch_wallet_id else 20
-        large_consolidation = coin_count > large_threshold
-
-        self._sage_consolidation_submitted = False
-        self._sage_consolidation_settling = False
-        self._sage_consolidation_resync_start_count = None
-        self._sage_consolidation_resync_last_count = None
-        if self._consolidate_wallet_sage_fallback(wallet_id, name):
-            return True
-
-        if getattr(self, "_sage_consolidation_submitted", False):
-            if getattr(self, "_sage_consolidation_settling", False):
+        for attempt in range(1, max_self_send_attempts + 1):
+            coin_count = self.get_coin_count(wallet_id)
+            if attempt == 1:
+                self.log(f"Current {name} coins: {coin_count}")
+            else:
                 self.log(
-                    f"{name} send-to-self was submitted, but Sage wallet is still "
-                    "settling after recent activity. Wait a minute, then rerun "
-                    "Coin Prep instead of forcing another combine immediately."
+                    f"Follow-up {name} consolidation pass {attempt}/"
+                    f"{max_self_send_attempts}: {coin_count} coins visible"
+                )
+
+            if coin_count <= 1:
+                self.log(f"✅ {name} already consolidated ({coin_count} coin)")
+                return True
+
+            large_threshold = 40 if wallet_id == self.xch_wallet_id else 20
+            large_consolidation = coin_count > large_threshold
+
+            self._sage_consolidation_submitted = False
+            self._sage_consolidation_settling = False
+            self._sage_consolidation_resync_start_count = None
+            self._sage_consolidation_resync_last_count = None
+            if self._consolidate_wallet_sage_fallback(wallet_id, name):
+                return True
+
+            if getattr(self, "_sage_consolidation_submitted", False):
+                if getattr(self, "_sage_consolidation_settling", False):
+                    self.log(
+                        f"{name} send-to-self was submitted, but Sage wallet is still "
+                        "settling after recent activity. Wait a minute, then rerun "
+                        "Coin Prep instead of forcing another combine immediately."
+                    )
+                    return False
+
+                current_count = self.get_coin_count(wallet_id)
+                if 1 < current_count < coin_count and attempt < max_self_send_attempts:
+                    self.log(
+                        f"{name} consolidation made progress "
+                        f"({coin_count} -> {current_count} coins) but did not "
+                        "reach one coin; continuing with a follow-up pass in "
+                        "this coin-prep run."
+                    )
+                    time.sleep(5)
+                    continue
+
+                self.log(
+                    f"{name} send-to-self was submitted but never verified as one coin; "
+                    "not retrying with another consolidation method"
                 )
                 return False
-            self.log(
-                f"{name} send-to-self was submitted but never verified as one coin; "
-                "not retrying with another consolidation method"
-            )
-            return False
 
-        if large_consolidation:
-            self.log(
-                f"Large {name} consolidation failed; not retrying as one giant /combine"
-            )
-            return False
+            if large_consolidation:
+                self.log(
+                    f"Large {name} consolidation failed; not retrying as one giant /combine"
+                )
+                return False
 
-        self.log("⚠️ Send-to-self consolidation failed — trying /combine endpoint...")
-        return self._consolidate_wallet_sage_combine(wallet_id, name)
+            self.log(
+                "⚠️ Send-to-self consolidation failed — trying /combine endpoint..."
+            )
+            return self._consolidate_wallet_sage_combine(wallet_id, name)
+
+        return False
 
     def _consolidate_wallet_sage_combine(self, wallet_id: int, name: str) -> bool:
         """Consolidate via Sage's /combine endpoint with explicit coin IDs.
@@ -2804,6 +2829,26 @@ class CoinPrepWorker:
                 )
 
         final_count = self.get_coin_count(wallet_id)
+        if 1 < final_count < before_count:
+            self.log(
+                f"{name} consolidation reduced from {before_count} to {final_count} "
+                "coins but did not surface one coin before timeout; forcing Sage "
+                "resync before failing"
+            )
+            self._sage_consolidation_resync_start_count = final_count
+            self._sage_consolidation_resync_last_count = final_count
+            if self._resync_sage_after_stale_consolidation(wallet_id, name):
+                return True
+            resync_count = getattr(self, "_sage_consolidation_resync_last_count", None)
+            if resync_count is not None and resync_count != final_count:
+                self._sage_consolidation_settling = True
+                self.log(
+                    f"{name} consolidation did not settle into one coin yet; "
+                    "Sage wallet is still settling after recent cancels/fills "
+                    f"({final_count} -> {resync_count} coins during resync). "
+                    "Wait a minute, then rerun Coin Prep."
+                )
+                return False
         self.log(
             f"ERROR: {name} consolidation did not complete within {max_wait_seconds}s "
             f"({before_count} -> {final_count} coins)"
@@ -6936,6 +6981,56 @@ class CoinPrepWorker:
             # Don't fail - they might just need more time
             return True
 
+    def _verify_post_prep_tier_drift(self) -> bool:
+        """Return False when the final tier layout is unsafe to trade."""
+        try:
+            from coin_manager import check_tier_size_drift_standalone
+
+            post_drift = check_tier_size_drift_standalone() or []
+        except Exception as drift_err:
+            self.log(f"Post-prep drift check skipped: {drift_err}")
+            return True
+
+        if not post_drift:
+            self.log("Post-prep drift check: every tier matches its target size")
+            return True
+
+        summary = ", ".join(
+            f"{f.get('side', '?')}/{f.get('tier', '?')}={f.get('ratio', '?')}x "
+            f"(n={f.get('coin_count', '?')})"
+            for f in post_drift
+            if isinstance(f, dict)
+        )
+        if not summary:
+            summary = str(post_drift)
+
+        self.log(
+            f"POST-PREP DRIFT: {summary} - coin prep finished but "
+            f"some tier sizes still don't match. Bot will refuse "
+            f"to start with this state."
+        )
+        try:
+            from database import log_event as _le
+
+            _le(
+                "error",
+                "tier_size_post_prep_drift",
+                f"Coin prep finished with residual drift: {summary}",
+            )
+        except Exception:
+            pass
+
+        try:
+            self.update_status(
+                PrepPhase.ERROR,
+                0.99,
+                "Post-prep tier drift detected - manual re-prep required",
+                error=f"POST_PREP_TIER_DRIFT: {summary}",
+            )
+        except Exception:
+            pass
+        return False
+
     def run_full_preparation(self) -> bool:
         """
         Execute complete coin preparation flow with PARALLEL OPTIMIZATION
@@ -7806,6 +7901,24 @@ class CoinPrepWorker:
                     )
             except Exception as _drift_err:
                 self.log(f"⚠️ Post-prep drift check skipped: {_drift_err}")
+
+            if locals().get("_post_drift"):
+                try:
+                    _summary = ", ".join(
+                        f"{f.get('side', '?')}/{f.get('tier', '?')}={f.get('ratio', '?')}x "
+                        f"(n={f.get('coin_count', '?')})"
+                        for f in locals().get("_post_drift", [])
+                        if isinstance(f, dict)
+                    )
+                    self.update_status(
+                        PrepPhase.ERROR,
+                        0.99,
+                        "Post-prep tier drift detected - manual re-prep required",
+                        error=f"POST_PREP_TIER_DRIFT: {_summary}",
+                    )
+                except Exception:
+                    pass
+                return False
 
             self.log(f"\n{'=' * 60}")
             self.log("🎉 COIN PREPARATION COMPLETE!")

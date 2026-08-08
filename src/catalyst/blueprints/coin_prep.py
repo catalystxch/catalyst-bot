@@ -45,6 +45,735 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _inventory_summary_from_coin_summary(
+    coin_summary: dict, manager_summary: dict = None
+) -> dict:
+    """Merge DB coin counts into a cold CoinManager inventory summary."""
+    summary = dict(manager_summary or {})
+    coin_summary = coin_summary or {}
+
+    def _int_value(key: str) -> int:
+        try:
+            return int(coin_summary.get(key, 0) or 0)
+        except Exception:
+            return 0
+
+    def _empty(value) -> bool:
+        return value in (None, "", 0, "0", "0.0", "0.00", "0.0000")
+
+    cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+    xch_locked_mojos = _int_value("xch_locked_mojos")
+    cat_locked_mojos = _int_value("cat_locked_mojos")
+    cat_divisor = Decimal(10) ** cat_decimals
+    derived = {
+        "xch_locked_coins": _int_value("xch_locked_count"),
+        "xch_locked_amount": (
+            f"{Decimal(xch_locked_mojos) / Decimal('1000000000000'):.4f}"
+        ),
+        "xch_locked_amount_raw": xch_locked_mojos,
+        "cat_locked_coins": _int_value("cat_locked_count"),
+        "cat_locked_amount": f"{Decimal(cat_locked_mojos) / cat_divisor:.2f}",
+        "cat_locked_amount_raw": cat_locked_mojos,
+        "xch_total_coins": _int_value("xch_total"),
+        "cat_total_coins": _int_value("cat_total"),
+    }
+
+    applied = False
+    for key, value in derived.items():
+        if _empty(summary.get(key)) and not _empty(value):
+            summary[key] = value
+            applied = True
+        elif key not in summary:
+            summary[key] = value
+
+    if applied:
+        summary["db_summary_fallback_applied"] = True
+    return summary
+
+
+def _read_text_tail(path: str, max_bytes: int = 400_000) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    with open(path, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        if size > max_bytes:
+            fh.seek(-max_bytes, os.SEEK_END)
+        else:
+            fh.seek(0)
+        return fh.read().decode("utf-8", errors="replace")
+
+
+def _split_sage_path_list(raw: str) -> list[str]:
+    paths: list[str] = []
+    for chunk in str(raw or "").split(os.pathsep):
+        for part in chunk.split(","):
+            part = part.strip().strip('"').strip("'")
+            if part:
+                paths.append(part)
+    return paths
+
+
+def _dedupe_normalized_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        try:
+            expanded = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+            key = os.path.normcase(os.path.realpath(expanded))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(expanded)
+    return result
+
+
+def _candidate_sage_data_dirs_for_bundle(
+    extra_dirs: list[str] | None = None,
+) -> list[str]:
+    roots: list[str] = []
+    try:
+        from sage_node import _candidate_sage_data_dirs as _sage_data_dirs
+
+        roots.extend(_sage_data_dirs(extra_dirs))
+    except Exception:
+        if extra_dirs:
+            roots.extend(extra_dirs)
+        roots.extend(_split_sage_path_list(getattr(cfg, "SAGE_DATA_DIR", "")))
+        roots.extend(_split_sage_path_list(os.environ.get("SAGE_DATA_DIR", "")))
+        roots.extend(_split_sage_path_list(os.environ.get("SAGE_HOME", "")))
+
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA", "")
+            localappdata = os.environ.get("LOCALAPPDATA", "")
+            userprofile = os.environ.get("USERPROFILE", "")
+            if appdata:
+                roots.append(os.path.join(appdata, "com.rigidnetwork.sage"))
+            if localappdata:
+                roots.append(os.path.join(localappdata, "com.rigidnetwork.sage"))
+                roots.append(os.path.join(localappdata, "Sage"))
+                roots.append(os.path.join(localappdata, "sage"))
+            if userprofile:
+                roots.append(
+                    os.path.join(
+                        userprofile, "AppData", "Roaming", "com.rigidnetwork.sage"
+                    )
+                )
+        elif sys.platform == "darwin":
+            roots.append(
+                os.path.expanduser(
+                    "~/Library/Application Support/com.rigidnetwork.sage"
+                )
+            )
+            roots.append(os.path.expanduser("~/Library/Application Support/Sage"))
+        else:
+            xdg_config = os.environ.get("XDG_CONFIG_HOME", "").strip()
+            xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+            if xdg_config:
+                roots.append(os.path.join(xdg_config, "com.rigidnetwork.sage"))
+            if xdg_data:
+                roots.append(os.path.join(xdg_data, "com.rigidnetwork.sage"))
+            roots.append(os.path.expanduser("~/.config/com.rigidnetwork.sage"))
+            roots.append(os.path.expanduser("~/.local/share/com.rigidnetwork.sage"))
+
+    return _dedupe_normalized_paths(roots)
+
+
+def _candidate_sage_log_dirs(data_dir: str) -> list[str]:
+    if not data_dir:
+        return []
+    root = os.path.abspath(os.path.expanduser(os.path.expandvars(data_dir)))
+    if os.path.basename(os.path.normpath(root)).lower() == "ssl":
+        root = os.path.dirname(root)
+    return _dedupe_normalized_paths(
+        [
+            root,
+            os.path.join(root, "log"),
+            os.path.join(root, "logs"),
+        ]
+    )
+
+
+def _discover_sage_log_paths(
+    extra_data_dirs: list[str] | None = None,
+    max_files: int = 4,
+) -> list[str]:
+    candidates: list[str] = []
+    for data_dir in _candidate_sage_data_dirs_for_bundle(extra_data_dirs):
+        for log_dir in _candidate_sage_log_dirs(data_dir):
+            if not os.path.isdir(log_dir):
+                continue
+            for pattern in ("app.log*", "sage*.log*", "*.log"):
+                candidates.extend(glob.glob(os.path.join(log_dir, pattern)))
+
+    files: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            if not os.path.isfile(path):
+                continue
+            key = os.path.normcase(os.path.realpath(path))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(path)
+
+    files.sort(key=lambda path: (os.path.getmtime(path), path), reverse=True)
+    return files[: max(0, int(max_files or 0))]
+
+
+def _safe_bundle_filename(filename: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_" for ch in os.path.basename(filename)
+    )
+    return safe.strip("._") or "sage-log"
+
+
+def _collect_sage_log_tails(
+    max_files: int = 4,
+    max_bytes: int = 400_000,
+) -> tuple[dict[str, str], list[dict]]:
+    log_texts: dict[str, str] = {}
+    metadata: list[dict] = []
+
+    for idx, path in enumerate(_discover_sage_log_paths(max_files=max_files), start=1):
+        filename = os.path.basename(path)
+        bundle_path = f"logs/sage/{idx:02d}_{_safe_bundle_filename(filename)}_tail.log"
+        item = {
+            "filename": filename,
+            "bundle_path": bundle_path,
+            "tail_bytes": int(max_bytes),
+        }
+        try:
+            stat = os.stat(path)
+            item["size_bytes"] = int(stat.st_size)
+            item["modified_at"] = datetime.fromtimestamp(
+                stat.st_mtime, timezone.utc
+            ).isoformat()
+            text = _read_text_tail(path, max_bytes=max_bytes)
+        except Exception as exc:
+            item["error"] = str(exc)[:200]
+            metadata.append(item)
+            continue
+        if text:
+            log_texts[bundle_path] = text
+        metadata.append(item)
+
+    return log_texts, metadata
+
+
+def _safe_used_percent(used_bytes: int | None, total_bytes: int | None) -> float | None:
+    try:
+        total = int(total_bytes or 0)
+        used = int(used_bytes or 0)
+        if total <= 0:
+            return None
+        return round((used / total) * 100, 1)
+    except Exception:
+        return None
+
+
+def _existing_path_for_disk_usage(path: str) -> str:
+    candidate = os.path.abspath(path or os.getcwd())
+    while candidate and not os.path.exists(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate if candidate and os.path.exists(candidate) else os.getcwd()
+
+
+def _disk_root_for_path(path: str) -> str:
+    absolute = os.path.abspath(path or os.getcwd())
+    drive, _ = os.path.splitdrive(absolute)
+    if drive:
+        return drive + os.sep
+    return os.path.abspath(os.path.sep)
+
+
+def _disk_diagnostics(label: str, path: str) -> dict:
+    try:
+        import shutil
+
+        usage_path = _existing_path_for_disk_usage(path)
+        usage = shutil.disk_usage(usage_path)
+        return {
+            "label": label,
+            "root": _disk_root_for_path(usage_path),
+            "total_bytes": int(usage.total),
+            "used_bytes": int(usage.used),
+            "free_bytes": int(usage.free),
+            "used_percent": _safe_used_percent(usage.used, usage.total),
+        }
+    except Exception as exc:
+        return {"label": label, "error": str(exc)}
+
+
+def _collect_disk_diagnostics() -> list[dict]:
+    paths = [("app_root", getattr(api_server, "_APP_ROOT", _PACKAGE_DIR))]
+    try:
+        from user_paths import data_dir, log_dir
+
+        paths.append(("data_dir", data_dir()))
+        paths.append(("log_dir", log_dir()))
+    except Exception:
+        paths.append(("runtime_dir", _coin_prep_runtime_dir()))
+
+    return [_disk_diagnostics(label, path) for label, path in paths]
+
+
+def _windows_system_memory() -> dict | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return {
+            "source": "GlobalMemoryStatusEx",
+            "total_physical_bytes": int(status.ullTotalPhys),
+            "available_physical_bytes": int(status.ullAvailPhys),
+            "memory_load_percent": int(status.dwMemoryLoad),
+            "total_page_file_bytes": int(status.ullTotalPageFile),
+            "available_page_file_bytes": int(status.ullAvailPageFile),
+            "total_virtual_bytes": int(status.ullTotalVirtual),
+            "available_virtual_bytes": int(status.ullAvailVirtual),
+        }
+    except Exception:
+        return None
+
+
+def _proc_meminfo_memory() -> dict | None:
+    meminfo_path = "/proc/meminfo"
+    if not os.path.exists(meminfo_path):
+        return None
+    try:
+        values: dict[str, int] = {}
+        with open(meminfo_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if ":" not in line:
+                    continue
+                key, raw = line.split(":", 1)
+                parts = raw.strip().split()
+                if not parts:
+                    continue
+                try:
+                    values[key] = int(parts[0]) * 1024
+                except ValueError:
+                    continue
+
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        used = (
+            total - available if total is not None and available is not None else None
+        )
+        result = {
+            "source": "proc_meminfo",
+            "total_physical_bytes": total,
+            "available_physical_bytes": available,
+            "used_physical_bytes": used,
+            "memory_load_percent": _safe_used_percent(used, total),
+            "swap_total_bytes": values.get("SwapTotal"),
+            "swap_free_bytes": values.get("SwapFree"),
+        }
+        return {k: v for k, v in result.items() if v is not None}
+    except Exception:
+        return None
+
+
+def _sysconf_memory() -> dict | None:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total = page_size * total_pages
+        available = None
+        try:
+            available = page_size * int(os.sysconf("SC_AVPHYS_PAGES"))
+        except Exception:
+            pass
+        used = total - available if available is not None else None
+        result = {
+            "source": "sysconf",
+            "total_physical_bytes": total,
+            "available_physical_bytes": available,
+            "used_physical_bytes": used,
+            "memory_load_percent": _safe_used_percent(used, total),
+        }
+        return {k: v for k, v in result.items() if v is not None}
+    except Exception:
+        return None
+
+
+def _collect_system_memory() -> dict:
+    for collector in (_windows_system_memory, _proc_meminfo_memory, _sysconf_memory):
+        data = collector()
+        if data:
+            return data
+    return {"source": "unavailable"}
+
+
+def _collect_system_uptime_secs() -> int | None:
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+            return int(ctypes.windll.kernel32.GetTickCount64() // 1000)
+        if os.path.exists("/proc/uptime"):
+            with open("/proc/uptime", "r", encoding="utf-8") as fh:
+                return int(float(fh.read().split()[0]))
+    except Exception:
+        return None
+    return None
+
+
+def _windows_process_entries() -> list[dict]:
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * MAX_PATH),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        ]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        ]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if handle in (0, INVALID_HANDLE_VALUE):
+            return []
+
+        entries = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(handle, ctypes.byref(entry))
+            while ok:
+                entries.append(
+                    {
+                        "pid": int(entry.th32ProcessID),
+                        "parent_pid": int(entry.th32ParentProcessID),
+                        "name": str(entry.szExeFile or ""),
+                    }
+                )
+                ok = kernel32.Process32NextW(handle, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(handle)
+        return entries
+    except Exception:
+        return []
+
+
+def _windows_process_memory(pid: int) -> dict:
+    if os.name != "nt":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_VM_READ = 0x0010
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+        access_modes = (
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        )
+        handle = None
+        for access in access_modes:
+            handle = kernel32.OpenProcess(access, False, int(pid))
+            if handle:
+                break
+        if not handle:
+            return {}
+
+        try:
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+            if not psapi.GetProcessMemoryInfo(
+                handle,
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                return {}
+            return {
+                "working_set_bytes": int(counters.WorkingSetSize),
+                "peak_working_set_bytes": int(counters.PeakWorkingSetSize),
+                "private_bytes": int(counters.PrivateUsage),
+                "pagefile_usage_bytes": int(counters.PagefileUsage),
+            }
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return {}
+
+
+def _process_tree_ids(processes: list[dict], root_pid: int) -> set[int]:
+    children: dict[int, list[dict]] = {}
+    for proc in processes:
+        children.setdefault(int(proc.get("parent_pid") or 0), []).append(proc)
+
+    tree_ids: set[int] = set()
+
+    def add_tree(proc_id: int) -> None:
+        if proc_id in tree_ids:
+            return
+        tree_ids.add(proc_id)
+        for child in children.get(proc_id, []):
+            add_tree(int(child.get("pid") or 0))
+
+    add_tree(int(root_pid))
+    return tree_ids
+
+
+def _windows_process_tree_memory(root_pid: int) -> list[dict]:
+    entries = _windows_process_entries()
+    if not entries:
+        return []
+    tree_ids = _process_tree_ids(entries, root_pid)
+    rows = []
+    for entry in entries:
+        pid = int(entry.get("pid") or 0)
+        if pid not in tree_ids:
+            continue
+        row = {
+            "pid": pid,
+            "parent_pid": int(entry.get("parent_pid") or 0),
+            "name": entry.get("name") or "",
+        }
+        row.update(_windows_process_memory(pid))
+        rows.append(row)
+    return rows
+
+
+def _proc_status_bytes(pid: int, key: str) -> int | None:
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.startswith(key + ":"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _proc_process_entries() -> list[dict]:
+    proc_root = "/proc"
+    if not os.path.isdir(proc_root):
+        return []
+    rows = []
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(
+                os.path.join(proc_root, name, "stat"),
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as fh:
+                stat = fh.read()
+            right = stat.rfind(")")
+            left = stat.find("(")
+            proc_name = stat[left + 1 : right] if left >= 0 and right > left else name
+            rest = stat[right + 2 :].split()
+            parent_pid = int(rest[1]) if len(rest) > 1 else 0
+            rss = _proc_status_bytes(pid, "VmRSS")
+            vms = _proc_status_bytes(pid, "VmSize")
+            row = {
+                "pid": pid,
+                "parent_pid": parent_pid,
+                "name": proc_name,
+            }
+            if rss is not None:
+                row["working_set_bytes"] = rss
+                row["rss_bytes"] = rss
+            if vms is not None:
+                row["virtual_memory_bytes"] = vms
+            rows.append(row)
+        except Exception:
+            continue
+    return rows
+
+
+def _proc_process_tree_memory(root_pid: int) -> list[dict]:
+    entries = _proc_process_entries()
+    if not entries:
+        return []
+    tree_ids = _process_tree_ids(entries, root_pid)
+    return [row for row in entries if int(row.get("pid") or 0) in tree_ids]
+
+
+def _current_process_memory_fallback() -> dict:
+    try:
+        import resource
+
+        max_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform != "darwin":
+            max_rss *= 1024
+        return {
+            "source": "resource.getrusage",
+            "peak_rss_bytes": max_rss,
+        }
+    except Exception:
+        return {"source": "unavailable"}
+
+
+def _collect_app_process_diagnostics() -> dict:
+    pid = os.getpid()
+    parent_pid = os.getppid() if hasattr(os, "getppid") else None
+    if os.name == "nt":
+        processes = _windows_process_tree_memory(pid)
+        source = "windows_process_tree"
+    else:
+        processes = _proc_process_tree_memory(pid)
+        source = "proc_process_tree" if processes else "current_process"
+
+    if not processes:
+        current = _windows_process_memory(pid) if os.name == "nt" else {}
+        if not current:
+            current = _current_process_memory_fallback()
+        processes = [
+            {
+                "pid": pid,
+                "parent_pid": parent_pid,
+                "name": os.path.basename(sys.executable),
+                **current,
+            }
+        ]
+
+    working_total = sum(int(p.get("working_set_bytes") or 0) for p in processes)
+    private_values = [int(p.get("private_bytes") or 0) for p in processes]
+    private_total = sum(private_values) if any(private_values) else None
+    current_process = next((p for p in processes if int(p.get("pid") or 0) == pid), {})
+
+    return {
+        "source": source,
+        "pid": pid,
+        "parent_pid": parent_pid,
+        "process_name": os.path.basename(sys.executable),
+        "tree_process_count": len(processes),
+        "tree_working_set_bytes": working_total or None,
+        "tree_private_bytes": private_total,
+        "current_process": current_process,
+        "processes": sorted(
+            processes,
+            key=lambda item: int(item.get("working_set_bytes") or 0),
+            reverse=True,
+        ),
+    }
+
+
+def _collect_pc_diagnostics() -> dict:
+    """Collect privacy-conscious PC health details for support bundles."""
+    import platform as _platform
+
+    system = {
+        "platform": _platform.platform(),
+        "system": _platform.system(),
+        "release": _platform.release(),
+        "version": _platform.version(),
+        "machine": _platform.machine(),
+        "processor": _platform.processor(),
+        "architecture": _platform.architecture()[0],
+        "cpu_count_logical": os.cpu_count(),
+        "uptime_secs": _collect_system_uptime_secs(),
+    }
+    try:
+        system["load_average"] = list(os.getloadavg())
+    except Exception:
+        pass
+
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "system": system,
+        "memory": _collect_system_memory(),
+        "disk": _collect_disk_diagnostics(),
+        "app_process": _collect_app_process_diagnostics(),
+    }
+
+
 def _coin_prep_runtime_dir() -> str:
     try:
         from user_paths import data_dir
@@ -2440,17 +3169,6 @@ def api_logs_download():
                 redacted.append(_redact_obj(item))
             return redacted
 
-        def _read_text_tail(path: str, max_bytes: int = 400_000) -> str:
-            if not path or not os.path.exists(path):
-                return ""
-            with open(path, "rb") as fh:
-                size = fh.seek(0, os.SEEK_END)
-                if size > max_bytes:
-                    fh.seek(-max_bytes, os.SEEK_END)
-                else:
-                    fh.seek(0)
-                return fh.read().decode("utf-8", errors="replace")
-
         def _json_safe(value):
             if isinstance(value, dict):
                 return api_server._serialize_dict(value)
@@ -2507,8 +3225,14 @@ def api_logs_download():
         except Exception as e:
             snapshots["system_info"] = {"error": str(e)}
 
-        # Config snapshot — cfg.to_dict() already excludes secrets
-        # (SPACESCAN_API_KEY, SAGE_FINGERPRINT, RPC TLS paths, etc.).
+        # PC diagnostics - whole-machine pressure plus the CATalyst
+        # process tree.
+        try:
+            snapshots["pc_diagnostics"] = _collect_pc_diagnostics()
+        except Exception as e:
+            snapshots["pc_diagnostics"] = {"error": str(e)}
+
+        # Config snapshot - cfg.to_dict() already excludes secrets.
         try:
             snapshots["config"] = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
         except Exception as e:
@@ -2555,10 +3279,17 @@ def api_logs_download():
             if bot is not None and getattr(bot, "coin_manager", None):
                 try:
                     _coin_inv["inventory_summary"] = (
-                        bot.coin_manager.get_inventory_summary() or {}
+                        _inventory_summary_from_coin_summary(
+                            _coin_summary,
+                            bot.coin_manager.get_inventory_summary() or {},
+                        )
                     )
                 except Exception as _ce:
                     _coin_inv["inventory_summary_error"] = str(_ce)
+            else:
+                _coin_inv["inventory_summary"] = _inventory_summary_from_coin_summary(
+                    _coin_summary
+                )
             snapshots["coin_inventory"] = api_server._serialize_dict(_coin_inv)
         except Exception as e:
             snapshots["coin_inventory"] = {"error": str(e)}
@@ -2698,6 +3429,18 @@ def api_logs_download():
             )
             manifest["latest_run_log"] = os.path.basename(latest_run_log)
 
+        try:
+            sage_log_texts, sage_log_meta = _collect_sage_log_tails()
+            log_texts.update(sage_log_texts)
+            snapshots["sage_logs"] = {
+                "included_count": len(sage_log_texts),
+                "files": sage_log_meta,
+            }
+            manifest["sage_log_count"] = len(sage_log_texts)
+        except Exception as e:
+            snapshots["sage_logs"] = {"included_count": 0, "error": str(e)}
+            manifest["sage_log_count"] = 0
+
         bundle_name = (
             "bot_debug_bundle_"
             + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -2722,6 +3465,7 @@ def api_logs_download():
                 "    config_history.json   recent settings changes (secrets stripped)",
                 "    bot_settings.json     persistent app state/settings",
                 "    system_info.json      Python / OS / platform",
+                "    pc_diagnostics.json   PC memory, disk, CPU, app process tree",
                 "    api_calls.json        external API call counters",
                 "    coin_inventory.json   tier-group counts + topup-pool totals",
                 "    open_offers.json      live open offers (with trade_ids)",
@@ -2733,12 +3477,14 @@ def api_logs_download():
                 "    market_toxicity.json  adverse-selection guard snapshot",
                 "    runtime_monitor.json  runtime monitor state",
                 "    splash.json           splash broadcast/node/receive",
+                "    sage_logs.json        native Sage wallet log index",
                 "    superlog_stats.json   superlog rotation stats",
                 "    superlog_archive.json recent superlog file list",
                 "    event_type_counts.json frequency of each event_type",
                 "  logs/",
                 "    current_superlog_tail.log    last ~400KB of running superlog",
                 "    latest_run_superlog_tail.log last ~400KB of most-recent run",
+                "    sage/*_tail.log             native Sage wallet log tails",
                 "",
                 "Privacy",
                 "-------",
@@ -2750,6 +3496,10 @@ def api_logs_download():
                 "  passwords, seed phrases, and private keys are redacted",
                 "  recursively.",
                 "* User-home path prefixes are redacted from log text.",
+                "* PC diagnostics include drive roots and CATalyst child",
+                "  process names, not full command lines or user paths.",
+                "* Native Sage wallet log tails are included only as text tails",
+                "  and pass through the same address/fingerprint/path redaction.",
                 "* Configuration excludes SPACESCAN_API_KEY, RPC TLS paths, and",
                 "  wallet fingerprints (filtered by cfg.to_dict()).",
                 "* The DB file, .env, user_secrets.json, and TLS keys are NOT",

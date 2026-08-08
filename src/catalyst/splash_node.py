@@ -585,8 +585,45 @@ class SplashNode:
                         _since_start < 30
                         and "insufficientpeers" in lower.replace(" ", "")
                     )
+                    _is_hook_failure = (
+                        "offer hook" in lower
+                        or "/api/splash/incoming" in lower
+                        or "127.0.0.1:5000/api/splash/incoming" in lower
+                    ) and (
+                        "error" in lower
+                        or "failed" in lower
+                        or "http 429" in lower
+                        or "429" in lower
+                        or "too many requests" in lower
+                    )
+                    _is_hook_refused = _is_hook_failure and (
+                        "connection refused" in lower
+                        or "actively refused" in lower
+                        or "os error 10061" in lower
+                    )
                     if "duplicate" in lower:
                         log_event("debug", "splash_node_output", f"Splash: {line}")
+                    elif _is_hook_failure:
+                        now = time.time()
+                        last_logged = float(
+                            getattr(self, "_last_hook_refused_log_time", 0.0) or 0.0
+                        )
+                        if now - last_logged >= 60.0:
+                            self._last_hook_refused_log_time = now
+                            severity = "debug" if _since_start < 30 else "warning"
+                            if _since_start < 30:
+                                prefix = "Splash webhook waiting for Flask"
+                            elif "429" in lower or "too many requests" in lower:
+                                prefix = "Splash webhook backpressure active"
+                            elif _is_hook_refused:
+                                prefix = "Splash webhook unreachable"
+                            else:
+                                prefix = "Splash webhook post failed"
+                            log_event(
+                                severity,
+                                "splash_node_output",
+                                f"{prefix}; suppressing repeated hook errors for 60s",
+                            )
                     elif _is_startup_burst:
                         log_event(
                             "debug", "splash_node_output", f"Splash (startup): {line}"

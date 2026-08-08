@@ -546,6 +546,7 @@ def api_cat_select():
         api_server._active_cat["ticker_id"] = ticker_id
         if wallet_id is not None:
             api_server._active_cat["wallet_id"] = int(wallet_id)
+    api_server.clear_balance_snapshot()
 
     # Persist to .env so it survives restarts.
     # CAT_WALLET_ID is intentionally NOT saved — it's resolved dynamically.
@@ -673,13 +674,17 @@ def api_balances_refresh():
                 ) / (10**cat_dec)
         except Exception:
             pass
+        balances = api_server.cache_balance_snapshot(
+            {
+                "xch": xch_bal,
+                "cat": cat_bal,
+            },
+            source="balances_refresh",
+        )
         return jsonify(
             {
                 "success": True,
-                "balances": {
-                    "xch": xch_bal,
-                    "cat": cat_bal,
-                },
+                "balances": balances,
             }
         )
     except Exception:

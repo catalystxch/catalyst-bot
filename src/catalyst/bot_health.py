@@ -64,6 +64,8 @@ class HealthCheck:
     anomaly_count: int = 0
     repaired_count: int = 0
     repair_log: List[str] = field(default_factory=list)
+    reason_codes: List[str] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -128,6 +130,8 @@ class HealthReport:
                     "anomaly_count": c.anomaly_count,
                     "repaired_count": c.repaired_count,
                     "repair_log": list(c.repair_log),
+                    "reason_codes": list(c.reason_codes),
+                    "details": dict(c.details),
                 }
                 for c in self.checks
             ],
@@ -1086,6 +1090,7 @@ def _cat_tier_reserve_shortage() -> Optional[dict]:
             "reserve_count": len(reserve_coins),
             "fundable_splits": reserve_mojos // size_mojos,
             "shortfall_mojos": required_mojos - reserve_mojos,
+            "reason_codes": ["TIER_SPARES_DEPLETED", "NEEDS_MANUAL_REPREP"],
         }
 
     return None
@@ -1114,6 +1119,8 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
     findings = []
     alerts_raised = []
     alerts_cleared = []
+    reason_codes = []
+    details = {}
 
     # Resolve the live event bus lazily; avoids a circular import at
     # module load, and degrades gracefully when running under tests
@@ -1216,6 +1223,7 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
                     f"(spendable={spendable_mojos / 1e12:.4f}, "
                     f"floor={min_operating_mojos / 1e12:.4f})"
                 )
+                reason_codes.append("XCH_OPERATING_FLOOR_LOW")
             else:
                 _clear_alert("funds_advisory_xch")
     except Exception as e:
@@ -1261,6 +1269,8 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
                 ]
                 if address:
                     msg_lines.append(f"Address: {address}")
+                reason_codes.extend(tier_shortage.get("reason_codes") or [])
+                details["cat_tier_shortage"] = dict(tier_shortage)
                 _emit_alert(
                     alert_id="funds_advisory_cat",
                     title=f"{ticker} topup pool underfunded",
@@ -1343,6 +1353,7 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
                         f"{ticker} shortfall {shortfall_cat:,.4f} "
                         f"(spendable={spendable_mojos / float(scale):,.4f})"
                     )
+                    reason_codes.append("CAT_OPERATING_FLOOR_LOW")
                 elif not cat_alert_active:
                     _clear_alert("funds_advisory_cat")
     except Exception as e:
@@ -1366,6 +1377,8 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
         anomaly_count=len(findings),
         repaired_count=0,  # repair is out-of-band (user action)
         repair_log=[f"raised:{a}" for a in alerts_raised],
+        reason_codes=list(dict.fromkeys(reason_codes)),
+        details=details,
     )
 
 

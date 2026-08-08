@@ -63,6 +63,9 @@ class _TempDB(unittest.TestCase):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
+        api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
+        api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def tearDown(self):
         if hasattr(_db._local, "conn") and _db._local.conn:
@@ -78,6 +81,9 @@ class _TempDB(unittest.TestCase):
         except Exception:
             pass
         api_server._rate_limit_log.clear()
+        api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
+        api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def _post_offer(self, offer=_VALID_OFFER, enabled=True):
         with (

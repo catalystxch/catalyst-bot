@@ -187,9 +187,25 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
 }
 
 # Dedicated limiter for /api/splash/incoming so an unbounded webhook flood
-# cannot amplify into runaway DB writes. 200/sec per process is still
-# generous for a local webhook but prevents a pathological flood.
-_SPLASH_RATE_LIMIT = {"window_s": 1.0, "max": 200, "hits": [], "lock": threading.Lock()}
+# cannot amplify into runaway DB writes. The defaults are intentionally close
+# to the background classifier's drain rate; Splash gossip can burst hard on
+# startup and the bot only needs a bounded sample for current-run visibility.
+_SPLASH_RATE_LIMIT = {"window_s": 1.0, "hits": [], "lock": threading.Lock()}
+_SPLASH_BACKLOG_CACHE = {
+    "checked_at": 0.0,
+    "new_count": 0,
+    "ttl_s": 1.0,
+    "lock": threading.Lock(),
+}
+_SPLASH_INCOMING_WRITE_LOCK = threading.Lock()
+
+
+def _splash_incoming_max_per_sec() -> int:
+    return max(1, int(getattr(cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 3) or 3))
+
+
+def _splash_incoming_max_backlog() -> int:
+    return max(0, int(getattr(cfg, "SPLASH_RECEIVE_MAX_BACKLOG", 250) or 250))
 
 
 def _splash_incoming_rate_limited() -> bool:
@@ -202,10 +218,47 @@ def _splash_incoming_rate_limited() -> bool:
         # Drop expired entries
         while hits and hits[0] < cutoff:
             hits.pop(0)
-        if len(hits) >= _SPLASH_RATE_LIMIT["max"]:
+        if len(hits) >= _splash_incoming_max_per_sec():
             return True
         hits.append(now)
         return False
+
+
+def _splash_incoming_backlog_full() -> bool:
+    max_backlog = _splash_incoming_max_backlog()
+    if max_backlog <= 0:
+        return False
+
+    now = time.time()
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        age = now - float(_SPLASH_BACKLOG_CACHE.get("checked_at", 0.0) or 0.0)
+        if age <= float(_SPLASH_BACKLOG_CACHE.get("ttl_s", 1.0) or 1.0):
+            return int(_SPLASH_BACKLOG_CACHE.get("new_count", 0) or 0) >= max_backlog
+
+    try:
+        from database import get_splash_incoming_stats
+
+        stats = get_splash_incoming_stats()
+        new_count = int(stats.get("new", 0) or 0)
+    except Exception:
+        return False
+
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        _SPLASH_BACKLOG_CACHE["checked_at"] = now
+        _SPLASH_BACKLOG_CACHE["new_count"] = new_count
+    return new_count >= max_backlog
+
+
+def _splash_incoming_note_recorded(was_new: bool) -> None:
+    if not was_new:
+        return
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        checked_at = float(_SPLASH_BACKLOG_CACHE.get("checked_at", 0.0) or 0.0)
+        if checked_at <= 0:
+            return
+        _SPLASH_BACKLOG_CACHE["new_count"] = (
+            int(_SPLASH_BACKLOG_CACHE.get("new_count", 0) or 0) + 1
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +979,25 @@ def _history_age_label(timestamp_value: str) -> str:
 # _build_fill_history_for_gui moved to blueprint
 
 
+def _live_wallet_reads_allowed(bot_obj=None) -> bool:
+    """True only when both public bot state and thread state are running."""
+    if bot_obj is None:
+        return False
+    state_running = False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
+    try:
+        method_running = (
+            bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
+        )
+    except Exception:
+        method_running = False
+    return bool(state_running and method_running)
+
+
 def _get_live_local_offer_edges(asset_id: str) -> dict:
     """Get our current best live bid/ask from wallet-open offers.
 
@@ -944,7 +1016,7 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
         return result
 
     trade_ids = None
-    if bot and getattr(bot, "offer_manager", None):
+    if _live_wallet_reads_allowed(bot) and getattr(bot, "offer_manager", None):
         try:
             wallet_open_buys, wallet_open_sells, _ = (
                 bot.offer_manager.sync_from_wallet()
@@ -1012,6 +1084,151 @@ _active_cat = {
 # Lock for multi-key mutations of _active_cat so readers never see a
 # half-updated pair (e.g. asset_id from the new CAT but decimals from the old).
 _active_cat_lock = threading.Lock()
+_balance_snapshot_lock = threading.Lock()
+_latest_balance_snapshot: Optional[dict] = None
+
+
+def _normalize_snapshot_asset_id(asset_id) -> str:
+    return str(asset_id or "").strip().lower().replace("0x", "")
+
+
+def _balance_snapshot_context() -> dict:
+    with _active_cat_lock:
+        asset_id = _active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        wallet_id = _active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", "")
+    return {
+        "asset_id": _normalize_snapshot_asset_id(asset_id),
+        "wallet_id": str(wallet_id or ""),
+        "fingerprint": str(
+            getattr(cfg, "SAGE_FINGERPRINT", "")
+            or os.environ.get("SAGE_FINGERPRINT", "")
+            or ""
+        ),
+    }
+
+
+def _coerce_balance_pair(balances) -> dict:
+    balances = balances or {}
+    coerced = {}
+    for side in ("xch", "cat"):
+        src = balances.get(side) if isinstance(balances, dict) else {}
+        if not isinstance(src, dict):
+            src = {}
+        coerced[side] = {
+            "total": _safe_float(src.get("total", 0)),
+            "spendable": _safe_float(src.get("spendable", 0)),
+        }
+    return coerced
+
+
+def _copy_balance_pair(balances) -> dict:
+    balances = balances or {}
+    return {
+        "xch": dict((balances.get("xch") if isinstance(balances, dict) else {}) or {}),
+        "cat": dict((balances.get("cat") if isinstance(balances, dict) else {}) or {}),
+    }
+
+
+def _balance_side_zero(balance: dict) -> bool:
+    return (
+        _safe_float((balance or {}).get("total", 0)) <= 0
+        and _safe_float((balance or {}).get("spendable", 0)) <= 0
+    )
+
+
+def _balance_side_nonzero(balance: dict) -> bool:
+    return (
+        _safe_float((balance or {}).get("total", 0)) > 0
+        or _safe_float((balance or {}).get("spendable", 0)) > 0
+    )
+
+
+def _snapshot_context_matches(snapshot: dict, context: dict) -> bool:
+    snap_context = (snapshot or {}).get("context") or {}
+    return all(
+        str(snap_context.get(key, "")) == str(context.get(key, ""))
+        for key in ("asset_id", "wallet_id", "fingerprint")
+    )
+
+
+def cache_balance_snapshot(balances, source: str = "") -> dict:
+    """Remember the latest wallet-verified balances for the active pair.
+
+    Sage can briefly return an empty CAT coin list while its DB is locked or
+    still syncing. If we already have a non-zero balance for this exact wallet
+    context, keep that value instead of poisoning the UI and Smart Settings.
+    """
+
+    global _latest_balance_snapshot  # noqa: PLW0603
+
+    context = _balance_snapshot_context()
+    incoming = _coerce_balance_pair(balances)
+    suspicious_zero_sides = []
+    with _balance_snapshot_lock:
+        merged = _copy_balance_pair(incoming)
+        previous = _latest_balance_snapshot
+        if previous and _snapshot_context_matches(previous, context):
+            previous_balances = _coerce_balance_pair(previous.get("balances") or {})
+            for side in ("xch", "cat"):
+                if _balance_side_zero(merged[side]) and _balance_side_nonzero(
+                    previous_balances[side]
+                ):
+                    merged[side] = dict(previous_balances[side])
+                    suspicious_zero_sides.append(side)
+        _latest_balance_snapshot = {
+            "context": dict(context),
+            "balances": _copy_balance_pair(merged),
+            "source": str(source or ""),
+            "updated_at": time.time(),
+            "suspicious_zero_sides": suspicious_zero_sides,
+        }
+        result = _copy_balance_pair(_latest_balance_snapshot["balances"])
+
+    if suspicious_zero_sides:
+        try:
+            slog(
+                "BALANCE",
+                "Ignored transient zero balance read for "
+                + ", ".join(suspicious_zero_sides),
+                {
+                    "source": source,
+                    "asset_id": context.get("asset_id"),
+                    "wallet_id": context.get("wallet_id"),
+                },
+                level="warning",
+            )
+        except Exception:
+            pass
+    return result
+
+
+def get_cached_balance_snapshot() -> Optional[dict]:
+    context = _balance_snapshot_context()
+    with _balance_snapshot_lock:
+        snapshot = _latest_balance_snapshot
+        if not snapshot or not _snapshot_context_matches(snapshot, context):
+            return None
+        return _copy_balance_pair(snapshot.get("balances") or {})
+
+
+def merge_cached_balance_snapshot(balances) -> Optional[dict]:
+    cached = get_cached_balance_snapshot()
+    if not cached:
+        return None
+    merged = _coerce_balance_pair(balances)
+    cached = _coerce_balance_pair(cached)
+    for side in ("xch", "cat"):
+        if _balance_side_zero(merged[side]) and _balance_side_nonzero(cached[side]):
+            merged[side] = dict(cached[side])
+    return merged
+
+
+def clear_balance_snapshot() -> None:
+    global _latest_balance_snapshot  # noqa: PLW0603
+    with _balance_snapshot_lock:
+        _latest_balance_snapshot = None
+
+
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
 if _active_cat["ticker_id"] and "_" not in _active_cat["ticker_id"]:
     _active_cat["ticker_id"] = f"{_active_cat['ticker_id']}_XCH"
@@ -2259,11 +2476,38 @@ def _get_health_snapshot() -> dict:
             "wallet_sync_state": wallet.get("sync_state", "unknown"),
             "node_reachable": node.get("reachable", False),
             "node_synced": node.get("synced", False),
-            "consecutive_failures": 0,
+            "consecutive_failures": _health_consecutive_failures(h),
             "last_check": time.time(),
         }
     except Exception:
-        return {"status": "unknown", "consecutive_failures": 0}
+        return {"status": "unknown", "consecutive_failures": 1}
+
+
+def _health_consecutive_failures(raw_health: dict) -> int:
+    """Best-effort failure count for one-shot health snapshots.
+
+    BotLoop tracks a real consecutive counter while running. Idle endpoints only
+    have the current live check, so report at least one failure when that check
+    is unhealthy instead of showing "rpc_failed" with zero failures.
+    """
+    raw_health = raw_health or {}
+    for source in (
+        raw_health,
+        raw_health.get("wallet") or {},
+        raw_health.get("node") or {},
+    ):
+        if "consecutive_failures" not in source:
+            continue
+        try:
+            return max(0, int(source.get("consecutive_failures") or 0))
+        except Exception:
+            continue
+
+    status = str(raw_health.get("status") or "unknown").strip().lower()
+    healthy = bool(raw_health.get("healthy", False))
+    if healthy or status in ("healthy", "ok", "not_started"):
+        return 0
+    return 1
 
 
 # api_status moved to blueprint

@@ -55,9 +55,15 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
+        api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
+        api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
+        api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def _get(self, path):
         return self.client.get(path, environ_base=_LOOPBACK)
@@ -274,6 +280,23 @@ class TestSplashIncoming(_FlaskBase):
         ):
             resp = self._post_incoming({"offer": "offer1valid"})
         self.assertEqual(resp.status_code, 429)
+
+    def test_backlog_full_returns_429_without_db_write(self):
+        """A full incoming backlog must reject before attempting another DB write."""
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch.object(
+                api_server.cfg, "SPLASH_RECEIVE_MAX_BACKLOG", 250, create=True
+            ),
+            patch("api_server._splash_incoming_rate_limited", return_value=False),
+            patch("database.get_splash_incoming_stats", return_value={"new": 250}),
+            patch("database.record_splash_incoming", return_value=True) as record_mock,
+        ):
+            resp = self._post_incoming({"offer": "offer1valid"})
+
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.get_json().get("error"), "backlog_full")
+        record_mock.assert_not_called()
 
     def test_invalid_body_returns_400(self):
         with (

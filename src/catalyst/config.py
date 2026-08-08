@@ -932,6 +932,8 @@ class Config:
         self.SPLASH_RECEIVE_ENABLED = _bool("SPLASH_RECEIVE_ENABLED", True)
         self.SPLASH_RECEIVE_POLL_SECS = _int("SPLASH_RECEIVE_POLL_SECS", 5)
         self.SPLASH_RECEIVE_BATCH_SIZE = _int("SPLASH_RECEIVE_BATCH_SIZE", 10)
+        self.SPLASH_RECEIVE_MAX_PER_SEC = _int("SPLASH_RECEIVE_MAX_PER_SEC", 3)
+        self.SPLASH_RECEIVE_MAX_BACKLOG = _int("SPLASH_RECEIVE_MAX_BACKLOG", 250)
         self.SPLASH_BINARY_PATH = _str("SPLASH_BINARY_PATH", "")
         self.SPLASH_P2P_PORT = _int("SPLASH_P2P_PORT", 11511)
         self.SPLASH_AUTO_START = _bool("SPLASH_AUTO_START", True)
@@ -996,6 +998,9 @@ class Config:
             "RUNTIME_MONITOR_TOPUP_WARN_SECS", 900
         )
         self.RUNTIME_MONITOR_STALE_POLLS = _int("RUNTIME_MONITOR_STALE_POLLS", 2)
+        self.RUNTIME_MONITOR_CYCLE_STALL_SECS = _int(
+            "RUNTIME_MONITOR_CYCLE_STALL_SECS", 0
+        )
         # Stale wallet data guard: block new offer creation after this many
         # consecutive stale sync cycles. Default 3 (~15s at 5s/loop).
         self.WALLET_STALE_CREATE_LIMIT = _int("WALLET_STALE_CREATE_LIMIT", 3)
@@ -1218,6 +1223,8 @@ class Config:
         "SPLASH_RECEIVE_ENABLED",
         "SPLASH_RECEIVE_POLL_SECS",
         "SPLASH_RECEIVE_BATCH_SIZE",
+        "SPLASH_RECEIVE_MAX_PER_SEC",
+        "SPLASH_RECEIVE_MAX_BACKLOG",
         "SPLASH_P2P_PORT",
         "SPLASH_AUTO_START",
         "SPLASH_TESTNET",
@@ -1245,6 +1252,7 @@ class Config:
         "RUNTIME_MONITOR_DEXIE_GRACE_SECS",
         "RUNTIME_MONITOR_TOPUP_WARN_SECS",
         "RUNTIME_MONITOR_STALE_POLLS",
+        "RUNTIME_MONITOR_CYCLE_STALL_SECS",
         "WALLET_STALE_CREATE_LIMIT",
         # CAT identity (safe — does not control wallet access)
         "CAT_ASSET_ID",

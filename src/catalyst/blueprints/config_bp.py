@@ -1038,6 +1038,29 @@ def api_check_resume():
             }
         )
     try:
+        import chia_node
+
+        if not chia_node.is_startup_authorised():
+            return jsonify(
+                {
+                    "can_resume": False,
+                    "has_session": False,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "reason": "wallet_not_started",
+                }
+            )
+    except Exception:
+        return jsonify(
+            {
+                "can_resume": False,
+                "has_session": False,
+                "buy_count": 0,
+                "sell_count": 0,
+                "reason": "wallet_startup_unknown",
+            }
+        )
+    try:
         from wallet import get_all_offers, classify_offers_from_list
 
         active_cat = server._active_cat
