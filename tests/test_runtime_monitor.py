@@ -702,9 +702,9 @@ class RuntimeMonitorTests(unittest.TestCase):
 
     def test_flags_stalled_cycle_step_when_step_does_not_advance(self):
         bot = _FakeBot()
-        bot._start_time = time.time() - 600
+        bot._start_time = time.time() - 3600
         bot._current_cycle_step = "step3_wallet_sync"
-        bot._cycle_step_started_at = time.monotonic() - 360
+        bot._cycle_step_started_at = time.monotonic() - 9999
         monitor = RuntimeMonitor(bot)
         monitor.reset_session()
 
@@ -715,14 +715,14 @@ class RuntimeMonitorTests(unittest.TestCase):
             ),
             patch("runtime_monitor.log_event") as log_event_mock,
             patch.object(monitor, "_resolve_superlog_path", return_value=""),
-            patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 0),
+            patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 180),
             patch("runtime_monitor.cfg.LOOP_SECONDS", 90),
         ):
             monitor._run_once()
 
         state = monitor.get_state()
         active_codes = {item["code"] for item in state["active_conditions"]}
-        self.assertIn("cycle_step_stalled", active_codes)
+        self.assertIn("cycle_step_stalled", active_codes, state)
         self.assertEqual(state["status"], "critical")
         self.assertTrue(
             any(
