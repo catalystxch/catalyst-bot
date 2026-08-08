@@ -57,24 +57,30 @@ def test_one_sided_mode_not_toxic_without_bad_flow():
 
 def test_fast_same_side_fills_raise_side_score():
     guard = MarketToxicityGuard()
-    snap = guard.update(ctx(recent_fills=[
-        {"side": "sell", "age_secs": 12, "size_xch": "0.02"},
-        {"side": "sell", "age_secs": 18, "size_xch": "0.03"},
-    ]))
+    snap = guard.update(
+        ctx(
+            recent_fills=[
+                {"side": "sell", "age_secs": 12, "size_xch": "0.02"},
+                {"side": "sell", "age_secs": 18, "size_xch": "0.03"},
+            ]
+        )
+    )
     assert snap.sell_score >= 55
     assert "fast_fills" in {r["key"] for r in snap.reasons}
 
 
 def test_small_balance_exposure_can_throttle():
     guard = MarketToxicityGuard()
-    snap = guard.update(ctx(
-        open_offers=[
-            {"side": "buy", "size_xch": "0.35"},
-            {"side": "buy", "size_xch": "0.30"},
-        ],
-        inventory_state={"xch_spendable": "1.0", "cat_spendable_xch": "0.2"},
-        recent_fills=[{"side": "buy", "age_secs": 15, "size_xch": "0.05"}],
-    ))
+    snap = guard.update(
+        ctx(
+            open_offers=[
+                {"side": "buy", "size_xch": "0.35"},
+                {"side": "buy", "size_xch": "0.30"},
+            ],
+            inventory_state={"xch_spendable": "1.0", "cat_spendable_xch": "0.2"},
+            recent_fills=[{"side": "buy", "age_secs": 15, "size_xch": "0.05"}],
+        )
+    )
     assert snap.buy_score >= 75
     assert "buy" in snap.throttled_sides
 ```
@@ -138,15 +144,30 @@ from risk_manager import RiskManager
 def test_toxicity_multiplier_widens_before_clamp(monkeypatch):
     rm = RiskManager()
     monkeypatch.setattr("risk_manager.cfg.DYNAMIC_SPREAD_ENABLED", True, raising=False)
-    monkeypatch.setattr("risk_manager.cfg.BASE_SPREAD_BPS", Decimal("800"), raising=False)
-    monkeypatch.setattr("risk_manager.cfg.MIN_SPREAD_BPS", Decimal("300"), raising=False)
-    monkeypatch.setattr("risk_manager.cfg.MAX_SPREAD_BPS", Decimal("3000"), raising=False)
+    monkeypatch.setattr(
+        "risk_manager.cfg.BASE_SPREAD_BPS", Decimal("800"), raising=False
+    )
+    monkeypatch.setattr(
+        "risk_manager.cfg.MIN_SPREAD_BPS", Decimal("300"), raising=False
+    )
+    monkeypatch.setattr(
+        "risk_manager.cfg.MAX_SPREAD_BPS", Decimal("3000"), raising=False
+    )
     monkeypatch.setattr("risk_manager.cfg.MIN_EDGE_BPS", Decimal("200"), raising=False)
-    rm.set_market_toxicity(ToxicitySnapshot(score=82, buy_score=82, sell_score=12, level="high",
-                                            buy_spread_multiplier=Decimal("1.75"),
-                                            sell_spread_multiplier=Decimal("1.20"),
-                                            throttled_sides=["buy"], throttle_until={"buy": 1300.0},
-                                            reasons=[], suggested_action="Throttle buy"))
+    rm.set_market_toxicity(
+        ToxicitySnapshot(
+            score=82,
+            buy_score=82,
+            sell_score=12,
+            level="high",
+            buy_spread_multiplier=Decimal("1.75"),
+            sell_spread_multiplier=Decimal("1.20"),
+            throttled_sides=["buy"],
+            throttle_until={"buy": 1300.0},
+            reasons=[],
+            suggested_action="Throttle buy",
+        )
+    )
     assert rm.get_adjusted_spread("buy") == Decimal("0.14")
     assert rm.should_enable_side("buy", Decimal("0.01")) is False
     assert rm.should_enable_side("sell", Decimal("0.01")) is True
