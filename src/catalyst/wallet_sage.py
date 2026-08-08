@@ -397,6 +397,11 @@ def ensure_initialized(force_retry: bool = False) -> bool:
             return False
 
 
+def is_initialized() -> bool:
+    """Return True once Sage RPC initialization has succeeded in this process."""
+    return bool(_init_ok)
+
+
 # Thread-local connection cache — reuses TLS connections within a thread.
 # Eliminates ~100-200ms TLS handshake overhead per RPC call.
 _conn_local = _thr.local()

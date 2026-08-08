@@ -41,6 +41,33 @@ def _live_wallet_reads_allowed(bot_obj=None) -> bool:
     return bool(state_running and method_running)
 
 
+def _dashboard_wallet_reads_allowed(bot_obj=None) -> bool:
+    """Allow one-shot dashboard wallet reads after wallet startup begins.
+
+    /api/status polls frequently and should only touch wallet RPC during an
+    active bot run. /api/dashboard is a page-load aggregator: once the user has
+    authorised wallet startup, it can do a fresh read and seed the balance cache
+    that status polling reuses.
+    """
+    if _live_wallet_reads_allowed(bot_obj):
+        return True
+    try:
+        from wallet import get_wallet_type, is_initialized as wallet_is_initialized
+
+        if get_wallet_type() == "sage" and wallet_is_initialized():
+            return True
+    except Exception:
+        # During early test/bootstrap imports the wallet dispatcher may not be
+        # available yet; fall through to the startup-authorised gate below.
+        pass
+    try:
+        import chia_node
+
+        return bool(chia_node.is_startup_authorised())
+    except Exception:
+        return False
+
+
 def _get_cfg_int(cfg, name: str, fallback: str | None = None) -> int:
     value = getattr(cfg, name, None)
     if value is None and fallback:
@@ -503,9 +530,13 @@ def api_dashboard():
             "cat_total": 0,
         }
 
-        # Fetch wallet balances directly from RPC only during an active run.
+        # Fetch wallet balances directly from RPC on dashboard page load once
+        # wallet startup has been authorised. Successful reads seed the balance
+        # cache so the high-frequency /api/status poll can stay read-only.
+        live_xch_balance_read = False
+        live_cat_balance_read = False
         try:
-            if not _live_wallet_reads_allowed(bot):
+            if not _dashboard_wallet_reads_allowed(bot):
                 raise StopIteration
             from wallet import get_wallet_balance, WALLET_ID_XCH
 
@@ -520,6 +551,7 @@ def api_dashboard():
                     Decimal(str(wb.get("spendable_balance", 0)))
                     / Decimal("1000000000000")
                 )
+                live_xch_balance_read = True
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
@@ -533,10 +565,32 @@ def api_dashboard():
                 wallet["cat_spendable"] = str(
                     Decimal(str(wb.get("spendable_balance", 0))) / _cat_divisor
                 )
+                live_cat_balance_read = True
         except StopIteration:
             pass
         except Exception as e:
             print(f"[DASHBOARD] Wallet balance fetch error: {e}", flush=True)
+
+        if live_xch_balance_read and live_cat_balance_read:
+            cached_from_live = api_server.cache_balance_snapshot(
+                asset_id=active_asset_id,
+                cat_wallet_id=cat_wid,
+                balances={
+                    "xch": {
+                        "total": wallet["xch_total"],
+                        "spendable": wallet["xch_spendable"],
+                    },
+                    "cat": {
+                        "total": wallet["cat_total"],
+                        "spendable": wallet["cat_spendable"],
+                    },
+                },
+                source="dashboard",
+            )
+            wallet["xch_total"] = str(cached_from_live["xch"]["total"])
+            wallet["xch_spendable"] = str(cached_from_live["xch"]["spendable"])
+            wallet["cat_total"] = str(cached_from_live["cat"]["total"])
+            wallet["cat_spendable"] = str(cached_from_live["cat"]["spendable"])
 
         merged_balances = api_server.merge_cached_balance_snapshot(
             asset_id=active_asset_id,
@@ -600,7 +654,7 @@ def api_dashboard():
         if (
             coins["xch_free"] == 0
             and coins["xch_total"] == 0
-            and _live_wallet_reads_allowed(bot)
+            and _dashboard_wallet_reads_allowed(bot)
         ):
             try:
                 from wallet import rpc as wallet_rpc

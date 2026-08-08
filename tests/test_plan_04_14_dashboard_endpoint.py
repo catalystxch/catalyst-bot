@@ -210,16 +210,185 @@ class TestDashboard(_FlaskBase):
         body = resp.get_json()
         self.assertIsInstance(body["current_cat"], dict)
 
-    def test_dashboard_does_not_read_wallet_when_bot_stopped(self):
+    def test_dashboard_does_not_read_wallet_before_startup_authorised(self):
         with (
             patch("wallet.get_wallet_balance") as get_wallet_balance,
             patch("wallet.rpc") as wallet_rpc,
+            patch("wallet.is_initialized", return_value=False),
+            patch("chia_node.is_startup_authorised", return_value=False),
         ):
             resp = self._get_dashboard()
 
         self.assertEqual(resp.status_code, 200)
         get_wallet_balance.assert_not_called()
         wallet_rpc.assert_not_called()
+
+    def test_dashboard_reads_and_caches_wallet_after_sage_initialized(self):
+        asset_id = "aa" * 32
+        original_active_cat = dict(api_server._active_cat)
+        api_server.clear_balance_snapshot()
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 12,
+            "cat_free_count": 9,
+            "xch_total": 12,
+            "cat_total": 9,
+        }
+        xch_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 12_500_000_000_000,
+                "spendable_balance": 12_000_000_000_000,
+            },
+        }
+        cat_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 987_654_321,
+                "spendable_balance": 900_000_000,
+            },
+        }
+
+        cached = None
+        try:
+            with (
+                patch("database.get_stats", return_value=fake_stats),
+                patch("database.get_coin_summary", return_value=fake_summary),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_connection", return_value=_make_mock_db_conn()),
+                patch.object(
+                    api_server,
+                    "_get_spacescan_market_context",
+                    return_value=_empty_spacescan(),
+                ),
+                patch.object(api_server, "bot", None),
+                patch("wallet.is_initialized", return_value=True),
+                patch("chia_node.is_startup_authorised", return_value=False),
+                patch(
+                    "wallet.get_wallet_balance",
+                    side_effect=[xch_balance, cat_balance],
+                ) as get_wallet_balance,
+            ):
+                resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+                cached = api_server.get_cached_balance_snapshot(
+                    asset_id=asset_id,
+                    cat_wallet_id=2,
+                )
+        finally:
+            api_server.clear_balance_snapshot()
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+
+        self.assertEqual(resp.status_code, 200)
+        get_wallet_balance.assert_any_call(1)
+        get_wallet_balance.assert_any_call(2)
+        wallet = resp.get_json()["wallet"]
+        self.assertEqual(float(wallet["xch_total"]), 12.5)
+        self.assertEqual(float(wallet["xch_spendable"]), 12.0)
+        self.assertEqual(float(wallet["cat_total"]), 987654.321)
+        self.assertEqual(float(wallet["cat_spendable"]), 900000.0)
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["xch"]["total"], 12.5)
+        self.assertEqual(cached["cat"]["total"], 987654.321)
+
+    def test_dashboard_does_not_cache_partial_live_wallet_read(self):
+        asset_id = "aa" * 32
+        original_active_cat = dict(api_server._active_cat)
+        api_server.clear_balance_snapshot()
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 12,
+            "cat_free_count": 9,
+            "xch_total": 12,
+            "cat_total": 9,
+        }
+        xch_balance = {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 12_500_000_000_000,
+                "spendable_balance": 12_000_000_000_000,
+            },
+        }
+        cat_failure = {"success": False, "error": "CAT read failed"}
+
+        cached = None
+        try:
+            with (
+                patch("database.get_stats", return_value=fake_stats),
+                patch("database.get_coin_summary", return_value=fake_summary),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_connection", return_value=_make_mock_db_conn()),
+                patch.object(
+                    api_server,
+                    "_get_spacescan_market_context",
+                    return_value=_empty_spacescan(),
+                ),
+                patch.object(api_server, "bot", None),
+                patch("wallet.is_initialized", return_value=True),
+                patch("chia_node.is_startup_authorised", return_value=False),
+                patch(
+                    "wallet.get_wallet_balance",
+                    side_effect=[xch_balance, cat_failure],
+                ),
+            ):
+                resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+                cached = api_server.get_cached_balance_snapshot(
+                    asset_id=asset_id,
+                    cat_wallet_id=2,
+                )
+        finally:
+            api_server.clear_balance_snapshot()
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+
+        self.assertEqual(resp.status_code, 200)
+        wallet = resp.get_json()["wallet"]
+        self.assertEqual(float(wallet["xch_total"]), 12.5)
+        self.assertEqual(float(wallet["cat_total"]), 0.0)
+        self.assertIsNone(cached)
 
     def test_dashboard_reuses_verified_cat_balance_on_transient_zero(self):
         asset_id = "aa" * 32
