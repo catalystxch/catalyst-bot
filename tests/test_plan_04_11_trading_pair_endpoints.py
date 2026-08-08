@@ -9,7 +9,9 @@ Tests GET /api/cats, POST /api/cat/select, POST /api/cat/refresh:
 
 import os
 import sys
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -102,7 +104,7 @@ class TestCatSelect(_FlaskBase):
         with (
             patch.object(api_server.cfg, "update"),
             patch("threading.Thread") as mt,
-            patch("wallet_sage.notify_cat_asset_id_changed"),
+            patch("wallet.notify_cat_asset_id_changed"),
             patch.object(api_server, "bot", None),
         ):
             mt.return_value.start = MagicMock()
@@ -173,6 +175,32 @@ class TestCatSelect(_FlaskBase):
         body = resp.get_json()
         self.assertEqual(body.get("asset_id"), _VALID_ASSET_ID)
 
+    def test_sage_select_normalizes_synthetic_wallet_id_to_active_id(self):
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        try:
+            api_server.cfg.CAT_WALLET_ID = 1000
+            body = {**_VALID_BODY, "wallet_id": 1000}
+            with (
+                patch.object(api_server.cfg, "update"),
+                patch("threading.Thread") as mt,
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch("wallet.notify_cat_asset_id_changed"),
+                patch.object(api_server, "bot", None),
+            ):
+                mt.return_value.start = MagicMock()
+                resp = self._post("/api/cat/select", body)
+
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.get_json().get("wallet_id"), 2)
+            self.assertEqual(api_server._active_cat.get("wallet_id"), 2)
+            self.assertEqual(api_server.cfg.CAT_WALLET_ID, 2)
+        finally:
+            api_server.clear_balance_snapshot()
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+
 
 # ---------------------------------------------------------------------------
 # 3. POST /api/cat/refresh
@@ -203,19 +231,149 @@ class TestCatRefresh(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBalanceRefresh(_FlaskBase):
-    def test_transient_cat_zero_reuses_last_verified_balance(self):
-        original_cat = dict(api_server._active_cat)
-        if hasattr(api_server, "clear_balance_snapshot"):
-            api_server.clear_balance_snapshot()
+    def test_sage_balance_refresh_uses_active_asset_wallet_id_after_remap(self):
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        api_server.cfg.CAT_WALLET_ID = 1000
+        api_server._active_cat.clear()
         api_server._active_cat.update(
             {
                 "asset_id": _VALID_ASSET_ID,
-                "wallet_id": 7,
-                "ticker_id": "TST_XCH",
-                "decimals": 3,
+                "wallet_id": 1000,
                 "name": "TestCAT",
+                "decimals": 3,
             }
         )
+
+        calls = []
+
+        def fake_balance(wallet_id):
+            calls.append(wallet_id)
+            if wallet_id == 1:
+                mojos = 5_000_000_000_000
+            elif wallet_id == 2:
+                mojos = 1_000_000 * 1_000
+            else:
+                mojos = 0
+            return {
+                "success": True,
+                "wallet_balance": {
+                    "confirmed_wallet_balance": mojos,
+                    "spendable_balance": mojos,
+                },
+            }
+
+        try:
+            with (
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch("wallet.get_wallet_balance", side_effect=fake_balance),
+                patch("wallet.notify_cat_asset_id_changed") as notify_cat,
+            ):
+                resp = self._post("/api/balances/refresh")
+
+            self.assertEqual(resp.status_code, 200)
+            body = resp.get_json()
+            self.assertTrue(body.get("success"))
+            self.assertEqual(calls, [1, 2])
+            self.assertEqual(body["balances"]["cat"]["total"], 1_000_000)
+            self.assertEqual(api_server._active_cat.get("wallet_id"), 2)
+            self.assertEqual(api_server.cfg.CAT_WALLET_ID, 2)
+            notify_cat.assert_called_once_with(_VALID_ASSET_ID)
+        finally:
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+
+    def test_status_keeps_refreshed_sage_cat_balance_before_bot_start(self):
+        import blueprints.bot as bot_blueprint
+
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        original_price_cache = getattr(bot_blueprint, "_prebot_price_cache", None)
+        api_server.cfg.CAT_WALLET_ID = 1000
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": _VALID_ASSET_ID,
+                "wallet_id": 1000,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+        bot_blueprint._prebot_price_cache = {
+            "fetched_at": time.time(),
+            "pricing": {"bid": 0, "mid": 0, "ask": 0},
+            "asset_id": _VALID_ASSET_ID,
+        }
+
+        calls = []
+
+        def fake_balance(wallet_id):
+            calls.append(wallet_id)
+            if wallet_id == 1:
+                mojos = 5_000_000_000_000
+            elif wallet_id == 2:
+                mojos = 1_000_000 * 1_000
+            else:
+                mojos = 0
+            return {
+                "success": True,
+                "wallet_balance": {
+                    "confirmed_wallet_balance": mojos,
+                    "spendable_balance": mojos,
+                },
+            }
+
+        try:
+            with (
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(api_server, "bot", None),
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch("wallet.get_wallet_balance", side_effect=fake_balance),
+                patch("wallet.notify_cat_asset_id_changed"),
+            ):
+                refresh_resp = self._post("/api/balances/refresh")
+                status_resp = self.client.get(
+                    "/api/status", environ_base=self._LOOPBACK
+                )
+
+            self.assertEqual(refresh_resp.status_code, 200)
+            self.assertEqual(status_resp.status_code, 200)
+            self.assertEqual(calls, [1, 2])
+            body = status_resp.get_json()
+            self.assertEqual(body["balances"]["cat"]["total"], 1_000_000)
+            self.assertEqual(body["balances"]["cat"]["spendable"], 1_000_000)
+            self.assertEqual(body["current_cat"]["asset_id"], _VALID_ASSET_ID)
+            self.assertEqual(body["current_cat"]["wallet_id"], 2)
+        finally:
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+            if original_price_cache is None:
+                try:
+                    delattr(bot_blueprint, "_prebot_price_cache")
+                except AttributeError:
+                    pass
+            else:
+                bot_blueprint._prebot_price_cache = original_price_cache
+
+    def test_balance_refresh_ignores_transient_cat_zero_after_verified_balance(self):
+        original_active_cat = dict(api_server._active_cat)
+        original_cat_wallet_id = api_server.cfg.CAT_WALLET_ID
+        api_server.cfg.CAT_WALLET_ID = 1000
+        api_server._active_cat.clear()
+        api_server._active_cat.update(
+            {
+                "asset_id": _VALID_ASSET_ID,
+                "wallet_id": 1000,
+                "name": "TestCAT",
+                "decimals": 3,
+                "ticker_id": "TEST_XCH",
+            }
+        )
+
         xch_ok = {
             "success": True,
             "wallet_balance": {
@@ -239,24 +397,68 @@ class TestBalanceRefresh(_FlaskBase):
         }
 
         try:
-            with patch(
-                "wallet.get_wallet_balance",
-                side_effect=[xch_ok, cat_ok, xch_ok, cat_zero],
+            with (
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(api_server, "get_wallet_type", return_value="sage"),
+                patch(
+                    "wallet.get_wallet_balance",
+                    side_effect=[xch_ok, cat_ok, xch_ok, cat_zero],
+                ),
+                patch("wallet.notify_cat_asset_id_changed"),
             ):
                 first = self._post("/api/balances/refresh")
                 second = self._post("/api/balances/refresh")
-        finally:
-            if hasattr(api_server, "clear_balance_snapshot"):
-                api_server.clear_balance_snapshot()
-            api_server._active_cat.clear()
-            api_server._active_cat.update(original_cat)
 
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        body = second.get_json()
-        self.assertTrue(body.get("success"))
-        self.assertEqual(body["balances"]["cat"]["total"], 6_500_000.0)
-        self.assertEqual(body["balances"]["cat"]["spendable"], 6_400_000.0)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            body = second.get_json()
+            self.assertEqual(body["balances"]["cat"]["total"], 6_500_000)
+            self.assertEqual(body["balances"]["cat"]["spendable"], 6_400_000)
+        finally:
+            api_server.cfg.CAT_WALLET_ID = original_cat_wallet_id
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_active_cat)
+            api_server.clear_balance_snapshot()
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestSageWalletIdNormalization(unittest.TestCase):
+    def test_active_cat_wallet_id_uses_fixed_sage_id(self):
+        with patch.object(api_server, "get_wallet_type", return_value="sage"):
+            self.assertEqual(api_server.active_cat_wallet_id(1000, _VALID_ASSET_ID), 2)
+
+    def test_active_cat_wallet_id_preserves_chia_id(self):
+        with patch.object(api_server, "get_wallet_type", return_value="chia"):
+            self.assertEqual(
+                api_server.active_cat_wallet_id(1000, _VALID_ASSET_ID),
+                1000,
+            )
+
+    def test_status_and_dashboard_balance_paths_use_active_cat_wallet_helper(self):
+        root = Path(__file__).resolve().parents[1]
+        dashboard = (
+            root / "src" / "catalyst" / "blueprints" / "dashboard.py"
+        ).read_text(encoding="utf-8")
+        status = (root / "src" / "catalyst" / "blueprints" / "bot.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("api_server.active_cat_wallet_id", dashboard)
+        self.assertIn("api_server.active_cat_wallet_id", status)
+
+    def test_cat_blueprint_routes_notify_through_wallet_facade(self):
+        root = Path(__file__).resolve().parents[1]
+        cat_blueprint = (root / "src" / "catalyst" / "blueprints" / "cat.py").read_text(
+            encoding="utf-8"
+        )
+        wallet = (root / "src" / "catalyst" / "wallet.py").read_text(encoding="utf-8")
+
+        self.assertIn("from wallet import notify_cat_asset_id_changed", cat_blueprint)
+        self.assertNotIn(
+            "from wallet_sage import notify_cat_asset_id_changed",
+            cat_blueprint,
+        )
+        self.assertIn("notify_cat_asset_id_changed", wallet)
 
 
 if __name__ == "__main__":

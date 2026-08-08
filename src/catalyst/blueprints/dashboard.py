@@ -16,6 +16,7 @@ from flask import Blueprint, jsonify, request
 
 import api_server
 from database import get_stats
+from super_log import slog
 
 
 bp = Blueprint("dashboard", __name__)
@@ -60,6 +61,8 @@ def _build_coin_recommendations(cfg, coins: dict, is_running: bool) -> list[dict
     if not is_running or not getattr(cfg, "TIER_ENABLED", False):
         return []
     if not getattr(cfg, "ENABLE_SELL", True):
+        return []
+    if (coins or {}).get("prep_running") or (coins or {}).get("topup_running"):
         return []
 
     tier_counts = (coins or {}).get("tier_counts") or {}
@@ -463,6 +466,27 @@ def api_dashboard():
             "cat_spendable": 0,
             "cat_total": 0,
         }
+        cat_wid = api_server.active_cat_wallet_id(
+            api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2),
+            active_asset_id,
+        )
+        cached_balances = api_server.get_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wid,
+        )
+        if cached_balances:
+            wallet["xch_total"] = str(
+                (cached_balances.get("xch") or {}).get("total", 0)
+            )
+            wallet["xch_spendable"] = str(
+                (cached_balances.get("xch") or {}).get("spendable", 0)
+            )
+            wallet["cat_total"] = str(
+                (cached_balances.get("cat") or {}).get("total", 0)
+            )
+            wallet["cat_spendable"] = str(
+                (cached_balances.get("cat") or {}).get("spendable", 0)
+            )
         # tier_counts is intentionally OMITTED here. We only populate it
         # below when TIER_ENABLED is true AND we successfully read the
         # coin summary. Sending a placeholder {"enabled": False, ...}
@@ -496,9 +520,6 @@ def api_dashboard():
                     Decimal(str(wb.get("spendable_balance", 0)))
                     / Decimal("1000000000000")
                 )
-            cat_wid = api_server._active_cat.get("wallet_id") or getattr(
-                cfg, "CAT_WALLET_ID", 2
-            )
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
@@ -517,8 +538,10 @@ def api_dashboard():
         except Exception as e:
             print(f"[DASHBOARD] Wallet balance fetch error: {e}", flush=True)
 
-        cached_wallet = api_server.merge_cached_balance_snapshot(
-            {
+        merged_balances = api_server.merge_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wid,
+            balances={
                 "xch": {
                     "total": wallet["xch_total"],
                     "spendable": wallet["xch_spendable"],
@@ -527,13 +550,13 @@ def api_dashboard():
                     "total": wallet["cat_total"],
                     "spendable": wallet["cat_spendable"],
                 },
-            }
+            },
         )
-        if cached_wallet:
-            wallet["xch_total"] = str(cached_wallet["xch"]["total"])
-            wallet["xch_spendable"] = str(cached_wallet["xch"]["spendable"])
-            wallet["cat_total"] = str(cached_wallet["cat"]["total"])
-            wallet["cat_spendable"] = str(cached_wallet["cat"]["spendable"])
+        if merged_balances:
+            wallet["xch_total"] = str(merged_balances["xch"]["total"])
+            wallet["xch_spendable"] = str(merged_balances["xch"]["spendable"])
+            wallet["cat_total"] = str(merged_balances["cat"]["total"])
+            wallet["cat_spendable"] = str(merged_balances["cat"]["spendable"])
 
         try:
             db_coin_summary = get_coin_summary()
@@ -547,6 +570,19 @@ def api_dashboard():
                 tier_counts = get_live_tier_group_counts()
                 tier_counts["enabled"] = True
                 coins["tier_counts"] = tier_counts
+            try:
+                if bot and getattr(bot, "coin_manager", None):
+                    coin_status = bot.coin_manager.get_status() or {}
+                    coins["prep_running"] = bool(coin_status.get("prep_running"))
+                    coins["topup_running"] = bool(coin_status.get("topup_running"))
+            except Exception as e:
+                coins["prep_running"] = False
+                coins["topup_running"] = False
+                slog(
+                    "API_STATUS",
+                    f"Dashboard coin manager status fetch error: {e}",
+                    level="debug",
+                )
             try:
                 is_running = bool(bot and bot.is_running())
             except Exception:

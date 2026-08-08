@@ -506,6 +506,41 @@ def _seconds_since(iso_ts: Optional[str], now: float) -> Optional[float]:
 _ORPHAN_LOCK_AGE_SECS = 300
 
 
+def _normalize_coin_id(coin_id: object) -> str:
+    cid = str(coin_id or "").strip().lower()
+    if cid and not cid.startswith("0x"):
+        cid = "0x" + cid
+    return cid
+
+
+def _wallet_confirmed_locked_coin_ids() -> set:
+    """Return coin ids Sage still reports as locked by any wallet offer."""
+    try:
+        from wallet import get_owned_coins_detailed, get_wallet_type
+
+        if get_wallet_type() != "sage":
+            return set()
+
+        locked_ids = set()
+        for wallet_id in (cfg.WALLET_ID_XCH, cfg.CAT_WALLET_ID):
+            detailed = get_owned_coins_detailed(wallet_id) or {}
+            for raw_coin_id, info in detailed.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("offer_id") or info.get("offer_hash"):
+                    cid = _normalize_coin_id(raw_coin_id)
+                    if cid:
+                        locked_ids.add(cid)
+        return locked_ids
+    except Exception as e:
+        slog(
+            "BOT_HEALTH",
+            f"Could not fetch wallet-confirmed locked coins: {e}",
+            level="debug",
+        )
+        return set()
+
+
 def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
     """Find coins marked locked in DB whose trade_id points to no open offer.
 
@@ -547,12 +582,18 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
             message="No orphan coin locks.",
         )
 
-    # Filter by age — only act on locks older than the threshold so we
-    # don't race in-flight reconcile updates.
+    # Wallet-confirmed locks may belong to NFT/off-wallet offers; leave those alone.
+    wallet_locked_ids = _wallet_confirmed_locked_coin_ids()
+
+    # Only act on old DB-only locks so we do not race in-flight reconcile updates.
     now = time.time()
     actionable = []
     too_fresh = 0
+    wallet_confirmed = 0
     for o in orphans:
+        if _normalize_coin_id(o.get("coin_id")) in wallet_locked_ids:
+            wallet_confirmed += 1
+            continue
         age = _seconds_since(o.get("last_seen"), now)
         if age is None or age >= _ORPHAN_LOCK_AGE_SECS:
             actionable.append(o)
@@ -581,7 +622,20 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
                     level="warn",
                 )
 
-    if not actionable and too_fresh:
+    if not actionable and wallet_confirmed and not too_fresh:
+        return HealthCheck(
+            name="orphan_locks",
+            category="coins",
+            status="pass",
+            severity="info",
+            message=(
+                f"{wallet_confirmed} wallet-confirmed external locks - "
+                "no cleanup needed."
+            ),
+            anomaly_count=0,
+        )
+
+    if not actionable and (too_fresh or wallet_confirmed):
         return HealthCheck(
             name="orphan_locks",
             category="coins",
@@ -597,7 +651,10 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
         category="coins",
         status="warn" if (actionable and not auto_repair) else "pass",
         severity="warning" if (actionable and not auto_repair) else "info",
-        message=(f"{len(actionable)} orphan locks ({too_fresh} too fresh to act on)"),
+        message=(
+            f"{len(actionable)} orphan locks ({too_fresh} too fresh, "
+            f"{wallet_confirmed} wallet-confirmed)"
+        ),
         anomaly_count=len(actionable),
         repaired_count=repaired,
         repair_log=repair_log,
@@ -1596,10 +1653,11 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
 
 _spacescan_refresh_inflight: bool = False
 _spacescan_refresh_last_at: float = 0.0
+_SPACESCAN_STALE_REFRESH_SECS = 12 * 3600
 
 
 def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
-    """Refresh the Spacescan cache when it's missing or expired.
+    """Refresh the Spacescan cache when it's missing, expired, or UI-stale.
 
     Read-only when auto_repair=False; otherwise spawns a single-shot
     background thread that calls `refresh_spacescan_cache(asset_id)`.
@@ -1632,15 +1690,26 @@ def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
         )
 
     # Peek at cache age. An expired cache will appear as None here because
-    # get_market_analysis_cache filters by expires_at.
+    # get_market_analysis_cache filters by expires_at. The UI marks token
+    # context stale after 12h even though the DB TTL is longer, so refresh
+    # once the UI would start suppressing Spacescan-derived guidance.
     try:
-        from database import get_market_analysis_cache
+        from database import (
+            get_market_analysis_cache,
+            get_market_analysis_cache_age_secs,
+        )
 
         cached = get_market_analysis_cache(asset_id, "spacescan")
+        cache_age_secs = get_market_analysis_cache_age_secs(asset_id, "spacescan")
     except Exception:
         cached = None
+        cache_age_secs = None
 
-    if cached:
+    cache_is_ui_stale = (
+        cache_age_secs is not None and cache_age_secs > _SPACESCAN_STALE_REFRESH_SECS
+    )
+
+    if cached and not cache_is_ui_stale:
         return HealthCheck(
             name="spacescan_cache",
             category="wallet",
@@ -1674,12 +1743,13 @@ def check_spacescan_cache_stale(auto_repair: bool = True) -> HealthCheck:
         )
 
     if not auto_repair:
+        state = "stale" if cache_is_ui_stale else "missing/expired"
         return HealthCheck(
             name="spacescan_cache",
             category="wallet",
             status="warn",
             severity="warning",
-            message=f"Spacescan cache missing/expired for {asset_id[:16]}...",
+            message=f"Spacescan cache {state} for {asset_id[:16]}...",
             anomaly_count=1,
         )
 

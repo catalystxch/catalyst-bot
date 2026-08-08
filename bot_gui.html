@@ -10190,16 +10190,16 @@
 
                 <!-- Orderbook Depth -->
                 <div style="background: var(--bg-surface); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">📊 Orderbook Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH value of all buy and sell offers on Dexie. Deeper books mean more liquidity and less price impact per trade.</span></span></div>
+                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">📊 Orderbook Depth <span class="cc-help">?<span class="cc-tooltip">Dexie-style visible book totals: buy depth is XCH in bids, sell depth is CAT available in asks. The pressure bar uses near-market XCH depth after ignoring far-out offers.</span></span></div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                         <div id="intelBuyDepthPanel">
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Buy Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH sitting in buy offers. Higher = stronger buying support.</span></span></div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Buy Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH sitting in visible buy offers on Dexie. Higher = stronger buying support.</span></span></div>
                             <div id="intelBuyDepth" style="font-size: 16px; font-weight: 600; color: var(--status-success);">0.00 XCH</div>
                             <div style="color: rgba(255,255,255,0.4); font-size: 11px;"><span id="intelBuyCount">0</span> offers</div>
                         </div>
                         <div id="intelSellDepthPanel">
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Sell Depth <span class="cc-help">?<span class="cc-tooltip">Total XCH value of sell offers. Higher = more tokens available to buy.</span></span></div>
-                            <div id="intelSellDepth" style="font-size: 16px; font-weight: 600; color: var(--status-danger);">0.00 XCH</div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Sell Depth <span class="cc-help">?<span class="cc-tooltip">Total CAT available in visible sell offers on Dexie. Higher = more tokens available to buy.</span></span></div>
+                            <div id="intelSellDepth" style="font-size: 16px; font-weight: 600; color: var(--status-danger);">0 CAT</div>
                             <div style="color: rgba(255,255,255,0.4); font-size: 11px;"><span id="intelSellCount">0</span> offers</div>
                         </div>
                     </div>
@@ -10856,7 +10856,7 @@
                             <div class="form-group mode-hide-on-sell-only" style="margin-bottom: 8px;">
                                 <label style="display: flex; align-items: center; gap: 10px;">
                                     <input type="checkbox" id="configBuyLadderReversed" style="width: auto; margin: 0;" checked onchange="handleReverseLadderToggle();">
-                                    <span>Reverse Buy Ladder <span class="cc-help">?<span class="cc-tooltip">When on: buy side places the SMALLEST offers closest to price and the LARGEST offers furthest away. This limits your XCH exposure when sellers hit the top of the book — a large commitment only gets filled on a genuine support-level drop. Sell side is unaffected (large sells stay closest to price, where buyers find them). Requires Tiered Sizing to be enabled.</span></span></span>
+                                    <span>Small Buys Closest <span class="cc-help">?<span class="cc-tooltip">Also called Reverse Buy Ladder. When on, the buy side places the smallest XCH offers closest to price and the largest XCH offers furthest away. This limits XCH exposure when sellers hit the top of the book; a large buy commitment only sits at deeper support levels. Sell side is unaffected: large sells stay closest to price, where buyers find them. Requires Tiered Sizing.</span></span></span>
                                 </label>
                                 <div class="v4-settings-hint" style="margin-top: 2px; margin-left: 26px; color: var(--slate-400);">Buy: small near price → large far. Sell: large near price → small far (unchanged).</div>
                                 <div id="reverseLadderRerunHint" style="display:none; margin-top: 6px; margin-left: 26px; padding: 6px 10px; border-radius: 6px; background: rgba(234,179,8,0.12); border: 1px solid rgba(234,179,8,0.35); color: var(--yellow-300, #fbbf24); font-size: 0.82em; line-height: 1.4;">
@@ -16637,7 +16637,7 @@
                         ? ' Waiting for the gap to hold across multiple cycles before recommending Close the Gap.'
                         : ' Let the gap settle before changing spreads aggressively.';
                     pushSuggestion({
-                        type: arbGapBps >= 200 ? 'warning' : 'info',
+                        type: 'info',
                         icon: '<>',
                         msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap.' + edgeMsg + gapAdvice,
                         action: null
@@ -17618,6 +17618,7 @@
             offers: { buy: [], sell: [] },
             stats: { loop_count: 0, uptime_seconds: 0 }
         };
+        let _lastVerifiedWalletBalances = { asset_id: '', balances: null };
         let _catSwitchInProgress = false;
         let _catSwitchTargetAssetId = '';
         let _catSwitchGateTimer = null;
@@ -17630,6 +17631,70 @@
 
         function isWalletSwitchBusy() {
             return !!_walletSwitchInProgress;
+        }
+
+        function _walletBalanceNumber(value) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : 0;
+        }
+
+        function _normalizeWalletBalanceSide(side = {}) {
+            return {
+                spendable: _walletBalanceNumber(side?.spendable),
+                total: _walletBalanceNumber(side?.total),
+            };
+        }
+
+        function _normalizeWalletBalances(balances = {}) {
+            return {
+                xch: _normalizeWalletBalanceSide(balances?.xch || {}),
+                cat: _normalizeWalletBalanceSide(balances?.cat || {}),
+            };
+        }
+
+        function _walletBalanceSideIsZero(side = {}) {
+            return _walletBalanceNumber(side?.spendable) <= 0
+                && _walletBalanceNumber(side?.total) <= 0;
+        }
+
+        function _walletBalanceSideHasValue(side = {}) {
+            return _walletBalanceNumber(side?.spendable) > 0
+                || _walletBalanceNumber(side?.total) > 0;
+        }
+
+        function resetVerifiedWalletBalances() {
+            _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+        }
+
+        function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '') {
+            const activeAssetId = String(
+                assetId
+                || currentCAT?.asset_id
+                || bot_state?.current_cat?.asset_id
+                || ''
+            ).trim();
+            const incoming = _normalizeWalletBalances(incomingBalances);
+            const cached = _lastVerifiedWalletBalances || {};
+            const cacheMatches = cached.balances && String(cached.asset_id || '') === activeAssetId;
+            const merged = _normalizeWalletBalances(incoming);
+
+            if (cacheMatches) {
+                for (const sideName of ['xch', 'cat']) {
+                    const cachedSide = cached.balances?.[sideName] || {};
+                    if (_walletBalanceSideIsZero(merged[sideName]) && _walletBalanceSideHasValue(cachedSide)) {
+                        merged[sideName] = { ...cachedSide };
+                    }
+                }
+            }
+
+            if (activeAssetId || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat)) {
+                _lastVerifiedWalletBalances = {
+                    asset_id: activeAssetId,
+                    balances: _normalizeWalletBalances(merged),
+                };
+            }
+
+            return merged;
         }
 
         function getCatMetaByAssetId(assetId) {
@@ -17880,6 +17945,7 @@
             }
             _pairDataReadyAssetId = '';
             _dashboardData = null;
+            resetVerifiedWalletBalances();
             coinPrepStatus = 'none';
 
             const selector = document.getElementById('catSelector');
@@ -20440,6 +20506,63 @@
             return dist;
         }
 
+        function getLadderPriceForSlot(slot, side, midPrice, spreadBps, maxOffers, minEdgeBps = 0) {
+            const total = Math.max(0, parseInt(maxOffers) || 0);
+            const mid = Number(midPrice || 0);
+            if (total <= 0 || mid <= 0) return 0;
+
+            const spreadFraction = Math.max(0, Number(spreadBps || 0)) / 10000;
+            const innerEdge = Math.max(0, Number(minEdgeBps || 0)) / 10000;
+            let distance = 0;
+            if (innerEdge >= spreadFraction) {
+                distance = spreadFraction;
+            } else if (total === 1) {
+                distance = innerEdge;
+            } else {
+                const step = (spreadFraction - innerEdge) / (total - 1);
+                distance = innerEdge + step * Math.max(0, parseInt(slot) || 0);
+            }
+
+            return String(side || '').toLowerCase() === 'buy'
+                ? mid * (1 - distance)
+                : mid * (1 + distance);
+        }
+
+        function buildSellLadderCatPlan({
+            midPrice,
+            spreadBps,
+            minEdgeBps,
+            maxSell,
+            tierCounts,
+            sellTierSizes
+        }) {
+            const tiers = ['inner', 'mid', 'outer', 'extreme'];
+            const dist = getCoinPrepTierDistribution(maxSell, tierCounts);
+            const tierLiveCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            const tierMaxCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            let liveCatTotal = 0;
+            let slot = 0;
+
+            for (const tier of tiers) {
+                const count = Math.max(0, parseInt(dist[tier]) || 0);
+                const sizeXch = Math.max(0, Number(sellTierSizes?.[tier] || 0));
+                for (let i = 0; i < count; i++) {
+                    const price = getLadderPriceForSlot(
+                        slot, 'sell', midPrice, spreadBps, maxSell, minEdgeBps
+                    );
+                    if (price > 0 && sizeXch > 0) {
+                        const cat = sizeXch / price;
+                        tierLiveCat[tier] += cat;
+                        tierMaxCat[tier] = Math.max(tierMaxCat[tier], cat);
+                        liveCatTotal += cat;
+                    }
+                    slot += 1;
+                }
+            }
+
+            return {tierLiveCat, tierMaxCat, liveCatTotal, tierCounts: dist};
+        }
+
         function clampCoinPrepMultiplier(value) {
             const parsed = parseFloat(value);
             const safe = Number.isFinite(parsed) ? parsed : 1;
@@ -20664,9 +20787,16 @@
                         ? (parseFloat(getWalletBalance('cat')) || 0) : 0;
                     const catReserve = parseFloat(document.getElementById('configCatReserve')?.value) || 0;
                     const catAvailable = Math.max(0, catBalance - catReserve);
-                    const sellTierCatSize = {};
-                    for (const t of tiers) sellTierCatSize[t] = (tierSizes[t] || 0) / midPrice;
-                    const sellLiveCat = sumCost(tierCounts, sellTierCatSize) * prepFactor;
+                    const sellLadderCatPlan = buildSellLadderCatPlan({
+                        midPrice,
+                        spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                        minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
+                        maxSell,
+                        tierCounts,
+                        sellTierSizes: tierSizes
+                    });
+                    const sellTierCatSize = sellLadderCatPlan.tierMaxCat || {};
+                    const sellLiveCat = (sellLadderCatPlan.liveCatTotal || 0) * prepFactor;
                     const sellSpareCat = sumCost(sellRecommended, sellTierCatSize) * prepFactor;
                     const usableCatForSpares = Math.max(0, (catAvailable * 0.92) - sellLiveCat);
                     if (sellSpareCat > 0 && sellSpareCat > usableCatForSpares) {
@@ -21015,6 +21145,8 @@
             coinPrepMultiplier,
             tierEnabled,
             midPrice,
+            spreadBps = 0,
+            minEdgeBps = 0,
             headroomPct,
             innerSize,
             midSize,
@@ -21128,6 +21260,20 @@
                 const sellDist = sellSideActive
                     ? getCoinPrepTierDistribution(maxSell, configuredTierCountsSell)
                     : { inner: 0, mid: 0, outer: 0, extreme: 0 };
+                const sellLadderCatPlan = sellSideActive ? buildSellLadderCatPlan({
+                    midPrice,
+                    spreadBps,
+                    minEdgeBps,
+                    maxSell,
+                    tierCounts: configuredTierCountsSell,
+                    sellTierSizes: plan.sellTierSizesXch,
+                }) : {
+                    tierLiveCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
+                    tierMaxCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
+                    liveCatTotal: 0,
+                };
+                plan.sellLadderCatPlan = sellLadderCatPlan;
+                plan.sellLiveCatForOffers = sellLadderCatPlan.liveCatTotal;
                 const buyWeightedCounts = buySideActive ? getCoinPrepPreparedTierCounts(
                     maxBuy, coinPrepMultiplier, plan.offerTierSizesXch,
                     configuredTierCountsBuy, configuredTierSparesBuy
@@ -21187,17 +21333,17 @@
                 for (const tier of plan.tierSequence) {
                     plan.tierCounts[tier] = buySizeCounts[tier] || 0;
                     const _buySizeXch = _sizeOrientedBuy[tier] || 0;
-                    const _sellSizeXch = plan.sellTierSizesXch[tier] || 0;
+                    const _sellTierCat = sellLadderCatPlan.tierMaxCat[tier] || 0;
                     plan.preparedTierSizesXch[tier] = _buySizeXch * prepMult;
                     plan.preparedTierSizesCat[tier] = midPrice > 0
-                        ? Math.round((_sellSizeXch / midPrice) * prepMult)
+                        ? Math.round(_sellTierCat * prepMult)
                         : 0;
                     plan.xchCoinsNeeded += plan.tierCounts[tier];
                     plan.catCoinsNeeded += sellWeightedCounts[tier] || 0;
                     plan.totalXchForCoinPrep += plan.tierCounts[tier] * plan.preparedTierSizesXch[tier];
                     plan.totalCatForCoinPrep += (sellWeightedCounts[tier] || 0) * plan.preparedTierSizesCat[tier];
                     plan.minXchForOffers += (buySizeDist[tier] || 0) * plan.preparedTierSizesXch[tier];
-                    plan.minCatForOffers += sellDist[tier] * plan.preparedTierSizesCat[tier];
+                    plan.minCatForOffers += sellLadderCatPlan.tierLiveCat[tier] || 0;
                 }
                 // Sell-side tier counts (no flip — sell ladder is identity-mapped)
                 plan.sellTierCounts = sellWeightedCounts;
@@ -21870,6 +22016,8 @@
                 coinPrepMultiplier,
                 tierEnabled,
                 midPrice,
+                spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(document.getElementById('configInnerSizeXch')?.value) || tradeSize * 2,
                 midSize: parseFloat(document.getElementById('configMidSizeXch')?.value) || tradeSize,
@@ -22397,10 +22545,17 @@
                 const outerSize = _f('configBuyOuterSizeXch')   || _f('configOuterSizeXch')   || tradeSize * 0.5;
                 const extremeSize = _f('configBuyExtremeSizeXch') || _f('configExtremeSizeXch') || tradeSize * 0.2;
                 // Position counts for the buy ladder (per-side when set).
-                const cInner = _i('configBuyInnerTierCount')   || _i('configInnerTierCount');
-                const cMid   = _i('configBuyMidTierCount')     || _i('configMidTierCount');
-                const cOuter = _i('configBuyOuterTierCount')   || _i('configOuterTierCount');
-                const cExt   = _i('configBuyExtremeTierCount') || _i('configExtremeTierCount');
+                const _buyTierCount = (xchId, legacyId) => {
+                    const xchEl = document.getElementById(xchId);
+                    if (xchEl && String(xchEl.value ?? '').trim() !== '') {
+                        return _i(xchId);
+                    }
+                    return _i(legacyId);
+                };
+                const cInner = _buyTierCount('configInnerTierCountXch', 'configInnerTierCount');
+                const cMid   = _buyTierCount('configMidTierCountXch', 'configMidTierCount');
+                const cOuter = _buyTierCount('configOuterTierCountXch', 'configOuterTierCount');
+                const cExt   = _buyTierCount('configExtremeTierCountXch', 'configExtremeTierCount');
                 // The per-side fields are already position-indexed in the
                 // orientation the bot will actually deploy, so a direct
                 // count × size product is the buy ladder's true XCH draw.
@@ -22463,13 +22618,21 @@
                 const cMid   = _i('configMidTierCount');
                 const cOuter = _i('configOuterTierCount');
                 const cExt   = _i('configExtremeTierCount');
-                const tierXchSum =
-                    cInner * innerSize +
-                    cMid   * midSize   +
-                    cOuter * outerSize +
-                    cExt   * extremeSize;
-                catNeededForOffers = tierXchSum > 0
-                    ? Math.round(tierXchSum / midPrice)
+                const sellLadderCatPlan = buildSellLadderCatPlan({
+                    midPrice,
+                    spreadBps: (parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100,
+                    minEdgeBps: (parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100,
+                    maxSell,
+                    tierCounts: { inner: cInner, mid: cMid, outer: cOuter, extreme: cExt },
+                    sellTierSizes: {
+                        inner: innerSize,
+                        mid: midSize,
+                        outer: outerSize,
+                        extreme: extremeSize
+                    }
+                });
+                catNeededForOffers = (sellLadderCatPlan.liveCatTotal || 0) > 0
+                    ? Math.round(sellLadderCatPlan.liveCatTotal)
                     : Math.round(catPerOfferBase * maxSell);
             } else {
                 const catPerOffer = midPrice > 0 ? Math.round(catPerOfferBase) : 0;
@@ -23229,19 +23392,21 @@
                     return data;
                 }
                 if (data.success && data.balances) {
+                    const mergedBalances = mergeVerifiedWalletBalances(data.balances, requestAssetId);
+                    data.balances = mergedBalances;
                     // Update bot_state so everything stays in sync
-                    bot_state.balances = data.balances;
+                    bot_state.balances = mergedBalances;
                     if (requestAssetId && (!currentCAT?.asset_id || currentCAT.asset_id === requestAssetId)) {
                         acceptPairDataRefresh(requestAssetId, 'wallet balances');
                     }
                     // Update display
-                    document.getElementById('xchSpendable').textContent = data.balances.xch.spendable.toFixed(4);
-                    document.getElementById('xchTotal').textContent = data.balances.xch.total.toFixed(4);
+                    document.getElementById('xchSpendable').textContent = mergedBalances.xch.spendable.toFixed(4);
+                    document.getElementById('xchTotal').textContent = mergedBalances.xch.total.toFixed(4);
                     const showCatBalances = !!(requestAssetId || currentCAT?.asset_id);
                     updateCatBalanceVisibility(showCatBalances);
                     if (showCatBalances) {
-                        document.getElementById('catSpendable').textContent = Math.floor(data.balances.cat.spendable).toLocaleString();
-                        document.getElementById('catTotal').textContent = Math.floor(data.balances.cat.total).toLocaleString();
+                        document.getElementById('catSpendable').textContent = Math.floor(mergedBalances.cat.spendable).toLocaleString();
+                        document.getElementById('catTotal').textContent = Math.floor(mergedBalances.cat.total).toLocaleString();
                     }
                     // Re-validate settings form (updates warnings based on new balances)
                     if (typeof refreshReserveDisplays === 'function') refreshReserveDisplays();
@@ -23334,9 +23499,15 @@
                         preserved[f] = bot_state[f];
                     }
                 }
-            bot_state = data;
-            Object.assign(bot_state, preserved);
-            updateWalletPickerAvailability();
+                if (data.balances) {
+                    data.balances = mergeVerifiedWalletBalances(
+                        data.balances,
+                        data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                    );
+                }
+                bot_state = data;
+                Object.assign(bot_state, preserved);
+                updateWalletPickerAvailability();
                 updateUI(data);
                 syncCommandCentreFromStatus(data);
                 
@@ -23595,13 +23766,18 @@
             }
 
             // Balances
-            document.getElementById('xchSpendable').textContent = data.balances.xch.spendable.toFixed(4);
-            document.getElementById('xchTotal').textContent = data.balances.xch.total.toFixed(4);
+            const displayBalances = mergeVerifiedWalletBalances(
+                data.balances || {},
+                data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+            );
+            data.balances = displayBalances;
+            document.getElementById('xchSpendable').textContent = displayBalances.xch.spendable.toFixed(4);
+            document.getElementById('xchTotal').textContent = displayBalances.xch.total.toFixed(4);
             const showCatBalances = hasSelectedTradingPair(data);
             updateCatBalanceVisibility(showCatBalances);
             if (showCatBalances) {
-                document.getElementById('catSpendable').textContent = Math.floor(data.balances.cat.spendable).toLocaleString();
-                document.getElementById('catTotal').textContent = Math.floor(data.balances.cat.total).toLocaleString();
+                document.getElementById('catSpendable').textContent = Math.floor(displayBalances.cat.spendable).toLocaleString();
+                document.getElementById('catTotal').textContent = Math.floor(displayBalances.cat.total).toLocaleString();
             }
 
             // Coin tracking (free vs locked)
@@ -24732,6 +24908,21 @@
             }
         }
 
+        function marketIntelCatTicker() {
+            const raw = currentCAT?.ticker_id || currentCAT?.ticker || currentCAT?.name || 'CAT';
+            const label = String(raw || 'CAT')
+                .replace(/_XCH$/i, '')
+                .replace(/\/XCH$/i, '')
+                .trim();
+            return label || 'CAT';
+        }
+
+        function formatMarketIntelDepth(value, maximumFractionDigits = 2) {
+            const n = Number(value || 0);
+            if (!Number.isFinite(n)) return '0';
+            return n.toLocaleString(undefined, { maximumFractionDigits });
+        }
+
         function renderMarketIntel(data) {
             const el = id => document.getElementById(id);
             if (!data || !el('intelCompSpread')) return;
@@ -24825,10 +25016,18 @@
                 }
             }
 
-            const buyDepth = parseFloat(data.buy_depth_xch || 0);
-            const sellDepth = parseFloat(data.sell_depth_xch || 0);
-            el('intelBuyDepth').textContent = buyDepth.toFixed(2) + ' XCH';
-            el('intelSellDepth').textContent = sellDepth.toFixed(2) + ' XCH';
+            const displayBuyDepth = parseFloat(data.dexie_total_buy_depth_xch ?? data.buy_depth_xch ?? 0) || 0;
+            const displaySellDepthXch = parseFloat(data.dexie_total_sell_depth_xch ?? data.sell_depth_xch ?? 0) || 0;
+            const displaySellDepthCat = parseFloat(data.dexie_total_sell_depth_cat ?? 0) || 0;
+            const sellDepthUnit = marketIntelCatTicker();
+            const buyDepth = parseFloat(data.buy_depth_xch ?? displayBuyDepth ?? 0) || 0;
+            const sellDepth = parseFloat(data.sell_depth_xch ?? displaySellDepthXch ?? 0) || 0;
+            el('intelBuyDepth').textContent = formatMarketIntelDepth(displayBuyDepth, 2) + ' XCH';
+            el('intelBuyDepth').title = 'Near-market depth used by the bot: ' + buyDepth.toFixed(2) + ' XCH';
+            el('intelSellDepth').textContent = displaySellDepthCat > 0
+                ? formatMarketIntelDepth(displaySellDepthCat, displaySellDepthCat >= 1000 ? 0 : 2) + ' ' + sellDepthUnit
+                : formatMarketIntelDepth(displaySellDepthXch, 2) + ' XCH';
+            el('intelSellDepth').title = 'Near-market depth used by the bot: ' + sellDepth.toFixed(2) + ' XCH';
             el('intelBuyCount').textContent = data.num_buy_offers || 0;
             el('intelSellCount').textContent = data.num_sell_offers || 0;
 
@@ -25507,17 +25706,22 @@
                 _dashboardData = payload;
                 const activeDashboardAssetId = returnedAssetId || requestAssetId || currentCAT?.asset_id || '';
                 if (payload?.wallet && activeDashboardAssetId) {
-                    bot_state = bot_state || {};
-                    bot_state.balances = {
+                    const dashboardBalances = mergeVerifiedWalletBalances({
                         xch: {
-                            spendable: Number(payload.wallet.xch_spendable || 0),
-                            total: Number(payload.wallet.xch_total || 0),
+                            spendable: payload.wallet.xch_spendable,
+                            total: payload.wallet.xch_total,
                         },
                         cat: {
-                            spendable: Number(payload.wallet.cat_spendable || 0),
-                            total: Number(payload.wallet.cat_total || 0),
+                            spendable: payload.wallet.cat_spendable,
+                            total: payload.wallet.cat_total,
                         },
-                    };
+                    }, activeDashboardAssetId);
+                    payload.wallet.xch_spendable = dashboardBalances.xch.spendable;
+                    payload.wallet.xch_total = dashboardBalances.xch.total;
+                    payload.wallet.cat_spendable = dashboardBalances.cat.spendable;
+                    payload.wallet.cat_total = dashboardBalances.cat.total;
+                    bot_state = bot_state || {};
+                    bot_state.balances = dashboardBalances;
                     acceptPairDataRefresh(activeDashboardAssetId, 'dashboard payload');
                 }
                 // Normalize field names: API returns fill_rate_per_hour,
@@ -25732,6 +25936,20 @@
 
             if (d.wallet) {
                 const w = d.wallet;
+                const walletBalances = mergeVerifiedWalletBalances({
+                    xch: {
+                        spendable: w.xch_spendable,
+                        total: w.xch_total,
+                    },
+                    cat: {
+                        spendable: w.cat_spendable,
+                        total: w.cat_total,
+                    },
+                }, d?.current_cat?.asset_id || currentCAT?.asset_id || '');
+                w.xch_spendable = walletBalances.xch.spendable;
+                w.xch_total = walletBalances.xch.total;
+                w.cat_spendable = walletBalances.cat.spendable;
+                w.cat_total = walletBalances.cat.total;
                 if (w.xch_spendable !== undefined) el('xchSpendable').textContent = parseFloat(w.xch_spendable).toFixed(4);
                 if (w.xch_total !== undefined) el('xchTotal').textContent = parseFloat(w.xch_total).toFixed(4);
                 const showCatBalances = hasSelectedTradingPair(d);
@@ -26528,12 +26746,16 @@
             }
 
             if (data.balances) {
+                const statusBalances = mergeVerifiedWalletBalances(
+                    data.balances,
+                    data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                );
                 _dashboardData.wallet = {
                     ...(_dashboardData.wallet || {}),
-                    xch_spendable: Number(data.balances?.xch?.spendable || 0),
-                    xch_total: Number(data.balances?.xch?.total || 0),
-                    cat_spendable: Number(data.balances?.cat?.spendable || 0),
-                    cat_total: Number(data.balances?.cat?.total || 0),
+                    xch_spendable: statusBalances.xch.spendable,
+                    xch_total: statusBalances.xch.total,
+                    cat_spendable: statusBalances.cat.spendable,
+                    cat_total: statusBalances.cat.total,
                 };
             }
 
@@ -27229,6 +27451,30 @@
         // Returns { icon, msg, cls } or null to skip the event.
         function laTranslate(eventType, severity, rawMsg, data) {
             const m = rawMsg || '';
+            const routineTopupBreadcrumbs = new Set([
+                'topup_source_unavailable',
+                'topup_trigger_recovery',
+                'topup_missing_offers_prioritized',
+                'topup_single_action_done',
+                'topup_cat-inner_start',
+                'topup_cat_inner',
+                'topup_cat-inner_osstep_submitted',
+                'topup_cat-inner_osstep_confirmed',
+                'topup_xch-sniper_osstep_submitted',
+                'topup_xch-sniper_osstep_confirmed',
+                'topup_xch-sniper_start',
+                'topup_xch_sniper',
+                'topup_cat-inner_pool_rebuild',
+                'topup_cat-inner_pool_rebuild_wait',
+                'topup_cat-inner_reserve_gone',
+                'topup_cat-inner_budget_bypass_floor_priority',
+                'topup_cat-inner_pool_rebuild_priority_borrow',
+                'topup_cat-inner_split_ok',
+                'topup_xch-sniper_split_ok',
+                'topup_split_blocked',
+                'drip_source_unavailable',
+            ]);
+            if (routineTopupBreadcrumbs.has(eventType)) return null;
 
             // --- Bot lifecycle ---
             if (eventType === 'bot_starting')
@@ -33367,24 +33613,44 @@ function closeCtgErrorModal() {
                     const tiers = ['inner', 'mid', 'outer', 'extreme'];
                     const sizeKey = (t) => t + '_size_xch';
                     const countKey = (t) => t + '_tier_count';
+                    const sellTierSizesForVerify = {};
+                    const sellTierCountsForVerify = {};
+                    for (const t of tiers) {
+                        sellTierSizesForVerify[t] = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
+                        sellTierCountsForVerify[t] = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
+                    }
+                    const configuredMaxSell = parseInt(config.max_active_sell || config.MAX_ACTIVE_SELL_OFFERS || 0)
+                        || tiers.reduce((sum, t) => sum + (parseInt(sellTierCountsForVerify[t]) || 0), 0);
+                    const sellLadderCatPlan = buildSellLadderCatPlan({
+                        midPrice,
+                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
+                            || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
+                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
+                            || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                        maxSell: configuredMaxSell,
+                        tierCounts: sellTierCountsForVerify,
+                        sellTierSizes: sellTierSizesForVerify,
+                    });
+                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     for (const t of tiers) {
                         const buyXch = Number(config[`buy_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const sellXch = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const buyCnt = parseInt(config[`buy_${t}_tier_count`] || config[countKey(t)] || 0);
                         const sellCnt = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
+                        const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
                         if (liquidityMode === 'buy_only') {
                             if (buyXch > 0) params.set(`${t}_xch`, String(buyXch));
                             if (buyCnt > 0) params.set(`${t}_count`, String(buyCnt));
                         } else if (liquidityMode === 'sell_only') {
-                            if (midPrice > 0 && sellXch > 0) params.set(`${t}_cat`, String(sellXch / midPrice));
+                            if (sellCatSize > 0) params.set(`${t}_cat`, String(sellCatSize * prepFactor));
                             if (sellCnt > 0) params.set(`${t}_count`, String(sellCnt));
                         } else {
                             const xch = Number(config[sizeKey(t)] || sellXch || 0);
                             const cnt = parseInt(config[countKey(t)] || sellCnt || 0);
                             if (xch > 0) params.set(`${t}_xch`, String(xch));
                             if (cnt > 0) params.set(`${t}_count`, String(cnt));
-                            if (midPrice > 0 && xch > 0) {
-                                params.set(`${t}_cat`, String(xch / midPrice));
+                            if (sellCatSize > 0) {
+                                params.set(`${t}_cat`, String(sellCatSize * prepFactor));
                             }
                         }
                     }
@@ -33479,6 +33745,10 @@ function closeCtgErrorModal() {
                 coinPrepMultiplier: Math.max(0.5, Math.min(3.0, parseFloat(config.coin_prep_multiplier) || 1)),
                 tierEnabled,
                 midPrice,
+                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
+                    || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
+                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
+                    || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(config.inner_size_xch) || tradeSize * 2,
                 midSize: parseFloat(config.mid_size_xch) || tradeSize,

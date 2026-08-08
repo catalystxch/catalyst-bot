@@ -134,6 +134,9 @@ class _DummyOfferManager:
     def detect_expiring_offers(self, *args, **kwargs):
         return []
 
+    def cleanup_expired_db_offers(self):
+        return []
+
     def retry_failed_cancels(self):
         return 0
 
@@ -400,6 +403,30 @@ class ProbeAnchorTests(unittest.TestCase):
     def tearDown(self):
         self._cfg_patcher.stop()
 
+    def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
+        self,
+    ):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+
+        class _StopAfterPrice:
+            def get_price(self, *args, **kwargs):
+                del args, kwargs
+                loop._running = False
+                return {"mid_price": Decimal("1.10"), "arb_gap_bps": 0}
+
+        class _FailingSyncOfferManager(_DummyOfferManager):
+            def sync_from_wallet(self):
+                raise AssertionError("wallet sync should not run after stop")
+
+        loop.price_engine = _StopAfterPrice()
+        loop.offer_manager = _FailingSyncOfferManager()
+
+        with patch.object(bot_loop, "log_event"):
+            loop._run_one_cycle()
+
+        self.assertEqual(loop._current_cycle_step, "idle")
+
     def test_watchdog_warning_noise_is_suppressed_between_milestones(self):
         loop = bot_loop.BotLoop()
         loop._watchdog_persistence_threshold = 5
@@ -645,6 +672,37 @@ class ProbeAnchorTests(unittest.TestCase):
             current_sell_count=2,
         )
 
+        self.assertEqual(targets["sell"], 4)
+
+    def test_local_expiry_rebuild_guard_overrides_zero_spare_adaptive_cap(self):
+        loop = bot_loop.BotLoop()
+        loop.coin_manager._tier_spares = {
+            "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+            "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+        }
+        loop._adaptive_target_backoff_until["sell"] = 1300.0
+
+        with (
+            patch.object(bot_loop.time, "time", return_value=1000.0),
+            patch.object(
+                bot_loop,
+                "get_offers_by_trade_ids",
+                return_value=[
+                    {"trade_id": "expired-sell", "side": "sell", "tier": "mid"},
+                    {"trade_id": "expired-probe", "side": "sell", "tier": "sniper"},
+                ],
+            ),
+        ):
+            marked = loop._mark_local_expiry_rebuild_needed({"expired-sell"})
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=1,
+            )
+
+        self.assertEqual(marked, {"sell": 1})
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
+        self.assertGreater(loop._expiry_rebuild_until["sell"], 1000.0)
         self.assertEqual(targets["sell"], 4)
 
     def test_confirmed_fills_clear_db_only_backoff_before_rebuild_targeting(self):

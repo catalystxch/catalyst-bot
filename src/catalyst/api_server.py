@@ -186,26 +186,31 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
     "/api/log",  # GUI flushes buffered log entries in bursts
 }
 
-# Dedicated limiter for /api/splash/incoming so an unbounded webhook flood
-# cannot amplify into runaway DB writes. The defaults are intentionally close
-# to the background classifier's drain rate; Splash gossip can burst hard on
-# startup and the bot only needs a bounded sample for current-run visibility.
+# Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
+# webhook flood cannot amplify into runaway DB writes.
 _SPLASH_RATE_LIMIT = {"window_s": 1.0, "hits": [], "lock": threading.Lock()}
 _SPLASH_BACKLOG_CACHE = {
     "checked_at": 0.0,
     "new_count": 0,
-    "ttl_s": 1.0,
     "lock": threading.Lock(),
 }
 _SPLASH_INCOMING_WRITE_LOCK = threading.Lock()
 
 
 def _splash_incoming_max_per_sec() -> int:
-    return max(1, int(getattr(cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 3) or 3))
+    try:
+        configured = int(getattr(cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 3) or 3)
+    except Exception:
+        configured = 3
+    return max(1, configured)
 
 
 def _splash_incoming_max_backlog() -> int:
-    return max(0, int(getattr(cfg, "SPLASH_RECEIVE_MAX_BACKLOG", 250) or 250))
+    try:
+        configured = int(getattr(cfg, "SPLASH_RECEIVE_MAX_BACKLOG", 250) or 0)
+    except Exception:
+        configured = 250
+    return max(0, configured)
 
 
 def _splash_incoming_rate_limited() -> bool:
@@ -225,40 +230,44 @@ def _splash_incoming_rate_limited() -> bool:
 
 
 def _splash_incoming_backlog_full() -> bool:
-    max_backlog = _splash_incoming_max_backlog()
-    if max_backlog <= 0:
+    import time as _t
+
+    limit = _splash_incoming_max_backlog()
+    if limit <= 0:
         return False
 
-    now = time.time()
+    now = _t.time()
     with _SPLASH_BACKLOG_CACHE["lock"]:
-        age = now - float(_SPLASH_BACKLOG_CACHE.get("checked_at", 0.0) or 0.0)
-        if age <= float(_SPLASH_BACKLOG_CACHE.get("ttl_s", 1.0) or 1.0):
-            return int(_SPLASH_BACKLOG_CACHE.get("new_count", 0) or 0) >= max_backlog
+        if now - float(_SPLASH_BACKLOG_CACHE["checked_at"] or 0.0) < 1.0:
+            return int(_SPLASH_BACKLOG_CACHE["new_count"] or 0) >= limit
 
     try:
         from database import get_splash_incoming_stats
 
         stats = get_splash_incoming_stats()
-        new_count = int(stats.get("new", 0) or 0)
-    except Exception:
+        new_count = int((stats or {}).get("new") or 0)
+    except Exception as e:
+        slog(
+            "API",
+            f"Splash incoming backlog check failed; accepting offer: {e}",
+            level="debug",
+        )
         return False
 
     with _SPLASH_BACKLOG_CACHE["lock"]:
         _SPLASH_BACKLOG_CACHE["checked_at"] = now
         _SPLASH_BACKLOG_CACHE["new_count"] = new_count
-    return new_count >= max_backlog
+    return new_count >= limit
 
 
 def _splash_incoming_note_recorded(was_new: bool) -> None:
     if not was_new:
         return
     with _SPLASH_BACKLOG_CACHE["lock"]:
-        checked_at = float(_SPLASH_BACKLOG_CACHE.get("checked_at", 0.0) or 0.0)
-        if checked_at <= 0:
-            return
-        _SPLASH_BACKLOG_CACHE["new_count"] = (
-            int(_SPLASH_BACKLOG_CACHE.get("new_count", 0) or 0) + 1
-        )
+        if float(_SPLASH_BACKLOG_CACHE["checked_at"] or 0.0) > 0.0:
+            _SPLASH_BACKLOG_CACHE["new_count"] = (
+                int(_SPLASH_BACKLOG_CACHE["new_count"] or 0) + 1
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1084,105 +1093,124 @@ _active_cat = {
 # Lock for multi-key mutations of _active_cat so readers never see a
 # half-updated pair (e.g. asset_id from the new CAT but decimals from the old).
 _active_cat_lock = threading.Lock()
+SAGE_ACTIVE_CAT_WALLET_ID = 2
 _balance_snapshot_lock = threading.Lock()
-_latest_balance_snapshot: Optional[dict] = None
+_latest_balance_snapshot: dict[str, Any] = {}
 
 
-def _normalize_snapshot_asset_id(asset_id) -> str:
-    return str(asset_id or "").strip().lower().replace("0x", "")
+def active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
+    if asset_id and get_wallet_type() == "sage":
+        return SAGE_ACTIVE_CAT_WALLET_ID
+    try:
+        return int(wallet_id)
+    except (TypeError, ValueError):
+        return int(getattr(cfg, "CAT_WALLET_ID", SAGE_ACTIVE_CAT_WALLET_ID))
 
 
-def _balance_snapshot_context() -> dict:
+def sync_active_cat_wallet_id(wallet_id=None, asset_id: str = "") -> int:
+    resolved_wallet_id = active_cat_wallet_id(wallet_id, asset_id)
     with _active_cat_lock:
-        asset_id = _active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
-        wallet_id = _active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", "")
+        _active_cat["wallet_id"] = resolved_wallet_id
+    if asset_id and get_wallet_type() == "sage":
+        cfg.CAT_WALLET_ID = resolved_wallet_id
+    return resolved_wallet_id
+
+
+def _balance_snapshot_payload(balances: dict | None) -> dict:
+    balances = balances or {}
+    xch = balances.get("xch") or {}
+    cat = balances.get("cat") or {}
     return {
-        "asset_id": _normalize_snapshot_asset_id(asset_id),
-        "wallet_id": str(wallet_id or ""),
-        "fingerprint": str(
-            getattr(cfg, "SAGE_FINGERPRINT", "")
-            or os.environ.get("SAGE_FINGERPRINT", "")
-            or ""
-        ),
+        "xch": {
+            "spendable": _safe_float(xch.get("spendable", 0)),
+            "total": _safe_float(xch.get("total", 0)),
+        },
+        "cat": {
+            "spendable": _safe_float(cat.get("spendable", 0)),
+            "total": _safe_float(cat.get("total", 0)),
+        },
     }
 
 
-def _coerce_balance_pair(balances) -> dict:
-    balances = balances or {}
-    coerced = {}
-    for side in ("xch", "cat"):
-        src = balances.get(side) if isinstance(balances, dict) else {}
-        if not isinstance(src, dict):
-            src = {}
-        coerced[side] = {
-            "total": _safe_float(src.get("total", 0)),
-            "spendable": _safe_float(src.get("spendable", 0)),
-        }
-    return coerced
-
-
-def _copy_balance_pair(balances) -> dict:
-    balances = balances or {}
-    return {
-        "xch": dict((balances.get("xch") if isinstance(balances, dict) else {}) or {}),
-        "cat": dict((balances.get("cat") if isinstance(balances, dict) else {}) or {}),
-    }
-
-
-def _balance_side_zero(balance: dict) -> bool:
+def _balance_side_zero(balance: dict | None) -> bool:
+    balance = balance or {}
     return (
-        _safe_float((balance or {}).get("total", 0)) <= 0
-        and _safe_float((balance or {}).get("spendable", 0)) <= 0
+        _safe_float(balance.get("total", 0)) <= 0
+        and _safe_float(balance.get("spendable", 0)) <= 0
     )
 
 
-def _balance_side_nonzero(balance: dict) -> bool:
+def _balance_side_nonzero(balance: dict | None) -> bool:
+    balance = balance or {}
     return (
-        _safe_float((balance or {}).get("total", 0)) > 0
-        or _safe_float((balance or {}).get("spendable", 0)) > 0
+        _safe_float(balance.get("total", 0)) > 0
+        or _safe_float(balance.get("spendable", 0)) > 0
     )
 
 
-def _snapshot_context_matches(snapshot: dict, context: dict) -> bool:
-    snap_context = (snapshot or {}).get("context") or {}
-    return all(
-        str(snap_context.get(key, "")) == str(context.get(key, ""))
-        for key in ("asset_id", "wallet_id", "fingerprint")
+def _balance_snapshot_context_matches(
+    snapshot: dict, *, asset_id: str = "", cat_wallet_id=None
+) -> bool:
+    cached_asset_id = str((snapshot or {}).get("asset_id") or "").strip().lower()
+    requested_asset_id = str(asset_id or "").strip().lower()
+    if requested_asset_id != cached_asset_id:
+        return False
+    try:
+        requested_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        requested_wallet_id = None
+    cached_wallet_id = (snapshot or {}).get("cat_wallet_id")
+    return not (
+        requested_wallet_id is not None
+        and cached_wallet_id is not None
+        and requested_wallet_id != cached_wallet_id
     )
 
 
-def cache_balance_snapshot(balances, source: str = "") -> dict:
-    """Remember the latest wallet-verified balances for the active pair.
+def cache_balance_snapshot(
+    *,
+    asset_id: str = "",
+    cat_wallet_id=None,
+    balances: dict | None = None,
+    source: str = "",
+) -> dict:
+    """Remember the last wallet-verified balance for status polls.
 
-    Sage can briefly return an empty CAT coin list while its DB is locked or
-    still syncing. If we already have a non-zero balance for this exact wallet
-    context, keep that value instead of poisoning the UI and Smart Settings.
+    /api/status avoids live wallet RPCs while the bot is idle. This cache lets
+    it echo an explicit balance refresh instead of overwriting the GUI with
+    synthetic zeroes on the next poll.
     """
-
-    global _latest_balance_snapshot  # noqa: PLW0603
-
-    context = _balance_snapshot_context()
-    incoming = _coerce_balance_pair(balances)
+    try:
+        normalized_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        normalized_wallet_id = None
+    incoming = _balance_snapshot_payload(balances)
     suspicious_zero_sides = []
     with _balance_snapshot_lock:
-        merged = _copy_balance_pair(incoming)
-        previous = _latest_balance_snapshot
-        if previous and _snapshot_context_matches(previous, context):
-            previous_balances = _coerce_balance_pair(previous.get("balances") or {})
+        previous = dict(_latest_balance_snapshot)
+        merged = _balance_snapshot_payload(incoming)
+        if previous and _balance_snapshot_context_matches(
+            previous, asset_id=asset_id, cat_wallet_id=normalized_wallet_id
+        ):
+            previous_balances = _balance_snapshot_payload(
+                previous.get("balances") or {}
+            )
             for side in ("xch", "cat"):
                 if _balance_side_zero(merged[side]) and _balance_side_nonzero(
                     previous_balances[side]
                 ):
                     merged[side] = dict(previous_balances[side])
                     suspicious_zero_sides.append(side)
-        _latest_balance_snapshot = {
-            "context": dict(context),
-            "balances": _copy_balance_pair(merged),
+        snapshot = {
+            "asset_id": str(asset_id or "").strip().lower(),
+            "cat_wallet_id": normalized_wallet_id,
+            "balances": _balance_snapshot_payload(merged),
             "source": str(source or ""),
             "updated_at": time.time(),
-            "suspicious_zero_sides": suspicious_zero_sides,
         }
-        result = _copy_balance_pair(_latest_balance_snapshot["balances"])
+        _latest_balance_snapshot.clear()
+        _latest_balance_snapshot.update(snapshot)
+        result = _balance_snapshot_payload(snapshot["balances"])
 
     if suspicious_zero_sides:
         try:
@@ -1192,41 +1220,66 @@ def cache_balance_snapshot(balances, source: str = "") -> dict:
                 + ", ".join(suspicious_zero_sides),
                 {
                     "source": source,
-                    "asset_id": context.get("asset_id"),
-                    "wallet_id": context.get("wallet_id"),
+                    "asset_id": snapshot["asset_id"],
+                    "cat_wallet_id": normalized_wallet_id,
                 },
                 level="warning",
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Failed to log transient zero balance read warning",
+                exc_info=True,
+            )
     return result
 
 
-def get_cached_balance_snapshot() -> Optional[dict]:
-    context = _balance_snapshot_context()
+def clear_balance_snapshot() -> None:
     with _balance_snapshot_lock:
-        snapshot = _latest_balance_snapshot
-        if not snapshot or not _snapshot_context_matches(snapshot, context):
-            return None
-        return _copy_balance_pair(snapshot.get("balances") or {})
+        _latest_balance_snapshot.clear()
 
 
-def merge_cached_balance_snapshot(balances) -> Optional[dict]:
-    cached = get_cached_balance_snapshot()
+def get_cached_balance_snapshot(
+    *, asset_id: str = "", cat_wallet_id=None
+) -> dict | None:
+    requested_asset_id = str(asset_id or "").strip().lower()
+    try:
+        requested_wallet_id = int(cat_wallet_id) if cat_wallet_id is not None else None
+    except (TypeError, ValueError):
+        requested_wallet_id = None
+    with _balance_snapshot_lock:
+        snapshot = dict(_latest_balance_snapshot)
+        balances = dict(snapshot.get("balances") or {})
+    if not snapshot or not balances:
+        return None
+    cached_asset_id = str(snapshot.get("asset_id") or "").strip().lower()
+    if requested_asset_id != cached_asset_id:
+        return None
+    cached_wallet_id = snapshot.get("cat_wallet_id")
+    if (
+        requested_wallet_id is not None
+        and cached_wallet_id is not None
+        and requested_wallet_id != cached_wallet_id
+    ):
+        return None
+    return _balance_snapshot_payload(balances)
+
+
+def merge_cached_balance_snapshot(
+    *, asset_id: str = "", cat_wallet_id=None, balances: dict | None = None
+) -> dict | None:
+    cached = get_cached_balance_snapshot(
+        asset_id=asset_id,
+        cat_wallet_id=cat_wallet_id,
+    )
     if not cached:
         return None
-    merged = _coerce_balance_pair(balances)
-    cached = _coerce_balance_pair(cached)
+    merged = _balance_snapshot_payload(balances)
     for side in ("xch", "cat"):
-        if _balance_side_zero(merged[side]) and _balance_side_nonzero(cached[side]):
+        if _balance_side_zero(merged[side]) and _balance_side_nonzero(
+            cached.get(side) or {}
+        ):
             merged[side] = dict(cached[side])
     return merged
-
-
-def clear_balance_snapshot() -> None:
-    global _latest_balance_snapshot  # noqa: PLW0603
-    with _balance_snapshot_lock:
-        _latest_balance_snapshot = None
 
 
 # Auto-fix: Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
@@ -2456,6 +2509,31 @@ def api_sage_latest_release():
 # api_bot_state moved to blueprint
 
 
+def _health_consecutive_failures(raw_health: dict) -> int:
+    """Count a live health probe as failed when wallet or node is unreachable."""
+    if not isinstance(raw_health, dict):
+        return 1
+    existing = raw_health.get("consecutive_failures")
+    if existing is not None:
+        try:
+            return max(0, int(existing))
+        except (TypeError, ValueError):
+            pass
+    if raw_health.get("healthy") is True:
+        return 0
+    wallet = raw_health.get("wallet") or {}
+    node = raw_health.get("node") or {}
+    wallet_bad = wallet.get("reachable") is False
+    node_bad = node.get("reachable") is False
+    status_bad = str(raw_health.get("status", "")).lower() in {
+        "unreachable",
+        "rpc_failed",
+        "error",
+        "unknown",
+    }
+    return 1 if wallet_bad or node_bad or status_bad else 0
+
+
 def _get_health_snapshot() -> dict:
     """Quick health check for /api/status when bot hasn't started yet."""
     import chia_node
@@ -2481,33 +2559,6 @@ def _get_health_snapshot() -> dict:
         }
     except Exception:
         return {"status": "unknown", "consecutive_failures": 1}
-
-
-def _health_consecutive_failures(raw_health: dict) -> int:
-    """Best-effort failure count for one-shot health snapshots.
-
-    BotLoop tracks a real consecutive counter while running. Idle endpoints only
-    have the current live check, so report at least one failure when that check
-    is unhealthy instead of showing "rpc_failed" with zero failures.
-    """
-    raw_health = raw_health or {}
-    for source in (
-        raw_health,
-        raw_health.get("wallet") or {},
-        raw_health.get("node") or {},
-    ):
-        if "consecutive_failures" not in source:
-            continue
-        try:
-            return max(0, int(source.get("consecutive_failures") or 0))
-        except Exception:
-            continue
-
-    status = str(raw_health.get("status") or "unknown").strip().lower()
-    healthy = bool(raw_health.get("healthy", False))
-    if healthy or status in ("healthy", "ok", "not_started"):
-        return 0
-    return 1
 
 
 # api_status moved to blueprint

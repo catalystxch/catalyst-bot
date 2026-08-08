@@ -40,7 +40,7 @@ def test_release_workflow_uses_env_for_github_ref_in_shell_steps():
     workflow = _read(".github/workflows/build-release.yml")
 
     shell_blocks = re.findall(
-        r"\n        run: \|\n(.*?)(?=\n\n      - name:|\Z)",
+        r"\n        run: \|\n(.*?)(?=\n\n      - name:|\n\n  [A-Za-z0-9_-]+:|\Z)",
         workflow,
         flags=re.S,
     )

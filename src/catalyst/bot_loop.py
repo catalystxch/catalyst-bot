@@ -112,6 +112,46 @@ def _format_sage_cleanup_skip_summary(total: int, new: int, repeated: int) -> st
     )
 
 
+def _normalize_coin_id_value(coin_id: object) -> str:
+    cid = str(coin_id or "").strip().lower()
+    if cid and not cid.startswith("0x"):
+        cid = "0x" + cid
+    return cid
+
+
+def _count_wallet_confirmed_external_locks(
+    locked_rows, active_trade_ids, wallet_confirmed_locked_ids
+) -> int:
+    """Count DB locks that are both non-book and wallet-confirmed locked."""
+    active_trade_ids = {str(tid or "") for tid in (active_trade_ids or set())}
+    wallet_locked_ids = {
+        _normalize_coin_id_value(cid) for cid in (wallet_confirmed_locked_ids or set())
+    }
+    count = 0
+    for row in locked_rows or []:
+        trade_id = str(row.get("trade_id") or "")
+        coin_id = _normalize_coin_id_value(row.get("coin_id"))
+        if trade_id in active_trade_ids:
+            continue
+        if coin_id and coin_id in wallet_locked_ids:
+            count += 1
+    return count
+
+
+def _get_wallet_confirmed_locked_coin_ids() -> set:
+    try:
+        from bot_health import _wallet_confirmed_locked_coin_ids
+
+        return _wallet_confirmed_locked_coin_ids()
+    except Exception as e:
+        slog(
+            "BOT_HEALTH",
+            f"Could not fetch wallet-confirmed locked coins for invariant check: {e}",
+            level="debug",
+        )
+        return set()
+
+
 def _find_cat_deposit_for_position_delta(delta_cat, scale, baseline_at=0):
     """Return a recent external CAT deposit coin matching a positive delta."""
     try:
@@ -397,6 +437,8 @@ class BotLoop:
         # ---- Loop state ----
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+        self._stop_finalize_thread: Optional[threading.Thread] = None
+        self._stop_finalize_lock = threading.Lock()
         self._loop_count: int = 0
         self._start_time: float = 0  # Set when bot starts, used for uptime
         self._last_loop_duration: float = 0
@@ -769,6 +811,10 @@ class BotLoop:
         }
         self._create_disabled_log_cooldown: float = 60.0
         self._adaptive_target_backoff_until: Dict[str, float] = {
+            "buy": 0.0,
+            "sell": 0.0,
+        }
+        self._expiry_rebuild_until: Dict[str, float] = {
             "buy": 0.0,
             "sell": 0.0,
         }
@@ -1534,6 +1580,15 @@ class BotLoop:
             live_count = min(current[side], full_target)
             spare_count = self._available_tier_spares_for_side(side)
             if spare_count is None:
+                targets[side] = full_target
+                continue
+            expiry_rebuild_remaining = max(
+                0.0, float(self._expiry_rebuild_until.get(side, 0.0) or 0.0) - now
+            )
+            if expiry_rebuild_remaining > 0 and live_count >= full_target:
+                self._expiry_rebuild_until[side] = 0.0
+                expiry_rebuild_remaining = 0.0
+            if expiry_rebuild_remaining > 0:
                 targets[side] = full_target
                 continue
             affordable_target = min(full_target, live_count + spare_count)
@@ -2550,6 +2605,47 @@ class BotLoop:
                 _fill_payload(fill, "buy") for fill in (buy_fills or [])
             ] + [_fill_payload(fill, "sell") for fill in (sell_fills or [])]
 
+            wallet_open = list(open_buys or []) + list(open_sells or [])
+            wallet_trade_ids = [
+                str((offer or {}).get("trade_id") or "")
+                for offer in wallet_open
+                if (offer or {}).get("trade_id")
+            ]
+            db_offer_by_id = {}
+            if wallet_trade_ids:
+                try:
+                    db_offer_by_id = {
+                        str((offer or {}).get("trade_id") or ""): offer
+                        for offer in get_offers_by_trade_ids(wallet_trade_ids)
+                        if (offer or {}).get("trade_id")
+                    }
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "toxicity_bootstrap_tier_lookup_failed",
+                        f"Could not load offer tiers for toxicity bootstrap check: {e}",
+                    )
+
+            def _is_normal_book_offer(offer: Dict) -> bool:
+                trade_id = str((offer or {}).get("trade_id") or "")
+                db_offer = db_offer_by_id.get(trade_id) or {}
+                tier = (
+                    str((offer or {}).get("tier") or db_offer.get("tier") or "")
+                    .strip()
+                    .lower()
+                )
+                return tier not in {"sniper", "boost"}
+
+            normal_book_count = sum(
+                1 for offer in wallet_open if _is_normal_book_offer(offer)
+            )
+            recovery_state = getattr(self, "_recovery_state", {}) or {}
+            book_bootstrap = (
+                not bool(recovery_state.get("book_ever_at_target"))
+                and normal_book_count <= 0
+                and not recent_fills
+            )
+
             open_offers = []
             for side, offers in (("buy", open_buys or []), ("sell", open_sells or [])):
                 for offer in offers:
@@ -2601,6 +2697,7 @@ class BotLoop:
                 liquidity_mode=str(
                     getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
                 ),
+                book_bootstrap=book_bootstrap,
             )
             snapshot = self.market_toxicity_guard.update(context)
             self.risk_manager.set_market_toxicity(snapshot)
@@ -2770,6 +2867,93 @@ class BotLoop:
                     ]
                 },
             )
+
+    def _mark_local_expiry_rebuild_needed(
+        self, trade_ids, now_ts: Optional[float] = None
+    ) -> Dict[str, int]:
+        """Temporarily keep expired sides at full target while freed coins settle."""
+        ids = {
+            str(tid or "").strip()
+            for tid in (trade_ids or [])
+            if str(tid or "").strip()
+        }
+        if not ids:
+            return {}
+
+        rows = []
+        try:
+            rows = list(get_offers_by_trade_ids(sorted(ids)) or [])
+        except Exception as e:
+            log_event(
+                "debug",
+                "local_expiry_rebuild_lookup_failed",
+                f"Could not batch-load expired offer rows for rebuild targeting: {e}",
+            )
+            rows = []
+
+        seen = {
+            str((row or {}).get("trade_id") or "").strip()
+            for row in rows
+            if (row or {}).get("trade_id")
+        }
+        for tid in sorted(ids - seen):
+            try:
+                row = get_offer(tid) or {}
+            except Exception:
+                row = {}
+            if row:
+                rows.append(row)
+
+        counts = {"buy": 0, "sell": 0}
+        for row in rows:
+            tid = str((row or {}).get("trade_id") or "").strip()
+            if tid and tid not in ids:
+                continue
+            side = str((row or {}).get("side") or "").strip().lower()
+            if side not in counts:
+                continue
+            tier = str((row or {}).get("tier") or "").strip().lower()
+            if tier in {"sniper", "boost"}:
+                continue
+            counts[side] += 1
+
+        counts = {side: count for side, count in counts.items() if count > 0}
+        if not counts:
+            return {}
+
+        now = float(now_ts if now_ts is not None else time.time())
+        try:
+            configured_grace = float(
+                getattr(cfg, "EXPIRY_REBUILD_TARGET_GRACE_SECS", 600) or 600
+            )
+        except Exception:
+            configured_grace = 600.0
+        try:
+            min_grace = 2.0 * float(getattr(cfg, "LOOP_SECONDS", 60) or 60)
+        except Exception:
+            min_grace = 120.0
+        grace_secs = max(60.0, min_grace, configured_grace)
+
+        for side in counts:
+            current_until = float(self._expiry_rebuild_until.get(side, 0.0) or 0.0)
+            self._expiry_rebuild_until[side] = max(current_until, now + grace_secs)
+            if float(self._adaptive_target_backoff_until.get(side, 0.0) or 0.0) > 0:
+                self._adaptive_target_backoff_until[side] = 0.0
+
+        summary = ", ".join(f"{side}={count}" for side, count in sorted(counts.items()))
+        log_event(
+            "warning",
+            "local_expiry_rebuild_target_guard",
+            f"Locally expired offer(s) retired ({summary}); holding affected "
+            f"side target(s) at full ladder size for {grace_secs:.0f}s so "
+            "the bot can rebuild from the coins released by expiry.",
+            data={
+                "expired_counts": counts,
+                "trade_ids": sorted(ids)[:50],
+                "grace_secs": round(grace_secs, 1),
+            },
+        )
+        return counts
 
     def _probe_has_matured(
         self, probe: Optional[Dict] = None, now_ts: Optional[float] = None
@@ -3611,12 +3795,28 @@ class BotLoop:
         except Exception:
             return
 
-        # Count DB-locked coins per wallet type.
+        # Count DB-locked coins per wallet type. Locks tied to non-book trade
+        # ids can be legitimate external Sage activity, such as NFT offers
+        # made from the same wallet, but only subtract them from the
+        # active-book invariant when Sage still confirms the coin is
+        # offer-locked. Stale Catalyst DB locks must remain visible here.
         try:
-            xch_locked = len(get_locked_coins("xch") or [])
-            cat_locked = len(get_locked_coins("cat") or [])
+            xch_locked_rows = get_locked_coins("xch") or []
+            cat_locked_rows = get_locked_coins("cat") or []
+            xch_locked = len(xch_locked_rows)
+            cat_locked = len(cat_locked_rows)
+            buy_trade_ids = {o.get("trade_id") for o in db_buys if o.get("trade_id")}
+            sell_trade_ids = {o.get("trade_id") for o in db_sells if o.get("trade_id")}
+            wallet_confirmed_locked_ids = _get_wallet_confirmed_locked_coin_ids()
+            xch_external_locked = _count_wallet_confirmed_external_locks(
+                xch_locked_rows, buy_trade_ids, wallet_confirmed_locked_ids
+            )
+            cat_external_locked = _count_wallet_confirmed_external_locks(
+                cat_locked_rows, sell_trade_ids, wallet_confirmed_locked_ids
+            )
         except Exception:
             xch_locked = cat_locked = 0
+            xch_external_locked = cat_external_locked = 0
 
         # Per-side layout detection. The watchdog's "reversed" mode expects
         # inner to be the LARGEST tier; "standard" expects inner SMALLEST.
@@ -3685,6 +3885,10 @@ class BotLoop:
             wallet_totals=wallet_totals,
             inventory=inventory_dict,
             db_locked_count={"xch": xch_locked, "cat": cat_locked},
+            external_locked_count={
+                "xch": xch_external_locked,
+                "cat": cat_external_locked,
+            },
         )
 
         # Persistence: track (side, code) → consecutive-pass streak.
@@ -4247,6 +4451,7 @@ class BotLoop:
         except Exception as exc:
             note_reset_failure("dynamic_amm_buffer", exc)
         self._adaptive_target_backoff_until = {"buy": 0.0, "sell": 0.0}
+        self._expiry_rebuild_until = {"buy": 0.0, "sell": 0.0}
         self._last_adaptive_offer_targets = {"buy": 0, "sell": 0}
         self._last_pricing_success_ts = 0
         # Reset position baselines so stale wallet comparisons from the
@@ -4270,6 +4475,14 @@ class BotLoop:
         Returns True if started, False if already running.
         """
         if self._running:
+            return False
+        if self._stop_finalize_thread and self._stop_finalize_thread.is_alive():
+            self._set_state(running=False, status="stopping")
+            log_event(
+                "warning",
+                "bot_start_blocked_stopping",
+                "Bot is still finishing the previous stop; wait for it to fully stop before starting again",
+            )
             return False
 
         self._reset_runtime_state()
@@ -4509,12 +4722,18 @@ class BotLoop:
         )
         return True
 
-    def stop(self) -> bool:
+    def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
 
         Returns True if stopped, False if not running.
         """
         if not self._running:
+            if (
+                wait
+                and self._stop_finalize_thread
+                and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread.join(timeout=90)
             return False
 
         self._running = False
@@ -4525,6 +4744,22 @@ class BotLoop:
         # minutes after stop() returns, because the 10s join timeout
         # expires but the thread is still alive creating offers.
         self.offer_manager._stop_requested = True
+
+        # Wake sleeping threads promptly. For GUI/API stop we return after
+        # this signal and let the finalizer perform joins/cleanup.
+        self._watcher_event.set()
+        if not wait:
+            if not (
+                self._stop_finalize_thread and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+            return True
+
         try:
             self.coin_manager.stop_topup(wait_secs=10)
         except Exception as e:
@@ -4605,6 +4840,91 @@ class BotLoop:
 
         log_event("info", "bot_stopped", "Bot loop stopped")
         return True
+
+    def _finalize_stop(self) -> None:
+        """Finish stop cleanup after the running flag has been cleared."""
+        with self._stop_finalize_lock:
+            try:
+                self.coin_manager.stop_topup(wait_secs=10)
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "stop_topup_failed",
+                    f"stop_topup raised during shutdown: {e}",
+                )
+
+            self._watcher_event.set()
+
+            try:
+                self.amm_monitor.stop()
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "amm_monitor_stop_failed",
+                    f"AMM Monitor stop raised during shutdown: {e}",
+                )
+
+            if _mempool_watcher_mod:
+                try:
+                    _mempool_watcher_mod.stop_watcher()
+                except Exception as e:
+                    log_event(
+                        "debug",
+                        "mempool_watcher_stop_failed",
+                        f"Mempool watcher stop raised during shutdown: {e}",
+                    )
+
+            if (
+                self._thread
+                and self._thread.is_alive()
+                and self._thread is not threading.current_thread()
+            ):
+                self._thread.join(timeout=30)
+
+            if self._splash_receive_thread and self._splash_receive_thread.is_alive():
+                self._splash_receive_thread.join(timeout=5)
+
+            for _t_name, _t_ref in [
+                ("health_monitor", self._health_thread),
+                ("price_watcher", self._watcher_thread),
+                ("coin_watcher", self._coin_watcher_thread),
+                ("dexie_repost", self._startup_repost_thread),
+            ]:
+                if _t_ref and _t_ref.is_alive():
+                    _t_ref.join(timeout=10)
+                    if _t_ref.is_alive():
+                        log_event(
+                            "warning",
+                            "thread_join_timeout",
+                            f"{_t_name} thread did not exit within 10s",
+                        )
+
+            try:
+                splash_running = bool(self.splash_node.is_running())
+            except Exception:
+                splash_running = False
+            if splash_running:
+                try:
+                    self.splash_node.stop()
+                except Exception as e:
+                    log_event(
+                        "debug",
+                        "splash_node_stop_failed",
+                        f"Splash node stop raised during shutdown: {e}",
+                    )
+
+            self._set_state(running=False, status="stopped")
+
+            for alert_id in (
+                "circuit_breaker",
+                "bot_recovery",
+                "cancel_retries",
+                "buy_disabled",
+                "sell_disabled",
+            ):
+                self._clear_alert(alert_id)
+
+            log_event("info", "bot_stopped", "Bot loop stopped")
 
     def is_running(self) -> bool:
         """Check if the bot loop is running."""
@@ -6529,7 +6849,7 @@ class BotLoop:
             try:
                 from database import get_open_offers, batch_cancel_stale_offers
 
-                db_open = get_open_offers()
+                db_open = get_open_offers(include_elapsed=True)
                 log_event(
                     "info",
                     "db_cleanup_start",
@@ -6833,6 +7153,30 @@ class BotLoop:
             except Exception as e:
                 log_event(
                     "warning", "db_cleanup_failed", f"DB offer cleanup failed: {e}"
+                )
+
+            locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
+            if locally_expired_ids:
+                self._mark_local_expiry_rebuild_needed(locally_expired_ids)
+                open_buys = [
+                    o for o in open_buys if o.get("trade_id") not in locally_expired_ids
+                ]
+                open_sells = [
+                    o
+                    for o in open_sells
+                    if o.get("trade_id") not in locally_expired_ids
+                ]
+                buy_ids = {
+                    o.get("trade_id", "") for o in open_buys if o.get("trade_id")
+                }
+                sell_ids = {
+                    o.get("trade_id", "") for o in open_sells if o.get("trade_id")
+                }
+                wallet_open_ids = buy_ids | sell_ids
+                log_event(
+                    "info",
+                    "startup_local_expired_filtered",
+                    f"Retired and filtered {len(locally_expired_ids)} locally expired open offer(s) after startup reconciliation",
                 )
 
             recovered_startup_trade_ids = set()
@@ -7671,6 +8015,7 @@ class BotLoop:
 
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
+        self._cycle_started_running = bool(self._running)
         self._recovery_state["cycle_probe_churn"] = False
         self._recovery_state["cycle_create_stalled"] = False
         self._requoted_this_cycle: set = set()  # sides requoted in step 9
@@ -7946,6 +8291,9 @@ class BotLoop:
             log_event("warning", "no_price", "Could not fetch price — skipping cycle")
             return
 
+        if self._cycle_stop_requested("price_fetch"):
+            return
+
         self._current_mid_price = mid_price
         self._set_state(mid_price=str(mid_price))
 
@@ -8067,6 +8415,18 @@ class BotLoop:
                     "overall_best_ask": str(intel_data.get("overall_best_ask", "0")),
                     "buy_depth_xch": str(intel_data.get("buy_depth_xch", "0")),
                     "sell_depth_xch": str(intel_data.get("sell_depth_xch", "0")),
+                    "dexie_total_buy_depth_xch": str(
+                        intel_data.get("dexie_total_buy_depth_xch", "0")
+                    ),
+                    "dexie_total_buy_depth_cat": str(
+                        intel_data.get("dexie_total_buy_depth_cat", "0")
+                    ),
+                    "dexie_total_sell_depth_xch": str(
+                        intel_data.get("dexie_total_sell_depth_xch", "0")
+                    ),
+                    "dexie_total_sell_depth_cat": str(
+                        intel_data.get("dexie_total_sell_depth_cat", "0")
+                    ),
                     "num_buy_offers": intel_data.get("num_buy_offers", 0),
                     "num_sell_offers": intel_data.get("num_sell_offers", 0),
                     "thin_side": intel_data.get("thin_side", ""),
@@ -8157,6 +8517,9 @@ class BotLoop:
             self._clear_alert("circuit_breaker")
             self._circuit_breaker_offer_safed = False
 
+        if self._cycle_stop_requested("pre_wallet_sync"):
+            return
+
         # ---- Step 3: Get current offers from wallet ----
         self._set_cycle_step("step3_wallet_sync")
         print("   [3] Syncing offers from wallet...", end="", flush=True)
@@ -8164,6 +8527,23 @@ class BotLoop:
         open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
         wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
+        locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
+        if locally_expired_ids:
+            self._mark_local_expiry_rebuild_needed(locally_expired_ids)
+            open_buys = [
+                o for o in open_buys if o.get("trade_id") not in locally_expired_ids
+            ]
+            open_sells = [
+                o for o in open_sells if o.get("trade_id") not in locally_expired_ids
+            ]
+            closed = list(closed or []) + [
+                {"trade_id": tid, "status": "expired"} for tid in locally_expired_ids
+            ]
+            log_event(
+                "info",
+                "wallet_open_expired_filtered",
+                f"Filtered {len(locally_expired_ids)} locally expired offer(s) out of the live wallet book",
+            )
         self._last_live_offer_edges = self._get_live_offer_edges(open_buys, open_sells)
 
         current_buy_ids = {
@@ -8444,6 +8824,9 @@ class BotLoop:
             self._clear_alert("wallet_offer_sync")
             self._wallet_sync_was_stale = False
 
+        if self._cycle_stop_requested("post_wallet_sync"):
+            return
+
         # ---- Step 4: Detect fills ----
         self._set_cycle_step("step4_fill_detection")
         # F11 fix (2026-04-08): drain any pending mempool watcher signals
@@ -8714,7 +9097,15 @@ class BotLoop:
             and not getattr(self, "_graceful_in_progress", False)
             and not self._recovery_is_active()
         ):
-            all_open = open_buys + open_sells
+            all_open = list(open_buys) + list(open_sells)
+            try:
+                all_open.extend(list(_db_buy_all) + list(_db_sell_all))
+            except Exception as e:
+                log_event(
+                    "debug",
+                    "expiry_refresh_db_merge_failed",
+                    f"Expiry refresh proceeding with wallet-open offers only: {e}",
+                )
             expiring_tids = self.offer_manager.detect_expiring_offers(
                 all_open, refresh_before_secs=cfg.OFFER_REFRESH_BEFORE
             )
@@ -9918,6 +10309,9 @@ class BotLoop:
                     flush=True,
                 )
 
+        if self._cycle_stop_requested("pre_requote"):
+            return
+
         # ---- Step 9: Requote if price moved or forced by convergence ----
         self._set_cycle_step("step9_requote")
         force_buy = self._force_requote.get("buy", False)
@@ -10083,6 +10477,9 @@ class BotLoop:
                 f"Reserve floor check failed (non-fatal): {_rf_err}",
             )
 
+        if self._cycle_stop_requested("pre_create"):
+            return
+
         # ---- Step 10: Create new offers if needed ----
         self._set_cycle_step("step10_create_offers")
         # Cap is based on DB-open count (_db_open_*_ids) so zombie wallet offers
@@ -10132,6 +10529,9 @@ class BotLoop:
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
         )
+
+        if self._cycle_stop_requested("post_create"):
+            return
 
         self._flush_public_offer_queues()
 
@@ -12996,6 +13396,18 @@ class BotLoop:
                 self._clear_alert("step_sla")
             except Exception:
                 pass
+
+    def _cycle_stop_requested(self, step_name: str) -> bool:
+        """Return True when the current cycle should stop immediately."""
+        if self._running or not getattr(self, "_cycle_started_running", False):
+            return False
+        self._set_cycle_step("idle")
+        log_event(
+            "info",
+            "cycle_stop_requested",
+            f"Stop requested during {step_name}; ending current cycle before more trading actions",
+        )
+        return True
 
     def _check_step_sla(self) -> None:
         """F27 (2026-04-08): SLA timer for individual cycle steps.

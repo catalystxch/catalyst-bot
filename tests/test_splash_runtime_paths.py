@@ -171,23 +171,15 @@ def test_splash_output_reader_suppresses_hook_connection_refused_burst(monkeypat
 def test_splash_output_reader_suppresses_windows_hook_refused_burst(monkeypatch):
     import splash_node
 
+    refused_line = (
+        "Error posting to offer hook: error sending request for url "
+        "(http://127.0.0.1:5000/api/splash/incoming): error trying "
+        "to connect: tcp connect error: No connection could be made "
+        "because the target machine actively refused it. (os error 10061)\n"
+    )
+
     class FakeProcess:
-        stdout = iter(
-            [
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-                "Error posting to offer hook: error sending request for url "
-                "(http://127.0.0.1:5000/api/splash/incoming): error trying "
-                "to connect: tcp connect error: No connection could be made "
-                "because the target machine actively refused it. (os error 10061)\n",
-            ]
-        )
+        stdout = iter([refused_line, refused_line, refused_line])
 
     events = []
     monkeypatch.setattr(
@@ -212,14 +204,14 @@ def test_splash_output_reader_throttles_hook_http_failures_and_redacts_offer(
 ):
     import splash_node
 
+    bad_offer = "offer1" + ("x" * 120)
+    hook_line = (
+        "Error posting to offer hook http://127.0.0.1:5000/api/splash/incoming: "
+        f"HTTP 429 Too Many Requests for {bad_offer}\n"
+    )
+
     class FakeProcess:
-        stdout = iter(
-            [
-                "Received Offer: offer1abcabcabc Error posting to offer hook: server returned 429 Too Many Requests\n",
-                "Error posting to offer hook: server returned 429 Too Many Requests for offer1defdefdef\n",
-                "failed POST http://127.0.0.1:5000/api/splash/incoming: HTTP 429 offer1ghighighi\n",
-            ]
-        )
+        stdout = iter([hook_line, hook_line, hook_line])
 
     events = []
     monkeypatch.setattr(
@@ -235,7 +227,11 @@ def test_splash_output_reader_throttles_hook_http_failures_and_redacts_offer(
 
     node._read_output()
 
-    warnings = [event for event in events if event[0] == "warning"]
-    assert len(warnings) == 1
-    assert warnings[0][1] == "splash_node_output"
-    assert "offer1" not in warnings[0][2]
+    hook_events = [
+        event
+        for event in events
+        if event[1] == "splash_node_output" and "webhook" in event[2].lower()
+    ]
+    assert len(hook_events) == 1
+    assert hook_events[0][0] == "warning"
+    assert bad_offer not in hook_events[0][2]

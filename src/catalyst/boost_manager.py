@@ -297,55 +297,84 @@ class BoostManager:
             "warnings": warnings,
         }
 
-    def _create_inverted_probe_pair(self, mid_price: Decimal) -> List[Dict]:
-        """Create one BUY (overpay) + one SELL (underprice) inverted probe.
+    def _next_inverted_probe_side(self) -> Optional[str]:
+        """Return the next enabled, unsettled probe side to create/push."""
+        ordered = ["buy", "sell"] if self._next_step_is_buy else ["sell", "buy"]
+        for side in ordered:
+            if side == "buy" and cfg.ENABLE_BUY and not self._buy_settled:
+                return "buy"
+            if side == "sell" and cfg.ENABLE_SELL and not self._sell_settled:
+                return "sell"
+        return None
 
-        Uses self._buy_offset_bps and self._sell_offset_bps. Tracks the
-        resulting trade IDs separately in _buy_probe_tid / _sell_probe_tid
-        so prune_active_boosts can identify which side was arbed.
-        """
+    def _track_inverted_probe_result(self, side: str, result: Dict) -> None:
+        tid = result.get("trade_id", "")
+        if not tid:
+            return
+        if side == "buy":
+            self._buy_probe_tid = tid
+            self._buy_probe_tid_history.add(tid)
+        else:
+            self._sell_probe_tid = tid
+            self._sell_probe_tid_history.add(tid)
+        self._active_boost_ids.append(tid)
+        self._session_total_probes_created += 1
+
+    def _post_inverted_probe_offers(self, created: List[Dict]) -> None:
+        if not created or not self._dexie_manager or not cfg.DEXIE_AUTO_POST:
+            return
+        for offer in created:
+            bech32 = offer.get("offer_bech32", "")
+            trade_id = offer.get("trade_id", "")
+            if bech32 and trade_id:
+                self._dexie_manager._post_single(bech32, trade_id, force=True)
+
+    def _create_inverted_probe_side(
+        self, side: str, mid_price: Decimal
+    ) -> Optional[Dict]:
+        """Create and track a single inverted probe side."""
         size_xch = self._effective_size_xch()
-        buy_price = mid_price * (
-            Decimal("1") + Decimal(self._buy_offset_bps) / Decimal("10000")
-        )
-        sell_price = mid_price * (
-            Decimal("1") - Decimal(self._sell_offset_bps) / Decimal("10000")
-        )
+        if side == "buy":
+            if not cfg.ENABLE_BUY or self._buy_settled:
+                return None
+            price = mid_price * (
+                Decimal("1") + Decimal(self._buy_offset_bps) / Decimal("10000")
+            )
+        elif side == "sell":
+            if not cfg.ENABLE_SELL or self._sell_settled:
+                return None
+            price = mid_price * (
+                Decimal("1") - Decimal(self._sell_offset_bps) / Decimal("10000")
+            )
+        else:
+            return None
 
-        created = []
+        result = self._create_single_offer(side, price, size_xch)
+        if not result:
+            return None
+        self._track_inverted_probe_result(side, result)
+        return result
 
-        if cfg.ENABLE_BUY and not self._buy_settled:
-            buy_result = self._create_single_offer("buy", buy_price, size_xch)
-            if buy_result:
-                created.append(buy_result)
-                tid = buy_result.get("trade_id", "")
-                if tid:
-                    self._buy_probe_tid = tid
-                    self._buy_probe_tid_history.add(tid)
-                    self._active_boost_ids.append(tid)
-                    self._session_total_probes_created += 1
+    def _create_inverted_probe_pair(self, mid_price: Decimal) -> List[Dict]:
+        """Create one enabled inverted probe side.
 
-        if cfg.ENABLE_SELL and not self._sell_settled:
-            sell_result = self._create_single_offer("sell", sell_price, size_xch)
-            if sell_result:
-                created.append(sell_result)
-                tid = sell_result.get("trade_id", "")
-                if tid:
-                    self._sell_probe_tid = tid
-                    self._sell_probe_tid_history.add(tid)
-                    self._active_boost_ids.append(tid)
-                    self._session_total_probes_created += 1
+        The historic method name is retained for callers, but the safety
+        invariant is now one crossed probe at a time. Posting both an
+        over-mid BUY and under-mid SELL from the same wallet lets direct
+        routes self-fill before public indexing.
+        """
+        side = self._next_inverted_probe_side()
+        if not side:
+            return []
 
-        # Post to Dexie immediately
-        if created and self._dexie_manager and cfg.DEXIE_AUTO_POST:
-            for offer in created:
-                bech32 = offer.get("offer_bech32", "")
-                trade_id = offer.get("trade_id", "")
-                if bech32 and trade_id:
-                    self._dexie_manager._post_single(bech32, trade_id, force=True)
+        result = self._create_inverted_probe_side(side, mid_price)
+        created = [result] if result else []
+
+        self._post_inverted_probe_offers(created)
 
         if created:
             self._boost_mid_price = mid_price
+            self._next_step_is_buy = side == "sell"
 
         return created
 
@@ -681,14 +710,44 @@ class BoostManager:
 
         side_action = False
 
-        # Throttle: only push ONE side per cycle to avoid mempool conflicts
-        # from simultaneous cancel+create on both BUY and SELL. We alternate.
-        # If the side we'd push is already settled, fall through to the other.
-        push_buy_first = self._next_step_is_buy
-        if push_buy_first and self._buy_settled:
-            push_buy_first = False  # buy done, try sell
-        elif not push_buy_first and self._sell_settled:
-            push_buy_first = True  # sell done, try buy
+        # Throttle: only touch ONE side per cycle. This avoids both mempool
+        # conflicts and crossed same-wallet probes self-filling through direct
+        # routes before public indexers see them.
+        selected_side = self._next_inverted_probe_side()
+        if not selected_side:
+            return False
+        push_buy_first = selected_side == "buy"
+
+        missing_side = None
+        if push_buy_first and not (
+            self._buy_probe_tid and self._buy_probe_tid in self._active_boost_ids
+        ):
+            missing_side = "buy"
+        elif (not push_buy_first) and not (
+            self._sell_probe_tid and self._sell_probe_tid in self._active_boost_ids
+        ):
+            missing_side = "sell"
+
+        if missing_side:
+            result = self._create_inverted_probe_side(
+                missing_side, self._boost_mid_price
+            )
+            if not result:
+                return False
+            self._post_inverted_probe_offers([result])
+            self._steps_taken += 1
+            self._last_step_time = now
+            self._stable_since = now
+            self._next_step_is_buy = missing_side == "sell"
+            log_event(
+                "info",
+                f"gap_closer_{missing_side}_probe_created",
+                f"Close the Gap {missing_side.upper()} probe created at "
+                f"{'+' if missing_side == 'buy' else '-'}"
+                f"{_bps_to_pct(self._buy_offset_bps if missing_side == 'buy' else self._sell_offset_bps)} "
+                "past mid (single-sided safety cadence)",
+            )
+            return True
 
         # --- BUY side: if probe survived, push deeper ---
         if (

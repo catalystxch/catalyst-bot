@@ -128,6 +128,40 @@ WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1000
 WINDOW_MIN_WIDTH = 1000
 WINDOW_MIN_HEIGHT = 700
+
+
+def _configure_linux_webengine_env() -> None:
+    """Configure embedded Linux web engines before pywebview imports."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+    required_flags = (
+        "--disable-features=BlockInsecurePrivateNetworkRequests,"
+        "PrivateNetworkAccessSendPreflights,"
+        "PrivateNetworkAccessRespectPreflightResults",
+        "--allow-insecure-localhost",
+    )
+    for flag in required_flags:
+        if flag not in existing:
+            existing = f"{existing} {flag}".strip()
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = existing
+
+
+def _initial_desktop_url() -> str:
+    """Return the first URL shown in the native desktop window."""
+    flask_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+    if sys.platform.startswith("linux"):
+        return flask_url
+
+    splash_path = _bundle_path("splash.html")
+    if os.path.exists(splash_path):
+        import pathlib
+
+        return pathlib.Path(splash_path).as_uri()
+    return flask_url
+
+
 # True when the app is running without a visible console (pythonw.exe or
 # after _hide_windows_console() is called).  The crash handler uses this to
 # decide whether to show a native dialog instead of printing to the terminal.
@@ -722,6 +756,14 @@ def start_flask_server():
 
 def run_desktop_mode(dev_mode: bool = False):
     """Main desktop app flow."""
+    # WebKit2GTK 4.1+ runs the WebProcess inside a bubblewrap sandbox that
+    # puts it in a separate network namespace, blocking access to the host's
+    # loopback interface (127.0.0.1). Setting this env var before the first
+    # import of webview disables that sandbox so localhost works.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("WEBKIT_DISABLE_SANDBOX", "1")
+        _configure_linux_webengine_env()
+
     try:
         import webview
     except ImportError:
@@ -875,15 +917,8 @@ def run_desktop_mode(dev_mode: bool = False):
         _win_x = None
         _win_y = None
 
-    # Show a local splash page first (logo + "created by MonkeyZoo") so the
-    # window doesn't flash black while the WebView2 backend boots and Flask's
-    # first HTML render lands. The splash auto-redirects to the Flask URL
-    # after a brief delay (see splash.html).
-    _splash_path = _bundle_path("splash.html")
-    if os.path.exists(_splash_path):
-        _initial_url = "file:///" + _splash_path.replace("\\", "/")
-    else:
-        _initial_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+    _initial_url = _initial_desktop_url()
+    print(f"  Desktop window URL: {_initial_url}", flush=True)
 
     _create_window_kwargs = dict(
         title=APP_NAME,

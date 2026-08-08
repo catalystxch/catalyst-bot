@@ -360,6 +360,7 @@ def check_coin_invariants(
     ],  # {"xch": {"free": N, "locked": N}, "cat": {...}}
     open_offers_count: Dict[str, int],  # {"buy": N, "sell": N}
     db_locked_count: Dict[str, int],  # {"xch": N, "cat": N}
+    external_locked_count: Optional[Dict[str, int]] = None,
 ) -> AuditResult:
     """Cycle-level cross-view reconciliation.
 
@@ -372,6 +373,8 @@ def check_coin_invariants(
         inventory: Our in-memory count of free/locked per wallet type.
         open_offers_count: Count of open offers by side from the DB.
         db_locked_count: DB count of ``status='locked'`` coins per type.
+        external_locked_count: DB-locked coins associated with non-book wallet
+            offers, such as NFT offers made from the same Sage wallet.
 
     Invariants checked:
         - inventory.free + inventory.locked == wallet.total (per coin type)
@@ -387,6 +390,7 @@ def check_coin_invariants(
     }
     result.summary["open_offers"] = dict(open_offers_count)
     result.summary["db_locked"] = dict(db_locked_count)
+    result.summary["external_locked"] = dict(external_locked_count or {})
 
     # Invariant 1: inventory totals match wallet totals
     for wtype in ("xch", "cat"):
@@ -419,7 +423,10 @@ def check_coin_invariants(
 
     # Invariant 2: DB-locked counts approximately match open offer counts
     # (±2 for sniper probes and temporary requote-transition state)
-    xch_locked = int(db_locked_count.get("xch", 0) or 0)
+    external_locked_count = external_locked_count or {}
+    xch_locked_raw = int(db_locked_count.get("xch", 0) or 0)
+    xch_external = max(0, int(external_locked_count.get("xch", 0) or 0))
+    xch_locked = max(0, xch_locked_raw - min(xch_locked_raw, xch_external))
     buy_offers = int(open_offers_count.get("buy", 0) or 0)
     if abs(xch_locked - buy_offers) > 2:
         result.issues.append(
@@ -427,7 +434,7 @@ def check_coin_invariants(
                 severity=Severity.WARN,
                 code="xch_locked_vs_buys_mismatch",
                 message=(
-                    f"DB has {xch_locked} XCH coins marked 'locked' but "
+                    f"DB has {xch_locked} active-book XCH coins marked 'locked' but "
                     f"{buy_offers} open buy offers. Divergence >2 suggests "
                     f"either phantom locks or untracked live offers."
                 ),
@@ -435,11 +442,18 @@ def check_coin_invariants(
                     "Trigger orphan cleanup and offer-coin relinking. "
                     "Check for zombie offers in Sage that don't match the DB."
                 ),
-                details={"xch_locked": xch_locked, "buy_offers": buy_offers},
+                details={
+                    "xch_locked": xch_locked,
+                    "xch_locked_raw": xch_locked_raw,
+                    "xch_external_locked": xch_external,
+                    "buy_offers": buy_offers,
+                },
             )
         )
 
-    cat_locked = int(db_locked_count.get("cat", 0) or 0)
+    cat_locked_raw = int(db_locked_count.get("cat", 0) or 0)
+    cat_external = max(0, int(external_locked_count.get("cat", 0) or 0))
+    cat_locked = max(0, cat_locked_raw - min(cat_locked_raw, cat_external))
     sell_offers = int(open_offers_count.get("sell", 0) or 0)
     if abs(cat_locked - sell_offers) > 2:
         result.issues.append(
@@ -447,12 +461,17 @@ def check_coin_invariants(
                 severity=Severity.WARN,
                 code="cat_locked_vs_sells_mismatch",
                 message=(
-                    f"DB has {cat_locked} CAT coins marked 'locked' but "
+                    f"DB has {cat_locked} active-book CAT coins marked 'locked' but "
                     f"{sell_offers} open sell offers. Divergence >2 suggests "
                     f"either phantom locks or untracked live offers."
                 ),
                 suggested_action=("Trigger orphan cleanup and offer-coin relinking."),
-                details={"cat_locked": cat_locked, "sell_offers": sell_offers},
+                details={
+                    "cat_locked": cat_locked,
+                    "cat_locked_raw": cat_locked_raw,
+                    "cat_external_locked": cat_external,
+                    "sell_offers": sell_offers,
+                },
             )
         )
 
@@ -478,6 +497,7 @@ def run_periodic_audit(
     wallet_totals: Dict[str, int],
     inventory: Dict[str, Dict[str, int]],
     db_locked_count: Dict[str, int],
+    external_locked_count: Optional[Dict[str, int]] = None,
 ) -> List[Issue]:
     """Run all audits at once. Returns a flat list of issues.
 
@@ -509,6 +529,7 @@ def run_periodic_audit(
         inventory=inventory,
         open_offers_count={"buy": len(offers_buy), "sell": len(offers_sell)},
         db_locked_count=db_locked_count,
+        external_locked_count=external_locked_count,
     )
     issues.extend(coin_audit.issues)
 

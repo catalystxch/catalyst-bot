@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 
 
-__version__ = "1.2.40"
+__version__ = "1.2.62"
 
 
 def _describe_to_version(describe: str) -> str:
@@ -60,7 +60,7 @@ def _git_describe(repo_root: Path) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
-        timeout=5,
+        timeout=1.5,
     )
     return result.stdout.strip()
 

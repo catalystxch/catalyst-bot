@@ -156,6 +156,8 @@ _BLOCKED_KEYS = {
 _KEY_MAP = {
     "spread_bps": "SPREAD_BPS",
     "loop_seconds": "LOOP_SECONDS",
+    "min_trade_xch": "MIN_TRADE_XCH",
+    "max_trade_xch": "MAX_TRADE_XCH",
     "default_trade_xch": "DEFAULT_TRADE_XCH",
     "max_active_buy": "MAX_ACTIVE_BUY",
     "max_active_sell": "MAX_ACTIVE_SELL",
@@ -260,6 +262,78 @@ _KEY_MAP = {
     "enable_runtime_coin_health": "ENABLE_RUNTIME_COIN_HEALTH",
     "sage_set_change_address": "SAGE_SET_CHANGE_ADDRESS",
 }
+
+
+_TRADE_BOUND_SIZE_KEYS = (
+    "default_trade_xch",
+    "inner_size_xch",
+    "mid_size_xch",
+    "outer_size_xch",
+    "extreme_size_xch",
+    "buy_inner_size_xch",
+    "buy_mid_size_xch",
+    "buy_outer_size_xch",
+    "buy_extreme_size_xch",
+    "sell_inner_size_xch",
+    "sell_mid_size_xch",
+    "sell_outer_size_xch",
+    "sell_extreme_size_xch",
+    "sniper_size_xch",
+)
+
+
+def _positive_decimal_or_none(value) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        dec = Decimal(str(value))
+    except Exception:
+        return None
+    if not dec.is_finite() or dec <= 0:
+        return None
+    return dec
+
+
+def _format_xch_bound(value: Decimal) -> str:
+    quantized = value.quantize(Decimal("0.0001"))
+    text = format(quantized, "f").rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _with_coherent_trade_bounds(data: dict, current_cfg) -> dict:
+    """Ensure hidden MIN/MAX_TRADE_XCH cannot lag behind generated sizes."""
+    adjusted = dict(data)
+    generated_sizes = [
+        dec
+        for dec in (
+            _positive_decimal_or_none(adjusted.get(key))
+            for key in _TRADE_BOUND_SIZE_KEYS
+        )
+        if dec is not None
+    ]
+    if not generated_sizes:
+        return adjusted
+
+    largest_generated = max(generated_sizes)
+    current_max = _positive_decimal_or_none(
+        adjusted.get("max_trade_xch")
+        or adjusted.get("MAX_TRADE_XCH")
+        or getattr(current_cfg, "MAX_TRADE_XCH", None)
+    )
+    if current_max is None or current_max < largest_generated:
+        adjusted["max_trade_xch"] = _format_xch_bound(largest_generated)
+
+    current_min = _positive_decimal_or_none(
+        adjusted.get("min_trade_xch")
+        or adjusted.get("MIN_TRADE_XCH")
+        or getattr(current_cfg, "MIN_TRADE_XCH", None)
+    )
+    if current_min is not None and current_min > largest_generated:
+        adjusted["min_trade_xch"] = _format_xch_bound(largest_generated)
+    elif current_min is None:
+        adjusted["min_trade_xch"] = "0.005"
+
+    return adjusted
 
 
 @bp.route("/api/config")
@@ -427,6 +501,7 @@ def api_config_update():
         return jsonify({"success": False, "error": f"Failed to update {key}"}), 500
 
     # --- Bulk format ---
+    data = _with_coherent_trade_bounds(data, cfg)
     updated = []
     errors = []
     validation_warnings = []

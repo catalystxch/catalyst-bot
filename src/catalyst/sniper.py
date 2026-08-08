@@ -323,7 +323,7 @@ class Sniper:
         if base is None or Decimal(str(base)) <= 0:
             base = cfg.DEFAULT_TRADE_XCH
         base = Decimal(str(base))
-        return min(base, cfg.MAX_TRADE_XCH)
+        return base
 
     def _publish_immediately(self, created: List[Dict]):
         """Push sniper probes to Dexie first, then Splash as broadcast follow-up."""

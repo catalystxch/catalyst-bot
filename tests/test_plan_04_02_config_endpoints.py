@@ -12,6 +12,7 @@ import os
 import sys
 import types
 import unittest
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -186,6 +187,38 @@ class TestConfigPost(_FlaskBase):
         self.assertEqual(written["TOXICITY_PROTECTION_LEVEL"], "defensive")
         self.assertEqual(written["TOXICITY_THROTTLE_SECS"], "180")
         self.assertEqual(written["TOXICITY_MAX_SPREAD_MULTIPLIER"], "2.0")
+
+    def test_bulk_trade_sizes_raise_hidden_max_trade_bound(self):
+        fake_cfg = MagicMock()
+        fake_cfg.update.return_value = True
+        fake_cfg.to_dict.return_value = {}
+        fake_cfg.LIQUIDITY_MODE = "two_sided"
+        fake_cfg.SNIPER_ENABLED = False
+        fake_cfg.MAX_ACTIVE_BUY_OFFERS = 3
+        fake_cfg.MAX_ACTIVE_SELL_OFFERS = 3
+        fake_cfg.MIN_TRADE_XCH = Decimal("0.005")
+        fake_cfg.MAX_TRADE_XCH = Decimal("0.050")
+        payload = {
+            "default_trade_xch": 3.4882,
+            "buy_inner_size_xch": 1.5855,
+            "buy_mid_size_xch": 3.4882,
+            "buy_outer_size_xch": 6.3421,
+            "buy_extreme_size_xch": 11.4157,
+            "sell_inner_size_xch": 8.7433,
+            "sell_mid_size_xch": 4.8574,
+            "sell_outer_size_xch": 2.6716,
+            "sell_extreme_size_xch": 1.2143,
+        }
+
+        with patch.object(api_server, "cfg", fake_cfg):
+            resp = self._post_json("/api/config", payload)
+
+        self.assertEqual(resp.status_code, 200)
+        written = {
+            call.args[0]: call.args[1] for call in fake_cfg.update.call_args_list
+        }
+        self.assertEqual(written["DEFAULT_TRADE_XCH"], "3.4882")
+        self.assertEqual(written["MAX_TRADE_XCH"], "11.4157")
 
     def test_failed_cfg_update_returns_500(self):
         """Patch cfg.update to return False."""

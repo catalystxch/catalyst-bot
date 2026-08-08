@@ -413,7 +413,7 @@ def api_chia_start_with_fingerprint():
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
 
         result = chia_node.trigger_start(fingerprint)
-        if isinstance(result, dict) and result.get("success"):
+        if result.get("success"):
             api_server.clear_balance_snapshot()
         return jsonify(_safe_wallet_start_result(result))
     except Exception:

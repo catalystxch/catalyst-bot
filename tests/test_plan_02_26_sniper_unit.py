@@ -175,9 +175,9 @@ class TestCalculateSnipeSize(unittest.TestCase):
         result = self._sniper_with_cfg(sniper_size=None, default=Decimal("0.01"))
         self.assertEqual(result, Decimal("0.01"))
 
-    def test_capped_by_max_trade(self):
-        result = self._sniper_with_cfg(sniper_size="5.0", max_trade=Decimal("1.0"))
-        self.assertEqual(result, Decimal("1.0"))
+    def test_dedicated_sniper_size_is_not_capped_by_max_trade(self):
+        result = self._sniper_with_cfg(sniper_size="0.71", max_trade=Decimal("0.05"))
+        self.assertEqual(result, Decimal("0.71"))
 
     def test_arb_gap_ignored(self):
         # arb_gap_bps is immediately deleted — size is always config-driven

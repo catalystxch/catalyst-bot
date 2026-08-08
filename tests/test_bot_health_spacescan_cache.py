@@ -125,6 +125,40 @@ class SpacescanCacheTests(unittest.TestCase):
         self.assertIn("warm", check.message.lower())
         self.assertFalse(refresh_called["fired"])
 
+    def test_stale_but_unexpired_cache_dispatches_refresh(self):
+        cfg = bot_health.cfg
+        cached = {"has_data": True, "holder_count": 3412}
+        refresh_called = {"count": 0, "asset_id": None}
+
+        def _fake_refresh(asset_id):
+            refresh_called["count"] += 1
+            refresh_called["asset_id"] = asset_id
+            return {"has_data": True, "holder_count": 3412, "activity_count": 100}
+
+        fake_module = types.ModuleType("market_data_collector")
+        fake_module.refresh_spacescan_cache = _fake_refresh
+        sys.modules["market_data_collector"] = fake_module
+
+        try:
+            with (
+                patch.object(cfg, "SPACESCAN_ENABLED", True),
+                patch.object(cfg, "CAT_ASSET_ID", "b8edcc6a"),
+                patch("database.get_market_analysis_cache", return_value=cached),
+                patch(
+                    "database.get_market_analysis_cache_age_secs",
+                    return_value=(12 * 3600) + 1,
+                ),
+            ):
+                check = bot_health.check_spacescan_cache_stale(auto_repair=True)
+                time.sleep(0.2)
+        finally:
+            sys.modules.pop("market_data_collector", None)
+
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.repaired_count, 1)
+        self.assertEqual(refresh_called["count"], 1)
+        self.assertEqual(refresh_called["asset_id"], "b8edcc6a")
+
     # ------------------------------------------------------------------
     # Expired cache → background refresh fires once
     # ------------------------------------------------------------------

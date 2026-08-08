@@ -24,6 +24,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
+from ladder_sizing import classify_slot_tier, ladder_price_for_slot
 from database import (
     add_offer,
     update_offer_status,
@@ -2862,35 +2863,14 @@ class OfferManager:
         This creates a smooth orderbook: tight offers near mid price
         (where most fills happen) and wider offers at the extremes.
         """
-        if max_offers <= 0:
-            return None
-
-        # Inner edge: minimum distance from mid (closest offer)
-        inner_edge = cfg.MIN_EDGE_BPS / Decimal("10000")
-
-        # Outer edge: the full adjusted spread (farthest offer)
-        outer_edge = half_spread
-
-        # Safety: if min edge >= full spread, just use the full spread everywhere
-        if inner_edge >= outer_edge:
-            distance = outer_edge
-        elif max_offers == 1:
-            # Single offer: place at inner edge (tight)
-            distance = inner_edge
-        else:
-            # Steady linear increase from inner_edge to outer_edge
-            step = (outer_edge - inner_edge) / Decimal(max_offers - 1)
-            distance = inner_edge + step * Decimal(slot)
-
-        if side == "buy":
-            price = mid_price * (Decimal("1") - distance)
-        else:
-            price = mid_price * (Decimal("1") + distance)
-
-        if price <= 0:
-            return None
-
-        return price
+        return ladder_price_for_slot(
+            slot,
+            side,
+            mid_price,
+            half_spread,
+            max_offers,
+            min_edge_bps=getattr(cfg, "MIN_EDGE_BPS", Decimal("0")),
+        )
 
     def _interpolate_refill_price(
         self,
@@ -3116,34 +3096,7 @@ class OfferManager:
                 tier: int(getattr(cfg, f"{prefix}{tier.upper()}_TIER_COUNT", 0) or 0)
                 for tier in ("inner", "mid", "outer", "extreme")
             }
-        if any(v > 0 for v in configured.values()):
-            remaining = total
-            running = 0
-            tier_dist = {}
-            for tier in ("inner", "mid", "outer", "extreme"):
-                take = min(max(0, configured[tier]), remaining)
-                tier_dist[tier] = take
-                running += take
-                remaining -= take
-            if remaining > 0:
-                tier_dist["extreme"] += remaining
-
-            running = 0
-            for tier in ("inner", "mid", "outer", "extreme"):
-                running += tier_dist[tier]
-                if slot < running:
-                    return tier
-            return "extreme"
-
-        ratio = slot / total
-        if ratio < 0.1:
-            return "inner"
-        elif ratio < 0.4:
-            return "mid"
-        elif ratio < 0.7:
-            return "outer"
-        else:
-            return "extreme"
+        return classify_slot_tier(slot, total, tier_counts=configured)
 
     # -------------------------------------------------------------------
     # Requoting (cancel + recreate when price moves)
@@ -4181,52 +4134,25 @@ class OfferManager:
         We must check valid_times.max_time manually and cancel stale ones.
         """
         count = cleanup_expired_offers()
+        return count + len(self.cleanup_expired_db_offers())
 
-        # Also update our database for any that expired
-        open_offers = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
-        expired_count = 0
-        for offer in open_offers:
-            expires_at = offer.get("expires_at")
-            if expires_at:
-                from datetime import datetime, timezone
+    def cleanup_expired_db_offers(self) -> List[str]:
+        """Retire DB-open offers whose local expires_at has elapsed.
 
-                try:
-                    exp_time = datetime.fromisoformat(expires_at)
-                    # Ensure timezone-aware comparison
-                    if exp_time.tzinfo is None:
-                        exp_time = exp_time.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) > exp_time:
-                        update_offer_status(offer["trade_id"], "expired")
-                        # Expired offers unlock the coin (no on-chain tx for expiry).
-                        # Mark the coin as free so it can be reused.
-                        _expired_coin_id = offer.get("coin_id")
-                        if _expired_coin_id:
-                            try:
-                                from database import free_coin as _free_coin
+        Pending-cancel rows deliberately stay open until Dexie/Spacescan
+        verification resolves them as cancelled, expired, or filled.
+        """
+        try:
+            from database import expire_open_offers_by_time
 
-                                _free_coin(_expired_coin_id)
-                                log_event(
-                                    "debug",
-                                    "coin_freed_on_expire",
-                                    f"Coin {_expired_coin_id[:16]}... freed "
-                                    f"(offer {offer['trade_id'][:12]}... expired)",
-                                )
-                            except Exception as e:
-                                log_event(
-                                    "debug",
-                                    "coin_free_on_expire_failed",
-                                    f"Could not free coin on offer expiry (non-critical): {e}",
-                                )
-                        expired_count += 1
-                except (ValueError, TypeError):
-                    pass
-
-        if expired_count > 0:
+            return expire_open_offers_by_time(cat_asset_id=cfg.CAT_ASSET_ID)
+        except Exception as e:
             log_event(
-                "info", "offers_expired", f"Cleaned up {expired_count} expired offers"
+                "warning",
+                "local_expired_offer_cleanup_failed",
+                f"Could not retire locally expired offers: {e}",
             )
-
-        return count + expired_count
+            return []
 
     # -------------------------------------------------------------------
     # Offer state queries
@@ -4279,14 +4205,38 @@ class OfferManager:
         for offer in open_offers:
             # Check valid_times.max_time from the wallet RPC record
             valid_times = offer.get("valid_times") or {}
-            max_time = valid_times.get("max_time", 0)
+            max_time = (
+                valid_times.get("max_time", 0)
+                or offer.get("max_time", 0)
+                or offer.get("expires_at_second", 0)
+            )
 
-            if max_time and max_time > 0:
-                time_left = max_time - now
+            if not max_time and offer.get("expires_at"):
+                try:
+                    from datetime import datetime, timezone
+
+                    exp_time = datetime.fromisoformat(
+                        str(offer.get("expires_at")).replace("Z", "+00:00")
+                    )
+                    if exp_time.tzinfo is None:
+                        exp_time = exp_time.replace(tzinfo=timezone.utc)
+                    max_time = int(exp_time.timestamp())
+                except Exception:
+                    max_time = 0
+
+            try:
+                max_time_int = int(max_time or 0)
+            except Exception:
+                max_time_int = 0
+
+            if max_time_int > 0:
+                time_left = max_time_int - now
                 if 0 < time_left < refresh_before_secs:
                     tid = offer.get("trade_id", "")
                     if tid:
                         expiring.append(tid)
+
+        expiring = list(dict.fromkeys(expiring))
 
         if expiring:
             log_event(

@@ -127,6 +127,82 @@ def test_extreme_dexie_tibet_gap_elevates_both_sides_without_throttle():
     assert "dexie_tibet_dislocation" in {r["key"] for r in snap.reasons}
 
 
+def test_bootstrap_public_book_risk_warns_without_guarding(monkeypatch):
+    monkeypatch.setattr(
+        "market_toxicity.cfg.TOXICITY_THROTTLE_START", 65, raising=False
+    )
+    monkeypatch.setattr("market_toxicity.cfg.TOXICITY_CANCEL_START", 85, raising=False)
+    monkeypatch.setattr(
+        "market_toxicity.cfg.TOXICITY_MIN_THROTTLE_SIGNALS", 1, raising=False
+    )
+    guard = MarketToxicityGuard()
+    ctx = _ctx(
+        loop_count=0,
+        arb_gap_bps=Decimal("1375.75"),
+        market_intel={
+            "thin_side": "buy",
+            "buy_depth_xch": "8.07",
+            "sell_depth_xch": "10440.02",
+            "orderbook_refreshes": 6,
+            "orderbook_age_secs": 7,
+        },
+    )
+    ctx.book_bootstrap = True
+
+    snap = guard.update(ctx)
+
+    assert snap.score < 65
+    assert snap.level == "elevated"
+    assert snap.buy_spread_multiplier > Decimal("1.0")
+    assert snap.throttled_sides == []
+    assert "bootstrap" in snap.suggested_action.lower()
+    assert "dexie_tibet_dislocation" in {r["key"] for r in snap.reasons}
+
+
+def test_bootstrap_public_cap_preserves_private_toxicity_memory(monkeypatch):
+    monkeypatch.setattr(
+        "market_toxicity.cfg.TOXICITY_THROTTLE_START", 65, raising=False
+    )
+    monkeypatch.setattr("market_toxicity.cfg.TOXICITY_CANCEL_START", 90, raising=False)
+    monkeypatch.setattr(
+        "market_toxicity.cfg.TOXICITY_MIN_THROTTLE_SIGNALS", 1, raising=False
+    )
+    monkeypatch.setattr("market_toxicity.cfg.TOXICITY_DECAY_PER_LOOP", 2, raising=False)
+    monkeypatch.setattr("market_toxicity.cfg.TOXICITY_THROTTLE_SECS", 5, raising=False)
+    guard = MarketToxicityGuard()
+
+    hot = guard.update(
+        _ctx(
+            now=1000.0,
+            recent_sweep_events=[{"side": "sell", "fill_count": 3}],
+            recent_fills=[
+                {"side": "sell", "age_secs": 8, "size_xch": "0.04"},
+                {"side": "sell", "age_secs": 10, "size_xch": "0.05"},
+                {"side": "sell", "age_secs": 12, "size_xch": "0.06"},
+            ],
+        )
+    )
+    assert hot.sell_score >= 65
+    assert "sell" in hot.throttled_sides
+
+    cooldown_ctx = _ctx(
+        now=1006.0,
+        market_intel={
+            "thin_side": "sell",
+            "buy_depth_xch": "3.0",
+            "sell_depth_xch": "0.2",
+            "orderbook_refreshes": 3,
+            "orderbook_age_secs": 12,
+        },
+    )
+    cooldown_ctx.book_bootstrap = True
+
+    cooling = guard.update(cooldown_ctx)
+
+    assert cooling.sell_score >= 65
+    assert "sell" in cooling.throttled_sides
+
+
 def test_public_market_thin_side_scores_matching_side():
     guard = MarketToxicityGuard()
 

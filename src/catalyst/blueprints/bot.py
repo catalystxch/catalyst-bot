@@ -356,7 +356,7 @@ def api_bot_stop():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    bot.stop()
+    bot.stop(wait=False)
     server.events.emit("bot_control", {"action": "stopped"})
     return jsonify({"status": "stopped"})
 
@@ -586,8 +586,13 @@ def api_bot_state():
                     from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
                     xch_free = int(get_spendable_coin_count(WALLET_ID_XCH) or 0)
-                    cat_wallet_id = api_server._active_cat.get("wallet_id") or getattr(
-                        cfg, "CAT_WALLET_ID", 2
+                    active_asset_id = api_server._active_cat.get("asset_id") or getattr(
+                        cfg, "CAT_ASSET_ID", ""
+                    )
+                    cat_wallet_id = api_server.active_cat_wallet_id(
+                        api_server._active_cat.get("wallet_id")
+                        or getattr(cfg, "CAT_WALLET_ID", 2),
+                        active_asset_id,
                     )
                     cat_free = int(get_spendable_coin_count(cat_wallet_id) or 0)
 
@@ -630,12 +635,6 @@ def api_status():
         if not bot:
             xch_bal = {"spendable": 0, "total": 0}
             cat_bal = {"spendable": 0, "total": 0}
-            cached_balances = api_server.merge_cached_balance_snapshot(
-                {"xch": xch_bal, "cat": cat_bal}
-            )
-            if cached_balances:
-                xch_bal = cached_balances["xch"]
-                cat_bal = cached_balances["cat"]
 
             # Pre-start pricing cache. Without this, every /api/status poll
             # (every 5 s) fires a live TibetSwap and Dexie fetch AND writes
@@ -652,30 +651,44 @@ def api_status():
                 }
 
             pricing = {"bid": 0, "mid": 0, "ask": 0}
-            asset_id = api_server._active_cat.get("asset_id") or (
-                cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
+            active_asset_id = str(
+                api_server._active_cat.get("asset_id")
+                or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else "")
+                or ""
+            ).strip()
+            cat_wallet_id = api_server.active_cat_wallet_id(
+                api_server._active_cat.get("wallet_id")
+                or getattr(cfg, "CAT_WALLET_ID", 2),
+                active_asset_id,
             )
-            price_lookup_asset_id = asset_id
             cat_dec = api_server._active_cat.get("decimals") or getattr(
                 cfg, "CAT_DECIMALS", 3
             )
+            cached_balances = api_server.get_cached_balance_snapshot(
+                asset_id=active_asset_id,
+                cat_wallet_id=cat_wallet_id,
+            )
+            if cached_balances:
+                xch_bal = cached_balances.get("xch") or xch_bal
+                cat_bal = cached_balances.get("cat") or cat_bal
 
             _cache_ttl = 60.0
             _now_ts = time.time()
             _use_cache = (
                 _prebot_price_cache.get("pricing") is not None
-                and _prebot_price_cache.get("asset_id") == asset_id
+                and _prebot_price_cache.get("asset_id") == active_asset_id
                 and (_now_ts - _prebot_price_cache.get("fetched_at", 0.0)) < _cache_ttl
             )
+            pricing_asset_id = active_asset_id
             if _use_cache:
                 pricing = dict(_prebot_price_cache["pricing"])
                 # Skip all HTTP fetches and logging below for this poll —
                 # the cache is fresh enough for a pre-bot dashboard.
-                price_lookup_asset_id = ""
+                pricing_asset_id = ""
 
-            if price_lookup_asset_id:
+            if pricing_asset_id:
                 print(
-                    f"[STATUS] Pricing lookup: asset_id={price_lookup_asset_id!r}, decimals={cat_dec}",
+                    f"[STATUS] Pricing lookup: asset_id={pricing_asset_id!r}, decimals={cat_dec}",
                     flush=True,
                 )
                 log_event(
@@ -683,7 +696,7 @@ def api_status():
                     "price_lookup",
                     f"Looking up price for {api_server._active_cat.get('name', 'unknown')}",
                 )
-            if price_lookup_asset_id:
+            if pricing_asset_id:
                 import requests as _req
 
                 mid = 0
@@ -696,7 +709,7 @@ def api_status():
                         getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
                         timeout=8,
                     )
-                    norm_id = price_lookup_asset_id.lower().strip().replace("0x", "")
+                    norm_id = pricing_asset_id.lower().strip().replace("0x", "")
                     for p in pairs:
                         p_id = (
                             str(p.get("asset_id", "")).lower().strip().replace("0x", "")
@@ -807,7 +820,7 @@ def api_status():
                             resp = _req.get(
                                 f"{dexie_base}/v1/offers",
                                 params={
-                                    "offered": price_lookup_asset_id,
+                                    "offered": pricing_asset_id,
                                     "requested": "xch",
                                     "status": 0,
                                     "page_size": 1,
@@ -853,7 +866,7 @@ def api_status():
                     log_event(
                         "error", "price_lookup", "No price available from any source"
                     )
-            else:
+            elif not active_asset_id:
                 print("[STATUS] No asset_id available for pricing", flush=True)
                 log_event(
                     "warning",
@@ -908,9 +921,7 @@ def api_status():
                     raise StopIteration
                 from wallet import get_all_offers, classify_offers_from_list
 
-                asset_id_for_offers = api_server._active_cat.get("asset_id") or getattr(
-                    cfg, "CAT_ASSET_ID", ""
-                )
+                asset_id_for_offers = active_asset_id
                 pre_offers = get_all_offers(include_completed=False, start=0, end=500)
                 if pre_offers and isinstance(pre_offers, list) and asset_id_for_offers:
                     open_buys, open_sells, _ = classify_offers_from_list(
@@ -1009,8 +1020,10 @@ def api_status():
                 from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
                 xch_free = int(get_spendable_coin_count(WALLET_ID_XCH) or 0)
-                cat_wid_coins = api_server._active_cat.get("wallet_id") or getattr(
-                    cfg, "CAT_WALLET_ID", 2
+                cat_wid_coins = api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", 2),
+                    active_asset_id,
                 )
                 cat_free = int(get_spendable_coin_count(cat_wid_coins) or 0)
             except StopIteration:
@@ -1057,7 +1070,9 @@ def api_status():
                         "offers": {
                             "buy": offers_buy_pre,
                             "sell": offers_sell_pre,
-                            "history": _build_fill_history_for_gui(asset_id, limit=20),
+                            "history": _build_fill_history_for_gui(
+                                active_asset_id, limit=20
+                            ),
                         },
                         "coin_tracking": coin_tracking_pre,
                         "logs": [],
@@ -1065,9 +1080,12 @@ def api_status():
                         "wallet_type": api_server.get_wallet_type(),
                         "current_cat": {
                             "name": cat_name,
-                            "asset_id": asset_id,
-                            "wallet_id": api_server._active_cat.get("wallet_id")
-                            or getattr(cfg, "CAT_WALLET_ID", None),
+                            "asset_id": active_asset_id,
+                            "wallet_id": api_server.active_cat_wallet_id(
+                                api_server._active_cat.get("wallet_id")
+                                or getattr(cfg, "CAT_WALLET_ID", None),
+                                active_asset_id,
+                            ),
                             "decimals": api_server._active_cat.get("decimals")
                             or getattr(cfg, "CAT_DECIMALS", 3),
                             "ticker_id": api_server._active_cat.get("ticker_id")
@@ -1113,7 +1131,7 @@ def api_status():
             },
         }
 
-        # If balances are all zero (bot hasn't run yet), try direct wallet RPC
+        # If balances are all zero during an active run, try direct wallet RPC.
         if balances_out["xch"]["total"] == 0 and _live_wallet_reads_allowed(bot):
             try:
                 from wallet import get_wallet_balance, WALLET_ID_XCH
@@ -1136,8 +1154,11 @@ def api_status():
                 from wallet import get_wallet_balance
 
                 # Use actively selected CAT wallet_id, fall back to config
-                cat_wallet_id = api_server._active_cat.get("wallet_id") or getattr(
-                    cfg, "CAT_WALLET_ID", 2
+                cat_wallet_id = api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", 2),
+                    api_server._active_cat.get("asset_id")
+                    or getattr(cfg, "CAT_ASSET_ID", ""),
                 )
                 cat_result = get_wallet_balance(cat_wallet_id)
                 if cat_result and cat_result.get("success"):
@@ -1154,7 +1175,18 @@ def api_status():
             except Exception:
                 pass
 
-        cached_balances = api_server.merge_cached_balance_snapshot(balances_out)
+        active_asset_id = str(
+            api_server._active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        ).strip()
+        cat_wallet_id = api_server.active_cat_wallet_id(
+            api_server._active_cat.get("wallet_id") or getattr(cfg, "CAT_WALLET_ID", 2),
+            active_asset_id,
+        )
+        cached_balances = api_server.merge_cached_balance_snapshot(
+            asset_id=active_asset_id,
+            cat_wallet_id=cat_wallet_id,
+            balances=balances_out,
+        )
         if cached_balances:
             balances_out = cached_balances
 
@@ -1806,8 +1838,12 @@ def api_status():
                 or (cfg.CAT_NAME if hasattr(cfg, "CAT_NAME") else ""),
                 "asset_id": api_server._active_cat.get("asset_id")
                 or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""),
-                "wallet_id": api_server._active_cat.get("wallet_id")
-                or getattr(cfg, "CAT_WALLET_ID", None),
+                "wallet_id": api_server.active_cat_wallet_id(
+                    api_server._active_cat.get("wallet_id")
+                    or getattr(cfg, "CAT_WALLET_ID", None),
+                    api_server._active_cat.get("asset_id")
+                    or (cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""),
+                ),
                 "decimals": api_server._active_cat.get("decimals")
                 or getattr(cfg, "CAT_DECIMALS", 3),
                 "ticker_id": api_server._active_cat.get("ticker_id")

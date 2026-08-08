@@ -359,6 +359,34 @@ class TestBpsToPct(_PatchedCfg):
         self.assertIsInstance(result, str)
 
 
+class TestExternalLockedCount(_PatchedCfg):
+    def test_unmatched_db_locks_without_wallet_confirmation_are_not_external(self):
+        rows = [{"coin_id": "0xstale", "trade_id": "cancelled-offer"}]
+
+        count = bot_loop._count_wallet_confirmed_external_locks(
+            rows,
+            active_trade_ids={"live-offer"},
+            wallet_confirmed_locked_ids=set(),
+        )
+
+        self.assertEqual(count, 0)
+
+    def test_only_wallet_confirmed_non_book_locks_are_external(self):
+        rows = [
+            {"coin_id": "external", "trade_id": "nft-offer"},
+            {"coin_id": "0xstale", "trade_id": "cancelled-offer"},
+            {"coin_id": "0xactive", "trade_id": "live-offer"},
+        ]
+
+        count = bot_loop._count_wallet_confirmed_external_locks(
+            rows,
+            active_trade_ids={"live-offer"},
+            wallet_confirmed_locked_ids={"0xexternal", "0xactive"},
+        )
+
+        self.assertEqual(count, 1)
+
+
 class TestPositionSanityDepositDetection(_PatchedCfg):
     def test_delta_matching_recent_unknown_cat_deposit_is_recognized(self):
         class _Conn:

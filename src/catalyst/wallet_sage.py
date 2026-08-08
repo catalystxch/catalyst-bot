@@ -172,6 +172,7 @@ _CAT_ASSET_ID = os.getenv("CAT_ASSET_ID", "")
 # Populated by get_wallets() when Sage's get_cats endpoint returns results.
 # Allows get_wallet_balance() etc. to resolve any CAT, not just the configured one.
 _wallet_id_to_asset_id: dict = {}
+SAGE_ACTIVE_CAT_WALLET_ID = 2
 
 HEADERS = {"Content-Type": "application/json"}
 
@@ -1016,7 +1017,7 @@ def notify_cat_asset_id_changed(asset_id: str) -> None:
     Also clears any per-wallet-id mismatch-warned flags so the first access
     after a switch gets a clean cross-check.
     """
-    global _CAT_ASSET_ID
+    global _CAT_ASSET_ID, _wallet_id_to_asset_id
     new_id = (asset_id or "").strip().lower().replace("0x", "")
     old_id = (_CAT_ASSET_ID or "").strip().lower().replace("0x", "")
     if new_id != old_id:
@@ -1033,6 +1034,14 @@ def notify_cat_asset_id_changed(asset_id: str) -> None:
             f"[Sage] Active CAT updated: {new_id[:16] if new_id else 'none'}",
             flush=True,
         )
+    if new_id:
+        _wallet_id_to_asset_id = {
+            wid: aid
+            for wid, aid in _wallet_id_to_asset_id.items()
+            if wid == SAGE_ACTIVE_CAT_WALLET_ID
+            or (aid or "").strip().lower().replace("0x", "") != new_id
+        }
+        _wallet_id_to_asset_id[SAGE_ACTIVE_CAT_WALLET_ID] = (asset_id or "").strip()
 
 
 def _is_cat_wallet(wallet_id: int) -> bool:
@@ -2426,7 +2435,7 @@ def get_wallets():
             # We then update cfg.CAT_WALLET_ID to match, so all modules
             # use the correct ID regardless of what .env says.
             # ─────────────────────────────────────────────────────────
-            CONFIGURED_CAT_WID = 2  # Fixed ID for the active trading CAT
+            CONFIGURED_CAT_WID = SAGE_ACTIVE_CAT_WALLET_ID
             next_synthetic_id = 1000  # Other CATs — far away, no collision risk
 
             new_mapping = {}
@@ -2512,7 +2521,7 @@ def get_wallets():
 
     # Fallback: get_cats didn't work — use single CAT from .env config
     asset_id = _get_cat_asset_id()
-    cat_wallet_id = 2  # Same fixed ID as dynamic path
+    cat_wallet_id = SAGE_ACTIVE_CAT_WALLET_ID
     cat_name = os.getenv("CAT_NAME", "MZ")
 
     if asset_id:
@@ -3816,9 +3825,11 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | st
     code path that silently produces an invalid/incomplete signature, causing the
     transaction to fail on-chain.  The explicit sign+submit path always works.
 
-    Returns True if all three steps succeeded, a pending-cancel method string
-    when Sage reports the same spend is already in/conflicting with the
-    mempool, or False for ordinary fallback-worthy failures.
+    Returns True if all three steps succeeded, "already_in_mempool" when Sage
+    proves this exact transaction is already pending, or False for
+    fallback-worthy failures. A generic MEMPOOL_CONFLICT can mean only one input
+    in the batch is already spent, so the caller must keep sequential fallback
+    available for the remaining offers.
     """
     num = len(offer_ids)
     print(f"   [Bulk] Step 1: cancel_offers(auto_submit=False, fee=0, n={num})...")
@@ -3833,8 +3844,8 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | st
             timeout=max(30, num * 2),
         )
     except SageMempoolConflict as e:
-        print(f"   [Bulk] cancel_offers already conflicts in mempool: {e}")
-        return "mempool_conflict_inflight"
+        print(f"   [Bulk] cancel_offers mempool conflict; falling back: {e}")
+        return False
     except SageAlreadyIncluding as e:
         print(f"   [Bulk] cancel_offers already including transaction: {e}")
         return "already_in_mempool"
@@ -3866,8 +3877,8 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | st
             timeout=sign_timeout,
         )
     except SageMempoolConflict as e:
-        print(f"   [Bulk] sign_coin_spends hit mempool conflict: {e}")
-        return "mempool_conflict_inflight"
+        print(f"   [Bulk] sign_coin_spends mempool conflict; falling back: {e}")
+        return False
     except SageAlreadyIncluding as e:
         print(f"   [Bulk] sign_coin_spends already including transaction: {e}")
         return "already_in_mempool"
@@ -3898,8 +3909,8 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | st
             timeout=30,
         )
     except SageMempoolConflict as e:
-        print(f"   [Bulk] submit_transaction already conflicts in mempool: {e}")
-        return "mempool_conflict_inflight"
+        print(f"   [Bulk] submit_transaction mempool conflict; falling back: {e}")
+        return False
     except SageAlreadyIncluding as e:
         print(f"   [Bulk] submit_transaction already including transaction: {e}")
         return "already_in_mempool"
@@ -3923,10 +3934,10 @@ def _cancel_offers_bulk_proper(offer_ids: list, fee_mojos: int = 0) -> bool | st
     _sub_status = str(submit_resp.get("status", "") or "").lower()
     _sub_text = f"{_sub_err or ''} {_sub_status}".upper()
     if "MEMPOOL_CONFLICT" in _sub_text:
-        print("   [Bulk] submit_transaction mempool conflict — marking pending")
-        return "mempool_conflict_inflight"
+        print("   [Bulk] submit_transaction mempool conflict - falling back")
+        return False
     if "ALREADY_INCLUDING_TRANSACTION" in _sub_text:
-        print("   [Bulk] submit_transaction already in mempool — marking pending")
+        print("   [Bulk] submit_transaction already in mempool - marking pending")
         return "already_in_mempool"
     if _sub_err or _sub_status in ("failed", "error", "rejected"):
         print(
@@ -4136,10 +4147,7 @@ def cancel_offers_batch(
                     cancel_submitted = True
                     batch_submitted = True
                     _mark_bulk_submitted(batch_ids)
-                elif bulk_result in (
-                    "already_in_mempool",
-                    "mempool_conflict_inflight",
-                ):
+                elif bulk_result == "already_in_mempool":
                     print(
                         f"   [Sage] Bulk cancel {batch_label} is pending in mempool "
                         f"({bulk_result})"

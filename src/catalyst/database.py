@@ -89,7 +89,7 @@ def _missing_splash_table(exc: Exception) -> bool:
 
 
 def _missing_offers_table(exc: Exception) -> bool:
-    """Return True when a narrow startup/test DB has no offers table yet."""
+    """Return True when a narrow test DB has no offers table."""
     return (
         isinstance(exc, sqlite3.OperationalError)
         and "no such table: offers" in str(exc).lower()
@@ -97,8 +97,11 @@ def _missing_offers_table(exc: Exception) -> bool:
 
 
 def _sqlite_locked(exc: Exception) -> bool:
-    """Return True for transient SQLite busy/locked errors."""
-    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+    """Return True for transient SQLite lock/busy errors."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
 
 
 def get_connection() -> sqlite3.Connection:
@@ -1107,14 +1110,6 @@ def init_database():
         )
 
     conn.commit()
-    try:
-        expire_elapsed_open_offers()
-    except Exception as _expiry_repair_err:
-        log_event(
-            "warning",
-            "db_elapsed_expiry_repair_failed",
-            f"Elapsed-offer expiry repair failed (non-fatal): {_expiry_repair_err}",
-        )
     log_event("info", "database_init", "Database initialized successfully")
 
     # Startup integrity check — surface DB corruption immediately rather
@@ -2071,11 +2066,104 @@ def _actionable_open_lifecycle_clause() -> str:
     return f"(lifecycle_state IS NULL OR lifecycle_state NOT IN ({states}))"
 
 
+def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
+    """Get open offers with their bech32 strings for Dexie repost.
+
+    Returns only offers that have a stored bech32 string.
+    Used during startup to repost offers without calling wallet RPC.
+    """
+    conn = get_connection()
+    query = f"""SELECT trade_id, offer_bech32, dexie_id, side, expires_at
+                FROM offers
+                WHERE status='open'
+                  AND offer_bech32 IS NOT NULL
+                  AND {_actionable_open_lifecycle_clause()}"""
+    params = []
+    if cat_asset_id:
+        query += " AND cat_asset_id=?"
+        params.append(cat_asset_id)
+    rows = conn.execute(query, params).fetchall()
+    now_dt = datetime.now(timezone.utc)
+    repostable = []
+    for row in rows:
+        offer = dict(row)
+        if _expiry_has_elapsed(offer.get("expires_at"), now_dt):
+            continue
+        offer.pop("expires_at", None)
+        repostable.append(offer)
+    return repostable
+
+
+def get_open_offers(
+    side: str = None,
+    cat_asset_id: str = None,
+    include_pending_cancel: bool = False,
+    include_mempool_observed: bool = False,
+    include_elapsed: bool = False,
+) -> List[Dict]:
+    """Get all open offers, optionally filtered by side and/or CAT pair.
+
+    By default, excludes offers whose lifecycle_state is 'cancel_requested'
+    (cancel RPC sent, awaiting on-chain confirmation). These offers still
+    have status='open' in the DB but the bot has already asked Sage to
+    cancel them — for cap counting, requote selection, dashboard display,
+    and trim decisions they are effectively gone.
+
+    Pass include_pending_cancel=True only when you specifically need to
+    examine pending-cancel offers (e.g. the bot_health verifier loop that
+    re-checks them against Dexie/Sage).
+    Pass include_mempool_observed=True only when investigating parked
+    fill-verification rows; they are protected in DB but hidden from normal
+    active-book views by default.
+    Pass include_elapsed=True for startup reconciliation only. Normal live-book
+    views hide locally elapsed offers without mutating the row so offline fills
+    can still be recovered before an explicit expiry pass marks them terminal.
+
+    Returns list of dicts with all offer fields.
+    """
+    conn = get_connection()
+    query = "SELECT * FROM offers WHERE status='open'"
+    params = []
+
+    excluded_lifecycle_states = []
+    if not include_pending_cancel:
+        excluded_lifecycle_states.extend(("cancel_requested", "cancel_sent"))
+    if not include_mempool_observed:
+        excluded_lifecycle_states.append("mempool_observed")
+    if excluded_lifecycle_states:
+        placeholders = ", ".join("?" for _ in excluded_lifecycle_states)
+        query += (
+            f" AND (lifecycle_state IS NULL OR lifecycle_state NOT IN ({placeholders}))"
+        )
+        params.extend(excluded_lifecycle_states)
+
+    if side:
+        query += " AND side=?"
+        params.append(side)
+    if cat_asset_id:
+        query += " AND cat_asset_id=?"
+        params.append(cat_asset_id)
+
+    query += " ORDER BY created_at DESC"
+    rows = conn.execute(query, params).fetchall()
+    offers = [dict(row) for row in rows]
+    if not include_elapsed:
+        now_dt = datetime.now(timezone.utc)
+        offers = [
+            offer
+            for offer in offers
+            if str(offer.get("lifecycle_state") or "open").lower()
+            in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+            or not _expiry_has_elapsed(offer.get("expires_at"), now_dt)
+        ]
+    return offers
+
+
 def _parse_offer_expiry(expires_at) -> Optional[datetime]:
     if expires_at is None:
         return None
     text = str(expires_at).strip()
-    if not text:
+    if not text or text in {"0", "None", "null"}:
         return None
     if text.endswith("Z"):
         text = f"{text[:-1]}+00:00"
@@ -2098,12 +2186,56 @@ def _expiry_has_elapsed(expires_at, now_dt: datetime) -> bool:
     return bool(expiry and expiry <= now_dt)
 
 
+def _elapsed_open_offer_ids(
+    cat_asset_id: str = None,
+    include_pending_cancel: bool = False,
+    include_mempool_observed: bool = False,
+    now_dt: datetime = None,
+) -> List[str]:
+    conn = get_connection()
+    query = (
+        "SELECT trade_id, expires_at FROM offers "
+        "WHERE status='open' "
+        "AND expires_at IS NOT NULL "
+        "AND TRIM(expires_at) != ''"
+    )
+    params = []
+
+    excluded_lifecycle_states = []
+    if not include_pending_cancel:
+        excluded_lifecycle_states.extend(("cancel_requested", "cancel_sent"))
+    if not include_mempool_observed:
+        excluded_lifecycle_states.append("mempool_observed")
+    if excluded_lifecycle_states:
+        placeholders = ", ".join("?" for _ in excluded_lifecycle_states)
+        query += (
+            f" AND (lifecycle_state IS NULL OR lifecycle_state NOT IN ({placeholders}))"
+        )
+        params.extend(excluded_lifecycle_states)
+
+    if cat_asset_id:
+        query += " AND cat_asset_id=?"
+        params.append(cat_asset_id)
+
+    rows = conn.execute(query, params).fetchall()
+    now_dt = now_dt or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    else:
+        now_dt = now_dt.astimezone(timezone.utc)
+    return [
+        str(row["trade_id"])
+        for row in rows
+        if row["trade_id"] and _expiry_has_elapsed(row["expires_at"], now_dt)
+    ]
+
+
 def expire_elapsed_open_offers(cat_asset_id: str = None, now: datetime = None) -> int:
     """Retire actionable open offers whose local expires_at has elapsed.
 
-    This is wallet-independent cleanup for app boot and idle dashboard reads.
-    Sage can be unreachable, or can still list an expired offer as open, but
-    the local max_time is enough to stop counting the offer as live.
+    This is explicit wallet-independent cleanup for paths that have already
+    reconciled terminal wallet state. Ordinary live-book reads hide elapsed
+    offers non-mutatingly so startup can still recover offline fills first.
     """
     now_dt = now or datetime.now(timezone.utc)
     if now_dt.tzinfo is None:
@@ -2134,16 +2266,16 @@ def expire_elapsed_open_offers(cat_asset_id: str = None, now: datetime = None) -
         log_event("warning", "db_elapsed_expiry_failed", f"Expiry scan failed: {e}")
         return 0
 
-    expired_ids = [
+    elapsed_trade_ids = [
         row["trade_id"]
         for row in rows
         if row["trade_id"] and _expiry_has_elapsed(row["expires_at"], now_dt)
     ]
-    if not expired_ids:
+    if not elapsed_trade_ids:
         return 0
 
     retired = 0
-    for trade_id in expired_ids:
+    for trade_id in elapsed_trade_ids:
         if update_offer_status(trade_id, "expired"):
             retired += 1
 
@@ -2157,82 +2289,63 @@ def expire_elapsed_open_offers(cat_asset_id: str = None, now: datetime = None) -
     return retired
 
 
-def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
-    """Get open offers with their bech32 strings for Dexie repost.
-
-    Returns only offers that have a stored bech32 string.
-    Used during startup to repost offers without calling wallet RPC.
-    """
-    expire_elapsed_open_offers(cat_asset_id=cat_asset_id)
-    conn = get_connection()
-    query = f"""SELECT trade_id, offer_bech32, dexie_id, side
-                FROM offers
-                WHERE status='open'
-                  AND offer_bech32 IS NOT NULL
-                  AND {_actionable_open_lifecycle_clause()}"""
-    params = []
-    if cat_asset_id:
-        query += " AND cat_asset_id=?"
-        params.append(cat_asset_id)
-    rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_open_offers(
-    side: str = None,
+def expire_open_offers_by_time(
     cat_asset_id: str = None,
+    now_ts: float = None,
     include_pending_cancel: bool = False,
     include_mempool_observed: bool = False,
-) -> List[Dict]:
-    """Get all open offers, optionally filtered by side and/or CAT pair.
+) -> List[str]:
+    """Mark locally elapsed open offers expired and free their locked coins.
 
-    By default, excludes offers whose lifecycle_state is 'cancel_requested'
-    (cancel RPC sent, awaiting on-chain confirmation). These offers still
-    have status='open' in the DB but the bot has already asked Sage to
-    cancel them — for cap counting, requote selection, dashboard display,
-    and trim decisions they are effectively gone.
-
-    Pass include_pending_cancel=True only when you specifically need to
-    examine pending-cancel offers (e.g. the bot_health verifier loop that
-    re-checks them against Dexie/Sage).
-    Pass include_mempool_observed=True only when investigating parked
-    fill-verification rows; they are protected in DB but hidden from normal
-    active-book views by default.
-
-    Returns list of dicts with all offer fields.
+    Compatibility API for offer manager callers that need the retired IDs.
     """
-    expire_elapsed_open_offers(cat_asset_id=cat_asset_id)
-    conn = get_connection()
-    query = "SELECT * FROM offers WHERE status='open'"
-    params = []
-
-    excluded_lifecycle_states = []
-    if not include_pending_cancel:
-        excluded_lifecycle_states.extend(("cancel_requested", "cancel_sent"))
-    if not include_mempool_observed:
-        excluded_lifecycle_states.append("mempool_observed")
-    if excluded_lifecycle_states:
-        placeholders = ", ".join("?" for _ in excluded_lifecycle_states)
-        query += (
-            f" AND (lifecycle_state IS NULL OR lifecycle_state NOT IN ({placeholders}))"
+    try:
+        now_dt = datetime.fromtimestamp(
+            float(now_ts if now_ts is not None else time.time()), tz=timezone.utc
         )
-        params.extend(excluded_lifecycle_states)
+        elapsed_trade_ids = _elapsed_open_offer_ids(
+            cat_asset_id=cat_asset_id,
+            include_pending_cancel=include_pending_cancel,
+            include_mempool_observed=include_mempool_observed,
+            now_dt=now_dt,
+        )
+    except sqlite3.OperationalError as e:
+        if _sqlite_locked(e) or _missing_offers_table(e):
+            return []
+        log_event(
+            "warning",
+            "offer_expiry_query_failed",
+            f"Could not query open offers for local expiry sweep: {e}",
+        )
+        return []
+    except Exception as e:
+        log_event(
+            "warning",
+            "offer_expiry_query_failed",
+            f"Could not query open offers for local expiry sweep: {e}",
+        )
+        return []
 
-    if side:
-        query += " AND side=?"
-        params.append(side)
-    if cat_asset_id:
-        query += " AND cat_asset_id=?"
-        params.append(cat_asset_id)
+    expired_trade_ids: List[str] = []
+    for trade_id in elapsed_trade_ids:
+        offer = get_offer(trade_id)
+        if offer and _expiry_has_elapsed(offer.get("expires_at"), now_dt):
+            if update_offer_status(trade_id, "expired"):
+                expired_trade_ids.append(trade_id)
 
-    query += " ORDER BY created_at DESC"
-    rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    if expired_trade_ids:
+        log_event(
+            "info",
+            "local_expired_offers_retired",
+            f"Retired {len(expired_trade_ids)} locally expired open offer(s)",
+            data={"trade_ids": expired_trade_ids[:50]},
+        )
+
+    return expired_trade_ids
 
 
 def get_offer_lifecycle_summary(cat_asset_id: str = None) -> Dict:
     """Return compact offer status/lifecycle counts for GUI diagnostics."""
-    expire_elapsed_open_offers(cat_asset_id=cat_asset_id)
     empty_side = {"open": 0, "filled": 0, "cancelled": 0, "expired": 0}
     summary = {
         "total": 0,
@@ -2247,20 +2360,27 @@ def get_offer_lifecycle_summary(cat_asset_id: str = None) -> Dict:
 
     conn = get_connection()
     query = (
-        "SELECT side, status, COALESCE(lifecycle_state, status, 'open') AS lifecycle_state, "
-        "COUNT(*) AS count FROM offers"
+        "SELECT side, status, expires_at, "
+        "COALESCE(lifecycle_state, status, 'open') AS lifecycle_state FROM offers"
     )
     params = []
     if cat_asset_id:
         query += " WHERE cat_asset_id=?"
         params.append(cat_asset_id)
-    query += " GROUP BY side, status, COALESCE(lifecycle_state, status, 'open')"
 
+    now_dt = datetime.now(timezone.utc)
     for row in conn.execute(query, params).fetchall():
         side = str(row["side"] or "").lower()
         status = str(row["status"] or "open").lower()
         lifecycle = str(row["lifecycle_state"] or status or "open").lower()
-        count = int(row["count"] or 0)
+        if (
+            status == "open"
+            and lifecycle not in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+            and _expiry_has_elapsed(row["expires_at"], now_dt)
+        ):
+            status = "expired"
+            lifecycle = "expired"
+        count = 1
 
         summary["total"] += count
         if status not in summary["by_status"]:
@@ -4877,43 +4997,18 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
 
     Returns counts of open offers, total fills, realised PnL, etc.
     """
-    expire_elapsed_open_offers(cat_asset_id=cat_asset_id)
     conn = get_connection()
     stats = {}
 
     # Open offers count
-    open_lifecycle_clause = _actionable_open_lifecycle_clause()
-    if cat_asset_id:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM offers "
-            f"WHERE status='open' AND {open_lifecycle_clause} AND cat_asset_id=?",
-            (cat_asset_id,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM offers "
-            f"WHERE status='open' AND {open_lifecycle_clause}"
-        ).fetchone()
-    stats["open_offers"] = row["cnt"]
-
-    # Open offers by side
-    query_base = (
-        "SELECT side, COUNT(*) as cnt FROM offers "
-        f"WHERE status='open' AND {open_lifecycle_clause}"
+    live_open_offers = get_open_offers(cat_asset_id=cat_asset_id)
+    stats["open_offers"] = len(live_open_offers)
+    stats["open_buys"] = sum(
+        1 for offer in live_open_offers if offer.get("side") == "buy"
     )
-    params = []
-    if cat_asset_id:
-        query_base += " AND cat_asset_id=?"
-        params.append(cat_asset_id)
-    query_base += " GROUP BY side"
-    rows = conn.execute(query_base, params).fetchall()
-    stats["open_buys"] = 0
-    stats["open_sells"] = 0
-    for row in rows:
-        if row["side"] == "buy":
-            stats["open_buys"] = row["cnt"]
-        elif row["side"] == "sell":
-            stats["open_sells"] = row["cnt"]
+    stats["open_sells"] = sum(
+        1 for offer in live_open_offers if offer.get("side") == "sell"
+    )
 
     economic_fill_ids = _get_economic_verified_fill_ids(conn, cat_asset_id, since)
 
@@ -5489,8 +5584,6 @@ def record_splash_incoming(
             conn.rollback()
         except Exception:
             pass
-        if _sqlite_locked(e):
-            return False
         log_event("warning", "splash_db_error", f"Failed to record incoming offer: {e}")
         return False
 

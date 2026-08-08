@@ -221,61 +221,99 @@ class TestDashboard(_FlaskBase):
         get_wallet_balance.assert_not_called()
         wallet_rpc.assert_not_called()
 
-    def test_dashboard_reuses_verified_balance_after_refresh_when_bot_stopped(self):
-        original_cat = dict(api_server._active_cat)
-        if hasattr(api_server, "clear_balance_snapshot"):
-            api_server.clear_balance_snapshot()
+    def test_dashboard_reuses_verified_cat_balance_on_transient_zero(self):
+        asset_id = "aa" * 32
+        original_active_cat = dict(api_server._active_cat)
+        api_server.clear_balance_snapshot()
+        api_server._active_cat.clear()
         api_server._active_cat.update(
             {
-                "asset_id": "d" * 64,
-                "wallet_id": 11,
-                "ticker_id": "DBD_XCH",
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "name": "TestCAT",
                 "decimals": 3,
-                "name": "DBD",
+                "ticker_id": "TEST_XCH",
             }
         )
-        xch_balance = {
+        api_server.cache_balance_snapshot(
+            asset_id=asset_id,
+            cat_wallet_id=2,
+            balances={
+                "xch": {"total": 5.0, "spendable": 4.0},
+                "cat": {"total": 6_500_000.0, "spendable": 6_400_000.0},
+            },
+            source="test",
+        )
+
+        zero_balance = {
             "success": True,
             "wallet_balance": {
-                "confirmed_wallet_balance": 7_000_000_000_000,
-                "spendable_balance": 6_750_000_000_000,
+                "confirmed_wallet_balance": 0,
+                "spendable_balance": 0,
             },
         }
-        cat_balance = {
-            "success": True,
-            "wallet_balance": {
-                "confirmed_wallet_balance": 8_900_000_000,
-                "spendable_balance": 8_800_000_000,
-            },
+        active_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            risk_manager=None,
+            market_intel=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+            price_engine=None,
+            _bot_state={},
+            _last_live_offer_edges={},
+            _loop_count=1,
+            _start_time=0,
+            _probe_state={},
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 0,
+            "cat_free_count": 0,
+            "xch_total": 0,
+            "cat_total": 0,
         }
 
         try:
-            with patch(
-                "wallet.get_wallet_balance", side_effect=[xch_balance, cat_balance]
-            ):
-                refresh = self.client.post(
-                    "/api/balances/refresh",
-                    headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
-                    environ_base=self._LOOPBACK,
-                )
             with (
-                patch("wallet.get_wallet_balance") as get_wallet_balance,
-                patch("wallet.rpc") as wallet_rpc,
+                patch("database.get_stats", return_value=fake_stats),
+                patch("database.get_coin_summary", return_value=fake_summary),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_connection", return_value=_make_mock_db_conn()),
+                patch.object(
+                    api_server,
+                    "_get_spacescan_market_context",
+                    return_value=_empty_spacescan(),
+                ),
+                patch.object(
+                    api_server, "_get_live_local_offer_edges", return_value={}
+                ),
+                patch("wallet.get_wallet_balance", return_value=zero_balance),
+                patch("wallet.rpc", return_value={"coins": []}),
+                patch.object(api_server, "bot", active_bot),
             ):
-                resp = self._get_dashboard()
+                resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
         finally:
-            if hasattr(api_server, "clear_balance_snapshot"):
-                api_server.clear_balance_snapshot()
+            api_server.clear_balance_snapshot()
             api_server._active_cat.clear()
-            api_server._active_cat.update(original_cat)
+            api_server._active_cat.update(original_active_cat)
 
-        self.assertEqual(refresh.status_code, 200)
         self.assertEqual(resp.status_code, 200)
-        get_wallet_balance.assert_not_called()
-        wallet_rpc.assert_not_called()
         wallet = resp.get_json()["wallet"]
-        self.assertEqual(wallet["xch_total"], "7.0")
-        self.assertEqual(wallet["cat_total"], "8900000.0")
+        self.assertEqual(float(wallet["cat_total"]), 6_500_000.0)
+        self.assertEqual(float(wallet["cat_spendable"]), 6_400_000.0)
 
     def test_market_health_uses_live_offer_edges_for_inner_spread(self):
         risk_manager = MagicMock()
@@ -427,6 +465,39 @@ class TestDashboard(_FlaskBase):
         self.assertIn("allocate an incoming CAT coin", rec["message"])
         self.assertNotIn("Coin Prep", rec["message"])
 
+    def test_cat_topup_pool_empty_recommendation_waits_during_live_topup(self):
+        cfg = types.SimpleNamespace(
+            TIER_ENABLED=True,
+            ENABLE_SELL=True,
+            SNIPER_ENABLED=True,
+            SNIPER_PREP_COUNT=25,
+            SNIPER_SIZE_XCH="0.001",
+            SELL_INNER_TIER_SPARE_COUNT=8,
+            SELL_MID_TIER_SPARE_COUNT=4,
+            SELL_OUTER_TIER_SPARE_COUNT=5,
+            SELL_EXTREME_TIER_SPARE_COUNT=2,
+        )
+        coins = {
+            "topup_running": True,
+            "tier_counts": {
+                "enabled": True,
+                "cat": {
+                    "inner": 1,
+                    "mid": 4,
+                    "outer": 5,
+                    "extreme": 2,
+                    "sniper": 24,
+                    "reserve": 0,
+                    "dust": 0,
+                },
+                "xch": {},
+            },
+        }
+
+        recs = dashboard_bp._build_coin_recommendations(cfg, coins, is_running=True)
+
+        self.assertEqual(recs, [])
+
     def test_shape_fix_coin_prep_halt_copy_is_explicitly_nuclear(self):
         with open(
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
@@ -470,6 +541,34 @@ class TestDashboard(_FlaskBase):
         status_sync = html.split("function syncCommandCentreFromStatus(data)")[1]
         status_sync = status_sync.split("let _sseConnection")[0]
         self.assertIn("ensureFiatPricesFromDashboard", status_sync)
+
+    def test_frontend_preserves_verified_balances_when_status_reports_zero(self):
+        with open(
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
+            encoding="utf-8",
+        ) as handle:
+            html = handle.read()
+
+        self.assertIn("function mergeVerifiedWalletBalances", html)
+
+        refresh = html.split("async function refreshBalances")[1]
+        refresh = refresh.split("async function refreshCATs")[0]
+        self.assertIn("mergeVerifiedWalletBalances(data.balances", refresh)
+
+        update_ui = html.split("function updateUI(data)")[1]
+        update_ui = update_ui.split("// Coin tracking (free vs locked)")[0]
+        self.assertIn("mergeVerifiedWalletBalances", update_ui)
+
+        dashboard = html.split("async function fetchDashboard")[1]
+        dashboard = dashboard.split("// Normalize field names")[0]
+        self.assertIn("mergeVerifiedWalletBalances", dashboard)
+
+        status_sync = html.split("function syncCommandCentreFromStatus(data)")[1]
+        status_sync = status_sync.split("let _sseConnection")[0]
+        self.assertIn("mergeVerifiedWalletBalances", status_sync)
+        self.assertNotIn(
+            "cat_total: Number(data.balances?.cat?.total || 0)", status_sync
+        )
 
     def test_fiat_price_summary_clears_snapshot_fields_when_prices_missing(self):
         with open(

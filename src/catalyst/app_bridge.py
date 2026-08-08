@@ -187,7 +187,7 @@ class AppBridge:
         bot = api.bot
         if bot is None:
             return {"success": False, "error": "Bot not initialized"}
-        bot.stop()
+        bot.stop(wait=False)
         try:
             api.events.emit("bot_control", {"action": "stopped"})
         except Exception:

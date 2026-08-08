@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GUI = ROOT / "bot_gui.html"
+BOT_LOOP = ROOT / "src" / "catalyst" / "bot_loop.py"
 
 
 def test_orderbook_depth_chart_uses_independent_side_price_lanes():
@@ -35,3 +36,22 @@ def test_market_intel_shows_crossed_public_book_instead_of_blank_spread():
 
     assert "bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk" in html
     assert "Crossed" in html
+
+
+def test_market_intel_depth_card_prefers_dexie_totals_for_display():
+    html = GUI.read_text(encoding="utf-8")
+
+    assert "data.dexie_total_buy_depth_xch ?? data.buy_depth_xch" in html
+    assert "data.dexie_total_sell_depth_cat" in html
+    assert "marketIntelCatTicker()" in html
+    assert "data.buy_depth_xch ?? displayBuyDepth" in html
+    assert "data.sell_depth_xch ?? displaySellDepthXch" in html
+
+
+def test_market_intel_sse_payload_includes_dexie_totals():
+    bot_loop = BOT_LOOP.read_text(encoding="utf-8")
+
+    assert '"dexie_total_buy_depth_xch"' in bot_loop
+    assert '"dexie_total_buy_depth_cat"' in bot_loop
+    assert '"dexie_total_sell_depth_xch"' in bot_loop
+    assert '"dexie_total_sell_depth_cat"' in bot_loop

@@ -104,7 +104,7 @@ def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
     worker.verify_coins = MagicMock(return_value=(2, 2))
     worker._merge_xch_fee_change_into_reserve = MagicMock(return_value=False)
     worker._designate_final_sweep = MagicMock()
-    worker._format_cat_amount = lambda value: str(value)
+    worker._format_cat_amount = str
 
     assert worker.run_full_preparation() is False
     worker.update_status.assert_any_call(

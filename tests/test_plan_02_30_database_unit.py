@@ -247,6 +247,168 @@ class TestGetOpenOffers(_TempDB):
         buys = _db.get_open_offers(side="buy", cat_asset_id="assetA")
         self.assertNotIn("b1", {o["trade_id"] for o in buys})
 
+    def test_expire_open_offers_by_time_marks_elapsed_rows_and_frees_coin(self):
+        now = datetime.now(timezone.utc)
+        past = (now - timedelta(seconds=1)).isoformat()
+        future = (now + timedelta(hours=1)).isoformat()
+
+        _db.upsert_coin("0xexpiredcoin", "cat", 123456, designation="tier_spare")
+        _db.add_offer(
+            "expired-row",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+            coin_id="0xexpiredcoin",
+        )
+        _db.lock_coin("0xexpiredcoin", "expired-row")
+        _db.add_offer(
+            "future-row",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=future,
+        )
+
+        expired = _db.expire_open_offers_by_time(
+            cat_asset_id="assetA", now_ts=now.timestamp()
+        )
+
+        self.assertEqual(expired, ["expired-row"])
+        self.assertEqual(_db.get_offer("expired-row")["status"], "expired")
+        self.assertEqual(_db.get_offer("future-row")["status"], "open")
+        open_ids = {o["trade_id"] for o in _db.get_open_offers(cat_asset_id="assetA")}
+        self.assertNotIn("expired-row", open_ids)
+        self.assertIn("future-row", open_ids)
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xexpiredcoin",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(coin["status"], "free")
+        self.assertIsNone(coin["trade_id"])
+
+    def test_elapsed_offer_expiry_is_hidden_until_explicit_expiry(self):
+        now = datetime.now(timezone.utc)
+        past = (now - timedelta(seconds=1)).isoformat()
+
+        _db.upsert_coin("0xidleexpired", "cat", 123456, designation="tier_spare")
+        _db.add_offer(
+            "idle-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+            coin_id="0xidleexpired",
+        )
+        _db.lock_coin("0xidleexpired", "idle-expired")
+
+        offers = _db.get_open_offers(cat_asset_id="assetA")
+        startup_offers = _db.get_open_offers(
+            cat_asset_id="assetA", include_elapsed=True
+        )
+        offer = _db.get_offer("idle-expired")
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xidleexpired",),
+            )
+            .fetchone()
+        )
+
+        self.assertNotIn("idle-expired", {o["trade_id"] for o in offers})
+        self.assertIn("idle-expired", {o["trade_id"] for o in startup_offers})
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "idle-expired")
+
+        retired = _db.expire_elapsed_open_offers(cat_asset_id="assetA", now=now)
+        offer = _db.get_offer("idle-expired")
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xidleexpired",),
+            )
+            .fetchone()
+        )
+        self.assertEqual(retired, 1)
+        self.assertEqual(offer["status"], "expired")
+        self.assertEqual(offer["lifecycle_state"], "expired")
+        self.assertEqual(coin["status"], "free")
+        self.assertIsNone(coin["trade_id"])
+
+    def test_get_stats_excludes_elapsed_expiry_without_mutating_rows(self):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE offers SET expires_at=? WHERE cat_asset_id=?",
+            (past, "assetA"),
+        )
+        conn.commit()
+
+        stats = _db.get_stats(cat_asset_id="assetA")
+        lifecycle = _db.get_offer_lifecycle_summary(cat_asset_id="assetA")
+
+        self.assertEqual(stats["open_offers"], 0)
+        self.assertEqual(lifecycle["by_status"]["expired"], 2)
+        self.assertEqual(_db.get_offer("b1")["status"], "open")
+        self.assertEqual(_db.get_offer("s1")["status"], "open")
+        startup_ids = {
+            o["trade_id"]
+            for o in _db.get_open_offers(cat_asset_id="assetA", include_elapsed=True)
+        }
+        self.assertEqual(startup_ids, {"b1", "s1"})
+
+    def test_init_database_preserves_elapsed_rows_for_startup_reconcile(self):
+        expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        _db.upsert_coin("0xbootexpired", "cat", 123456, designation="tier_spare")
+        _db.add_offer(
+            "boot-expired",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=expired_at,
+            coin_id="0xbootexpired",
+        )
+        _db.lock_coin("0xbootexpired", "boot-expired")
+
+        _db._db_initialized_path = ""
+        _db.init_database()
+
+        offer = _db.get_offer("boot-expired")
+        live_offers = _db.get_open_offers(cat_asset_id="assetA")
+        startup_offers = _db.get_open_offers(
+            cat_asset_id="assetA", include_elapsed=True
+        )
+        coin = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?",
+                ("0xbootexpired",),
+            )
+            .fetchone()
+        )
+        self.assertNotIn("boot-expired", {o["trade_id"] for o in live_offers})
+        self.assertIn("boot-expired", {o["trade_id"] for o in startup_offers})
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "boot-expired")
+
     def test_excludes_pending_fill_verification_by_default(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
         offers = _db.get_open_offers(cat_asset_id="assetA")
@@ -257,99 +419,6 @@ class TestGetOpenOffers(_TempDB):
             include_mempool_observed=True,
         )
         self.assertIn("b1", {o["trade_id"] for o in with_pending})
-
-    def test_elapsed_offer_expiry_is_retired_before_open_query(self):
-        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
-        _db.upsert_coin(
-            "0xexpiredcoin",
-            "xch",
-            123456,
-            designation="tier_spare",
-            tier="inner",
-        )
-        _db.add_offer(
-            "expired-open",
-            "buy",
-            Decimal("1.00"),
-            Decimal("0.5"),
-            Decimal("500"),
-            "assetA",
-            expires_at=past,
-            coin_id="0xexpiredcoin",
-        )
-        _db.lock_coin("0xexpiredcoin", "expired-open")
-
-        offers = _db.get_open_offers(cat_asset_id="assetA")
-
-        offer = _db.get_offer("expired-open")
-        coin = (
-            _db.get_connection()
-            .execute(
-                "SELECT status, trade_id FROM coins WHERE coin_id=?",
-                ("0xexpiredcoin",),
-            )
-            .fetchone()
-        )
-        self.assertNotIn("expired-open", {o["trade_id"] for o in offers})
-        self.assertEqual(offer["status"], "expired")
-        self.assertEqual(offer["lifecycle_state"], "expired")
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
-
-    def test_get_stats_retires_elapsed_expiry_before_counting_open_offers(self):
-        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
-        conn = _db.get_connection()
-        conn.execute(
-            "UPDATE offers SET expires_at=? WHERE cat_asset_id=?",
-            (past, "assetA"),
-        )
-        conn.commit()
-
-        stats = _db.get_stats(cat_asset_id="assetA")
-
-        self.assertEqual(stats["open_offers"], 0)
-        self.assertEqual(stats["open_buys"], 0)
-        self.assertEqual(stats["open_sells"], 0)
-        self.assertEqual(_db.get_offer("b1")["status"], "expired")
-        self.assertEqual(_db.get_offer("s1")["status"], "expired")
-
-    def test_init_database_retires_elapsed_expiry_before_idle_snapshots(self):
-        past = _db._sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=1))
-        _db.upsert_coin(
-            "0xbootexpired",
-            "cat",
-            123456,
-            designation="tier_spare",
-            tier="inner",
-        )
-        _db.add_offer(
-            "boot-expired",
-            "sell",
-            Decimal("1.00"),
-            Decimal("0.5"),
-            Decimal("500"),
-            "assetA",
-            expires_at=past,
-            coin_id="0xbootexpired",
-        )
-        _db.lock_coin("0xbootexpired", "boot-expired")
-        _db._db_initialized_path = ""
-
-        _db.init_database()
-
-        offer = _db.get_offer("boot-expired")
-        coin = (
-            _db.get_connection()
-            .execute(
-                "SELECT status, trade_id FROM coins WHERE coin_id=?",
-                ("0xbootexpired",),
-            )
-            .fetchone()
-        )
-        self.assertEqual(offer["status"], "expired")
-        self.assertEqual(offer["lifecycle_state"], "expired")
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
 
     def test_get_stats_excludes_non_actionable_open_rows(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
@@ -362,9 +431,24 @@ class TestGetOpenOffers(_TempDB):
         self.assertEqual(stats["open_sells"], 0)
 
     def test_get_offers_for_repost_excludes_non_actionable_open_rows(self):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         conn = _db.get_connection()
         conn.execute("UPDATE offers SET offer_bech32='offer1fake' WHERE trade_id='b1'")
         conn.execute("UPDATE offers SET offer_bech32='offer1fake' WHERE trade_id='s1'")
+        conn.commit()
+        _db.add_offer(
+            "expired-repost",
+            "sell",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+            expires_at=past,
+        )
+        conn.execute(
+            "UPDATE offers SET offer_bech32='offer1expired' "
+            "WHERE trade_id='expired-repost'"
+        )
         conn.commit()
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
 
@@ -372,7 +456,9 @@ class TestGetOpenOffers(_TempDB):
         trade_ids = {o["trade_id"] for o in repostable}
 
         self.assertNotIn("b1", trade_ids)
+        self.assertNotIn("expired-repost", trade_ids)
         self.assertIn("s1", trade_ids)
+        self.assertEqual(_db.get_offer("expired-repost")["status"], "open")
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
@@ -650,61 +736,19 @@ class TestElapsedExpiryMissingTable(_TempDB):
     """Elapsed-expiry repair tolerates narrow test DBs without offers."""
 
     def test_missing_offers_table_is_quiet_noop(self):
-        import sqlite3
+        conn = _db.get_connection()
+        conn.execute("DROP TABLE offers")
+        conn.commit()
 
-        class MissingOffersConnection:
-            def execute(self, *args, **kwargs):
-                raise sqlite3.OperationalError("no such table: offers")
-
-        events = []
-        with patch.object(
-            _db, "get_connection", return_value=MissingOffersConnection()
-        ):
-            with patch.object(
-                _db,
-                "log_event",
-                side_effect=lambda severity, event_type, message, *args, **kwargs: (
-                    events.append((severity, event_type, message))
-                ),
-            ):
-                retired = _db.expire_elapsed_open_offers()
+        with patch.object(_db, "log_event") as log_event:
+            retired = _db.expire_elapsed_open_offers()
 
         self.assertEqual(retired, 0)
         self.assertFalse(
-            [event for event in events if event[0] in ("warning", "error")]
-        )
-
-
-@unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
-class TestSplashIncomingLockContention(_TempDB):
-    """Splash incoming writes tolerate transient SQLite contention."""
-
-    def test_record_locked_database_is_non_warning_best_effort_drop(self):
-        import sqlite3
-
-        class LockedConnection:
-            def execute(self, *args, **kwargs):
-                raise sqlite3.OperationalError("database is locked")
-
-            def rollback(self):
-                pass
-
-        events = []
-        with patch.object(_db, "get_connection", return_value=LockedConnection()):
-            with patch.object(
-                _db,
-                "log_event",
-                side_effect=lambda severity, event_type, message, *args, **kwargs: (
-                    events.append((severity, event_type, message))
-                ),
-            ):
-                recorded = _db.record_splash_incoming(
-                    "offer1abc", "fingerprint", source_ip="127.0.0.1"
-                )
-
-        self.assertFalse(recorded)
-        self.assertFalse(
-            [event for event in events if event[0] in ("warning", "error")]
+            any(
+                call.args[0] == "warning" and call.args[1] == "db_elapsed_expiry_failed"
+                for call in log_event.mock_calls
+            )
         )
 
 

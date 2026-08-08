@@ -161,6 +161,30 @@ class WindowsProcessLifetimeTests(unittest.TestCase):
             self.assertEqual(env["SAGE_KEY_PATH"], str(key_path))
             self.assertEqual(env["SAGE_DATA_DIR"], os.path.realpath(ssl_dir.parent))
 
+    def test_coin_prep_worker_environment_normalizes_sage_active_cat_wallet(self):
+        base_env = {
+            "WALLET_TYPE": "sage",
+            "CAT_ASSET_ID": "abc123",
+            "CAT_WALLET_ID": "1000",
+            "SAGE_CERT_PATH": "C:\\Sage\\ssl\\wallet.crt",
+            "SAGE_KEY_PATH": "C:\\Sage\\ssl\\wallet.key",
+        }
+
+        env = coin_manager._coin_prep_worker_environment(base_env)
+
+        self.assertEqual(env["CAT_WALLET_ID"], "2")
+
+    def test_coin_prep_worker_environment_preserves_chia_cat_wallet(self):
+        env = coin_manager._coin_prep_worker_environment(
+            {
+                "WALLET_TYPE": "chia",
+                "CAT_ASSET_ID": "abc123",
+                "CAT_WALLET_ID": "1000",
+            }
+        )
+
+        self.assertEqual(env["CAT_WALLET_ID"], "1000")
+
     def test_coin_prep_worker_environment_logs_explicit_sage_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ssl_dir = Path(temp_dir) / "explicit" / "ssl"

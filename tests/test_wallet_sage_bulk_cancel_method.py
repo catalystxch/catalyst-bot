@@ -159,7 +159,7 @@ class BulkCancelMethodTagTests(unittest.TestCase):
             self.assertTrue(results[tid]["success"])
             self.assertEqual(results[tid]["method"], "submitted_pending_confirm")
 
-    def test_bulk_submit_mempool_conflict_returns_inflight_marker(self):
+    def test_bulk_submit_mempool_conflict_returns_false_for_fallback(self):
         calls = []
 
         def fake_sage_post(endpoint, payload, timeout=0):
@@ -178,20 +178,54 @@ class BulkCancelMethodTagTests(unittest.TestCase):
         ):
             result = wallet_sage._cancel_offers_bulk_proper(["aaaa", "bbbb"])
 
-        self.assertEqual(result, "mempool_conflict_inflight")
+        self.assertIs(result, False)
         self.assertEqual(
             calls,
             ["cancel_offers", "sign_coin_spends", "submit_transaction"],
         )
 
-    def test_bulk_mempool_conflict_marks_batch_pending_without_sequential_retry(self):
+    def test_bulk_mempool_conflict_runs_sequential_fallback(self):
+        trade_ids = ["aaaa", "bbbb", "cccc"]
+
+        def fake_cancel_offer(trade_id, secure, timeout=0, fee_mojos=None):
+            return {
+                "success": True,
+                "method": "submitted_pending_confirm",
+                "trade_id": trade_id,
+            }
+
+        with (
+            patch.object(
+                wallet_sage,
+                "_cancel_offers_bulk_proper",
+                return_value=False,
+            ),
+            patch.object(
+                wallet_sage,
+                "cancel_offer",
+                side_effect=fake_cancel_offer,
+            ) as cancel_offer,
+            patch.object(wallet_sage, "get_spendable_coin_count", return_value=10),
+            patch.object(wallet_sage.time, "sleep", return_value=None),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                trade_ids, secure=True, skip_confirmation=True
+            )
+
+        self.assertEqual(cancel_offer.call_count, len(trade_ids))
+        for tid in trade_ids:
+            self.assertTrue(results[tid]["success"])
+            self.assertEqual(results[tid]["method"], "submitted_pending_confirm")
+            self.assertIn(results[tid]["method"], CANCEL_PENDING_METHODS)
+
+    def test_bulk_already_including_marks_batch_pending_without_sequential_retry(self):
         trade_ids = ["aaaa", "bbbb", "cccc"]
 
         with (
             patch.object(
                 wallet_sage,
                 "_cancel_offers_bulk_proper",
-                return_value="mempool_conflict_inflight",
+                return_value="already_in_mempool",
             ),
             patch.object(wallet_sage, "cancel_offer") as cancel_offer,
             patch.object(wallet_sage, "get_spendable_coin_count", return_value=10),
@@ -203,7 +237,7 @@ class BulkCancelMethodTagTests(unittest.TestCase):
         cancel_offer.assert_not_called()
         for tid in trade_ids:
             self.assertTrue(results[tid]["success"])
-            self.assertEqual(results[tid]["method"], "mempool_conflict_inflight")
+            self.assertEqual(results[tid]["method"], "already_in_mempool")
             self.assertIn(results[tid]["method"], CANCEL_PENDING_METHODS)
 
 

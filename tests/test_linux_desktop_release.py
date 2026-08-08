@@ -136,6 +136,42 @@ def test_linux_notification_runtime_dependencies_are_declared():
     assert "libnotify-bin" in package_script
 
 
+def test_linux_initial_desktop_url_uses_loopback(monkeypatch):
+    sys.modules.pop("desktop_app", None)
+    monkeypatch.setattr(sys, "platform", "linux")
+    desktop_app = importlib.import_module("desktop_app")
+
+    assert desktop_app._initial_desktop_url() == "http://127.0.0.1:5000/"
+
+
+def test_linux_desktop_window_wires_loopback_initial_url():
+    text = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
+
+    assert "_initial_desktop_url()" in text
+    assert "_configure_linux_webengine_env()" in text
+    assert '_splash_path = _bundle_path("splash.html")' not in text
+
+
+def test_linux_package_launchers_export_loopback_runtime_env():
+    package_script = (ROOT / "scripts" / "package_linux.sh").read_text(encoding="utf-8")
+
+    assert "QTWEBENGINE_CHROMIUM_FLAGS" in package_script
+    assert "BlockInsecurePrivateNetworkRequests" in package_script
+    assert "PrivateNetworkAccessSendPreflights" in package_script
+    assert "PrivateNetworkAccessRespectPreflightResults" in package_script
+    assert "--allow-insecure-localhost" in package_script
+    assert "FONTCONFIG_FILE" in package_script
+    assert "FONTCONFIG_PATH" in package_script
+    assert 'rm -f "$appdir/usr/lib/catalyst/splash.html"' in package_script
+    assert 'rm -f "$deb_root/opt/catalyst/splash.html"' in package_script
+
+
+def test_linux_desktop_smoke_requires_loopback_url():
+    smoke = (ROOT / "scripts" / "linux_desktop_smoke.sh").read_text(encoding="utf-8")
+
+    assert "Desktop window URL: http://127.0.0.1:5000/" in smoke
+
+
 def test_linux_detect_gui_backend_prefers_qt_when_available(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")

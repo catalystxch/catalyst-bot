@@ -598,7 +598,10 @@ class TestAppUpdateFrontendAndReleaseWorkflow(unittest.TestCase):
         self.assertIn("latest.json.sig", workflow)
         self.assertIn("CATALYST_UPDATE_SIGNING_KEY_B64", workflow)
         self.assertIn("CATALYST_RELEASE_CHANNEL_TOKEN", workflow)
-        self.assertIn("Catalyst-Setup-${{ github.ref_name }}.exe.sha256", workflow)
+        self.assertIn("Catalyst-Setup-$($env:RELEASE_REF).exe.sha256", workflow)
+        self.assertIn(
+            'gh release upload "$($env:RELEASE_REF)" @assets --clobber', workflow
+        )
 
 
 if __name__ == "__main__":

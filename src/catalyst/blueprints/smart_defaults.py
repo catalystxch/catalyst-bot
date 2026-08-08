@@ -17,6 +17,7 @@ from flask import Blueprint, jsonify, request
 import api_server
 from config import cfg
 from database import log_event
+from ladder_sizing import prepared_sell_ladder_cat_total
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -60,6 +61,16 @@ def _nonnegative_int_or_none(value):
     return parsed if parsed >= 0 else None
 
 
+def _cat_prep_units_floor(value) -> int:
+    try:
+        parsed = Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError, TypeError):
+        return 0
+    if parsed <= 0:
+        return 0
+    return int(parsed)
+
+
 def _smart_float(value, default: float = 0.0) -> float:
     try:
         parsed = float(value)
@@ -73,6 +84,30 @@ def _smart_float(value, default: float = 0.0) -> float:
     except Exception:
         pass
     return parsed
+
+
+def _sell_ladder_cat_prep_total(
+    *,
+    mid_price,
+    spread_bps,
+    min_edge_bps,
+    max_sell,
+    tier_counts,
+    tier_spares,
+    tier_sizes_xch,
+    headroom_mult,
+) -> int:
+    """CAT required by prep for the generated sell ladder."""
+    return prepared_sell_ladder_cat_total(
+        mid_price=mid_price,
+        spread_bps=spread_bps,
+        min_edge_bps=min_edge_bps,
+        max_sell=max_sell,
+        tier_counts=tier_counts,
+        tier_spares=tier_spares,
+        tier_sizes_xch=tier_sizes_xch,
+        headroom_mult=headroom_mult,
+    )
 
 
 def _prep_count_from_budget(
@@ -1154,7 +1189,9 @@ def _calculate_smart_defaults(
             cat_spendable = _raw_total / (10**decimals)
             _pending_tx_count += int(wb.get("pending_coin_removal_count", 0) or 0)
         wallet_balances = api_server.cache_balance_snapshot(
-            {
+            asset_id=asset_id,
+            cat_wallet_id=cat_wid,
+            balances={
                 "xch": {"total": xch_spendable, "spendable": xch_spendable},
                 "cat": {"total": cat_spendable, "spendable": cat_spendable},
             },
@@ -2296,6 +2333,7 @@ def _calculate_smart_defaults(
     _smart_extreme = 0.0
     _smart_trade_size = 0.0
     _capital_plan = {}
+    _n_final = 0
     _n_sell_cap = 0  # F64: CAT-backed sell capacity (set inside capital plan)
 
     if _avail_xch > 0 and _trading_xch >= (_MIN_OFFER_XCH * 2) and _target_n > 0:
@@ -2606,24 +2644,12 @@ def _calculate_smart_defaults(
         # guaranteed to pass the coin-prep feasibility check in the frontend:
         #
         #   totalCatForCoinPrep = sum_tier:
-        #       (n_live + n_spare) × round(tier_size_xch / mid_price × headroom_mult)
+        #       (n_live + n_spare) × round(max_cat_for_generated_tier_slot × headroom_mult)
         #
         # If the total exceeds avail_cat, scale ALL tier sizes down by the
         # ratio (avail_cat / total), then re-floor at _MIN_OFFER_XCH.
         if mid_price and mid_price > 0 and _avail_cat > 0:
             _cp_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
-            _tier_live_spare_size = [
-                (_smart_n_inner, _spare_inner, _smart_inner),
-                (_smart_n_mid, _spare_mid, _smart_mid),
-            ]
-            if _max_tiers >= 3 and _smart_outer > 0:
-                _tier_live_spare_size.append(
-                    (_smart_n_outer, _spare_outer, _smart_outer)
-                )
-            if _max_tiers >= 4 and _smart_extreme > 0:
-                _tier_live_spare_size.append(
-                    (_smart_n_extreme, _spare_extreme, _smart_extreme)
-                )
             # Use the actual configured spares the frontend will build with.
             # PREVIOUSLY this also took max() against (live × 3) as a "what if
             # the user is on the recommended 2:1 spare template" defensive
@@ -2633,9 +2659,30 @@ def _calculate_smart_defaults(
             # spare snap already lives in the frontend Recommended button —
             # if the user clicks it the spare counts arrive here updated, so
             # the defensive max is never needed.
-            _total_cat_prep = sum(
-                (_nl + _ns) * round((_sx / mid_price) * _cp_hm)
-                for _nl, _ns, _sx in _tier_live_spare_size
+            _total_cat_prep = _sell_ladder_cat_prep_total(
+                mid_price=mid_price,
+                spread_bps=base_spread_bps,
+                min_edge_bps=inner_edge_bps,
+                max_sell=_smart_max_sell,
+                tier_counts={
+                    "inner": _smart_n_inner,
+                    "mid": _smart_n_mid,
+                    "outer": _smart_n_outer,
+                    "extreme": _smart_n_extreme,
+                },
+                tier_spares={
+                    "inner": _spare_inner,
+                    "mid": _spare_mid,
+                    "outer": _spare_outer,
+                    "extreme": _spare_extreme,
+                },
+                tier_sizes_xch={
+                    "inner": _smart_inner,
+                    "mid": _smart_mid,
+                    "outer": _smart_outer,
+                    "extreme": _smart_extreme,
+                },
+                headroom_mult=_cp_hm,
             )
             # F55 (2026-04-09): the frontend's coin-prep total includes
             # sniper CAT and the topup-pool CAT alongside the trading
@@ -2759,7 +2806,6 @@ def _calculate_smart_defaults(
 
         _capital_plan = {
             "total_xch": round(xch_spendable, 4),
-            "total_cat": round(cat_spendable, 2),
             "xch_reserve": _xch_reserve,
             "cat_reserve": _cat_reserve,
             "available_xch": round(_avail_xch, 4),
@@ -2804,7 +2850,6 @@ def _calculate_smart_defaults(
     else:
         _capital_plan = {
             "total_xch": round(xch_spendable, 4),
-            "total_cat": round(cat_spendable, 2),
             "xch_reserve": _xch_reserve,
             "cat_reserve": _cat_reserve,
             "available_xch": round(_avail_xch, 4),
@@ -3565,8 +3610,7 @@ def _calculate_smart_defaults(
                 _f64_old_sell_inner = _smart_sell_inner
 
                 # Helper: compute tier sizes from a base, then verify the
-                # ACTUAL total in tokens using the same per-tier integer
-                # rounding the frontend uses (round(xch / mid_price × hm)).
+                # actual prep total using the generated sell-slot prices.
                 # Returns (sizes_dict, total_cat_tokens).
                 def _f64_size_and_verify(base):
                     si = max(_MIN_OFFER_XCH, round(base * _size_mults[0], 4))
@@ -3581,18 +3625,30 @@ def _calculate_smart_defaults(
                         if _max_tiers == 4 and _smart_sell_extreme > 0
                         else _smart_sell_extreme
                     )
-                    # Same formula the frontend uses in buildCoinPrepPlan:
-                    # (live + spare) × round(tier_xch / mid_price × headroom)
-                    _tls = [
-                        (_smart_n_inner + _spare_inner, si),
-                        (_smart_n_mid + _spare_mid, sm),
-                    ]
-                    if _max_tiers >= 3 and so > 0:
-                        _tls.append((_smart_n_outer + _spare_outer, so))
-                    if _max_tiers == 4 and se > 0:
-                        _tls.append((_smart_n_extreme + _spare_extreme, se))
-                    total = sum(
-                        cnt * round((sx / mid_price) * _cp_hm_f64) for cnt, sx in _tls
+                    total = _sell_ladder_cat_prep_total(
+                        mid_price=mid_price,
+                        spread_bps=base_spread_bps,
+                        min_edge_bps=inner_edge_bps,
+                        max_sell=_smart_max_sell,
+                        tier_counts={
+                            "inner": _smart_n_inner,
+                            "mid": _smart_n_mid,
+                            "outer": _smart_n_outer,
+                            "extreme": _smart_n_extreme,
+                        },
+                        tier_spares={
+                            "inner": _spare_inner,
+                            "mid": _spare_mid,
+                            "outer": _spare_outer,
+                            "extreme": _spare_extreme,
+                        },
+                        tier_sizes_xch={
+                            "inner": si,
+                            "mid": sm,
+                            "outer": so,
+                            "extreme": se,
+                        },
+                        headroom_mult=_cp_hm_f64,
                     )
                     return (si, sm, so, se), total
 
@@ -3702,17 +3758,30 @@ def _calculate_smart_defaults(
                         if ne > 0
                         else _spare_extreme
                     )
-                    _tiers = [
-                        (ni, si, _smart_sell_inner),
-                        (nm, sm, _smart_sell_mid),
-                    ]
-                    if _max_tiers >= 3 and _smart_sell_outer > 0:
-                        _tiers.append((no, so, _smart_sell_outer))
-                    if _max_tiers == 4 and _smart_sell_extreme > 0:
-                        _tiers.append((ne, se, _smart_sell_extreme))
-                    cat = sum(
-                        (_nl + _ns) * round((_sx / mid_price) * _cp_hm_f64)
-                        for _nl, _ns, _sx in _tiers
+                    cat = _sell_ladder_cat_prep_total(
+                        mid_price=mid_price,
+                        spread_bps=base_spread_bps,
+                        min_edge_bps=inner_edge_bps,
+                        max_sell=n,
+                        tier_counts={
+                            "inner": ni,
+                            "mid": nm,
+                            "outer": no,
+                            "extreme": ne,
+                        },
+                        tier_spares={
+                            "inner": si,
+                            "mid": sm,
+                            "outer": so,
+                            "extreme": se,
+                        },
+                        tier_sizes_xch={
+                            "inner": _smart_sell_inner,
+                            "mid": _smart_sell_mid,
+                            "outer": _smart_sell_outer,
+                            "extreme": _smart_sell_extreme,
+                        },
+                        headroom_mult=_cp_hm_f64,
                     )
                     return (ni, nm, no, ne), (si, sm, so, se), cat
 
@@ -3767,6 +3836,37 @@ def _calculate_smart_defaults(
                 _capital_plan["strategy"] = _strategy
     # ═══ END SELL-SIDE INDEPENDENT SIZING ═════════════════════════════════
 
+    # ═══ DBX cap clamp (opt-in via the pre-prompt) ════════════════════════
+    # When the user picks "Maximize DBX" before Smart Settings runs, clamp
+    # the spread + requote so every tier of the resulting ladder lands
+    # inside Dexie's incentive cap and stays reward-eligible. The cap is
+    # the tighter of the two sides' caps (already computed in
+    # _smart_dbx_defaults). Only applies if the calculated spread is wider
+    # than the cap — otherwise the result already qualifies and we leave
+    # everything alone. Keep this before F65 so the CAT budget verifier uses
+    # the same final spread that gets returned to the GUI and worker.
+    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
+    if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
+        _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
+        if _cap_bps > 0:
+            _orig_base = base_spread_bps
+            if base_spread_bps > _cap_bps:
+                base_spread_bps = _cap_bps
+            if max_spread_bps > _cap_bps:
+                max_spread_bps = _cap_bps
+            if min_spread_bps > _cap_bps:
+                min_spread_bps = _cap_bps
+            # Requote scales with the (now tighter) spread so requotes
+            # don't slingshot offers outside the cap. Floor at 25 bps so
+            # we don't end up requoting on every micro-move.
+            if _orig_base > _cap_bps and _orig_base > 0:
+                _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
+                requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
+            messages.append(
+                f"DBX cap applied: spread tightened to {_cap_bps / 100:.1f}% "
+                f"(from {_orig_base / 100:.1f}%) so all tiers stay reward-eligible"
+            )
+
     # ═══ F65 FINAL SELL-SIDE CAT VERIFICATION ═════════════════════════════
     # Belt-and-suspenders check: compute the EXACT coin-prep total using
     # the same formula the frontend uses (tiers + sniper + topup), and
@@ -3775,18 +3875,30 @@ def _calculate_smart_defaults(
     # rounding accumulation, mid_price movement, or future code changes.
     if _avail_cat > 0 and mid_price and mid_price > 0 and _smart_sell_inner > 0:
         _f65_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
-        _f65_tiers = [
-            (_sell_n_inner + _sell_spare_inner, _smart_sell_inner),
-            (_sell_n_mid + _sell_spare_mid, _smart_sell_mid),
-        ]
-        if _max_tiers >= 3 and _smart_sell_outer > 0:
-            _f65_tiers.append((_sell_n_outer + _sell_spare_outer, _smart_sell_outer))
-        if _max_tiers == 4 and _smart_sell_extreme > 0:
-            _f65_tiers.append(
-                (_sell_n_extreme + _sell_spare_extreme, _smart_sell_extreme)
-            )
-        _f65_tier_cat = sum(
-            _cnt * round((_sx / mid_price) * _f65_hm) for _cnt, _sx in _f65_tiers
+        _f65_tier_cat = _sell_ladder_cat_prep_total(
+            mid_price=mid_price,
+            spread_bps=base_spread_bps,
+            min_edge_bps=inner_edge_bps,
+            max_sell=_smart_max_sell,
+            tier_counts={
+                "inner": _sell_n_inner,
+                "mid": _sell_n_mid,
+                "outer": _sell_n_outer,
+                "extreme": _sell_n_extreme,
+            },
+            tier_spares={
+                "inner": _sell_spare_inner,
+                "mid": _sell_spare_mid,
+                "outer": _sell_spare_outer,
+                "extreme": _sell_spare_extreme,
+            },
+            tier_sizes_xch={
+                "inner": _smart_sell_inner,
+                "mid": _smart_sell_mid,
+                "outer": _smart_sell_outer,
+                "extreme": _smart_sell_extreme,
+            },
+            headroom_mult=_f65_hm,
         )
         _f65_sniper_cat = (
             round((_smart_sniper_size / mid_price) * _f65_hm) * _smart_sniper_prep
@@ -3824,21 +3936,31 @@ def _calculate_smart_defaults(
             _smart_outer = _smart_sell_outer
             _smart_extreme = _smart_sell_extreme
 
-            # Verify the scaled sizes actually fit now
-            _f65_tiers2 = [
-                (_sell_n_inner + _sell_spare_inner, _smart_sell_inner),
-                (_sell_n_mid + _sell_spare_mid, _smart_sell_mid),
-            ]
-            if _max_tiers >= 3 and _smart_sell_outer > 0:
-                _f65_tiers2.append(
-                    (_sell_n_outer + _sell_spare_outer, _smart_sell_outer)
-                )
-            if _max_tiers == 4 and _smart_sell_extreme > 0:
-                _f65_tiers2.append(
-                    (_sell_n_extreme + _sell_spare_extreme, _smart_sell_extreme)
-                )
-            _f65_new_tier = sum(
-                _c * round((_s / mid_price) * _f65_hm) for _c, _s in _f65_tiers2
+            # Verify the scaled sizes actually fit now.
+            _f65_new_tier = _sell_ladder_cat_prep_total(
+                mid_price=mid_price,
+                spread_bps=base_spread_bps,
+                min_edge_bps=inner_edge_bps,
+                max_sell=_smart_max_sell,
+                tier_counts={
+                    "inner": _sell_n_inner,
+                    "mid": _sell_n_mid,
+                    "outer": _sell_n_outer,
+                    "extreme": _sell_n_extreme,
+                },
+                tier_spares={
+                    "inner": _sell_spare_inner,
+                    "mid": _sell_spare_mid,
+                    "outer": _sell_spare_outer,
+                    "extreme": _sell_spare_extreme,
+                },
+                tier_sizes_xch={
+                    "inner": _smart_sell_inner,
+                    "mid": _smart_sell_mid,
+                    "outer": _smart_sell_outer,
+                    "extreme": _smart_sell_extreme,
+                },
+                headroom_mult=_f65_hm,
             )
             _f65_new_total = _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
             if _f65_new_total > _avail_cat:
@@ -3877,11 +3999,10 @@ def _calculate_smart_defaults(
 
                 if _f65_new_total > _avail_cat and _f65_topup_cat > 0:
                     _old_topup_cat = _topup_buffer_cat
-                    _topup_buffer_cat = max(
-                        0.0,
-                        round(_avail_cat - _f65_new_tier - _f65_sniper_cat, 3),
+                    _f65_topup_cat = _cat_prep_units_floor(
+                        _avail_cat - _f65_new_tier - _f65_sniper_cat
                     )
-                    _f65_topup_cat = round(_topup_buffer_cat)
+                    _topup_buffer_cat = float(_f65_topup_cat)
                     _f65_new_total = _f65_new_tier + _f65_sniper_cat + _f65_topup_cat
                     messages.append(
                         f"CAT topup budget capped: {_old_topup_cat:,.0f} -> "
@@ -3946,36 +4067,6 @@ def _calculate_smart_defaults(
         and int(_smart_sniper_prep or 0) > 0
     )
 
-    # ═══ DBX cap clamp (opt-in via the pre-prompt) ════════════════════════
-    # When the user picks "Maximize DBX" before Smart Settings runs, clamp
-    # the spread + requote so every tier of the resulting ladder lands
-    # inside Dexie's incentive cap and stays reward-eligible. The cap is
-    # the tighter of the two sides' caps (already computed in
-    # _smart_dbx_defaults). Only applies if the calculated spread is wider
-    # than the cap — otherwise the result already qualifies and we leave
-    # everything alone.
-    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
-    if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
-        _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
-        if _cap_bps > 0:
-            _orig_base = base_spread_bps
-            if base_spread_bps > _cap_bps:
-                base_spread_bps = _cap_bps
-            if max_spread_bps > _cap_bps:
-                max_spread_bps = _cap_bps
-            if min_spread_bps > _cap_bps:
-                min_spread_bps = _cap_bps
-            # Requote scales with the (now tighter) spread so requotes
-            # don't slingshot offers outside the cap. Floor at 25 bps so
-            # we don't end up requoting on every micro-move.
-            if _orig_base > _cap_bps and _orig_base > 0:
-                _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
-                requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
-            messages.append(
-                f"DBX cap applied: spread tightened to {_cap_bps / 100:.1f}% "
-                f"(from {_orig_base / 100:.1f}%) so all tiers stay reward-eligible"
-            )
-
     _toxicity_defaults = _smart_toxicity_defaults(
         avail_xch=_avail_xch,
         avail_cat=_avail_cat,
@@ -3991,6 +4082,30 @@ def _calculate_smart_defaults(
     messages.append(
         "Adverse-selection guard: "
         f"{_toxicity_defaults['toxicity_protection_level']} protection"
+    )
+
+    _smart_trade_bound_candidates = [
+        _smart_trade_size,
+        _smart_inner,
+        _smart_mid,
+        _smart_outer,
+        _smart_extreme,
+        _smart_buy_inner,
+        _smart_buy_mid,
+        _smart_buy_outer,
+        _smart_buy_extreme,
+        _smart_sell_inner,
+        _smart_sell_mid,
+        _smart_sell_outer,
+        _smart_sell_extreme,
+        _smart_sniper_size if _sniper_auto else 0,
+    ]
+    _smart_max_trade_xch = round(
+        max(
+            (float(v) for v in _smart_trade_bound_candidates if float(v or 0) > 0),
+            default=0.0,
+        ),
+        4,
     )
 
     result = {
@@ -4155,6 +4270,8 @@ def _calculate_smart_defaults(
         "default_trade_xch": round(_smart_trade_size, 4)
         if _smart_trade_size > 0
         else None,
+        "min_trade_xch": round(_MIN_OFFER_XCH, 4),
+        "max_trade_xch": _smart_max_trade_xch if _smart_max_trade_xch > 0 else None,
         # Legacy single-shared size fields (kept in sync with the SELL
         # side so pre-F62 callers continue to work).
         "inner_size_xch": _smart_inner if _smart_inner > 0 else None,
