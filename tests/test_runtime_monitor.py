@@ -704,7 +704,7 @@ class RuntimeMonitorTests(unittest.TestCase):
         bot = _FakeBot()
         bot._start_time = time.time() - 3600
         bot._current_cycle_step = "step3_wallet_sync"
-        bot._cycle_step_started_at = time.monotonic() - 9999
+        bot._cycle_step_started_at = 1.0
         monitor = RuntimeMonitor(bot)
         monitor.reset_session()
 
@@ -717,6 +717,7 @@ class RuntimeMonitorTests(unittest.TestCase):
             patch.object(monitor, "_resolve_superlog_path", return_value=""),
             patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 180),
             patch("runtime_monitor.cfg.LOOP_SECONDS", 90),
+            patch("runtime_monitor.time.monotonic", return_value=10000.0),
         ):
             monitor._run_once()
 
