@@ -105,6 +105,10 @@ if WALLET_TYPE == "chia":
         """Chia backend compatibility stub for Sage active CAT cache updates."""
         return None
 
+    def is_initialized() -> bool:
+        """Chia backend has no separate Sage-style initialization step."""
+        return True
+
     # Chia's spendable RPC is already the exact selectable view.
     get_exact_spendable_coins_rpc = get_spendable_coins_rpc
 else:
@@ -190,6 +194,7 @@ else:
         # Sage-specific: message signing for Dexie liquidity-rewards claims
         sign_message_by_address,
         notify_cat_asset_id_changed,
+        is_initialized,
     )
 
 
