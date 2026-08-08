@@ -542,7 +542,7 @@ class TestDashboard(_FlaskBase):
         status_sync = status_sync.split("let _sseConnection")[0]
         self.assertIn("ensureFiatPricesFromDashboard", status_sync)
 
-    def test_frontend_preserves_verified_balances_when_status_reports_zero(self):
+    def test_frontend_preserves_verified_balances_only_when_status_omits_fields(self):
         with open(
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
             encoding="utf-8",
@@ -550,6 +550,21 @@ class TestDashboard(_FlaskBase):
             html = handle.read()
 
         self.assertIn("function mergeVerifiedWalletBalances", html)
+        self.assertIn("function _walletBalanceFieldIsPresent", html)
+        self.assertIn("function hasVerifiedWalletBalance", html)
+        self.assertIn("function resetSmartBalanceSnapshot", html)
+        self.assertIn("!live[sideName] && cached.live?.[sideName]", html)
+        self.assertNotIn("_walletBalanceSideIsZero(merged[sideName])", html)
+
+        reset_pair = html.split("function resetPairSelectionState")[1]
+        reset_pair = reset_pair.split("function shouldRequireExplicitPairSelection")[0]
+        self.assertIn("resetVerifiedWalletBalances();", reset_pair)
+        self.assertIn("resetSmartBalanceSnapshot();", reset_pair)
+
+        reserve_helper = html.split("function getWalletBalance(type)")[1]
+        reserve_helper = reserve_helper.split("function setReservePercent")[0]
+        self.assertIn("hasVerifiedWalletBalance('xch')", reserve_helper)
+        self.assertIn("hasVerifiedWalletBalance('cat')", reserve_helper)
 
         refresh = html.split("async function refreshBalances")[1]
         refresh = refresh.split("async function refreshCATs")[0]

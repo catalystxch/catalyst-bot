@@ -269,10 +269,9 @@ def api_splash_incoming():
         fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
         source_ip = request.remote_addr
 
-        from database import record_splash_incoming
-
-        with server._SPLASH_INCOMING_WRITE_LOCK:
-            was_new = record_splash_incoming(offer_bech32, fp, source_ip=source_ip)
+        was_new = server._record_splash_incoming_locked(
+            offer_bech32, fp, source_ip=source_ip
+        )
         server._splash_incoming_note_recorded(was_new)
 
         if was_new:

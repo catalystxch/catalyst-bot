@@ -671,6 +671,9 @@ class BotLoop:
         self._splash_receive_batch_size: int = max(
             1, int(getattr(cfg, "SPLASH_RECEIVE_BATCH_SIZE", 10) or 10)
         )
+        self._splash_receive_view_retries: int = max(
+            1, int(getattr(cfg, "SPLASH_RECEIVE_VIEW_RETRIES", 3) or 3)
+        )
         self._splash_receive_parser_warned: bool = False
 
         # ---- Graceful migration state (V1 parity) ----
@@ -5009,6 +5012,41 @@ class BotLoop:
                 )
             return wallet_type, None
 
+    def _splash_receive_view_retry_count(self, offer: Dict) -> int:
+        hint = str((offer or {}).get("pair_hint") or "")
+        prefix = "view_retry:"
+        if not hint.startswith(prefix):
+            return 0
+        try:
+            return max(0, int(hint[len(prefix) :]))
+        except Exception:
+            return 0
+
+    def _mark_splash_incoming_view_retry(
+        self, offer: Dict, update_status, reason: str
+    ) -> bool:
+        offer_id = int((offer or {}).get("id", 0) or 0)
+        if not offer_id:
+            return False
+        attempt = self._splash_receive_view_retry_count(offer) + 1
+        max_attempts = max(1, int(getattr(self, "_splash_receive_view_retries", 3)))
+        detail = str(reason or "unknown")[:180]
+        if attempt >= max_attempts:
+            update_status(offer_id, "ignored", pair_hint="view_unavailable")
+            log_event(
+                "warning",
+                "splash_receive_view_unavailable",
+                f"Could not inspect inbound Splash offer {offer_id} after {attempt} attempts; ignoring ({detail})",
+            )
+        else:
+            update_status(offer_id, "new", pair_hint=f"view_retry:{attempt}")
+            log_event(
+                "debug",
+                "splash_receive_view_retry",
+                f"Could not inspect inbound Splash offer {offer_id}; retry {attempt}/{max_attempts} ({detail})",
+            )
+        return True
+
     def _process_splash_incoming_batch(self):
         """Classify newly received Splash offers for the active CAT/XCH pair."""
         if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
@@ -5052,20 +5090,15 @@ class BotLoop:
             try:
                 viewed = view_offer(bech32)
             except Exception as e:
-                log_event(
-                    "debug",
-                    "splash_receive_view_error",
-                    f"Could not inspect inbound Splash offer {offer_id}: {e}",
-                )
-                update_splash_incoming_status(
-                    offer_id, "ignored", pair_hint="view_error"
+                self._mark_splash_incoming_view_retry(
+                    offer, update_splash_incoming_status, str(e)
                 )
                 processed_any = True
                 continue
 
             if not viewed:
-                update_splash_incoming_status(
-                    offer_id, "ignored", pair_hint="view_empty"
+                self._mark_splash_incoming_view_retry(
+                    offer, update_splash_incoming_status, "empty view_offer result"
                 )
                 processed_any = True
                 continue

@@ -17618,7 +17618,11 @@
             offers: { buy: [], sell: [] },
             stats: { loop_count: 0, uptime_seconds: 0 }
         };
-        let _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+        let _lastVerifiedWalletBalances = {
+            asset_id: '',
+            balances: null,
+            live: { xch: false, cat: false },
+        };
         let _catSwitchInProgress = false;
         let _catSwitchTargetAssetId = '';
         let _catSwitchGateTimer = null;
@@ -17638,6 +17642,12 @@
             return Number.isFinite(n) ? n : 0;
         }
 
+        function _walletBalanceFieldIsPresent(side = {}, key = '') {
+            if (!side || typeof side !== 'object') return false;
+            if (!Object.prototype.hasOwnProperty.call(side, key)) return false;
+            return Number.isFinite(Number(side[key]));
+        }
+
         function _normalizeWalletBalanceSide(side = {}) {
             return {
                 spendable: _walletBalanceNumber(side?.spendable),
@@ -17652,18 +17662,46 @@
             };
         }
 
-        function _walletBalanceSideIsZero(side = {}) {
-            return _walletBalanceNumber(side?.spendable) <= 0
-                && _walletBalanceNumber(side?.total) <= 0;
-        }
-
         function _walletBalanceSideHasValue(side = {}) {
             return _walletBalanceNumber(side?.spendable) > 0
                 || _walletBalanceNumber(side?.total) > 0;
         }
 
+        function _walletBalanceSideHasLiveFields(side = {}) {
+            return _walletBalanceFieldIsPresent(side, 'spendable')
+                || _walletBalanceFieldIsPresent(side, 'total');
+        }
+
         function resetVerifiedWalletBalances() {
-            _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+            _lastVerifiedWalletBalances = {
+                asset_id: '',
+                balances: null,
+                live: { xch: false, cat: false },
+            };
+        }
+
+        function resetSmartBalanceSnapshot() {
+            window._smartXchBalance = 0;
+            window._smartCatBalance = 0;
+            window._smartBalanceAssetId = '';
+        }
+
+        function hasVerifiedWalletBalance(type) {
+            const sideName = type === 'xch' ? 'xch' : 'cat';
+            const cached = _lastVerifiedWalletBalances || {};
+            if (!cached.balances || !cached.live?.[sideName]) return false;
+            if (sideName === 'cat') {
+                const activeAssetId = String(
+                    currentCAT?.asset_id
+                    || bot_state?.current_cat?.asset_id
+                    || ''
+                ).trim();
+                const cachedAssetId = String(cached.asset_id || '').trim();
+                if (activeAssetId && cachedAssetId && activeAssetId !== cachedAssetId) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '') {
@@ -17677,20 +17715,26 @@
             const cached = _lastVerifiedWalletBalances || {};
             const cacheMatches = cached.balances && String(cached.asset_id || '') === activeAssetId;
             const merged = _normalizeWalletBalances(incoming);
+            const live = {
+                xch: _walletBalanceSideHasLiveFields(incomingBalances?.xch || {}),
+                cat: _walletBalanceSideHasLiveFields(incomingBalances?.cat || {}),
+            };
 
             if (cacheMatches) {
                 for (const sideName of ['xch', 'cat']) {
                     const cachedSide = cached.balances?.[sideName] || {};
-                    if (_walletBalanceSideIsZero(merged[sideName]) && _walletBalanceSideHasValue(cachedSide)) {
+                    if (!live[sideName] && cached.live?.[sideName]) {
                         merged[sideName] = { ...cachedSide };
+                        live[sideName] = true;
                     }
                 }
             }
 
-            if (activeAssetId || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat)) {
+            if (activeAssetId && (live.xch || live.cat || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat))) {
                 _lastVerifiedWalletBalances = {
                     asset_id: activeAssetId,
                     balances: _normalizeWalletBalances(merged),
+                    live,
                 };
             }
 
@@ -17946,6 +17990,7 @@
             _pairDataReadyAssetId = '';
             _dashboardData = null;
             resetVerifiedWalletBalances();
+            resetSmartBalanceSnapshot();
             coinPrepStatus = 'none';
 
             const selector = document.getElementById('catSelector');
@@ -22378,7 +22423,9 @@
             if (type === 'xch') {
                 const liveXch = Number(bot_state?.balances?.xch?.total || 0);
                 const smartXch = Number(window._smartXchBalance || 0);
-                return liveXch > 0 ? liveXch : (smartXch > 0 ? smartXch : 0);
+                return hasVerifiedWalletBalance('xch')
+                    ? liveXch
+                    : (smartXch > 0 ? smartXch : 0);
             }
             const liveCat = Number(bot_state?.balances?.cat?.total || 0);
             const smartCat = Number(window._smartCatBalance || 0);
@@ -22388,7 +22435,9 @@
                 : (currentCAT || {});
             const activeAssetId = String(settingsCAT?.asset_id || currentCAT?.asset_id || '');
             const smartMatchesPair = !smartAssetId || !activeAssetId || smartAssetId === activeAssetId;
-            return liveCat > 0 ? liveCat : (smartMatchesPair && smartCat > 0 ? smartCat : 0);
+            return hasVerifiedWalletBalance('cat')
+                ? liveCat
+                : (smartMatchesPair && smartCat > 0 ? smartCat : 0);
         }
         
         function setReservePercent(type, pct) {

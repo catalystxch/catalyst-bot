@@ -270,6 +270,15 @@ def _splash_incoming_note_recorded(was_new: bool) -> None:
             )
 
 
+def _record_splash_incoming_locked(
+    offer_bech32: str, fingerprint: str, source_ip: str = None
+) -> bool:
+    from database import record_splash_incoming
+
+    with _SPLASH_INCOMING_WRITE_LOCK:
+        return record_splash_incoming(offer_bech32, fingerprint, source_ip=source_ip)
+
+
 # ---------------------------------------------------------------------------
 # Simple per-endpoint rate limiter for state-changing operations
 #
