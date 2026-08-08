@@ -715,6 +715,7 @@ class RuntimeMonitorTests(unittest.TestCase):
             ),
             patch("runtime_monitor.log_event") as log_event_mock,
             patch.object(monitor, "_resolve_superlog_path", return_value=""),
+            patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 0),
             patch("runtime_monitor.cfg.LOOP_SECONDS", 90),
         ):
             monitor._run_once()
