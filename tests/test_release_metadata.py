@@ -23,6 +23,29 @@ def test_sync_release_metadata_writes_runtime_version_and_windows_info(tmp_path)
     assert "OriginalFilename', u'Catalyst.exe'" in version_info
 
 
+def test_sync_release_metadata_preserves_runtime_helpers(tmp_path):
+    version_dir = tmp_path / "src" / "catalyst"
+    version_dir.mkdir(parents=True)
+    version_file = version_dir / "_version.py"
+    version_file.write_text(
+        '''"""Version helpers."""
+
+__version__ = "1.2.2"
+
+
+def get_version():
+    return __version__
+''',
+        encoding="utf-8",
+    )
+
+    sync_release_metadata(tmp_path, "v1.2.3")
+
+    text = version_file.read_text(encoding="utf-8")
+    assert '__version__ = "1.2.3"' in text
+    assert "def get_version():" in text
+
+
 def test_sync_release_metadata_rejects_non_numeric_versions(tmp_path):
     version_dir = tmp_path / "src" / "catalyst"
     version_dir.mkdir(parents=True)

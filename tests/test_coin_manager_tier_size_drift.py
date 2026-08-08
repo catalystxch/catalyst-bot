@@ -87,3 +87,37 @@ def test_instance_drift_uses_same_bounds(monkeypatch):
     findings = manager.check_tier_size_drift()
 
     assert findings == []
+
+
+def test_reclassify_moves_reserve_sized_tier_spares_to_reserve(monkeypatch):
+    monkeypatch.setattr(cfg, "TIER_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        coin_manager,
+        "get_tier_sizes_mojos_from_cfg",
+        lambda is_cat=False: {"inner": 1000, "mid": 500, "outer": 250},
+    )
+
+    def fake_coins(wallet_type, designation, tier=None):
+        assert designation == "tier_spare"
+        if wallet_type == "cat":
+            return [
+                {
+                    "coin_id": "0xreservefuel",
+                    "amount_mojos": 2000,
+                    "assigned_tier": "inner",
+                }
+            ]
+        return []
+
+    designations = []
+
+    def fake_set_coin_designation(coin_id, designation, assigned_tier=None):
+        designations.append((coin_id, designation, assigned_tier))
+
+    monkeypatch.setattr(database, "get_coins_by_designation", fake_coins)
+    monkeypatch.setattr(database, "set_coin_designation", fake_set_coin_designation)
+
+    moved = coin_manager.reclassify_tier_spare_coins()
+
+    assert designations == [("0xreservefuel", "reserve", "none")]
+    assert moved["reclassified"] == 1

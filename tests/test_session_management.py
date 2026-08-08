@@ -154,6 +154,7 @@ class SessionManagementTests(unittest.TestCase):
 
         with (
             patch.object(_api_server, "_FRESH_START_FLAG", self._flag_path),
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[fake_offer]),
             patch(
                 "wallet.classify_offers_from_list", return_value=([fake_offer], [], [])

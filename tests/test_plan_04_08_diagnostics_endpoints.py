@@ -148,6 +148,39 @@ class TestDiagnosticsRuntime(_FlaskBase):
 
 
 # ---------------------------------------------------------------------------
+# 1b. GET /api/health
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestHealthEndpoint(_FlaskBase):
+    def test_unreachable_live_wallet_check_counts_as_failure(self):
+        raw_health = {
+            "status": "unreachable",
+            "healthy": False,
+            "wallet": {
+                "reachable": False,
+                "synced": False,
+                "syncing": False,
+                "sync_state": "rpc_failed",
+            },
+            "node": {"reachable": False, "synced": False},
+        }
+
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch("wallet.get_chia_health", return_value=raw_health),
+            patch.object(api_server, "bot", None),
+        ):
+            resp = self.client.get("/api/health", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["chia_health"]["status"], "unreachable")
+        self.assertGreaterEqual(body["chia_health"]["consecutive_failures"], 1)
+
+
+# ---------------------------------------------------------------------------
 # 2. GET /api/diagnostics/api-stats
 # ---------------------------------------------------------------------------
 

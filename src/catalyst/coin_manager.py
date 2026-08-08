@@ -773,6 +773,7 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
     This module-level function walks every tier_spare coin, runs
     classify_coin against the current tier sizes, and either:
       - re-stamps the coin to the tier its actual amount fits;
+      - moves reserve-sized coins into the reserve bucket;
       - moves obvious dust into the dust bucket;
       - leaves the coin alone when the assignment is already correct.
 
@@ -823,6 +824,9 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
 
             if cls.designation == CoinDesignation.DUST:
                 new_designation = "dust"
+                new_tier = None
+            elif cls.designation == CoinDesignation.RESERVE:
+                new_designation = "reserve"
                 new_tier = None
             elif cls.best_tier and cls.fit in (CoinFit.EXACT, CoinFit.OVERSIZE_FIT):
                 new_designation = "tier_spare"

@@ -12,6 +12,9 @@ from pathlib import Path
 
 
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
+VERSION_ASSIGNMENT_RE = re.compile(
+    r'^__version__\s*=\s*["\'][^"\']*["\']', re.MULTILINE
+)
 
 
 def _parse_version(version: str) -> tuple[str, tuple[int, int, int, int]]:
@@ -65,11 +68,27 @@ VSVersionInfo(
 """
 
 
+def _write_runtime_version(version_file: Path, normalized: str) -> None:
+    replacement = f'__version__ = "{normalized}"'
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not version_file.exists():
+        version_file.write_text(replacement + "\n", encoding="utf-8")
+        return
+
+    existing = version_file.read_text(encoding="utf-8")
+    if VERSION_ASSIGNMENT_RE.search(existing):
+        updated = VERSION_ASSIGNMENT_RE.sub(replacement, existing, count=1)
+    else:
+        updated = replacement + "\n\n" + existing
+    version_file.write_text(updated, encoding="utf-8")
+
+
 def sync_release_metadata(root: Path, version: str) -> None:
     normalized, parts = _parse_version(version)
 
     version_file = root / "src" / "catalyst" / "_version.py"
-    version_file.write_text(f'__version__ = "{normalized}"\n', encoding="utf-8")
+    _write_runtime_version(version_file, normalized)
 
     version_info = root / "version_info.txt"
     version_info.write_text(_version_info(normalized, parts), encoding="utf-8")

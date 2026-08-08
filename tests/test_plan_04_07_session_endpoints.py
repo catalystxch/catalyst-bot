@@ -154,6 +154,7 @@ class TestSessionResumeChosen(_FlaskBase):
 class TestCheckResume(_FlaskBase):
     def test_returns_200(self):
         with (
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[]),
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
@@ -163,6 +164,7 @@ class TestCheckResume(_FlaskBase):
 
     def test_response_has_can_resume_key(self):
         with (
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[]),
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
@@ -191,6 +193,7 @@ class TestCheckResume(_FlaskBase):
 
     def test_no_wallet_offers_returns_cannot_resume(self):
         with (
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[]),
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
@@ -202,6 +205,7 @@ class TestCheckResume(_FlaskBase):
     def test_open_offers_returns_can_resume(self):
         fake_offer = {"trade_id": "abc", "status": "PENDING_ACCEPT"}
         with (
+            patch("chia_node.is_startup_authorised", return_value=True),
             patch("wallet.get_all_offers", return_value=[fake_offer]),
             patch(
                 "wallet.classify_offers_from_list", return_value=([fake_offer], [], [])
@@ -217,6 +221,20 @@ class TestCheckResume(_FlaskBase):
         self.assertTrue(body["can_resume"])
         self.assertIn("buy_count", body)
         self.assertIn("sell_count", body)
+
+    def test_wallet_not_started_does_not_query_offers(self):
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(api_server, "_fresh_start_is_set", return_value=False),
+            patch("chia_node.is_startup_authorised", return_value=False),
+            patch("wallet.get_all_offers") as get_all_offers,
+        ):
+            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertFalse(body["can_resume"])
+        self.assertEqual(body.get("reason"), "wallet_not_started")
+        get_all_offers.assert_not_called()
 
 
 if __name__ == "__main__":

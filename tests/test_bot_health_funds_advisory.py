@@ -363,6 +363,8 @@ class FundsAdvisoryTests(unittest.TestCase):
             self.assertIn("CAT-inner", alert["message"])
             self.assertIn("0/10", alert["message"])
             self.assertIn("topup pool", alert["message"])
+            self.assertIn("TIER_SPARES_DEPLETED", check.reason_codes)
+            self.assertIn("NEEDS_MANUAL_REPREP", check.reason_codes)
         finally:
             conn.close()
             self._uninstall_fake_bus()

@@ -17578,10 +17578,35 @@
         // ─────────────────────────────────────────────────────────────────────
         let _resumeSessionSummary = null;
         let hasCheckedResumeOnLoad = false; // Track if we've shown resume modal
-        // Start with settings NOT reviewed (banner visible)
-        // User must click "Save & Confirm" in THIS session to hide it
-        let settingsReviewed = false; // ALWAYS start as false
-        let userHasSavedSettings = false; // Only populate trade fields from .env after first save
+        function readStoredSettingsReviewed() {
+            try {
+                return localStorage.getItem('settingsReviewed') === 'true';
+            } catch (_) {
+                return false;
+            }
+        }
+
+        function getStoredSettingsReviewedAssetId() {
+            try {
+                return localStorage.getItem('settingsReviewedAssetId') || '';
+            } catch (_) {
+                return '';
+            }
+        }
+
+        function isSettingsReviewedForCurrentPair() {
+            if (!settingsReviewed) return false;
+            const storedAssetId = getStoredSettingsReviewedAssetId();
+            const currentAssetId = currentCAT?.asset_id || '';
+            return !storedAssetId || !currentAssetId || storedAssetId === currentAssetId;
+        }
+
+        // Restore the review flag before Settings decides whether to blank
+        // market-derived fields. Pair changes clear this flag via
+        // setSettingsReviewedState(false), so a truly fresh pair still starts
+        // blank while a saved Smart Settings run survives page reloads.
+        let settingsReviewed = readStoredSettingsReviewed();
+        let userHasSavedSettings = settingsReviewed; // Only populate trade fields from .env after first save
         let coinPrepStatus = 'none'; // 'none' | 'done' | 'skipped'
         
         // Bot state (mirrors API response)
@@ -17593,7 +17618,11 @@
             offers: { buy: [], sell: [] },
             stats: { loop_count: 0, uptime_seconds: 0 }
         };
-        let _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+        let _lastVerifiedWalletBalances = {
+            asset_id: '',
+            balances: null,
+            live: { xch: false, cat: false },
+        };
         let _catSwitchInProgress = false;
         let _catSwitchTargetAssetId = '';
         let _catSwitchGateTimer = null;
@@ -17601,7 +17630,7 @@
         let _pairSelectedByUser = false;
         let _tierCountMode = 'auto';
         let _tierSpareMode = 'auto';
-        let _freshStartBlankTierTemplates = true;
+        let _freshStartBlankTierTemplates = !settingsReviewed;
         let _walletSwitchInProgress = false;
 
         function isWalletSwitchBusy() {
@@ -17611,6 +17640,12 @@
         function _walletBalanceNumber(value) {
             const n = Number(value);
             return Number.isFinite(n) ? n : 0;
+        }
+
+        function _walletBalanceFieldIsPresent(side = {}, key = '') {
+            if (!side || typeof side !== 'object') return false;
+            if (!Object.prototype.hasOwnProperty.call(side, key)) return false;
+            return Number.isFinite(Number(side[key]));
         }
 
         function _normalizeWalletBalanceSide(side = {}) {
@@ -17627,18 +17662,46 @@
             };
         }
 
-        function _walletBalanceSideIsZero(side = {}) {
-            return _walletBalanceNumber(side?.spendable) <= 0
-                && _walletBalanceNumber(side?.total) <= 0;
-        }
-
         function _walletBalanceSideHasValue(side = {}) {
             return _walletBalanceNumber(side?.spendable) > 0
                 || _walletBalanceNumber(side?.total) > 0;
         }
 
+        function _walletBalanceSideHasLiveFields(side = {}) {
+            return _walletBalanceFieldIsPresent(side, 'spendable')
+                || _walletBalanceFieldIsPresent(side, 'total');
+        }
+
         function resetVerifiedWalletBalances() {
-            _lastVerifiedWalletBalances = { asset_id: '', balances: null };
+            _lastVerifiedWalletBalances = {
+                asset_id: '',
+                balances: null,
+                live: { xch: false, cat: false },
+            };
+        }
+
+        function resetSmartBalanceSnapshot() {
+            window._smartXchBalance = 0;
+            window._smartCatBalance = 0;
+            window._smartBalanceAssetId = '';
+        }
+
+        function hasVerifiedWalletBalance(type) {
+            const sideName = type === 'xch' ? 'xch' : 'cat';
+            const cached = _lastVerifiedWalletBalances || {};
+            if (!cached.balances || !cached.live?.[sideName]) return false;
+            if (sideName === 'cat') {
+                const activeAssetId = String(
+                    currentCAT?.asset_id
+                    || bot_state?.current_cat?.asset_id
+                    || ''
+                ).trim();
+                const cachedAssetId = String(cached.asset_id || '').trim();
+                if (activeAssetId && cachedAssetId && activeAssetId !== cachedAssetId) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '') {
@@ -17652,20 +17715,26 @@
             const cached = _lastVerifiedWalletBalances || {};
             const cacheMatches = cached.balances && String(cached.asset_id || '') === activeAssetId;
             const merged = _normalizeWalletBalances(incoming);
+            const live = {
+                xch: _walletBalanceSideHasLiveFields(incomingBalances?.xch || {}),
+                cat: _walletBalanceSideHasLiveFields(incomingBalances?.cat || {}),
+            };
 
             if (cacheMatches) {
                 for (const sideName of ['xch', 'cat']) {
                     const cachedSide = cached.balances?.[sideName] || {};
-                    if (_walletBalanceSideIsZero(merged[sideName]) && _walletBalanceSideHasValue(cachedSide)) {
+                    if (!live[sideName] && cached.live?.[sideName]) {
                         merged[sideName] = { ...cachedSide };
+                        live[sideName] = true;
                     }
                 }
             }
 
-            if (activeAssetId || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat)) {
+            if (activeAssetId && (live.xch || live.cat || _walletBalanceSideHasValue(merged.xch) || _walletBalanceSideHasValue(merged.cat))) {
                 _lastVerifiedWalletBalances = {
                     asset_id: activeAssetId,
                     balances: _normalizeWalletBalances(merged),
+                    live,
                 };
             }
 
@@ -17921,6 +17990,7 @@
             _pairDataReadyAssetId = '';
             _dashboardData = null;
             resetVerifiedWalletBalances();
+            resetSmartBalanceSnapshot();
             coinPrepStatus = 'none';
 
             const selector = document.getElementById('catSelector');
@@ -17981,7 +18051,14 @@
 
         function setSettingsReviewedState(nextValue) {
             settingsReviewed = !!nextValue;
-            localStorage.setItem('settingsReviewed', settingsReviewed ? 'true' : 'false');
+            try {
+                localStorage.setItem('settingsReviewed', settingsReviewed ? 'true' : 'false');
+                if (settingsReviewed && currentCAT?.asset_id) {
+                    localStorage.setItem('settingsReviewedAssetId', currentCAT.asset_id);
+                } else {
+                    localStorage.removeItem('settingsReviewedAssetId');
+                }
+            } catch (_) {}
             checkSettingsReviewed();
         }
 
@@ -17998,7 +18075,7 @@
         }
 
         function shouldUseFreshStartBlankTierTemplates() {
-            return _freshStartBlankTierTemplates && !settingsReviewed && !hasResumedLiveBook();
+            return _freshStartBlankTierTemplates && !isSettingsReviewedForCurrentPair() && !hasResumedLiveBook();
         }
 
         function resetCoreOrderBookInputsForFreshStart() {
@@ -18304,7 +18381,7 @@
         function canAttemptBotStart() {
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const hasPair = !!pair.selected;
-            return settingsReviewed && hasPair && coinPrepStatus !== 'none' && coinPrepStatus !== 'checking';
+            return isSettingsReviewedForCurrentPair() && hasPair && coinPrepStatus !== 'none' && coinPrepStatus !== 'checking';
         }
 
         function _getPairFromSelector(selectorId = 'catSelector') {
@@ -19586,9 +19663,26 @@
                 // the Reverse Buy Ladder swap reduces tier XCH below the server's
                 // _trading_xch estimate (making total = balance always).
                 try {
-                    const _xchBal = Number(data.xch_balance || 0);
+                    const _xchBal = Number(
+                        data.xch_balance
+                        || data?._data_sources?.xch_balance
+                        || data._capital_plan?.total_xch
+                        || 0
+                    );
                     window._smartXchBalance = _xchBal > 0 ? _xchBal : 0;
                 } catch (_e) { window._smartXchBalance = 0; }
+                try {
+                    const _cp = data._capital_plan || {};
+                    const _catBal = Number(_cp.total_cat || 0)
+                        || (Number(_cp.available_cat || 0) + Number(_cp.cat_reserve || 0));
+                    window._smartCatBalance = _catBal > 0 ? _catBal : 0;
+                    window._smartBalanceAssetId = String(
+                        data?._data_sources?.asset_id || currentCAT?.asset_id || ''
+                    );
+                } catch (_e) {
+                    window._smartCatBalance = 0;
+                    window._smartBalanceAssetId = '';
+                }
                 // F65 (2026-04-12): snapshot the mid_price Smart Settings
                 // used so the coin-prep preview computes token amounts at
                 // the same price — prevents false overshoot warnings when
@@ -19603,8 +19697,9 @@
                 if (typeof updateTierSpareHint === 'function') updateTierSpareHint();
 
                 // --- POST-WRITE GATE: ensure the Coin Prep Summary renders
-                // with LIVE data only. We require all three dependencies
-                // (pair ready, balances populated, mid price > 0) before we
+                // with the same wallet snapshot Smart Settings used. We
+                // require all three dependencies (pair ready, balances
+                // populated, mid price > 0) before we
                 // call updateCoinPrepPreview(). If any are missing we poll
                 // briefly and hold the loading state in the meantime so
                 // the user never sees a provisional/stale preview that
@@ -19614,8 +19709,12 @@
                     const pairOk = _assetIdForGate
                         && typeof isPairDataReadyFor === 'function'
                         && isPairDataReadyFor(_assetIdForGate);
-                    const balXch = Number(bot_state?.balances?.xch?.total || 0);
-                    const balCat = Number(bot_state?.balances?.cat?.total || 0);
+                    const balXch = Number(typeof getWalletBalance === 'function'
+                        ? (parseFloat(getWalletBalance('xch')) || 0)
+                        : (bot_state?.balances?.xch?.total || 0));
+                    const balCat = Number(typeof getWalletBalance === 'function'
+                        ? (parseFloat(getWalletBalance('cat')) || 0)
+                        : (bot_state?.balances?.cat?.total || 0));
                     const midOk  = Number(bot_state?.pricing?.mid || 0) > 0;
                     // We need a non-zero XCH balance and a valid mid price.
                     // CAT balance may legitimately be 0 for buy-only pairs,
@@ -21881,8 +21980,8 @@
             const catReserve = parseFloat(document.getElementById('configCatReserve')?.value) || 0;
             const tokenName = settingsCAT?.name || currentCAT?.name || 'CAT';
             const pairReady = isPairDataReadyFor(settingsCAT.asset_id);
-            const xchBalance = pairReady ? (bot_state?.balances?.xch?.total || 0) : 0;
-            const catBalance = pairReady ? (bot_state?.balances?.cat?.total || 0) : 0;
+            const xchBalance = pairReady ? (parseFloat(getWalletBalance('xch')) || 0) : 0;
+            const catBalance = pairReady ? (parseFloat(getWalletBalance('cat')) || 0) : 0;
             // F65 (2026-04-12): prefer the mid_price Smart Settings used
             // so the coin-prep preview matches the backend's verified
             // totals.  Falls back to live price when no snapshot exists
@@ -22322,10 +22421,23 @@
         // =================================================================
         function getWalletBalance(type) {
             if (type === 'xch') {
-                return bot_state?.balances?.xch?.total || 0;
-            } else {
-                return bot_state?.balances?.cat?.total || 0;
+                const liveXch = Number(bot_state?.balances?.xch?.total || 0);
+                const smartXch = Number(window._smartXchBalance || 0);
+                return hasVerifiedWalletBalance('xch')
+                    ? liveXch
+                    : (smartXch > 0 ? smartXch : 0);
             }
+            const liveCat = Number(bot_state?.balances?.cat?.total || 0);
+            const smartCat = Number(window._smartCatBalance || 0);
+            const smartAssetId = String(window._smartBalanceAssetId || '');
+            const settingsCAT = (typeof getSettingsSelectedCAT === 'function')
+                ? getSettingsSelectedCAT()
+                : (currentCAT || {});
+            const activeAssetId = String(settingsCAT?.asset_id || currentCAT?.asset_id || '');
+            const smartMatchesPair = !smartAssetId || !activeAssetId || smartAssetId === activeAssetId;
+            return hasVerifiedWalletBalance('cat')
+                ? liveCat
+                : (smartMatchesPair && smartCat > 0 ? smartCat : 0);
         }
         
         function setReservePercent(type, pct) {

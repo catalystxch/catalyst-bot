@@ -113,6 +113,7 @@ class _FakeBot:
         self._current_mid_price = "0.00012050"
         self._start_time = time.time() - 300
         self._current_cycle_step = "idle"
+        self._cycle_step_started_at = 0.0
         self._pending_cancel_wallet_ids_by_side = {"buy": set(), "sell": set()}
         self._last_bulk_create_time = 0.0
         self._sweep_protection = sweep_protection or {}
@@ -698,6 +699,38 @@ class RuntimeMonitorTests(unittest.TestCase):
         )
 
         self.assertGreater(monitor._last_fill_activity_at, 0.0)
+
+    def test_flags_stalled_cycle_step_when_step_does_not_advance(self):
+        bot = _FakeBot()
+        bot._start_time = time.time() - 3600
+        bot._current_cycle_step = "step3_wallet_sync"
+        bot._cycle_step_started_at = 1.0
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+
+        with (
+            patch("runtime_monitor.get_events_since", return_value=[]),
+            patch(
+                "runtime_monitor.get_open_offers", return_value=_open_offer_rows(30, 30)
+            ),
+            patch("runtime_monitor.log_event") as log_event_mock,
+            patch.object(monitor, "_resolve_superlog_path", return_value=""),
+            patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 180),
+            patch("runtime_monitor.cfg.LOOP_SECONDS", 90),
+            patch("runtime_monitor.time.monotonic", return_value=10000.0),
+        ):
+            monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertIn("cycle_step_stalled", active_codes, state)
+        self.assertEqual(state["status"], "critical")
+        self.assertTrue(
+            any(
+                call.args[1] == "bot_health_cycle_stalled"
+                for call in log_event_mock.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":

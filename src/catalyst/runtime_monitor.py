@@ -132,6 +132,7 @@ class RuntimeMonitor:
             "coin_headroom_low": False,
             "topup_lag": False,
             "slow_runtime": False,
+            "cycle_step_stalled": False,
         }
         self._streaks: Dict[str, int] = {
             "wallet_sync_stale": 0,
@@ -594,6 +595,25 @@ class RuntimeMonitor:
             "latest_ms": {k: round(v, 1) for k, v in self._slow_last_ms.items()},
             "active_methods": [],
         }
+        cycle_step = str(getattr(self._bot, "_current_cycle_step", "") or "idle")
+        try:
+            step_started_at = float(
+                getattr(self._bot, "_cycle_step_started_at", 0.0) or 0.0
+            )
+        except Exception:
+            step_started_at = 0.0
+        step_age_secs = (
+            round(max(0.0, time.monotonic() - step_started_at), 1)
+            if step_started_at > 0.0 and cycle_step != "idle"
+            else 0.0
+        )
+        configured_stall_secs = float(
+            getattr(cfg, "RUNTIME_MONITOR_CYCLE_STALL_SECS", 0) or 0
+        )
+        if configured_stall_secs <= 0:
+            configured_stall_secs = max(
+                180.0, float(getattr(cfg, "LOOP_SECONDS", 90) or 90) * 3.0
+            )
 
         return {
             "market": {
@@ -658,6 +678,9 @@ class RuntimeMonitor:
                 ),
                 "mid_price": str(self._bot._current_mid_price),
                 "started_at": self._bot._start_time,
+                "cycle_step": cycle_step,
+                "cycle_step_age_secs": step_age_secs,
+                "cycle_stall_threshold_secs": round(configured_stall_secs, 1),
                 "last_post_activity_secs_ago": round(
                     max(0.0, time.time() - self._last_post_activity_at), 1
                 )
@@ -719,6 +742,42 @@ class RuntimeMonitor:
         # within 20s. 180s covers the full post-ladder propagation window.
         startup_grace = now < (float(self._bot._start_time or now) + 180.0)
         wallet_fresh = bool(market.get("wallet_sync_fresh", True))
+        bot_state = snapshot["bot"]
+
+        cycle_step = str(bot_state.get("cycle_step") or "idle")
+        cycle_step_age = float(bot_state.get("cycle_step_age_secs", 0.0) or 0.0)
+        cycle_stall_threshold = float(
+            bot_state.get("cycle_stall_threshold_secs", 0.0) or 0.0
+        )
+        cycle_stalled = (
+            (not startup_grace)
+            and cycle_step != "idle"
+            and cycle_stall_threshold > 0.0
+            and cycle_step_age >= cycle_stall_threshold
+        )
+        if self._apply_condition(
+            "cycle_step_stalled",
+            cycle_stalled,
+            severity="error",
+            open_event="bot_health_cycle_stalled",
+            open_message=(
+                f"Bot cycle appears stalled in {cycle_step} for {cycle_step_age:.0f}s "
+                f"(threshold {cycle_stall_threshold:.0f}s)"
+            ),
+            close_event="bot_health_cycle_unstalled",
+            close_message="Bot cycle step is advancing again",
+        ):
+            active_conditions.append(
+                self._condition_entry(
+                    "cycle_step_stalled",
+                    "error",
+                    "Bot cycle appears stalled",
+                    detail=(
+                        f"Cycle step {cycle_step} has not advanced for "
+                        f"{cycle_step_age:.0f}s"
+                    ),
+                )
+            )
 
         stale_active = not wallet_fresh
         self._update_streak("wallet_sync_stale", stale_active)

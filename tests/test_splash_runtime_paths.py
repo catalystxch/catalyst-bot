@@ -197,3 +197,41 @@ def test_splash_output_reader_suppresses_windows_hook_refused_burst(monkeypatch)
 
     warnings = [event for event in events if event[0] == "warning"]
     assert len(warnings) <= 1
+
+
+def test_splash_output_reader_throttles_hook_http_failures_and_redacts_offer(
+    monkeypatch,
+):
+    import splash_node
+
+    bad_offer = "offer1" + ("x" * 120)
+    hook_line = (
+        "Error posting to offer hook http://127.0.0.1:5000/api/splash/incoming: "
+        f"HTTP 429 Too Many Requests for {bad_offer}\n"
+    )
+
+    class FakeProcess:
+        stdout = iter([hook_line, hook_line, hook_line])
+
+    events = []
+    monkeypatch.setattr(
+        splash_node,
+        "log_event",
+        lambda severity, event_type, message: events.append(
+            (severity, event_type, message)
+        ),
+    )
+    node = splash_node.SplashNode()
+    node._process = FakeProcess()
+    node._last_start_time = time.time() - 120
+
+    node._read_output()
+
+    hook_events = [
+        event
+        for event in events
+        if event[1] == "splash_node_output" and "webhook" in event[2].lower()
+    ]
+    assert len(hook_events) == 1
+    assert hook_events[0][0] == "warning"
+    assert bad_offer not in hook_events[0][2]

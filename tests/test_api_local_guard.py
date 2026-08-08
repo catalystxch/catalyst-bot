@@ -24,6 +24,9 @@ class TestApiLocalGuard(unittest.TestCase):
         self.client = api_server.app.test_client()
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
         api_server._rate_limit_log.clear()
+        api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
+        api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def test_root_sets_http_only_local_session_cookie_without_injecting_token(self):
         resp = self.client.get("/", environ_base=self.loopback)
@@ -130,6 +133,7 @@ class TestApiLocalGuard(unittest.TestCase):
     def test_splash_incoming_is_not_hit_by_generic_rate_limit(self):
         with (
             patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True),
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 1000),
             patch.object(api_server, "bot", None),
             patch("database.record_splash_incoming", return_value=False),
         ):

@@ -186,10 +186,31 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
     "/api/log",  # GUI flushes buffered log entries in bursts
 }
 
-# Dedicated limiter for /api/splash/incoming so an unbounded webhook flood
-# cannot amplify into runaway DB writes. 200/sec per process is still
-# generous for a local webhook but prevents a pathological flood.
-_SPLASH_RATE_LIMIT = {"window_s": 1.0, "max": 200, "hits": [], "lock": threading.Lock()}
+# Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
+# webhook flood cannot amplify into runaway DB writes.
+_SPLASH_RATE_LIMIT = {"window_s": 1.0, "hits": [], "lock": threading.Lock()}
+_SPLASH_BACKLOG_CACHE = {
+    "checked_at": 0.0,
+    "new_count": 0,
+    "lock": threading.Lock(),
+}
+_SPLASH_INCOMING_WRITE_LOCK = threading.Lock()
+
+
+def _splash_incoming_max_per_sec() -> int:
+    try:
+        configured = int(getattr(cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 3) or 3)
+    except Exception:
+        configured = 3
+    return max(1, configured)
+
+
+def _splash_incoming_max_backlog() -> int:
+    try:
+        configured = int(getattr(cfg, "SPLASH_RECEIVE_MAX_BACKLOG", 250) or 0)
+    except Exception:
+        configured = 250
+    return max(0, configured)
 
 
 def _splash_incoming_rate_limited() -> bool:
@@ -202,10 +223,60 @@ def _splash_incoming_rate_limited() -> bool:
         # Drop expired entries
         while hits and hits[0] < cutoff:
             hits.pop(0)
-        if len(hits) >= _SPLASH_RATE_LIMIT["max"]:
+        if len(hits) >= _splash_incoming_max_per_sec():
             return True
         hits.append(now)
         return False
+
+
+def _splash_incoming_backlog_full() -> bool:
+    import time as _t
+
+    limit = _splash_incoming_max_backlog()
+    if limit <= 0:
+        return False
+
+    now = _t.time()
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        if now - float(_SPLASH_BACKLOG_CACHE["checked_at"] or 0.0) < 1.0:
+            return int(_SPLASH_BACKLOG_CACHE["new_count"] or 0) >= limit
+
+    try:
+        from database import get_splash_incoming_stats
+
+        stats = get_splash_incoming_stats()
+        new_count = int((stats or {}).get("new") or 0)
+    except Exception as e:
+        slog(
+            "API",
+            f"Splash incoming backlog check failed; accepting offer: {e}",
+            level="debug",
+        )
+        return False
+
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        _SPLASH_BACKLOG_CACHE["checked_at"] = now
+        _SPLASH_BACKLOG_CACHE["new_count"] = new_count
+    return new_count >= limit
+
+
+def _splash_incoming_note_recorded(was_new: bool) -> None:
+    if not was_new:
+        return
+    with _SPLASH_BACKLOG_CACHE["lock"]:
+        if float(_SPLASH_BACKLOG_CACHE["checked_at"] or 0.0) > 0.0:
+            _SPLASH_BACKLOG_CACHE["new_count"] = (
+                int(_SPLASH_BACKLOG_CACHE["new_count"] or 0) + 1
+            )
+
+
+def _record_splash_incoming_locked(
+    offer_bech32: str, fingerprint: str, source_ip: str = None
+) -> bool:
+    from database import record_splash_incoming
+
+    with _SPLASH_INCOMING_WRITE_LOCK:
+        return record_splash_incoming(offer_bech32, fingerprint, source_ip=source_ip)
 
 
 # ---------------------------------------------------------------------------

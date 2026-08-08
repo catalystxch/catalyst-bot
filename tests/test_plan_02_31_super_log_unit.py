@@ -143,6 +143,14 @@ class TestSetLevel(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"super_log unavailable: {_SKIP}")
 class TestTeeWriter(unittest.TestCase):
+    def test_log_lock_is_reentrant_for_rotation_logging(self):
+        self.assertTrue(_sl._log_lock.acquire(blocking=False))
+        try:
+            self.assertTrue(_sl._log_lock.acquire(blocking=False))
+            _sl._log_lock.release()
+        finally:
+            _sl._log_lock.release()
+
     def test_none_original_stream_is_safe_for_no_console_builds(self):
         writer = _sl._TeeWriter(None, _sl._log_lock)
 

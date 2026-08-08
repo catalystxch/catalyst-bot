@@ -28,7 +28,12 @@ def test_cert_candidates_returns_default_wallet_crt_paths(self):
     body = resp.get_json()
     self.assertTrue(body.get("success"))
     self.assertIsInstance(body.get("candidates"), list)
-    self.assertTrue(any(str(path).endswith(os.path.join("ssl", "wallet.crt")) for path in body["candidates"]))
+    self.assertTrue(
+        any(
+            str(path).endswith(os.path.join("ssl", "wallet.crt"))
+            for path in body["candidates"]
+        )
+    )
 ```
 
 ```python
@@ -44,13 +49,17 @@ def test_set_fingerprint_rejects_running_bot(self):
 def test_set_fingerprint_persists_and_triggers_start(self):
     fake_cfg = MagicMock()
     fake_cfg.update.return_value = True
-    with patch.object(api_server, "bot", None), \
-         patch.object(api_server, "cfg", fake_cfg), \
-         patch("chia_node.trigger_start", return_value={"success": True}) as trigger:
+    with (
+        patch.object(api_server, "bot", None),
+        patch.object(api_server, "cfg", fake_cfg),
+        patch("chia_node.trigger_start", return_value={"success": True}) as trigger,
+    ):
         resp = self._post("/api/sage/fingerprint", {"fingerprint": "12345678"})
     self.assertEqual(resp.status_code, 200)
     self.assertTrue(resp.get_json().get("success"))
-    fake_cfg.update.assert_called_once_with("SAGE_FINGERPRINT", "12345678", source="sage_wallet_settings")
+    fake_cfg.update.assert_called_once_with(
+        "SAGE_FINGERPRINT", "12345678", source="sage_wallet_settings"
+    )
     trigger.assert_called_once_with("12345678")
 ```
 
