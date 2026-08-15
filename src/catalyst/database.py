@@ -1026,15 +1026,17 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         ("network", "offer_fingerprint", "publication_epoch"),
     )
 
-    placeholders = ",".join("?" for _ in _STABILITY_REQUIRED_COLUMNS)
-    actual_triggers = {
-        str(row[0]): (str(row[1]), str(row[2]))
-        for row in conn.execute(
-            f"SELECT name, tbl_name, sql FROM sqlite_master "
-            f"WHERE type='trigger' AND tbl_name IN ({placeholders})",
-            tuple(_STABILITY_REQUIRED_COLUMNS),
-        ).fetchall()
+    stability_tables_by_owner = {
+        table_name.casefold(): table_name
+        for table_name in _STABILITY_REQUIRED_COLUMNS
     }
+    actual_triggers = {}
+    for row in conn.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger'"
+    ).fetchall():
+        canonical_owner = stability_tables_by_owner.get(str(row[1]).casefold())
+        if canonical_owner is not None:
+            actual_triggers[str(row[0])] = (canonical_owner, str(row[2]))
     unexpected_triggers = sorted(actual_triggers.keys() - expected_triggers.keys())
     if unexpected_triggers:
         raise RuntimeError(

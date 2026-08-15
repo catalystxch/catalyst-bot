@@ -460,6 +460,125 @@ def test_stability_migration_rejects_unexpected_trigger_on_stability_table(
         database.init_database()
 
 
+@pytest.mark.parametrize(
+    ("table_name", "trigger_target"),
+    [
+        ("offer_intents", "OFFER_INTENTS"),
+        ("offer_operation_journal", '"OfFeR_OpErAtIoN_JoUrNaL"'),
+        ("runtime_safety_latch", "RUNTIME_SAFETY_LATCH"),
+        ("runtime_mutation_lease", '"RuNtImE_MuTaTiOn_LeAsE"'),
+        ("runtime_worker_delegations", "RUNTIME_WORKER_DELEGATIONS"),
+        ("publication_outbox", '"PuBlIcAtIoN_OuTbOx"'),
+    ],
+)
+def test_stability_migration_rejects_case_variant_trigger_on_every_safety_table(
+    isolated_database, table_name, trigger_target
+):
+    database.init_database()
+    database.close_connection()
+    trigger_name = f"unexpected_case_{table_name}"
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute(
+            f"""
+            CREATE TRIGGER {trigger_name}
+            AFTER UPDATE ON {trigger_target} BEGIN SELECT 1; END
+            """
+        )
+        stored_owner = conn.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger_name,),
+        ).fetchone()[0]
+    assert stored_owner != table_name
+    assert stored_owner.casefold() == table_name.casefold()
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="unexpected stability trigger"):
+        database.init_database()
+
+
+def test_case_variant_trigger_is_rejected_before_timestamp_normalization_side_effect(
+    isolated_database,
+):
+    database.init_database()
+    _prepare_intent("intent-trigger-side-effect")
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE migration_trigger_effects (value TEXT NOT NULL);
+            UPDATE offer_intents SET updated_at='2026-08-15 12:01:00'
+            WHERE intent_id='intent-trigger-side-effect';
+            CREATE TRIGGER unexpected_normalization_trigger
+            AFTER UPDATE ON "OFFER_INTENTS"
+            BEGIN
+                INSERT INTO migration_trigger_effects(value) VALUES ('fired');
+            END;
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="unexpected stability trigger"):
+        database.init_database()
+
+    with sqlite3.connect(isolated_database) as conn:
+        effects = conn.execute(
+            "SELECT value FROM migration_trigger_effects"
+        ).fetchall()
+        stored = conn.execute(
+            "SELECT updated_at FROM offer_intents "
+            "WHERE intent_id='intent-trigger-side-effect'"
+        ).fetchone()[0]
+    assert effects == []
+    assert stored == "2026-08-15 12:01:00"
+
+
+def test_unicode_trigger_name_and_quoted_case_variant_owner_cannot_bypass_validation(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    trigger_name = "\N{GREEK CAPITAL LETTER DELTA}_unexpected"
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute(
+            f"""
+            CREATE TRIGGER "{trigger_name}"
+            AFTER UPDATE ON [OfFeR_InTeNtS] BEGIN SELECT 1; END
+            """
+        )
+        stored = conn.execute(
+            "SELECT name, tbl_name FROM sqlite_master "
+            "WHERE type='trigger' AND name=?",
+            (trigger_name,),
+        ).fetchone()
+    assert stored == (trigger_name, "OfFeR_InTeNtS")
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="unexpected stability trigger"):
+        database.init_database()
+
+
+def test_non_stability_trigger_with_case_variant_owner_is_ignored(isolated_database):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER legitimate_offer_trigger
+            AFTER UPDATE ON "OFFERS" BEGIN SELECT 1; END
+            """
+        )
+    database._db_initialized_path = ""
+
+    database.init_database()
+
+    with sqlite3.connect(isolated_database) as conn:
+        trigger = conn.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type='trigger' "
+            "AND name='legitimate_offer_trigger'"
+        ).fetchone()
+    assert trigger == ("OFFERS",)
+
+
 def test_stability_migration_rejects_missing_singleton_check_and_extra_rows(
     isolated_database,
 ):
