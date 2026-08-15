@@ -17,14 +17,15 @@ All DB access in the codebase should route through this module; importing
 `sqlite3` elsewhere is a smell.
 """
 
-import os
+import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Optional, List, Dict
+from typing import Any, Dict, Iterable, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +581,185 @@ CREATE TABLE IF NOT EXISTS market_analysis_cache (
 
 CREATE INDEX IF NOT EXISTS idx_market_cache_asset ON market_analysis_cache(asset_id);
 CREATE INDEX IF NOT EXISTS idx_market_cache_type ON market_analysis_cache(analysis_type);
+
+-- Stability kernel: canonical durable offer intent registry. Atomic amounts
+-- are TEXT so they remain exact beyond SQLite's signed 64-bit INTEGER range.
+CREATE TABLE IF NOT EXISTS offer_intents (
+    intent_id                   TEXT PRIMARY KEY,
+    run_id                      TEXT NOT NULL,
+    wallet_fingerprint_hash     TEXT NOT NULL,
+    network                     TEXT NOT NULL,
+    asset_id                    TEXT NOT NULL,
+    side                        TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    tier                        TEXT NOT NULL,
+    purpose                     TEXT NOT NULL,
+    slot_key                    TEXT,
+    generation                  INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    parent_intent_id            TEXT,
+    child_intent_id             TEXT,
+    offered_amount_atomic       TEXT NOT NULL
+        CHECK(offered_amount_atomic <> '' AND offered_amount_atomic NOT GLOB '*[^0-9]*'),
+    requested_amount_atomic     TEXT NOT NULL
+        CHECK(requested_amount_atomic <> '' AND requested_amount_atomic NOT GLOB '*[^0-9]*'),
+    selected_coin_ids_json      TEXT NOT NULL,
+    selected_coin_ids_sha256    TEXT NOT NULL,
+    offer_text_sha256           TEXT,
+    sage_trade_id               TEXT,
+    publication_identity        TEXT,
+    lifecycle_state             TEXT NOT NULL DEFAULT 'prepared',
+    row_version                 INTEGER NOT NULL DEFAULT 0 CHECK(row_version >= 0),
+    prepared_at                 TEXT NOT NULL,
+    submitted_at                TEXT,
+    confirmed_at                TEXT,
+    first_visible_at            TEXT,
+    terminal_at                 TEXT,
+    updated_at                  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_sage_trade_id
+    ON offer_intents(sage_trade_id) WHERE sage_trade_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_offer_text_sha256
+    ON offer_intents(offer_text_sha256) WHERE offer_text_sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_offer_intents_state
+    ON offer_intents(lifecycle_state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_offer_intents_slot_generation
+    ON offer_intents(run_id, slot_key, generation);
+CREATE INDEX IF NOT EXISTS idx_offer_intents_parent
+    ON offer_intents(parent_intent_id);
+
+-- Append-only operation evidence. The sequence is ordering metadata only;
+-- event_id and operation/attempt/phase are the durable idempotency boundaries.
+CREATE TABLE IF NOT EXISTS offer_operation_journal (
+    sequence                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id                    TEXT NOT NULL UNIQUE,
+    operation_id                TEXT NOT NULL,
+    intent_id                   TEXT,
+    operation_type              TEXT NOT NULL,
+    attempt                     INTEGER NOT NULL CHECK(attempt >= 1),
+    phase                       TEXT NOT NULL,
+    outcome                     TEXT NOT NULL,
+    request_timestamp           TEXT NOT NULL,
+    wallet_identity_json        TEXT NOT NULL DEFAULT '{}',
+    transaction_id              TEXT,
+    spend_identity              TEXT,
+    evidence_json               TEXT NOT NULL DEFAULT '{}',
+    evidence_sha256             TEXT NOT NULL,
+    reason_code                 TEXT,
+    blocks_mutation             INTEGER NOT NULL DEFAULT 0
+        CHECK(blocks_mutation IN (0, 1)),
+    created_at                  TEXT NOT NULL,
+    UNIQUE(operation_id, attempt, phase)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_journal_operation
+    ON offer_operation_journal(operation_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_offer_journal_intent
+    ON offer_operation_journal(intent_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_offer_journal_blockers
+    ON offer_operation_journal(blocks_mutation, operation_id, sequence);
+CREATE TRIGGER IF NOT EXISTS offer_operation_journal_no_update
+BEFORE UPDATE ON offer_operation_journal
+BEGIN
+    SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_operation_journal_no_delete
+BEFORE DELETE ON offer_operation_journal
+BEGIN
+    SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
+END;
+
+-- One durable fail-closed latch for a data directory.
+CREATE TABLE IF NOT EXISTS runtime_safety_latch (
+    singleton_id                INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    generation                  INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    state                       TEXT NOT NULL DEFAULT 'resolved'
+        CHECK(state IN ('resolved', 'tripped')),
+    reason_code                 TEXT,
+    reason                      TEXT,
+    blocking_operation_ids_json TEXT NOT NULL DEFAULT '[]',
+    wallet_fingerprint_hash     TEXT,
+    network                     TEXT,
+    tripped_at                  TEXT,
+    resolved_at                 TEXT,
+    updated_at                  TEXT NOT NULL
+);
+INSERT OR IGNORE INTO runtime_safety_latch (
+    singleton_id, generation, state, blocking_operation_ids_json, updated_at
+) VALUES (1, 0, 'resolved', '[]', datetime('now'));
+
+-- One compare-and-set mutation owner. Released rows retain the prior owner for
+-- diagnostics while active=0 makes the singleton available for acquisition.
+CREATE TABLE IF NOT EXISTS runtime_mutation_lease (
+    singleton_id                INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    lease_version               INTEGER NOT NULL DEFAULT 0 CHECK(lease_version >= 0),
+    active                      INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    owner_run_id                TEXT,
+    owner_pid                   INTEGER,
+    owner_host                  TEXT,
+    wallet_fingerprint_hash     TEXT,
+    network                     TEXT,
+    acquired_at                 TEXT,
+    heartbeat_at                TEXT,
+    expires_at                  TEXT,
+    released_at                 TEXT,
+    updated_at                  TEXT NOT NULL
+);
+INSERT OR IGNORE INTO runtime_mutation_lease (
+    singleton_id, lease_version, active, updated_at
+) VALUES (1, 0, 0, datetime('now'));
+
+-- Narrow, expiring child-worker authority tied to one parent run/operation.
+CREATE TABLE IF NOT EXISTS runtime_worker_delegations (
+    delegation_id               TEXT PRIMARY KEY,
+    delegation_token_hash       TEXT NOT NULL UNIQUE,
+    parent_run_id               TEXT NOT NULL,
+    operation_id                TEXT NOT NULL,
+    worker_id                   TEXT NOT NULL,
+    purpose                     TEXT NOT NULL,
+    wallet_fingerprint_hash     TEXT NOT NULL,
+    network                     TEXT NOT NULL,
+    state                       TEXT NOT NULL DEFAULT 'active'
+        CHECK(state IN ('active', 'expired', 'revoked')),
+    metadata_json               TEXT NOT NULL DEFAULT '{}',
+    issued_at                   TEXT NOT NULL,
+    expires_at                  TEXT NOT NULL,
+    expired_at                  TEXT,
+    revoked_at                  TEXT,
+    updated_at                  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_worker_delegation_active_scope
+    ON runtime_worker_delegations(parent_run_id, operation_id, purpose)
+    WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_worker_delegation_expiry
+    ON runtime_worker_delegations(state, expires_at);
+
+-- Destination-neutral publication outbox. The explicit idempotency key and
+-- the network/fingerprint/epoch tuple both prevent duplicate remote effects.
+CREATE TABLE IF NOT EXISTS publication_outbox (
+    publication_id              TEXT PRIMARY KEY,
+    idempotency_key             TEXT NOT NULL UNIQUE,
+    intent_id                   TEXT,
+    network                     TEXT NOT NULL,
+    offer_fingerprint           TEXT NOT NULL,
+    publication_epoch           TEXT NOT NULL,
+    publisher                   TEXT NOT NULL,
+    payload_json                TEXT NOT NULL,
+    state                       TEXT NOT NULL DEFAULT 'queued'
+        CHECK(state IN ('queued', 'claimed', 'succeeded', 'retryable',
+                        'suppressed', 'unresolved', 'failed')),
+    attempt_count               INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    claim_owner_run_id          TEXT,
+    claim_expires_at            TEXT,
+    next_attempt_at             TEXT,
+    last_error_json             TEXT,
+    queued_at                   TEXT NOT NULL,
+    succeeded_at                TEXT,
+    terminal_at                 TEXT,
+    updated_at                  TEXT NOT NULL,
+    UNIQUE(network, offer_fingerprint, publication_epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_outbox_ready
+    ON publication_outbox(state, next_attempt_at, queued_at);
+CREATE INDEX IF NOT EXISTS idx_publication_outbox_intent
+    ON publication_outbox(intent_id, state);
 """
 
 
@@ -595,7 +775,16 @@ def init_database():
     with _db_init_lock:
         if _db_initialized_path == DB_PATH:
             return
+        _init_database_impl()
+        # Publish initialization only after every migration and integrity
+        # setup step has returned. Concurrent callers block on _db_init_lock
+        # and therefore never observe a half-created stability schema.
         _db_initialized_path = DB_PATH
+
+
+def _init_database_impl():
+    """Run the migration sequence while ``_db_init_lock`` is held."""
+
     conn = get_connection()
     conn.executescript(SCHEMA_SQL)
 
@@ -5920,3 +6109,1332 @@ def clear_market_analysis_cache(
         return cursor.rowcount
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Stability kernel: durable offer intents, operation journal and runtime gates
+# ---------------------------------------------------------------------------
+
+
+def _stability_connection() -> sqlite3.Connection:
+    """Return a short-lived autocommit connection for stability CAS writes."""
+
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        from super_log import trace_connection
+
+        trace_connection(conn, f"stability-{threading.current_thread().name}")
+    except ImportError:
+        pass
+    return conn
+
+
+def _required_stability_text(value: Any, label: str) -> str:
+    text = str(value) if value is not None else ""
+    text = text.strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    return text
+
+
+def _optional_stability_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _atomic_amount_text(value: Any, label: str) -> str:
+    """Validate an atomic integer without converting it through float/SQLite."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a positive atomic integer")
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise ValueError(f"{label} must be a positive atomic integer")
+    if not text or not text.isascii() or not text.isdigit() or int(text) <= 0:
+        raise ValueError(f"{label} must be a positive atomic integer")
+    return text
+
+
+def _canonical_json_text(
+    value: Any,
+    label: str,
+    *,
+    expected_type: Optional[type] = None,
+    default: Any = None,
+    max_bytes: Optional[int] = None,
+) -> str:
+    """Validate and canonicalize JSON before a caller opens a transaction."""
+
+    if value is None:
+        value = {} if default is None else default
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must contain valid JSON") from exc
+    else:
+        parsed = value
+    if expected_type is not None and not isinstance(parsed, expected_type):
+        raise ValueError(
+            f"{label} JSON must decode to {expected_type.__name__}"
+        )
+    try:
+        encoded = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain valid JSON") from exc
+    if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{label} exceeds {max_bytes} UTF-8 bytes")
+    return encoded
+
+
+def _journal_values(
+    *,
+    event_id: str,
+    operation_id: str,
+    intent_id: Optional[str],
+    operation_type: str,
+    attempt: int,
+    phase: str,
+    outcome: str,
+    request_timestamp: Any,
+    wallet_identity_json: Any,
+    transaction_id: Optional[str],
+    spend_identity: Optional[str],
+    evidence_json: Any,
+    evidence_sha256: Optional[str],
+    reason_code: Optional[str],
+    blocks_mutation: bool,
+    created_at: Any,
+) -> Dict[str, Any]:
+    """Validate one journal event completely before its write transaction."""
+
+    try:
+        safe_attempt = int(attempt)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("attempt must be a positive integer") from exc
+    if isinstance(attempt, bool) or safe_attempt < 1:
+        raise ValueError("attempt must be a positive integer")
+    wallet_json = _canonical_json_text(
+        wallet_identity_json, "wallet_identity_json", default={}
+    )
+    evidence = _canonical_json_text(
+        evidence_json, "evidence_json", default={}, max_bytes=65536
+    )
+    digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+    if evidence_sha256 is not None and str(evidence_sha256) != digest:
+        raise ValueError("evidence_sha256 does not match canonical evidence JSON")
+    return {
+        "event_id": _required_stability_text(event_id, "event_id"),
+        "operation_id": _required_stability_text(operation_id, "operation_id"),
+        "intent_id": _optional_stability_text(intent_id),
+        "operation_type": _required_stability_text(
+            operation_type, "operation_type"
+        ).upper(),
+        "attempt": safe_attempt,
+        "phase": _required_stability_text(phase, "phase").upper(),
+        "outcome": _required_stability_text(outcome, "outcome").upper(),
+        "request_timestamp": _sqlite_ts(request_timestamp or created_at or _now()),
+        "wallet_identity_json": wallet_json,
+        "transaction_id": _optional_stability_text(transaction_id),
+        "spend_identity": _optional_stability_text(spend_identity),
+        "evidence_json": evidence,
+        "evidence_sha256": digest,
+        "reason_code": (
+            _required_stability_text(reason_code, "reason_code").upper()
+            if reason_code is not None and str(reason_code).strip()
+            else None
+        ),
+        "blocks_mutation": 1 if blocks_mutation else 0,
+        "created_at": _sqlite_ts(created_at or request_timestamp or _now()),
+    }
+
+
+_JOURNAL_COMPARE_COLUMNS = (
+    "event_id",
+    "operation_id",
+    "intent_id",
+    "operation_type",
+    "attempt",
+    "phase",
+    "outcome",
+    "request_timestamp",
+    "wallet_identity_json",
+    "transaction_id",
+    "spend_identity",
+    "evidence_json",
+    "evidence_sha256",
+    "reason_code",
+    "blocks_mutation",
+    "created_at",
+)
+
+
+def _insert_offer_operation_event(
+    conn: sqlite3.Connection, values: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Insert one event or return the byte-for-byte idempotent existing row."""
+
+    existing = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE event_id=?",
+        (values["event_id"],),
+    ).fetchone()
+    if existing is not None:
+        row = dict(existing)
+        if any(row[column] != values[column] for column in _JOURNAL_COMPARE_COLUMNS):
+            raise ValueError("event_id already exists with different journal data")
+        return row
+    conn.execute(
+        """
+        INSERT INTO offer_operation_journal (
+            event_id, operation_id, intent_id, operation_type, attempt, phase,
+            outcome, request_timestamp, wallet_identity_json, transaction_id,
+            spend_identity, evidence_json, evidence_sha256, reason_code,
+            blocks_mutation, created_at
+        ) VALUES (
+            :event_id, :operation_id, :intent_id, :operation_type, :attempt,
+            :phase, :outcome, :request_timestamp, :wallet_identity_json,
+            :transaction_id, :spend_identity, :evidence_json, :evidence_sha256,
+            :reason_code, :blocks_mutation, :created_at
+        )
+        """,
+        values,
+    )
+    row = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE event_id=?",
+        (values["event_id"],),
+    ).fetchone()
+    return dict(row)
+
+
+def append_offer_operation_event(
+    *,
+    event_id: str,
+    operation_id: str,
+    operation_type: str,
+    attempt: int,
+    phase: str,
+    outcome: str,
+    request_timestamp: Any,
+    intent_id: Optional[str] = None,
+    wallet_identity_json: Any = None,
+    transaction_id: Optional[str] = None,
+    spend_identity: Optional[str] = None,
+    evidence_json: Any = None,
+    evidence_sha256: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    blocks_mutation: bool = False,
+    created_at: Any = None,
+) -> Dict[str, Any]:
+    """Append an immutable typed event using two durable idempotency keys."""
+
+    values = _journal_values(
+        event_id=event_id,
+        operation_id=operation_id,
+        intent_id=intent_id,
+        operation_type=operation_type,
+        attempt=attempt,
+        phase=phase,
+        outcome=outcome,
+        request_timestamp=request_timestamp,
+        wallet_identity_json=wallet_identity_json,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+        evidence_json=evidence_json,
+        evidence_sha256=evidence_sha256,
+        reason_code=reason_code,
+        blocks_mutation=blocks_mutation,
+        created_at=created_at,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _insert_offer_operation_event(conn, values)
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def prepare_offer_intent(
+    *,
+    intent_id: str,
+    operation_id: str,
+    event_id: str,
+    run_id: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    asset_id: str,
+    side: str,
+    tier: str,
+    purpose: str,
+    offered_amount_atomic: Any,
+    requested_amount_atomic: Any,
+    selected_coin_ids_json: Any,
+    slot_key: Optional[str] = None,
+    generation: int = 0,
+    parent_intent_id: Optional[str] = None,
+    selected_coin_ids_sha256: Optional[str] = None,
+    wallet_identity_json: Any = None,
+    evidence_json: Any = None,
+    prepared_at: Any = None,
+) -> Dict[str, Any]:
+    """Atomically persist a creation intent and its PREPARED journal event."""
+
+    safe_side = _required_stability_text(side, "side").lower()
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    try:
+        safe_generation = int(generation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("generation must be a non-negative integer") from exc
+    if isinstance(generation, bool) or safe_generation < 0:
+        raise ValueError("generation must be a non-negative integer")
+    coin_ids_json = _canonical_json_text(
+        selected_coin_ids_json,
+        "selected_coin_ids_json",
+        expected_type=list,
+        default=[],
+    )
+    coin_ids = json.loads(coin_ids_json)
+    normalized_coin_ids = sorted(
+        {_required_stability_text(coin_id, "selected coin id") for coin_id in coin_ids}
+    )
+    if not normalized_coin_ids:
+        raise ValueError("at least one selected coin identity is required")
+    coin_ids_json = _canonical_json_text(
+        normalized_coin_ids,
+        "selected_coin_ids_json",
+        expected_type=list,
+    )
+    coin_ids_digest = hashlib.sha256(coin_ids_json.encode("utf-8")).hexdigest()
+    if (
+        selected_coin_ids_sha256 is not None
+        and str(selected_coin_ids_sha256) != coin_ids_digest
+    ):
+        raise ValueError(
+            "selected_coin_ids_sha256 does not match canonical selected coin JSON"
+        )
+    prepared = _sqlite_ts(prepared_at or _now())
+    immutable = {
+        "intent_id": _required_stability_text(intent_id, "intent_id"),
+        "run_id": _required_stability_text(run_id, "run_id"),
+        "wallet_fingerprint_hash": _required_stability_text(
+            wallet_fingerprint_hash, "wallet_fingerprint_hash"
+        ),
+        "network": _required_stability_text(network, "network"),
+        "asset_id": _required_stability_text(asset_id, "asset_id"),
+        "side": safe_side,
+        "tier": _required_stability_text(tier, "tier"),
+        "purpose": _required_stability_text(purpose, "purpose"),
+        "slot_key": _optional_stability_text(slot_key),
+        "generation": safe_generation,
+        "parent_intent_id": _optional_stability_text(parent_intent_id),
+        "offered_amount_atomic": _atomic_amount_text(
+            offered_amount_atomic, "offered_amount_atomic"
+        ),
+        "requested_amount_atomic": _atomic_amount_text(
+            requested_amount_atomic, "requested_amount_atomic"
+        ),
+        "selected_coin_ids_json": coin_ids_json,
+        "selected_coin_ids_sha256": coin_ids_digest,
+        "prepared_at": prepared,
+    }
+    # These calls deliberately happen before BEGIN IMMEDIATE.
+    safe_wallet_json = _canonical_json_text(
+        wallet_identity_json, "wallet_identity_json", default={}
+    )
+    safe_evidence_json = _canonical_json_text(
+        evidence_json, "evidence_json", default={}
+    )
+    journal = _journal_values(
+        event_id=event_id,
+        operation_id=operation_id,
+        intent_id=immutable["intent_id"],
+        operation_type="CREATE",
+        attempt=1,
+        phase="PREPARED",
+        outcome="PREPARED",
+        request_timestamp=prepared,
+        wallet_identity_json=safe_wallet_json,
+        transaction_id=None,
+        spend_identity=None,
+        evidence_json=safe_evidence_json,
+        evidence_sha256=None,
+        reason_code="INTENT_PREPARED",
+        blocks_mutation=True,
+        created_at=prepared,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?",
+            (immutable["intent_id"],),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO offer_intents (
+                    intent_id, run_id, wallet_fingerprint_hash, network,
+                    asset_id, side, tier, purpose, slot_key, generation,
+                    parent_intent_id, offered_amount_atomic,
+                    requested_amount_atomic, selected_coin_ids_json,
+                    selected_coin_ids_sha256, lifecycle_state, row_version,
+                    prepared_at, updated_at
+                ) VALUES (
+                    :intent_id, :run_id, :wallet_fingerprint_hash, :network,
+                    :asset_id, :side, :tier, :purpose, :slot_key, :generation,
+                    :parent_intent_id, :offered_amount_atomic,
+                    :requested_amount_atomic, :selected_coin_ids_json,
+                    :selected_coin_ids_sha256, 'prepared', 0,
+                    :prepared_at, :prepared_at
+                )
+                """,
+                immutable,
+            )
+        else:
+            existing_dict = dict(existing)
+            if any(existing_dict[key] != value for key, value in immutable.items()):
+                raise ValueError("intent_id already exists with different intent data")
+        _insert_offer_operation_event(conn, journal)
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?",
+            (immutable["intent_id"],),
+        ).fetchone()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finalize_offer_intent(
+    *,
+    intent_id: str,
+    operation_id: str,
+    event_id: str,
+    lifecycle_state: str,
+    outcome: str,
+    attempt: int = 1,
+    sage_trade_id: Optional[str] = None,
+    offer_text_sha256: Optional[str] = None,
+    publication_identity: Optional[str] = None,
+    child_intent_id: Optional[str] = None,
+    transaction_id: Optional[str] = None,
+    spend_identity: Optional[str] = None,
+    wallet_identity_json: Any = None,
+    evidence_json: Any = None,
+    evidence_sha256: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    blocks_mutation: bool = False,
+    expected_row_version: Optional[int] = None,
+    finalized_at: Any = None,
+) -> Dict[str, Any]:
+    """Atomically finalize intent identity/state and append its outcome event."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    state = _required_stability_text(lifecycle_state, "lifecycle_state").lower()
+    final_time = _sqlite_ts(finalized_at or _now())
+    safe_wallet_json = _canonical_json_text(
+        wallet_identity_json, "wallet_identity_json", default={}
+    )
+    safe_evidence_json = _canonical_json_text(
+        evidence_json, "evidence_json", default={}
+    )
+    journal = _journal_values(
+        event_id=event_id,
+        operation_id=operation_id,
+        intent_id=safe_intent_id,
+        operation_type="CREATE",
+        attempt=attempt,
+        phase="FINALIZED",
+        outcome=outcome,
+        request_timestamp=final_time,
+        wallet_identity_json=safe_wallet_json,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+        evidence_json=safe_evidence_json,
+        evidence_sha256=evidence_sha256,
+        reason_code=reason_code,
+        blocks_mutation=blocks_mutation,
+        created_at=final_time,
+    )
+    trade_id = _optional_stability_text(sage_trade_id)
+    offer_hash = _optional_stability_text(offer_text_sha256)
+    publication = _optional_stability_text(publication_identity)
+    child = _optional_stability_text(child_intent_id)
+    if state == "created" and journal["outcome"] == "CONFIRMED" and (
+        trade_id is None or offer_hash is None
+    ):
+        raise ValueError("confirmed creation requires a Sage trade ID and offer hash")
+    terminal_states = {
+        "cancelled",
+        "filled",
+        "expired",
+        "retired",
+        "completed",
+        "creation_failed",
+        "rejected",
+        "quarantined",
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if current is None:
+            raise ValueError("intent_id does not exist")
+        current_dict = dict(current)
+        existing_event = conn.execute(
+            "SELECT event_id FROM offer_operation_journal WHERE event_id=?",
+            (journal["event_id"],),
+        ).fetchone()
+        if existing_event is not None:
+            _insert_offer_operation_event(conn, journal)
+            if (
+                current_dict["lifecycle_state"] != state
+                or current_dict["sage_trade_id"] != trade_id
+                or current_dict["offer_text_sha256"] != offer_hash
+            ):
+                raise ValueError("event_id already finalized a different intent state")
+            conn.commit()
+            return current_dict
+        if current_dict["lifecycle_state"] not in {
+            "prepared",
+            "creation_unknown",
+            "submitted_unconfirmed",
+        }:
+            raise ValueError("offer intent is already finalized")
+        current_version = int(current_dict["row_version"])
+        if expected_row_version is not None and int(expected_row_version) != current_version:
+            raise ValueError("offer intent row_version compare-and-set failed")
+        submitted_at = (
+            final_time
+            if state.startswith("submitted") or "submitted" in journal["outcome"].lower()
+            else current_dict["submitted_at"]
+        )
+        confirmed_at = (
+            final_time
+            if state == "created" and journal["outcome"] == "CONFIRMED"
+            else current_dict["confirmed_at"]
+        )
+        terminal_at = (
+            final_time if state in terminal_states else current_dict["terminal_at"]
+        )
+        cursor = conn.execute(
+            """
+            UPDATE offer_intents
+            SET sage_trade_id=?, offer_text_sha256=?, publication_identity=?,
+                child_intent_id=?, lifecycle_state=?, row_version=row_version+1,
+                submitted_at=?, confirmed_at=?, terminal_at=?, updated_at=?
+            WHERE intent_id=? AND row_version=?
+            """,
+            (
+                trade_id,
+                offer_hash,
+                publication,
+                child,
+                state,
+                submitted_at,
+                confirmed_at,
+                terminal_at,
+                final_time,
+                safe_intent_id,
+                current_version,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("offer intent row_version compare-and-set failed")
+        _insert_offer_operation_event(conn, journal)
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT * FROM offer_intents WHERE intent_id=?", (str(intent_id),)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_offer_intent_by_trade_id(sage_trade_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT * FROM offer_intents WHERE sage_trade_id=?", (str(sage_trade_id),)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_offer_intent_by_hash(offer_text_sha256: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT * FROM offer_intents WHERE offer_text_sha256=?",
+        (str(offer_text_sha256),),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_offer_operation_events(operation_id: str) -> List[Dict[str, Any]]:
+    rows = get_connection().execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? ORDER BY sequence",
+        (str(operation_id),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_unresolved_offer_operation_blockers() -> List[Dict[str, Any]]:
+    """Return the latest event for operations still marked fail-closed."""
+
+    rows = get_connection().execute(
+        """
+        SELECT journal.*
+        FROM offer_operation_journal AS journal
+        JOIN (
+            SELECT operation_id, MAX(sequence) AS latest_sequence
+            FROM offer_operation_journal
+            GROUP BY operation_id
+        ) AS latest
+          ON latest.operation_id = journal.operation_id
+         AND latest.latest_sequence = journal.sequence
+        WHERE journal.blocks_mutation = 1
+        ORDER BY journal.sequence
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_runtime_safety_latch() -> Dict[str, Any]:
+    row = get_connection().execute(
+        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("runtime safety latch singleton is missing")
+    return dict(row)
+
+
+def trip_runtime_safety_latch(
+    *,
+    reason_code: str,
+    blocking_operation_ids: Iterable[str],
+    wallet_fingerprint_hash: str,
+    network: str,
+    reason: str = "",
+    tripped_at: Any = None,
+) -> Dict[str, Any]:
+    """Trip or extend the singleton latch without losing existing blockers."""
+
+    incoming = sorted(
+        {
+            _required_stability_text(value, "blocking operation id")
+            for value in blocking_operation_ids
+        }
+    )
+    if not incoming:
+        raise ValueError("at least one blocking operation id is required")
+    # Validate/canonicalize before BEGIN IMMEDIATE.
+    _canonical_json_text(incoming, "blocking_operation_ids_json", expected_type=list)
+    when = _sqlite_ts(tripped_at or _now())
+    safe_reason_code = _required_stability_text(reason_code, "reason_code").upper()
+    safe_wallet = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("runtime safety latch singleton is missing")
+        current = dict(row)
+        if current["state"] == "tripped" and (
+            current["wallet_fingerprint_hash"] != safe_wallet
+            or current["network"] != safe_network
+        ):
+            raise ValueError("runtime safety latch wallet binding mismatch")
+        existing = (
+            json.loads(current["blocking_operation_ids_json"])
+            if current["state"] == "tripped"
+            else []
+        )
+        blockers = sorted(set(existing) | set(incoming))
+        blockers_json = _canonical_json_text(
+            blockers, "blocking_operation_ids_json", expected_type=list
+        )
+        generation = int(current["generation"]) + (
+            1 if current["state"] != "tripped" else 0
+        )
+        conn.execute(
+            """
+            UPDATE runtime_safety_latch
+            SET generation=?, state='tripped', reason_code=?, reason=?,
+                blocking_operation_ids_json=?, wallet_fingerprint_hash=?,
+                network=?, tripped_at=COALESCE(tripped_at, ?),
+                resolved_at=NULL, updated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                generation,
+                safe_reason_code,
+                str(reason or ""),
+                blockers_json,
+                safe_wallet,
+                safe_network,
+                when,
+                when,
+            ),
+        )
+        conn.commit()
+        result = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        return dict(result)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_runtime_safety_latch(
+    *,
+    expected_generation: int,
+    resolved_operation_ids: Iterable[str],
+    resolved_at: Any = None,
+) -> Dict[str, Any]:
+    """Resolve exactly one observed latch generation with all blockers named."""
+
+    resolved_ids = sorted(
+        {
+            _required_stability_text(value, "resolved operation id")
+            for value in resolved_operation_ids
+        }
+    )
+    _canonical_json_text(resolved_ids, "resolved_operation_ids_json", expected_type=list)
+    when = _sqlite_ts(resolved_at or _now())
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("runtime safety latch singleton is missing")
+        latch = dict(row)
+        if int(latch["generation"]) != int(expected_generation):
+            conn.commit()
+            return {
+                "resolved": False,
+                "reason": "generation_mismatch",
+                "latch": latch,
+            }
+        blockers = set(json.loads(latch["blocking_operation_ids_json"]))
+        if not blockers.issubset(set(resolved_ids)):
+            conn.commit()
+            return {
+                "resolved": False,
+                "reason": "blockers_not_resolved",
+                "latch": latch,
+            }
+        if blockers:
+            placeholders = ",".join("?" for _ in blockers)
+            latest_rows = conn.execute(
+                f"""
+                SELECT journal.operation_id, journal.blocks_mutation
+                FROM offer_operation_journal AS journal
+                JOIN (
+                    SELECT operation_id, MAX(sequence) AS latest_sequence
+                    FROM offer_operation_journal
+                    WHERE operation_id IN ({placeholders})
+                    GROUP BY operation_id
+                ) AS latest
+                  ON latest.operation_id = journal.operation_id
+                 AND latest.latest_sequence = journal.sequence
+                """,
+                tuple(sorted(blockers)),
+            ).fetchall()
+            resolved_by_journal = {
+                str(item["operation_id"])
+                for item in latest_rows
+                if int(item["blocks_mutation"] or 0) == 0
+            }
+            if not blockers.issubset(resolved_by_journal):
+                conn.commit()
+                return {
+                    "resolved": False,
+                    "reason": "blockers_still_unresolved",
+                    "latch": latch,
+                }
+        conn.execute(
+            """
+            UPDATE runtime_safety_latch
+            SET state='resolved', reason_code=NULL, reason=NULL,
+                blocking_operation_ids_json='[]', resolved_at=?, updated_at=?
+            WHERE singleton_id=1 AND generation=? AND state='tripped'
+            """,
+            (when, when, int(expected_generation)),
+        )
+        result = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        result_dict = dict(result)
+        return {
+            "resolved": result_dict["state"] == "resolved",
+            "reason": "resolved" if result_dict["state"] == "resolved" else "not_tripped",
+            "latch": result_dict,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_runtime_mutation_lease() -> Dict[str, Any]:
+    row = get_connection().execute(
+        "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("runtime mutation lease singleton is missing")
+    return dict(row)
+
+
+def acquire_runtime_mutation_lease(
+    *,
+    owner_run_id: str,
+    owner_pid: int,
+    owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    lease_expires_at: Any,
+    now: Any = None,
+    allow_expired_takeover: bool = False,
+    expected_lease_version: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Acquire/renew the singleton lease with explicit expired-takeover CAS."""
+
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    host = _required_stability_text(owner_host, "owner_host")
+    wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    try:
+        pid = int(owner_pid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("owner_pid must be a positive integer") from exc
+    if isinstance(owner_pid, bool) or pid <= 0:
+        raise ValueError("owner_pid must be a positive integer")
+    at = _sqlite_ts(now or _now())
+    expiry = _sqlite_ts(lease_expires_at)
+    if expiry <= at:
+        raise ValueError("lease_expires_at must be later than now")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("runtime mutation lease singleton is missing")
+        current = dict(row)
+        version = int(current["lease_version"])
+        reason = "acquired"
+        can_acquire = not bool(current["active"])
+        if current["active"] and current["owner_run_id"] == owner:
+            if expected_lease_version is not None and int(expected_lease_version) != version:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "compare_and_set_failed",
+                    "lease": current,
+                }
+            can_acquire = True
+            reason = "renewed"
+        elif current["active"]:
+            expired = bool(current["expires_at"] and current["expires_at"] <= at)
+            if not expired:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "owned_by_other_run",
+                    "lease": current,
+                }
+            if not allow_expired_takeover:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "expired_takeover_not_authorized",
+                    "lease": current,
+                }
+            if expected_lease_version is None:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "takeover_requires_compare_and_set",
+                    "lease": current,
+                }
+            if int(expected_lease_version) != version:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "compare_and_set_failed",
+                    "lease": current,
+                }
+            can_acquire = True
+            reason = "expired_lease_taken_over"
+        if expected_lease_version is not None and int(expected_lease_version) != version:
+            conn.commit()
+            return {
+                "acquired": False,
+                "reason": "compare_and_set_failed",
+                "lease": current,
+            }
+        if not can_acquire:
+            conn.commit()
+            return {"acquired": False, "reason": "not_available", "lease": current}
+        cursor = conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=lease_version+1, active=1, owner_run_id=?,
+                owner_pid=?, owner_host=?, wallet_fingerprint_hash=?, network=?,
+                acquired_at=CASE WHEN active=0 OR owner_run_id<>? THEN ? ELSE acquired_at END,
+                heartbeat_at=?, expires_at=?, released_at=NULL, updated_at=?
+            WHERE singleton_id=1 AND lease_version=?
+            """,
+            (
+                owner,
+                pid,
+                host,
+                wallet_hash,
+                safe_network,
+                owner,
+                at,
+                at,
+                expiry,
+                at,
+                version,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return {
+                "acquired": False,
+                "reason": "compare_and_set_failed",
+                "lease": get_runtime_mutation_lease(),
+            }
+        result = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        return {"acquired": True, "reason": reason, "lease": dict(result)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def heartbeat_runtime_mutation_lease(
+    *,
+    owner_run_id: str,
+    expected_lease_version: int,
+    lease_expires_at: Any,
+    heartbeat_at: Any = None,
+) -> Dict[str, Any]:
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    at = _sqlite_ts(heartbeat_at or _now())
+    expiry = _sqlite_ts(lease_expires_at)
+    if expiry <= at:
+        raise ValueError("lease_expires_at must be later than heartbeat_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=lease_version+1, heartbeat_at=?, expires_at=?, updated_at=?
+            WHERE singleton_id=1 AND active=1 AND owner_run_id=? AND lease_version=?
+            """,
+            (at, expiry, at, owner, int(expected_lease_version)),
+        )
+        row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        return {
+            "heartbeat": cursor.rowcount == 1,
+            "reason": "heartbeat" if cursor.rowcount == 1 else "compare_and_set_failed",
+            "lease": dict(row),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_runtime_mutation_lease(
+    *,
+    owner_run_id: str,
+    expected_lease_version: int,
+    released_at: Any = None,
+) -> Dict[str, Any]:
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    at = _sqlite_ts(released_at or _now())
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=lease_version+1, active=0, released_at=?,
+                expires_at=NULL, updated_at=?
+            WHERE singleton_id=1 AND active=1 AND owner_run_id=? AND lease_version=?
+            """,
+            (at, at, owner, int(expected_lease_version)),
+        )
+        row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        return {
+            "released": cursor.rowcount == 1,
+            "reason": "released" if cursor.rowcount == 1 else "compare_and_set_failed",
+            "lease": dict(row),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def issue_worker_delegation(
+    *,
+    delegation_id: str,
+    delegation_token_hash: str,
+    parent_run_id: str,
+    operation_id: str,
+    worker_id: str,
+    purpose: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    issued_at: Any,
+    expires_at: Any,
+    metadata_json: Any = None,
+) -> Dict[str, Any]:
+    metadata = _canonical_json_text(metadata_json, "metadata_json", default={})
+    issued = _sqlite_ts(issued_at)
+    expiry = _sqlite_ts(expires_at)
+    if expiry <= issued:
+        raise ValueError("delegation expires_at must be later than issued_at")
+    values = {
+        "delegation_id": _required_stability_text(delegation_id, "delegation_id"),
+        "delegation_token_hash": _required_stability_text(
+            delegation_token_hash, "delegation_token_hash"
+        ),
+        "parent_run_id": _required_stability_text(parent_run_id, "parent_run_id"),
+        "operation_id": _required_stability_text(operation_id, "operation_id"),
+        "worker_id": _required_stability_text(worker_id, "worker_id"),
+        "purpose": _required_stability_text(purpose, "purpose"),
+        "wallet_fingerprint_hash": _required_stability_text(
+            wallet_fingerprint_hash, "wallet_fingerprint_hash"
+        ),
+        "network": _required_stability_text(network, "network"),
+        "metadata_json": metadata,
+        "issued_at": issued,
+        "expires_at": expiry,
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM runtime_worker_delegations WHERE delegation_id=?",
+            (values["delegation_id"],),
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            if any(row[key] != value for key, value in values.items()):
+                raise ValueError("delegation_id already exists with different data")
+            conn.commit()
+            return row
+        conn.execute(
+            """
+            INSERT INTO runtime_worker_delegations (
+                delegation_id, delegation_token_hash, parent_run_id,
+                operation_id, worker_id, purpose, wallet_fingerprint_hash,
+                network, state, metadata_json, issued_at, expires_at, updated_at
+            ) VALUES (
+                :delegation_id, :delegation_token_hash, :parent_run_id,
+                :operation_id, :worker_id, :purpose, :wallet_fingerprint_hash,
+                :network, 'active', :metadata_json, :issued_at, :expires_at,
+                :issued_at
+            )
+            """,
+            values,
+        )
+        row = conn.execute(
+            "SELECT * FROM runtime_worker_delegations WHERE delegation_id=?",
+            (values["delegation_id"],),
+        ).fetchone()
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_valid_worker_delegation(
+    *,
+    delegation_id: str,
+    delegation_token_hash: str,
+    parent_run_id: str,
+    operation_id: str,
+    purpose: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    now: Any = None,
+) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        """
+        SELECT * FROM runtime_worker_delegations
+        WHERE delegation_id=? AND delegation_token_hash=? AND parent_run_id=?
+          AND operation_id=? AND purpose=? AND wallet_fingerprint_hash=?
+          AND network=? AND state='active' AND expires_at>?
+        """,
+        (
+            str(delegation_id),
+            str(delegation_token_hash),
+            str(parent_run_id),
+            str(operation_id),
+            str(purpose),
+            str(wallet_fingerprint_hash),
+            str(network),
+            _sqlite_ts(now or _now()),
+        ),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def expire_worker_delegations(*, now: Any = None) -> int:
+    at = _sqlite_ts(now or _now())
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE runtime_worker_delegations
+            SET state='expired', expired_at=?, updated_at=?
+            WHERE state='active' AND expires_at<=?
+            """,
+            (at, at, at),
+        )
+        count = int(cursor.rowcount or 0)
+        conn.commit()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def revoke_worker_delegation(
+    *,
+    delegation_id: str,
+    parent_run_id: str,
+    operation_id: str,
+    revoked_at: Any = None,
+) -> Dict[str, Any]:
+    """Revoke one exact active child-worker scope before its natural expiry."""
+
+    delegation = _required_stability_text(delegation_id, "delegation_id")
+    parent = _required_stability_text(parent_run_id, "parent_run_id")
+    operation = _required_stability_text(operation_id, "operation_id")
+    at = _sqlite_ts(revoked_at or _now())
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM runtime_worker_delegations WHERE delegation_id=?",
+            (delegation,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return {"revoked": False, "reason": "not_found", "delegation": None}
+        current = dict(row)
+        if current["parent_run_id"] != parent or current["operation_id"] != operation:
+            conn.commit()
+            return {
+                "revoked": False,
+                "reason": "scope_mismatch",
+                "delegation": current,
+            }
+        if current["state"] == "revoked":
+            conn.commit()
+            return {
+                "revoked": True,
+                "reason": "already_revoked",
+                "delegation": current,
+            }
+        if current["state"] != "active":
+            conn.commit()
+            return {
+                "revoked": False,
+                "reason": "not_active",
+                "delegation": current,
+            }
+        conn.execute(
+            """
+            UPDATE runtime_worker_delegations
+            SET state='revoked', revoked_at=?, updated_at=?
+            WHERE delegation_id=? AND state='active'
+            """,
+            (at, at, delegation),
+        )
+        result = conn.execute(
+            "SELECT * FROM runtime_worker_delegations WHERE delegation_id=?",
+            (delegation,),
+        ).fetchone()
+        conn.commit()
+        return {"revoked": True, "reason": "revoked", "delegation": dict(result)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def enqueue_publication_outbox(
+    *,
+    publication_id: str,
+    idempotency_key: str,
+    network: str,
+    offer_fingerprint: str,
+    publication_epoch: str,
+    publisher: str,
+    payload_json: Any,
+    intent_id: Optional[str] = None,
+    queued_at: Any = None,
+) -> Dict[str, Any]:
+    """Queue one publication identity or return its exact idempotent row."""
+
+    queued = _sqlite_ts(queued_at or _now())
+    values = {
+        "publication_id": _required_stability_text(
+            publication_id, "publication_id"
+        ),
+        "idempotency_key": _required_stability_text(
+            idempotency_key, "idempotency_key"
+        ),
+        "intent_id": _optional_stability_text(intent_id),
+        "network": _required_stability_text(network, "network"),
+        "offer_fingerprint": _required_stability_text(
+            offer_fingerprint, "offer_fingerprint"
+        ),
+        "publication_epoch": _required_stability_text(
+            publication_epoch, "publication_epoch"
+        ),
+        "publisher": _required_stability_text(publisher, "publisher"),
+        "payload_json": _canonical_json_text(payload_json, "payload_json", default={}),
+        "queued_at": queued,
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT * FROM publication_outbox
+            WHERE publication_id=? OR idempotency_key=? OR
+                  (network=? AND offer_fingerprint=? AND publication_epoch=?)
+            LIMIT 1
+            """,
+            (
+                values["publication_id"],
+                values["idempotency_key"],
+                values["network"],
+                values["offer_fingerprint"],
+                values["publication_epoch"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            identity_columns = (
+                "idempotency_key",
+                "intent_id",
+                "network",
+                "offer_fingerprint",
+                "publication_epoch",
+                "publisher",
+                "payload_json",
+            )
+            if row["idempotency_key"] == values["idempotency_key"] and all(
+                row[key] == values[key] for key in identity_columns
+            ):
+                conn.commit()
+                return {"queued": False, "idempotent": True, "record": row}
+            raise ValueError("publication idempotency conflict")
+        conn.execute(
+            """
+            INSERT INTO publication_outbox (
+                publication_id, idempotency_key, intent_id, network,
+                offer_fingerprint, publication_epoch, publisher, payload_json,
+                state, attempt_count, queued_at, updated_at
+            ) VALUES (
+                :publication_id, :idempotency_key, :intent_id, :network,
+                :offer_fingerprint, :publication_epoch, :publisher,
+                :payload_json, 'queued', 0, :queued_at, :queued_at
+            )
+            """,
+            values,
+        )
+        row = conn.execute(
+            "SELECT * FROM publication_outbox WHERE publication_id=?",
+            (values["publication_id"],),
+        ).fetchone()
+        conn.commit()
+        return {"queued": True, "idempotent": False, "record": dict(row)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_publication_outbox(publication_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT * FROM publication_outbox WHERE publication_id=?",
+        (str(publication_id),),
+    ).fetchone()
+    return dict(row) if row is not None else None

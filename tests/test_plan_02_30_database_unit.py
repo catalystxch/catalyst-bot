@@ -5,6 +5,8 @@ isolation. Tests covers norm_coin_id, add_offer/get_offer/update_offer_status,
 get_open_offers, record_fill/get_fills/get_net_position, upsert_coin/
 get_free_coins/lock_coin/free_coin/get_coin_summary, record_price/
 get_recent_prices, log_event/get_recent_events, get_setting/set_setting.
+The durable stability repository is also smoke-tested through its initial
+singleton latch state.
 """
 
 import os
@@ -750,6 +752,19 @@ class TestElapsedExpiryMissingTable(_TempDB):
                 for call in log_event.mock_calls
             )
         )
+
+
+@unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
+class TestStabilityRepository(_TempDB):
+    """The stability migration exposes a durable resolved latch on every DB."""
+
+    def test_initial_runtime_safety_latch_is_resolved(self):
+        latch = _db.get_runtime_safety_latch()
+
+        self.assertEqual(latch["singleton_id"], 1)
+        self.assertEqual(latch["generation"], 0)
+        self.assertEqual(latch["state"], "resolved")
+        self.assertEqual(latch["blocking_operation_ids_json"], "[]")
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
