@@ -45,35 +45,100 @@ def _console(msg: str) -> None:
 
 
 _REDACTED = "[REDACTED]"
-_SENSITIVE_NAME_RE = re.compile(
-    r"(?:api[_-]?(?:key|token)|private[_-]?key|secret|token|password|"
-    r"passphrase|authorization|auth|credential|mnemonic|seed|puzzle[_-]?reveal|"
-    r"signature|certificate|cert)$",
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?P<name>[\"']?[A-Za-z][A-Za-z0-9_. -]*?[\"']?)\s*"
+    r"(?P<separator>[:=])\s*"
+    r"(?P<value>\[REDACTED\]|(?:Bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^,\s;}\]]+))",
     re.IGNORECASE,
 )
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?P<name>[\"']?(?:api[_-]?(?:key|token)|private[_-]?key|secret|token|"
-    r"password|passphrase|authorization|auth|credential|mnemonic|seed|"
-    r"puzzle[_-]?reveal|signature|certificate|cert)[\"']?\s*[:=]\s*)"
-    r"(?:\[REDACTED\]|\"[^\"]*\"|'[^']*'|[^,\s;}\]]+)",
+_SENSITIVE_HEADER_RE = re.compile(
+    r"(?P<name>(?:proxy[-_ ]?authorization|authorization|set[-_ ]?cookie|cookie|"
+    r"x[-_ ]?api[-_ ]?(?:key|token))\s*:\s*)(?P<value>[^\r\n]+)",
     re.IGNORECASE,
 )
 _PRIVATE_KEY_BLOCK_RE = re.compile(
     r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----.*?-----END(?: [A-Z]+)? PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL,
 )
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_SENSITIVE_SINGLE_TOKENS = {
+    "auth",
+    "authorization",
+    "certificate",
+    "cert",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "header",
+    "headers",
+    "mnemonic",
+    "password",
+    "passphrase",
+    "private",
+    "secret",
+    "secrets",
+    "seed",
+    "signature",
+    "token",
+}
+_SENSITIVE_TOKEN_SEQUENCES = {
+    ("access", "token"),
+    ("api", "key"),
+    ("api", "token"),
+    ("private", "key"),
+    ("puzzle", "reveal"),
+    ("refresh", "token"),
+    ("seed", "phrase"),
+    ("set", "cookie"),
+    ("x", "api", "key"),
+    ("x", "api", "token"),
+}
+_MAX_SANITIZED_COLLECTION_ITEMS = 64
+
+
+def _normalise_sage_field_name(name: Any) -> tuple[str, ...]:
+    """Split camel/snake/kebab header names into comparable tokens."""
+    camel_spaced = _CAMEL_CASE_BOUNDARY_RE.sub("_", str(name or ""))
+    normalised = re.sub(r"[^a-z0-9]+", "_", camel_spaced.lower()).strip("_")
+    return tuple(token for token in normalised.split("_") if token)
 
 
 def _is_sensitive_name(name: Any) -> bool:
-    """Return whether a structured field name may contain a secret."""
-    return bool(_SENSITIVE_NAME_RE.search(str(name)))
+    """Identify credential-bearing field names without broad substring matches.
+
+    Threat model: Sage errors and payloads may label credentials with camelCase,
+    snake_case, kebab-case, or HTTP-header spelling. Token sequences catch those
+    variants while preserving unrelated names such as ``monkey_count``,
+    ``keyframe``, and ``token_count``.
+    """
+    tokens = _normalise_sage_field_name(name)
+    if not tokens:
+        return False
+    if len(tokens) == 1 and tokens[0] in _SENSITIVE_SINGLE_TOKENS:
+        return True
+    if any(token in _SENSITIVE_SINGLE_TOKENS - {"private", "token"} for token in tokens):
+        return True
+    return any(
+        tokens[index : index + len(sequence)] == sequence
+        for sequence in _SENSITIVE_TOKEN_SEQUENCES
+        for index in range(len(tokens) - len(sequence) + 1)
+    )
 
 
 def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
     """Redact secret-bearing text before it reaches a caller or any log sink."""
     text = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, str(value))
-    text = _SENSITIVE_ASSIGNMENT_RE.sub(
+    text = _SENSITIVE_HEADER_RE.sub(
         lambda match: f"{match.group('name')}{_REDACTED}", text
+    )
+    text = _SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('name')}{match.group('separator')}{_REDACTED}"
+            if _is_sensitive_name(match.group('name'))
+            else match.group(0)
+        ),
+        text,
     )
     return text[:limit]
 
@@ -81,14 +146,23 @@ def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
 def _sanitize_sage_data(value: Any, limit: int = 80) -> Any:
     """Produce bounded, recursively redacted structured data for diagnostics."""
     if isinstance(value, dict):
-        return {
-            str(key): _REDACTED
-            if _is_sensitive_name(key)
-            else _sanitize_sage_data(item, limit)
-            for key, item in value.items()
-        }
+        result = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_SANITIZED_COLLECTION_ITEMS:
+                result["_truncated_items"] = len(value) - index
+                break
+            result[str(key)] = (
+                _REDACTED if _is_sensitive_name(key) else _sanitize_sage_data(item, limit)
+            )
+        return result
     if isinstance(value, (list, tuple)):
-        return [_sanitize_sage_data(item, limit) for item in value]
+        result = [
+            _sanitize_sage_data(item, limit)
+            for item in value[:_MAX_SANITIZED_COLLECTION_ITEMS]
+        ]
+        if len(value) > _MAX_SANITIZED_COLLECTION_ITEMS:
+            result.append({"_truncated_items": len(value) - _MAX_SANITIZED_COLLECTION_ITEMS})
+        return result
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return _sanitize_sage_text(value, limit)
