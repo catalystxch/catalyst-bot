@@ -27,6 +27,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -776,90 +777,212 @@ CREATE INDEX IF NOT EXISTS idx_publication_outbox_intent
 
 _STABILITY_REQUIRED_COLUMNS = {
     "offer_intents": {
-        "intent_id", "run_id", "wallet_fingerprint_hash", "network", "asset_id",
-        "side", "tier", "purpose", "slot_key", "generation", "parent_intent_id",
-        "child_intent_id", "offered_amount_atomic", "requested_amount_atomic",
-        "selected_coin_ids_json", "selected_coin_ids_sha256", "offer_text_sha256",
-        "sage_trade_id", "publication_identity", "lifecycle_state", "row_version",
-        "prepared_at", "submitted_at", "confirmed_at", "first_visible_at",
-        "terminal_at", "updated_at",
+        "intent_id",
+        "run_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "asset_id",
+        "side",
+        "tier",
+        "purpose",
+        "slot_key",
+        "generation",
+        "parent_intent_id",
+        "child_intent_id",
+        "offered_amount_atomic",
+        "requested_amount_atomic",
+        "selected_coin_ids_json",
+        "selected_coin_ids_sha256",
+        "offer_text_sha256",
+        "sage_trade_id",
+        "publication_identity",
+        "lifecycle_state",
+        "row_version",
+        "prepared_at",
+        "submitted_at",
+        "confirmed_at",
+        "first_visible_at",
+        "terminal_at",
+        "updated_at",
     },
     "offer_operation_journal": {
-        "sequence", "event_id", "operation_id", "intent_id", "operation_type",
-        "attempt", "phase", "outcome", "request_timestamp", "wallet_identity_json",
-        "transaction_id", "spend_identity", "evidence_json", "evidence_sha256",
-        "reason_code", "blocks_mutation", "created_at",
+        "sequence",
+        "event_id",
+        "operation_id",
+        "intent_id",
+        "operation_type",
+        "attempt",
+        "phase",
+        "outcome",
+        "request_timestamp",
+        "wallet_identity_json",
+        "transaction_id",
+        "spend_identity",
+        "evidence_json",
+        "evidence_sha256",
+        "reason_code",
+        "blocks_mutation",
+        "created_at",
     },
     "runtime_safety_latch": {
-        "singleton_id", "generation", "state", "reason_code", "reason",
-        "blocking_operation_ids_json", "wallet_fingerprint_hash", "network",
-        "tripped_at", "resolved_at", "updated_at",
+        "singleton_id",
+        "generation",
+        "state",
+        "reason_code",
+        "reason",
+        "blocking_operation_ids_json",
+        "wallet_fingerprint_hash",
+        "network",
+        "tripped_at",
+        "resolved_at",
+        "updated_at",
     },
     "runtime_mutation_lease": {
-        "singleton_id", "lease_version", "active", "owner_run_id", "owner_pid",
-        "owner_host", "wallet_fingerprint_hash", "network", "acquired_at",
-        "heartbeat_at", "expires_at", "released_at", "updated_at",
+        "singleton_id",
+        "lease_version",
+        "active",
+        "owner_run_id",
+        "owner_pid",
+        "owner_host",
+        "wallet_fingerprint_hash",
+        "network",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "released_at",
+        "updated_at",
     },
     "runtime_worker_delegations": {
-        "delegation_id", "delegation_token_hash", "parent_run_id", "operation_id",
-        "worker_id", "purpose", "wallet_fingerprint_hash", "network", "state",
-        "metadata_json", "issued_at", "expires_at", "expired_at", "revoked_at",
+        "delegation_id",
+        "delegation_token_hash",
+        "parent_run_id",
+        "operation_id",
+        "worker_id",
+        "purpose",
+        "wallet_fingerprint_hash",
+        "network",
+        "state",
+        "metadata_json",
+        "issued_at",
+        "expires_at",
+        "expired_at",
+        "revoked_at",
         "updated_at",
     },
     "publication_outbox": {
-        "publication_id", "idempotency_key", "intent_id", "network",
-        "offer_fingerprint", "publication_epoch", "publisher", "payload_json",
-        "state", "attempt_count", "claim_owner_run_id", "claim_expires_at",
-        "next_attempt_at", "last_error_json", "queued_at", "succeeded_at",
-        "terminal_at", "updated_at",
+        "publication_id",
+        "idempotency_key",
+        "intent_id",
+        "network",
+        "offer_fingerprint",
+        "publication_epoch",
+        "publisher",
+        "payload_json",
+        "state",
+        "attempt_count",
+        "claim_owner_run_id",
+        "claim_expires_at",
+        "next_attempt_at",
+        "last_error_json",
+        "queued_at",
+        "succeeded_at",
+        "terminal_at",
+        "updated_at",
     },
 }
 
 _STABILITY_INDEXES = {
     "uniq_offer_intents_sage_trade_id": (
-        "offer_intents", True, True, ("sage_trade_id",), "sage_trade_idisnotnull"
+        "offer_intents",
+        True,
+        True,
+        ("sage_trade_id",),
+        "sage_trade_idisnotnull",
     ),
     "uniq_offer_intents_offer_text_sha256": (
-        "offer_intents", True, True, ("offer_text_sha256",),
-        "offer_text_sha256isnotnull"
+        "offer_intents",
+        True,
+        True,
+        ("offer_text_sha256",),
+        "offer_text_sha256isnotnull",
     ),
     "idx_offer_intents_state": (
-        "offer_intents", False, False, ("lifecycle_state", "updated_at"), None
+        "offer_intents",
+        False,
+        False,
+        ("lifecycle_state", "updated_at"),
+        None,
     ),
     "idx_offer_intents_slot_generation": (
-        "offer_intents", False, False, ("run_id", "slot_key", "generation"), None
+        "offer_intents",
+        False,
+        False,
+        ("run_id", "slot_key", "generation"),
+        None,
     ),
     "uniq_offer_intents_active_slot_generation": (
-        "offer_intents", True, True, ("run_id", "slot_key", "generation"),
+        "offer_intents",
+        True,
+        True,
+        ("run_id", "slot_key", "generation"),
         "slot_keyisnotnullandlifecycle_statein('prepared','submitted_unconfirmed',"
-        "'creation_unknown','created')"
+        "'creation_unknown','created')",
     ),
     "idx_offer_intents_parent": (
-        "offer_intents", False, False, ("parent_intent_id",), None
+        "offer_intents",
+        False,
+        False,
+        ("parent_intent_id",),
+        None,
     ),
     "idx_offer_journal_operation": (
-        "offer_operation_journal", False, False, ("operation_id", "sequence"), None
+        "offer_operation_journal",
+        False,
+        False,
+        ("operation_id", "sequence"),
+        None,
     ),
     "idx_offer_journal_intent": (
-        "offer_operation_journal", False, False, ("intent_id", "sequence"), None
+        "offer_operation_journal",
+        False,
+        False,
+        ("intent_id", "sequence"),
+        None,
     ),
     "idx_offer_journal_blockers": (
-        "offer_operation_journal", False, False,
-        ("blocks_mutation", "operation_id", "sequence"), None
+        "offer_operation_journal",
+        False,
+        False,
+        ("blocks_mutation", "operation_id", "sequence"),
+        None,
     ),
     "uniq_worker_delegation_active_scope": (
-        "runtime_worker_delegations", True, True,
-        ("parent_run_id", "operation_id", "purpose"), "state='active'"
+        "runtime_worker_delegations",
+        True,
+        True,
+        ("parent_run_id", "operation_id", "purpose"),
+        "state='active'",
     ),
     "idx_worker_delegation_expiry": (
-        "runtime_worker_delegations", False, False, ("state", "expires_at"), None
+        "runtime_worker_delegations",
+        False,
+        False,
+        ("state", "expires_at"),
+        None,
     ),
     "idx_publication_outbox_ready": (
-        "publication_outbox", False, False,
-        ("state", "next_attempt_at", "queued_at"), None
+        "publication_outbox",
+        False,
+        False,
+        ("state", "next_attempt_at", "queued_at"),
+        None,
     ),
     "idx_publication_outbox_intent": (
-        "publication_outbox", False, False, ("intent_id", "state"), None
+        "publication_outbox",
+        False,
+        False,
+        ("intent_id", "state"),
+        None,
     ),
 }
 
@@ -902,9 +1025,7 @@ def _require_unique_key(
             and _index_key_columns(conn, str(index[1])) == columns
         ):
             return
-    raise RuntimeError(
-        f"stability schema {table} is missing UNIQUE key {columns!r}"
-    )
+    raise RuntimeError(f"stability schema {table} is missing UNIQUE key {columns!r}")
 
 
 def _validate_stability_schema(conn: sqlite3.Connection) -> None:
@@ -938,8 +1059,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         expected_triggers = {
             str(row[0]): (str(row[1]), str(row[2]))
             for row in expected_conn.execute(
-                "SELECT name, tbl_name, sql FROM sqlite_master "
-                "WHERE type='trigger'"
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger'"
             ).fetchall()
         }
     finally:
@@ -994,9 +1114,13 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index'"
         ).fetchall()
     }
-    for name, (table, unique, partial, columns, predicate) in (
-        _STABILITY_INDEXES.items()
-    ):
+    for name, (
+        table,
+        unique,
+        partial,
+        columns,
+        predicate,
+    ) in _STABILITY_INDEXES.items():
         index_rows = {
             str(row[1]): row
             for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall()
@@ -1025,9 +1149,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
     )
-    _require_unique_key(
-        conn, "runtime_worker_delegations", ("delegation_token_hash",)
-    )
+    _require_unique_key(conn, "runtime_worker_delegations", ("delegation_token_hash",))
     _require_unique_key(conn, "publication_outbox", ("idempotency_key",))
     _require_unique_key(
         conn,
@@ -1059,8 +1181,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         if (
             actual is None
             or actual[0] != expected_table
-            or _normalized_schema_sql(actual[1])
-            != _normalized_schema_sql(expected_sql)
+            or _normalized_schema_sql(actual[1]) != _normalized_schema_sql(expected_sql)
         ):
             raise RuntimeError(
                 f"stability schema {name} has wrong append-only trigger definition"
@@ -1117,9 +1238,7 @@ _MUTABLE_STABILITY_TIMESTAMPS = {
 def _normalize_existing_stability_timestamps(conn: sqlite3.Connection) -> None:
     """Upgrade mutable Task 3 timestamps atomically before safety comparisons."""
 
-    for table, (key_column, timestamp_columns) in (
-        _MUTABLE_STABILITY_TIMESTAMPS.items()
-    ):
+    for table, (key_column, timestamp_columns) in _MUTABLE_STABILITY_TIMESTAMPS.items():
         selected_columns = (key_column, *timestamp_columns)
         select_sql = ", ".join(f'"{column}"' for column in selected_columns)
         rows = conn.execute(f'SELECT {select_sql} FROM "{table}"').fetchall()
@@ -1190,9 +1309,7 @@ def _database_migration_guard(*, timeout: float = 30.0):
                 else:
                     import fcntl
 
-                    fcntl.flock(
-                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
             except (OSError, IOError) as exc:
@@ -1884,11 +2001,15 @@ def _parse_iso_timestamp(value: Any, label: str, *, require_timezone: bool) -> d
         text = value.strip()
         if not text:
             raise ValueError(f"{label} must be a valid ISO-8601 timestamp")
-        if require_timezone and re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-            r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})",
-            text,
-        ) is None:
+        if (
+            require_timezone
+            and re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})",
+                text,
+            )
+            is None
+        ):
             raise ValueError(
                 f"{label} must be a valid timezone-aware ISO-8601 timestamp"
             )
@@ -1897,9 +2018,7 @@ def _parse_iso_timestamp(value: Any, label: str, *, require_timezone: bool) -> d
         try:
             parsed = datetime.fromisoformat(text)
         except ValueError as exc:
-            raise ValueError(
-                f"{label} must be a valid ISO-8601 timestamp"
-            ) from exc
+            raise ValueError(f"{label} must be a valid ISO-8601 timestamp") from exc
     else:
         raise ValueError(f"{label} must be a datetime or ISO-8601 string")
 
@@ -1913,17 +2032,17 @@ def _parse_iso_timestamp(value: Any, label: str, *, require_timezone: bool) -> d
 def _sqlite_ts(value) -> str:
     """Normalize a valid timestamp to the legacy SQLite UTC format."""
 
-    return _parse_iso_timestamp(
-        value, "timestamp", require_timezone=False
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    return _parse_iso_timestamp(value, "timestamp", require_timezone=False).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def _stability_timestamp(value: Any, label: str) -> str:
     """Return strict, timezone-aware UTC text with lexical time ordering."""
 
-    return _parse_iso_timestamp(
-        value, label, require_timezone=True
-    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return _parse_iso_timestamp(value, label, require_timezone=True).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
 
 
 def _canonical_stored_stability_timestamp(value: Any) -> str:
@@ -6667,6 +6786,23 @@ def _stability_connection() -> sqlite3.Connection:
     return conn
 
 
+def _stability_read_only_connection() -> sqlite3.Connection:
+    """Open the existing stability database without creating or changing it."""
+
+    database_uri = f"{Path(os.path.abspath(DB_PATH)).as_uri()}?mode=ro"
+    conn = sqlite3.connect(
+        database_uri,
+        timeout=10,
+        isolation_level=None,
+        uri=True,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def _required_stability_text(value: Any, label: str) -> str:
     text = str(value) if value is not None else ""
     text = text.strip()
@@ -6728,9 +6864,7 @@ def _canonical_json_text(
     else:
         parsed = value
     if expected_type is not None and not isinstance(parsed, expected_type):
-        raise ValueError(
-            f"{label} JSON must decode to {expected_type.__name__}"
-        )
+        raise ValueError(f"{label} JSON must decode to {expected_type.__name__}")
     try:
         encoded = json.dumps(
             parsed,
@@ -7186,7 +7320,9 @@ def finalize_offer_intent(
         if source_state not in allowed_transitions:
             raise ValueError("offer intent is already finalized")
         if state not in allowed_transitions[source_state]:
-            raise ValueError("offer intent source/destination transition is not allowed")
+            raise ValueError(
+                "offer intent source/destination transition is not allowed"
+            )
         current_version = _exact_integer(current_dict["row_version"], "row_version")
         if (
             safe_expected_row_version is not None
@@ -7195,7 +7331,8 @@ def finalize_offer_intent(
             raise ValueError("offer intent row_version compare-and-set failed")
         submitted_at = (
             final_time
-            if state.startswith("submitted") or "submitted" in journal["outcome"].lower()
+            if state.startswith("submitted")
+            or "submitted" in journal["outcome"].lower()
             else current_dict["submitted_at"]
         )
         confirmed_at = (
@@ -7204,9 +7341,7 @@ def finalize_offer_intent(
             else current_dict["confirmed_at"]
         )
         terminal_at = (
-            final_time
-            if state == "creation_failed"
-            else current_dict["terminal_at"]
+            final_time if state == "creation_failed" else current_dict["terminal_at"]
         )
         cursor = conn.execute(
             """
@@ -7246,40 +7381,56 @@ def finalize_offer_intent(
 
 
 def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT * FROM offer_intents WHERE intent_id=?", (str(intent_id),)
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT * FROM offer_intents WHERE intent_id=?", (str(intent_id),))
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 
 def get_offer_intent_by_trade_id(sage_trade_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT * FROM offer_intents WHERE sage_trade_id=?", (str(sage_trade_id),)
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_intents WHERE sage_trade_id=?", (str(sage_trade_id),)
+        )
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 
 def get_offer_intent_by_hash(offer_text_sha256: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT * FROM offer_intents WHERE offer_text_sha256=?",
-        (str(offer_text_sha256),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_intents WHERE offer_text_sha256=?",
+            (str(offer_text_sha256),),
+        )
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 
 def get_offer_operation_events(operation_id: str) -> List[Dict[str, Any]]:
-    rows = get_connection().execute(
-        "SELECT * FROM offer_operation_journal WHERE operation_id=? ORDER BY sequence",
-        (str(operation_id),),
-    ).fetchall()
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? ORDER BY sequence",
+            (str(operation_id),),
+        )
+        .fetchall()
+    )
     return [dict(row) for row in rows]
 
 
 def get_unresolved_offer_operation_blockers() -> List[Dict[str, Any]]:
     """Return the latest event for operations still marked fail-closed."""
 
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT journal.*
         FROM offer_operation_journal AS journal
         JOIN (
@@ -7292,14 +7443,124 @@ def get_unresolved_offer_operation_blockers() -> List[Dict[str, Any]]:
         WHERE journal.blocks_mutation = 1
         ORDER BY journal.sequence
         """
-    ).fetchall()
+        )
+        .fetchall()
+    )
     return [dict(row) for row in rows]
 
 
+def get_mutation_authorization_snapshot(
+    *,
+    delegation_id: Optional[str] = None,
+    delegation_token_hash: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    purpose: Optional[str] = None,
+    wallet_fingerprint_hash: Optional[str] = None,
+    network: Optional[str] = None,
+    now: Any = None,
+    read_only: bool = False,
+) -> Dict[str, Any]:
+    """Read all mutation authorization state from one SQLite snapshot.
+
+    When a worker scope is supplied, its delegation is selected in the same
+    transaction as the latch, journal blockers, and parent lease. Supplying a
+    partial scope is rejected so callers cannot accidentally weaken matching.
+    """
+
+    raw_scope = (
+        delegation_id,
+        delegation_token_hash,
+        parent_run_id,
+        operation_id,
+        purpose,
+        wallet_fingerprint_hash,
+        network,
+    )
+    has_scope = any(value is not None for value in raw_scope)
+    if has_scope and not all(value is not None for value in raw_scope):
+        raise ValueError("worker delegation authorization scope is incomplete")
+    scope = None
+    if has_scope:
+        scope = {
+            "delegation_id": _required_stability_text(delegation_id, "delegation_id"),
+            "delegation_token_hash": _required_stability_text(
+                delegation_token_hash, "delegation_token_hash"
+            ),
+            "parent_run_id": _required_stability_text(parent_run_id, "parent_run_id"),
+            "operation_id": _required_stability_text(operation_id, "operation_id"),
+            "purpose": _required_stability_text(purpose, "purpose"),
+            "wallet_fingerprint_hash": _required_stability_text(
+                wallet_fingerprint_hash, "wallet_fingerprint_hash"
+            ),
+            "network": _required_stability_text(network, "network"),
+            "now": _stability_timestamp_or_now(now, "now timestamp"),
+        }
+
+    if type(read_only) is not bool:
+        raise TypeError("read_only must be an exact bool")
+    conn = _stability_read_only_connection() if read_only else _stability_connection()
+    try:
+        conn.execute("BEGIN")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        blocker_rows = conn.execute(
+            """
+            SELECT journal.*
+            FROM offer_operation_journal AS journal
+            JOIN (
+                SELECT operation_id, MAX(sequence) AS latest_sequence
+                FROM offer_operation_journal
+                GROUP BY operation_id
+            ) AS latest
+              ON latest.operation_id = journal.operation_id
+             AND latest.latest_sequence = journal.sequence
+            WHERE journal.blocks_mutation = 1
+            ORDER BY journal.sequence
+            """
+        ).fetchall()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        delegation_row = None
+        if scope is not None:
+            delegation_row = conn.execute(
+                """
+                SELECT * FROM runtime_worker_delegations
+                WHERE delegation_id=:delegation_id
+                  AND delegation_token_hash=:delegation_token_hash
+                  AND parent_run_id=:parent_run_id
+                  AND operation_id=:operation_id
+                  AND purpose=:purpose
+                  AND wallet_fingerprint_hash=:wallet_fingerprint_hash
+                  AND network=:network AND state='active' AND expires_at>:now
+                """,
+                scope,
+            ).fetchone()
+        if latch_row is None or lease_row is None:
+            raise RuntimeError("mutation authorization singleton is missing")
+        result = {
+            "latch": dict(latch_row),
+            "unresolved": [dict(row) for row in blocker_rows],
+            "lease": dict(lease_row),
+            "delegation": dict(delegation_row) if delegation_row is not None else None,
+        }
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_runtime_safety_latch() -> Dict[str, Any]:
-    row = get_connection().execute(
-        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT * FROM runtime_safety_latch WHERE singleton_id=1")
+        .fetchone()
+    )
     if row is None:
         raise RuntimeError("runtime safety latch singleton is missing")
     return dict(row)
@@ -7407,7 +7668,9 @@ def resolve_runtime_safety_latch(
             for value in resolved_operation_ids
         }
     )
-    _canonical_json_text(resolved_ids, "resolved_operation_ids_json", expected_type=list)
+    _canonical_json_text(
+        resolved_ids, "resolved_operation_ids_json", expected_type=list
+    )
     when = _stability_timestamp_or_now(resolved_at, "resolved_at")
     conn = _stability_connection()
     try:
@@ -7462,7 +7725,29 @@ def resolve_runtime_safety_latch(
                     "reason": "blockers_still_unresolved",
                     "latch": latch,
                 }
-        conn.execute(
+        unresolved_rows = conn.execute(
+            """
+            SELECT journal.operation_id
+            FROM offer_operation_journal AS journal
+            JOIN (
+                SELECT operation_id, MAX(sequence) AS latest_sequence
+                FROM offer_operation_journal
+                GROUP BY operation_id
+            ) AS latest
+              ON latest.operation_id = journal.operation_id
+             AND latest.latest_sequence = journal.sequence
+            WHERE journal.blocks_mutation = 1
+            LIMIT 1
+            """
+        ).fetchall()
+        if unresolved_rows:
+            conn.commit()
+            return {
+                "resolved": False,
+                "reason": "blockers_still_unresolved",
+                "latch": latch,
+            }
+        cursor = conn.execute(
             """
             UPDATE runtime_safety_latch
             SET state='resolved', reason_code=NULL, reason=NULL,
@@ -7476,9 +7761,10 @@ def resolve_runtime_safety_latch(
         ).fetchone()
         conn.commit()
         result_dict = dict(result)
+        transitioned = cursor.rowcount == 1
         return {
-            "resolved": result_dict["state"] == "resolved",
-            "reason": "resolved" if result_dict["state"] == "resolved" else "not_tripped",
+            "resolved": transitioned and result_dict["state"] == "resolved",
+            "reason": "resolved" if transitioned else "not_tripped",
             "latch": result_dict,
         }
     except Exception:
@@ -7489,9 +7775,11 @@ def resolve_runtime_safety_latch(
 
 
 def get_runtime_mutation_lease() -> Dict[str, Any]:
-    row = get_connection().execute(
-        "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT * FROM runtime_mutation_lease WHERE singleton_id=1")
+        .fetchone()
+    )
     if row is None:
         raise RuntimeError("runtime mutation lease singleton is missing")
     return dict(row)
@@ -7586,9 +7874,7 @@ def acquire_runtime_mutation_lease(
             can_acquire = True
             reason = "renewed"
         elif current["active"]:
-            expired = bool(
-                current["expires_at"] and current["expires_at"] <= safety_at
-            )
+            expired = bool(current["expires_at"] and current["expires_at"] <= safety_at)
             if not expired:
                 conn.commit()
                 return {
@@ -7615,6 +7901,33 @@ def acquire_runtime_mutation_lease(
                 return {
                     "acquired": False,
                     "reason": "compare_and_set_failed",
+                    "lease": current,
+                }
+            latch_row = conn.execute(
+                "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
+            ).fetchone()
+            blocker_row = conn.execute(
+                """
+                SELECT 1
+                FROM offer_operation_journal AS journal
+                JOIN (
+                    SELECT operation_id, MAX(sequence) AS latest_sequence
+                    FROM offer_operation_journal
+                    GROUP BY operation_id
+                ) AS latest
+                  ON latest.operation_id = journal.operation_id
+                 AND latest.latest_sequence = journal.sequence
+                WHERE journal.blocks_mutation = 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if latch_row is None:
+                raise RuntimeError("runtime safety latch singleton is missing")
+            if latch_row["state"] != "resolved" or blocker_row is not None:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "mutation_gate_blocked",
                     "lease": current,
                 }
             can_acquire = True
@@ -7683,9 +7996,7 @@ def heartbeat_runtime_mutation_lease(
     owner = _required_stability_text(owner_run_id, "owner_run_id")
     version = _exact_integer(expected_lease_version, "expected_lease_version")
     at = _stability_timestamp_or_now(heartbeat_at, "heartbeat_at timestamp")
-    expiry = _stability_timestamp(
-        lease_expires_at, "lease_expires_at timestamp"
-    )
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at timestamp")
     if expiry <= at:
         raise ValueError("lease_expires_at must be later than heartbeat_at")
     conn = _stability_connection()
@@ -7725,9 +8036,7 @@ def heartbeat_runtime_mutation_lease(
                 "lease": current,
             }
         if expiry <= safety_at:
-            raise ValueError(
-                "lease_expires_at must be later than post-lock wall clock"
-            )
+            raise ValueError("lease_expires_at must be later than post-lock wall clock")
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -7878,24 +8187,28 @@ def get_valid_worker_delegation(
     network: str,
     now: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        """
+    row = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM runtime_worker_delegations
         WHERE delegation_id=? AND delegation_token_hash=? AND parent_run_id=?
           AND operation_id=? AND purpose=? AND wallet_fingerprint_hash=?
           AND network=? AND state='active' AND expires_at>?
         """,
-        (
-            str(delegation_id),
-            str(delegation_token_hash),
-            str(parent_run_id),
-            str(operation_id),
-            str(purpose),
-            str(wallet_fingerprint_hash),
-            str(network),
-            _stability_timestamp_or_now(now, "now timestamp"),
-        ),
-    ).fetchone()
+            (
+                str(delegation_id),
+                str(delegation_token_hash),
+                str(parent_run_id),
+                str(operation_id),
+                str(purpose),
+                str(wallet_fingerprint_hash),
+                str(network),
+                _stability_timestamp_or_now(now, "now timestamp"),
+            ),
+        )
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 
@@ -8004,12 +8317,8 @@ def enqueue_publication_outbox(
 
     queued = _stability_timestamp_or_now(queued_at, "queued_at")
     values = {
-        "publication_id": _required_stability_text(
-            publication_id, "publication_id"
-        ),
-        "idempotency_key": _required_stability_text(
-            idempotency_key, "idempotency_key"
-        ),
+        "publication_id": _required_stability_text(publication_id, "publication_id"),
+        "idempotency_key": _required_stability_text(idempotency_key, "idempotency_key"),
         "intent_id": _optional_stability_text(intent_id),
         "network": _required_stability_text(network, "network"),
         "offer_fingerprint": _required_stability_text(
@@ -8085,8 +8394,12 @@ def enqueue_publication_outbox(
 
 
 def get_publication_outbox(publication_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT * FROM publication_outbox WHERE publication_id=?",
-        (str(publication_id),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM publication_outbox WHERE publication_id=?",
+            (str(publication_id),),
+        )
+        .fetchone()
+    )
     return dict(row) if row is not None else None

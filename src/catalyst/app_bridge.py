@@ -24,6 +24,7 @@ import inspect
 import json
 import traceback
 from decimal import Decimal
+from functools import wraps
 
 
 _LOOPBACK_ENVIRON = {"REMOTE_ADDR": "127.0.0.1"}
@@ -77,6 +78,7 @@ def _safe(func):
     max_positional = sum(1 for p in params if p.kind in _POSITIONAL_KINDS)
     has_var_positional = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
 
+    @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             if not has_var_positional and len(args) > max_positional:
@@ -93,8 +95,32 @@ def _safe(func):
                 "error": "Internal error — check bot logs for details",
             }
 
-    wrapper.__name__ = func.__name__
     return wrapper
+
+
+def _mutation_guard(operation: str):
+    """Fail closed before direct bridge calls that bypass Flask hooks."""
+
+    def decorate(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            api = self.api
+            api._ensure_mutation_runtime()
+            try:
+                api.mutation_gate.require_allowed(operation)
+            except api.mutation_gate.MutationBlocked as exc:
+                return {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                    "operation": operation,
+                }
+            return func(self, *args, **kwargs)
+
+        wrapper._mutation_operation = operation
+        return wrapper
+
+    return decorate
 
 
 class AppBridge:
@@ -167,6 +193,7 @@ class AppBridge:
     # -----------------------------------------------------------------------
 
     @_safe
+    @_mutation_guard("app_bridge:start_bot")
     def start_bot(self, _body=None):
         """Start the bot loop. Maps to POST /api/bot/start.
         Delegates fully to api_server.api_bot_start() which runs all pre-start
@@ -249,6 +276,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:update_config")
     def update_config(self, body=None):
         """
         Update configuration. Maps to POST /api/config.
@@ -267,6 +295,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:live_config")
     def live_config(self, body=None):
         """Apply a live config change. Maps to POST /api/config/live."""
         import api_server
@@ -282,6 +311,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reload_config")
     def reload_config(self, _body=None):
         """Reload config from disk. Maps to POST /api/config/reload."""
         import api_server
@@ -296,6 +326,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:apply_config")
     def apply_config(self, body=None):
         """Apply config changes. Maps to POST /api/config/apply."""
         import api_server
@@ -424,6 +455,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cancel_all_offers")
     def cancel_all_offers(self, _body=None):
         """Cancel all offers. Maps to POST /api/offers/cancel_all."""
         import api_server
@@ -447,6 +479,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cancel_offer")
     def cancel_offer(self, body=None):
         """Cancel a single offer. Maps to POST /api/offers/cancel."""
         import api_server
@@ -462,6 +495,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cleanup_orphans")
     def cleanup_orphans(self, _body=None):
         """Clean up orphaned offers. Maps to POST /api/offers/cleanup_orphans."""
         import api_server
@@ -498,6 +532,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:purge_fills")
     def purge_fills(self, _body=None):
         """Purge fill history. Maps to POST /api/fills/purge."""
         import api_server
@@ -553,6 +588,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_pnl")
     def reset_pnl(self, body=None):
         """Reset PnL counters. Maps to POST /api/pnl/reset."""
         import api_server
@@ -568,6 +604,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_offer_history")
     def reset_offer_history(self, body=None):
         """Clear terminal offer-history rows. Maps to POST /api/reset/offer-history."""
         import api_server
@@ -583,6 +620,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_full")
     def reset_full(self, body=None):
         """Run the combined data reset. Maps to POST /api/reset/full."""
         import api_server
@@ -602,6 +640,7 @@ class AppBridge:
     # -----------------------------------------------------------------------
 
     @_safe
+    @_mutation_guard("app_bridge:fresh_start")
     def fresh_start(self, body=None):
         """Clear session state. Maps to POST /api/session/fresh-start."""
         import api_server
@@ -639,6 +678,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:trigger_topup")
     def trigger_topup(self, _body=None):
         """Trigger coin topup. Maps to POST /api/coins/topup."""
         import api_server
@@ -662,6 +702,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:trigger_coin_prep")
     def trigger_coin_prep(self, _body=None):
         """Trigger coin prep. Maps to POST /api/coin-prep/trigger."""
         import api_server
@@ -676,6 +717,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_coin_prep")
     def reset_coin_prep(self, _body=None):
         """Reset coin prep state. Maps to POST /api/coin-prep/reset."""
         import api_server
@@ -717,6 +759,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:activate_boost")
     def activate_boost(self, body=None):
         """Activate boost. Maps to POST /api/boost/activate."""
         import api_server
@@ -732,6 +775,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:deactivate_boost")
     def deactivate_boost(self, _body=None):
         """Deactivate boost. Maps to POST /api/boost/deactivate."""
         import api_server
@@ -804,6 +848,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:dismiss_alert")
     def dismiss_alert(self, body=None):
         """Dismiss an alert. Maps to POST /api/alerts/dismiss."""
         import api_server
@@ -837,6 +882,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:clear_logs")
     def clear_logs(self, _body=None):
         """Clear logs. Maps to POST /api/logs/clear."""
         import api_server
@@ -961,6 +1007,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_update_install")
     def start_update_install(self, _body=None):
         """Start secure updater. Maps to POST /api/update/install."""
         import api_server
@@ -1030,6 +1077,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:select_cat")
     def select_cat(self, body=None):
         """Select active CAT. Maps to POST /api/cat/select."""
         import api_server
@@ -1045,6 +1093,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:refresh_cat")
     def refresh_cat(self, _body=None):
         """Refresh CAT data. Maps to POST /api/cat/refresh."""
         import api_server
@@ -1082,6 +1131,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:begin_startup")
     def begin_startup(self, body=None):
         """Begin wallet startup. Maps to POST /api/wallet/begin-startup."""
         import api_server
@@ -1115,6 +1165,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_with_fingerprint")
     def start_with_fingerprint(self, body=None):
         """Start with fingerprint. Maps to POST /api/sage/start-with-fingerprint."""
         import api_server
@@ -1130,6 +1181,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:set_sage_fingerprint")
     def set_sage_fingerprint(self, body=None):
         """Persist and start Sage fingerprint. Maps to POST /api/sage/fingerprint."""
         import api_server
@@ -1183,6 +1235,7 @@ class AppBridge:
             return {"success": False, "error": "File picker unavailable"}
 
     @_safe
+    @_mutation_guard("app_bridge:setup_certs")
     def setup_certs(self, body=None):
         """Setup Sage certificates. Maps to POST /api/sage/setup-certs."""
         import api_server
@@ -1228,6 +1281,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:repost_dexie")
     def repost_dexie(self, _body=None):
         """Repost to Dexie. Maps to POST /api/dexie/repost."""
         import api_server
@@ -1273,6 +1327,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:download_splash_setup")
     def download_splash_setup(self, _body=None):
         """Download Splash binary. Maps to POST /api/splash/setup/download."""
         import api_server
@@ -1296,6 +1351,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_splash_node")
     def start_splash_node(self, _body=None):
         """Start Splash node. Maps to POST /api/splash/node/start."""
         import api_server
@@ -1319,6 +1375,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:set_splash_receive")
     def set_splash_receive(self, body=None):
         """Set Splash receive enabled. Maps to POST /api/splash/receive."""
         import api_server
@@ -1347,6 +1404,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:setup_spacescan")
     def setup_spacescan(self, body=None):
         """Setup Spacescan. Maps to POST /api/spacescan/setup."""
         import api_server

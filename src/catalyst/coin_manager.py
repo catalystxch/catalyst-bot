@@ -28,6 +28,7 @@ import json
 import os
 import hashlib
 import sys
+import uuid
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
@@ -274,6 +275,46 @@ def _coin_prep_worker_environment(base_env: Optional[dict] = None) -> dict:
 
     _log_coin_prep_sage_rpc_context(detected_cert, "auto-detected")
     return env
+
+
+def _issue_coin_prep_worker_delegation(
+    env: dict,
+    *,
+    operation_id: str,
+    worker_id: str,
+    ttl_seconds: int,
+):
+    """Issue one narrow worker authority and place its raw token only in env."""
+
+    if type(env) is not dict:
+        raise TypeError("coin prep worker environment must be an exact dict")
+    import mutation_gate
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        raise mutation_gate.MutationBlocked(
+            "MUTATION_RUNTIME_NOT_INITIALIZED", "coin_prep.launch"
+        )
+    handoff = runtime.issue_worker_delegation(
+        operation_id=operation_id,
+        purpose="coin_prep",
+        worker_id=worker_id,
+        ttl_seconds=ttl_seconds,
+    )
+    env.update(handoff.to_environment())
+    return handoff
+
+
+def _revoke_coin_prep_worker_delegation(handoff):
+    import mutation_gate
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return {"revoked": False, "reason": "parent_runtime_unavailable"}
+    try:
+        return runtime.revoke_worker_delegation(handoff)
+    except Exception:
+        return {"revoked": False, "reason": "delegation_revoke_failed"}
 
 
 class _TopupWalletDegraded(Exception):
@@ -1568,6 +1609,7 @@ class CoinManager:
 
         # Coin prep worker process
         self._prep_process: Optional[subprocess.Popen] = None
+        self._prep_delegation = None
 
         # Lock for thread safety
         self._lock = threading.Lock()
@@ -10506,6 +10548,9 @@ class CoinManager:
                     f"Could not terminate previous coin prep worker (PID {self._prep_process.pid}): {e}",
                 )
             self._prep_process = None
+            if self._prep_delegation is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             with self._lock:
                 self._prep_running = False
 
@@ -10533,6 +10578,9 @@ class CoinManager:
                 return False
             env = _coin_prep_worker_environment()
             cat_wallet_id = _coin_prep_active_cat_wallet_id(env)
+            prep_run_id = str(uuid.uuid4())
+            operation_id = f"coin-prep:{prep_run_id}"
+            worker_id = f"coin-prep-worker:{prep_run_id}"
 
             # Build CLI args to pass correct config to the worker.
             # This ensures the worker uses the ACTUAL bot settings
@@ -10691,6 +10739,7 @@ class CoinManager:
                 )
 
             cmd.extend(["--cat-wallet", str(cat_wallet_id)])
+            cmd.extend(["--run-id", prep_run_id])
 
             # Pass the bot's current weighted mid to the worker so CAT sizing
             # reflects what the bot is actually quoting, not Dexie's last_price
@@ -10717,6 +10766,17 @@ class CoinManager:
                     cmd.extend(["--live-price", str(_live_mid)])
             except Exception:
                 pass
+
+            max_runtime = int(
+                float(getattr(cfg, "COIN_PREP_MAX_RUNTIME_SECS", 600) or 600)
+            )
+            delegation_ttl = max(60, min(3600, max_runtime + 60))
+            self._prep_delegation = _issue_coin_prep_worker_delegation(
+                env,
+                operation_id=operation_id,
+                worker_id=worker_id,
+                ttl_seconds=delegation_ttl,
+            )
 
             self._prep_process = subprocess.Popen(
                 cmd,
@@ -10765,6 +10825,9 @@ class CoinManager:
             return True
 
         except Exception as e:
+            if self._prep_delegation is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             with self._lock:
                 self._prep_running = False
             log_event(
@@ -10827,6 +10890,9 @@ class CoinManager:
             with self._lock:
                 self._prep_running = False
             self._prep_process = None
+            if self._prep_delegation is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             return {"running": False, "exit_code": -1, "killed_for_runtime": True}
 
         poll = self._prep_process.poll()
@@ -10834,6 +10900,9 @@ class CoinManager:
         if poll is not None:
             with self._lock:
                 self._prep_running = False
+            if self._prep_delegation is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
 
             try:
                 stdout_data = (

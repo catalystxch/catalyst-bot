@@ -1642,6 +1642,7 @@ def _api_coin_prep_trigger_locked():
 
         def do_prep():
             prep_succeeded = False
+            delegation = None
             try:
                 # Launch worker without a visible console window.
                 # We rely on the DB/superlog/log file for debugging instead of
@@ -1651,6 +1652,8 @@ def _api_coin_prep_trigger_locked():
                     _coin_prep_active_cat_wallet_id,
                     _coin_prep_worker_command,
                     _coin_prep_worker_environment,
+                    _issue_coin_prep_worker_delegation,
+                    _revoke_coin_prep_worker_delegation,
                 )
 
                 worker_dir = _coin_prep_runtime_dir()
@@ -1973,6 +1976,18 @@ def _api_coin_prep_trigger_locked():
 
                 cmd += ["--cat-wallet", str(cat_wallet_id)]
 
+                operation_id = f"coin-prep:{run_id}"
+                worker_id = f"coin-prep-worker:{run_id}"
+                max_runtime = int(
+                    float(getattr(cfg, "COIN_PREP_MAX_RUNTIME_SECS", 600) or 600)
+                )
+                delegation = _issue_coin_prep_worker_delegation(
+                    env,
+                    operation_id=operation_id,
+                    worker_id=worker_id,
+                    ttl_seconds=max(60, min(3600, max_runtime + 60)),
+                )
+
                 log_path = _coin_prep_output_log_file()
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 log_file = open(log_path, "w", encoding="utf-8")
@@ -2131,6 +2146,11 @@ def _api_coin_prep_trigger_locked():
                         log_file.close()
                 except Exception:
                     pass
+                try:
+                    if delegation is not None:
+                        _revoke_coin_prep_worker_delegation(delegation)
+                except Exception:
+                    pass
                 api_server._coin_prep_state["running"] = False
                 api_server._coin_prep_proc = None  # Clear global ref — worker is done
                 # CRITICAL: Ungate the bot loop so it can resume offer creation
@@ -2167,6 +2187,22 @@ def _api_coin_prep_trigger_locked():
 def api_coin_prep_reset():
     """Reset coin prep state."""
     bot = api_server.bot
+    blueprint_proc = api_server._coin_prep_proc
+    manager = getattr(bot, "coin_manager", None) if bot is not None else None
+    manager_proc = getattr(manager, "_prep_process", None)
+    blueprint_live = blueprint_proc is not None and blueprint_proc.poll() is None
+    manager_live = manager_proc is not None and manager_proc.poll() is None
+    if blueprint_live or manager_live:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "coin_prep_still_running",
+                    "reason": "cancel_coin_prep_before_reset",
+                }
+            ),
+            409,
+        )
     api_server._coin_prep_state["running"] = False
     api_server._coin_prep_state["complete"] = False
     api_server._coin_prep_state["started_at"] = None
@@ -2244,6 +2280,20 @@ def api_coin_prep_cancel():
                     f"Could not kill cm worker PID {pid}: {e}",
                 )
             cm._prep_process = None
+        delegation = getattr(cm, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                log_event(
+                    "warning",
+                    "coin_prep_cancel_delegation_revoke_failed",
+                    "Could not confirm coin-prep worker delegation revocation",
+                )
+            finally:
+                cm._prep_delegation = None
         # Always release the gate flag so /api/coins/prep can run again
         try:
             with cm._lock:

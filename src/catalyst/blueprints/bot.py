@@ -508,7 +508,8 @@ def api_shutdown():
         print("   Shutting down server...", flush=True)
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
-        # 5. Kill the process
+        # 5. Release mutation ownership, then kill the process.
+        api_server.release_mutation_runtime()
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()

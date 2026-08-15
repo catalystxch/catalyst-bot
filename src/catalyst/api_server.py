@@ -29,6 +29,8 @@ import logging
 import threading
 import secrets
 import webbrowser
+import hashlib
+import database
 
 # When run as the entry point (`python api_server.py`), Python loads this file
 # as the `__main__` module — `sys.modules` has no `api_server` key. Any
@@ -93,6 +95,7 @@ from database import (
     get_live_tier_group_counts,
 )
 from tx_fees import get_fee_settings_snapshot
+import mutation_gate
 
 # ---------------------------------------------------------------------------
 # Bundle-aware path resolution.
@@ -185,6 +188,84 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
     "/api/log",  # GUI flushes buffered log entries in bursts
 }
+
+# Every state-changing HTTP verb is classified explicitly. Only the first
+# group may initiate wallet/signing effects; safety/diagnostic and stop/abort
+# controls remain usable while another process owns the mutation lease.
+_MUTATING_API_ENDPOINTS = {
+    "api_update_install",
+    "api_update_relaunch_intent",
+    "boost.api_boost_activate",
+    "boost.api_boost_deactivate",
+    "bot.api_bot_start",
+    "cat.api_cat_refresh",
+    "cat.api_cat_select",
+    "cat.api_deposit_advisory_allocate",
+    "coin_prep.api_coin_prep",
+    "coin_prep.api_coin_prep_reset",
+    "coin_prep.api_coin_prep_trigger",
+    "coin_prep.api_coin_topup",
+    "coin_prep.api_db_backup",
+    "coin_prep.api_log_event",
+    "coin_prep.api_logs_clear",
+    "config_bp.api_config_apply",
+    "config_bp.api_config_live",
+    "config_bp.api_config_reload",
+    "config_bp.api_config_update",
+    "market.api_dbx_claim",
+    "market.api_debug_sage_single_offer_test",
+    "market.api_dexie_repost",
+    "offers.api_cancel_all",
+    "offers.api_cancel_offer",
+    "offers.api_cleanup_orphans",
+    "offers.api_pnl_reset",
+    "offers.api_purge_fills",
+    "offers.api_reset_full",
+    "offers.api_reset_offer_history",
+    "sage.api_chia_start_with_fingerprint",
+    "sage.api_sage_daemon_start",
+    "sage.api_sage_set_fingerprint",
+    "sage.api_sage_setup_certs",
+    "sage.api_wallet_begin_startup",
+    "sage.api_wallet_retry_sage_connect",
+    "session.api_session_fresh_start",
+    "session.api_session_resume_chosen",
+    "spacescan.api_spacescan_setup",
+    "splash.api_splash_incoming",
+    "splash.api_splash_node_start",
+    "splash.api_splash_receive",
+    "splash.api_splash_setup_download",
+    "superlog.api_superlog_level",
+    "system.api_wallets_switch",
+    "watchdog.api_watchdog_cancel_mismatched_offers",
+    "watchdog.api_dismiss_alert",
+}
+
+_READ_ONLY_WRITE_API_ENDPOINTS = {
+    "cat.api_balances_refresh",
+    "config_bp.api_settings_validate",
+}
+
+_CONTROL_WRITE_API_ENDPOINTS = {
+    "api_open_data_folder",
+    "api_open_external",
+    "bot.api_bot_stop",
+    "bot.api_shutdown",
+    "coin_prep.api_coin_prep_cancel",
+    "system.api_console_toggle",
+    "watchdog.api_watchdog_shape_fix_abort",
+}
+
+_read_only_diagnostics_active = False
+
+
+def _write_endpoint_requires_mutation(endpoint: str) -> bool:
+    """Default every unrecognized write endpoint to mutation-protected."""
+
+    return endpoint not in (
+        _READ_ONLY_WRITE_API_ENDPOINTS | _CONTROL_WRITE_API_ENDPOINTS
+    )
+
 
 # Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
 # webhook flood cannot amplify into runaway DB writes.
@@ -1087,6 +1168,124 @@ app.config["_CATALYST_API_SERVER_MODULE"] = sys.modules[__name__]
 
 # The bot loop instance (created at startup)
 bot: BotLoop = None
+_mutation_runtime = None
+_mutation_runtime_db_path = None
+_mutation_runtime_init_lock = threading.RLock()
+
+
+def _configured_mutation_binding() -> tuple[str, str]:
+    """Return a deterministic config-only binding without wallet RPC."""
+
+    raw_fingerprint = str(
+        getattr(cfg, "SAGE_FINGERPRINT", "")
+        or getattr(cfg, "WALLET_FINGERPRINT", "")
+        or "unconfigured"
+    ).strip()
+    fingerprint_hash = hashlib.sha256(
+        f"fingerprint:{raw_fingerprint}".encode("utf-8")
+    ).hexdigest()
+    network = str(
+        os.environ.get("CATALYST_NETWORK_ID")
+        or os.environ.get("CHIA_NETWORK")
+        or "mainnet"
+    ).strip()
+    if not network or len(network) > 64:
+        network = "mainnet"
+    return fingerprint_hash, network
+
+
+def _mutation_stop_handler(reason_code: str) -> None:
+    """Stop a running bot immediately after the mutation lease fails."""
+
+    current_bot = bot
+    if current_bot is None:
+        return
+    try:
+        if current_bot.is_running():
+            try:
+                current_bot.stop(wait=False)
+            except TypeError:
+                current_bot.stop()
+        slog(
+            "SAFETY",
+            "Bot switched to read-only after mutation safety stop",
+            {"reason_code": str(reason_code or "MUTATION_GATE_SAFETY_STOP")},
+            level="critical",
+        )
+    except Exception:
+        slog(
+            "SAFETY",
+            "Could not confirm bot stop after mutation safety event",
+            {"reason_code": "MUTATION_GATE_SAFETY_STOP"},
+            level="critical",
+        )
+
+
+def initialize_mutation_runtime(
+    *, start_heartbeat: bool = True, acquire_lease: bool = True
+) -> dict:
+    """Acquire mutation ownership without contacting the configured wallet."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    with _mutation_runtime_init_lock:
+        wallet_hash, network = _configured_mutation_binding()
+        _mutation_runtime = mutation_gate.initialize(
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            start_heartbeat=start_heartbeat,
+            acquire_lease=acquire_lease,
+        )
+        _mutation_runtime_db_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        _mutation_runtime.register_stop_handler(_mutation_stop_handler)
+        result = _mutation_runtime.status().to_dict()
+    slog(
+        "SAFETY",
+        "Mutation runtime initialized",
+        {
+            "allowed": result["allowed"],
+            "reason_code": result["reason_code"],
+            "lease_owner_pid": result["lease"]["owner_pid"],
+        },
+        level="info" if result["allowed"] else "warning",
+    )
+    return result
+
+
+def _ensure_mutation_runtime() -> None:
+    global _mutation_runtime, _mutation_runtime_db_path
+    with _mutation_runtime_init_lock:
+        current_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        if (
+            mutation_gate.current_runtime() is not None
+            and _mutation_runtime_db_path == current_path
+        ):
+            return
+        try:
+            if mutation_gate.current_runtime() is not None:
+                mutation_gate.shutdown_runtime()
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+            init_database()
+            initialize_mutation_runtime()
+        except Exception:
+            # The request guard below still fails closed with the stable
+            # MUTATION_RUNTIME_NOT_INITIALIZED result.
+            slog(
+                "SAFETY",
+                "Mutation runtime initialization failed",
+                {"reason_code": "DURABLE_STATE_UNAVAILABLE"},
+                level="error",
+            )
+
+
+def release_mutation_runtime() -> dict:
+    global _mutation_runtime, _mutation_runtime_db_path
+    with _mutation_runtime_init_lock:
+        result = mutation_gate.shutdown_runtime()
+        _mutation_runtime = None
+        _mutation_runtime_db_path = None
+        return result
+
 
 # Active CAT selection — updated when user picks a CAT from the dropdown.
 # Stores wallet_id, asset_id, name, decimals so /api/status can fetch
@@ -1557,6 +1756,11 @@ def _get_live_mid_price_str() -> Optional[str]:
 def create_bot() -> BotLoop:
     """Create and return the bot loop instance."""
     global bot
+    # Database initialization is completed by both desktop and Flask entry
+    # points before this function. Acquire the lease before constructing any
+    # background component that could eventually reach a wallet mutation.
+    if mutation_gate.current_runtime() is None:
+        initialize_mutation_runtime()
     bot = BotLoop()
     # Wire up event bus to bot loop for push updates
     bot._event_bus = events
@@ -1575,6 +1779,11 @@ def create_bot() -> BotLoop:
         print(f"  [SHAPE-FIX] ⚠️  Could not init orchestrator: {_sf_err}", flush=True)
         bot.shape_fix_orchestrator = None
     bot.runtime_monitor.start()
+    # A latch may have tripped before the bot existed. Late registration
+    # immediately observes it and stops the new loop before it can trade.
+    runtime = mutation_gate.current_runtime()
+    if runtime is not None:
+        runtime.register_stop_handler(_mutation_stop_handler)
     return bot
 
 
@@ -1629,6 +1838,19 @@ def enforce_local_runtime_guard():
     if path.startswith("/api/debug/"):
         return jsonify({"error": "debug_routes_disabled"}), 404
 
+    if (
+        _read_only_diagnostics_active
+        and path.startswith("/api/")
+        and path != "/api/safety/status"
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "error": "diagnostics_read_only",
+                "reason": "DIAGNOSTICS_READ_ONLY",
+            }
+        ), 423
+
     protected_pages = {"/", "/console", "/api/events"}
     if path.startswith("/api/") or path in protected_pages:
         if not _is_loopback_addr(request.remote_addr):
@@ -1660,11 +1882,44 @@ def enforce_local_runtime_guard():
                 {"error": "rate_limited", "message": "Too many requests"}
             ), 429
 
+        endpoint = request.endpoint or ""
+        requires_mutation = bool(
+            {"POST", "PUT", "PATCH", "DELETE"}.intersection({request.method})
+        ) and _write_endpoint_requires_mutation(endpoint)
+        if endpoint == "bot.api_shutdown":
+            try:
+                requires_mutation = bool(
+                    (request.get_json(silent=True) or {}).get("cancel_offers", False)
+                )
+            except Exception:
+                requires_mutation = False
+        if requires_mutation:
+            _ensure_mutation_runtime()
+            operation = f"api:{endpoint}"
+            try:
+                mutation_gate.require_allowed(operation)
+            except mutation_gate.MutationBlocked as exc:
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": exc.reason_code,
+                        "operation": operation,
+                    }
+                ), 423
+
 
 @app.route("/")
 def serve_gui():
     """Serve the bot GUI HTML file."""
     return _serve_bootstrapped_html("bot_gui.html")
+
+
+@app.route("/api/safety/status")
+def api_safety_status():
+    """Return bounded, non-secret latch and lease diagnostics."""
+
+    return jsonify({"success": True, "safety": mutation_gate.status().to_dict()})
 
 
 @app.route("/console")
@@ -3232,6 +3487,7 @@ def _graceful_shutdown(signum, _frame):
     except Exception as e:
         print(f"   ⚠️ Could not stop Chia: {e}", flush=True)
 
+    release_mutation_runtime()
     print("   Goodbye!", flush=True)
     sys.exit(0)
 
@@ -3443,6 +3699,31 @@ app.register_blueprint(_smart_defaults_bp)
 app.register_blueprint(_bot_bp)
 
 
+def _validate_write_route_classification() -> None:
+    classified = (
+        _MUTATING_API_ENDPOINTS
+        | _READ_ONLY_WRITE_API_ENDPOINTS
+        | _CONTROL_WRITE_API_ENDPOINTS
+    )
+    write_endpoints = {
+        rule.endpoint
+        for rule in app.url_map.iter_rules()
+        if {"POST", "PUT", "PATCH", "DELETE"}.intersection(rule.methods)
+    }
+    overlaps = (
+        (_MUTATING_API_ENDPOINTS & _READ_ONLY_WRITE_API_ENDPOINTS)
+        | (_MUTATING_API_ENDPOINTS & _CONTROL_WRITE_API_ENDPOINTS)
+        | (_READ_ONLY_WRITE_API_ENDPOINTS & _CONTROL_WRITE_API_ENDPOINTS)
+    )
+    if overlaps or classified != write_endpoints:
+        raise RuntimeError(
+            "API write-route mutation classification is incomplete or ambiguous"
+        )
+
+
+_validate_write_route_classification()
+
+
 # Re-export helpers that moved into blueprint modules so tests doing
 # `patch.object(api_server, "_xxx", ...)` keep working unchanged.
 from blueprints.market import _fetch_dbx_pair_status  # noqa: E402
@@ -3454,15 +3735,82 @@ from blueprints.smart_defaults import (  # noqa: E402
 from blueprints.offers import _build_fill_history_for_gui  # noqa: E402
 
 
+def _configured_flask_port() -> int:
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        return 5000
+    return port if 1 <= port <= 65535 else 5000
+
+
+def _loopback_port_is_available(port: int) -> bool:
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _select_standalone_server_mode(preferred_port: int) -> tuple[int, bool]:
+    """Choose the normal port or an alternate read-only diagnostic port."""
+
+    preferred = int(preferred_port)
+    if _loopback_port_is_available(preferred):
+        return preferred, False
+    for candidate in range(preferred + 1, min(65536, preferred + 51)):
+        if _loopback_port_is_available(candidate):
+            return candidate, True
+    raise RuntimeError("no loopback diagnostics port is available")
+
+
+def _read_only_diagnostics_shutdown(_signum, _frame) -> None:
+    """Exit a non-owner diagnostics process without touching shared services."""
+
+    mutation_gate.shutdown_runtime()
+    raise SystemExit(0)
+
+
+def _serve_read_only_diagnostics(port: int) -> None:
+    """Serve a fail-closed view using only the existing database in read-only mode."""
+
+    global _read_only_diagnostics_active
+    previous_mode = _read_only_diagnostics_active
+    _read_only_diagnostics_active = True
+    try:
+        initialize_mutation_runtime(start_heartbeat=False, acquire_lease=False)
+        slog(
+            "SAFETY",
+            "Read-only diagnostics server starting",
+            {"port": int(port), "reason_code": "DIAGNOSTICS_READ_ONLY"},
+            level="warning",
+        )
+        app.run(
+            host="127.0.0.1",
+            port=int(port),
+            debug=False,
+            threaded=True,
+            use_reloader=False,
+        )
+    finally:
+        _read_only_diagnostics_active = previous_mode
+        release_mutation_runtime()
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  CATalyst V2 - The Smart One")
     print("=" * 60)
 
-    # --- Check for stale instance already running on port 5000 ---
+    # Confirm the selected normal/diagnostic port is not unexpectedly occupied.
     import socket as _socket
 
-    _port = 5000
+    _requested_port = _configured_flask_port()
+    _port, _diagnostics_only = _select_standalone_server_mode(_requested_port)
     _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
         _sock.settimeout(1)
@@ -3483,14 +3831,21 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # Register signal handlers for clean shutdown
-    signal.signal(signal.SIGINT, _graceful_shutdown)  # Ctrl+C
-    signal.signal(signal.SIGTERM, _graceful_shutdown)  # kill / task manager
+    # A non-owner diagnostic process must never stop shared wallet services.
+    _shutdown_handler = (
+        _read_only_diagnostics_shutdown if _diagnostics_only else _graceful_shutdown
+    )
+    signal.signal(signal.SIGINT, _shutdown_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, _shutdown_handler)  # kill / task manager
     # SIGBREAK is Windows-only (terminal close / Ctrl+Break)
     if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _graceful_shutdown)
+        signal.signal(signal.SIGBREAK, _shutdown_handler)
 
-    # Initialise
+    if _diagnostics_only:
+        _serve_read_only_diagnostics(_port)
+        sys.exit(0)
+
+    # Only the lease-seeking owner is allowed to initialize or migrate SQLite.
     init_database()
 
     # One-shot migration: mark all currently-designated reserve coins as
@@ -3582,11 +3937,6 @@ if __name__ == "__main__":
     # It is triggered explicitly by the GUI after the user accepts the risk
     # disclosure, via POST /api/wallet/begin-startup.  This ensures no wallet
     # RPC calls are made before the user has acknowledged the disclaimer.
-
-    try:
-        _port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
-    except (TypeError, ValueError):
-        _port = 5000
 
     log_event("info", "server_started", f"API server starting on port {_port}")
 

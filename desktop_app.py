@@ -1088,6 +1088,23 @@ def run_flask_mode():
     start_flask_server()
 
 
+def _find_available_diagnostics_port(preferred: int) -> int:
+    """Return a nearby loopback port for a non-owning diagnostic server."""
+
+    for candidate in range(max(1, int(preferred) + 1), min(65535, int(preferred) + 51)):
+        if check_port_free(candidate):
+            return candidate
+    raise RuntimeError("no loopback diagnostics port is available")
+
+
+def run_read_only_diagnostics_mode(port: int) -> None:
+    """Serve diagnostics without constructing the bot or acquiring a lease."""
+
+    import api_server
+
+    api_server._serve_read_only_diagnostics(int(port))
+
+
 # ---------------------------------------------------------------------------
 # Internal state & helpers
 # ---------------------------------------------------------------------------
@@ -1197,6 +1214,13 @@ def _cleanup():
         if api_server.bot and api_server.bot._running:
             print("  Stopping bot...")
             api_server.bot.stop()
+    except Exception:
+        pass
+
+    try:
+        import api_server
+
+        api_server.release_mutation_runtime()
     except Exception:
         pass
 
@@ -1412,6 +1436,8 @@ def main(argv=None):
     # wallet coins → MEMPOOL_CONFLICT cascade in Sage.
     if not _acquire_instance_lock():
         _open_existing_instance_in_browser()
+        diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
+        run_read_only_diagnostics_mode(diagnostics_port)
         return 0
 
     # Kill-on-close Job Object: ensures default child processes (coin-prep

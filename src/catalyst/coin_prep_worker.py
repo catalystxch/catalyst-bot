@@ -36,6 +36,8 @@ from enum import Enum
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from win_subprocess import hidden_subprocess_kwargs
+import mutation_gate
+from super_log import slog
 
 from wallet import (
     get_all_offers,
@@ -72,6 +74,17 @@ load_dotenv()
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN", "").strip()
 _API_LOG_POST_TIMEOUT_S = 0.15
 _API_LOG_QUEUE_MAX = 400
+_WORKER_DELEGATION_ENV_NAMES = (
+    mutation_gate.DELEGATION_ID_ENV,
+    mutation_gate.DELEGATION_TOKEN_ENV,
+    mutation_gate.DELEGATION_PARENT_RUN_ENV,
+    mutation_gate.DELEGATION_OPERATION_ENV,
+    mutation_gate.DELEGATION_PURPOSE_ENV,
+    mutation_gate.DELEGATION_WORKER_ENV,
+    mutation_gate.DELEGATION_WALLET_ENV,
+    mutation_gate.DELEGATION_NETWORK_ENV,
+)
+_worker_delegation_environment = None
 
 
 def _local_api_headers() -> dict:
@@ -79,6 +92,90 @@ def _local_api_headers() -> dict:
     if _LOCAL_API_TOKEN:
         headers["X-Bot-Local-Token"] = _LOCAL_API_TOKEN
     return headers
+
+
+def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
+    """Validate the exact parent/run scope before constructing the worker."""
+
+    global _worker_delegation_environment
+    try:
+        smoke = getattr(args, "sage_rpc_smoke", False)
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    if type(smoke) is not bool:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        )
+    if smoke:
+        return {"allowed": True, "reason": "read_only_smoke"}
+    env = os.environ if environment is None else environment
+    try:
+        run_id = getattr(args, "run_id", None)
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    if type(run_id) is not str or not run_id.strip() or len(run_id.strip()) > 128:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        )
+    safe_run_id = run_id.strip()
+    try:
+        handoff_environment = {
+            key: env.get(key) for key in _WORKER_DELEGATION_ENV_NAMES
+        }
+        expected = {
+            mutation_gate.DELEGATION_OPERATION_ENV: f"coin-prep:{safe_run_id}",
+            mutation_gate.DELEGATION_PURPOSE_ENV: "coin_prep",
+            mutation_gate.DELEGATION_WORKER_ENV: f"coin-prep-worker:{safe_run_id}",
+        }
+        if any(
+            type(handoff_environment[key]) is not str
+            or handoff_environment[key] != value
+            for key, value in expected.items()
+        ):
+            raise mutation_gate.MutationBlocked(
+                "WORKER_DELEGATION_INVALID", "coin_prep.start"
+            )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    result = mutation_gate.require_worker_allowed_from_environment(
+        "coin_prep.start", handoff_environment
+    )
+    if environment is None:
+        _worker_delegation_environment = dict(handoff_environment)
+        for key in _WORKER_DELEGATION_ENV_NAMES:
+            os.environ.pop(key, None)
+    return result
+
+
+def _worker_authority_environment(environment=None):
+    if environment is not None:
+        return environment
+    if _worker_delegation_environment is not None:
+        return _worker_delegation_environment
+    return os.environ
+
+
+def _guarded_wallet_mutation(
+    operation: str,
+    callback,
+    *args,
+    environment=None,
+    **kwargs,
+):
+    """Run a wallet callback only after a fresh delegated-authority read."""
+
+    mutation_gate.require_worker_allowed_from_environment(
+        operation, _worker_authority_environment(environment)
+    )
+    return callback(*args, **kwargs)
 
 
 def _env_int(name: str, default: int, *fallback_names: str) -> int:
@@ -735,6 +832,17 @@ class CoinPrepWorker:
         )
         self.log("   ⚡ Parallel optimization enabled!")
 
+    def _call_wallet_mutation(self, operation: str, callback, *args, **kwargs):
+        if not getattr(self, "_is_subprocess", False):
+            return callback(*args, **kwargs)
+        return _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+
+    def _require_cli_mutation(self, operation: str) -> None:
+        if getattr(self, "_is_subprocess", False):
+            mutation_gate.require_worker_allowed_from_environment(
+                operation, _worker_authority_environment()
+            )
+
     def _format_cat_amount(self, amount) -> str:
         return format_cat_display_amount(amount, self.cat_decimals)
 
@@ -1381,7 +1489,12 @@ class CoinPrepWorker:
         self.log(
             f"XCH fee cleanup: merging {len(extra_ids)} extra coin(s) ({extra_total:,} mojos) back into reserve"
         )
-        result = combine_coins([reserve_id] + extra_ids, fee_mojos=self._tx_fee_mojos())
+        result = self._call_wallet_mutation(
+            "coin_prep.combine_fee_reserve",
+            combine_coins,
+            [reserve_id] + extra_ids,
+            fee_mojos=self._tx_fee_mojos(),
+        )
         if not self._sage_submit_succeeded(result):
             self.log("XCH fee cleanup combine was not accepted by Sage")
             return False
@@ -2524,7 +2637,12 @@ class CoinPrepWorker:
                 f"Bulk cancelling {cancel_count} offers...",
             )
 
-            results = cancel_offers_batch(trade_ids, secure=True)
+            results = self._call_wallet_mutation(
+                "coin_prep.cancel_offers",
+                cancel_offers_batch,
+                trade_ids,
+                secure=True,
+            )
 
             # Count successes and failures from the batch result
             pending_methods = {
@@ -2573,7 +2691,13 @@ class CoinPrepWorker:
                     still_failing = []
                     for tid in failed_ids:
                         try:
-                            res = rpc_cancel_offer(tid, secure=True, timeout=120)
+                            res = self._call_wallet_mutation(
+                                "coin_prep.cancel_offer_retry",
+                                rpc_cancel_offer,
+                                tid,
+                                secure=True,
+                                timeout=120,
+                            )
                             if res and res.get("success"):
                                 cancelled += 1
                                 self.log(f"   Retry OK: {tid[:16]}...")
@@ -2670,7 +2794,12 @@ class CoinPrepWorker:
                         f"\nRound {round_num} timed out with {len(still_open)} stragglers — re-submitting cancels..."
                     )
                     try:
-                        re_results = cancel_offers_batch(still_open, secure=True)
+                        re_results = self._call_wallet_mutation(
+                            "coin_prep.cancel_offers_retry",
+                            cancel_offers_batch,
+                            still_open,
+                            secure=True,
+                        )
                         re_ok = sum(
                             1
                             for tid in still_open
@@ -2686,7 +2815,13 @@ class CoinPrepWorker:
                             _ok = 0
                             for _tid in still_open:
                                 try:
-                                    _r = rpc_cancel_offer(_tid, secure=True, timeout=60)
+                                    _r = self._call_wallet_mutation(
+                                        "coin_prep.cancel_offer_retry",
+                                        rpc_cancel_offer,
+                                        _tid,
+                                        secure=True,
+                                        timeout=60,
+                                    )
                                     if _r and _r.get("success"):
                                         _ok += 1
                                 except Exception:
@@ -2779,6 +2914,7 @@ class CoinPrepWorker:
         self.log("Submitting consolidation transaction...")
 
         try:
+            self._require_cli_mutation("coin_prep.cli_consolidate")
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -2983,7 +3119,12 @@ class CoinPrepWorker:
                         f"Combining {name} batch {index}/{len(batches)} "
                         f"({len(batch)} coins, fee={combine_fee:,} mojos)..."
                     )
-                    result = combine_coins(coin_ids=batch, fee_mojos=combine_fee)
+                    result = self._call_wallet_mutation(
+                        "coin_prep.combine_batch",
+                        combine_coins,
+                        coin_ids=batch,
+                        fee_mojos=combine_fee,
+                    )
                     if not self._sage_submit_succeeded(result):
                         self.log(
                             "ERROR: /combine batch was not accepted; falling back to send-to-self"
@@ -3003,7 +3144,12 @@ class CoinPrepWorker:
                 f"Combining {len(coin_ids)} {name} coins via /combine "
                 f"(fee={combine_fee:,} mojos)..."
             )
-            result = combine_coins(coin_ids=coin_ids, fee_mojos=combine_fee)
+            result = self._call_wallet_mutation(
+                "coin_prep.combine",
+                combine_coins,
+                coin_ids=coin_ids,
+                fee_mojos=combine_fee,
+            )
 
             if self._sage_submit_succeeded(result):
                 self.log(f"✅ {name} /combine submitted (was {len(coin_ids)} coins)")
@@ -3233,7 +3379,12 @@ class CoinPrepWorker:
             self.log(
                 f"Forcing Sage resync for {name} after stale consolidation view..."
             )
-            if not sage_login(int(fingerprint), force_resync=True):
+            if not self._call_wallet_mutation(
+                "coin_prep.sage_resync",
+                sage_login,
+                int(fingerprint),
+                force_resync=True,
+            ):
                 self.log(f"Sage resync failed for {name}")
                 return False
 
@@ -3391,7 +3542,9 @@ class CoinPrepWorker:
                         f"fee={fee_mojos:,}); waiting for wallet to reach <= "
                         f"{target_count} coins before the next batch..."
                     )
-                    result = send_transaction(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.consolidate_staged_batch",
+                        send_transaction,
                         wallet_id=wallet_id,
                         amount_mojos=int(send_amount),
                         address=address,
@@ -3444,7 +3597,9 @@ class CoinPrepWorker:
                     f"({before_count} input coins, amount={send_amount:,} mojos, "
                     f"fee={fee_mojos:,})..."
                 )
-                result = send_transaction(
+                result = self._call_wallet_mutation(
+                    "coin_prep.consolidate_final_batch",
+                    send_transaction,
                     wallet_id=wallet_id,
                     amount_mojos=int(send_amount),
                     address=address,
@@ -3478,7 +3633,9 @@ class CoinPrepWorker:
                 f"({before_count} input coins, amount={send_amount:,} mojos, "
                 f"fee={fee_mojos:,})..."
             )
-            result = send_transaction(
+            result = self._call_wallet_mutation(
+                "coin_prep.consolidate_balance",
+                send_transaction,
                 wallet_id=wallet_id,
                 amount_mojos=int(send_amount),
                 address=address,
@@ -3549,6 +3706,7 @@ class CoinPrepWorker:
         self.log("Submitting pool creation transaction...")
 
         try:
+            self._require_cli_mutation("coin_prep.cli_create_pool")
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -3596,8 +3754,13 @@ class CoinPrepWorker:
             self.log(
                 f"Submitting pool creation transaction ({amount} {name} = {mojos} mojos)..."
             )
-            result = send_transaction(
-                wallet_id, mojos, address, fee_mojos=self._tx_fee_mojos()
+            result = self._call_wallet_mutation(
+                "coin_prep.create_pool",
+                send_transaction,
+                wallet_id,
+                mojos,
+                address,
+                fee_mojos=self._tx_fee_mojos(),
             )
 
             if self._sage_submit_succeeded(result):
@@ -3971,7 +4134,9 @@ class CoinPrepWorker:
             send_ok = False
             for attempt in range(3):
                 try:
-                    result = send_transaction(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.create_tier_pool",
+                        send_transaction,
                         wallet_id=wallet_id,
                         amount_mojos=pool_mojos,
                         address=address,
@@ -4100,7 +4265,9 @@ class CoinPrepWorker:
             split_ok = False
             for attempt in range(3):
                 try:
-                    result = split_coins_rpc(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.split_tier_pool",
+                        split_coins_rpc,
                         wallet_id=wallet_id,
                         target_coin_id=coin_id,
                         num_coins=count,
@@ -4375,12 +4542,18 @@ class CoinPrepWorker:
             for attempt in range(3):
                 try:
                     if is_cat:
-                        result = send_cat_multi(
-                            payments, fee_mojos=self._tx_fee_mojos()
+                        result = self._call_wallet_mutation(
+                            "coin_prep.create_cat_tier_pools",
+                            send_cat_multi,
+                            payments,
+                            fee_mojos=self._tx_fee_mojos(),
                         )
                     else:
-                        result = send_transaction_multi(
-                            payments, fee_mojos=self._tx_fee_mojos()
+                        result = self._call_wallet_mutation(
+                            "coin_prep.create_xch_tier_pools",
+                            send_transaction_multi,
+                            payments,
+                            fee_mojos=self._tx_fee_mojos(),
                         )
                     if result is None:
                         self.log(
@@ -4701,7 +4874,9 @@ class CoinPrepWorker:
                 try:
                     if is_cat:
                         amount_per_coin = pool_mojos // count
-                        result = sage_topup_split(
+                        result = self._call_wallet_mutation(
+                            "coin_prep.split_cat_pool",
+                            sage_topup_split,
                             source_coin_id=coin_id,
                             num_coins=count,
                             trading_size_mojos=amount_per_coin,
@@ -4711,7 +4886,9 @@ class CoinPrepWorker:
                             fee_coin_id=fee_coin_id,
                         )
                     else:
-                        result = split_coins_rpc(
+                        result = self._call_wallet_mutation(
+                            "coin_prep.split_xch_pool",
+                            split_coins_rpc,
                             wallet_id=wallet_id,
                             target_coin_id=coin_id,
                             num_coins=count,
@@ -4812,7 +4989,12 @@ class CoinPrepWorker:
                 for _ in range(needed_count)
             ]
             try:
-                result = send_transaction_multi(payments, fee_mojos=cat_fee_mojos)
+                result = self._call_wallet_mutation(
+                    "coin_prep.create_cat_fee_inputs",
+                    send_transaction_multi,
+                    payments,
+                    fee_mojos=cat_fee_mojos,
+                )
             except Exception as e:
                 self.log(f"   Dedicated CAT fee-input multi_send exception: {e}")
                 return []
@@ -5310,7 +5492,9 @@ class CoinPrepWorker:
                                     )
                                     continue
                             if ic:
-                                result = sage_topup_split(
+                                result = self._call_wallet_mutation(
+                                    "coin_prep.retry_cat_split",
+                                    sage_topup_split,
                                     source_coin_id=split_state["pool_coin_id"],
                                     num_coins=cnt,
                                     trading_size_mojos=pm // cnt,
@@ -5319,7 +5503,9 @@ class CoinPrepWorker:
                                     is_cat=True,
                                 )
                             else:
-                                result = split_coins_rpc(
+                                result = self._call_wallet_mutation(
+                                    "coin_prep.retry_xch_split",
+                                    split_coins_rpc,
                                     wallet_id=wid,
                                     target_coin_id=split_state["pool_coin_id"],
                                     num_coins=cnt,
@@ -6707,7 +6893,9 @@ class CoinPrepWorker:
                 self.log(
                     f"   🔄 Sage RPC split: {num_coins} coins of {coin_size} from {bare_coin_id[:16]}..."
                 )
-                result = sage_split(
+                result = self._call_wallet_mutation(
+                    "coin_prep.split_single_sage",
+                    sage_split,
                     wallet_id=wallet_id,
                     target_coin_id=bare_coin_id,
                     num_coins=num_coins,
@@ -6751,6 +6939,7 @@ class CoinPrepWorker:
             )
 
             try:
+                self._require_cli_mutation("coin_prep.cli_split")
                 process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -8716,6 +8905,17 @@ def main():
 
     if args.sage_rpc_smoke:
         sys.exit(_run_sage_rpc_smoke())
+
+    try:
+        _validate_coin_prep_worker_delegation(args)
+    except mutation_gate.MutationBlocked as exc:
+        slog(
+            "SAFETY",
+            "Coin prep worker blocked before wallet access",
+            {"reason_code": exc.reason_code},
+            level="critical",
+        )
+        sys.exit(2)
 
     # Only set env vars when a value was EXPLICITLY passed on command line.
     # Without this guard, stale .env defaults would override the smart
