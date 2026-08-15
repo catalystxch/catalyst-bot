@@ -7,6 +7,7 @@ then use a narrow database function to persist an authorized result.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -92,7 +93,7 @@ _ACTIVE_SLOT_STATES = frozenset(
 
 
 def _required_text(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"{label} is required")
     return value.strip()
 
@@ -117,7 +118,7 @@ def _optional_hex_identity(value: Any, label: str) -> Optional[str]:
 def _atomic_amount(value: Any, label: str) -> str:
     if type(value) is int:
         text = str(value)
-    elif isinstance(value, str):
+    elif type(value) is str:
         text = value
     else:
         raise ValueError(f"{label} must be a positive atomic integer")
@@ -339,6 +340,12 @@ class OfferEvidence:
             self.terminal_outcome, TerminalOutcome
         ):
             raise ValueError("terminal_outcome must be a TerminalOutcome")
+        if (self.observed_state == RegistryState.TERMINAL) != (
+            self.terminal_outcome is not None
+        ):
+            raise ValueError(
+                "terminal_outcome must exactly match a terminal observed state"
+            )
         if not isinstance(self.source, EvidenceSource):
             raise ValueError("source must be an EvidenceSource")
         object.__setattr__(
@@ -393,6 +400,17 @@ class OfferEvidence:
             or type(self.input_coins_owned_unlocked) is not bool
         ):
             raise ValueError("evidence flags must be booleans")
+        if (self.source == EvidenceSource.FULL_WALLET_HISTORY) != self.full_history:
+            raise ValueError(
+                "full_history must exactly match a full-wallet-history source"
+            )
+        if self.input_coins_owned_unlocked and self.source not in {
+            EvidenceSource.AUTHORITATIVE_WALLET,
+            EvidenceSource.FULL_WALLET_HISTORY,
+        }:
+            raise ValueError(
+                "owned-unlocked input proof requires an authoritative wallet source"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +420,17 @@ class AuthorizationDecision:
     reason: str
     record: Optional[OfferRecord] = None
     idempotent: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.allowed) is not bool or type(self.idempotent) is not bool:
+            raise ValueError("authorization flags must be booleans")
+        if not isinstance(self.code, AuthorizationCode):
+            raise ValueError("code must be an AuthorizationCode")
+        object.__setattr__(self, "reason", _required_text(self.reason, "reason"))
+        if self.record is not None and not isinstance(self.record, OfferRecord):
+            raise ValueError("record must be an OfferRecord")
+        if self.idempotent and not self.allowed:
+            raise ValueError("an idempotent authorization must be allowed")
 
 
 _PERSISTED_STATE_ALIASES = {
@@ -418,7 +447,7 @@ def offer_record_from_row(
     if not isinstance(row, Mapping):
         raise ValueError("offer intent row must be a mapping")
     coin_json = row.get("selected_coin_ids_json")
-    if not isinstance(coin_json, str):
+    if type(coin_json) is not str:
         raise ValueError("selected_coin_ids_json must be canonical JSON text")
     try:
         coin_ids = json.loads(coin_json)
@@ -426,8 +455,34 @@ def offer_record_from_row(
         raise ValueError("selected_coin_ids_json must contain valid JSON") from exc
     if not isinstance(coin_ids, list):
         raise ValueError("selected_coin_ids_json must contain a JSON array")
+    try:
+        validated_coin_ids = tuple(
+            _hex_identity(coin_id, "selected_coin_ids_json coin id")
+            for coin_id in coin_ids
+        )
+    except ValueError as exc:
+        raise ValueError("selected_coin_ids_json contains an invalid coin id") from exc
+    if validated_coin_ids != tuple(sorted(set(validated_coin_ids))):
+        raise ValueError(
+            "selected_coin_ids_json must be sorted and contain no duplicates"
+        )
+    canonical_coin_json = json.dumps(
+        list(validated_coin_ids),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if coin_json != canonical_coin_json:
+        raise ValueError("selected_coin_ids_json is not canonical compact JSON")
+    expected_coin_digest = hashlib.sha256(coin_json.encode("utf-8")).hexdigest()
+    coin_digest = row.get("selected_coin_ids_sha256")
+    if type(coin_digest) is not str or coin_digest != expected_coin_digest:
+        raise ValueError(
+            "selected_coin_ids_sha256 does not match selected_coin_ids_json"
+        )
     raw_state = row.get("lifecycle_state")
-    if not isinstance(raw_state, str):
+    if type(raw_state) is not str:
         raise ValueError("lifecycle_state is required")
     normalized_state = raw_state.strip().lower()
     try:
@@ -451,7 +506,7 @@ def offer_record_from_row(
         child_intent_id=row.get("child_intent_id"),
         offered_amount_atomic=row.get("offered_amount_atomic"),
         requested_amount_atomic=row.get("requested_amount_atomic"),
-        selected_coin_ids=tuple(coin_ids),
+        selected_coin_ids=validated_coin_ids,
         offer_text_sha256=row.get("offer_text_sha256"),
         sage_trade_id=row.get("sage_trade_id"),
         state=state,
@@ -552,6 +607,31 @@ def _protected_reference(snapshot: RegistrySnapshot, reference: OfferReference) 
     )
 
 
+def _snapshot_identity_decision(
+    snapshot: RegistrySnapshot,
+) -> Optional[AuthorizationDecision]:
+    """Reject duplicate durable identities anywhere in a registry snapshot."""
+
+    for attribute, label in (
+        ("intent_id", "intent id"),
+        ("sage_trade_id", "Sage trade id"),
+        ("offer_text_sha256", "offer hash"),
+    ):
+        seen: set[str] = set()
+        for record in snapshot.records:
+            identity = getattr(record, attribute)
+            if identity is None:
+                continue
+            if identity in seen:
+                return _decision(
+                    False,
+                    AuthorizationCode.AMBIGUOUS_MATCH,
+                    f"duplicate durable {label} in registry snapshot",
+                )
+            seen.add(identity)
+    return None
+
+
 def _resolve(
     snapshot: RegistrySnapshot, reference: OfferReference
 ) -> tuple[Optional[OfferRecord], Optional[AuthorizationDecision]]:
@@ -565,6 +645,9 @@ def _resolve(
         return None, _decision(
             False, AuthorizationCode.PROTECTED_OFFER, "offer is protected"
         )
+    identity_denial = _snapshot_identity_decision(snapshot)
+    if identity_denial is not None:
+        return None, identity_denial
 
     matches = []
     for record in snapshot.records:
@@ -600,6 +683,13 @@ def _resolve(
         return None, _decision(
             False, AuthorizationCode.REFERENCE_MISMATCH, "offer identifiers disagree"
         )
+    if (
+        record.sage_trade_id in snapshot.protected_sage_trade_ids
+        or record.offer_text_sha256 in snapshot.protected_offer_hashes
+    ):
+        return None, _decision(
+            False, AuthorizationCode.PROTECTED_OFFER, "offer is protected", record
+        )
     if record.protected:
         return None, _decision(
             False, AuthorizationCode.PROTECTED_OFFER, "offer is protected", record
@@ -614,7 +704,7 @@ def _resolve(
 def _binding_decision(
     record: OfferRecord, wallet_fingerprint_hash: Any, network: Any
 ) -> Optional[AuthorizationDecision]:
-    if not isinstance(wallet_fingerprint_hash, str) or not isinstance(network, str):
+    if type(wallet_fingerprint_hash) is not str or type(network) is not str:
         return _decision(
             False,
             AuthorizationCode.INVALID_INPUT,
@@ -665,7 +755,11 @@ def _lineage_decision(
                 "replacement generation is not consecutive",
                 record,
             )
-        if parent.state not in {RegistryState.CREATED, RegistryState.VISIBLE}:
+        if parent.state not in {
+            RegistryState.CREATED,
+            RegistryState.VISIBLE,
+            RegistryState.CANCEL_REQUESTED,
+        }:
             return _decision(
                 False,
                 AuthorizationCode.INVALID_LINEAGE,
@@ -743,7 +837,7 @@ def _has_duplicate_active_slot(snapshot: RegistrySnapshot, record: OfferRecord) 
     return bool(
         record.slot_key is not None
         and any(
-            other.intent_id != record.intent_id
+            other is not record
             and other.run_id == record.run_id
             and other.slot_key == record.slot_key
             and other.generation == record.generation
@@ -751,6 +845,41 @@ def _has_duplicate_active_slot(snapshot: RegistrySnapshot, record: OfferRecord) 
             for other in snapshot.records
         )
     )
+
+
+def _registry_blocker_decision(
+    snapshot: RegistrySnapshot,
+    record: OfferRecord,
+    *,
+    exclude_target: bool = False,
+) -> Optional[AuthorizationDecision]:
+    if any(
+        (not exclude_target or item is not record) and item.state in _BLOCKING_STATES
+        for item in snapshot.records
+    ):
+        return _decision(
+            False,
+            AuthorizationCode.REGISTRY_BLOCKED,
+            "an unresolved registry row blocks mutation",
+            record,
+        )
+    return None
+
+
+def _replacement_child_visibility_decision(
+    snapshot: RegistrySnapshot, record: OfferRecord
+) -> Optional[AuthorizationDecision]:
+    if not record.child_intent_id:
+        return None
+    child = _records_by_intent(snapshot, record.child_intent_id)[0]
+    if child.state != RegistryState.VISIBLE:
+        return _decision(
+            False,
+            AuthorizationCode.REPLACEMENT_CHILD_NOT_VISIBLE,
+            "replacement child is not visible",
+            record,
+        )
+    return None
 
 
 def authorize_mutation(snapshot: Any, request: Any) -> AuthorizationDecision:
@@ -773,14 +902,9 @@ def authorize_mutation(snapshot: Any, request: Any) -> AuthorizationDecision:
     )
     if binding is not None:
         return binding
-    blockers = [item for item in snapshot.records if item.state in _BLOCKING_STATES]
-    if blockers:
-        return _decision(
-            False,
-            AuthorizationCode.REGISTRY_BLOCKED,
-            "an unresolved registry row blocks mutation",
-            record,
-        )
+    blocker = _registry_blocker_decision(snapshot, record)
+    if blocker is not None:
+        return blocker
     if not record.selected_coin_ids:
         return _decision(
             False,
@@ -833,14 +957,9 @@ def authorize_mutation(snapshot: Any, request: Any) -> AuthorizationDecision:
         request.kind in {MutationKind.CANCEL, MutationKind.REPLACE}
         and record.child_intent_id
     ):
-        child = _records_by_intent(snapshot, record.child_intent_id)[0]
-        if child.state != RegistryState.VISIBLE:
-            return _decision(
-                False,
-                AuthorizationCode.REPLACEMENT_CHILD_NOT_VISIBLE,
-                "replacement child is not visible",
-                record,
-            )
+        child_visibility = _replacement_child_visibility_decision(snapshot, record)
+        if child_visibility is not None:
+            return child_visibility
     return _decision(True, AuthorizationCode.ALLOWED, "mutation is authorized", record)
 
 
@@ -866,6 +985,35 @@ def _evidence_matches(
     )
 
 
+def _reconciliation_evidence_decision(
+    record: OfferRecord,
+    evidence: Optional[OfferEvidence],
+    destination: RegistryState,
+) -> Optional[AuthorizationDecision]:
+    if evidence is None:
+        return _decision(
+            False,
+            AuthorizationCode.RECONCILIATION_EVIDENCE_REQUIRED,
+            "unresolved state requires reconciliation evidence",
+            record,
+        )
+    if not _evidence_matches(record, evidence, destination):
+        return _decision(
+            False,
+            AuthorizationCode.EVIDENCE_MISMATCH,
+            "evidence does not exactly match the offer",
+            record,
+        )
+    if evidence.source == EvidenceSource.THIRD_PARTY_OBSERVATION:
+        return _decision(
+            False,
+            AuthorizationCode.RECONCILIATION_EVIDENCE_REQUIRED,
+            "third-party evidence cannot resolve registry state",
+            record,
+        )
+    return None
+
+
 def _terminal_evidence_decision(
     record: OfferRecord, evidence: OfferEvidence
 ) -> Optional[AuthorizationDecision]:
@@ -881,6 +1029,33 @@ def _terminal_evidence_decision(
             False,
             AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
             "third-party observation is not terminal proof",
+            record,
+        )
+    if (
+        evidence.terminal_outcome == TerminalOutcome.FILLED
+        and evidence.input_coins_owned_unlocked
+    ):
+        return _decision(
+            False,
+            AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
+            "filled inputs cannot also be owned and unlocked",
+            record,
+        )
+    if (
+        evidence.source == EvidenceSource.FULL_WALLET_HISTORY
+        and evidence.terminal_outcome
+        in {
+            TerminalOutcome.CANCELLED,
+            TerminalOutcome.EXPIRED,
+            TerminalOutcome.CREATION_FAILED,
+            TerminalOutcome.REJECTED,
+        }
+        and not evidence.input_coins_owned_unlocked
+    ):
+        return _decision(
+            False,
+            AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
+            "safe release lacks owned unlocked input proof",
             record,
         )
     if record.state == RegistryState.PREPARED and evidence.terminal_outcome not in {
@@ -900,6 +1075,7 @@ def _terminal_evidence_decision(
         if record.state not in {
             RegistryState.PREPARED,
             RegistryState.SUBMITTED_UNCONFIRMED,
+            RegistryState.QUARANTINED,
         } or evidence.source not in {
             EvidenceSource.AUTHORITATIVE_WALLET,
             EvidenceSource.FULL_WALLET_HISTORY,
@@ -949,6 +1125,59 @@ def _terminal_evidence_decision(
     return None
 
 
+def _quarantine_evidence_decision(
+    record: OfferRecord, evidence: Optional[OfferEvidence]
+) -> Optional[AuthorizationDecision]:
+    if not (
+        evidence
+        and evidence.source == EvidenceSource.FULL_WALLET_HISTORY
+        and evidence.full_history
+    ):
+        return _decision(
+            False,
+            AuthorizationCode.QUARANTINE_PROOF_REQUIRED,
+            "quarantine requires full wallet history",
+            record,
+        )
+    if evidence.terminal_outcome == TerminalOutcome.FILLED:
+        if evidence.input_coins_owned_unlocked:
+            return _decision(
+                False,
+                AuthorizationCode.QUARANTINE_PROOF_REQUIRED,
+                "filled inputs cannot also be owned and unlocked",
+                record,
+            )
+        if (
+            not (evidence.transaction_id or evidence.spend_identity)
+            or evidence.block_height is None
+            or evidence.block_height <= 0
+        ):
+            return _decision(
+                False,
+                AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
+                "quarantined fill lacks authoritative on-chain proof",
+                record,
+            )
+        return None
+    if (
+        evidence.terminal_outcome
+        in {
+            TerminalOutcome.CANCELLED,
+            TerminalOutcome.EXPIRED,
+            TerminalOutcome.CREATION_FAILED,
+            TerminalOutcome.REJECTED,
+        }
+        and evidence.input_coins_owned_unlocked
+    ):
+        return None
+    return _decision(
+        False,
+        AuthorizationCode.QUARANTINE_PROOF_REQUIRED,
+        "quarantine safe release requires owned unlocked input proof",
+        record,
+    )
+
+
 def authorize_transition(
     snapshot: Any,
     reference: Any,
@@ -978,6 +1207,9 @@ def authorize_transition(
     binding = _binding_decision(record, wallet_fingerprint_hash, network)
     if binding is not None:
         return binding
+    blocker = _registry_blocker_decision(snapshot, record, exclude_target=True)
+    if blocker is not None:
+        return blocker
     if not record.selected_coin_ids:
         return _decision(
             False,
@@ -998,26 +1230,7 @@ def authorize_transition(
     table = transition_decision(record.state, destination)
     if not table.allowed:
         return _decision(False, table.code, table.reason, record)
-    if table.idempotent:
-        return _decision(
-            True, AuthorizationCode.IDEMPOTENT, table.reason, record, idempotent=True
-        )
-
     needs_reconciliation = record.state in _BLOCKING_STATES
-    if destination == RegistryState.TERMINAL and evidence is None:
-        return _decision(
-            False,
-            AuthorizationCode.TERMINAL_PROOF_REQUIRED,
-            "terminal transition requires proof",
-            record,
-        )
-    if needs_reconciliation and evidence is None:
-        return _decision(
-            False,
-            AuthorizationCode.RECONCILIATION_EVIDENCE_REQUIRED,
-            "unresolved state requires reconciliation evidence",
-            record,
-        )
     if evidence is not None and not _evidence_matches(record, evidence, destination):
         return _decision(
             False,
@@ -1025,35 +1238,44 @@ def authorize_transition(
             "evidence does not exactly match the offer",
             record,
         )
+    if needs_reconciliation:
+        reconciliation_denial = _reconciliation_evidence_decision(
+            record, evidence, destination
+        )
+        if reconciliation_denial is not None:
+            return reconciliation_denial
+    if table.idempotent:
+        return _decision(
+            True, AuthorizationCode.IDEMPOTENT, table.reason, record, idempotent=True
+        )
+
+    if destination == RegistryState.CANCEL_REQUESTED:
+        child_visibility = _replacement_child_visibility_decision(snapshot, record)
+        if child_visibility is not None:
+            return child_visibility
+    if destination == RegistryState.TERMINAL and evidence is None:
+        return _decision(
+            False,
+            AuthorizationCode.TERMINAL_PROOF_REQUIRED,
+            "terminal transition requires proof",
+            record,
+        )
     if record.state == RegistryState.QUARANTINED:
-        if not (
-            evidence
-            and evidence.source == EvidenceSource.FULL_WALLET_HISTORY
-            and evidence.full_history
-            and evidence.input_coins_owned_unlocked
-        ):
-            return _decision(
-                False,
-                AuthorizationCode.QUARANTINE_PROOF_REQUIRED,
-                "quarantine requires full history and owned unlocked coins",
-                record,
-            )
+        quarantine_denial = _quarantine_evidence_decision(record, evidence)
+        if quarantine_denial is not None:
+            return quarantine_denial
     if destination == RegistryState.TERMINAL:
         assert isinstance(evidence, OfferEvidence)
         terminal_denial = _terminal_evidence_decision(record, evidence)
         if terminal_denial is not None:
             return terminal_denial
-    elif (
-        needs_reconciliation
-        and evidence is not None
-        and evidence.source == EvidenceSource.THIRD_PARTY_OBSERVATION
-    ):
-        return _decision(
-            False,
-            AuthorizationCode.RECONCILIATION_EVIDENCE_REQUIRED,
-            "third-party evidence cannot resolve registry state",
-            record,
-        )
+        if evidence.terminal_outcome in {
+            TerminalOutcome.CANCELLED,
+            TerminalOutcome.EXPIRED,
+        }:
+            child_visibility = _replacement_child_visibility_decision(snapshot, record)
+            if child_visibility is not None:
+                return child_visibility
     return _decision(
         True, AuthorizationCode.ALLOWED, "transition is authorized", record
     )
