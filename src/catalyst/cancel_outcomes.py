@@ -136,7 +136,7 @@ def _safe_error_code(value: Any) -> str:
 
 def decode_evidence_code(alias: Any) -> str:
     """Decode a documented v4 compact evidence reason, or return empty."""
-    if not isinstance(alias, str):
+    if type(alias) is not str:
         return ""
     return _COMPACT_EVIDENCE_CODE_DECODER.get(alias, "")
 

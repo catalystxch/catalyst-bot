@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 import pytest
 
@@ -17,6 +18,39 @@ from cancel_outcomes import (
     normalize_cancel_response,
     safe_raw_response,
 )
+
+
+class _UnhashableStr(str):
+    __hash__ = None
+
+
+class _HostileHashStr(str):
+    def __hash__(self):
+        raise AssertionError("decoder invoked attacker-controlled __hash__")
+
+
+class _HostileEqualHashStr(str):
+    def __hash__(self):
+        return str.__hash__(self)
+
+    def __eq__(self, other):
+        raise AssertionError("decoder invoked attacker-controlled __eq__")
+
+
+class _HostileStringifiable:
+    def __str__(self):
+        raise AssertionError("decoder invoked attacker-controlled __str__")
+
+
+class _HostileMapping(Mapping):
+    def __getitem__(self, key):
+        raise AssertionError("decoder read an attacker-controlled mapping")
+
+    def __iter__(self):
+        raise AssertionError("decoder iterated an attacker-controlled mapping")
+
+    def __len__(self):
+        raise AssertionError("decoder measured an attacker-controlled mapping")
 
 
 @pytest.mark.parametrize(
@@ -552,6 +586,68 @@ def test_evidence_decoder_is_total_and_fail_closed_for_invalid_aliases(
 ):
     """Malformed JSON-valid aliases must return empty instead of raising."""
     assert decode_evidence_code(invalid_alias) == ""
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        _UnhashableStr("MC"),
+        _HostileHashStr("MC"),
+        _HostileEqualHashStr("MC"),
+    ],
+    ids=["unhashable", "hostile-hash", "hostile-equality"],
+)
+def test_evidence_decoder_rejects_str_subclasses_without_invoking_them(alias):
+    """Only exact built-in strings may reach the compact-code mapping."""
+    assert decode_evidence_code(alias) == ""
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        _HostileStringifiable(),
+        _HostileMapping(),
+        [],
+        {},
+        None,
+        0,
+        1,
+        1.5,
+        True,
+        False,
+    ],
+    ids=[
+        "hostile-str",
+        "hostile-mapping",
+        "list",
+        "dict",
+        "none",
+        "zero",
+        "integer",
+        "float",
+        "true",
+        "false",
+    ],
+)
+def test_evidence_decoder_rejects_non_strings_without_coercion(alias):
+    """Rejected types must not be coerced, hashed, compared, or traversed."""
+    assert decode_evidence_code(alias) == ""
+
+
+@pytest.mark.parametrize(
+    ("alias", "want"),
+    [
+        ("MC", "MEMPOOL_CONFLICT"),
+        ("CU", CANCEL_UNKNOWN),
+        ("", ""),
+        ("UNKNOWN", ""),
+        ("MC ", ""),
+        ("mc", ""),
+    ],
+)
+def test_evidence_decoder_accepts_only_exact_plain_alias_strings(alias, want):
+    """Plain documented aliases decode while malformed strings fail closed."""
+    assert decode_evidence_code(alias) == want
 
 
 def test_compact_evidence_schema_is_immutable_unique_and_round_trips():
