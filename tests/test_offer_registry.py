@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from itertools import product
 
 import pytest
@@ -53,6 +53,57 @@ class HostileStr(str):
 
     def __hash__(self):
         raise AssertionError("hostile hash invoked")
+
+
+class HostileOfferRecord(OfferRecord):
+    """A stored UNKNOWN record that lies about its state after construction."""
+
+    def __getattribute__(self, name):
+        if name == "state":
+            underlying = object.__getattribute__(self, name)
+            if underlying is RegistryState.UNKNOWN:
+                return RegistryState.VISIBLE
+        return object.__getattribute__(self, name)
+
+
+class OfferRecordSubclass(OfferRecord):
+    pass
+
+
+class RegistrySnapshotSubclass(RegistrySnapshot):
+    pass
+
+
+class MutationRequestSubclass(MutationRequest):
+    pass
+
+
+class OfferReferenceSubclass(OfferReference):
+    pass
+
+
+class OfferEvidenceSubclass(OfferEvidence):
+    pass
+
+
+class DomainTypeSpoof:
+    """A mutable object that makes isinstance() claim a policy domain type."""
+
+    def __init__(self, claimed_type):
+        self.claimed_type = claimed_type
+
+    @property
+    def __class__(self):
+        return self.claimed_type
+
+
+def subclass_copy(subclass, value, base_type):
+    return subclass(
+        **{
+            field.name: object.__getattribute__(value, field.name)
+            for field in fields(base_type)
+        }
+    )
 
 
 def record(
@@ -230,6 +281,25 @@ def test_domain_values_are_deeply_immutable_and_atomic_amounts_never_float():
     with pytest.raises(ValueError, match="atomic integer"):
         replace(record(), offered_amount_atomic=True)
 
+    mutable_coins = [COIN]
+    normalized = replace(item, selected_coin_ids=mutable_coins)
+    snapshot = RegistrySnapshot(
+        [normalized],
+        protected_sage_trade_ids=[TRADE],
+        protected_offer_hashes=[OFFER_HASH],
+    )
+    mutation = request(MutationKind.CREATE, selected_coin_ids=mutable_coins)
+    proof = replace(evidence(), selected_coin_ids=mutable_coins)
+    mutable_coins.clear()
+
+    assert type(normalized.selected_coin_ids) is tuple
+    assert type(snapshot.records) is tuple
+    assert type(snapshot.protected_sage_trade_ids) is frozenset
+    assert type(snapshot.protected_offer_hashes) is frozenset
+    assert type(mutation.selected_coin_ids) is tuple
+    assert type(proof.selected_coin_ids) is tuple
+    assert normalized.selected_coin_ids == (COIN,)
+
 
 def test_public_text_rejects_hostile_subclasses_without_invoking_overrides():
     """Catches subclass hooks spoofing validation, equality, hashing, or storage."""
@@ -293,6 +363,113 @@ def test_hostile_runtime_wallet_and_network_are_denied_without_comparison():
     )
     assert hostile_wallet.code is AuthorizationCode.INVALID_INPUT
     assert hostile_network.code is AuthorizationCode.INVALID_INPUT
+
+
+def test_snapshot_rejects_offer_record_subclass_before_policy_access():
+    """Catches an underlying UNKNOWN row lying that it is mutation-safe."""
+
+    hostile = subclass_copy(
+        HostileOfferRecord,
+        record(state=RegistryState.UNKNOWN),
+        OfferRecord,
+    )
+    assert object.__getattribute__(hostile, "state") is RegistryState.UNKNOWN
+    assert hostile.state is RegistryState.VISIBLE
+
+    with pytest.raises(ValueError, match="OfferRecord"):
+        RegistrySnapshot((hostile,))
+
+
+def test_authorize_mutation_rejects_registry_snapshot_subclass():
+    """Catches a snapshot subtype changing its records after validation."""
+
+    hostile = subclass_copy(
+        RegistrySnapshotSubclass,
+        RegistrySnapshot((record(state=RegistryState.VISIBLE),)),
+        RegistrySnapshot,
+    )
+    decision = authorize_mutation(hostile, request(MutationKind.CANCEL))
+    assert decision.code is AuthorizationCode.INVALID_INPUT
+
+
+def test_authorize_mutation_rejects_mutation_request_subclass():
+    """Catches a request subtype changing its mutation kind after validation."""
+
+    hostile = subclass_copy(
+        MutationRequestSubclass,
+        request(MutationKind.CANCEL),
+        MutationRequest,
+    )
+    decision = authorize_mutation(
+        RegistrySnapshot((record(state=RegistryState.VISIBLE),)), hostile
+    )
+    assert decision.code is AuthorizationCode.INVALID_INPUT
+
+
+def test_authorize_transition_rejects_offer_reference_subclass():
+    """Catches a reference subtype redirecting lookup after validation."""
+
+    hostile = subclass_copy(
+        OfferReferenceSubclass,
+        reference(),
+        OfferReference,
+    )
+    decision = authorize_transition(
+        RegistrySnapshot((record(),)),
+        hostile,
+        RegistryState.VISIBLE,
+        WALLET,
+        NETWORK,
+    )
+    assert decision.code is AuthorizationCode.INVALID_INPUT
+
+
+def test_authorize_transition_rejects_offer_evidence_subclass():
+    """Catches an evidence subtype changing terminal proof after validation."""
+
+    hostile = subclass_copy(OfferEvidenceSubclass, evidence(), OfferEvidence)
+    decision = authorize_transition(
+        RegistrySnapshot((record(state=RegistryState.VISIBLE),)),
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=hostile,
+    )
+    assert decision.code is AuthorizationCode.INVALID_INPUT
+
+
+def test_domain_enum_and_decision_fields_reject_isinstance_spoofs():
+    """Catches mutable objects impersonating enum and record domain types."""
+
+    with pytest.raises(ValueError):
+        replace(record(), state=DomainTypeSpoof(RegistryState))
+    with pytest.raises(ValueError):
+        replace(request(MutationKind.CANCEL), kind=DomainTypeSpoof(MutationKind))
+    with pytest.raises(ValueError):
+        replace(evidence(), source=DomainTypeSpoof(EvidenceSource))
+    with pytest.raises(ValueError):
+        replace(evidence(), terminal_outcome=DomainTypeSpoof(TerminalOutcome))
+    with pytest.raises(ValueError):
+        AuthorizationDecision(
+            True,
+            DomainTypeSpoof(AuthorizationCode),
+            "spoofed decision",
+        )
+    hostile_record = subclass_copy(OfferRecordSubclass, record(), OfferRecord)
+    with pytest.raises(ValueError):
+        AuthorizationDecision(
+            True,
+            AuthorizationCode.ALLOWED,
+            "spoofed record",
+            hostile_record,
+        )
+
+    transition = transition_decision(
+        DomainTypeSpoof(RegistryState), RegistryState.VISIBLE
+    )
+    assert transition.code is AuthorizationCode.INVALID_INPUT
+    assert type(transition) is AuthorizationDecision
 
 
 def task3_row(**changes):
@@ -980,6 +1157,226 @@ def test_terminal_proof_source_has_outcome_specific_requirements():
         WALLET,
         NETWORK,
         evidence=wallet_expiry,
+    ).allowed
+
+
+@pytest.mark.parametrize(
+    ("outcome", "source", "full_history", "owned_unlocked"),
+    [
+        (
+            TerminalOutcome.FILLED,
+            EvidenceSource.AUTHORITATIVE_WALLET,
+            False,
+            False,
+        ),
+        (
+            TerminalOutcome.CANCELLED,
+            EvidenceSource.AUTHORITATIVE_WALLET,
+            False,
+            False,
+        ),
+        (
+            TerminalOutcome.FILLED,
+            EvidenceSource.FULL_WALLET_HISTORY,
+            True,
+            False,
+        ),
+        (
+            TerminalOutcome.CANCELLED,
+            EvidenceSource.FULL_WALLET_HISTORY,
+            True,
+            True,
+        ),
+    ],
+)
+def test_filled_and_cancelled_require_chain_proof_regardless_of_source_label(
+    outcome, source, full_history, owned_unlocked
+):
+    """Catches wallet/history labels bypassing outcome-driven chain proof."""
+
+    proof = evidence(
+        outcome=outcome,
+        source=source,
+        transaction_id=None,
+        spend_identity=None,
+        block_height=None,
+        full_history=full_history,
+        input_coins_owned_unlocked=owned_unlocked,
+    )
+    decision = authorize_transition(
+        RegistrySnapshot((record(state=RegistryState.VISIBLE),)),
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proof,
+    )
+    assert decision.code is AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT
+
+
+@pytest.mark.parametrize(
+    ("outcome", "source", "full_history", "owned_unlocked", "identity_field"),
+    [
+        (
+            TerminalOutcome.FILLED,
+            EvidenceSource.AUTHORITATIVE_WALLET,
+            False,
+            False,
+            "transaction_id",
+        ),
+        (
+            TerminalOutcome.CANCELLED,
+            EvidenceSource.AUTHORITATIVE_WALLET,
+            False,
+            False,
+            "spend_identity",
+        ),
+        (
+            TerminalOutcome.FILLED,
+            EvidenceSource.FULL_WALLET_HISTORY,
+            True,
+            False,
+            "spend_identity",
+        ),
+        (
+            TerminalOutcome.CANCELLED,
+            EvidenceSource.FULL_WALLET_HISTORY,
+            True,
+            True,
+            "transaction_id",
+        ),
+    ],
+)
+def test_exact_chain_proof_authorizes_live_outcome_across_wallet_sources(
+    outcome, source, full_history, owned_unlocked, identity_field
+):
+    """Catches outcome proof accidentally being tied to only exact-source labels."""
+
+    identity = {
+        "transaction_id": None,
+        "spend_identity": None,
+        identity_field: "exact-chain-identity",
+    }
+    proof = evidence(
+        outcome=outcome,
+        source=source,
+        block_height=456,
+        full_history=full_history,
+        input_coins_owned_unlocked=owned_unlocked,
+        **identity,
+    )
+    assert authorize_transition(
+        RegistrySnapshot((record(state=RegistryState.VISIBLE),)),
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proof,
+    ).allowed
+
+
+@pytest.mark.parametrize(
+    ("state", "outcome"),
+    [
+        (RegistryState.PREPARED, TerminalOutcome.CREATION_FAILED),
+        (RegistryState.PREPARED, TerminalOutcome.REJECTED),
+        (RegistryState.VISIBLE, TerminalOutcome.EXPIRED),
+    ],
+)
+def test_non_chain_terminal_outcomes_retain_authoritative_wallet_semantics(
+    state, outcome
+):
+    """Catches chain-proof hardening spilling into non-chain terminal outcomes."""
+
+    item = record(
+        state=state,
+        trade_id=None if state is RegistryState.PREPARED else TRADE,
+        offer_hash=None if state is RegistryState.PREPARED else OFFER_HASH,
+    )
+    proof = evidence(
+        outcome=outcome,
+        source=EvidenceSource.AUTHORITATIVE_WALLET,
+        transaction_id=None,
+        spend_identity=None,
+        block_height=None,
+    )
+    if state is RegistryState.PREPARED:
+        proof = replace(proof, sage_trade_id=None, offer_text_sha256=None)
+    assert authorize_transition(
+        RegistrySnapshot((item,)),
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proof,
+    ).allowed
+
+
+@pytest.mark.parametrize("outcome", [TerminalOutcome.FILLED, TerminalOutcome.CANCELLED])
+def test_terminal_idempotent_replay_validates_supplied_outcome_proof(outcome):
+    """Catches same-state replay accepting an asserted but unproven outcome."""
+
+    snapshot = RegistrySnapshot((record(state=RegistryState.TERMINAL),))
+    insufficient = evidence(
+        outcome=outcome,
+        source=EvidenceSource.AUTHORITATIVE_WALLET,
+        transaction_id=None,
+        spend_identity=None,
+        block_height=None,
+    )
+    denied = authorize_transition(
+        snapshot,
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=insufficient,
+    )
+    assert denied.code is AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT
+
+    proven = replace(insufficient, spend_identity="spend-proven", block_height=456)
+    replay = authorize_transition(
+        snapshot,
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proven,
+    )
+    assert replay.allowed and replay.idempotent
+
+
+def test_quarantined_cancel_requires_chain_proof_and_accepts_exact_spend():
+    """Catches safe-release flags replacing cancellation transaction proof."""
+
+    snapshot = RegistrySnapshot((record(state=RegistryState.QUARANTINED),))
+    incomplete = evidence(
+        outcome=TerminalOutcome.CANCELLED,
+        source=EvidenceSource.FULL_WALLET_HISTORY,
+        transaction_id=None,
+        spend_identity=None,
+        block_height=None,
+        full_history=True,
+        input_coins_owned_unlocked=True,
+    )
+    denied = authorize_transition(
+        snapshot,
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=incomplete,
+    )
+    assert denied.code is AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT
+
+    proven = replace(incomplete, transaction_id="cancel-tx", block_height=456)
+    assert authorize_transition(
+        snapshot,
+        reference(),
+        RegistryState.TERMINAL,
+        WALLET,
+        NETWORK,
+        evidence=proven,
     ).allowed
 
 

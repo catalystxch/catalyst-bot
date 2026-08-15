@@ -223,7 +223,7 @@ class OfferRecord:
             "sage_trade_id",
             _optional_hex_identity(self.sage_trade_id, "sage_trade_id"),
         )
-        if not isinstance(self.state, RegistryState):
+        if type(self.state) is not RegistryState:
             raise ValueError("state must be a RegistryState")
         if type(self.owned) is not bool or type(self.protected) is not bool:
             raise ValueError("owned and protected must be booleans")
@@ -268,7 +268,7 @@ class RegistrySnapshot:
             raise ValueError(
                 "records must be a collection of OfferRecord values"
             ) from exc
-        if any(not isinstance(record, OfferRecord) for record in records):
+        if any(type(record) is not OfferRecord for record in records):
             raise ValueError("records must contain only OfferRecord values")
         object.__setattr__(self, "records", records)
         object.__setattr__(
@@ -298,9 +298,9 @@ class MutationRequest:
     selected_coin_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, MutationKind):
+        if type(self.kind) is not MutationKind:
             raise ValueError("kind must be a MutationKind")
-        if not isinstance(self.reference, OfferReference):
+        if type(self.reference) is not OfferReference:
             raise ValueError("reference must be an OfferReference")
         object.__setattr__(
             self,
@@ -334,10 +334,11 @@ class OfferEvidence:
     input_coins_owned_unlocked: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.observed_state, RegistryState):
+        if type(self.observed_state) is not RegistryState:
             raise ValueError("observed_state must be a RegistryState")
-        if self.terminal_outcome is not None and not isinstance(
-            self.terminal_outcome, TerminalOutcome
+        if (
+            self.terminal_outcome is not None
+            and type(self.terminal_outcome) is not TerminalOutcome
         ):
             raise ValueError("terminal_outcome must be a TerminalOutcome")
         if (self.observed_state == RegistryState.TERMINAL) != (
@@ -346,7 +347,7 @@ class OfferEvidence:
             raise ValueError(
                 "terminal_outcome must exactly match a terminal observed state"
             )
-        if not isinstance(self.source, EvidenceSource):
+        if type(self.source) is not EvidenceSource:
             raise ValueError("source must be an EvidenceSource")
         object.__setattr__(
             self, "intent_id", _required_text(self.intent_id, "intent_id")
@@ -424,10 +425,10 @@ class AuthorizationDecision:
     def __post_init__(self) -> None:
         if type(self.allowed) is not bool or type(self.idempotent) is not bool:
             raise ValueError("authorization flags must be booleans")
-        if not isinstance(self.code, AuthorizationCode):
+        if type(self.code) is not AuthorizationCode:
             raise ValueError("code must be an AuthorizationCode")
         object.__setattr__(self, "reason", _required_text(self.reason, "reason"))
-        if self.record is not None and not isinstance(self.record, OfferRecord):
+        if self.record is not None and type(self.record) is not OfferRecord:
             raise ValueError("record must be an OfferRecord")
         if self.idempotent and not self.allowed:
             raise ValueError("an idempotent authorization must be allowed")
@@ -574,9 +575,7 @@ def _decision(
 def transition_decision(source: Any, destination: Any) -> AuthorizationDecision:
     """Return the complete deterministic state-table decision."""
 
-    if not isinstance(source, RegistryState) or not isinstance(
-        destination, RegistryState
-    ):
+    if type(source) is not RegistryState or type(destination) is not RegistryState:
         return _decision(
             False, AuthorizationCode.INVALID_INPUT, "registry states are required"
         )
@@ -885,9 +884,7 @@ def _replacement_child_visibility_decision(
 def authorize_mutation(snapshot: Any, request: Any) -> AuthorizationDecision:
     """Authorize one mutation from a single immutable registry snapshot."""
 
-    if not isinstance(snapshot, RegistrySnapshot) or not isinstance(
-        request, MutationRequest
-    ):
+    if type(snapshot) is not RegistrySnapshot or type(request) is not MutationRequest:
         return _decision(
             False,
             AuthorizationCode.INVALID_INPUT,
@@ -1014,6 +1011,14 @@ def _reconciliation_evidence_decision(
     return None
 
 
+def _has_exact_chain_proof(evidence: OfferEvidence) -> bool:
+    return bool(
+        (evidence.transaction_id or evidence.spend_identity)
+        and evidence.block_height is not None
+        and evidence.block_height > 0
+    )
+
+
 def _terminal_evidence_decision(
     record: OfferRecord, evidence: OfferEvidence
 ) -> Optional[AuthorizationDecision]:
@@ -1069,6 +1074,16 @@ def _terminal_evidence_decision(
             record,
         )
     if evidence.terminal_outcome in {
+        TerminalOutcome.FILLED,
+        TerminalOutcome.CANCELLED,
+    } and not _has_exact_chain_proof(evidence):
+        return _decision(
+            False,
+            AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
+            "filled or cancelled outcome lacks exact on-chain proof",
+            record,
+        )
+    if evidence.terminal_outcome in {
         TerminalOutcome.CREATION_FAILED,
         TerminalOutcome.REJECTED,
     }:
@@ -1076,6 +1091,7 @@ def _terminal_evidence_decision(
             RegistryState.PREPARED,
             RegistryState.SUBMITTED_UNCONFIRMED,
             RegistryState.QUARANTINED,
+            RegistryState.TERMINAL,
         } or evidence.source not in {
             EvidenceSource.AUTHORITATIVE_WALLET,
             EvidenceSource.FULL_WALLET_HISTORY,
@@ -1101,11 +1117,7 @@ def _terminal_evidence_decision(
         EvidenceSource.EXACT_TRANSACTION,
         EvidenceSource.EXACT_COIN_SPEND,
     }:
-        if (
-            not (evidence.transaction_id or evidence.spend_identity)
-            or evidence.block_height is None
-            or evidence.block_height <= 0
-        ):
+        if not _has_exact_chain_proof(evidence):
             return _decision(
                 False,
                 AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
@@ -1147,11 +1159,7 @@ def _quarantine_evidence_decision(
                 "filled inputs cannot also be owned and unlocked",
                 record,
             )
-        if (
-            not (evidence.transaction_id or evidence.spend_identity)
-            or evidence.block_height is None
-            or evidence.block_height <= 0
-        ):
+        if not _has_exact_chain_proof(evidence):
             return _decision(
                 False,
                 AuthorizationCode.TERMINAL_PROOF_INSUFFICIENT,
@@ -1190,10 +1198,10 @@ def authorize_transition(
     """Authorize a registry transition, including proof-bearing reconciliation."""
 
     if (
-        not isinstance(snapshot, RegistrySnapshot)
-        or not isinstance(reference, OfferReference)
-        or not isinstance(destination, RegistryState)
-        or (evidence is not None and not isinstance(evidence, OfferEvidence))
+        type(snapshot) is not RegistrySnapshot
+        or type(reference) is not OfferReference
+        or type(destination) is not RegistryState
+        or (evidence is not None and type(evidence) is not OfferEvidence)
     ):
         return _decision(
             False,
@@ -1244,6 +1252,14 @@ def authorize_transition(
         )
         if reconciliation_denial is not None:
             return reconciliation_denial
+    if (
+        table.idempotent
+        and destination == RegistryState.TERMINAL
+        and evidence is not None
+    ):
+        terminal_denial = _terminal_evidence_decision(record, evidence)
+        if terminal_denial is not None:
+            return terminal_denial
     if table.idempotent:
         return _decision(
             True, AuthorizationCode.IDEMPOTENT, table.reason, record, idempotent=True
@@ -1265,7 +1281,7 @@ def authorize_transition(
         if quarantine_denial is not None:
             return quarantine_denial
     if destination == RegistryState.TERMINAL:
-        assert isinstance(evidence, OfferEvidence)
+        assert type(evidence) is OfferEvidence
         terminal_denial = _terminal_evidence_decision(record, evidence)
         if terminal_denial is not None:
             return terminal_denial
