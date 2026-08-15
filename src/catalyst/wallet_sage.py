@@ -22,6 +22,7 @@ offer is already gone from the wallet's view.
 """
 
 import os
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -45,192 +46,353 @@ def _console(msg: str) -> None:
 
 
 _REDACTED = "[REDACTED]"
-_ASSIGNMENT_HEAD_CANDIDATE_RE = re.compile(
-    r"(?:^|(?<=[\s?&,:;{\[(/]))"
-    r"(?=(?P<name>[\"']?[A-Za-z][A-Za-z0-9_.-]*"
-    r"(?:[ ]+[A-Za-z0-9_.-]+)*?[\"']?)[ \t]*"
-    r"(?P<separator>[:=])(?P<spacing>[ \t]*))",
-    re.IGNORECASE,
+_TRUNCATED = "[TRUNCATED]"
+_CYCLE = "[CYCLE]"
+_MAX_SAGE_SCAN_CHARS = 16 * 1024
+_MAX_SAGE_EMIT_CHARS = 2 * 1024
+_MAX_SAGE_FIELD_NAME_CHARS = 64
+_MAX_SAGE_SCALAR_CHARS = 80
+_MAX_SANITIZED_DEPTH = 8
+_MAX_SANITIZED_COLLECTION_ITEMS = 64
+_MAX_SANITIZED_NODES = 256
+_ASCII_ATOM_RE = re.compile(r"[A-Za-z0-9._:+/-]{1,80}\Z")
+_CAMEL_CASE_BOUNDARY_RE = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
 )
-_ASSIGNMENT_VALUE_DELIMITER_RE = re.compile(r"[,;}\]\r\n]")
-_PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----.*?-----END(?: [A-Z]+)? PRIVATE KEY-----",
-    re.IGNORECASE | re.DOTALL,
+_PEM_BEGIN_RE = re.compile(
+    r"-----BEGIN ([A-Z0-9 ]{0,48}(?:PRIVATE KEY|CERTIFICATE))-----"
 )
-_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_SENSITIVE_EXACT_FIELDS = {
-    "auth",
+_SAFE_METADATA_NAMES = {
+    "auth_method",
+    "certificate_status",
+    "header_count",
+    "private_key_status",
+    "seed_count",
+    "signature_status",
+    "token_presence",
+}
+_NEGATIVE_CREDENTIAL_NAMES = {
+    "keyframe",
+    "monkey_count",
+    "public_key",
+    "token_count",
+}
+_CREDENTIAL_CONTAINERS = {
     "authorization",
-    "certificate",
-    "cert",
     "cookie",
     "cookies",
-    "credential",
-    "credentials",
     "header",
     "headers",
+    "http_headers",
+    "proxy_authorization",
+    "request_headers",
+    "response_headers",
+    "set_cookie",
+}
+_CREDENTIAL_SCALAR_TOKENS = {
+    "auth",
+    "certificate",
+    "cert",
+    "credential",
+    "credentials",
+    "key",
     "mnemonic",
-    "password",
     "passphrase",
-    "private",
+    "password",
     "secret",
     "secrets",
     "seed",
     "signature",
     "token",
 }
-_SENSITIVE_COMPONENT_TOKENS = {
-    "credential",
-    "credentials",
-    "passphrase",
-    "password",
-    "secret",
-    "secrets",
-}
-_SENSITIVE_TERMINAL_TOKENS = _SENSITIVE_EXACT_FIELDS - {
-    "header",
-    "headers",
-    "private",
-}
-_CREDENTIAL_VALUE_PREFIX_TOKENS = _SENSITIVE_TERMINAL_TOKENS | {
-    "key",
-    "private",
-}
-_CREDENTIAL_VALUE_SUFFIX_TOKENS = {"header", "value"}
-_SENSITIVE_TOKEN_SEQUENCES = {
+_CREDENTIAL_SEQUENCES = {
     ("access", "token"),
     ("api", "key"),
     ("api", "token"),
     ("auth", "secret"),
     ("auth", "token"),
-    ("authorization", "header"),
     ("client", "certificate"),
-    ("cookie", "value"),
     ("private", "key"),
     ("puzzle", "reveal"),
     ("refresh", "token"),
     ("seed", "material"),
     ("seed", "phrase"),
-    ("set", "cookie"),
     ("wallet", "signature"),
     ("x", "api", "key"),
     ("x", "api", "token"),
 }
-_METADATA_SUFFIX_TOKENS = {
-    "available",
-    "count",
-    "enabled",
-    "method",
-    "presence",
-    "present",
-    "status",
-    "valid",
-    "verified",
-}
-_MAX_SANITIZED_COLLECTION_ITEMS = 64
+_FIELD_SAFE = "safe"
+_FIELD_CONTAINER = "container"
+_FIELD_SCALAR = "scalar"
+_FIELD_ORDINARY = "ordinary"
 
 
 def _normalise_sage_field_name(name: Any) -> tuple[str, ...]:
-    """Split camel/snake/kebab header names into comparable tokens."""
+    """Split snake/camel/acronym-camel/kebab/space names into tokens."""
     camel_spaced = _CAMEL_CASE_BOUNDARY_RE.sub("_", str(name or ""))
     normalised = re.sub(r"[^a-z0-9]+", "_", camel_spaced.lower()).strip("_")
     return tuple(token for token in normalised.split("_") if token)
 
 
-def _is_sensitive_name(name: Any) -> bool:
-    """Identify credential-bearing field names without broad substring matches.
-
-    Threat model: Sage errors and payloads may label credentials with camelCase,
-    snake_case, kebab-case, or HTTP-header spelling. Credential nouns and
-    value-bearing suffixes catch equivalent labels without enumerating every
-    spelling; terminal metadata tokens keep status/count/method/presence fields
-    visible rather than treating every related word as a secret.
-    """
+def _classify_sage_field(name: Any) -> str:
+    """Classify a diagnostic field in fail-closed precedence order."""
+    raw_name = str(name or "").strip(" \t\"'")
     tokens = _normalise_sage_field_name(name)
     if not tokens:
-        return False
-    if len(tokens) > 1 and tokens[-1] in _METADATA_SUFFIX_TOKENS:
-        return False
-    if len(tokens) == 1 and tokens[0] in _SENSITIVE_EXACT_FIELDS:
-        return True
-    if any(token in _SENSITIVE_COMPONENT_TOKENS for token in tokens):
-        return True
-    if tokens[-1] in _SENSITIVE_TERMINAL_TOKENS:
-        return True
-    if (
-        tokens[-1] in _CREDENTIAL_VALUE_SUFFIX_TOKENS
-        and any(token in _CREDENTIAL_VALUE_PREFIX_TOKENS for token in tokens[:-1])
+        return _FIELD_ORDINARY
+    normalised = "_".join(tokens)
+    if normalised in _SAFE_METADATA_NAMES:
+        return _FIELD_SAFE
+    if normalised in _NEGATIVE_CREDENTIAL_NAMES:
+        return _FIELD_ORDINARY
+    if len(raw_name) > _MAX_SAGE_FIELD_NAME_CHARS:
+        return _FIELD_SCALAR
+    if normalised in _CREDENTIAL_CONTAINERS:
+        return _FIELD_CONTAINER
+    if any(
+        token in {"authorization", "cookie", "cookies", "header", "headers"}
+        for token in tokens
     ):
-        return True
-    return any(
+        return _FIELD_CONTAINER
+    if normalised.endswith(("_header", "_headers", "_value")) and any(
+        token in _CREDENTIAL_SCALAR_TOKENS
+        or token in {"authorization", "cookie", "private"}
+        for token in tokens[:-1]
+    ):
+        return _FIELD_CONTAINER
+    if any(token in _CREDENTIAL_SCALAR_TOKENS for token in tokens):
+        return _FIELD_SCALAR
+    if any(
         tokens[index : index + len(sequence)] == sequence
-        for sequence in _SENSITIVE_TOKEN_SEQUENCES
+        for sequence in _CREDENTIAL_SEQUENCES
         for index in range(len(tokens) - len(sequence) + 1)
+    ):
+        return _FIELD_SCALAR
+    return _FIELD_ORDINARY
+
+
+def _is_sensitive_name(name: Any) -> bool:
+    """Compatibility predicate backed by the fail-closed classifier."""
+    return _classify_sage_field(name) in {_FIELD_CONTAINER, _FIELD_SCALAR}
+
+
+def _matching_quote_end(text: str, start: int) -> Optional[int]:
+    quote = text[start]
+    escaped = False
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return index + 1
+    return None
+
+
+def _safe_metadata_scalar_end(text: str, start: int) -> Optional[int]:
+    if start >= len(text):
+        return None
+    if text[start] == '"':
+        end = _matching_quote_end(text, start)
+        if end is None or end - start > _MAX_SAGE_SCALAR_CHARS + 2:
+            return None
+        try:
+            value = _json.loads(text[start:end])
+        except (TypeError, ValueError):
+            return None
+        return end if isinstance(value, str) and len(value) <= 80 else None
+    end = start
+    while end < len(text) and text[end] not in " \t\r\n,;}]":
+        end += 1
+    atom = text[start:end]
+    if not _ASCII_ATOM_RE.fullmatch(atom):
+        return None
+    boundary = end
+    while boundary < len(text) and text[boundary] in " \t":
+        boundary += 1
+    if boundary >= len(text) or text[boundary] in "\r\n,;}]":
+        return end
+    next_separator = min(
+        (
+            position
+            for position in (
+                text.find(":", boundary, boundary + _MAX_SAGE_FIELD_NAME_CHARS + 2),
+                text.find("=", boundary, boundary + _MAX_SAGE_FIELD_NAME_CHARS + 2),
+            )
+            if position >= 0
+        ),
+        default=-1,
     )
+    if next_separator >= 0:
+        next_name = text[boundary:next_separator].strip(" \t\"'")
+        if _classify_sage_field(next_name) != _FIELD_ORDINARY:
+            return end
+    return None
 
 
-def _is_metadata_name(name: Any) -> bool:
-    """Return whether a compound field ends in an allowed metadata suffix."""
-    tokens = _normalise_sage_field_name(name)
-    return len(tokens) > 1 and tokens[-1] in _METADATA_SUFFIX_TOKENS
-
-
-def _sage_assignment_heads(text: str) -> list[dict[str, Any]]:
-    """Find assignment heads without letting an outer label hide a nested one."""
-    candidates_by_separator = {}
-    for match in _ASSIGNMENT_HEAD_CANDIDATE_RE.finditer(text):
-        name = match.group("name")
-        candidate = {
-            "name_start": match.start("name"),
-            "value_start": match.end("spacing"),
-            "sensitive": _is_sensitive_name(name),
-            "metadata": _is_metadata_name(name),
-        }
-        candidates_by_separator.setdefault(match.start("separator"), []).append(
-            candidate
-        )
-
+def _assignment_heads(text: str) -> list[dict[str, Any]]:
+    """Find bounded semantic assignment heads with a deterministic scan."""
     heads = []
-    for candidates in candidates_by_separator.values():
-        semantic = [
-            candidate
-            for candidate in candidates
-            if candidate["sensitive"] or candidate["metadata"]
+    boundary_chars = " \t\r\n?&,:;{[(/\"'"
+    name_chars = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.- \"'"
+    )
+    for separator in range(len(text)):
+        if text[separator] not in ":=":
+            continue
+        name_end = separator
+        while name_end > 0 and text[name_end - 1] in " \t":
+            name_end -= 1
+        first = max(0, name_end - _MAX_SAGE_FIELD_NAME_CHARS - 2)
+        candidates = []
+        for start in range(first, name_end):
+            if start and text[start - 1] not in boundary_chars:
+                continue
+            candidate = text[start:name_end]
+            if not candidate or any(char not in name_chars for char in candidate):
+                continue
+            stripped = candidate.strip(" \t\"'")
+            if not stripped or not stripped[0].isalpha():
+                continue
+            kind = _classify_sage_field(stripped)
+            if kind == _FIELD_ORDINARY:
+                continue
+            candidates.append((start, stripped, kind))
+        if not candidates:
+            continue
+        safe_candidates = [
+            candidate for candidate in candidates if candidate[2] == _FIELD_SAFE
         ]
-        heads.append(max(semantic or candidates, key=lambda item: item["name_start"]))
-    return sorted(heads, key=lambda item: item["name_start"])
+        start, name, kind = max(
+            safe_candidates or candidates, key=lambda item: item[0]
+        )
+        value_start = separator + 1
+        while value_start < len(text) and text[value_start] in " \t":
+            value_start += 1
+        safe_end = (
+            _safe_metadata_scalar_end(text, value_start)
+            if kind == _FIELD_SAFE
+            else None
+        )
+        if kind == _FIELD_SAFE and safe_end is None:
+            kind = _FIELD_SCALAR
+        heads.append(
+            {
+                "name": name,
+                "name_start": start,
+                "value_start": value_start,
+                "safe_end": safe_end,
+                "kind": kind,
+            }
+        )
+    return heads
 
 
-def _sage_assignment_value_end(text: str, start: int, next_head: int) -> int:
-    """Bound an assignment value by quotes, structure, or the next field."""
-    if start < len(text) and text[start] in {'"', "'"}:
-        closing_quote = text.find(text[start], start + 1)
-        if closing_quote >= 0:
-            return closing_quote + 1
-    delimiter = _ASSIGNMENT_VALUE_DELIMITER_RE.search(text, start, next_head)
-    value_end = delimiter.start() if delimiter else next_head
-    while value_end > start and text[value_end - 1] in " \t":
-        value_end -= 1
-    return value_end
+def _matching_structure_end(text: str, start: int) -> Optional[int]:
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    stack = [pairs[text[start]]]
+    quote = None
+    escaped = False
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+            if not stack:
+                return index + 1
+    return None
+
+
+def _logical_record_end(text: str, start: int, folded: bool) -> int:
+    index = start
+    while index < len(text):
+        if text[index] not in "\r\n":
+            index += 1
+            continue
+        terminator_end = index + 1
+        if text[index] == "\r" and terminator_end < len(text) and text[terminator_end] == "\n":
+            terminator_end += 1
+        if folded and terminator_end < len(text) and text[terminator_end] in " \t":
+            index = terminator_end + 1
+            continue
+        return index
+    return len(text)
+
+
+def _head_is_on_folded_line(text: str, head_start: int) -> bool:
+    line_start = max(text.rfind("\n", 0, head_start), text.rfind("\r", 0, head_start)) + 1
+    return line_start > 0 and not text[line_start:head_start].strip(" \t")
+
+
+def _redaction_end_before_head(text: str, head_start: int, safe: bool) -> int:
+    end = head_start
+    while end > 0 and text[end - 1] in " \t":
+        end -= 1
+    if safe and end > 0 and text[end - 1] in ",;":
+        end -= 1
+    return end
+
+
+def _credential_value_end(
+    text: str,
+    current: dict[str, Any],
+    following: list[dict[str, Any]],
+) -> int:
+    start = current["value_start"]
+    if start >= len(text):
+        return start
+    if text[start] in {'"', "'"}:
+        return _matching_quote_end(text, start) or len(text)
+    if text[start] in "{[(":
+        return _matching_structure_end(text, start) or len(text)
+
+    container = current["kind"] == _FIELD_CONTAINER
+    record_end = _logical_record_end(text, start, folded=container)
+    for candidate in following:
+        if not (start < candidate["name_start"] < record_end):
+            continue
+        if container and _head_is_on_folded_line(text, candidate["name_start"]):
+            continue
+        if candidate["kind"] == _FIELD_SAFE:
+            return _redaction_end_before_head(
+                text, candidate["name_start"], safe=True
+            )
+        if not container and candidate["kind"] in {
+            _FIELD_CONTAINER,
+            _FIELD_SCALAR,
+        }:
+            return _redaction_end_before_head(
+                text, candidate["name_start"], safe=False
+            )
+    return record_end
 
 
 def _redact_sage_assignments(text: str) -> str:
-    """Redact semantic assignment values, including overlapping candidates."""
-    heads = _sage_assignment_heads(text)
+    """Redact credential values with one bounded state-machine model."""
+    heads = _assignment_heads(text)
     ranges = []
+    covered_until = 0
     for index, head in enumerate(heads):
-        if not head["sensitive"]:
+        if head["kind"] not in {_FIELD_CONTAINER, _FIELD_SCALAR}:
             continue
-        next_head = len(text)
-        for candidate in heads[index + 1 :]:
-            if candidate["name_start"] > head["value_start"]:
-                next_head = candidate["name_start"]
-                break
-        value_end = _sage_assignment_value_end(
-            text, head["value_start"], next_head
-        )
-        if value_end > head["value_start"]:
-            ranges.append((head["value_start"], value_end))
+        if head["value_start"] < covered_until:
+            continue
+        end = _credential_value_end(text, head, heads[index + 1 :])
+        if end > head["value_start"]:
+            ranges.append((head["value_start"], end))
+            covered_until = end
 
     if not ranges:
         return text
@@ -245,36 +407,308 @@ def _redact_sage_assignments(text: str) -> str:
     return "".join(parts)
 
 
-def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
-    """Redact secret-bearing text before it reaches a caller or any log sink."""
-    text = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, str(value))
-    text = _redact_sage_assignments(text)
-    return text[:limit]
+def _redact_pem_blocks(text: str) -> str:
+    parts = []
+    cursor = 0
+    while cursor < len(text):
+        match = _PEM_BEGIN_RE.search(text, cursor)
+        if match is None:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor : match.start()])
+        end_label = f"-----END {match.group(1)}-----"
+        block_end = text.find(end_label, match.end())
+        parts.append(_REDACTED)
+        if block_end < 0:
+            cursor = len(text)
+            break
+        cursor = block_end + len(end_label)
+    return "".join(parts)
+
+
+def _bounded_text(text: str, limit: int, input_was_truncated: bool = False) -> str:
+    limit = max(0, min(int(limit), _MAX_SAGE_EMIT_CHARS))
+    needs_marker = input_was_truncated or len(text) > limit
+    if not needs_marker:
+        return text
+    if _TRUNCATED in text and len(text) <= limit:
+        return text
+    if limit < len(_TRUNCATED):
+        return ""
+    prefix = text[: limit - len(_TRUNCATED)]
+    if prefix.endswith("\r"):
+        prefix = prefix[:-1]
+    for marker in (_REDACTED, _TRUNCATED, _CYCLE):
+        marker_start = prefix.rfind("[")
+        marker_end = prefix.rfind("]")
+        if marker_start > marker_end and marker.startswith(prefix[marker_start:]):
+            prefix = prefix[:marker_start]
+            break
+    return prefix + _TRUNCATED
+
+
+def _safe_string(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _safe_scalar_value(value: Any) -> bool:
+    if value is None or isinstance(value, bool) or isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, str) and len(value) <= _MAX_SAGE_SCALAR_CHARS
+
+
+def _bounded_diagnostic_name(value: Any) -> str:
+    name = _safe_string(value)
+    if 0 < len(name) <= _MAX_SAGE_FIELD_NAME_CHARS:
+        return name
+    return _TRUNCATED
 
 
 def _sanitize_sage_data(value: Any, limit: int = 80) -> Any:
-    """Produce bounded, recursively redacted structured data for diagnostics."""
-    if isinstance(value, dict):
-        result = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= _MAX_SANITIZED_COLLECTION_ITEMS:
-                result["_truncated_items"] = len(value) - index
-                break
-            result[str(key)] = (
-                _REDACTED if _is_sensitive_name(key) else _sanitize_sage_data(item, limit)
-            )
-        return result
-    if isinstance(value, (list, tuple)):
-        result = [
-            _sanitize_sage_data(item, limit)
-            for item in value[:_MAX_SANITIZED_COLLECTION_ITEMS]
-        ]
-        if len(value) > _MAX_SANITIZED_COLLECTION_ITEMS:
-            result.append({"_truncated_items": len(value) - _MAX_SANITIZED_COLLECTION_ITEMS})
-        return result
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return _sanitize_sage_text(value, limit)
+    """Recursively sanitize diagnostic data with depth/node/cycle bounds."""
+    context = {"nodes": 0, "active": set()}
+
+    def sanitize(item: Any, depth: int) -> Any:
+        context["nodes"] += 1
+        if context["nodes"] > _MAX_SANITIZED_NODES or depth > _MAX_SANITIZED_DEPTH:
+            return _TRUNCATED
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in context["active"]:
+                return _CYCLE
+            context["active"].add(identity)
+            result = {}
+            try:
+                for index, (key, child) in enumerate(item.items()):
+                    if index >= _MAX_SANITIZED_COLLECTION_ITEMS:
+                        result["_truncated_items"] = _TRUNCATED
+                        break
+                    raw_key = _safe_string(key)
+                    safe_key = _bounded_diagnostic_name(key)
+                    if not 0 < len(raw_key) <= _MAX_SAGE_FIELD_NAME_CHARS:
+                        result[safe_key] = _REDACTED
+                        continue
+                    kind = _classify_sage_field(safe_key)
+                    if kind == _FIELD_SAFE:
+                        result[safe_key] = child if _safe_scalar_value(child) else _REDACTED
+                    elif kind in {_FIELD_CONTAINER, _FIELD_SCALAR}:
+                        result[safe_key] = _REDACTED
+                    else:
+                        result[safe_key] = sanitize(child, depth + 1)
+            finally:
+                context["active"].remove(identity)
+            return result
+        if isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in context["active"]:
+                return _CYCLE
+            context["active"].add(identity)
+            try:
+                result = [
+                    sanitize(child, depth + 1)
+                    for child in item[:_MAX_SANITIZED_COLLECTION_ITEMS]
+                ]
+                if len(item) > _MAX_SANITIZED_COLLECTION_ITEMS:
+                    result.append({_TRUNCATED: _TRUNCATED})
+                return result
+            finally:
+                context["active"].remove(identity)
+        if isinstance(item, (int, float, bool)) or item is None:
+            return item if not isinstance(item, float) or math.isfinite(item) else _REDACTED
+        return _sanitize_sage_text(item, min(int(limit), _MAX_SAGE_SCALAR_CHARS))
+
+    return sanitize(value, 0)
+
+
+def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
+    """Sanitize bounded free text, parsing valid JSON before text scanning."""
+    raw = _safe_string(value)
+    input_was_truncated = len(raw) > _MAX_SAGE_SCAN_CHARS
+    text = raw[:_MAX_SAGE_SCAN_CHARS]
+    try:
+        parsed = _json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+        parsed_json = False
+    else:
+        parsed_json = True
+
+    if parsed_json:
+        serialized = _json.dumps(
+            _sanitize_sage_data(parsed),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        bounded_limit = max(0, min(int(limit), _MAX_SAGE_EMIT_CHARS))
+        if not input_was_truncated and len(serialized) <= bounded_limit:
+            return serialized
+        fallback = _json.dumps({"_truncated": _TRUNCATED}, separators=(",", ":"))
+        return fallback if len(fallback) <= bounded_limit else ""
+
+    text = _redact_pem_blocks(text)
+    text = _redact_sage_assignments(text)
+    return _bounded_text(text, limit, input_was_truncated)
+
+
+def _summarize_sage_payload(value: Any) -> Any:
+    """Summarize payload keys/types/sizes without copying arbitrary values."""
+    context = {"nodes": 0, "active": set()}
+
+    def scalar_summary(item: Any) -> dict[str, Any]:
+        if item is None:
+            return {"type": "null"}
+        if isinstance(item, bool):
+            return {"type": "bool"}
+        if isinstance(item, (int, float)):
+            return {"type": "number"}
+        if isinstance(item, (str, bytes, bytearray)):
+            return {"type": "string", "size": len(item)}
+        return {"type": type(item).__name__}
+
+    def summarize(item: Any, depth: int) -> Any:
+        context["nodes"] += 1
+        if context["nodes"] > _MAX_SANITIZED_NODES or depth > _MAX_SANITIZED_DEPTH:
+            return _TRUNCATED
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in context["active"]:
+                return _CYCLE
+            context["active"].add(identity)
+            fields = {}
+            try:
+                for index, (key, child) in enumerate(item.items()):
+                    if index >= _MAX_SANITIZED_COLLECTION_ITEMS:
+                        fields["_truncated_items"] = _TRUNCATED
+                        break
+                    raw_key = _safe_string(key)
+                    safe_key = _bounded_diagnostic_name(key)
+                    if not 0 < len(raw_key) <= _MAX_SAGE_FIELD_NAME_CHARS:
+                        fields[safe_key] = _REDACTED
+                        continue
+                    kind = _classify_sage_field(safe_key)
+                    if kind == _FIELD_SAFE:
+                        fields[safe_key] = (
+                            child if _safe_scalar_value(child) else _REDACTED
+                        )
+                    elif kind in {_FIELD_CONTAINER, _FIELD_SCALAR}:
+                        fields[safe_key] = _REDACTED
+                    else:
+                        fields[safe_key] = summarize(child, depth + 1)
+            finally:
+                context["active"].remove(identity)
+            return {"type": "object", "size": len(item), "fields": fields}
+        if isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in context["active"]:
+                return _CYCLE
+            context["active"].add(identity)
+            try:
+                item_summaries = [
+                    summarize(child, depth + 1)
+                    for child in item[:_MAX_SANITIZED_COLLECTION_ITEMS]
+                ]
+                if len(item) > _MAX_SANITIZED_COLLECTION_ITEMS:
+                    item_summaries.append(_TRUNCATED)
+            finally:
+                context["active"].remove(identity)
+            return {"type": "array", "size": len(item), "items": item_summaries}
+        return scalar_summary(item)
+
+    return summarize(value, 0)
+
+
+def _safe_metadata_from_text(text: str) -> dict[str, Any]:
+    metadata = {}
+    sanitized = _redact_sage_assignments(_redact_pem_blocks(text))
+    for head in _assignment_heads(sanitized):
+        if head["kind"] != _FIELD_SAFE or head["safe_end"] is None:
+            continue
+        source_value = sanitized[head["value_start"] : head["safe_end"]]
+        if source_value.startswith('"'):
+            try:
+                value = _json.loads(source_value)
+            except (TypeError, ValueError):
+                continue
+        elif source_value == "true":
+            value = True
+        elif source_value == "false":
+            value = False
+        elif source_value == "null":
+            value = None
+        else:
+            value = source_value
+        metadata["_".join(_normalise_sage_field_name(head["name"]))] = value
+    return metadata
+
+
+def _summarize_sage_response(raw: str) -> Any:
+    bounded = raw[:_MAX_SAGE_SCAN_CHARS]
+    try:
+        parsed = _json.loads(bounded)
+    except (TypeError, ValueError):
+        summary = {"type": "text", "size": len(raw)}
+        metadata = _safe_metadata_from_text(bounded)
+        if metadata:
+            summary["metadata"] = metadata
+        return summary
+    return _summarize_sage_payload(parsed)
+
+
+_KNOWN_SAGE_OPERATIONAL_CODES = {
+    "ALREADY_INCLUDING_TRANSACTION",
+    "BAD_AGGREGATE_SIGNATURE",
+    "MEMPOOL_CONFLICT",
+    "NO_SPENDABLE_COINS",
+    "UNKNOWN_UNSPENT",
+}
+_STABLE_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{2,63}\Z")
+
+
+def _stable_sage_code(value: Any, allow_known_prefix: bool) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if candidate in _KNOWN_SAGE_OPERATIONAL_CODES:
+        return candidate
+    if allow_known_prefix:
+        for code in _KNOWN_SAGE_OPERATIONAL_CODES:
+            if candidate == code or candidate.startswith(code + " ") or candidate.startswith(code + ":"):
+                return code
+    return None
+
+
+def _classify_sage_response_error(parsed: Any, raw: str) -> Optional[str]:
+    """Extract a stable code from explicit fields or an anchored text record."""
+    if isinstance(parsed, dict):
+        for field in ("error_code", "code"):
+            code = _stable_sage_code(parsed.get(field), allow_known_prefix=False)
+            if code:
+                return code
+        for field in ("error", "error_message", "status"):
+            code = _stable_sage_code(parsed.get(field), allow_known_prefix=True)
+            if code:
+                return code
+        return None
+    return _stable_sage_code(raw.lstrip(), allow_known_prefix=True)
+
+
+def _sage_response_is_application_failure(parsed: Any) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("success") is False:
+        return True
+    if parsed.get("error") or parsed.get("error_message"):
+        return True
+    return str(parsed.get("status") or "").strip().lower() in {
+        "error",
+        "failed",
+        "failure",
+    }
 
 
 # Sage defaults to port 9257 — uses HTTPS with self-signed cert
@@ -519,13 +953,32 @@ def _parse_sage_rpc_url(url: str) -> Tuple[str, int]:
 _SAGE_HOST, _SAGE_PORT = _parse_sage_rpc_url(WALLET_URL)
 
 
-class SageMempoolConflict(Exception):
+class _SageRPCFailure(Exception):
+    """Typed failure that retains only bounded, sanitized diagnostics."""
+
+    error_code = "SAGE_RPC_ERROR"
+
+    def __init__(
+        self,
+        *_discarded_remote_text: Any,
+        status: Optional[int] = None,
+        response_summary: Any = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        self.status = status
+        self.response_summary = response_summary
+        if error_code:
+            self.error_code = error_code
+        super().__init__(self.error_code)
+
+
+class SageMempoolConflict(_SageRPCFailure):
     """Raised when Sage reports a MEMPOOL_CONFLICT — two transactions tried to spend the same coin."""
 
-    pass
+    error_code = "MEMPOOL_CONFLICT"
 
 
-class SageUnknownUnspent(Exception):
+class SageUnknownUnspent(_SageRPCFailure):
     """Raised when Sage reports UNKNOWN_UNSPENT — the coin doesn't exist in the UTXO set.
 
     Common causes:
@@ -534,16 +987,32 @@ class SageUnknownUnspent(Exception):
     - Stale coin ID from a previous state
     """
 
-    pass
+    error_code = "UNKNOWN_UNSPENT"
 
 
-class SageAlreadyIncluding(Exception):
+class SageAlreadyIncluding(_SageRPCFailure):
     """Raised when Sage reports ALREADY_INCLUDING_TRANSACTION — the cancel TX
     is already in the mempool from a previous submit. This is effectively a
     success: the cancel is in flight and just needs blocks to confirm.
     """
 
-    pass
+    error_code = "ALREADY_INCLUDING_TRANSACTION"
+
+
+class SageOperationalError(_SageRPCFailure):
+    """Raised for a stable Sage code without a dedicated exception type."""
+
+
+class SageHTTPError(_SageRPCFailure, ConnectionError):
+    """HTTP failure whose raw response is discarded at the transport boundary."""
+
+    error_code = "SAGE_HTTP_ERROR"
+
+
+class SageConnectionError(_SageRPCFailure, ConnectionError):
+    """Transport failure whose exception text is discarded at the boundary."""
+
+    error_code = "SAGE_CONNECTION_ERROR"
 
 
 def _sage_tx_error_level(kind: str, endpoint: str) -> str:
@@ -674,7 +1143,7 @@ def ensure_initialized(force_retry: bool = False) -> bool:
             result = rpc("initialize", {}, timeout=_INIT_RPC_TIMEOUT)
             if _rpc_succeeded(result):
                 _console("  [Sage] initialize OK")
-            elif isinstance(result, dict) and "404" in str(result.get("error", "")):
+            elif isinstance(result, dict) and result.get("http_status") == 404:
                 _console(
                     "  [Sage] initialize endpoint not found (Sage version doesn't require it) — OK"
                 )
@@ -747,6 +1216,21 @@ def _get_sage_connection(timeout: int = 10):
     return conn
 
 
+def _raise_sage_response_failure(
+    code: Optional[str], status: Optional[int], response_summary: Any
+) -> None:
+    failure_args = {"status": status, "response_summary": response_summary}
+    if code == "MEMPOOL_CONFLICT":
+        raise SageMempoolConflict(**failure_args)
+    if code == "UNKNOWN_UNSPENT":
+        raise SageUnknownUnspent(**failure_args)
+    if code == "ALREADY_INCLUDING_TRANSACTION":
+        raise SageAlreadyIncluding(**failure_args)
+    if code:
+        raise SageOperationalError(error_code=code, **failure_args)
+    raise SageHTTPError(**failure_args)
+
+
 def _sage_post(path: str, payload: dict, timeout: int = 10):
     """Low-level HTTPS POST to Sage, bypassing requests library entirely.
 
@@ -757,106 +1241,56 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
     body = _json.dumps(payload).encode("utf-8")
     headers_dict = {"Content-Type": "application/json", "Connection": "keep-alive"}
 
-    conn = _get_sage_connection(timeout)
     try:
-        conn.request("POST", "/" + path.lstrip("/"), body=body, headers=headers_dict)
-        resp = conn.getresponse()
-        data = resp.read().decode("utf-8")
-    except Exception:
-        # Connection was stale — recreate and retry once
-        _conn_local.conn = None
-        ctx = ssl._create_unverified_context()
-        if CERT_PATH and KEY_PATH:
-            ctx.load_cert_chain(CERT_PATH, KEY_PATH)
-        conn = http.client.HTTPSConnection(
-            _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
-        )
-        _conn_local.conn = conn
-        conn.request("POST", "/" + path.lstrip("/"), body=body, headers=headers_dict)
-        resp = conn.getresponse()
-        data = resp.read().decode("utf-8")
-
-    def _log_sage_error(kind: str, snippet: str):
-        """Always-on structured logger for sage transaction errors so we
-        can grep / display them in the GUI. Fail-open."""
+        conn = _get_sage_connection(timeout)
         try:
-            from database import log_event as _le
-
-            # Capture which thread raised this so we can correlate with
-            # boost_step/cancel/create activity in the same window.
-            import threading as _t
-
-            level = _sage_tx_error_level(kind, path)
-            expected_cancel_settlement = level == "info"
-            safe_path = _sanitize_sage_text(path, 120)
-            safe_snippet = _sanitize_sage_text(snippet, 500)
-            if expected_cancel_settlement:
-                message = (
-                    f"Sage {kind} on {safe_path}: cancel appears in flight; "
-                    "the bot will verify before marking it cancelled"
-                )
-            else:
-                message = f"⚠️ Sage {kind} on {safe_path}: {safe_snippet[:200]}"
-            _le(
-                level,
-                f"sage_{kind.lower()}",
-                message,
-                data={
-                    "endpoint": safe_path,
-                    "kind": kind,
-                    "snippet": safe_snippet,
-                    "expected_cancel_settlement": expected_cancel_settlement,
-                    "thread": _t.current_thread().name,
-                },
+            conn.request(
+                "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
             )
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8")
         except Exception:
-            pass
+            # Connection was stale — recreate and retry once.
+            _conn_local.conn = None
+            ctx = ssl._create_unverified_context()
+            if CERT_PATH and KEY_PATH:
+                ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+            conn = http.client.HTTPSConnection(
+                _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
+            )
+            _conn_local.conn = conn
+            conn.request(
+                "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
+            )
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8")
+    except _SageRPCFailure:
+        raise
+    except Exception:
+        raise SageConnectionError() from None
 
     if resp.status == 200:
         parsed = _json.loads(data)
-        # Check for transaction errors in the response body
-        # Sage may return 200 but include error details in the JSON
-        if isinstance(parsed, dict):
-            error_msg = parsed.get("error") or parsed.get("error_message") or ""
-            status = parsed.get("status") or ""
-            combined = str(error_msg) + str(status)
-            if "MEMPOOL_CONFLICT" in combined:
-                _log_sage_error("MEMPOOL_CONFLICT", combined)
-                raise SageMempoolConflict(
-                    f"MEMPOOL_CONFLICT on {path}: another transaction already spent one of these coins"
-                )
-            if "UNKNOWN_UNSPENT" in combined:
-                _log_sage_error("UNKNOWN_UNSPENT", combined)
-                raise SageUnknownUnspent(
-                    f"UNKNOWN_UNSPENT on {path}: coin not in UTXO set (not confirmed or already spent)"
-                )
-            if "ALREADY_INCLUDING_TRANSACTION" in combined:
-                _log_sage_error("ALREADY_INCLUDING", combined)
-                raise SageAlreadyIncluding(
-                    f"ALREADY_INCLUDING_TRANSACTION on {path}: cancel TX already in mempool"
-                )
+        code = _classify_sage_response_error(parsed, data)
+        if code:
+            _raise_sage_response_failure(
+                code,
+                resp.status,
+                _summarize_sage_payload(parsed),
+            )
+        if _sage_response_is_application_failure(parsed):
+            raise _SageRPCFailure(
+                status=resp.status,
+                response_summary=_summarize_sage_payload(parsed),
+            )
         return parsed
-    else:
-        # Check for specific error types in non-200 responses
-        if "MEMPOOL_CONFLICT" in data:
-            _log_sage_error("MEMPOOL_CONFLICT", data)
-            raise SageMempoolConflict(
-                f"MEMPOOL_CONFLICT on {path}: {_sanitize_sage_text(data, 200)}"
-            )
-        if "UNKNOWN_UNSPENT" in data:
-            _log_sage_error("UNKNOWN_UNSPENT", data)
-            raise SageUnknownUnspent(
-                f"UNKNOWN_UNSPENT on {path}: {_sanitize_sage_text(data, 200)}"
-            )
-        if "ALREADY_INCLUDING_TRANSACTION" in data:
-            _log_sage_error("ALREADY_INCLUDING", data)
-            raise SageAlreadyIncluding(
-                "ALREADY_INCLUDING_TRANSACTION on "
-                f"{path}: {_sanitize_sage_text(data, 200)}"
-            )
-        raise ConnectionError(
-            f"Sage HTTP {resp.status}: {_sanitize_sage_text(data, 300)}"
-        )
+
+    try:
+        parsed = _json.loads(data)
+    except (TypeError, ValueError):
+        parsed = None
+    code = _classify_sage_response_error(parsed, data)
+    _raise_sage_response_failure(code, resp.status, _summarize_sage_response(data))
 
 
 # Quiet mode: suppress RPC error logging
@@ -867,6 +1301,113 @@ def set_quiet_mode(quiet: bool):
     """Enable/disable RPC error suppression."""
     global _quiet_mode
     _quiet_mode = quiet
+
+
+def _safe_sage_endpoint(endpoint: Any) -> str:
+    raw = _safe_string(endpoint)[:_MAX_SAGE_SCAN_CHARS]
+    before_fragment, fragment_separator, fragment = raw.partition("#")
+    path, query_separator, query = before_fragment.partition("?")
+    sanitized_path = _sanitize_sage_text(path, 256)
+    safe_path = re.sub(r"[^A-Za-z0-9._~%/+:\[\]-]", "_", sanitized_path)[:256]
+
+    def safe_parameters(parameters: str) -> str:
+        parts = []
+        for raw_part in re.split(r"[&;]", parameters):
+            if not raw_part:
+                continue
+            name = raw_part.split("=", 1)[0]
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+            safe_name = safe_name[:_MAX_SAGE_FIELD_NAME_CHARS] or _REDACTED
+            parts.append(f"{safe_name}={_REDACTED}")
+        return "&".join(parts)
+
+    result = safe_path
+    if query_separator:
+        result += "?" + safe_parameters(query)
+    if fragment_separator:
+        result += "#" + safe_parameters(fragment)
+    return _bounded_text(result, 512)
+
+
+_SAGE_FIXED_MESSAGES = {
+    "ALREADY_INCLUDING_TRANSACTION": "Sage reports that the transaction is already pending.",
+    "BAD_AGGREGATE_SIGNATURE": "Sage rejected the transaction signature.",
+    "MEMPOOL_CONFLICT": (
+        "Sage rejected the transaction because an input is already spent or pending."
+    ),
+    "NO_SPENDABLE_COINS": "Sage reports that no spendable coins are available.",
+    "SAGE_CONNECTION_ERROR": "The Sage RPC service could not be reached.",
+    "SAGE_HTTP_ERROR": "The Sage RPC service returned an HTTP error.",
+    "SAGE_RPC_ERROR": "The Sage RPC request failed.",
+    "UNKNOWN_UNSPENT": "Sage reports that an input coin is not unspent.",
+}
+
+
+def _build_sage_diagnostic(
+    *,
+    endpoint: Any,
+    payload: Any,
+    error_code: str,
+    elapsed: float,
+    http_status: Optional[int] = None,
+    response_summary: Any = None,
+) -> dict[str, Any]:
+    code = (
+        error_code
+        if _STABLE_CODE_RE.fullmatch(str(error_code or ""))
+        else "SAGE_RPC_ERROR"
+    )
+    diagnostic = {
+        "success": False,
+        "error": code,
+        "error_code": code,
+        "message": _SAGE_FIXED_MESSAGES.get(
+            code, "The Sage RPC request failed with a wallet error."
+        ),
+        "endpoint": _safe_sage_endpoint(endpoint),
+        "http_status": http_status,
+        "elapsed_secs": round(max(0.0, float(elapsed)), 2),
+        "payload_summary": _summarize_sage_payload(payload or {}),
+    }
+    if response_summary is not None:
+        diagnostic["response_summary"] = response_summary
+    serialized = _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True)
+    if len("[Sage] ") + len(serialized) > _MAX_SAGE_EMIT_CHARS:
+        payload_type = diagnostic["payload_summary"].get("type", "object")
+        payload_size = diagnostic["payload_summary"].get("size", 0)
+        diagnostic["payload_summary"] = {
+            "type": payload_type,
+            "size": payload_size,
+            "_truncated": _TRUNCATED,
+        }
+        if "response_summary" in diagnostic:
+            response = diagnostic["response_summary"]
+            response_type = response.get("type", "response") if isinstance(response, dict) else "response"
+            response_size = response.get("size") if isinstance(response, dict) else None
+            diagnostic["response_summary"] = {
+                "type": response_type,
+                "size": response_size,
+                "_truncated": _TRUNCATED,
+            }
+    return diagnostic
+
+
+def _emit_sage_diagnostic(diagnostic: dict[str, Any], endpoint: Any) -> None:
+    code = diagnostic["error_code"]
+    level = _sage_tx_error_level(code, _safe_string(endpoint))
+    if not _quiet_mode:
+        _console("[Sage] " + _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True))
+    try:
+        from database import log_event as _le
+
+        _le(
+            level,
+            f"sage_{code.lower()}",
+            diagnostic["message"],
+            data=diagnostic,
+        )
+    except Exception:
+        pass
 
 
 def rpc(endpoint: str, payload: dict, timeout: int = 10):
@@ -887,7 +1428,6 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
             return None
 
     start = time.time()
-    safe_endpoint = _sanitize_sage_text(endpoint, 120)
 
     try:
         result = _sage_post(endpoint, payload, timeout=timeout)
@@ -895,101 +1435,36 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         if WALLET_DEBUG:
             elapsed = time.time() - start
             if elapsed > 1.0:
-                _console(f"⏱️  [Sage] {safe_endpoint} took {elapsed:.2f}s")
+                _console(
+                    f"⏱️  [Sage] {_safe_sage_endpoint(endpoint)} took {elapsed:.2f}s"
+                )
 
         return result
-    except SageMempoolConflict as e:
-        elapsed = time.time() - start
-        safe_error = _sanitize_sage_text(e)
-        _conflict_level = _sage_tx_error_level("MEMPOOL_CONFLICT", endpoint)
-        if _conflict_level == "info":
-            _console(
-                f"   [Sage] cancel already in flight on {safe_endpoint} "
-                f"(after {elapsed:.2f}s); will verify"
-            )
-        else:
-            _console(
-                "⚠️  [Sage] MEMPOOL_CONFLICT on "
-                f"{safe_endpoint} (after {elapsed:.2f}s): {safe_error}"
-            )
-        # Structured event so we can query/display these in the GUI and
-        # diagnose root cause. Includes payload key summary so we know
-        # which coin/offer triggered it (without dumping full payloads).
-        try:
-            from database import log_event as _le
-
-            _payload_summary = _sanitize_sage_data(payload or {})
-            if _conflict_level == "info":
-                message = (
-                    f"Sage MEMPOOL_CONFLICT on {safe_endpoint} after {elapsed:.2f}s: "
-                    "cancel appears in flight; bot will verify"
-                )
-            else:
-                message = (
-                    f"⚠️ Sage MEMPOOL_CONFLICT on {safe_endpoint} after {elapsed:.2f}s: "
-                    f"{safe_error[:200]}"
-                )
-            _le(
-                _conflict_level,
-                "sage_mempool_conflict",
-                message,
-                data={
-                    "endpoint": safe_endpoint,
-                    "elapsed_secs": round(elapsed, 2),
-                    "error_message": safe_error,
-                    "expected_cancel_settlement": _conflict_level == "info",
-                    "payload_summary": _payload_summary,
-                },
-            )
-        except Exception:
-            pass  # additive — never block on logging failure
-        # Return a structured error so callers can detect this specific failure
-        return {
-            "error": "MEMPOOL_CONFLICT",
-            "success": False,
-            "message": safe_error,
-            "endpoint": safe_endpoint,
-        }
-    except SageUnknownUnspent as e:
-        elapsed = time.time() - start
-        safe_error = _sanitize_sage_text(e)
-        _console(
-            f"⚠️  [Sage] UNKNOWN_UNSPENT on {safe_endpoint} (after {elapsed:.2f}s): "
-            f"{safe_error}"
+    except _SageRPCFailure as error:
+        diagnostic = _build_sage_diagnostic(
+            endpoint=endpoint,
+            payload=payload,
+            error_code=error.error_code,
+            elapsed=time.time() - start,
+            http_status=error.status,
+            response_summary=error.response_summary,
         )
-        # Return structured error — coin not confirmed on-chain yet or already spent
-        return {
-            "error": "UNKNOWN_UNSPENT",
-            "success": False,
-            "message": safe_error,
-            "endpoint": safe_endpoint,
-        }
-    except ConnectionError as e:
-        elapsed = time.time() - start
-        err_str = str(e)
-        safe_error = _sanitize_sage_text(e, 300)
-        # Suppress the noisy error print for the one expected 404 case:
-        # `initialize` returns 404 on Sage versions that don't require an
-        # explicit init RPC. ensure_initialized() handles this dict and
-        # treats it as success — there's no need to scare the operator
-        # with a ❌ line in the log every startup.
-        _is_expected_init_404 = endpoint == "initialize" and "404" in err_str
-        if not _quiet_mode and not _is_expected_init_404:
-            _console(
-                f"❌ Sage RPC error calling {safe_endpoint} (after {elapsed:.2f}s): "
-                f"{safe_error}"
-            )
-        # Return structured error so callers can see the actual message
-        # (previously returned None which became "Unknown error" in logs)
-        return {"error": safe_error, "success": False, "endpoint": safe_endpoint}
-    except Exception as e:
-        elapsed = time.time() - start
-        if not _quiet_mode:
-            _console(
-                f"❌ Sage RPC error calling {safe_endpoint} (after {elapsed:.2f}s): "
-                f"{_sanitize_sage_text(e)}"
-            )
-        return None
+    except ConnectionError:
+        diagnostic = _build_sage_diagnostic(
+            endpoint=endpoint,
+            payload=payload,
+            error_code="SAGE_CONNECTION_ERROR",
+            elapsed=time.time() - start,
+        )
+    except Exception:
+        diagnostic = _build_sage_diagnostic(
+            endpoint=endpoint,
+            payload=payload,
+            error_code="SAGE_RPC_ERROR",
+            elapsed=time.time() - start,
+        )
+    _emit_sage_diagnostic(diagnostic, endpoint)
+    return diagnostic
 
 
 def full_node_rpc(endpoint: str, payload: dict, timeout: int = 5):

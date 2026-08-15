@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 import unittest
@@ -16,6 +17,373 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_fail_closed_authorization_and_cookie_state_machine_matrix(self):
+        cases = (
+            (
+                "Authorization: Digest username=AUTH_USER, realm=AUTH_REALM, "
+                'nonce="AUTH_NONCE", response="AUTH_RESPONSE=="\r\n'
+                " header_count=FOLDED_NOT_A_BOUNDARY\r\n"
+                "header_count=SAFE_HEADER_COUNT",
+                ("AUTH_USER", "AUTH_REALM", "AUTH_NONCE", "AUTH_RESPONSE"),
+                "header_count=SAFE_HEADER_COUNT",
+            ),
+            (
+                "Proxy-Authorization: Digest username=PROXY_USER; nonce=PROXY_NONCE; "
+                "response=PROXY_RESPONSE==\n"
+                "auth_method=SAFE_AUTH_METHOD",
+                ("PROXY_USER", "PROXY_NONCE", "PROXY_RESPONSE"),
+                "auth_method=SAFE_AUTH_METHOD",
+            ),
+            (
+                "Authorization: Bearer BEARER.SECRET/+==, tail=STILL_SECRET\r"
+                "Authorization: Basic BASIC_SECRET==\r",
+                ("BEARER.SECRET", "STILL_SECRET", "BASIC_SECRET"),
+                None,
+            ),
+            (
+                "Cookie: first=COOKIE_ONE; second=COOKIE_TWO; flag=COOKIE_FLAG\r\n"
+                "Set-Cookie: session=SET_COOKIE; Expires=Wed, 21 Oct 2030 "
+                "07:28:00 GMT; Path=/admin; HttpOnly\r\n",
+                ("COOKIE_ONE", "COOKIE_TWO", "COOKIE_FLAG", "SET_COOKIE", "2030"),
+                None,
+            ),
+        )
+
+        for source, sentinels, compatibility_value in cases:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                for sentinel in sentinels:
+                    self.assertNotIn(sentinel, sanitized)
+                if compatibility_value is not None:
+                    self.assertIn(compatibility_value, sanitized)
+                self.assertEqual(
+                    wallet_sage._sanitize_sage_text(sanitized), sanitized
+                )
+
+    def test_fail_closed_scalar_metadata_and_negative_name_matrix(self):
+        sensitive = (
+            "token=one TOKEN TWO, generic=STILL_TOKEN; tail",
+            "secret: one SECRET TWO; detail=STILL_SECRET!",
+            "password='one PASSWORD TWO; generic=STILL_PASSWORD'",
+            "private_key=[one, KEY_TWO, nested=STILL_KEY]",
+            "seed_phrase={one: SEED_TWO, nested=STILL_SEED}",
+            "signature=one SIGNATURE_TWO!!!",
+            "certificate=one CERTIFICATE_TWO...",
+            "puzzle_reveal=one PUZZLE_REVEAL_TWO",
+            "APIToken=one ACRONYM_CAMEL_TWO",
+            "HTTPAuthorizationHeader=one HTTP_HEADER_TWO",
+        )
+        for source in sensitive:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(
+                    "benign prefix: " + source
+                )
+                self.assertNotIn("TWO", sanitized)
+                self.assertNotIn("STILL_", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+        exact_safe = (
+            "header_count=SAFE_HEADER_COUNT",
+            "certificateStatus=valid",
+            "signature-status=verified",
+            "auth method=SAFE_AUTH_METHOD",
+            "seed_count=12",
+            "tokenPresence=true",
+            'private-key-status="available"',
+        )
+        for source in exact_safe:
+            with self.subTest(source=source):
+                self.assertEqual(wallet_sage._sanitize_sage_text(source), source)
+
+        fail_closed_near_misses = (
+            "header_count=unsafe metadata with spaces SECRET_NEAR_MISS",
+            "certificate_count=CERTIFICATE_NEAR_MISS",
+            "auth_status=AUTH_NEAR_MISS",
+            "private_key_status=UNSAFE*STATUS",
+            "HTTPHeaderCount=HTTP_HEADER_NEAR_MISS",
+        )
+        for source in fail_closed_near_misses:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertNotIn("NEAR_MISS", sanitized)
+                self.assertNotIn("UNSAFE*STATUS", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+        negatives = (
+            "monkey_count=VISIBLE_MONKEY",
+            "keyframe=VISIBLE_KEYFRAME",
+            "token_count=VISIBLE_TOKEN_COUNT",
+            "public_key=VISIBLE_PUBLIC_KEY",
+        )
+        for source in negatives:
+            with self.subTest(source=source):
+                self.assertEqual(wallet_sage._sanitize_sage_text(source), source)
+
+    def test_fail_closed_json_pem_malformed_and_output_bounds(self):
+        source = {
+            "nested": {
+                "authorization": "JSON_AUTH_SENTINEL",
+                "safe": "escaped quote: \\\" and bracket ]",
+                "metadata": {"headerCount": "SAFE_HEADER_COUNT"},
+            },
+            "items": [{"password": "JSON_PASSWORD_SENTINEL"}],
+        }
+        sanitized_json = wallet_sage._sanitize_sage_text(
+            json.dumps(source, indent=2)
+        )
+        parsed = json.loads(sanitized_json)
+        self.assertEqual(parsed["nested"]["authorization"], "[REDACTED]")
+        self.assertEqual(parsed["items"][0]["password"], "[REDACTED]")
+        self.assertEqual(
+            parsed["nested"]["metadata"]["headerCount"], "SAFE_HEADER_COUNT"
+        )
+
+        malformed = (
+            '{"authorization": "MALFORMED_JSON_SENTINEL",',
+            'token="UNTERMINATED_QUOTE_SENTINEL',
+            "private_key=[UNBALANCED_BRACKET_SENTINEL",
+            "multiline_secret=FIRST_LINE_SENTINEL\nSECOND_LINE_VISIBLE",
+        )
+        for source_text in malformed:
+            with self.subTest(source=source_text):
+                sanitized = wallet_sage._sanitize_sage_text(source_text)
+                self.assertNotIn("SENTINEL", sanitized)
+
+        pem = (
+            "before\n-----BEGIN PRIVATE KEY-----\nPRIVATE_PEM_SENTINEL\n"
+            "-----END PRIVATE KEY-----\nafter\n"
+            "-----BEGIN CERTIFICATE-----\nCERT_PEM_SENTINEL\n"
+            "-----END CERTIFICATE-----\nlast\n"
+            "-----BEGIN EC PRIVATE KEY-----\nUNFINISHED_PEM_SENTINEL"
+        )
+        sanitized_pem = wallet_sage._sanitize_sage_text(pem)
+        self.assertNotIn("PEM_SENTINEL", sanitized_pem)
+        self.assertEqual(sanitized_pem.count("[REDACTED]"), 3)
+        self.assertIn("before", sanitized_pem)
+        self.assertIn("after", sanitized_pem)
+
+        huge = "safe-prefix\r\ntoken=" + "HUGE_SECRET_SENTINEL" * 2000
+        bounded = wallet_sage._sanitize_sage_text(huge, limit=2048)
+        self.assertLessEqual(len(bounded), 2048)
+        self.assertNotIn("SENTINEL", bounded)
+        self.assertFalse(bounded.endswith("\r"))
+        self.assertNotRegex(bounded, r"\[(?:REDACTED|TRUNCATED)$")
+        self.assertEqual(wallet_sage._sanitize_sage_text(bounded, 2048), bounded)
+
+    def test_structured_sanitizer_enforces_all_bounds_and_cycles(self):
+        over_items = [{"token": f"ITEM_SECRET_{index}"} for index in range(70)]
+        over_depth = current = {}
+        for _ in range(10):
+            child = {}
+            current["child"] = child
+            current = child
+        over_nodes = [list(range(4)) for _ in range(64)]
+        cycle = {"safe": "CYCLE_SAFE"}
+        cycle["self"] = cycle
+        overlong_name = "x" * 70 + "Token"
+
+        sanitized_items = wallet_sage._sanitize_sage_data(over_items)
+        sanitized_depth = wallet_sage._sanitize_sage_data(over_depth)
+        sanitized_nodes = wallet_sage._sanitize_sage_data(over_nodes)
+        try:
+            sanitized_cycle = wallet_sage._sanitize_sage_data(cycle)
+        except RecursionError:
+            sanitized_cycle = "RECURSION_LEAK"
+        sanitized_long_name = wallet_sage._sanitize_sage_data(
+            {overlong_name: "OVERLONG_NAME_SECRET_SENTINEL"}
+        )
+
+        self.assertLessEqual(len(sanitized_items), 65)
+        self.assertIn("[TRUNCATED]", repr(sanitized_items))
+        self.assertIn("[TRUNCATED]", repr(sanitized_depth))
+        self.assertIn("[TRUNCATED]", repr(sanitized_nodes))
+        self.assertEqual(sanitized_cycle["self"], "[CYCLE]")
+        self.assertNotIn("OVERLONG_NAME_SECRET_SENTINEL", repr(sanitized_long_name))
+        self.assertEqual(
+            wallet_sage._sanitize_sage_data(sanitized_cycle), sanitized_cycle
+        )
+
+    def test_rpc_reuses_one_fixed_diagnostic_and_discards_remote_text(self):
+        class FakeResponse:
+            status = 500
+
+            def read(self):
+                return (
+                    b"MEMPOOL_CONFLICT remote prose RESPONSE_SENTINEL "
+                    b"Authorization: Digest username=REMOTE_USER, "
+                    b'response="REMOTE_DIGEST"\r\n'
+                    b" auth_method=FOLDED_METADATA_SENTINEL\r\n"
+                    b"header_count=SAFE_HEADER_COUNT"
+                )
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        console_messages = []
+        events = []
+        fake_database = types.ModuleType("database")
+        fake_database.log_event = lambda *args, **kwargs: events.append((args, kwargs))
+        payload = {
+            "token": "PAYLOAD_SENTINEL",
+            "ordinary": "ARBITRARY_PAYLOAD_STRING_SENTINEL",
+            "header_count": "SAFE_HEADER_COUNT",
+        }
+
+        with (
+            patch.dict(sys.modules, {"database": fake_database}),
+            patch.object(
+                wallet_sage, "_get_sage_connection", return_value=FakeConnection()
+            ),
+            patch.object(wallet_sage, "_console", side_effect=console_messages.append),
+        ):
+            result = wallet_sage.rpc(
+                "submit/api_token=PATH_SENTINEL?api_token=ENDPOINT_SENTINEL"
+                "#secret=FRAGMENT_SENTINEL",
+                payload,
+            )
+
+        self.assertEqual(result["error"], "MEMPOOL_CONFLICT")
+        self.assertEqual(result["error_code"], "MEMPOOL_CONFLICT")
+        self.assertEqual(result["http_status"], 500)
+        self.assertEqual(
+            result["message"],
+            "Sage rejected the transaction because an input is already spent or pending.",
+        )
+        self.assertIs(events[0][1]["data"], result)
+        self.assertEqual(events[0][0][2], result["message"])
+        observed = repr((result, console_messages, events))
+        for sentinel in (
+            "RESPONSE_SENTINEL",
+            "REMOTE_USER",
+            "REMOTE_DIGEST",
+            "FOLDED_METADATA_SENTINEL",
+            "PAYLOAD_SENTINEL",
+            "ARBITRARY_PAYLOAD_STRING_SENTINEL",
+            "PATH_SENTINEL",
+            "ENDPOINT_SENTINEL",
+            "FRAGMENT_SENTINEL",
+        ):
+            with self.subTest(sentinel=sentinel):
+                self.assertNotIn(sentinel, observed)
+        self.assertIn("SAFE_HEADER_COUNT", observed)
+        self.assertNotIn("response_snippet", result)
+
+    def test_rpc_preserves_success_and_classifies_stable_codes_without_substrings(self):
+        success = {"success": True, "value": "APPLICATION_RESULT_UNCHANGED"}
+        with patch.object(wallet_sage, "_sage_post", return_value=success):
+            self.assertIs(wallet_sage.rpc("get_balance", {}), success)
+
+        cases = (
+            ("NO_SPENDABLE_COINS", "NO_SPENDABLE_COINS"),
+            ("UNKNOWN_UNSPENT", "UNKNOWN_UNSPENT"),
+            ("REMOTE_SECRET_SENTINEL", "SAGE_HTTP_ERROR"),
+            ("prefix MEMPOOL_CONFLICT is only remote prose", "SAGE_HTTP_ERROR"),
+        )
+        for remote_error, expected_code in cases:
+            class FakeResponse:
+                status = 409
+
+                def read(self):
+                    return json.dumps({"error": remote_error}).encode()
+
+            class FakeConnection:
+                def request(self, *args, **kwargs):
+                    pass
+
+                def getresponse(self):
+                    return FakeResponse()
+
+            with (
+                self.subTest(remote_error=remote_error),
+                patch.object(
+                    wallet_sage,
+                    "_get_sage_connection",
+                    return_value=FakeConnection(),
+                ),
+                patch.object(wallet_sage, "_console"),
+            ):
+                result = wallet_sage.rpc("submit_transaction", {})
+            self.assertEqual(result["error_code"], expected_code)
+            self.assertNotIn("REMOTE_SECRET_SENTINEL", repr(result))
+
+    def test_sage_post_discards_transport_exception_text_before_direct_callers(self):
+        with patch.object(
+            wallet_sage,
+            "_get_sage_connection",
+            side_effect=ConnectionError("TRANSPORT_EXCEPTION_SENTINEL"),
+        ):
+            with self.assertRaises(wallet_sage.SageConnectionError) as raised:
+                wallet_sage._sage_post("get_balance", {})
+
+        self.assertEqual(str(raised.exception), "SAGE_CONNECTION_ERROR")
+        self.assertNotIn("TRANSPORT_EXCEPTION_SENTINEL", repr(raised.exception.__dict__))
+
+    def test_rpc_diagnostic_emit_is_bounded_for_large_structured_inputs(self):
+        payload = {
+            f"ordinary_field_{index:02d}": "PAYLOAD_BOUND_SECRET_SENTINEL" * 20
+            for index in range(64)
+        }
+        response_summary = wallet_sage._summarize_sage_payload(
+            {
+                f"remote_field_{index:02d}": "RESPONSE_BOUND_SECRET_SENTINEL" * 20
+                for index in range(64)
+            }
+        )
+        console_messages = []
+        with (
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=wallet_sage.SageMempoolConflict(
+                    status=500, response_summary=response_summary
+                ),
+            ),
+            patch.object(wallet_sage, "_console", side_effect=console_messages.append),
+        ):
+            result = wallet_sage.rpc("submit_transaction", payload)
+
+        self.assertLessEqual(len(console_messages[0]), 2048)
+        self.assertLessEqual(len(json.dumps(result)), 2048)
+        self.assertNotIn("SECRET_SENTINEL", repr((result, console_messages)))
+        self.assertIn("[TRUNCATED]", repr(result))
+
+    def test_http_200_application_failure_discards_remote_error_text(self):
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "ambiguous REMOTE_APPLICATION_ERROR_SENTINEL",
+                        "authorization": "REMOTE_APPLICATION_AUTH_SENTINEL",
+                    }
+                ).encode()
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        with (
+            patch.object(
+                wallet_sage, "_get_sage_connection", return_value=FakeConnection()
+            ),
+            patch.object(wallet_sage, "_console"),
+        ):
+            result = wallet_sage.rpc("submit_transaction", {})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "SAGE_RPC_ERROR")
+        self.assertEqual(result["http_status"], 200)
+        self.assertNotIn("REMOTE_APPLICATION", repr(result))
+
     def test_colon_credentials_preserve_trailing_assignments_and_clean_marker(self):
         cases = (
             (
@@ -65,10 +433,10 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 '"header_count": "SAFE_HEADER_COUNT", '
                 '"proxy_authorization": "Basic JSON_PROXY_SECRET", '
                 '"auth_method": "SAFE_AUTH_METHOD"}',
-                '{"authorization": [REDACTED], '
-                '"header_count": "SAFE_HEADER_COUNT", '
-                '"proxy_authorization": [REDACTED], '
-                '"auth_method": "SAFE_AUTH_METHOD"}',
+                '{"authorization":"[REDACTED]",'
+                '"header_count":"SAFE_HEADER_COUNT",'
+                '"proxy_authorization":"[REDACTED]",'
+                '"auth_method":"SAFE_AUTH_METHOD"}',
                 2,
             ),
             (
@@ -76,7 +444,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 "Set-Cookie: session=SET_COOKIE_SECRET; Path=/\r\n"
                 "auth_method=SAFE_AUTH_METHOD",
                 "Cookie: [REDACTED]\r\n"
-                "Set-Cookie: [REDACTED]; Path=/\r\n"
+                "Set-Cookie: [REDACTED]\r\n"
                 "auth_method=SAFE_AUTH_METHOD",
                 2,
             ),
@@ -582,14 +950,22 @@ class TestWalletSageSigningGuard(unittest.TestCase):
         ):
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, observed)
-        for safe_value in (
+        for safe_name in (
+            "monkey_count",
+            "keyframe",
+            "token_count",
+            "public_key",
+        ):
+            with self.subTest(safe_name=safe_name):
+                self.assertIn(safe_name, observed)
+        for arbitrary_value in (
             "SAFE_MONKEY_COUNT",
             "SAFE_KEYFRAME",
             "SAFE_TOKEN_COUNT",
             "SAFE_PUBLIC_KEY",
         ):
-            with self.subTest(safe_value=safe_value):
-                self.assertIn(safe_value, observed)
+            with self.subTest(arbitrary_value=arbitrary_value):
+                self.assertNotIn(arbitrary_value, observed)
 
     def test_sanitizers_recursively_bound_variant_secret_data(self):
         secret = "LONG_SECRET_VALUE_" + "x" * 200
@@ -673,7 +1049,10 @@ class TestWalletSageSigningGuard(unittest.TestCase):
 
         observed = repr((result, console_messages))
         self.assertNotIn("CONNECTION_PRIVATE_KEY", observed)
-        self.assertIn("[REDACTED]", observed)
+        self.assertEqual(result["error_code"], "SAGE_CONNECTION_ERROR")
+        self.assertEqual(
+            result["message"], "The Sage RPC service could not be reached."
+        )
 
     def test_rpc_exception_paths_do_not_raise_when_console_is_cp1252(self):
         def cp1252_console(message, **kwargs):
@@ -690,10 +1069,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 "builtins.print", side_effect=cp1252_console
             ), patch.object(wallet_sage, "_sage_post", side_effect=error):
                 result = wallet_sage.rpc("test", {})
-            if isinstance(error, RuntimeError):
-                self.assertIsNone(result)
-            else:
-                self.assertFalse(result["success"])
+            self.assertFalse(result["success"])
 
     def test_allows_wallet_with_secrets(self):
         with patch.object(
