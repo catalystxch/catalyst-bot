@@ -222,7 +222,7 @@ def test_submitted_requires_transaction_id_or_exact_spend_identity(
         ),
         (
             {"error": "rejected: mempool_conflict was not observed"},
-            CANCEL_UNKNOWN,
+            CANCEL_FAILED,
         ),
         ({"status": "not already_including"}, CANCEL_UNKNOWN),
         ({"code": "MEMPOOL_CONFLICT_RETRY"}, CANCEL_UNKNOWN),
@@ -246,11 +246,57 @@ def test_only_exact_positive_mempool_codes_can_mark_submission(
 
 
 @pytest.mark.parametrize(
+    ("response", "error", "want_outcome"),
+    [
+        (
+            {"success": False, "error_code": "MEMPOOL_CONFLICT"},
+            "MEMPOOL_CONFLICT",
+            CANCEL_FAILED,
+        ),
+        (
+            {"status": "REJECTED", "code": "MEMPOOL_CONFLICT"},
+            "MEMPOOL_CONFLICT",
+            CANCEL_FAILED,
+        ),
+        (
+            {"status": "NOT_ALREADY_INCLUDING", "error_code": "MEMPOOL_CONFLICT"},
+            None,
+            CANCEL_UNKNOWN,
+        ),
+        (
+            {"code": "MEMPOOL_CONFLICT"},
+            "NOT_MEMPOOL_CONFLICT",
+            CANCEL_UNKNOWN,
+        ),
+        (
+            {"code": "MEMPOOL_CONFLICT"},
+            "rejected: mempool_conflict was not observed",
+            CANCEL_FAILED,
+        ),
+    ],
+)
+def test_full_evidence_scan_blocks_positive_submission_on_rejection_or_negation(
+    response, error, want_outcome
+):
+    """Any rejection or negation anywhere wins before positive codes are read."""
+    result = normalize_cancel_response(
+        response,
+        error=error,
+        method="submit_transaction",
+        transaction_id="a" * 64,
+    )
+
+    assert result["outcome"] == want_outcome
+    assert result["submitted"] is False
+
+
+@pytest.mark.parametrize(
     ("transaction_id", "valid"),
     [
         ("a" * 64, True),
         ("0x" + "b" * 64, True),
-        ("123e4567-e89b-12d3-a456-426614174000", True),
+        ("123e4567-e89b-12d3-a456-426614174000", False),
+        ("ffffffff-ffff-ffff-ffff-ffffffffffff", False),
         ("cancel-tx-456", False),
         (" " + "a" * 64, False),
         ("a" * 65, False),
@@ -316,9 +362,31 @@ def test_safe_evidence_is_allowlisted_and_deterministically_digested():
     assert "free-text-secret" not in first
     assert "also-do-not-persist" not in first
     assert "x" * 100 not in first
-    assert evidence["transaction_id"] == "c" * 64
+    assert evidence["tx"] == "c" * 64
     assert evidence["success"] is True
-    assert evidence["truncated"] is True
+    assert evidence["t"] is True
+
+
+@pytest.mark.parametrize("limit", [192, 256])
+def test_evidence_priority_preserves_digest_transaction_id_and_positive_code(limit):
+    """Useful reconciliation identity must survive before generic metadata."""
+    rendered = safe_raw_response(
+        {
+            "Authorization": "Bearer secret",
+            "coin_spends": ["x" * 5_000],
+            "error_code": "MEMPOOL_CONFLICT",
+            "key_count_noise": [1, 2, 3],
+            "success": True,
+            "transaction_id": "d" * 64,
+        },
+        limit=limit,
+    )
+    evidence = json.loads(rendered)
+
+    assert len(rendered.encode("utf-8")) <= limit
+    assert evidence["d"]
+    assert evidence["tx"] == "d" * 64
+    assert evidence["code"] == "MEMPOOL_CONFLICT"
 
 
 def test_cancellation_result_keeps_digest_with_bounded_raw_evidence():

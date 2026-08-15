@@ -29,10 +29,6 @@ _OUTCOMES = frozenset(
 )
 _EXACT_SPEND_IDENTITY = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)
 _HEX_TRANSACTION_ID = re.compile(r"^(?:0x)?[0-9a-f]{64}$", re.IGNORECASE)
-_UUID_TRANSACTION_ID = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
 _STABLE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 _METHOD_TAG = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _POSITIVE_SUBMISSION_CODES = frozenset(
@@ -43,7 +39,15 @@ _POSITIVE_SUBMISSION_CODES = frozenset(
     }
 )
 _REJECTION_CODES = frozenset({"REJECTED", "FAILED", "CANCEL_REJECTED"})
+_NEGATED_SUBMISSION_CODES = frozenset(
+    {"NOT_MEMPOOL_CONFLICT", "NOT_ALREADY_INCLUDING"}
+)
 _SAFE_DIAGNOSTIC_CODES = _POSITIVE_SUBMISSION_CODES | _REJECTION_CODES
+_REJECTION_TEXT = re.compile(r"\breject(?:ed|ion)?\b", re.IGNORECASE)
+_NEGATED_SUBMISSION_TEXT = re.compile(
+    r"\b(?:not|no)[ _-]*(?:mempool_conflict|already_including)\b",
+    re.IGNORECASE,
+)
 
 
 def _json_default(value: Any) -> dict[str, str]:
@@ -80,7 +84,7 @@ def _validated_transaction_id(value: Any) -> str:
     """Return a canonical Sage/Chia transaction identifier, or an empty string."""
     if not isinstance(value, str):
         return ""
-    if _HEX_TRANSACTION_ID.fullmatch(value) or _UUID_TRANSACTION_ID.fullmatch(value):
+    if _HEX_TRANSACTION_ID.fullmatch(value):
         return value.lower()
     return ""
 
@@ -110,63 +114,89 @@ def _response_codes(response: Mapping[str, Any]) -> set[str]:
     }
 
 
-def _evidence_projection(value: Any) -> dict[str, Any]:
-    """Keep only safe, bounded response facts; never retain raw payload text."""
+def _evidence_projection(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return compact-core and optional safe facts without retaining raw text."""
     raw = _canonical_json(value)
-    projection: dict[str, Any] = {
-        "byte_length": len(raw.encode("utf-8")),
-        "schema": "catalyst.cancel.response.v2",
-        "kind": "mapping" if isinstance(value, Mapping) else type(value).__name__,
-        "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-        "truncated": True,
+    core: dict[str, Any] = {
+        "d": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "t": True,
+        "v": 3,
+    }
+    optional: dict[str, Any] = {
+        "k": "mapping" if isinstance(value, Mapping) else type(value).__name__,
+        "n": len(raw.encode("utf-8")),
     }
     if not isinstance(value, Mapping):
-        return projection
+        return core, optional
 
-    projection["key_count"] = len(value)
+    optional["keys"] = len(value)
     if isinstance(value.get("success"), bool):
-        projection["success"] = value["success"]
+        optional["success"] = value["success"]
     safe_codes = sorted(_response_codes(value) & _SAFE_DIAGNOSTIC_CODES)
     if safe_codes:
-        projection["codes"] = safe_codes
+        core["code"] = safe_codes[0]
     transaction_id = _validated_transaction_id(
         value.get("transaction_id") or value.get("tx_id")
     )
     if transaction_id:
-        projection["transaction_id"] = transaction_id
+        core["tx"] = transaction_id
     spend_identity = _validated_spend_identity(value.get("spend_identity"))
     if spend_identity:
-        projection["spend_identity"] = spend_identity
+        core["spend"] = spend_identity
     if isinstance(value.get("coin_spends"), (list, tuple)):
-        projection["coin_spends_count"] = len(value["coin_spends"])
-    return projection
+        optional["spends"] = len(value["coin_spends"])
+    return core, optional
 
 
 def safe_raw_response(value: Any, limit: int = 4096) -> str:
     """Return a bounded allowlisted evidence projection, never raw response text."""
     limit = max(2, int(limit))
-    projection = _evidence_projection(value)
-    for removable in ("coin_spends_count", "key_count", "codes", "kind"):
-        rendered = _canonical_json(projection)
-        if len(rendered.encode("utf-8")) <= limit:
-            return rendered
-        projection.pop(removable, None)
-
+    projection, optional = _evidence_projection(value)
     rendered = _canonical_json(projection)
     if len(rendered.encode("utf-8")) <= limit:
-        return rendered
-    fallback = _canonical_json(
-        {
-            "schema": "catalyst.cancel.response.v2",
-            "sha256": evidence_digest(value),
-            "truncated": True,
-        }
-    )
+        for key in ("success", "n", "spends", "keys", "k"):
+            if key not in optional:
+                continue
+            candidate = {**projection, key: optional[key]}
+            candidate_rendered = _canonical_json(candidate)
+            if len(candidate_rendered.encode("utf-8")) <= limit:
+                projection = candidate
+        return _canonical_json(projection)
+    fallback = _canonical_json({"d": evidence_digest(value), "v": 3})
     return fallback if len(fallback.encode("utf-8")) <= limit else "{}"
 
 
 def _has_submission_identity(transaction_id: str, spend_identity: str) -> bool:
     return bool(transaction_id) or bool(spend_identity)
+
+
+def _evidence_values(
+    response: Any, error: BaseException | str | None
+) -> tuple[Any, ...]:
+    values: list[Any] = [error]
+    if isinstance(response, Mapping):
+        values.extend(
+            response.get(field) for field in ("error_code", "code", "status", "error")
+        )
+    return tuple(values)
+
+
+def _has_explicit_rejection(response: Any, values: tuple[Any, ...]) -> bool:
+    if isinstance(response, Mapping) and response.get("success") is False:
+        return True
+    return any(
+        _normalized_code(value) in _REJECTION_CODES
+        or (isinstance(value, str) and bool(_REJECTION_TEXT.search(value)))
+        for value in values
+    )
+
+
+def _has_negated_submission_marker(values: tuple[Any, ...]) -> bool:
+    return any(
+        _normalized_code(value) in _NEGATED_SUBMISSION_CODES
+        or (isinstance(value, str) and bool(_NEGATED_SUBMISSION_TEXT.search(value)))
+        for value in values
+    )
 
 
 def cancellation_result(
@@ -245,9 +275,20 @@ def normalize_cancel_response(
             spend_identity=spend_identity,
         )
 
-    error_code = _normalized_code(error)
     identity_present = _has_submission_identity(transaction_id, spend_identity)
-    if http_status == 404:
+    values = _evidence_values(response, error)
+    all_codes = {_normalized_code(value) for value in values} - {""}
+    if _has_explicit_rejection(response, values):
+        rejection_codes = sorted(all_codes & _REJECTION_CODES)
+        return cancellation_result(
+            CANCEL_FAILED,
+            method=method,
+            raw_response=response,
+            error=rejection_codes[0] if rejection_codes else "REJECTED",
+            transaction_id=transaction_id,
+            spend_identity=spend_identity,
+        )
+    if _has_negated_submission_marker(values):
         return cancellation_result(
             CANCEL_UNKNOWN,
             method=method,
@@ -256,18 +297,12 @@ def normalize_cancel_response(
             transaction_id=transaction_id,
             spend_identity=spend_identity,
         )
-    if error is not None:
-        if error_code in _REJECTION_CODES:
-            outcome = CANCEL_FAILED
-        elif error_code in _POSITIVE_SUBMISSION_CODES and identity_present:
-            outcome = CANCEL_SUBMITTED_UNCONFIRMED
-        else:
-            outcome = CANCEL_UNKNOWN
+    if http_status == 404:
         return cancellation_result(
-            outcome,
+            CANCEL_UNKNOWN,
             method=method,
             raw_response=response,
-            error=error_code or "CANCEL_ERROR_UNCLASSIFIED",
+            error="CANCEL_ERROR_UNCLASSIFIED",
             transaction_id=transaction_id,
             spend_identity=spend_identity,
         )
@@ -290,26 +325,14 @@ def normalize_cancel_response(
             spend_identity=spend_identity,
         )
 
-    response_codes = _response_codes(response)
-    if response.get("success") is False or response_codes & _REJECTION_CODES:
-        return cancellation_result(
-            CANCEL_FAILED,
-            method=method,
-            raw_response=response,
-            error=next(
-                iter(sorted(response_codes & _REJECTION_CODES)),
-                "CANCEL_ERROR_UNCLASSIFIED",
-            ),
-            transaction_id=transaction_id,
-            spend_identity=spend_identity,
-        )
-    if response_codes & _POSITIVE_SUBMISSION_CODES:
+    positive_codes = sorted(all_codes & _POSITIVE_SUBMISSION_CODES)
+    if positive_codes:
         outcome = CANCEL_SUBMITTED_UNCONFIRMED if identity_present else CANCEL_UNKNOWN
         return cancellation_result(
             outcome,
             method=method,
             raw_response=response,
-            error=next(iter(sorted(response_codes & _POSITIVE_SUBMISSION_CODES))),
+            error=positive_codes[0],
             transaction_id=transaction_id,
             spend_identity=spend_identity,
         )
