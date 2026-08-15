@@ -16,6 +16,122 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_sensitive_name_matrix_distinguishes_credentials_from_metadata(self):
+        sensitive_names = (
+            "authorization_header",
+            "client_certificate",
+            "wallet_signature",
+            "auth_token",
+            "auth_secret",
+            "seed_phrase",
+            "seed_material",
+            "private_key_material",
+            "secrets",
+            "cookie",
+        )
+        harmless_metadata_names = (
+            "header_count",
+            "certificate_status",
+            "signature_status",
+            "auth_method",
+            "seed_count",
+            "token_presence",
+            "private_key_status",
+        )
+
+        for name in sensitive_names:
+            with self.subTest(name=name):
+                self.assertTrue(wallet_sage._is_sensitive_name(name))
+        for name in harmless_metadata_names:
+            with self.subTest(name=name):
+                self.assertFalse(wallet_sage._is_sensitive_name(name))
+
+    def test_rpc_preserves_metadata_but_redacts_semantic_credential_names(self):
+        class FakeResponse:
+            status = 500
+
+            def read(self):
+                return (
+                    b"MEMPOOL_CONFLICT header_count=SAFE_HEADER_COUNT "
+                    b"certificate_status=SAFE_CERTIFICATE_STATUS "
+                    b"signature_status=SAFE_SIGNATURE_STATUS "
+                    b"auth_method=SAFE_AUTH_METHOD seed_count=SAFE_SEED_COUNT "
+                    b"authorization_header=RESPONSE_AUTH_HEADER "
+                    b"client_certificate=RESPONSE_CLIENT_CERTIFICATE "
+                    b"wallet_signature=RESPONSE_WALLET_SIGNATURE "
+                    b"auth_token=RESPONSE_AUTH_TOKEN auth_secret=RESPONSE_AUTH_SECRET "
+                    b"seed_phrase=RESPONSE_SEED_PHRASE seed_material=RESPONSE_SEED_MATERIAL"
+                )
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        console_messages = []
+        events = []
+        fake_database = types.ModuleType("database")
+        fake_database.log_event = lambda *args, **kwargs: events.append((args, kwargs))
+        payload = {
+            "header_count": "PAYLOAD_HEADER_COUNT",
+            "certificate_status": "PAYLOAD_CERTIFICATE_STATUS",
+            "signature_status": "PAYLOAD_SIGNATURE_STATUS",
+            "auth_method": "PAYLOAD_AUTH_METHOD",
+            "seed_count": "PAYLOAD_SEED_COUNT",
+            "authorization_header": "PAYLOAD_AUTH_HEADER",
+            "client_certificate": "PAYLOAD_CLIENT_CERTIFICATE",
+            "wallet_signature": "PAYLOAD_WALLET_SIGNATURE",
+            "auth_token": "PAYLOAD_AUTH_TOKEN",
+            "auth_secret": "PAYLOAD_AUTH_SECRET",
+            "seed_phrase": "PAYLOAD_SEED_PHRASE",
+            "seed_material": "PAYLOAD_SEED_MATERIAL",
+        }
+
+        with (
+            patch.dict(sys.modules, {"database": fake_database}),
+            patch.object(
+                wallet_sage, "_get_sage_connection", return_value=FakeConnection()
+            ),
+            patch.object(wallet_sage, "_console", side_effect=console_messages.append),
+        ):
+            result = wallet_sage.rpc("submit_transaction", payload)
+
+        observed = repr((result, console_messages, events))
+        for safe_value in (
+            "SAFE_HEADER_COUNT",
+            "SAFE_CERTIFICATE_STATUS",
+            "SAFE_SIGNATURE_STATUS",
+            "SAFE_AUTH_METHOD",
+            "SAFE_SEED_COUNT",
+            "PAYLOAD_HEADER_COUNT",
+            "PAYLOAD_CERTIFICATE_STATUS",
+            "PAYLOAD_SIGNATURE_STATUS",
+            "PAYLOAD_AUTH_METHOD",
+            "PAYLOAD_SEED_COUNT",
+        ):
+            with self.subTest(safe_value=safe_value):
+                self.assertIn(safe_value, observed)
+        for secret in (
+            "RESPONSE_AUTH_HEADER",
+            "RESPONSE_CLIENT_CERTIFICATE",
+            "RESPONSE_WALLET_SIGNATURE",
+            "RESPONSE_AUTH_TOKEN",
+            "RESPONSE_AUTH_SECRET",
+            "RESPONSE_SEED_PHRASE",
+            "RESPONSE_SEED_MATERIAL",
+            "PAYLOAD_AUTH_HEADER",
+            "PAYLOAD_CLIENT_CERTIFICATE",
+            "PAYLOAD_WALLET_SIGNATURE",
+            "PAYLOAD_AUTH_TOKEN",
+            "PAYLOAD_AUTH_SECRET",
+            "PAYLOAD_SEED_PHRASE",
+            "PAYLOAD_SEED_MATERIAL",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, observed)
+
     def test_rpc_recursively_redacts_secret_name_variants_without_over_redacting_safe_fields(self):
         class FakeResponse:
             status = 500

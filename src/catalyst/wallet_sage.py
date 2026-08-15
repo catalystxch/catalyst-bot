@@ -61,7 +61,7 @@ _PRIVATE_KEY_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_SENSITIVE_SINGLE_TOKENS = {
+_SENSITIVE_EXACT_FIELDS = {
     "auth",
     "authorization",
     "certificate",
@@ -82,17 +82,43 @@ _SENSITIVE_SINGLE_TOKENS = {
     "signature",
     "token",
 }
+_SENSITIVE_COMPONENT_TOKENS = {
+    "credential",
+    "credentials",
+    "passphrase",
+    "password",
+    "secret",
+    "secrets",
+}
 _SENSITIVE_TOKEN_SEQUENCES = {
     ("access", "token"),
     ("api", "key"),
     ("api", "token"),
+    ("auth", "secret"),
+    ("auth", "token"),
+    ("authorization", "header"),
+    ("client", "certificate"),
+    ("cookie", "value"),
     ("private", "key"),
     ("puzzle", "reveal"),
     ("refresh", "token"),
+    ("seed", "material"),
     ("seed", "phrase"),
     ("set", "cookie"),
+    ("wallet", "signature"),
     ("x", "api", "key"),
     ("x", "api", "token"),
+}
+_METADATA_SUFFIX_TOKENS = {
+    "available",
+    "count",
+    "enabled",
+    "method",
+    "presence",
+    "present",
+    "status",
+    "valid",
+    "verified",
 }
 _MAX_SANITIZED_COLLECTION_ITEMS = 64
 
@@ -108,16 +134,18 @@ def _is_sensitive_name(name: Any) -> bool:
     """Identify credential-bearing field names without broad substring matches.
 
     Threat model: Sage errors and payloads may label credentials with camelCase,
-    snake_case, kebab-case, or HTTP-header spelling. Token sequences catch those
-    variants while preserving unrelated names such as ``monkey_count``,
-    ``keyframe``, and ``token_count``.
+    snake_case, kebab-case, or HTTP-header spelling. Explicit credential sequences
+    catch those variants; terminal metadata tokens keep status/count/method/presence
+    fields visible rather than treating every related word as a secret.
     """
     tokens = _normalise_sage_field_name(name)
     if not tokens:
         return False
-    if len(tokens) == 1 and tokens[0] in _SENSITIVE_SINGLE_TOKENS:
+    if len(tokens) > 1 and tokens[-1] in _METADATA_SUFFIX_TOKENS:
+        return False
+    if len(tokens) == 1 and tokens[0] in _SENSITIVE_EXACT_FIELDS:
         return True
-    if any(token in _SENSITIVE_SINGLE_TOKENS - {"private", "token"} for token in tokens):
+    if any(token in _SENSITIVE_COMPONENT_TOKENS for token in tokens):
         return True
     return any(
         tokens[index : index + len(sequence)] == sequence
