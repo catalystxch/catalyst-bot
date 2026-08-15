@@ -17,6 +17,154 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_full_sensitive_assignment_name_beats_safe_metadata_suffix(self):
+        cases = (
+            "token header_count=OVERLAP_TOKEN_SECRET",
+            "authorization auth_method=OVERLAP_AUTH_SECRET",
+        )
+
+        for source in cases:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertNotIn("OVERLAP", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+    def test_overlong_free_text_field_name_fails_closed(self):
+        source = "x" * 70 + "Token=OVERLONG_TEXT_SECRET_SENTINEL"
+
+        sanitized = wallet_sage._sanitize_sage_text(source)
+
+        self.assertNotIn("OVERLONG_TEXT_SECRET_SENTINEL", sanitized)
+        self.assertIn("[REDACTED]", sanitized)
+
+    def test_mismatched_structure_close_redacts_the_remainder(self):
+        source = "token=[FIRST_SECRET} ] AFTER_MISMATCH_SECRET"
+
+        sanitized = wallet_sage._sanitize_sage_text(source)
+
+        self.assertNotIn("FIRST_SECRET", sanitized)
+        self.assertNotIn("AFTER_MISMATCH_SECRET", sanitized)
+        self.assertEqual(sanitized, "token=[REDACTED]")
+
+    def test_invalid_json_200_is_typed_before_raw_parser_exception_escapes(self):
+        invalid_json = (
+            b'{"success": false, "authorization": "INVALID_JSON_AUTH_SENTINEL"'
+        )
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return invalid_json
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        with patch.object(
+            wallet_sage, "_get_sage_connection", return_value=FakeConnection()
+        ):
+            with self.assertRaises(wallet_sage._SageRPCFailure) as raised:
+                wallet_sage._sage_post("submit_transaction", {})
+
+        direct_failure = raised.exception
+        self.assertEqual(direct_failure.error_code, "SAGE_RPC_ERROR")
+        self.assertEqual(direct_failure.status, 200)
+        self.assertNotIn("INVALID_JSON_AUTH_SENTINEL", repr(direct_failure.__dict__))
+        self.assertEqual(direct_failure.response_summary["type"], "text")
+
+        with (
+            patch.object(
+                wallet_sage,
+                "_get_sage_connection",
+                return_value=FakeConnection(),
+            ),
+            patch.object(wallet_sage, "_console"),
+        ):
+            result = wallet_sage.rpc("submit_transaction", {})
+
+        self.assertEqual(result["error_code"], "SAGE_RPC_ERROR")
+        self.assertEqual(result["http_status"], 200)
+        self.assertEqual(result["response_summary"], direct_failure.response_summary)
+        self.assertEqual(result["response_summary"]["type"], "text")
+        self.assertNotIn("INVALID_JSON_AUTH_SENTINEL", repr(result))
+
+    def test_actual_sage_post_preserves_success_with_code_shaped_metadata(self):
+        success = {
+            "success": True,
+            "code": "MEMPOOL_CONFLICT",
+            "status": "ok",
+            "value": "APPLICATION_RESULT_UNCHANGED",
+        }
+        encoded = json.dumps(success).encode()
+        real_loads = json.loads
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return encoded
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        def controlled_loads(value):
+            if value == encoded.decode():
+                return success
+            return real_loads(value)
+
+        with (
+            patch.object(
+                wallet_sage,
+                "_get_sage_connection",
+                return_value=FakeConnection(),
+            ),
+            patch.object(wallet_sage._json, "loads", side_effect=controlled_loads),
+        ):
+            result = wallet_sage.rpc("get_balance", {})
+
+        self.assertIs(result, success)
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "code": "MEMPOOL_CONFLICT",
+                "status": "ok",
+                "value": "APPLICATION_RESULT_UNCHANGED",
+            },
+        )
+
+    def test_container_scanner_has_bounded_forward_work_for_many_heads(self):
+        class CountingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.rfind_work = 0
+                return instance
+
+            def rfind(self, sub, start=0, end=None):
+                stop = len(self) if end is None else end
+                self.rfind_work += max(0, stop - start)
+                return super().rfind(sub, start, stop)
+
+        source = CountingText(
+            "Authorization: Digest "
+            + " ".join(
+                f"token_{index}=HEAD_SECRET_{index}" for index in range(120)
+            )
+        )
+
+        sanitized = wallet_sage._redact_sage_assignments(source)
+
+        self.assertNotIn("HEAD_SECRET", sanitized)
+        self.assertLessEqual(source.rfind_work, len(source) * 4)
+
     def test_fail_closed_authorization_and_cookie_state_machine_matrix(self):
         cases = (
             (

@@ -177,6 +177,78 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["method"], "mempool_conflict_inflight")
 
+    def test_cancel_offer_uses_typed_http_404_for_already_gone(self):
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=wallet_sage.SageHTTPError(status=404),
+            ),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["already_gone"])
+        self.assertEqual(result["method"], "already_gone_ambiguous")
+
+    def test_cancel_offer_preserves_stable_no_spendable_code(self):
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=wallet_sage.SageOperationalError(
+                    error_code="NO_SPENDABLE_COINS"
+                ),
+            ),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=True, fee_mojos=100)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "NO_SPENDABLE_COINS")
+        self.assertEqual(result["error_code"], "NO_SPENDABLE_COINS")
+
+    def test_sequential_cancel_retries_stable_no_spendable_code_without_fee(self):
+        stable_no_fee_coin = {
+            "success": False,
+            "error": "NO_SPENDABLE_COINS",
+            "error_code": "NO_SPENDABLE_COINS",
+            "message": "Sage reports that no spendable coins are available.",
+        }
+
+        with (
+            patch.object(
+                wallet_sage,
+                "cancel_offer",
+                side_effect=[stable_no_fee_coin, {"success": True}],
+            ) as cancel,
+            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
+            patch("builtins.print"),
+            patch.object(wallet_sage.time, "sleep", return_value=None),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                ["0xabc123"],
+                secure=True,
+                fee_mojos=100,
+                skip_confirmation=True,
+            )
+
+        self.assertTrue(results["0xabc123"]["success"])
+        self.assertEqual(cancel.call_count, 2)
+        self.assertEqual(cancel.call_args_list[0].kwargs["fee_mojos"], 100)
+        self.assertEqual(cancel.call_args_list[1].kwargs["fee_mojos"], 0)
+
+    def test_already_including_transaction_is_info_for_cancel(self):
+        self.assertEqual(
+            wallet_sage._sage_tx_error_level(
+                "ALREADY_INCLUDING_TRANSACTION", "cancel_offer"
+            ),
+            "info",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

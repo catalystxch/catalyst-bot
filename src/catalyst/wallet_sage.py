@@ -238,6 +238,16 @@ def _assignment_heads(text: str) -> list[dict[str, Any]]:
     name_chars = set(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.- \"'"
     )
+    folded_positions = bytearray(len(text))
+    at_line_start = True
+    folded_line = False
+    for index, char in enumerate(text):
+        if at_line_start:
+            folded_line = index > 0 and char in " \t"
+            at_line_start = False
+        folded_positions[index] = folded_line
+        if char in "\r\n":
+            at_line_start = True
     for separator in range(len(text)):
         if text[separator] not in ":=":
             continue
@@ -246,6 +256,13 @@ def _assignment_heads(text: str) -> list[dict[str, Any]]:
             name_end -= 1
         first = max(0, name_end - _MAX_SAGE_FIELD_NAME_CHARS - 2)
         candidates = []
+        overlong_name = (
+            first > 0
+            and text[first - 1] in name_chars
+            and all(char in name_chars for char in text[first:name_end])
+        )
+        if overlong_name:
+            candidates.append((first, _TRUNCATED, _FIELD_SCALAR))
         for start in range(first, name_end):
             if start and text[start - 1] not in boundary_chars:
                 continue
@@ -261,31 +278,52 @@ def _assignment_heads(text: str) -> list[dict[str, Any]]:
             candidates.append((start, stripped, kind))
         if not candidates:
             continue
-        safe_candidates = [
-            candidate for candidate in candidates if candidate[2] == _FIELD_SAFE
-        ]
-        start, name, kind = max(
-            safe_candidates or candidates, key=lambda item: item[0]
-        )
         value_start = separator + 1
         while value_start < len(text) and text[value_start] in " \t":
             value_start += 1
-        safe_end = (
-            _safe_metadata_scalar_end(text, value_start)
-            if kind == _FIELD_SAFE
-            else None
-        )
-        if kind == _FIELD_SAFE and safe_end is None:
-            kind = _FIELD_SCALAR
-        heads.append(
-            {
+
+        def build_head(candidate: tuple[int, str, str]) -> dict[str, Any]:
+            start, name, kind = candidate
+            safe_end = (
+                _safe_metadata_scalar_end(text, value_start)
+                if kind == _FIELD_SAFE
+                else None
+            )
+            if kind == _FIELD_SAFE and safe_end is None:
+                kind = _FIELD_SCALAR
+            return {
                 "name": name,
                 "name_start": start,
                 "value_start": value_start,
                 "safe_end": safe_end,
                 "kind": kind,
+                "folded": bool(folded_positions[start]),
             }
-        )
+
+        full_head = build_head(min(candidates, key=lambda item: item[0]))
+        safe_suffixes = [
+            build_head(candidate)
+            for candidate in candidates
+            if candidate[2] == _FIELD_SAFE
+            and candidate[0] > full_head["name_start"]
+        ]
+        valid_safe_suffixes = [
+            head for head in safe_suffixes if head["kind"] == _FIELD_SAFE
+        ]
+        if valid_safe_suffixes:
+            safe_suffix = max(
+                valid_safe_suffixes, key=lambda head: head["name_start"]
+            )
+            prefix = text[
+                full_head["name_start"] : safe_suffix["name_start"]
+            ].strip(" \t\"'")
+            if _classify_sage_field(prefix) == _FIELD_ORDINARY:
+                heads.append(safe_suffix)
+                continue
+            heads.append(full_head)
+            heads.append(safe_suffix)
+            continue
+        heads.append(full_head)
     return heads
 
 
@@ -308,7 +346,9 @@ def _matching_structure_end(text: str, start: int) -> Optional[int]:
             quote = char
         elif char in pairs:
             stack.append(pairs[char])
-        elif stack and char == stack[-1]:
+        elif char in "}])":
+            if not stack or char != stack[-1]:
+                return None
             stack.pop()
             if not stack:
                 return index + 1
@@ -331,11 +371,6 @@ def _logical_record_end(text: str, start: int, folded: bool) -> int:
     return len(text)
 
 
-def _head_is_on_folded_line(text: str, head_start: int) -> bool:
-    line_start = max(text.rfind("\n", 0, head_start), text.rfind("\r", 0, head_start)) + 1
-    return line_start > 0 and not text[line_start:head_start].strip(" \t")
-
-
 def _redaction_end_before_head(text: str, head_start: int, safe: bool) -> int:
     end = head_start
     while end > 0 and text[end - 1] in " \t":
@@ -347,9 +382,10 @@ def _redaction_end_before_head(text: str, head_start: int, safe: bool) -> int:
 
 def _credential_value_end(
     text: str,
-    current: dict[str, Any],
-    following: list[dict[str, Any]],
+    heads: list[dict[str, Any]],
+    current_index: int,
 ) -> int:
+    current = heads[current_index]
     start = current["value_start"]
     if start >= len(text):
         return start
@@ -360,22 +396,48 @@ def _credential_value_end(
 
     container = current["kind"] == _FIELD_CONTAINER
     record_end = _logical_record_end(text, start, folded=container)
-    for candidate in following:
-        if not (start < candidate["name_start"] < record_end):
-            continue
-        if container and _head_is_on_folded_line(text, candidate["name_start"]):
-            continue
-        if candidate["kind"] == _FIELD_SAFE:
-            return _redaction_end_before_head(
-                text, candidate["name_start"], safe=True
+    candidate_index = current_index + 1
+    while candidate_index < len(heads):
+        value_start = heads[candidate_index]["value_start"]
+        group_end = candidate_index + 1
+        while (
+            group_end < len(heads)
+            and heads[group_end]["value_start"] == value_start
+        ):
+            group_end += 1
+        candidates = [
+            candidate
+            for candidate in heads[candidate_index:group_end]
+            if start < candidate["name_start"] < record_end
+            and not (container and candidate["folded"])
+        ]
+        safe_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["kind"] == _FIELD_SAFE
+        ]
+        if safe_candidates:
+            safe_candidate = max(
+                safe_candidates, key=lambda candidate: candidate["name_start"]
             )
-        if not container and candidate["kind"] in {
-            _FIELD_CONTAINER,
-            _FIELD_SCALAR,
-        }:
             return _redaction_end_before_head(
-                text, candidate["name_start"], safe=False
+                text, safe_candidate["name_start"], safe=True
             )
+        if not container:
+            sensitive_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate["kind"] in {_FIELD_CONTAINER, _FIELD_SCALAR}
+            ]
+            if sensitive_candidates:
+                sensitive_candidate = min(
+                    sensitive_candidates,
+                    key=lambda candidate: candidate["name_start"],
+                )
+                return _redaction_end_before_head(
+                    text, sensitive_candidate["name_start"], safe=False
+                )
+        candidate_index = group_end
     return record_end
 
 
@@ -387,9 +449,9 @@ def _redact_sage_assignments(text: str) -> str:
     for index, head in enumerate(heads):
         if head["kind"] not in {_FIELD_CONTAINER, _FIELD_SCALAR}:
             continue
-        if head["value_start"] < covered_until:
+        if head["name_start"] < covered_until:
             continue
-        end = _credential_value_end(text, head, heads[index + 1 :])
+        end = _credential_value_end(text, heads, index)
         if end > head["value_start"]:
             ranges.append((head["value_start"], end))
             covered_until = end
@@ -1020,7 +1082,12 @@ def _sage_tx_error_level(kind: str, endpoint: str) -> str:
     kind_norm = str(kind or "").upper()
     endpoint_norm = str(endpoint or "").lower()
     if (
-        kind_norm in {"MEMPOOL_CONFLICT", "ALREADY_INCLUDING"}
+        kind_norm
+        in {
+            "MEMPOOL_CONFLICT",
+            "ALREADY_INCLUDING",
+            "ALREADY_INCLUDING_TRANSACTION",
+        }
         and "cancel" in endpoint_norm
     ):
         return "info"
@@ -1270,18 +1337,25 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
         raise SageConnectionError() from None
 
     if resp.status == 200:
-        parsed = _json.loads(data)
-        code = _classify_sage_response_error(parsed, data)
-        if code:
-            _raise_sage_response_failure(
-                code,
-                resp.status,
-                _summarize_sage_payload(parsed),
-            )
-        if _sage_response_is_application_failure(parsed):
+        try:
+            parsed = _json.loads(data)
+        except (TypeError, ValueError):
+            response_summary = _summarize_sage_response(data)
+            code = _classify_sage_response_error(None, data)
+            if code:
+                _raise_sage_response_failure(code, resp.status, response_summary)
             raise _SageRPCFailure(
                 status=resp.status,
-                response_summary=_summarize_sage_payload(parsed),
+                response_summary=response_summary,
+            ) from None
+        if _sage_response_is_application_failure(parsed):
+            response_summary = _summarize_sage_payload(parsed)
+            code = _classify_sage_response_error(parsed, data)
+            if code:
+                _raise_sage_response_failure(code, resp.status, response_summary)
+            raise _SageRPCFailure(
+                status=resp.status,
+                response_summary=response_summary,
             )
         return parsed
 
@@ -3984,6 +4058,35 @@ def cancel_offer(
             "note": f"Sage cancel conflict appears in-flight: {str(e)[:160]}",
         }
 
+    except SageHTTPError as e:
+        if e.status == 404:
+            print(
+                f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), deferring to on-chain verification"
+            )
+            return {
+                "success": True,
+                "already_gone": True,
+                "method": "already_gone_ambiguous",
+                "note": "Sage 404 — offer gone, fill_tracker / bot_health will verify",
+            }
+        result = {
+            "success": False,
+            "error": e.error_code,
+            "error_code": e.error_code,
+            "http_status": e.status,
+        }
+        if e.status in {202, 500}:
+            result["uncertain"] = True
+        return result
+
+    except SageOperationalError as e:
+        return {
+            "success": False,
+            "error": e.error_code,
+            "error_code": e.error_code,
+            "http_status": e.status,
+        }
+
     except ConnectionError as e:
         err_str = str(e)
         # Sage may return non-200 but still process the cancel.
@@ -4676,6 +4779,9 @@ def _sage_bulk_cancel_batch_pause_secs() -> float:
 def _is_no_spendable_coin_error(result: Optional[Dict]) -> bool:
     if not isinstance(result, dict):
         return False
+    error_code = str(result.get("error_code") or result.get("error") or "").upper()
+    if error_code == "NO_SPENDABLE_COINS":
+        return True
     error = str(result.get("error") or result.get("reason") or "").lower()
     return "no spendable coins" in error or "coin selection error" in error
 
