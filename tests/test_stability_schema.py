@@ -579,6 +579,47 @@ def test_non_stability_trigger_with_case_variant_owner_is_ignored(isolated_datab
     assert trigger == ("OFFERS",)
 
 
+def test_unicode_confusable_trigger_owners_remain_distinct_from_stability_tables(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    confusable_owners = (
+        ("offer_intent\N{LATIN SMALL LETTER LONG S}", "long_s_owner_trigger"),
+        (
+            "runtime_wor\N{KELVIN SIGN}er_delegations",
+            "kelvin_owner_trigger",
+        ),
+        (
+            "publ\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}cation_outbox",
+            "dotted_i_owner_trigger",
+        ),
+        (
+            "offer_\N{CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I}ntents",
+            "cyrillic_i_owner_trigger",
+        ),
+    )
+    with sqlite3.connect(isolated_database) as conn:
+        for owner, trigger_name in confusable_owners:
+            conn.execute(f'CREATE TABLE "{owner}" (value INTEGER NOT NULL)')
+            conn.execute(
+                f'CREATE TRIGGER "{trigger_name}" '
+                f'AFTER UPDATE ON "{owner}" BEGIN SELECT 1; END'
+            )
+    database._db_initialized_path = ""
+
+    database.init_database()
+
+    with sqlite3.connect(isolated_database) as conn:
+        stored_owners = dict(
+            conn.execute(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+        )
+    for owner, trigger_name in confusable_owners:
+        assert stored_owners[trigger_name] == owner
+
+
 def test_stability_migration_rejects_missing_singleton_check_and_extra_rows(
     isolated_database,
 ):

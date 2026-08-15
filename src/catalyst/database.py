@@ -864,6 +864,15 @@ _STABILITY_INDEXES = {
 }
 
 
+def _sqlite_identifier_fold(identifier: str) -> str:
+    """Match SQLite's ASCII-only case folding for schema identifiers."""
+
+    return "".join(
+        chr(ord(character) + 32) if "A" <= character <= "Z" else character
+        for character in identifier
+    )
+
+
 def _normalized_schema_sql(sql: Optional[str]) -> str:
     if not sql:
         return ""
@@ -1027,14 +1036,16 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     )
 
     stability_tables_by_owner = {
-        table_name.casefold(): table_name
+        _sqlite_identifier_fold(table_name): table_name
         for table_name in _STABILITY_REQUIRED_COLUMNS
     }
     actual_triggers = {}
     for row in conn.execute(
         "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='trigger'"
     ).fetchall():
-        canonical_owner = stability_tables_by_owner.get(str(row[1]).casefold())
+        canonical_owner = stability_tables_by_owner.get(
+            _sqlite_identifier_fold(str(row[1]))
+        )
         if canonical_owner is not None:
             actual_triggers[str(row[0])] = (canonical_owner, str(row[2]))
     unexpected_triggers = sorted(actual_triggers.keys() - expected_triggers.keys())
