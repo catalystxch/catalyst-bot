@@ -16,6 +16,292 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_free_form_sanitizer_redacts_header_value_assignment_bypasses(self):
+        bypasses = (
+            ("cookie_header=COOKIE_HEADER_SECRET", "COOKIE_HEADER_SECRET"),
+            (
+                "proxy_authorization=PROXY_AUTHORIZATION_SECRET",
+                "PROXY_AUTHORIZATION_SECRET",
+            ),
+            (
+                "authorization_value=AUTHORIZATION_VALUE_SECRET",
+                "AUTHORIZATION_VALUE_SECRET",
+            ),
+            ("auth_header=AUTH_HEADER_SECRET", "AUTH_HEADER_SECRET"),
+        )
+
+        for source, secret in bypasses:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertNotIn(secret, sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+    def test_free_form_sanitizer_finds_bypasses_after_benign_prefixes(self):
+        sensitive_names = (
+            "cookie_header",
+            "proxy_authorization",
+            "authorization_value",
+            "auth_header",
+        )
+
+        for name in sensitive_names:
+            for source in (
+                f"error: {name}=PREFIXED_FREE_TEXT_SECRET",
+                f"detail: {name}: PREFIXED_DETAIL_SECRET",
+                f"endpoint?warning: {name}=PREFIXED_ENDPOINT_SECRET",
+            ):
+                with self.subTest(name=name, source=source):
+                    sanitized = wallet_sage._sanitize_sage_text(source)
+                    self.assertNotIn("SECRET", sanitized)
+                    self.assertIn("[REDACTED]", sanitized)
+
+    def test_free_form_sanitizer_redacts_multi_word_credentials_to_next_field(self):
+        assignments = (
+            ("token_value", "TOKEN_TAIL_A1", "header_count=SAFE_HEADER_COUNT"),
+            (
+                "secretValue",
+                "SECRET_TAIL_B2",
+                "certificate_status=SAFE_CERTIFICATE_STATUS",
+            ),
+            ("key-value", "KEY_TAIL_C3", "signature_status=SAFE_SIGNATURE_STATUS"),
+            ("seed value", "SEED_TAIL_D4", "auth_method=SAFE_AUTH_METHOD"),
+            ("cert_value", "CERT_TAIL_E5", "seed_count=SAFE_SEED_COUNT"),
+            (
+                "signatureValue",
+                "SIGNATURE_TAIL_F6",
+                "token_presence=SAFE_TOKEN_PRESENCE",
+            ),
+        )
+
+        for name, secret_tail, safe_assignment in assignments:
+            for separator in ("=", ":"):
+                with self.subTest(name=name, separator=separator):
+                    source = (
+                        f"{name}{separator}first-word {secret_tail} "
+                        f"{safe_assignment}"
+                    )
+                    sanitized = wallet_sage._sanitize_sage_text(source)
+                    self.assertNotIn("first-word", sanitized)
+                    self.assertNotIn(secret_tail, sanitized)
+                    self.assertIn(safe_assignment, sanitized)
+
+    def test_free_form_sanitizer_redacts_semantic_credentials_across_name_styles(self):
+        credential_name_variants = (
+            (
+                "cookie_header",
+                "cookieHeader",
+                "cookie-header",
+                "cookie header",
+            ),
+            (
+                "proxy_authorization",
+                "proxyAuthorization",
+                "proxy-authorization",
+                "proxy authorization",
+            ),
+            (
+                "authorization_value",
+                "authorizationValue",
+                "authorization-value",
+                "authorization value",
+            ),
+            ("auth_header", "authHeader", "auth-header", "auth header"),
+            ("token_value", "tokenValue", "token-value", "token value"),
+            ("secret_value", "secretValue", "secret-value", "secret value"),
+            ("key_value", "keyValue", "key-value", "key value"),
+            ("seed_value", "seedValue", "seed-value", "seed value"),
+            ("cert_value", "certValue", "cert-value", "cert value"),
+            (
+                "signature_value",
+                "signatureValue",
+                "signature-value",
+                "signature value",
+            ),
+        )
+
+        for names in credential_name_variants:
+            for name in names:
+                for separator in ("=", ":"):
+                    with self.subTest(name=name, separator=separator):
+                        source = f"{name}{separator}CREDENTIAL_VALUE"
+                        sanitized = wallet_sage._sanitize_sage_text(source)
+                        self.assertNotIn("CREDENTIAL_VALUE", sanitized)
+                        self.assertIn("[REDACTED]", sanitized)
+
+    def test_free_form_sanitizer_preserves_metadata_across_name_styles(self):
+        metadata_name_variants = (
+            ("header_count", "headerCount", "header-count", "header count"),
+            (
+                "certificate_status",
+                "certificateStatus",
+                "certificate-status",
+                "certificate status",
+            ),
+            (
+                "signature_status",
+                "signatureStatus",
+                "signature-status",
+                "signature status",
+            ),
+            ("auth_method", "authMethod", "auth-method", "auth method"),
+            ("seed_count", "seedCount", "seed-count", "seed count"),
+            (
+                "token_presence",
+                "tokenPresence",
+                "token-presence",
+                "token presence",
+            ),
+            (
+                "private_key_status",
+                "privateKeyStatus",
+                "private-key-status",
+                "private key status",
+            ),
+        )
+
+        for names in metadata_name_variants:
+            for name in names:
+                for separator in ("=", ":"):
+                    with self.subTest(name=name, separator=separator):
+                        source = f"{name}{separator}SAFE_METADATA_VALUE"
+                        self.assertEqual(
+                            wallet_sage._sanitize_sage_text(source), source
+                        )
+
+    def test_sanitizers_redact_nested_credentials_and_http_headers(self):
+        headers = (
+            "Authorization: Bearer HTTP_AUTH_VALUE_A1\n"
+            "Proxy-Authorization: Basic HTTP_PROXY_VALUE_B2\n"
+            "Cookie: session=HTTP_COOKIE_VALUE_C3\n"
+            "Set-Cookie: session=HTTP_SET_COOKIE_VALUE_D4"
+        )
+        nested = {
+            "outer": [
+                {
+                    "cookieHeader": "NESTED_COOKIE_HEADER_SECRET",
+                    "proxy-authorization": "NESTED_PROXY_AUTHORIZATION_SECRET",
+                    "authorization value": "NESTED_AUTHORIZATION_VALUE_SECRET",
+                    "auth_header": "NESTED_AUTH_HEADER_SECRET",
+                },
+                {
+                    "tokenValue": "NESTED_TOKEN_VALUE_SECRET",
+                    "secret-value": "NESTED_SECRET_VALUE_SECRET",
+                    "key value": "NESTED_KEY_VALUE_SECRET",
+                    "seed_value": "NESTED_SEED_VALUE_SECRET",
+                    "certValue": "NESTED_CERT_VALUE_SECRET",
+                    "signature-value": "NESTED_SIGNATURE_VALUE_SECRET",
+                },
+                {
+                    "headerCount": "SAFE_HEADER_COUNT",
+                    "certificate-status": "SAFE_CERTIFICATE_STATUS",
+                    "signature status": "SAFE_SIGNATURE_STATUS",
+                    "auth_method": "SAFE_AUTH_METHOD",
+                    "seedCount": "SAFE_SEED_COUNT",
+                },
+            ],
+            "http_headers": {
+                "Authorization": "NESTED_AUTHORIZATION_HEADER_SECRET",
+                "Cookie": "NESTED_COOKIE_HEADER_MAP_SECRET",
+            },
+        }
+
+        sanitized_headers = wallet_sage._sanitize_sage_text(headers)
+        sanitized_nested = wallet_sage._sanitize_sage_data(nested)
+        observed = repr((sanitized_headers, sanitized_nested))
+        for secret in (
+            "HTTP_AUTH_VALUE_A1",
+            "HTTP_PROXY_VALUE_B2",
+            "HTTP_COOKIE_VALUE_C3",
+            "HTTP_SET_COOKIE_VALUE_D4",
+            "NESTED_COOKIE_HEADER_SECRET",
+            "NESTED_PROXY_AUTHORIZATION_SECRET",
+            "NESTED_AUTHORIZATION_VALUE_SECRET",
+            "NESTED_AUTH_HEADER_SECRET",
+            "NESTED_TOKEN_VALUE_SECRET",
+            "NESTED_SECRET_VALUE_SECRET",
+            "NESTED_KEY_VALUE_SECRET",
+            "NESTED_SEED_VALUE_SECRET",
+            "NESTED_CERT_VALUE_SECRET",
+            "NESTED_SIGNATURE_VALUE_SECRET",
+            "NESTED_AUTHORIZATION_HEADER_SECRET",
+            "NESTED_COOKIE_HEADER_MAP_SECRET",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, observed)
+        for safe_value in (
+            "SAFE_HEADER_COUNT",
+            "SAFE_CERTIFICATE_STATUS",
+            "SAFE_SIGNATURE_STATUS",
+            "SAFE_AUTH_METHOD",
+            "SAFE_SEED_COUNT",
+        ):
+            with self.subTest(safe_value=safe_value):
+                self.assertIn(safe_value, observed)
+
+    def test_rpc_redacts_header_value_bypasses_at_every_diagnostic_boundary(self):
+        class FakeResponse:
+            status = 500
+
+            def read(self):
+                return (
+                    b"MEMPOOL_CONFLICT error: "
+                    b"cookie_header=RESPONSE_COOKIE_HEADER_SECRET; detail: "
+                    b"proxy_authorization=RESPONSE_PROXY_AUTHORIZATION_SECRET; warning: "
+                    b"authorization_value=RESPONSE_AUTHORIZATION_VALUE_SECRET; context: "
+                    b"auth_header=RESPONSE_AUTH_HEADER_SECRET; "
+                    b"header_count=SAFE_RESPONSE_HEADER_COUNT"
+                )
+
+        class FakeConnection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+        console_messages = []
+        events = []
+        fake_database = types.ModuleType("database")
+        fake_database.log_event = lambda *args, **kwargs: events.append((args, kwargs))
+        payload = {
+            "nested": {
+                "cookieHeader": "PAYLOAD_COOKIE_HEADER_SECRET",
+                "proxy-authorization": "PAYLOAD_PROXY_AUTHORIZATION_SECRET",
+                "authorization value": "PAYLOAD_AUTHORIZATION_VALUE_SECRET",
+                "auth_header": "PAYLOAD_AUTH_HEADER_SECRET",
+                "header_count": "SAFE_PAYLOAD_HEADER_COUNT",
+            }
+        }
+        endpoint = "submit_transaction?auth_header=ENDPOINT_AUTH_HEADER_SECRET"
+
+        with (
+            patch.dict(sys.modules, {"database": fake_database}),
+            patch.object(
+                wallet_sage, "_get_sage_connection", return_value=FakeConnection()
+            ),
+            patch.object(wallet_sage, "_console", side_effect=console_messages.append),
+        ):
+            result = wallet_sage.rpc(endpoint, payload)
+
+        self.assertFalse(result["success"])
+        self.assertTrue(events)
+        observed = repr((result, console_messages, events))
+        for secret in (
+            "RESPONSE_COOKIE_HEADER_SECRET",
+            "RESPONSE_PROXY_AUTHORIZATION_SECRET",
+            "RESPONSE_AUTHORIZATION_VALUE_SECRET",
+            "RESPONSE_AUTH_HEADER_SECRET",
+            "PAYLOAD_COOKIE_HEADER_SECRET",
+            "PAYLOAD_PROXY_AUTHORIZATION_SECRET",
+            "PAYLOAD_AUTHORIZATION_VALUE_SECRET",
+            "PAYLOAD_AUTH_HEADER_SECRET",
+            "ENDPOINT_AUTH_HEADER_SECRET",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, observed)
+        self.assertIn("SAFE_RESPONSE_HEADER_COUNT", observed)
+        self.assertIn("SAFE_PAYLOAD_HEADER_COUNT", observed)
+
     def test_sensitive_name_matrix_distinguishes_credentials_from_metadata(self):
         sensitive_names = (
             "authorization_header",

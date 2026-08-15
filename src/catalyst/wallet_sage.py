@@ -45,12 +45,14 @@ def _console(msg: str) -> None:
 
 
 _REDACTED = "[REDACTED]"
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?P<name>[\"']?[A-Za-z][A-Za-z0-9_. -]*?[\"']?)\s*"
-    r"(?P<separator>[:=])\s*"
-    r"(?P<value>\[REDACTED\]|(?:Bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^,\s;}\]]+))",
+_ASSIGNMENT_HEAD_CANDIDATE_RE = re.compile(
+    r"(?:^|(?<=[\s?&,:;{\[(/]))"
+    r"(?=(?P<name>[\"']?[A-Za-z][A-Za-z0-9_.-]*"
+    r"(?:[ ]+[A-Za-z0-9_.-]+)*?[\"']?)[ \t]*"
+    r"(?P<separator>[:=])(?P<spacing>[ \t]*))",
     re.IGNORECASE,
 )
+_ASSIGNMENT_VALUE_DELIMITER_RE = re.compile(r"[,;}\]\r\n]")
 _SENSITIVE_HEADER_RE = re.compile(
     r"(?P<name>(?:proxy[-_ ]?authorization|authorization|set[-_ ]?cookie|cookie|"
     r"x[-_ ]?api[-_ ]?(?:key|token))\s*:\s*)(?P<value>[^\r\n]+)",
@@ -90,6 +92,16 @@ _SENSITIVE_COMPONENT_TOKENS = {
     "secret",
     "secrets",
 }
+_SENSITIVE_TERMINAL_TOKENS = _SENSITIVE_EXACT_FIELDS - {
+    "header",
+    "headers",
+    "private",
+}
+_CREDENTIAL_VALUE_PREFIX_TOKENS = _SENSITIVE_TERMINAL_TOKENS | {
+    "key",
+    "private",
+}
+_CREDENTIAL_VALUE_SUFFIX_TOKENS = {"header", "value"}
 _SENSITIVE_TOKEN_SEQUENCES = {
     ("access", "token"),
     ("api", "key"),
@@ -134,9 +146,10 @@ def _is_sensitive_name(name: Any) -> bool:
     """Identify credential-bearing field names without broad substring matches.
 
     Threat model: Sage errors and payloads may label credentials with camelCase,
-    snake_case, kebab-case, or HTTP-header spelling. Explicit credential sequences
-    catch those variants; terminal metadata tokens keep status/count/method/presence
-    fields visible rather than treating every related word as a secret.
+    snake_case, kebab-case, or HTTP-header spelling. Credential nouns and
+    value-bearing suffixes catch equivalent labels without enumerating every
+    spelling; terminal metadata tokens keep status/count/method/presence fields
+    visible rather than treating every related word as a secret.
     """
     tokens = _normalise_sage_field_name(name)
     if not tokens:
@@ -147,11 +160,91 @@ def _is_sensitive_name(name: Any) -> bool:
         return True
     if any(token in _SENSITIVE_COMPONENT_TOKENS for token in tokens):
         return True
+    if tokens[-1] in _SENSITIVE_TERMINAL_TOKENS:
+        return True
+    if (
+        tokens[-1] in _CREDENTIAL_VALUE_SUFFIX_TOKENS
+        and any(token in _CREDENTIAL_VALUE_PREFIX_TOKENS for token in tokens[:-1])
+    ):
+        return True
     return any(
         tokens[index : index + len(sequence)] == sequence
         for sequence in _SENSITIVE_TOKEN_SEQUENCES
         for index in range(len(tokens) - len(sequence) + 1)
     )
+
+
+def _is_metadata_name(name: Any) -> bool:
+    """Return whether a compound field ends in an allowed metadata suffix."""
+    tokens = _normalise_sage_field_name(name)
+    return len(tokens) > 1 and tokens[-1] in _METADATA_SUFFIX_TOKENS
+
+
+def _sage_assignment_heads(text: str) -> list[dict[str, Any]]:
+    """Find assignment heads without letting an outer label hide a nested one."""
+    candidates_by_separator = {}
+    for match in _ASSIGNMENT_HEAD_CANDIDATE_RE.finditer(text):
+        name = match.group("name")
+        candidate = {
+            "name_start": match.start("name"),
+            "value_start": match.end("spacing"),
+            "sensitive": _is_sensitive_name(name),
+            "metadata": _is_metadata_name(name),
+        }
+        candidates_by_separator.setdefault(match.start("separator"), []).append(
+            candidate
+        )
+
+    heads = []
+    for candidates in candidates_by_separator.values():
+        semantic = [
+            candidate
+            for candidate in candidates
+            if candidate["sensitive"] or candidate["metadata"]
+        ]
+        heads.append(max(semantic or candidates, key=lambda item: item["name_start"]))
+    return sorted(heads, key=lambda item: item["name_start"])
+
+
+def _sage_assignment_value_end(text: str, start: int, next_head: int) -> int:
+    """Bound an assignment value by quotes, structure, or the next field."""
+    if start < len(text) and text[start] in {'"', "'"}:
+        closing_quote = text.find(text[start], start + 1)
+        if closing_quote >= 0:
+            return closing_quote + 1
+    delimiter = _ASSIGNMENT_VALUE_DELIMITER_RE.search(text, start, next_head)
+    return delimiter.start() if delimiter else next_head
+
+
+def _redact_sage_assignments(text: str) -> str:
+    """Redact semantic assignment values, including overlapping candidates."""
+    heads = _sage_assignment_heads(text)
+    ranges = []
+    for index, head in enumerate(heads):
+        if not head["sensitive"]:
+            continue
+        next_head = len(text)
+        for candidate in heads[index + 1 :]:
+            if candidate["name_start"] >= head["value_start"]:
+                next_head = candidate["name_start"]
+                break
+        value_end = _sage_assignment_value_end(
+            text, head["value_start"], next_head
+        )
+        if value_end > head["value_start"]:
+            ranges.append((head["value_start"], value_end))
+
+    if not ranges:
+        return text
+    parts = []
+    cursor = 0
+    for start, end in ranges:
+        if start < cursor:
+            continue
+        parts.extend((text[cursor:start], _REDACTED))
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
@@ -160,14 +253,7 @@ def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
     text = _SENSITIVE_HEADER_RE.sub(
         lambda match: f"{match.group('name')}{_REDACTED}", text
     )
-    text = _SENSITIVE_ASSIGNMENT_RE.sub(
-        lambda match: (
-            f"{match.group('name')}{match.group('separator')}{_REDACTED}"
-            if _is_sensitive_name(match.group('name'))
-            else match.group(0)
-        ),
-        text,
-    )
+    text = _redact_sage_assignments(text)
     return text[:limit]
 
 
