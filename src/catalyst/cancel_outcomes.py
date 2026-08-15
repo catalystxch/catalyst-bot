@@ -40,14 +40,36 @@ _POSITIVE_SUBMISSION_CODES = frozenset(
 )
 _REJECTION_CODES = frozenset({"REJECTED", "FAILED", "CANCEL_REJECTED"})
 _NEGATED_SUBMISSION_CODES = frozenset(
-    {"NOT_MEMPOOL_CONFLICT", "NOT_ALREADY_INCLUDING"}
+    f"NOT_{code}" for code in _POSITIVE_SUBMISSION_CODES
 )
-_SAFE_DIAGNOSTIC_CODES = _POSITIVE_SUBMISSION_CODES | _REJECTION_CODES
-_REJECTION_TEXT = re.compile(r"\breject(?:ed|ion)?\b", re.IGNORECASE)
+_SAFE_DIAGNOSTIC_CODES = (
+    _POSITIVE_SUBMISSION_CODES | _REJECTION_CODES | _NEGATED_SUBMISSION_CODES
+)
+_EXACT_REJECTION_PHRASES = frozenset(
+    {"rejected", "cancel rejected", "transaction rejected"}
+)
 _NEGATED_SUBMISSION_TEXT = re.compile(
     r"\b(?:not|no)[ _-]*(?:mempool_conflict|already_including)\b",
     re.IGNORECASE,
 )
+COMPACT_EVIDENCE_CODE_ALIASES = {
+    CANCEL_CONFIRMED: "CC",
+    CANCEL_SUBMITTED_UNCONFIRMED: "CS",
+    CANCEL_FAILED: "CF",
+    CANCEL_UNKNOWN: "CU",
+    "MEMPOOL_CONFLICT": "MC",
+    "ALREADY_INCLUDING": "AI",
+    "ALREADY_INCLUDING_TRANSACTION": "AIT",
+    "REJECTED": "RJ",
+    "FAILED": "FL",
+    "CANCEL_REJECTED": "CR",
+    "NOT_MEMPOOL_CONFLICT": "NMC",
+    "NOT_ALREADY_INCLUDING": "NAI",
+    "NOT_ALREADY_INCLUDING_TRANSACTION": "NAIT",
+}
+_COMPACT_EVIDENCE_CODE_DECODER = {
+    alias: code for code, alias in COMPACT_EVIDENCE_CODE_ALIASES.items()
+}
 
 
 def _json_default(value: Any) -> dict[str, str]:
@@ -100,6 +122,11 @@ def _safe_error_code(value: Any) -> str:
     return code if code in _SAFE_DIAGNOSTIC_CODES else "CANCEL_ERROR_UNCLASSIFIED"
 
 
+def decode_evidence_code(alias: Any) -> str:
+    """Decode the documented v4 compact evidence reason, or return empty."""
+    return _COMPACT_EVIDENCE_CODE_DECODER.get(alias, "")
+
+
 def _safe_method(value: Any) -> str:
     if isinstance(value, str) and _METHOD_TAG.fullmatch(value):
         return value
@@ -114,44 +141,63 @@ def _response_codes(response: Mapping[str, Any]) -> set[str]:
     }
 
 
-def _evidence_projection(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+def _evidence_reason_from_raw(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return CANCEL_UNKNOWN
+    codes = _response_codes(value)
+    if value.get("success") is False or codes & _REJECTION_CODES:
+        return sorted(codes & _REJECTION_CODES)[0] if codes & _REJECTION_CODES else CANCEL_FAILED
+    if codes & _NEGATED_SUBMISSION_CODES:
+        return sorted(codes & _NEGATED_SUBMISSION_CODES)[0]
+    if codes & _POSITIVE_SUBMISSION_CODES:
+        return sorted(codes & _POSITIVE_SUBMISSION_CODES)[0]
+    return CANCEL_UNKNOWN
+
+
+def _evidence_reason(value: Any, decision_code: Any) -> str:
+    code = _normalized_code(decision_code)
+    if code in COMPACT_EVIDENCE_CODE_ALIASES:
+        return code
+    return _evidence_reason_from_raw(value)
+
+
+def _evidence_projection(
+    value: Any, decision_code: Any = ""
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return compact-core and optional safe facts without retaining raw text."""
     raw = _canonical_json(value)
     core: dict[str, Any] = {
         "d": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "t": True,
-        "v": 3,
+        "v": 4,
     }
     optional: dict[str, Any] = {
         "k": "mapping" if isinstance(value, Mapping) else type(value).__name__,
         "n": len(raw.encode("utf-8")),
     }
-    if not isinstance(value, Mapping):
-        return core, optional
-
-    optional["keys"] = len(value)
-    if isinstance(value.get("success"), bool):
-        optional["success"] = value["success"]
-    safe_codes = sorted(_response_codes(value) & _SAFE_DIAGNOSTIC_CODES)
-    if safe_codes:
-        core["code"] = safe_codes[0]
-    transaction_id = _validated_transaction_id(
-        value.get("transaction_id") or value.get("tx_id")
-    )
-    if transaction_id:
-        core["tx"] = transaction_id
-    spend_identity = _validated_spend_identity(value.get("spend_identity"))
-    if spend_identity:
-        core["spend"] = spend_identity
-    if isinstance(value.get("coin_spends"), (list, tuple)):
-        optional["spends"] = len(value["coin_spends"])
+    reason = _evidence_reason(value, decision_code)
+    core["code"] = COMPACT_EVIDENCE_CODE_ALIASES[reason]
+    if isinstance(value, Mapping):
+        optional["keys"] = len(value)
+        if isinstance(value.get("success"), bool):
+            optional["success"] = value["success"]
+        transaction_id = _validated_transaction_id(
+            value.get("transaction_id") or value.get("tx_id")
+        )
+        if transaction_id:
+            core["tx"] = transaction_id
+        spend_identity = _validated_spend_identity(value.get("spend_identity"))
+        if spend_identity:
+            core["spend"] = spend_identity
+        if isinstance(value.get("coin_spends"), (list, tuple)):
+            optional["spends"] = len(value["coin_spends"])
     return core, optional
 
 
-def safe_raw_response(value: Any, limit: int = 4096) -> str:
+def safe_raw_response(value: Any, limit: int = 4096, decision_code: Any = "") -> str:
     """Return a bounded allowlisted evidence projection, never raw response text."""
     limit = max(2, int(limit))
-    projection, optional = _evidence_projection(value)
+    projection, optional = _evidence_projection(value, decision_code)
     rendered = _canonical_json(projection)
     if len(rendered.encode("utf-8")) <= limit:
         for key in ("success", "n", "spends", "keys", "k"):
@@ -162,7 +208,7 @@ def safe_raw_response(value: Any, limit: int = 4096) -> str:
             if len(candidate_rendered.encode("utf-8")) <= limit:
                 projection = candidate
         return _canonical_json(projection)
-    fallback = _canonical_json({"d": evidence_digest(value), "v": 3})
+    fallback = _canonical_json({"d": evidence_digest(value), "v": 4})
     return fallback if len(fallback.encode("utf-8")) <= limit else "{}"
 
 
@@ -186,7 +232,10 @@ def _has_explicit_rejection(response: Any, values: tuple[Any, ...]) -> bool:
         return True
     return any(
         _normalized_code(value) in _REJECTION_CODES
-        or (isinstance(value, str) and bool(_REJECTION_TEXT.search(value)))
+        or (
+            isinstance(value, str)
+            and " ".join(value.casefold().split()) in _EXACT_REJECTION_PHRASES
+        )
         for value in values
     )
 
@@ -197,6 +246,21 @@ def _has_negated_submission_marker(values: tuple[Any, ...]) -> bool:
         or (isinstance(value, str) and bool(_NEGATED_SUBMISSION_TEXT.search(value)))
         for value in values
     )
+
+
+def _has_ambiguous_evidence_text(values: tuple[Any, ...]) -> bool:
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if _normalized_code(value):
+            continue
+        normalized_phrase = " ".join(value.casefold().split())
+        if normalized_phrase in _EXACT_REJECTION_PHRASES:
+            continue
+        if _NEGATED_SUBMISSION_TEXT.search(value):
+            continue
+        return True
+    return False
 
 
 def cancellation_result(
@@ -227,7 +291,12 @@ def cancellation_result(
         error_text = error_text or "CANCEL_ERROR_UNCLASSIFIED"
 
     submitted = normalized == CANCEL_SUBMITTED_UNCONFIRMED
-    raw_evidence = safe_raw_response(raw_response)
+    evidence_reason = (
+        error_text
+        if error_text in COMPACT_EVIDENCE_CODE_ALIASES
+        else normalized
+    )
+    raw_evidence = safe_raw_response(raw_response, decision_code=evidence_reason)
     result: dict[str, Any] = {
         "outcome": normalized,
         "success": normalized == CANCEL_CONFIRMED,
@@ -289,6 +358,16 @@ def normalize_cancel_response(
             spend_identity=spend_identity,
         )
     if _has_negated_submission_marker(values):
+        negated_codes = sorted(all_codes & _NEGATED_SUBMISSION_CODES)
+        return cancellation_result(
+            CANCEL_UNKNOWN,
+            method=method,
+            raw_response=response,
+            error=negated_codes[0] if negated_codes else "CANCEL_ERROR_UNCLASSIFIED",
+            transaction_id=transaction_id,
+            spend_identity=spend_identity,
+        )
+    if _has_ambiguous_evidence_text(values):
         return cancellation_result(
             CANCEL_UNKNOWN,
             method=method,
@@ -362,7 +441,9 @@ __all__ = [
     "CANCEL_FAILED",
     "CANCEL_SUBMITTED_UNCONFIRMED",
     "CANCEL_UNKNOWN",
+    "COMPACT_EVIDENCE_CODE_ALIASES",
     "cancellation_result",
+    "decode_evidence_code",
     "evidence_digest",
     "normalize_cancel_response",
     "normalize_cancel_result",

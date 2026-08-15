@@ -12,6 +12,7 @@ from cancel_outcomes import (
     CANCEL_SUBMITTED_UNCONFIRMED,
     CANCEL_UNKNOWN,
     cancellation_result,
+    decode_evidence_code,
     normalize_cancel_response,
     safe_raw_response,
 )
@@ -222,7 +223,7 @@ def test_submitted_requires_transaction_id_or_exact_spend_identity(
         ),
         (
             {"error": "rejected: mempool_conflict was not observed"},
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN,
         ),
         ({"status": "not already_including"}, CANCEL_UNKNOWN),
         ({"code": "MEMPOOL_CONFLICT_RETRY"}, CANCEL_UNKNOWN),
@@ -271,7 +272,7 @@ def test_only_exact_positive_mempool_codes_can_mark_submission(
         (
             {"code": "MEMPOOL_CONFLICT"},
             "rejected: mempool_conflict was not observed",
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN,
         ),
     ],
 )
@@ -288,6 +289,46 @@ def test_full_evidence_scan_blocks_positive_submission_on_rejection_or_negation(
 
     assert result["outcome"] == want_outcome
     assert result["submitted"] is False
+
+
+@pytest.mark.parametrize(
+    "positive_code",
+    [
+        "MEMPOOL_CONFLICT",
+        "ALREADY_INCLUDING",
+        "ALREADY_INCLUDING_TRANSACTION",
+    ],
+)
+def test_every_not_positive_code_blocks_submitted_classification(positive_code):
+    """All positive codes have a systematic NOT_ fail-closed counterpart."""
+    result = normalize_cancel_response(
+        {"code": positive_code, "status": f"NOT_{positive_code}"},
+        method="submit_transaction",
+        transaction_id="a" * 64,
+    )
+
+    assert result["outcome"] == CANCEL_UNKNOWN
+    assert result["submitted"] is False
+
+
+@pytest.mark.parametrize(
+    ("message", "want_outcome"),
+    [
+        ("cancel rejected", CANCEL_FAILED),
+        ("transaction rejected", CANCEL_FAILED),
+        ("cancellation was not rejected", CANCEL_UNKNOWN),
+        ("rejection not observed", CANCEL_UNKNOWN),
+        ('history: "cancel rejected" yesterday', CANCEL_UNKNOWN),
+        ("remote detail contains cancel rejected", CANCEL_UNKNOWN),
+    ],
+)
+def test_rejection_prose_requires_an_exact_unnegated_phrase(message, want_outcome):
+    """Historical or negated text cannot manufacture a terminal failure."""
+    result = normalize_cancel_response(
+        {"error": message}, method="submit_transaction", transaction_id="a" * 64
+    )
+
+    assert result["outcome"] == want_outcome
 
 
 @pytest.mark.parametrize(
@@ -386,7 +427,60 @@ def test_evidence_priority_preserves_digest_transaction_id_and_positive_code(lim
     assert len(rendered.encode("utf-8")) <= limit
     assert evidence["d"]
     assert evidence["tx"] == "d" * 64
-    assert evidence["code"] == "MEMPOOL_CONFLICT"
+    assert decode_evidence_code(evidence["code"]) == "MEMPOOL_CONFLICT"
+
+
+@pytest.mark.parametrize("limit", [192, 256])
+def test_compact_evidence_keeps_longest_decision_code_with_transaction_id(limit):
+    """The longest canonical reason still fits alongside digest and tx identity."""
+    response = {
+        "Authorization": "Bearer secret",
+        "code": "ALREADY_INCLUDING_TRANSACTION",
+        "coin_spends": ["x" * 5_000],
+        "transaction_id": "e" * 64,
+    }
+    rendered = safe_raw_response(
+        response,
+        limit=limit,
+        decision_code="ALREADY_INCLUDING_TRANSACTION",
+    )
+    evidence = json.loads(rendered)
+
+    assert len(rendered.encode("utf-8")) <= limit
+    assert decode_evidence_code(evidence["code"]) == "ALREADY_INCLUDING_TRANSACTION"
+    assert evidence["tx"] == "e" * 64
+    assert evidence["d"]
+
+
+@pytest.mark.parametrize(
+    ("response", "want_outcome", "want_reason"),
+    [
+        (
+            {"code": "MEMPOOL_CONFLICT", "status": "REJECTED"},
+            CANCEL_FAILED,
+            "REJECTED",
+        ),
+        (
+            {
+                "code": "MEMPOOL_CONFLICT",
+                "status": "NOT_ALREADY_INCLUDING_TRANSACTION",
+            },
+            CANCEL_UNKNOWN,
+            "NOT_ALREADY_INCLUDING_TRANSACTION",
+        ),
+    ],
+)
+def test_evidence_code_is_derived_from_final_decision_not_raw_positive_signal(
+    response, want_outcome, want_reason
+):
+    """A losing raw positive code must not survive as cancellation evidence."""
+    result = normalize_cancel_response(
+        {**response, "transaction_id": "f" * 64}, method="submit_transaction"
+    )
+    evidence = json.loads(result["raw_response"])
+
+    assert result["outcome"] == want_outcome
+    assert decode_evidence_code(evidence["code"]) == want_reason
 
 
 def test_cancellation_result_keeps_digest_with_bounded_raw_evidence():
