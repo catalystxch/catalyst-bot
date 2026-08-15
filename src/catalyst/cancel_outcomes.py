@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 
@@ -52,24 +53,35 @@ _NEGATED_SUBMISSION_TEXT = re.compile(
     r"\b(?:not|no)[ _-]*(?:mempool_conflict|already_including)\b",
     re.IGNORECASE,
 )
-COMPACT_EVIDENCE_CODE_ALIASES = {
-    CANCEL_CONFIRMED: "CC",
-    CANCEL_SUBMITTED_UNCONFIRMED: "CS",
-    CANCEL_FAILED: "CF",
-    CANCEL_UNKNOWN: "CU",
-    "MEMPOOL_CONFLICT": "MC",
-    "ALREADY_INCLUDING": "AI",
-    "ALREADY_INCLUDING_TRANSACTION": "AIT",
-    "REJECTED": "RJ",
-    "FAILED": "FL",
-    "CANCEL_REJECTED": "CR",
-    "NOT_MEMPOOL_CONFLICT": "NMC",
-    "NOT_ALREADY_INCLUDING": "NAI",
-    "NOT_ALREADY_INCLUDING_TRANSACTION": "NAIT",
-}
-_COMPACT_EVIDENCE_CODE_DECODER = {
-    alias: code for code, alias in COMPACT_EVIDENCE_CODE_ALIASES.items()
-}
+_COMPACT_EVIDENCE_SCHEMA_VERSION = 4
+_COMPACT_EVIDENCE_CODE_SCHEMA = (
+    (CANCEL_CONFIRMED, "CC"),
+    (CANCEL_SUBMITTED_UNCONFIRMED, "CS"),
+    (CANCEL_FAILED, "CF"),
+    (CANCEL_UNKNOWN, "CU"),
+    ("MEMPOOL_CONFLICT", "MC"),
+    ("ALREADY_INCLUDING", "AI"),
+    ("ALREADY_INCLUDING_TRANSACTION", "AIT"),
+    ("REJECTED", "RJ"),
+    ("FAILED", "FL"),
+    ("CANCEL_REJECTED", "CR"),
+    ("NOT_MEMPOOL_CONFLICT", "NMC"),
+    ("NOT_ALREADY_INCLUDING", "NAI"),
+    ("NOT_ALREADY_INCLUDING_TRANSACTION", "NAIT"),
+)
+# Public v4 encoder schema. MappingProxyType keeps runtime consumers from
+# changing aliases after the decoder has been derived from this single source.
+COMPACT_EVIDENCE_CODE_ALIASES: Mapping[str, str] = MappingProxyType(
+    dict(_COMPACT_EVIDENCE_CODE_SCHEMA)
+)
+_COMPACT_EVIDENCE_CODE_DECODER: Mapping[str, str] = MappingProxyType(
+    {alias: code for code, alias in _COMPACT_EVIDENCE_CODE_SCHEMA}
+)
+if (
+    len(COMPACT_EVIDENCE_CODE_ALIASES) != len(_COMPACT_EVIDENCE_CODE_SCHEMA)
+    or len(_COMPACT_EVIDENCE_CODE_DECODER) != len(_COMPACT_EVIDENCE_CODE_SCHEMA)
+):
+    raise RuntimeError("compact evidence v4 codes and aliases must be unique")
 
 
 def _json_default(value: Any) -> dict[str, str]:
@@ -123,7 +135,9 @@ def _safe_error_code(value: Any) -> str:
 
 
 def decode_evidence_code(alias: Any) -> str:
-    """Decode the documented v4 compact evidence reason, or return empty."""
+    """Decode a documented v4 compact evidence reason, or return empty."""
+    if not isinstance(alias, str):
+        return ""
     return _COMPACT_EVIDENCE_CODE_DECODER.get(alias, "")
 
 
@@ -150,6 +164,12 @@ def _evidence_reason_from_raw(value: Any) -> str:
     if codes & _NEGATED_SUBMISSION_CODES:
         return sorted(codes & _NEGATED_SUBMISSION_CODES)[0]
     if codes & _POSITIVE_SUBMISSION_CODES:
+        transaction_id = _validated_transaction_id(
+            value.get("transaction_id") or value.get("tx_id")
+        )
+        spend_identity = _validated_spend_identity(value.get("spend_identity"))
+        if not _has_submission_identity(transaction_id, spend_identity):
+            return CANCEL_UNKNOWN
         return sorted(codes & _POSITIVE_SUBMISSION_CODES)[0]
     return CANCEL_UNKNOWN
 
@@ -169,7 +189,7 @@ def _evidence_projection(
     core: dict[str, Any] = {
         "d": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "t": True,
-        "v": 4,
+        "v": _COMPACT_EVIDENCE_SCHEMA_VERSION,
     }
     optional: dict[str, Any] = {
         "k": "mapping" if isinstance(value, Mapping) else type(value).__name__,
@@ -208,7 +228,9 @@ def safe_raw_response(value: Any, limit: int = 4096, decision_code: Any = "") ->
             if len(candidate_rendered.encode("utf-8")) <= limit:
                 projection = candidate
         return _canonical_json(projection)
-    fallback = _canonical_json({"d": evidence_digest(value), "v": 4})
+    fallback = _canonical_json(
+        {"d": evidence_digest(value), "v": _COMPACT_EVIDENCE_SCHEMA_VERSION}
+    )
     return fallback if len(fallback.encode("utf-8")) <= limit else "{}"
 
 
@@ -289,6 +311,8 @@ def cancellation_result(
     ):
         normalized = CANCEL_UNKNOWN
         error_text = error_text or "CANCEL_ERROR_UNCLASSIFIED"
+    if normalized == CANCEL_UNKNOWN and error_text in _POSITIVE_SUBMISSION_CODES:
+        error_text = CANCEL_UNKNOWN
 
     submitted = normalized == CANCEL_SUBMITTED_UNCONFIRMED
     evidence_reason = (

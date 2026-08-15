@@ -11,6 +11,7 @@ from cancel_outcomes import (
     CANCEL_FAILED,
     CANCEL_SUBMITTED_UNCONFIRMED,
     CANCEL_UNKNOWN,
+    COMPACT_EVIDENCE_CODE_ALIASES,
     cancellation_result,
     decode_evidence_code,
     normalize_cancel_response,
@@ -481,6 +482,97 @@ def test_evidence_code_is_derived_from_final_decision_not_raw_positive_signal(
 
     assert result["outcome"] == want_outcome
     assert decode_evidence_code(evidence["code"]) == want_reason
+
+
+@pytest.mark.parametrize(
+    "positive_code",
+    [
+        "MEMPOOL_CONFLICT",
+        "ALREADY_INCLUDING",
+        "ALREADY_INCLUDING_TRANSACTION",
+    ],
+)
+@pytest.mark.parametrize(
+    "signal_location",
+    ["error_code", "code", "status", "error", "adapter_error"],
+)
+def test_positive_signal_without_valid_identity_uses_unknown_reason_everywhere(
+    positive_code, signal_location
+):
+    """A losing positive signal must not remain authoritative after downgrade."""
+    response = {}
+    adapter_error = None
+    if signal_location == "adapter_error":
+        adapter_error = positive_code
+    else:
+        response[signal_location] = positive_code
+
+    result = normalize_cancel_response(
+        response,
+        error=adapter_error,
+        method="submit_transaction",
+    )
+    evidence = json.loads(result["raw_response"])
+
+    assert result["outcome"] == CANCEL_UNKNOWN
+    assert result["error"] == CANCEL_UNKNOWN
+    assert decode_evidence_code(evidence["code"]) == CANCEL_UNKNOWN
+    for limit in (192, 256):
+        bounded = safe_raw_response(
+            response,
+            limit=limit,
+            decision_code=result["error"],
+        )
+        bounded_evidence = json.loads(bounded)
+        assert len(bounded.encode("utf-8")) <= limit
+        assert decode_evidence_code(bounded_evidence["code"]) == CANCEL_UNKNOWN
+        inferred = safe_raw_response(response, limit=limit)
+        inferred_evidence = json.loads(inferred)
+        assert decode_evidence_code(inferred_evidence["code"]) == CANCEL_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "invalid_alias",
+    [
+        [],
+        {},
+        0,
+        1.5,
+        True,
+        False,
+        None,
+        "",
+        "UNKNOWN",
+        "MC ",
+        "mc",
+    ],
+)
+def test_evidence_decoder_is_total_and_fail_closed_for_invalid_aliases(
+    invalid_alias,
+):
+    """Malformed JSON-valid aliases must return empty instead of raising."""
+    assert decode_evidence_code(invalid_alias) == ""
+
+
+def test_compact_evidence_schema_is_immutable_unique_and_round_trips():
+    """Runtime mutation or duplicate aliases must not desynchronise v4 codecs."""
+    original_alias = COMPACT_EVIDENCE_CODE_ALIASES["MEMPOOL_CONFLICT"]
+    try:
+        with pytest.raises(TypeError):
+            COMPACT_EVIDENCE_CODE_ALIASES["MEMPOOL_CONFLICT"] = "RJ"
+    finally:
+        if COMPACT_EVIDENCE_CODE_ALIASES["MEMPOOL_CONFLICT"] != original_alias:
+            COMPACT_EVIDENCE_CODE_ALIASES["MEMPOOL_CONFLICT"] = original_alias
+
+    aliases = tuple(COMPACT_EVIDENCE_CODE_ALIASES.values())
+    assert len(aliases) == len(set(aliases))
+    for code, alias in COMPACT_EVIDENCE_CODE_ALIASES.items():
+        evidence = json.loads(
+            safe_raw_response({}, limit=192, decision_code=code)
+        )
+        assert evidence["v"] == 4
+        assert evidence["code"] == alias
+        assert decode_evidence_code(alias) == code
 
 
 def test_cancellation_result_keeps_digest_with_bounded_raw_evidence():
