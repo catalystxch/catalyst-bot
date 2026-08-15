@@ -9,6 +9,8 @@ from offer_lifecycle import (
     apply_fill_verification,
     coarse_status,
     is_terminal,
+    registry_state,
+    signal_requires_registry_proof,
 )
 
 
@@ -145,6 +147,40 @@ class TestOfferLifecycle(unittest.TestCase):
         t = apply_signal(OfferState.OPEN, OfferSignal.FILL_DETECTED)
         with self.assertRaises(AttributeError):
             t.new_state = OfferState.OPEN
+
+    def test_registry_adapter_preserves_coarse_lifecycle_compatibility(self):
+        expected = {
+            "open": "visible",
+            "refresh_due": "visible",
+            "cancel_requested": "cancel_requested",
+            "mempool_observed": "visible",
+            "filled": "terminal",
+            "cancelled": "terminal",
+            "expired": "terminal",
+            "not_submitted": "terminal",
+            "phantom_rejected": "terminal",
+            "prepared": "prepared",
+            "submitted_unconfirmed": "submitted_unconfirmed",
+            "creation_unknown": "unknown",
+            "creation_failed": "terminal",
+            "created": "created",
+            "conflicted": "conflicted",
+            "quarantined": "quarantined",
+        }
+        self.assertEqual({value: registry_state(value) for value in expected}, expected)
+        self.assertEqual(coarse_status("visible"), "open")
+        self.assertEqual(coarse_status("created"), "open")
+        self.assertEqual(coarse_status("creation_failed"), "expired")
+        self.assertTrue(is_terminal("creation_failed"))
+
+    def test_unproven_terminal_signals_are_marked_for_registry_policy(self):
+        for signal in (
+            OfferSignal.FILL_DETECTED,
+            OfferSignal.TIME_EXPIRED,
+            OfferSignal.REFRESH_POSTED,
+        ):
+            self.assertTrue(signal_requires_registry_proof(signal))
+        self.assertFalse(signal_requires_registry_proof(OfferSignal.EXPIRY_NEAR))
 
 
 if __name__ == "__main__":
