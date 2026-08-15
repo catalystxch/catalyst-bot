@@ -24,6 +24,7 @@ from urllib3 import Retry
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import datetime
 from typing import List, Dict, Optional
 from decimal import Decimal, ROUND_DOWN
 from tx_fees import get_effective_transaction_fee_mojos
@@ -95,6 +96,53 @@ def set_quiet_mode(quiet: bool):
     """Enable/disable RPC error suppression (e.g. during Chia restart)."""
     global _quiet_mode
     _quiet_mode = quiet
+
+
+def get_wallet_identity() -> dict:
+    """Read the closest available Chia wallet identity snapshot without mutation."""
+    observed_at_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    try:
+        result = rpc("get_logged_in_fingerprint", {}, timeout=5)
+    except Exception:
+        result = None
+    if not isinstance(result, dict) or result.get("success") is False:
+        return {
+            "success": False,
+            "backend": "chia",
+            "name": None,
+            "fingerprint": None,
+            "network_id": None,
+            "kind": None,
+            "has_secrets": None,
+            "observed_at_utc": observed_at_utc,
+            "error": "identity_lookup_failed",
+        }
+    try:
+        fingerprint = int(result.get("fingerprint"))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "backend": "chia",
+            "name": None,
+            "fingerprint": None,
+            "network_id": None,
+            "kind": None,
+            "has_secrets": None,
+            "observed_at_utc": observed_at_utc,
+            "error": "invalid_fingerprint",
+        }
+    return {
+        "success": True,
+        "backend": "chia",
+        "name": None,
+        "fingerprint": fingerprint,
+        "network_id": None,
+        "kind": None,
+        "has_secrets": None,
+        "observed_at_utc": observed_at_utc,
+    }
 
 
 def rpc(endpoint: str, payload: dict, timeout: int = 10):

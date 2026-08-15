@@ -14,6 +14,26 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_rpc_exception_paths_do_not_raise_when_console_is_cp1252(self):
+        def cp1252_console(message, **kwargs):
+            str(message).encode("cp1252")
+
+        exceptions = (
+            wallet_sage.SageMempoolConflict("snowman: ☃"),
+            wallet_sage.SageUnknownUnspent("snowman: ☃"),
+            ConnectionError("snowman: ☃"),
+            RuntimeError("snowman: ☃"),
+        )
+        for error in exceptions:
+            with self.subTest(error=type(error).__name__), patch(
+                "builtins.print", side_effect=cp1252_console
+            ), patch.object(wallet_sage, "_sage_post", side_effect=error):
+                result = wallet_sage.rpc("test", {})
+            if isinstance(error, RuntimeError):
+                self.assertIsNone(result)
+            else:
+                self.assertFalse(result["success"])
+
     def test_allows_wallet_with_secrets(self):
         with patch.object(
             wallet_sage, "get_current_key", return_value={"has_secrets": True}

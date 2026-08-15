@@ -123,7 +123,23 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
     def test_missing_fingerprint_is_startup_info_not_error(self):
         manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
-        fake_wallet = types.SimpleNamespace(get_current_key=lambda: None)
+        identity_calls = []
+
+        def get_wallet_identity():
+            identity_calls.append(True)
+            return {
+                "success": False,
+                "backend": "sage",
+                "name": None,
+                "fingerprint": None,
+                "network_id": None,
+                "kind": None,
+                "has_secrets": None,
+                "observed_at_utc": "2026-08-15T12:00:00Z",
+                "error": "active_key_unavailable",
+            }
+
+        fake_wallet = types.SimpleNamespace(get_wallet_identity=get_wallet_identity)
 
         with (
             patch.dict(sys.modules, {"wallet": fake_wallet}),
@@ -134,6 +150,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             result = manager._resolve_fingerprint()
 
         self.assertEqual(result, "")
+        self.assertEqual(identity_calls, [True] * 4)
         fingerprint_events = [
             call
             for call in log_event.call_args_list

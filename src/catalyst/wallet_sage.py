@@ -11,8 +11,8 @@ Key responsibilities:
     - Offer create / list / inspect / cancel with Sage's offered/requested asset format
     - XCH and CAT coin queries keyed by asset_id (no wallet_id abstraction)
     - Native ``split_xch`` / ``split_cat`` endpoints plus transfer helpers
-    - Mutual-TLS client cert auto-generated on first run, reused per thread via
-      ``http.client.HTTPSConnection`` for low-latency polling
+    - Mutual-TLS using configured or platform Sage certificates, reused per thread
+      via ``http.client.HTTPSConnection`` for low-latency polling
 
 Amounts are passed and returned as strings and converted to integer mojos
 internally. A workaround in ``get_spendable_coins_with_owned_fallback``
@@ -22,27 +22,18 @@ offer is already gone from the wallet's view.
 """
 
 import os
-from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
 from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal, ROUND_DOWN
 from tx_fees import get_effective_transaction_fee_mojos
+from config import cfg
 
 # Silence warnings for localhost self-signed cert
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-try:
-    from user_paths import env_file as _env_file, data_dir as _data_dir
-
-    load_dotenv(_env_file(), override=False)
-except Exception:
-    _data_dir = None
-    load_dotenv()
-
 
 def _console(msg: str) -> None:
     """Print to console, replacing unencodable chars on cp1252 Windows terminals."""
@@ -54,13 +45,12 @@ def _console(msg: str) -> None:
 
 # Sage defaults to port 9257 — uses HTTPS with self-signed cert
 # IMPORTANT: use 127.0.0.1 (not localhost) to match Sage's actual bind address
-WALLET_URL = os.getenv("SAGE_RPC_URL", "https://127.0.0.1:9257").rstrip("/")
-CERT_PATH = os.getenv("SAGE_CERT_PATH", "")
-KEY_PATH = os.getenv("SAGE_KEY_PATH", "")
+WALLET_URL = cfg.SAGE_RPC_URL.rstrip("/")
+CERT_PATH = cfg.SAGE_CERT_PATH
+KEY_PATH = cfg.SAGE_KEY_PATH
 
-# --- Auto-detect or generate client certificates ---
-# Sage RPC requires mutual TLS. Clients must present a self-signed cert.
-# Priority: SAGE_CERT_PATH env → auto-generated cert in bot directory.
+# --- Deterministic client certificate resolution ---
+# Sage RPC requires the configured or installed Sage wallet certificate pair.
 
 
 def _generate_self_signed_cert(cert_path, key_path):
@@ -128,35 +118,104 @@ def _generate_self_signed_cert(cert_path, key_path):
         return False
 
 
-def _auto_client_cert_paths() -> Tuple[str, str]:
-    try:
-        _cert_base = (
-            _data_dir() if _data_dir else os.path.dirname(os.path.abspath(__file__))
+def resolve_client_cert_paths(
+    configured_cert: str,
+    configured_key: str,
+    platform_ssl_dirs: List[str],
+) -> Tuple[str, str]:
+    """Resolve Sage TLS paths without reading files or creating certificates."""
+    if configured_cert and configured_key:
+        return configured_cert, configured_key
+    for ssl_dir in platform_ssl_dirs:
+        if ssl_dir:
+            return (
+                os.path.join(ssl_dir, "wallet.crt"),
+                os.path.join(ssl_dir, "wallet.key"),
+            )
+    return "", ""
+
+
+def _platform_sage_ssl_dirs(sage_data_dir: str) -> List[str]:
+    """Find existing platform Sage TLS directories without importing sage_node."""
+    import platform
+
+    roots = [sage_data_dir] if sage_data_dir else []
+    for key in ("SAGE_HOME", "SAGE_ALLOWED_CERT_ROOTS"):
+        roots.extend(path for path in os.getenv(key, "").split(os.pathsep) if path)
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        localappdata = os.environ.get("LOCALAPPDATA")
+        userprofile = os.environ.get("USERPROFILE")
+        if appdata:
+            roots.append(os.path.join(appdata, "com.rigidnetwork.sage"))
+        if localappdata:
+            roots.extend(
+                [
+                    os.path.join(localappdata, "com.rigidnetwork.sage"),
+                    os.path.join(localappdata, "Sage"),
+                    os.path.join(localappdata, "sage"),
+                ]
+            )
+        if userprofile:
+            roots.extend(
+                [
+                    os.path.join(
+                        userprofile, "AppData", "Roaming", "com.rigidnetwork.sage"
+                    ),
+                    os.path.join(
+                        userprofile, "AppData", "Local", "com.rigidnetwork.sage"
+                    ),
+                ]
+            )
+    elif system == "Darwin":
+        roots.extend(
+            [
+                os.path.expanduser("~/Library/Application Support/com.rigidnetwork.sage"),
+                os.path.expanduser("~/Library/Application Support/Sage"),
+            ]
         )
-    except Exception:
-        _cert_base = os.path.dirname(os.path.abspath(__file__))
-    return (
-        os.path.join(_cert_base, "sage_client_ssl", "client.crt"),
-        os.path.join(_cert_base, "sage_client_ssl", "client.key"),
-    )
+    else:
+        roots.extend(
+            [
+                os.path.join(
+                    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                    "com.rigidnetwork.sage",
+                ),
+                os.path.join(
+                    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+                    "com.rigidnetwork.sage",
+                ),
+            ]
+        )
+
+    result = []
+    for root in roots:
+        ssl_dir = root if os.path.basename(os.path.normpath(root)).lower() == "ssl" else os.path.join(root, "ssl")
+        cert_path = os.path.join(ssl_dir, "wallet.crt")
+        key_path = os.path.join(ssl_dir, "wallet.key")
+        if os.path.isfile(cert_path) and os.path.isfile(key_path) and ssl_dir not in result:
+            result.append(ssl_dir)
+    return result
 
 
-def _resolve_client_cert_paths(cert_path: str, key_path: str) -> Tuple[str, str]:
-    if cert_path and key_path:
-        return cert_path, key_path
-
-    # Auto-generate a client cert in the user data directory so packaged
-    # installs under Program Files never need to write beside the executable.
-    _auto_cert, _auto_key = _auto_client_cert_paths()
-
-    if os.path.exists(_auto_cert) and os.path.exists(_auto_key):
-        return _auto_cert, _auto_key
-    if _generate_self_signed_cert(_auto_cert, _auto_key):
-        return _auto_cert, _auto_key
-    return cert_path, key_path
+def _connection_settings() -> Tuple[str, str, str, str]:
+    """Return cfg settings with explicit process overrides for startup helpers."""
+    url, cert_path, key_path, data_dir = cfg.sage_connection_settings()
+    url = os.getenv("SAGE_RPC_URL") or url
+    cert_path = os.getenv("SAGE_CERT_PATH") or cert_path
+    key_path = os.getenv("SAGE_KEY_PATH") or key_path
+    data_dir = os.getenv("SAGE_DATA_DIR") or data_dir
+    return url, cert_path, key_path, data_dir
 
 
-CERT_PATH, KEY_PATH = _resolve_client_cert_paths(CERT_PATH, KEY_PATH)
+_initial_url, _initial_cert, _initial_key, _initial_data_dir = _connection_settings()
+WALLET_URL = _initial_url.rstrip("/")
+CERT_PATH, KEY_PATH = resolve_client_cert_paths(
+    _initial_cert,
+    _initial_key,
+    _platform_sage_ssl_dirs(_initial_data_dir),
+)
 
 # Sage doesn't use wallet IDs — but we keep the constant for API compatibility.
 # Other modules import WALLET_ID_XCH for offer_dict keys.
@@ -412,15 +471,11 @@ def reload_connection_settings() -> None:
     global WALLET_URL, CERT_PATH, KEY_PATH, _SAGE_HOST, _SAGE_PORT
     global _init_ok, _init_last_attempt
 
-    try:
-        load_dotenv(_env_file(), override=False)
-    except Exception:
-        load_dotenv(override=True)
-
-    WALLET_URL = os.getenv("SAGE_RPC_URL", "https://127.0.0.1:9257").rstrip("/")
-    cert_path = os.getenv("SAGE_CERT_PATH", "")
-    key_path = os.getenv("SAGE_KEY_PATH", "")
-    CERT_PATH, KEY_PATH = _resolve_client_cert_paths(cert_path, key_path)
+    url, cert_path, key_path, data_dir = _connection_settings()
+    WALLET_URL = url.rstrip("/")
+    CERT_PATH, KEY_PATH = resolve_client_cert_paths(
+        cert_path, key_path, _platform_sage_ssl_dirs(data_dir)
+    )
     _SAGE_HOST, _SAGE_PORT = _parse_sage_rpc_url(WALLET_URL)
     _conn_local.conn = None
     _init_ok = False
@@ -593,19 +648,19 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         if WALLET_DEBUG:
             elapsed = time.time() - start
             if elapsed > 1.0:
-                print(f"⏱️  [Sage] {endpoint} took {elapsed:.2f}s")
+                _console(f"⏱️  [Sage] {endpoint} took {elapsed:.2f}s")
 
         return result
     except SageMempoolConflict as e:
         elapsed = time.time() - start
         _conflict_level = _sage_tx_error_level("MEMPOOL_CONFLICT", endpoint)
         if _conflict_level == "info":
-            print(
+            _console(
                 f"   [Sage] cancel already in flight on {endpoint} "
                 f"(after {elapsed:.2f}s); will verify"
             )
         else:
-            print(
+            _console(
                 f"⚠️  [Sage] MEMPOOL_CONFLICT on {endpoint} (after {elapsed:.2f}s): {e}"
             )
         # Structured event so we can query/display these in the GUI and
@@ -652,7 +707,7 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         }
     except SageUnknownUnspent as e:
         elapsed = time.time() - start
-        print(f"⚠️  [Sage] UNKNOWN_UNSPENT on {endpoint} (after {elapsed:.2f}s): {e}")
+        _console(f"⚠️  [Sage] UNKNOWN_UNSPENT on {endpoint} (after {elapsed:.2f}s): {e}")
         # Return structured error — coin not confirmed on-chain yet or already spent
         return {
             "error": "UNKNOWN_UNSPENT",
@@ -670,14 +725,14 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         # with a ❌ line in the log every startup.
         _is_expected_init_404 = endpoint == "initialize" and "404" in err_str
         if not _quiet_mode and not _is_expected_init_404:
-            print(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+            _console(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
         # Return structured error so callers can see the actual message
         # (previously returned None which became "Unknown error" in logs)
         return {"error": err_str[:300], "success": False, "endpoint": endpoint}
     except Exception as e:
         elapsed = time.time() - start
         if not _quiet_mode:
-            print(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+            _console(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
         return None
 
 
@@ -728,6 +783,82 @@ def get_current_key() -> dict:
     except Exception as e:
         print(f"  [Sage] get_current_key error: {e}")
     return None
+
+
+def _get_current_key_read_only() -> Optional[dict]:
+    """Read Sage's active key without triggering session initialization."""
+    try:
+        result = rpc("get_key", {}, timeout=5)
+        if isinstance(result, dict) and isinstance(result.get("key"), dict):
+            return result["key"]
+    except Exception:
+        pass
+    return None
+
+
+def _identity_observed_at_utc() -> str:
+    """Return an RFC 3339 UTC timestamp without local-time ambiguity."""
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_wallet_identity() -> dict:
+    """Read a fresh Sage wallet identity snapshot without mutating wallet state."""
+    observed_at_utc = _identity_observed_at_utc()
+    try:
+        key = _get_current_key_read_only()
+    except Exception as exc:
+        return {
+            "success": False,
+            "backend": "sage",
+            "name": None,
+            "fingerprint": None,
+            "network_id": None,
+            "kind": None,
+            "has_secrets": None,
+            "observed_at_utc": observed_at_utc,
+            "error": str(exc) or "identity_lookup_failed",
+        }
+
+    if not isinstance(key, dict):
+        return {
+            "success": False,
+            "backend": "sage",
+            "name": None,
+            "fingerprint": None,
+            "network_id": None,
+            "kind": None,
+            "has_secrets": None,
+            "observed_at_utc": observed_at_utc,
+            "error": "active_key_unavailable",
+        }
+
+    try:
+        fingerprint = int(key.get("fingerprint"))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "backend": "sage",
+            "name": key.get("name"),
+            "fingerprint": None,
+            "network_id": key.get("network_id"),
+            "kind": key.get("kind"),
+            "has_secrets": key.get("has_secrets"),
+            "observed_at_utc": observed_at_utc,
+            "error": "invalid_fingerprint",
+        }
+
+    return {
+        "success": True,
+        "backend": "sage",
+        "name": key.get("name"),
+        "fingerprint": fingerprint,
+        "network_id": key.get("network_id"),
+        "kind": key.get("kind"),
+        "has_secrets": bool(key.get("has_secrets", False)),
+        "observed_at_utc": observed_at_utc,
+    }
 
 
 def _require_signing_capability() -> bool:

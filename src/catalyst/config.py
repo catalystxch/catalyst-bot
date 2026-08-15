@@ -239,6 +239,16 @@ class Config:
         with self._lock:
             return bool(self._pending_restart_changes)
 
+    def sage_connection_settings(self) -> tuple[str, str, str, str]:
+        """Return the typed Sage RPC and TLS settings used by its adapter."""
+        with self._lock:
+            return (
+                self.SAGE_RPC_URL,
+                self.SAGE_CERT_PATH,
+                self.SAGE_KEY_PATH,
+                self.SAGE_DATA_DIR,
+            )
+
     def _reload_inner(self):
         """Internal reload — called under lock."""
         # Force re-read of .env

@@ -91,6 +91,7 @@ if WALLET_TYPE == "chia":
         get_transactions_list,
         get_transaction_count,
         get_all_coins_for_wallet,
+        get_wallet_identity,
     )
 
     def get_owned_coins_detailed(wallet_id: int):
@@ -195,6 +196,7 @@ else:
         sign_message_by_address,
         notify_cat_asset_id_changed,
         is_initialized,
+        get_wallet_identity,
     )
 
 

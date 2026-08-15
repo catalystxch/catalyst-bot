@@ -2168,17 +2168,17 @@ class CoinManager:
         wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
 
         if wallet_type == "sage":
-            # Sage: use get_current_key() instead of get_logged_in_fingerprint.
+            # Sage: use the backend-neutral wallet identity snapshot.
             # Retry up to 4 times with short delays — Sage may still be starting
             # up when the bot initializes (e.g. user closed Sage and let the app
             # launch it fresh). Non-fatal: fingerprint is re-resolved later if needed.
-            from wallet_sage import get_current_key
+            from wallet import get_wallet_identity
 
             for _attempt in range(4):
                 try:
-                    key = get_current_key()
-                    if key and key.get("fingerprint"):
-                        fp_str = str(key["fingerprint"])
+                    identity = get_wallet_identity()
+                    if identity.get("success") and identity.get("fingerprint"):
+                        fp_str = str(identity["fingerprint"])
                         log_event(
                             "info",
                             "coin_mgr_fingerprint",
