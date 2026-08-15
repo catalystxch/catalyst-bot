@@ -20,6 +20,7 @@ All DB access in the codebase should route through this module; importing
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -581,6 +582,10 @@ CREATE TABLE IF NOT EXISTS market_analysis_cache (
 
 CREATE INDEX IF NOT EXISTS idx_market_cache_asset ON market_analysis_cache(asset_id);
 CREATE INDEX IF NOT EXISTS idx_market_cache_type ON market_analysis_cache(analysis_type);
+"""
+
+
+STABILITY_SCHEMA_SQL = """
 
 -- Stability kernel: canonical durable offer intent registry. Atomic amounts
 -- are TEXT so they remain exact beyond SQLite's signed 64-bit INTEGER range.
@@ -623,6 +628,11 @@ CREATE INDEX IF NOT EXISTS idx_offer_intents_state
     ON offer_intents(lifecycle_state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_offer_intents_slot_generation
     ON offer_intents(run_id, slot_key, generation);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_active_slot_generation
+    ON offer_intents(run_id, slot_key, generation)
+    WHERE slot_key IS NOT NULL AND lifecycle_state IN (
+        'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created'
+    );
 CREATE INDEX IF NOT EXISTS idx_offer_intents_parent
     ON offer_intents(parent_intent_id);
 
@@ -763,6 +773,326 @@ CREATE INDEX IF NOT EXISTS idx_publication_outbox_intent
 """
 
 
+_STABILITY_REQUIRED_COLUMNS = {
+    "offer_intents": {
+        "intent_id", "run_id", "wallet_fingerprint_hash", "network", "asset_id",
+        "side", "tier", "purpose", "slot_key", "generation", "parent_intent_id",
+        "child_intent_id", "offered_amount_atomic", "requested_amount_atomic",
+        "selected_coin_ids_json", "selected_coin_ids_sha256", "offer_text_sha256",
+        "sage_trade_id", "publication_identity", "lifecycle_state", "row_version",
+        "prepared_at", "submitted_at", "confirmed_at", "first_visible_at",
+        "terminal_at", "updated_at",
+    },
+    "offer_operation_journal": {
+        "sequence", "event_id", "operation_id", "intent_id", "operation_type",
+        "attempt", "phase", "outcome", "request_timestamp", "wallet_identity_json",
+        "transaction_id", "spend_identity", "evidence_json", "evidence_sha256",
+        "reason_code", "blocks_mutation", "created_at",
+    },
+    "runtime_safety_latch": {
+        "singleton_id", "generation", "state", "reason_code", "reason",
+        "blocking_operation_ids_json", "wallet_fingerprint_hash", "network",
+        "tripped_at", "resolved_at", "updated_at",
+    },
+    "runtime_mutation_lease": {
+        "singleton_id", "lease_version", "active", "owner_run_id", "owner_pid",
+        "owner_host", "wallet_fingerprint_hash", "network", "acquired_at",
+        "heartbeat_at", "expires_at", "released_at", "updated_at",
+    },
+    "runtime_worker_delegations": {
+        "delegation_id", "delegation_token_hash", "parent_run_id", "operation_id",
+        "worker_id", "purpose", "wallet_fingerprint_hash", "network", "state",
+        "metadata_json", "issued_at", "expires_at", "expired_at", "revoked_at",
+        "updated_at",
+    },
+    "publication_outbox": {
+        "publication_id", "idempotency_key", "intent_id", "network",
+        "offer_fingerprint", "publication_epoch", "publisher", "payload_json",
+        "state", "attempt_count", "claim_owner_run_id", "claim_expires_at",
+        "next_attempt_at", "last_error_json", "queued_at", "succeeded_at",
+        "terminal_at", "updated_at",
+    },
+}
+
+_STABILITY_INDEXES = {
+    "uniq_offer_intents_sage_trade_id": (
+        "offer_intents", True, True, ("sage_trade_id",), "sage_trade_idisnotnull"
+    ),
+    "uniq_offer_intents_offer_text_sha256": (
+        "offer_intents", True, True, ("offer_text_sha256",),
+        "offer_text_sha256isnotnull"
+    ),
+    "idx_offer_intents_state": (
+        "offer_intents", False, False, ("lifecycle_state", "updated_at"), None
+    ),
+    "idx_offer_intents_slot_generation": (
+        "offer_intents", False, False, ("run_id", "slot_key", "generation"), None
+    ),
+    "uniq_offer_intents_active_slot_generation": (
+        "offer_intents", True, True, ("run_id", "slot_key", "generation"),
+        "slot_keyisnotnullandlifecycle_statein('prepared','submitted_unconfirmed',"
+        "'creation_unknown','created')"
+    ),
+    "idx_offer_intents_parent": (
+        "offer_intents", False, False, ("parent_intent_id",), None
+    ),
+    "idx_offer_journal_operation": (
+        "offer_operation_journal", False, False, ("operation_id", "sequence"), None
+    ),
+    "idx_offer_journal_intent": (
+        "offer_operation_journal", False, False, ("intent_id", "sequence"), None
+    ),
+    "idx_offer_journal_blockers": (
+        "offer_operation_journal", False, False,
+        ("blocks_mutation", "operation_id", "sequence"), None
+    ),
+    "uniq_worker_delegation_active_scope": (
+        "runtime_worker_delegations", True, True,
+        ("parent_run_id", "operation_id", "purpose"), "state='active'"
+    ),
+    "idx_worker_delegation_expiry": (
+        "runtime_worker_delegations", False, False, ("state", "expires_at"), None
+    ),
+    "idx_publication_outbox_ready": (
+        "publication_outbox", False, False,
+        ("state", "next_attempt_at", "queued_at"), None
+    ),
+    "idx_publication_outbox_intent": (
+        "publication_outbox", False, False, ("intent_id", "state"), None
+    ),
+}
+
+
+def _normalized_schema_sql(sql: Optional[str]) -> str:
+    if not sql:
+        return ""
+    return "".join(
+        character
+        for character in sql.lower()
+        if not character.isspace() and character not in {'"', "`"}
+    ).rstrip(";")
+
+
+def _index_key_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
+    return tuple(
+        str(row[2])
+        for row in conn.execute(f'PRAGMA index_xinfo("{index_name}")').fetchall()
+        if int(row[5]) == 1
+    )
+
+
+def _require_unique_key(
+    conn: sqlite3.Connection, table: str, columns: tuple[str, ...]
+) -> None:
+    for index in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
+        if int(index[2]) == 1 and _index_key_columns(conn, str(index[1])) == columns:
+            return
+    raise RuntimeError(
+        f"stability schema {table} is missing UNIQUE key {columns!r}"
+    )
+
+
+def _validate_stability_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed if same-name legacy objects do not match the safety contract."""
+
+    expected_conn = sqlite3.connect(":memory:")
+    try:
+        expected_conn.executescript(STABILITY_SCHEMA_SQL)
+        expected_table_info = {
+            table: {
+                str(row[1]): row
+                for row in expected_conn.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            }
+            for table in _STABILITY_REQUIRED_COLUMNS
+        }
+        expected_index_sql = {
+            str(row[0]): str(row[1])
+            for row in expected_conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                "AND sql IS NOT NULL"
+            ).fetchall()
+        }
+    finally:
+        expected_conn.close()
+
+    for table, required_columns in _STABILITY_REQUIRED_COLUMNS.items():
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        columns = {str(row[1]): row for row in rows}
+        missing = sorted(required_columns - columns.keys())
+        if missing:
+            raise RuntimeError(
+                f"stability schema {table} missing required columns: {missing}"
+            )
+        for column in required_columns:
+            actual = columns[column]
+            expected = expected_table_info[table][column]
+            if str(actual[2]).upper() != str(expected[2]).upper():
+                raise RuntimeError(
+                    f"stability schema {table}.{column} has wrong column type"
+                )
+            if int(actual[3]) != int(expected[3]):
+                raise RuntimeError(
+                    f"stability schema {table}.{column} has wrong NOT NULL property"
+                )
+            if _normalized_schema_sql(actual[4]) != _normalized_schema_sql(expected[4]):
+                raise RuntimeError(
+                    f"stability schema {table}.{column} has wrong DEFAULT property"
+                )
+            if int(actual[5]) != int(expected[5]):
+                raise RuntimeError(
+                    f"stability schema {table}.{column} has wrong PRIMARY KEY property"
+                )
+
+    table_sql = {
+        str(row[0]): _normalized_schema_sql(row[1])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    required_fragments = {
+        "offer_intents": (
+            "check(sidein('buy','sell'))",
+            "check(generation>=0)",
+            "check(row_version>=0)",
+            "check(offered_amount_atomic<>''and"
+            "offered_amount_atomicnotglob'*[^0-9]*')",
+            "check(requested_amount_atomic<>''and"
+            "requested_amount_atomicnotglob'*[^0-9]*')",
+        ),
+        "offer_operation_journal": (
+            "check(attempt>=1)", "check(blocks_mutationin(0,1))"
+        ),
+        "runtime_safety_latch": (
+            "check(singleton_id=1)", "check(generation>=0)",
+            "check(statein('resolved','tripped'))"
+        ),
+        "runtime_mutation_lease": (
+            "check(singleton_id=1)", "check(lease_version>=0)",
+            "check(activein(0,1))"
+        ),
+        "runtime_worker_delegations": (
+            "check(statein('active','expired','revoked'))",
+        ),
+        "publication_outbox": (
+            "check(attempt_count>=0)",
+            "check(statein('queued','claimed','succeeded','retryable','suppressed',"
+            "'unresolved','failed'))",
+        ),
+    }
+    for table, fragments in required_fragments.items():
+        for fragment in fragments:
+            if fragment not in table_sql[table]:
+                if table.startswith("runtime_") and "singleton_id=1" in fragment:
+                    detail = "singleton CHECK constraint"
+                else:
+                    detail = f"required logical constraint {fragment}"
+                raise RuntimeError(f"stability schema {table} missing {detail}")
+
+    indexes = {
+        str(row[0]): (str(row[1]), row[2])
+        for row in conn.execute(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    for name, (table, unique, partial, columns, predicate) in (
+        _STABILITY_INDEXES.items()
+    ):
+        index_rows = {
+            str(row[1]): row
+            for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall()
+        }
+        row = index_rows.get(name)
+        if (
+            row is None
+            or int(row[2]) != int(unique)
+            or int(row[4]) != int(partial)
+            or _index_key_columns(conn, name) != columns
+            or name not in indexes
+            or indexes[name][0] != table
+            or _normalized_schema_sql(indexes[name][1])
+            != _normalized_schema_sql(expected_index_sql.get(name))
+        ):
+            descriptor = "unique partial" if unique and partial else "required"
+            raise RuntimeError(
+                f"stability schema index {name} has wrong {descriptor} definition"
+            )
+        if predicate and predicate not in _normalized_schema_sql(indexes[name][1]):
+            raise RuntimeError(
+                f"stability schema index {name} has wrong unique partial predicate"
+            )
+
+    _require_unique_key(conn, "offer_operation_journal", ("event_id",))
+    _require_unique_key(
+        conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
+    )
+    _require_unique_key(
+        conn, "runtime_worker_delegations", ("delegation_token_hash",)
+    )
+    _require_unique_key(conn, "publication_outbox", ("idempotency_key",))
+    _require_unique_key(
+        conn,
+        "publication_outbox",
+        ("network", "offer_fingerprint", "publication_epoch"),
+    )
+
+    expected_triggers = {
+        "offer_operation_journal_no_update": """
+            CREATE TRIGGER offer_operation_journal_no_update
+            BEFORE UPDATE ON offer_operation_journal BEGIN
+                SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
+            END
+        """,
+        "offer_operation_journal_no_delete": """
+            CREATE TRIGGER offer_operation_journal_no_delete
+            BEFORE DELETE ON offer_operation_journal BEGIN
+                SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
+            END
+        """,
+    }
+    actual_triggers = {
+        str(row[0]): str(row[1])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+        ).fetchall()
+    }
+    for name, expected_sql in expected_triggers.items():
+        if _normalized_schema_sql(actual_triggers.get(name)) != _normalized_schema_sql(
+            expected_sql
+        ):
+            raise RuntimeError(
+                f"stability schema {name} has wrong append-only trigger definition"
+            )
+
+    for table in ("runtime_safety_latch", "runtime_mutation_lease"):
+        count, minimum, maximum = conn.execute(
+            f'SELECT COUNT(*), MIN(singleton_id), MAX(singleton_id) FROM "{table}"'
+        ).fetchone()
+        if (int(count), minimum, maximum) != (1, 1, 1):
+            raise RuntimeError(
+                f"stability schema {table} violates singleton row cardinality"
+            )
+
+
+def _migrate_stability_schema() -> None:
+    """Serialize, create and validate stability objects in one DB transaction."""
+
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        _validate_stability_schema(conn)
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_database():
     """Create all tables and indexes if they don't exist.
 
@@ -797,6 +1127,7 @@ def _init_database_impl():
     # with "no such column: lifecycle_state".
 
     conn.commit()
+    _migrate_stability_schema()
 
     # Migration: add coin_id column to offers table if it doesn't exist.
     # This tracks which specific coin was locked by each offer.
@@ -1407,23 +1738,62 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _sqlite_ts(value) -> str:
-    """Normalize a datetime or ISO string to SQLite timestamp format.
+def _parse_iso_timestamp(value: Any, label: str, *, require_timezone: bool) -> datetime:
+    """Parse one ISO-8601 timestamp without lossy string manipulation."""
 
-    _now() writes timestamps as 'YYYY-MM-DD HH:MM:SS', but Python's
-    .isoformat() produces 'YYYY-MM-DDTHH:MM:SS+00:00'.  SQLite does
-    lexical comparison, so mixing formats silently breaks time-window
-    queries.  Pass any datetime or string through this helper before
-    using it in a WHERE clause or INSERT.
-    """
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        else:
-            value = value.astimezone(timezone.utc)
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    text = str(value)
-    return text.replace("T", " ").replace("Z", "").split("+")[0]
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{label} must be a valid ISO-8601 timestamp")
+        if require_timezone and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})",
+            text,
+        ) is None:
+            raise ValueError(
+                f"{label} must be a valid timezone-aware ISO-8601 timestamp"
+            )
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"{label} must be a valid ISO-8601 timestamp"
+            ) from exc
+    else:
+        raise ValueError(f"{label} must be a datetime or ISO-8601 string")
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        if require_timezone:
+            raise ValueError(f"{label} must include an explicit timezone")
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _sqlite_ts(value) -> str:
+    """Normalize a valid timestamp to the legacy SQLite UTC format."""
+
+    return _parse_iso_timestamp(
+        value, "timestamp", require_timezone=False
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _stability_timestamp(value: Any, label: str) -> str:
+    """Return strict, timezone-aware UTC text with lexical time ordering."""
+
+    return _parse_iso_timestamp(
+        value, label, require_timezone=True
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _stability_timestamp_or_now(value: Any, label: str) -> str:
+    return _stability_timestamp(
+        datetime.now(timezone.utc) if value is None else value,
+        label,
+    )
 
 
 def _get_reconcile_tier_sizes_mojos(wallet_type: str) -> Dict[str, int]:
@@ -6163,6 +6533,16 @@ def _atomic_amount_text(value: Any, label: str) -> str:
     return text
 
 
+def _exact_integer(value: Any, label: str, *, minimum: int = 0) -> int:
+    """Accept a real Python integer only; never coerce bool/float/text."""
+
+    if type(value) is not int:
+        raise ValueError(f"{label} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    return value
+
+
 def _canonical_json_text(
     value: Any,
     label: str,
@@ -6222,12 +6602,7 @@ def _journal_values(
 ) -> Dict[str, Any]:
     """Validate one journal event completely before its write transaction."""
 
-    try:
-        safe_attempt = int(attempt)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("attempt must be a positive integer") from exc
-    if isinstance(attempt, bool) or safe_attempt < 1:
-        raise ValueError("attempt must be a positive integer")
+    safe_attempt = _exact_integer(attempt, "attempt", minimum=1)
     wallet_json = _canonical_json_text(
         wallet_identity_json, "wallet_identity_json", default={}
     )
@@ -6247,7 +6622,10 @@ def _journal_values(
         "attempt": safe_attempt,
         "phase": _required_stability_text(phase, "phase").upper(),
         "outcome": _required_stability_text(outcome, "outcome").upper(),
-        "request_timestamp": _sqlite_ts(request_timestamp or created_at or _now()),
+        "request_timestamp": _stability_timestamp_or_now(
+            request_timestamp if request_timestamp is not None else created_at,
+            "request_timestamp",
+        ),
         "wallet_identity_json": wallet_json,
         "transaction_id": _optional_stability_text(transaction_id),
         "spend_identity": _optional_stability_text(spend_identity),
@@ -6259,7 +6637,10 @@ def _journal_values(
             else None
         ),
         "blocks_mutation": 1 if blocks_mutation else 0,
-        "created_at": _sqlite_ts(created_at or request_timestamp or _now()),
+        "created_at": _stability_timestamp_or_now(
+            created_at if created_at is not None else request_timestamp,
+            "created_at",
+        ),
     }
 
 
@@ -6400,12 +6781,7 @@ def prepare_offer_intent(
     safe_side = _required_stability_text(side, "side").lower()
     if safe_side not in {"buy", "sell"}:
         raise ValueError("side must be buy or sell")
-    try:
-        safe_generation = int(generation)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("generation must be a non-negative integer") from exc
-    if isinstance(generation, bool) or safe_generation < 0:
-        raise ValueError("generation must be a non-negative integer")
+    safe_generation = _exact_integer(generation, "generation")
     coin_ids_json = _canonical_json_text(
         selected_coin_ids_json,
         "selected_coin_ids_json",
@@ -6431,7 +6807,7 @@ def prepare_offer_intent(
         raise ValueError(
             "selected_coin_ids_sha256 does not match canonical selected coin JSON"
         )
-    prepared = _sqlite_ts(prepared_at or _now())
+    prepared = _stability_timestamp_or_now(prepared_at, "prepared_at")
     immutable = {
         "intent_id": _required_stability_text(intent_id, "intent_id"),
         "run_id": _required_stability_text(run_id, "run_id"),
@@ -6553,7 +6929,23 @@ def finalize_offer_intent(
 
     safe_intent_id = _required_stability_text(intent_id, "intent_id")
     state = _required_stability_text(lifecycle_state, "lifecycle_state").lower()
-    final_time = _sqlite_ts(finalized_at or _now())
+    safe_outcome = _required_stability_text(outcome, "outcome").upper()
+    allowed_finalizations = {
+        ("created", "CONFIRMED"): False,
+        ("submitted_unconfirmed", "SUBMITTED_UNCONFIRMED"): True,
+        ("creation_unknown", "UNKNOWN"): True,
+        ("creation_failed", "FAILED"): False,
+    }
+    matrix_key = (state, safe_outcome)
+    if matrix_key not in allowed_finalizations:
+        raise ValueError("creation state/outcome combination is not allowed")
+    derived_blocks_mutation = allowed_finalizations[matrix_key]
+    safe_expected_row_version = (
+        _exact_integer(expected_row_version, "expected_row_version")
+        if expected_row_version is not None
+        else None
+    )
+    final_time = _stability_timestamp_or_now(finalized_at, "finalized_at")
     safe_wallet_json = _canonical_json_text(
         wallet_identity_json, "wallet_identity_json", default={}
     )
@@ -6567,7 +6959,7 @@ def finalize_offer_intent(
         operation_type="CREATE",
         attempt=attempt,
         phase="FINALIZED",
-        outcome=outcome,
+        outcome=safe_outcome,
         request_timestamp=final_time,
         wallet_identity_json=safe_wallet_json,
         transaction_id=transaction_id,
@@ -6575,27 +6967,22 @@ def finalize_offer_intent(
         evidence_json=safe_evidence_json,
         evidence_sha256=evidence_sha256,
         reason_code=reason_code,
-        blocks_mutation=blocks_mutation,
+        blocks_mutation=derived_blocks_mutation,
         created_at=final_time,
     )
     trade_id = _optional_stability_text(sage_trade_id)
     offer_hash = _optional_stability_text(offer_text_sha256)
     publication = _optional_stability_text(publication_identity)
     child = _optional_stability_text(child_intent_id)
-    if state == "created" and journal["outcome"] == "CONFIRMED" and (
-        trade_id is None or offer_hash is None
-    ):
+    is_confirmed = matrix_key == ("created", "CONFIRMED")
+    if is_confirmed and (trade_id is None or offer_hash is None):
         raise ValueError("confirmed creation requires a Sage trade ID and offer hash")
-    terminal_states = {
-        "cancelled",
-        "filled",
-        "expired",
-        "retired",
-        "completed",
-        "creation_failed",
-        "rejected",
-        "quarantined",
-    }
+    if not is_confirmed and any(
+        value is not None for value in (trade_id, offer_hash, publication, child)
+    ):
+        raise ValueError("only confirmed creation may commit offer identity")
+    if not is_confirmed and journal["reason_code"] is None:
+        raise ValueError("non-confirmed creation requires a reason_code")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -6615,6 +7002,8 @@ def finalize_offer_intent(
                 current_dict["lifecycle_state"] != state
                 or current_dict["sage_trade_id"] != trade_id
                 or current_dict["offer_text_sha256"] != offer_hash
+                or current_dict["publication_identity"] != publication
+                or current_dict["child_intent_id"] != child
             ):
                 raise ValueError("event_id already finalized a different intent state")
             conn.commit()
@@ -6625,8 +7014,11 @@ def finalize_offer_intent(
             "submitted_unconfirmed",
         }:
             raise ValueError("offer intent is already finalized")
-        current_version = int(current_dict["row_version"])
-        if expected_row_version is not None and int(expected_row_version) != current_version:
+        current_version = _exact_integer(current_dict["row_version"], "row_version")
+        if (
+            safe_expected_row_version is not None
+            and safe_expected_row_version != current_version
+        ):
             raise ValueError("offer intent row_version compare-and-set failed")
         submitted_at = (
             final_time
@@ -6639,7 +7031,9 @@ def finalize_offer_intent(
             else current_dict["confirmed_at"]
         )
         terminal_at = (
-            final_time if state in terminal_states else current_dict["terminal_at"]
+            final_time
+            if state == "creation_failed"
+            else current_dict["terminal_at"]
         )
         cursor = conn.execute(
             """
@@ -6759,7 +7153,7 @@ def trip_runtime_safety_latch(
         raise ValueError("at least one blocking operation id is required")
     # Validate/canonicalize before BEGIN IMMEDIATE.
     _canonical_json_text(incoming, "blocking_operation_ids_json", expected_type=list)
-    when = _sqlite_ts(tripped_at or _now())
+    when = _stability_timestamp_or_now(tripped_at, "tripped_at")
     safe_reason_code = _required_stability_text(reason_code, "reason_code").upper()
     safe_wallet = _required_stability_text(
         wallet_fingerprint_hash, "wallet_fingerprint_hash"
@@ -6831,6 +7225,9 @@ def resolve_runtime_safety_latch(
 ) -> Dict[str, Any]:
     """Resolve exactly one observed latch generation with all blockers named."""
 
+    safe_expected_generation = _exact_integer(
+        expected_generation, "expected_generation"
+    )
     resolved_ids = sorted(
         {
             _required_stability_text(value, "resolved operation id")
@@ -6838,7 +7235,7 @@ def resolve_runtime_safety_latch(
         }
     )
     _canonical_json_text(resolved_ids, "resolved_operation_ids_json", expected_type=list)
-    when = _sqlite_ts(resolved_at or _now())
+    when = _stability_timestamp_or_now(resolved_at, "resolved_at")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -6848,7 +7245,7 @@ def resolve_runtime_safety_latch(
         if row is None:
             raise RuntimeError("runtime safety latch singleton is missing")
         latch = dict(row)
-        if int(latch["generation"]) != int(expected_generation):
+        if int(latch["generation"]) != safe_expected_generation:
             conn.commit()
             return {
                 "resolved": False,
@@ -6899,7 +7296,7 @@ def resolve_runtime_safety_latch(
                 blocking_operation_ids_json='[]', resolved_at=?, updated_at=?
             WHERE singleton_id=1 AND generation=? AND state='tripped'
             """,
-            (when, when, int(expected_generation)),
+            (when, when, safe_expected_generation),
         )
         result = conn.execute(
             "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
@@ -6947,14 +7344,14 @@ def acquire_runtime_mutation_lease(
         wallet_fingerprint_hash, "wallet_fingerprint_hash"
     )
     safe_network = _required_stability_text(network, "network")
-    try:
-        pid = int(owner_pid)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("owner_pid must be a positive integer") from exc
-    if isinstance(owner_pid, bool) or pid <= 0:
-        raise ValueError("owner_pid must be a positive integer")
-    at = _sqlite_ts(now or _now())
-    expiry = _sqlite_ts(lease_expires_at)
+    pid = _exact_integer(owner_pid, "owner_pid", minimum=1)
+    expected_version = (
+        None
+        if expected_lease_version is None
+        else _exact_integer(expected_lease_version, "expected_lease_version")
+    )
+    at = _stability_timestamp_or_now(now, "now timestamp")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at timestamp")
     if expiry <= at:
         raise ValueError("lease_expires_at must be later than now")
     conn = _stability_connection()
@@ -6970,11 +7367,45 @@ def acquire_runtime_mutation_lease(
         reason = "acquired"
         can_acquire = not bool(current["active"])
         if current["active"] and current["owner_run_id"] == owner:
-            if expected_lease_version is not None and int(expected_lease_version) != version:
+            if current["expires_at"] <= at:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "lease_expired",
+                    "lease": current,
+                }
+            if expected_version is None:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "renewal_requires_compare_and_set",
+                    "lease": current,
+                }
+            if expected_version != version:
                 conn.commit()
                 return {
                     "acquired": False,
                     "reason": "compare_and_set_failed",
+                    "lease": current,
+                }
+            binding = (
+                current["owner_pid"],
+                current["owner_host"],
+                current["wallet_fingerprint_hash"],
+                current["network"],
+            )
+            if binding != (pid, host, wallet_hash, safe_network):
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "owner_binding_mismatch",
+                    "lease": current,
+                }
+            if expiry <= current["expires_at"]:
+                conn.commit()
+                return {
+                    "acquired": False,
+                    "reason": "new_expiry_not_monotonic",
                     "lease": current,
                 }
             can_acquire = True
@@ -6995,14 +7426,14 @@ def acquire_runtime_mutation_lease(
                     "reason": "expired_takeover_not_authorized",
                     "lease": current,
                 }
-            if expected_lease_version is None:
+            if expected_version is None:
                 conn.commit()
                 return {
                     "acquired": False,
                     "reason": "takeover_requires_compare_and_set",
                     "lease": current,
                 }
-            if int(expected_lease_version) != version:
+            if expected_version != version:
                 conn.commit()
                 return {
                     "acquired": False,
@@ -7011,7 +7442,7 @@ def acquire_runtime_mutation_lease(
                 }
             can_acquire = True
             reason = "expired_lease_taken_over"
-        if expected_lease_version is not None and int(expected_lease_version) != version:
+        if expected_version is not None and expected_version != version:
             conn.commit()
             return {
                 "acquired": False,
@@ -7071,20 +7502,55 @@ def heartbeat_runtime_mutation_lease(
     heartbeat_at: Any = None,
 ) -> Dict[str, Any]:
     owner = _required_stability_text(owner_run_id, "owner_run_id")
-    at = _sqlite_ts(heartbeat_at or _now())
-    expiry = _sqlite_ts(lease_expires_at)
+    version = _exact_integer(expected_lease_version, "expected_lease_version")
+    at = _stability_timestamp_or_now(heartbeat_at, "heartbeat_at timestamp")
+    expiry = _stability_timestamp(
+        lease_expires_at, "lease_expires_at timestamp"
+    )
     if expiry <= at:
         raise ValueError("lease_expires_at must be later than heartbeat_at")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if current_row is None:
+            raise RuntimeError("runtime mutation lease singleton is missing")
+        current = dict(current_row)
+        if (
+            not current["active"]
+            or current["owner_run_id"] != owner
+            or int(current["lease_version"]) != version
+        ):
+            conn.commit()
+            return {
+                "heartbeat": False,
+                "reason": "compare_and_set_failed",
+                "lease": current,
+            }
+        if current["expires_at"] <= at:
+            conn.commit()
+            return {
+                "heartbeat": False,
+                "reason": "lease_expired",
+                "lease": current,
+            }
+        if expiry <= current["expires_at"]:
+            conn.commit()
+            return {
+                "heartbeat": False,
+                "reason": "new_expiry_not_monotonic",
+                "lease": current,
+            }
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
             SET lease_version=lease_version+1, heartbeat_at=?, expires_at=?, updated_at=?
-            WHERE singleton_id=1 AND active=1 AND owner_run_id=? AND lease_version=?
+            WHERE singleton_id=1 AND active=1 AND owner_run_id=?
+              AND lease_version=? AND expires_at>?
             """,
-            (at, expiry, at, owner, int(expected_lease_version)),
+            (at, expiry, at, owner, version, at),
         )
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
@@ -7109,7 +7575,8 @@ def release_runtime_mutation_lease(
     released_at: Any = None,
 ) -> Dict[str, Any]:
     owner = _required_stability_text(owner_run_id, "owner_run_id")
-    at = _sqlite_ts(released_at or _now())
+    version = _exact_integer(expected_lease_version, "expected_lease_version")
+    at = _stability_timestamp_or_now(released_at, "released_at timestamp")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -7120,7 +7587,7 @@ def release_runtime_mutation_lease(
                 expires_at=NULL, updated_at=?
             WHERE singleton_id=1 AND active=1 AND owner_run_id=? AND lease_version=?
             """,
-            (at, at, owner, int(expected_lease_version)),
+            (at, at, owner, version),
         )
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
@@ -7153,8 +7620,8 @@ def issue_worker_delegation(
     metadata_json: Any = None,
 ) -> Dict[str, Any]:
     metadata = _canonical_json_text(metadata_json, "metadata_json", default={})
-    issued = _sqlite_ts(issued_at)
-    expiry = _sqlite_ts(expires_at)
+    issued = _stability_timestamp(issued_at, "issued_at timestamp")
+    expiry = _stability_timestamp(expires_at, "expires_at timestamp")
     if expiry <= issued:
         raise ValueError("delegation expires_at must be later than issued_at")
     values = {
@@ -7241,14 +7708,14 @@ def get_valid_worker_delegation(
             str(purpose),
             str(wallet_fingerprint_hash),
             str(network),
-            _sqlite_ts(now or _now()),
+            _stability_timestamp_or_now(now, "now timestamp"),
         ),
     ).fetchone()
     return dict(row) if row is not None else None
 
 
 def expire_worker_delegations(*, now: Any = None) -> int:
-    at = _sqlite_ts(now or _now())
+    at = _stability_timestamp_or_now(now, "now timestamp")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -7282,7 +7749,7 @@ def revoke_worker_delegation(
     delegation = _required_stability_text(delegation_id, "delegation_id")
     parent = _required_stability_text(parent_run_id, "parent_run_id")
     operation = _required_stability_text(operation_id, "operation_id")
-    at = _sqlite_ts(revoked_at or _now())
+    at = _stability_timestamp_or_now(revoked_at, "revoked_at timestamp")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -7350,7 +7817,7 @@ def enqueue_publication_outbox(
 ) -> Dict[str, Any]:
     """Queue one publication identity or return its exact idempotent row."""
 
-    queued = _sqlite_ts(queued_at or _now())
+    queued = _stability_timestamp_or_now(queued_at, "queued_at")
     values = {
         "publication_id": _required_stability_text(
             publication_id, "publication_id"

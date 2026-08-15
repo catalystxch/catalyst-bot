@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 import pytest
@@ -22,10 +22,11 @@ STABILITY_TABLES = {
     "publication_outbox",
 }
 
-AT = "2026-08-15 12:00:00"
-LATER = "2026-08-15 12:01:00"
-EXPIRES = "2026-08-15 12:05:00"
-AFTER_EXPIRY = "2026-08-15 12:06:00"
+AT = "2026-08-15T12:00:00.000000Z"
+LATER = "2026-08-15T12:01:00.000000Z"
+EXPIRES = "2026-08-15T12:05:00.000000Z"
+AFTER_EXPIRY = "2026-08-15T12:06:00.000000Z"
+_DEFAULT = object()
 
 
 @pytest.fixture
@@ -155,6 +156,7 @@ def _prepare_intent(
     offered_amount_atomic: str = "18446744073709551616000000000000000001",
     requested_amount_atomic: str = "340282366920938463463374607431768211457",
     selected_coin_ids_json=None,
+    generation=7,
 ):
     return database.prepare_offer_intent(
         intent_id=intent_id,
@@ -168,7 +170,7 @@ def _prepare_intent(
         tier="inner",
         purpose="ladder",
         slot_key="asset-a:buy:inner",
-        generation=7,
+        generation=generation,
         parent_intent_id=None,
         offered_amount_atomic=offered_amount_atomic,
         requested_amount_atomic=requested_amount_atomic,
@@ -191,24 +193,32 @@ def _finalize_intent(
     *,
     operation_id: str | None = None,
     event_id: str | None = None,
-    trade_id: str | None = None,
-    offer_hash: str | None = None,
+    trade_id=_DEFAULT,
+    offer_hash=_DEFAULT,
     lifecycle_state: str = "created",
     outcome: str = "CONFIRMED",
     blocks_mutation: bool = False,
     evidence_json=None,
+    publication_identity: str | None = None,
+    child_intent_id: str | None = None,
+    attempt=1,
+    reason_code: str | None = None,
 ):
     return database.finalize_offer_intent(
         intent_id=intent_id,
         operation_id=operation_id or f"create:{intent_id}",
         event_id=event_id or f"event:finalize:{intent_id}",
-        attempt=1,
+        attempt=attempt,
         lifecycle_state=lifecycle_state,
         outcome=outcome,
-        sage_trade_id=trade_id if trade_id is not None else _sha(f"trade:{intent_id}"),
-        offer_text_sha256=(
-            offer_hash if offer_hash is not None else _sha(f"offer:{intent_id}")
+        sage_trade_id=(
+            _sha(f"trade:{intent_id}") if trade_id is _DEFAULT else trade_id
         ),
+        offer_text_sha256=(
+            _sha(f"offer:{intent_id}") if offer_hash is _DEFAULT else offer_hash
+        ),
+        publication_identity=publication_identity,
+        child_intent_id=child_intent_id,
         wallet_identity_json={
             "fingerprint_sha256": _sha("wallet-a"),
             "network": "mainnet",
@@ -218,6 +228,7 @@ def _finalize_intent(
             if evidence_json is not None
             else {"source": "unit-test", "phase": "finalized"}
         ),
+        reason_code=reason_code,
         blocks_mutation=blocks_mutation,
         finalized_at=LATER,
     )
@@ -305,11 +316,210 @@ def test_concurrent_initializers_observe_complete_stability_schema(isolated_data
     assert _integrity(isolated_database) == "ok"
 
 
+def test_stability_migration_fails_closed_on_missing_required_column_and_rolls_back(
+    isolated_database,
+):
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE offer_intents (
+                intent_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                slot_key TEXT,
+                generation INTEGER NOT NULL DEFAULT 0,
+                parent_intent_id TEXT,
+                sage_trade_id TEXT,
+                offer_text_sha256 TEXT,
+                lifecycle_state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="offer_intents.*missing required columns"):
+        database.init_database()
+
+    assert "offer_intents" in _table_names(isolated_database)
+    assert "offer_operation_journal" not in _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
+def test_stability_migration_rejects_wrong_unique_partial_index(isolated_database):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP INDEX uniq_offer_intents_active_slot_generation")
+        conn.execute(
+            """
+            CREATE INDEX uniq_offer_intents_active_slot_generation
+            ON offer_intents(slot_key, run_id, generation)
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="active_slot_generation.*unique partial"):
+        database.init_database()
+
+
+def test_stability_migration_rejects_wrong_append_only_trigger(isolated_database):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TRIGGER offer_operation_journal_no_update")
+        conn.execute(
+            """
+            CREATE TRIGGER offer_operation_journal_no_update
+            BEFORE UPDATE ON offer_operation_journal BEGIN SELECT 1; END
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="append-only trigger"):
+        database.init_database()
+
+
+def test_stability_migration_rejects_missing_singleton_check_and_extra_rows(
+    isolated_database,
+):
+    with sqlite3.connect(isolated_database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE runtime_safety_latch (
+                singleton_id INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                state TEXT NOT NULL DEFAULT 'resolved'
+                    CHECK(state IN ('resolved', 'tripped')),
+                reason_code TEXT,
+                reason TEXT,
+                blocking_operation_ids_json TEXT NOT NULL DEFAULT '[]',
+                wallet_fingerprint_hash TEXT,
+                network TEXT,
+                tripped_at TEXT,
+                resolved_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO runtime_safety_latch (
+                singleton_id, generation, state,
+                blocking_operation_ids_json, updated_at
+            ) VALUES
+                (1, 0, 'resolved', '[]', '2026-08-15T12:00:00.000000Z'),
+                (2, 0, 'resolved', '[]', '2026-08-15T12:00:00.000000Z');
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="runtime_safety_latch.*singleton"):
+        database.init_database()
+
+
+def test_stability_migration_rejects_wrong_required_column_property(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        original = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='publication_outbox'"
+        ).fetchone()[0]
+        malformed = original.replace(
+            "network                     TEXT NOT NULL",
+            "network                     TEXT",
+        )
+        assert malformed != original
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' "
+            "AND name='publication_outbox'",
+            (malformed,),
+        )
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute(f"PRAGMA schema_version={version + 1}")
+    database._db_initialized_path = ""
+
+    with pytest.raises(
+        RuntimeError, match="publication_outbox.network.*NOT NULL property"
+    ):
+        database.init_database()
+
+
+def test_stability_migration_rejects_extra_singleton_rows_even_with_check_shape(
+    isolated_database,
+):
+    with sqlite3.connect(isolated_database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE runtime_safety_latch (
+                singleton_id INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                state TEXT NOT NULL DEFAULT 'resolved'
+                    CHECK(state IN ('resolved', 'tripped')),
+                reason_code TEXT,
+                reason TEXT,
+                blocking_operation_ids_json TEXT NOT NULL DEFAULT '[]',
+                wallet_fingerprint_hash TEXT,
+                network TEXT,
+                tripped_at TEXT,
+                resolved_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO runtime_safety_latch (
+                singleton_id, generation, state,
+                blocking_operation_ids_json, updated_at
+            ) VALUES
+                (1, 0, 'resolved', '[]', '2026-08-15T12:00:00.000000Z'),
+                (2, 0, 'resolved', '[]', '2026-08-15T12:00:00.000000Z');
+            """
+        )
+        original = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='runtime_safety_latch'"
+        ).fetchone()[0]
+        shaped = original.replace(
+            "singleton_id INTEGER PRIMARY KEY,",
+            "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),",
+        )
+        assert shaped != original
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' "
+            "AND name='runtime_safety_latch'",
+            (shaped,),
+        )
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute(f"PRAGMA schema_version={version + 1}")
+
+    with pytest.raises(RuntimeError, match="runtime_safety_latch.*cardinality"):
+        database.init_database()
+
+
+def test_stability_migration_waits_for_database_writer_and_completes_atomically(
+    isolated_database,
+):
+    blocker = sqlite3.connect(isolated_database, timeout=1, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(database.init_database)
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.1)
+            blocker.commit()
+            future.result(timeout=10)
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+
+    assert STABILITY_TABLES <= _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
 def test_schema_has_exact_identity_uniqueness_and_singletons(isolated_database):
     database.init_database()
     _prepare_intent("intent-a")
     _finalize_intent("intent-a", trade_id=_sha("shared-trade"), offer_hash=_sha("offer-a"))
-    _prepare_intent("intent-b")
+    _prepare_intent("intent-b", generation=8)
 
     with pytest.raises(sqlite3.IntegrityError):
         _finalize_intent(
@@ -321,7 +531,7 @@ def test_schema_has_exact_identity_uniqueness_and_singletons(isolated_database):
     assert database.get_offer_intent("intent-b")["lifecycle_state"] == "prepared"
     assert len(database.get_offer_operation_events("create:intent-b")) == 1
 
-    _prepare_intent("intent-c")
+    _prepare_intent("intent-c", generation=9)
     with pytest.raises(sqlite3.IntegrityError):
         _finalize_intent(
             "intent-c",
@@ -546,6 +756,264 @@ def test_confirmed_finalize_requires_identity_and_cannot_be_rebound(isolated_dat
     )
 
 
+@pytest.mark.parametrize(
+    ("lifecycle_state", "outcome"),
+    [
+        ("created", "UNKNOWN"),
+        ("created", "FAILED"),
+        ("creation_unknown", "CONFIRMED"),
+        ("creation_unknown", "SUBMITTED_UNCONFIRMED"),
+        ("submitted_unconfirmed", "UNKNOWN"),
+        ("creation_failed", "CONFIRMED"),
+        ("rejected", "FAILED"),
+    ],
+)
+def test_finalize_rejects_state_outcome_permutations_and_rolls_back(
+    isolated_database, lifecycle_state, outcome
+):
+    database.init_database()
+    intent_id = f"intent-invalid-{lifecycle_state}-{outcome}"
+    _prepare_intent(intent_id)
+
+    with pytest.raises(ValueError, match="state/outcome"):
+        _finalize_intent(
+            intent_id,
+            lifecycle_state=lifecycle_state,
+            outcome=outcome,
+            trade_id=None,
+            offer_hash=None,
+            reason_code="TEST_INVALID_PERMUTATION",
+        )
+
+    intent = database.get_offer_intent(intent_id)
+    assert intent["lifecycle_state"] == "prepared"
+    assert intent["row_version"] == 0
+    assert len(database.get_offer_operation_events(f"create:{intent_id}")) == 1
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_state", "outcome", "expected_blocking"),
+    [
+        ("created", "CONFIRMED", 0),
+        ("submitted_unconfirmed", "SUBMITTED_UNCONFIRMED", 1),
+        ("creation_unknown", "UNKNOWN", 1),
+        ("creation_failed", "FAILED", 0),
+    ],
+)
+def test_finalize_derives_blocking_from_allowed_creation_outcome(
+    isolated_database, lifecycle_state, outcome, expected_blocking
+):
+    database.init_database()
+    intent_id = f"intent-{lifecycle_state}"
+    _prepare_intent(intent_id)
+    is_confirmed = outcome == "CONFIRMED"
+
+    finalized = _finalize_intent(
+        intent_id,
+        lifecycle_state=lifecycle_state,
+        outcome=outcome,
+        trade_id=_sha(f"trade:{intent_id}") if is_confirmed else None,
+        offer_hash=_sha(f"offer:{intent_id}") if is_confirmed else None,
+        blocks_mutation=not bool(expected_blocking),
+        reason_code=None if is_confirmed else f"CREATE_{outcome}",
+    )
+
+    event = database.get_offer_operation_events(f"create:{intent_id}")[-1]
+    assert finalized["lifecycle_state"] == lifecycle_state
+    assert event["outcome"] == outcome
+    assert event["blocks_mutation"] == expected_blocking
+    assert (finalized["sage_trade_id"] is not None) is is_confirmed
+    assert (finalized["offer_text_sha256"] is not None) is is_confirmed
+
+
+def test_unknown_creation_remains_latest_blocker_until_confirmed_reconciliation(
+    isolated_database,
+):
+    database.init_database()
+    _prepare_intent()
+
+    _finalize_intent(
+        lifecycle_state="creation_unknown",
+        outcome="UNKNOWN",
+        trade_id=None,
+        offer_hash=None,
+        blocks_mutation=False,
+        reason_code="RPC_TIMEOUT",
+    )
+
+    blockers = database.get_unresolved_offer_operation_blockers()
+    assert [(row["operation_id"], row["outcome"]) for row in blockers] == [
+        ("create:intent-1", "UNKNOWN")
+    ]
+
+    _finalize_intent(
+        event_id="event:reconciled:intent-1",
+        attempt=2,
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        trade_id=_sha("trade:intent-1"),
+        offer_hash=_sha("offer:intent-1"),
+    )
+    assert database.get_unresolved_offer_operation_blockers() == []
+
+
+def test_finalize_exact_replay_includes_publication_and_child_identity(
+    isolated_database,
+):
+    database.init_database()
+    _prepare_intent()
+    first = _finalize_intent(
+        publication_identity="publication:1",
+        child_intent_id="intent-child-1",
+    )
+
+    replay = _finalize_intent(
+        publication_identity="publication:1",
+        child_intent_id="intent-child-1",
+    )
+    assert replay == first
+
+    with pytest.raises(ValueError, match="different intent state"):
+        _finalize_intent(
+            publication_identity="publication:other",
+            child_intent_id="intent-child-other",
+        )
+
+    persisted = database.get_offer_intent("intent-1")
+    assert persisted["publication_identity"] == "publication:1"
+    assert persisted["child_intent_id"] == "intent-child-1"
+    assert len(database.get_offer_operation_events("create:intent-1")) == 2
+
+
+@pytest.mark.parametrize("generation", [True, 7.0, "7"])
+def test_prepare_rejects_coercible_noninteger_generation(
+    isolated_database, generation
+):
+    database.init_database()
+
+    with pytest.raises(ValueError, match="generation must be an integer"):
+        _prepare_intent("intent-bad-generation", generation=generation)
+    assert database.get_offer_intent("intent-bad-generation") is None
+
+
+@pytest.mark.parametrize(
+    ("state", "outcome", "trade_id", "offer_hash", "reason_code"),
+    [
+        ("prepared", None, None, None, None),
+        (
+            "submitted_unconfirmed",
+            "SUBMITTED_UNCONFIRMED",
+            None,
+            None,
+            "wallet-timeout",
+        ),
+        ("creation_unknown", "UNKNOWN", None, None, "wallet-timeout"),
+        ("created", "CONFIRMED", _DEFAULT, _DEFAULT, None),
+    ],
+)
+def test_active_lifecycle_states_hold_one_database_enforced_slot_generation(
+    isolated_database, state, outcome, trade_id, offer_hash, reason_code
+):
+    database.init_database()
+    _prepare_intent("intent-active-a")
+    if outcome is not None:
+        _finalize_intent(
+            "intent-active-a",
+            lifecycle_state=state,
+            outcome=outcome,
+            trade_id=trade_id,
+            offer_hash=offer_hash,
+            reason_code=reason_code,
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _prepare_intent("intent-active-b")
+    assert database.get_offer_intent("intent-active-b") is None
+
+
+def test_terminal_creation_failure_releases_slot_but_generation_is_exact(
+    isolated_database,
+):
+    database.init_database()
+    _prepare_intent("intent-failed-a")
+    _finalize_intent(
+        "intent-failed-a",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        trade_id=None,
+        offer_hash=None,
+        reason_code="wallet-rejected",
+    )
+
+    replacement = _prepare_intent("intent-failed-b")
+    later_generation = _prepare_intent("intent-next-generation", generation=8)
+
+    assert replacement["lifecycle_state"] == "prepared"
+    assert later_generation["generation"] == 8
+
+
+def test_racing_prepares_cannot_claim_same_active_slot_generation(
+    isolated_database,
+):
+    database.init_database()
+
+    def prepare(intent_id):
+        try:
+            return ("ok", _prepare_intent(intent_id)["intent_id"])
+        except sqlite3.IntegrityError:
+            return ("conflict", intent_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(prepare, ["intent-race-a", "intent-race-b"]))
+
+    assert sorted(result[0] for result in results) == ["conflict", "ok"]
+    assert sum(
+        database.get_offer_intent(intent_id) is not None
+        for intent_id in ("intent-race-a", "intent-race-b")
+    ) == 1
+
+
+@pytest.mark.parametrize("attempt", [True, 1.0, "1"])
+def test_journal_rejects_coercible_noninteger_attempt(isolated_database, attempt):
+    database.init_database()
+
+    with pytest.raises(ValueError, match="attempt must be an integer"):
+        database.append_offer_operation_event(
+            event_id="event:bad-attempt",
+            operation_id="operation:bad-attempt",
+            operation_type="RECONCILE",
+            attempt=attempt,
+            phase="READ",
+            outcome="UNKNOWN",
+            request_timestamp=AT,
+            evidence_json={},
+        )
+    assert database.get_offer_operation_events("operation:bad-attempt") == []
+
+
+@pytest.mark.parametrize("row_version", [True, 0.0, "0"])
+def test_finalize_rejects_coercible_noninteger_row_version(
+    isolated_database, row_version
+):
+    database.init_database()
+    _prepare_intent()
+
+    with pytest.raises(ValueError, match="expected_row_version must be an integer"):
+        database.finalize_offer_intent(
+            intent_id="intent-1",
+            operation_id="create:intent-1",
+            event_id="event:bad-version",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=_sha("trade:intent-1"),
+            offer_text_sha256=_sha("offer:intent-1"),
+            expected_row_version=row_version,
+            evidence_json={},
+            finalized_at=LATER,
+        )
+    assert database.get_offer_intent("intent-1")["row_version"] == 0
+
+
 def test_oversized_evidence_is_rejected_before_journal_write(isolated_database):
     database.init_database()
 
@@ -733,7 +1201,7 @@ def test_mutation_lease_acquire_heartbeat_release_are_compare_and_set(
     heartbeat = database.heartbeat_runtime_mutation_lease(
         owner_run_id="run-a",
         expected_lease_version=1,
-        lease_expires_at="2026-08-15 12:10:00",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
         heartbeat_at=LATER,
     )
     assert heartbeat["heartbeat"] is True
@@ -742,7 +1210,7 @@ def test_mutation_lease_acquire_heartbeat_release_are_compare_and_set(
     stale_heartbeat = database.heartbeat_runtime_mutation_lease(
         owner_run_id="run-a",
         expected_lease_version=1,
-        lease_expires_at="2026-08-15 12:11:00",
+        lease_expires_at="2026-08-15T12:11:00.000000Z",
         heartbeat_at=EXPIRES,
     )
     assert stale_heartbeat["heartbeat"] is False
@@ -780,7 +1248,7 @@ def test_expired_lease_takeover_requires_explicit_cas_version(isolated_database)
         owner_host="host-a",
         wallet_fingerprint_hash=_sha("wallet-a"),
         network="mainnet",
-        lease_expires_at="2026-08-15 12:20:00",
+        lease_expires_at="2026-08-15T12:20:00.000000Z",
         now=AFTER_EXPIRY,
         allow_expired_takeover=True,
     )
@@ -793,7 +1261,7 @@ def test_expired_lease_takeover_requires_explicit_cas_version(isolated_database)
         owner_host="host-a",
         wallet_fingerprint_hash=_sha("wallet-a"),
         network="mainnet",
-        lease_expires_at="2026-08-15 12:20:00",
+        lease_expires_at="2026-08-15T12:20:00.000000Z",
         now=AFTER_EXPIRY,
         allow_expired_takeover=True,
         expected_lease_version=1,
@@ -802,6 +1270,326 @@ def test_expired_lease_takeover_requires_explicit_cas_version(isolated_database)
     assert takeover["reason"] == "expired_lease_taken_over"
     assert takeover["lease"]["owner_run_id"] == "run-b"
     assert takeover["lease"]["lease_version"] == 2
+
+
+@pytest.mark.parametrize(
+    ("now", "expiry", "expected_now", "expected_expiry"),
+    [
+        (
+            "2026-08-15T13:00:00+01:00",
+            "2026-08-15T13:05:00+01:00",
+            AT,
+            EXPIRES,
+        ),
+        (
+            "2026-08-15T07:00:00-05:00",
+            "2026-08-15T07:05:00-05:00",
+            AT,
+            EXPIRES,
+        ),
+        (
+            "2026-08-15T12:00:00.123456Z",
+            "2026-08-15T12:05:00.654321Z",
+            "2026-08-15T12:00:00.123456Z",
+            "2026-08-15T12:05:00.654321Z",
+        ),
+    ],
+)
+def test_lease_timestamps_normalize_offsets_to_sortable_utc(
+    isolated_database, now, expiry, expected_now, expected_expiry
+):
+    database.init_database()
+
+    result = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=expiry,
+        now=now,
+    )
+
+    assert result["acquired"] is True
+    assert result["lease"]["acquired_at"] == expected_now
+    assert result["lease"]["heartbeat_at"] == expected_now
+    assert result["lease"]["expires_at"] == expected_expiry
+
+
+@pytest.mark.parametrize(
+    "bad_timestamp",
+    [
+        "not-a-time",
+        "2026-08-15 12:00:00",
+        "2026-08-15 12:00:00+00:00",
+        "2026-08-15T12:00:00",
+        "2026-08-15T12:00Z",
+        "2026-08-15T12:00:00z",
+        "2026-08-15T12:00:00,123Z",
+        "2026-08-15",
+        "2026-08-15T25:00:00Z",
+        "2026-08-15T12:00:00+99:00",
+    ],
+)
+def test_lease_rejects_invalid_or_naive_timestamp_before_write(
+    isolated_database, bad_timestamp
+):
+    database.init_database()
+
+    with pytest.raises(ValueError, match="timestamp"):
+        database.acquire_runtime_mutation_lease(
+            owner_run_id="run-a",
+            owner_pid=100,
+            owner_host="host-a",
+            wallet_fingerprint_hash=_sha("wallet-a"),
+            network="mainnet",
+            lease_expires_at=EXPIRES,
+            now=bad_timestamp,
+        )
+    assert database.get_runtime_mutation_lease()["active"] == 0
+
+
+def test_same_owner_lease_renewal_requires_exact_fencing_and_binding(
+    isolated_database,
+):
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=EXPIRES,
+        now=AT,
+    )
+
+    no_version = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now=LATER,
+    )
+    assert no_version["acquired"] is False
+    assert no_version["reason"] == "renewal_requires_compare_and_set"
+
+    mismatches = [
+        {"owner_pid": 101},
+        {"owner_host": "host-b"},
+        {"wallet_fingerprint_hash": _sha("wallet-b")},
+        {"network": "testnet11"},
+    ]
+    for mismatch in mismatches:
+        values = {
+            "owner_run_id": "run-a",
+            "owner_pid": 100,
+            "owner_host": "host-a",
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+            "lease_expires_at": "2026-08-15T12:10:00.000000Z",
+            "now": LATER,
+            "expected_lease_version": 1,
+        }
+        values.update(mismatch)
+        result = database.acquire_runtime_mutation_lease(**values)
+        assert result["acquired"] is False
+        assert result["reason"] == "owner_binding_mismatch"
+        assert result["lease"]["lease_version"] == 1
+
+    renewed = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now=LATER,
+        expected_lease_version=1,
+    )
+    assert renewed["acquired"] is True
+    assert renewed["reason"] == "renewed"
+    assert renewed["lease"]["lease_version"] == 2
+
+    stale_restart = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:11:00.000000Z",
+        now="2026-08-15T12:02:00.000000Z",
+        expected_lease_version=1,
+    )
+    assert stale_restart["acquired"] is False
+    assert stale_restart["reason"] == "compare_and_set_failed"
+
+
+def test_same_owner_cannot_renew_expired_lease(isolated_database):
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=EXPIRES,
+        now=AT,
+    )
+
+    result = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:20:00.000000Z",
+        now=AFTER_EXPIRY,
+        expected_lease_version=1,
+    )
+
+    assert result["acquired"] is False
+    assert result["reason"] == "lease_expired"
+    assert result["lease"]["lease_version"] == 1
+
+
+def test_heartbeat_cannot_resurrect_or_shorten_lease(isolated_database):
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=EXPIRES,
+        now=AT,
+    )
+
+    shortened = database.heartbeat_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=1,
+        lease_expires_at="2026-08-15T12:04:00.000000Z",
+        heartbeat_at=LATER,
+    )
+    assert shortened["heartbeat"] is False
+    assert shortened["reason"] == "new_expiry_not_monotonic"
+
+    expired = database.heartbeat_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=1,
+        lease_expires_at="2026-08-15T12:20:00.000000Z",
+        heartbeat_at=AFTER_EXPIRY,
+    )
+    assert expired["heartbeat"] is False
+    assert expired["reason"] == "lease_expired"
+    assert expired["lease"]["lease_version"] == 1
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1"])
+def test_lease_cas_rejects_coercible_noninteger_versions(
+    isolated_database, version
+):
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=EXPIRES,
+        now=AT,
+    )
+
+    with pytest.raises(ValueError, match="expected_lease_version must be an integer"):
+        database.heartbeat_runtime_mutation_lease(
+            owner_run_id="run-a",
+            expected_lease_version=version,
+            lease_expires_at="2026-08-15T12:10:00.000000Z",
+            heartbeat_at=LATER,
+        )
+    with pytest.raises(ValueError, match="expected_lease_version must be an integer"):
+        database.release_runtime_mutation_lease(
+            owner_run_id="run-a",
+            expected_lease_version=version,
+            released_at=LATER,
+        )
+    assert database.get_runtime_mutation_lease()["lease_version"] == 1
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1"])
+def test_lease_reacquire_rejects_coercible_noninteger_version(
+    isolated_database, version
+):
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at=EXPIRES,
+        now=AT,
+    )
+
+    with pytest.raises(ValueError, match="expected_lease_version must be an integer"):
+        database.acquire_runtime_mutation_lease(
+            owner_run_id="run-a",
+            owner_pid=100,
+            owner_host="host-a",
+            wallet_fingerprint_hash=_sha("wallet-a"),
+            network="mainnet",
+            lease_expires_at="2026-08-15T12:10:00.000000Z",
+            now=LATER,
+            expected_lease_version=version,
+        )
+
+
+@pytest.mark.parametrize("generation", [True, 1.0, "1"])
+def test_latch_resolve_rejects_coercible_noninteger_generation(
+    isolated_database, generation
+):
+    database.init_database()
+
+    with pytest.raises(ValueError, match="expected_generation must be an integer"):
+        database.resolve_runtime_safety_latch(
+            expected_generation=generation,
+            resolved_operation_ids=[],
+            resolved_at=LATER,
+        )
+
+
+def test_delegation_uses_utc_normalization_for_expiry_comparison(isolated_database):
+    database.init_database()
+    issued = database.issue_worker_delegation(
+        delegation_id="delegation-offset",
+        delegation_token_hash=_sha("token-offset"),
+        parent_run_id="run-a",
+        operation_id="coin-prep:offset",
+        worker_id="worker-1",
+        purpose="replacement-capacity",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        issued_at="2026-08-15T13:00:00+01:00",
+        expires_at="2026-08-15T07:05:00-05:00",
+    )
+    assert issued["issued_at"] == AT
+    assert issued["expires_at"] == EXPIRES
+
+    assert (
+        database.get_valid_worker_delegation(
+            delegation_id="delegation-offset",
+            delegation_token_hash=_sha("token-offset"),
+            parent_run_id="run-a",
+            operation_id="coin-prep:offset",
+            purpose="replacement-capacity",
+            wallet_fingerprint_hash=_sha("wallet-a"),
+            network="mainnet",
+            now="2026-08-15T13:04:00+01:00",
+        )
+        is not None
+    )
+    assert database.expire_worker_delegations(now="2026-08-15T08:06:00-04:00") == 1
 
 
 def test_worker_delegation_is_exactly_scoped_and_expires(isolated_database):
