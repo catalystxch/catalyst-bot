@@ -24,6 +24,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional
@@ -885,7 +886,12 @@ def _require_unique_key(
     conn: sqlite3.Connection, table: str, columns: tuple[str, ...]
 ) -> None:
     for index in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
-        if int(index[2]) == 1 and _index_key_columns(conn, str(index[1])) == columns:
+        if (
+            int(index[2]) == 1
+            and str(index[3]) == "u"
+            and int(index[4]) == 0
+            and _index_key_columns(conn, str(index[1])) == columns
+        ):
             return
     raise RuntimeError(
         f"stability schema {table} is missing UNIQUE key {columns!r}"
@@ -912,6 +918,19 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
             for row in expected_conn.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='index' "
                 "AND sql IS NOT NULL"
+            ).fetchall()
+        }
+        expected_table_sql = {
+            str(row[0]): str(row[1])
+            for row in expected_conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        expected_triggers = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in expected_conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type='trigger'"
             ).fetchall()
         }
     finally:
@@ -951,44 +970,14 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
             "SELECT name, sql FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    required_fragments = {
-        "offer_intents": (
-            "check(sidein('buy','sell'))",
-            "check(generation>=0)",
-            "check(row_version>=0)",
-            "check(offered_amount_atomic<>''and"
-            "offered_amount_atomicnotglob'*[^0-9]*')",
-            "check(requested_amount_atomic<>''and"
-            "requested_amount_atomicnotglob'*[^0-9]*')",
-        ),
-        "offer_operation_journal": (
-            "check(attempt>=1)", "check(blocks_mutationin(0,1))"
-        ),
-        "runtime_safety_latch": (
-            "check(singleton_id=1)", "check(generation>=0)",
-            "check(statein('resolved','tripped'))"
-        ),
-        "runtime_mutation_lease": (
-            "check(singleton_id=1)", "check(lease_version>=0)",
-            "check(activein(0,1))"
-        ),
-        "runtime_worker_delegations": (
-            "check(statein('active','expired','revoked'))",
-        ),
-        "publication_outbox": (
-            "check(attempt_count>=0)",
-            "check(statein('queued','claimed','succeeded','retryable','suppressed',"
-            "'unresolved','failed'))",
-        ),
-    }
-    for table, fragments in required_fragments.items():
-        for fragment in fragments:
-            if fragment not in table_sql[table]:
-                if table.startswith("runtime_") and "singleton_id=1" in fragment:
-                    detail = "singleton CHECK constraint"
-                else:
-                    detail = f"required logical constraint {fragment}"
-                raise RuntimeError(f"stability schema {table} missing {detail}")
+    for table in _STABILITY_REQUIRED_COLUMNS:
+        if table_sql.get(table) != _normalized_schema_sql(
+            expected_table_sql.get(table)
+        ):
+            raise RuntimeError(
+                f"stability schema {table} canonical table definition mismatch; "
+                "singleton and logical constraints must match"
+            )
 
     indexes = {
         str(row[0]): (str(row[1]), row[2])
@@ -1037,29 +1026,28 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         ("network", "offer_fingerprint", "publication_epoch"),
     )
 
-    expected_triggers = {
-        "offer_operation_journal_no_update": """
-            CREATE TRIGGER offer_operation_journal_no_update
-            BEFORE UPDATE ON offer_operation_journal BEGIN
-                SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
-            END
-        """,
-        "offer_operation_journal_no_delete": """
-            CREATE TRIGGER offer_operation_journal_no_delete
-            BEFORE DELETE ON offer_operation_journal BEGIN
-                SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
-            END
-        """,
-    }
+    placeholders = ",".join("?" for _ in _STABILITY_REQUIRED_COLUMNS)
     actual_triggers = {
-        str(row[0]): str(row[1])
+        str(row[0]): (str(row[1]), str(row[2]))
         for row in conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            f"SELECT name, tbl_name, sql FROM sqlite_master "
+            f"WHERE type='trigger' AND tbl_name IN ({placeholders})",
+            tuple(_STABILITY_REQUIRED_COLUMNS),
         ).fetchall()
     }
-    for name, expected_sql in expected_triggers.items():
-        if _normalized_schema_sql(actual_triggers.get(name)) != _normalized_schema_sql(
-            expected_sql
+    unexpected_triggers = sorted(actual_triggers.keys() - expected_triggers.keys())
+    if unexpected_triggers:
+        raise RuntimeError(
+            "stability schema has unexpected stability trigger(s): "
+            f"{unexpected_triggers}"
+        )
+    for name, (expected_table, expected_sql) in expected_triggers.items():
+        actual = actual_triggers.get(name)
+        if (
+            actual is None
+            or actual[0] != expected_table
+            or _normalized_schema_sql(actual[1])
+            != _normalized_schema_sql(expected_sql)
         ):
             raise RuntimeError(
                 f"stability schema {name} has wrong append-only trigger definition"
@@ -1075,6 +1063,78 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
             )
 
 
+_MUTABLE_STABILITY_TIMESTAMPS = {
+    "offer_intents": (
+        "intent_id",
+        (
+            "prepared_at",
+            "submitted_at",
+            "confirmed_at",
+            "first_visible_at",
+            "terminal_at",
+            "updated_at",
+        ),
+    ),
+    "runtime_safety_latch": (
+        "singleton_id",
+        ("tripped_at", "resolved_at", "updated_at"),
+    ),
+    "runtime_mutation_lease": (
+        "singleton_id",
+        ("acquired_at", "heartbeat_at", "expires_at", "released_at", "updated_at"),
+    ),
+    "runtime_worker_delegations": (
+        "delegation_id",
+        ("issued_at", "expires_at", "expired_at", "revoked_at", "updated_at"),
+    ),
+    "publication_outbox": (
+        "publication_id",
+        (
+            "claim_expires_at",
+            "next_attempt_at",
+            "queued_at",
+            "succeeded_at",
+            "terminal_at",
+            "updated_at",
+        ),
+    ),
+}
+
+
+def _normalize_existing_stability_timestamps(conn: sqlite3.Connection) -> None:
+    """Upgrade mutable Task 3 timestamps atomically before safety comparisons."""
+
+    for table, (key_column, timestamp_columns) in (
+        _MUTABLE_STABILITY_TIMESTAMPS.items()
+    ):
+        selected_columns = (key_column, *timestamp_columns)
+        select_sql = ", ".join(f'"{column}"' for column in selected_columns)
+        rows = conn.execute(f'SELECT {select_sql} FROM "{table}"').fetchall()
+        for row in rows:
+            key_value = row[0]
+            updates = {}
+            for offset, column in enumerate(timestamp_columns, start=1):
+                stored = row[offset]
+                if stored is None:
+                    continue
+                try:
+                    canonical = _canonical_stored_stability_timestamp(stored)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{table}.{column} contains an invalid stored "
+                        "stability timestamp"
+                    ) from exc
+                if canonical != stored:
+                    updates[column] = canonical
+            if not updates:
+                continue
+            assignments = ", ".join(f'"{column}"=?' for column in updates)
+            conn.execute(
+                f'UPDATE "{table}" SET {assignments} WHERE "{key_column}"=?',
+                (*updates.values(), key_value),
+            )
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -1084,6 +1144,7 @@ def _migrate_stability_schema() -> None:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _validate_stability_schema(conn)
+        _normalize_existing_stability_timestamps(conn)
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -1091,6 +1152,68 @@ def _migrate_stability_schema() -> None:
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def _database_migration_guard(*, timeout: float = 30.0):
+    """Hold an OS lock adjacent to the exact DB for the complete migration."""
+
+    lock_path = f"{os.path.abspath(DB_PATH)}.migration.lock"
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    handle = open(lock_path, "a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                acquired = True
+                break
+            except (OSError, IOError) as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"timed out waiting for database migration lock: {lock_path}"
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+        try:
+            handle.seek(1)
+            handle.truncate()
+            handle.write(
+                f"pid={os.getpid()} acquired={int(time.time())}\n".encode("ascii")
+            )
+            handle.flush()
+        except OSError:
+            pass
+        yield
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (OSError, IOError):
+                pass
+        handle.close()
 
 
 def init_database():
@@ -1105,11 +1228,12 @@ def init_database():
     with _db_init_lock:
         if _db_initialized_path == DB_PATH:
             return
-        _init_database_impl()
-        # Publish initialization only after every migration and integrity
-        # setup step has returned. Concurrent callers block on _db_init_lock
-        # and therefore never observe a half-created stability schema.
-        _db_initialized_path = DB_PATH
+        with _database_migration_guard():
+            _init_database_impl()
+            # Publish initialization only after every migration and integrity
+            # setup step has returned. Concurrent callers block on both the
+            # process lock and this database-adjacent OS lock.
+            _db_initialized_path = DB_PATH
 
 
 def _init_database_impl():
@@ -1789,11 +1913,39 @@ def _stability_timestamp(value: Any, label: str) -> str:
     ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _canonical_stored_stability_timestamp(value: Any) -> str:
+    """Accept canonical Task 3 text or the legacy SQLite timestamp shape."""
+
+    if not isinstance(value, str):
+        raise ValueError("stored stability timestamp must be text")
+    text = value.strip()
+    legacy_match = re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
+        r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?",
+        text,
+    )
+    if legacy_match is not None:
+        if text.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", text):
+            return _stability_timestamp(
+                f"{text[:10]}T{text[11:]}", "stored stability timestamp"
+            )
+        return _parse_iso_timestamp(
+            text, "stored stability timestamp", require_timezone=False
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return _stability_timestamp(text, "stored stability timestamp")
+
+
 def _stability_timestamp_or_now(value: Any, label: str) -> str:
     return _stability_timestamp(
         datetime.now(timezone.utc) if value is None else value,
         label,
     )
+
+
+def _stability_wall_clock() -> str:
+    """Capture authoritative UTC time at the point a safety lock is held."""
+
+    return _stability_timestamp(datetime.now(timezone.utc), "wall clock")
 
 
 def _get_reconcile_tier_sizes_mojos(wallet_type: str) -> Dict[str, int]:
@@ -6998,9 +7150,8 @@ def finalize_offer_intent(
         ).fetchone()
         if existing_event is not None:
             _insert_offer_operation_event(conn, journal)
-            if (
-                current_dict["lifecycle_state"] != state
-                or current_dict["sage_trade_id"] != trade_id
+            if is_confirmed and (
+                current_dict["sage_trade_id"] != trade_id
                 or current_dict["offer_text_sha256"] != offer_hash
                 or current_dict["publication_identity"] != publication
                 or current_dict["child_intent_id"] != child
@@ -7008,12 +7159,21 @@ def finalize_offer_intent(
                 raise ValueError("event_id already finalized a different intent state")
             conn.commit()
             return current_dict
-        if current_dict["lifecycle_state"] not in {
-            "prepared",
-            "creation_unknown",
-            "submitted_unconfirmed",
-        }:
+        source_state = current_dict["lifecycle_state"]
+        allowed_transitions = {
+            "prepared": {
+                "created",
+                "submitted_unconfirmed",
+                "creation_unknown",
+                "creation_failed",
+            },
+            "submitted_unconfirmed": {"created"},
+            "creation_unknown": {"created"},
+        }
+        if source_state not in allowed_transitions:
             raise ValueError("offer intent is already finalized")
+        if state not in allowed_transitions[source_state]:
+            raise ValueError("offer intent source/destination transition is not allowed")
         current_version = _exact_integer(current_dict["row_version"], "row_version")
         if (
             safe_expected_row_version is not None
@@ -7357,6 +7517,8 @@ def acquire_runtime_mutation_lease(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        safety_at = max(at, locked_at)
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
@@ -7367,7 +7529,7 @@ def acquire_runtime_mutation_lease(
         reason = "acquired"
         can_acquire = not bool(current["active"])
         if current["active"] and current["owner_run_id"] == owner:
-            if current["expires_at"] <= at:
+            if current["expires_at"] <= safety_at:
                 conn.commit()
                 return {
                     "acquired": False,
@@ -7411,7 +7573,9 @@ def acquire_runtime_mutation_lease(
             can_acquire = True
             reason = "renewed"
         elif current["active"]:
-            expired = bool(current["expires_at"] and current["expires_at"] <= at)
+            expired = bool(
+                current["expires_at"] and current["expires_at"] <= safety_at
+            )
             if not expired:
                 conn.commit()
                 return {
@@ -7452,6 +7616,8 @@ def acquire_runtime_mutation_lease(
         if not can_acquire:
             conn.commit()
             return {"acquired": False, "reason": "not_available", "lease": current}
+        if expiry <= safety_at:
+            raise ValueError("lease_expires_at must be later than post-lock wall clock")
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -7468,10 +7634,10 @@ def acquire_runtime_mutation_lease(
                 wallet_hash,
                 safe_network,
                 owner,
-                at,
-                at,
+                safety_at,
+                safety_at,
                 expiry,
-                at,
+                safety_at,
                 version,
             ),
         )
@@ -7512,6 +7678,8 @@ def heartbeat_runtime_mutation_lease(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        safety_at = max(at, locked_at)
         current_row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
@@ -7529,7 +7697,7 @@ def heartbeat_runtime_mutation_lease(
                 "reason": "compare_and_set_failed",
                 "lease": current,
             }
-        if current["expires_at"] <= at:
+        if current["expires_at"] <= safety_at:
             conn.commit()
             return {
                 "heartbeat": False,
@@ -7543,6 +7711,10 @@ def heartbeat_runtime_mutation_lease(
                 "reason": "new_expiry_not_monotonic",
                 "lease": current,
             }
+        if expiry <= safety_at:
+            raise ValueError(
+                "lease_expires_at must be later than post-lock wall clock"
+            )
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -7550,7 +7722,7 @@ def heartbeat_runtime_mutation_lease(
             WHERE singleton_id=1 AND active=1 AND owner_run_id=?
               AND lease_version=? AND expires_at>?
             """,
-            (at, expiry, at, owner, version, at),
+            (safety_at, expiry, safety_at, owner, version, safety_at),
         )
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
