@@ -37,8 +37,21 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        self._gate_patchers = [
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate,
+                "enter_mutation",
+                return_value="coin-prep-unit-permit",
+            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+        ]
+        for patcher in self._gate_patchers:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self._gate_patchers):
+            patcher.stop()
         api_server._rate_limit_log.clear()
         api_server._coin_prep_state["running"] = False
         api_server._coin_prep_state["complete"] = False
@@ -423,7 +436,10 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertEqual(second.status_code, 200)
         self.assertTrue(first.get_json().get("success"))
         self.assertEqual(second.get_json().get("status"), "already_running")
-        self.assertEqual(mock_thread.call_count, 1)
+        # The first guarded mutation also starts the lease-heartbeat thread.
+        # The duplicate request must add no second coin-prep worker.
+        names = [call.kwargs.get("name") for call in mock_thread.call_args_list]
+        self.assertEqual(names.count("coin-prep-api-worker"), 1)
 
     def test_trigger_passes_sage_active_cat_wallet_to_worker(self):
         captured = {}
@@ -466,6 +482,14 @@ class TestCoinPrepTrigger(_FlaskBase):
                     "coin_manager._coin_prep_worker_command", return_value=["worker"]
                 ),
                 patch("coin_manager._coin_prep_worker_environment", return_value=env),
+                patch(
+                    "coin_manager._issue_coin_prep_worker_delegation",
+                    return_value=MagicMock(to_environment=lambda: {}),
+                ),
+                patch(
+                    "coin_manager._revoke_coin_prep_worker_delegation",
+                    return_value={"revoked": True},
+                ),
                 patch("subprocess.Popen", side_effect=fake_popen),
                 patch.object(
                     coin_prep_blueprint,

@@ -30,7 +30,6 @@ import threading
 import secrets
 import webbrowser
 import hashlib
-import database
 
 # When run as the entry point (`python api_server.py`), Python loads this file
 # as the `__main__` module — `sys.modules` has no `api_server` key. Any
@@ -41,6 +40,41 @@ import database
 # subsequent `import api_server` calls return the already-initialized object.
 if __name__ == "__main__":
     sys.modules.setdefault("api_server", sys.modules[__name__])
+
+    # A standalone second process must discover durable ownership before
+    # importing CATalyst modules whose import hooks migrate config, start
+    # logging, or otherwise write into the shared data directory.
+    import socket as _early_socket
+    import read_only_diagnostics as _early_diagnostics
+
+    if _early_diagnostics.preflight_requires_diagnostics():
+        try:
+            _early_preferred_port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+        except (TypeError, ValueError):
+            _early_preferred_port = 5000
+        if not 1 <= _early_preferred_port <= 65535:
+            _early_preferred_port = 5000
+        _early_selected_port = None
+        for _early_candidate in range(
+            _early_preferred_port, min(65536, _early_preferred_port + 51)
+        ):
+            _early_sock = _early_socket.socket(
+                _early_socket.AF_INET, _early_socket.SOCK_STREAM
+            )
+            try:
+                _early_sock.bind(("127.0.0.1", _early_candidate))
+                _early_selected_port = _early_candidate
+                break
+            except OSError:
+                continue
+            finally:
+                _early_sock.close()
+        if _early_selected_port is None:
+            raise SystemExit(1)
+        _early_diagnostics.serve(_early_selected_port)
+        raise SystemExit(0)
+
+import database
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -77,7 +111,7 @@ if sys.platform == "win32":
                     setattr(sys, _attr, _wrapped)
             except Exception:
                 pass
-from flask import Flask, jsonify, request, send_from_directory, send_file, Response
+from flask import Flask, jsonify, request, send_from_directory, send_file, Response, g
 
 # ---- Super Log: capture EVERYTHING to terminal + file ----
 from super_log import init_super_log, slog, intercept_log_event
@@ -1281,10 +1315,392 @@ def _ensure_mutation_runtime() -> None:
 def release_mutation_runtime() -> dict:
     global _mutation_runtime, _mutation_runtime_db_path
     with _mutation_runtime_init_lock:
-        result = mutation_gate.shutdown_runtime()
+        result = mutation_gate.shutdown_runtime(release_owned_lease=True)
         _mutation_runtime = None
         _mutation_runtime_db_path = None
         return result
+
+
+_background_mutation_threads_lock = threading.Lock()
+_background_mutation_threads: dict[int, threading.Thread] = {}
+
+
+def start_mutation_thread(*, operation: str, target, name: str) -> threading.Thread:
+    """Start one tracked async mutator with a permit held for its lifetime."""
+
+    permit = mutation_gate.enter_mutation(operation)
+    holder: dict[str, threading.Thread] = {}
+
+    def run() -> None:
+        try:
+            target()
+        finally:
+            mutation_gate.exit_mutation(permit)
+            thread = holder.get("thread")
+            if thread is not None:
+                with _background_mutation_threads_lock:
+                    _background_mutation_threads.pop(id(thread), None)
+
+    thread = threading.Thread(target=run, name=str(name)[:128], daemon=True)
+    holder["thread"] = thread
+    with _background_mutation_threads_lock:
+        _background_mutation_threads[id(thread)] = thread
+    try:
+        thread.start()
+    except Exception:
+        with _background_mutation_threads_lock:
+            _background_mutation_threads.pop(id(thread), None)
+        mutation_gate.exit_mutation(permit)
+        raise
+    return thread
+
+
+def _shutdown_thread_refs(bot_instance) -> list[Any]:
+    """Return a de-duplicated snapshot of mutation-producing threads."""
+
+    class _UnverifiableThreadInventory:
+        name = "mutation-thread-inventory"
+
+        @staticmethod
+        def is_alive():
+            raise RuntimeError("mutation thread inventory unavailable")
+
+    refs: list[Any] = []
+    owners = [bot_instance]
+    if bot_instance is not None:
+        owners.extend(
+            [
+                getattr(bot_instance, "coin_manager", None),
+                getattr(bot_instance, "runtime_monitor", None),
+                getattr(bot_instance, "amm_monitor", None),
+                getattr(bot_instance, "shape_fix_orchestrator", None),
+            ]
+        )
+    for owner in owners:
+        if owner is None:
+            continue
+        for attr in (
+            "_thread",
+            "_topup_thread",
+            "_splash_receive_thread",
+            "_health_thread",
+            "_watcher_thread",
+            "_coin_watcher_thread",
+            "_startup_repost_thread",
+            "_stop_finalize_thread",
+            "_graceful_cancel_thread",
+        ):
+            candidate = getattr(owner, attr, None)
+            if candidate is not None and callable(getattr(candidate, "is_alive", None)):
+                refs.append(candidate)
+        for collection_name in ("_ladder_threads", "_sniper_threads"):
+            ladder_threads = getattr(owner, collection_name, None)
+            if not isinstance(ladder_threads, (list, tuple, set)):
+                continue
+            refs.extend(
+                candidate
+                for candidate in ladder_threads
+                if callable(getattr(candidate, "is_alive", None))
+            )
+        worker_threads = getattr(owner, "_threads", None)
+        if isinstance(worker_threads, dict):
+            owner_lock = getattr(owner, "_lock", None)
+            try:
+                if owner_lock is None:
+                    worker_snapshot = tuple(worker_threads.values())
+                else:
+                    with owner_lock:
+                        worker_snapshot = tuple(worker_threads.values())
+            except Exception:
+                refs.append(_UnverifiableThreadInventory())
+                continue
+            refs.extend(
+                candidate
+                for candidate in worker_snapshot
+                if callable(getattr(candidate, "is_alive", None))
+            )
+    for global_name in (
+        "_coin_prep_thread",
+        "_cancel_all_thread",
+        "_boost_activation_thread",
+    ):
+        candidate = globals().get(global_name)
+        if candidate is not None and callable(getattr(candidate, "is_alive", None)):
+            refs.append(candidate)
+    with _background_mutation_threads_lock:
+        refs.extend(_background_mutation_threads.values())
+    return list({id(item): item for item in refs}.values())
+
+
+def _stop_child_process(process, *, timeout_seconds: float) -> bool:
+    """Stop one child and prove it exited; uncertainty is a hard failure."""
+
+    if process is None:
+        return True
+    try:
+        if process.poll() is not None:
+            return True
+    except Exception:
+        return False
+    try:
+        process.terminate()
+        process.wait(timeout=max(0.0, timeout_seconds))
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=max(0.0, timeout_seconds))
+        except Exception:
+            return False
+    try:
+        return process.poll() is not None
+    except Exception:
+        return False
+
+
+def _thread_name(thread) -> str:
+    name = getattr(thread, "name", None)
+    return str(name)[:128] if name else "unnamed-mutation-thread"
+
+
+def quiesce_and_release_mutation_runtime(
+    *, bot_instance=None, wait_seconds: float = 30.0
+) -> dict[str, Any]:
+    """Release ownership only after every local mutation source is proven stopped."""
+
+    global _coin_prep_proc, _coin_prep_thread
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return {"released": False, "reason": "not_initialized"}
+
+    runtime.begin_quiesce()
+    target_bot = bot if bot_instance is None else bot_instance
+    manager = (
+        getattr(target_bot, "coin_manager", None) if target_bot is not None else None
+    )
+    known_threads = _shutdown_thread_refs(target_bot)
+    stop_failed = False
+
+    if target_bot is not None:
+        try:
+            target_bot.stop(wait=True)
+        except Exception:
+            stop_failed = True
+
+    shape_fix = (
+        getattr(target_bot, "shape_fix_orchestrator", None)
+        if target_bot is not None
+        else None
+    )
+    if shape_fix is not None and callable(getattr(shape_fix, "abort_flow", None)):
+        for side in ("buy", "sell"):
+            try:
+                shape_fix.abort_flow(side)
+            except Exception:
+                stop_failed = True
+
+    for monitor_name in ("runtime_monitor", "amm_monitor"):
+        monitor = (
+            getattr(target_bot, monitor_name, None) if target_bot is not None else None
+        )
+        if monitor is not None and callable(getattr(monitor, "stop", None)):
+            try:
+                monitor.stop()
+            except Exception:
+                stop_failed = True
+
+    manager_process = getattr(manager, "_prep_process", None) if manager else None
+    blueprint_process = _coin_prep_proc
+    process_results: list[tuple[Any, bool]] = []
+    unique_processes = {
+        id(item): item
+        for item in (manager_process, blueprint_process)
+        if item is not None
+    }
+    for process in unique_processes.values():
+        process_results.append(
+            (process, _stop_child_process(process, timeout_seconds=wait_seconds))
+        )
+    if any(not stopped for _process, stopped in process_results):
+        stop_failed = True
+
+    manager_process_stopped = manager_process is None or any(
+        process is manager_process and stopped for process, stopped in process_results
+    )
+    blueprint_process_stopped = blueprint_process is None or any(
+        process is blueprint_process and stopped for process, stopped in process_results
+    )
+    if manager_process_stopped and manager is not None:
+        delegation = getattr(manager, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                revoke = _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                revoke = {"revoked": False, "reason": "delegation_revoke_failed"}
+            if not revoke.get("revoked") and revoke.get("reason") not in {
+                "delegation_not_active",
+                "delegation_not_found",
+            }:
+                stop_failed = True
+            else:
+                manager._prep_delegation = None
+        manager._prep_process = None
+        manager._prep_running = False
+    if blueprint_process_stopped:
+        _coin_prep_proc = None
+        _coin_prep_state["running"] = False
+
+    live_child_pids = sorted(
+        {
+            int(getattr(process, "pid", 0) or 0)
+            for process, stopped in process_results
+            if not stopped and int(getattr(process, "pid", 0) or 0) > 0
+        }
+    )
+    if live_child_pids:
+        stop_failed = True
+
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    all_threads = list(
+        {
+            id(item): item for item in known_threads + _shutdown_thread_refs(target_bot)
+        }.values()
+    )
+    for thread in all_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive() and callable(getattr(thread, "join", None)):
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            stop_failed = True
+
+    all_threads = list(
+        {
+            id(item): item for item in all_threads + _shutdown_thread_refs(target_bot)
+        }.values()
+    )
+    live_threads: list[str] = []
+    unverified_threads: list[str] = []
+    for thread in all_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            alive = bool(thread.is_alive())
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+            continue
+        if alive:
+            live_threads.append(_thread_name(thread))
+    live_threads = sorted(set(live_threads))
+    unverified_threads = sorted(set(unverified_threads))
+    if live_threads:
+        stop_failed = True
+    if manager is not None and (
+        bool(getattr(manager, "_prep_running", False))
+        or bool(getattr(manager, "_topup_running", False))
+    ):
+        stop_failed = True
+
+    if not runtime.wait_for_quiescence(max(0.0, deadline - time.monotonic())):
+        runtime.stop_heartbeat()
+        return {
+            "released": False,
+            "reason": "mutations_in_flight",
+            "live_threads": live_threads,
+            "unverified_threads": unverified_threads,
+            "live_child_pids": live_child_pids,
+        }
+
+    # A permitted launcher may publish its subprocess handle immediately
+    # before returning. Re-snapshot children only after permits have drained.
+    final_manager_process = getattr(manager, "_prep_process", None) if manager else None
+    final_blueprint_process = _coin_prep_proc
+    known_process_ids = {id(process) for process, _stopped in process_results}
+    for process in (final_manager_process, final_blueprint_process):
+        if process is not None and id(process) not in known_process_ids:
+            process_results.append(
+                (process, _stop_child_process(process, timeout_seconds=wait_seconds))
+            )
+            known_process_ids.add(id(process))
+    if any(not stopped for _process, stopped in process_results):
+        stop_failed = True
+
+    final_manager_stopped = final_manager_process is None or any(
+        process is final_manager_process and stopped
+        for process, stopped in process_results
+    )
+    if final_manager_stopped and manager is not None:
+        delegation = getattr(manager, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                revoke = _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                revoke = {"revoked": False, "reason": "delegation_revoke_failed"}
+            if not revoke.get("revoked") and revoke.get("reason") not in {
+                "delegation_not_active",
+                "delegation_not_found",
+            }:
+                stop_failed = True
+            else:
+                manager._prep_delegation = None
+        manager._prep_process = None
+        manager._prep_running = False
+    final_blueprint_stopped = final_blueprint_process is None or any(
+        process is final_blueprint_process and stopped
+        for process, stopped in process_results
+    )
+    if final_blueprint_stopped:
+        _coin_prep_proc = None
+        _coin_prep_state["running"] = False
+    live_child_pids = sorted(
+        {
+            int(getattr(process, "pid", 0) or 0)
+            for process, stopped in process_results
+            if not stopped and int(getattr(process, "pid", 0) or 0) > 0
+        }
+    )
+
+    # A request that already held a permit when quiescence began may publish
+    # its worker reference immediately before exiting that permit.  Drain
+    # permits first, then take the definitive producer snapshot.
+    final_threads = _shutdown_thread_refs(target_bot)
+    for thread in final_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive() and callable(getattr(thread, "join", None)):
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+    for thread in final_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive():
+                live_threads.append(_thread_name(thread))
+                stop_failed = True
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+    live_threads = sorted(set(live_threads))
+    unverified_threads = sorted(set(unverified_threads))
+    if stop_failed:
+        runtime.stop_heartbeat()
+        return {
+            "released": False,
+            "reason": "mutation_producers_not_stopped",
+            "live_threads": live_threads,
+            "unverified_threads": unverified_threads,
+            "live_child_pids": live_child_pids,
+        }
+
+    return release_mutation_runtime()
 
 
 # Active CAT selection — updated when user picks a CAT from the dropdown.
@@ -1761,6 +2177,7 @@ def create_bot() -> BotLoop:
     # background component that could eventually reach a wallet mutation.
     if mutation_gate.current_runtime() is None:
         initialize_mutation_runtime()
+    mutation_gate.require_allowed("startup:create_bot")
     bot = BotLoop()
     # Wire up event bus to bot loop for push updates
     bot._event_bus = events
@@ -1897,7 +2314,7 @@ def enforce_local_runtime_guard():
             _ensure_mutation_runtime()
             operation = f"api:{endpoint}"
             try:
-                mutation_gate.require_allowed(operation)
+                g._mutation_permit = mutation_gate.enter_mutation(operation)
             except mutation_gate.MutationBlocked as exc:
                 return jsonify(
                     {
@@ -1907,6 +2324,15 @@ def enforce_local_runtime_guard():
                         "operation": operation,
                     }
                 ), 423
+
+
+@app.teardown_request
+def release_local_runtime_guard(_error=None):
+    """Always retire the exact in-flight permit, including exceptional routes."""
+
+    permit = getattr(g, "_mutation_permit", None)
+    if permit:
+        mutation_gate.exit_mutation(permit)
 
 
 @app.route("/")
@@ -3287,6 +3713,9 @@ _coin_prep_state = {
     "xch_needed": 0,
     "cat_needed": 0,
 }
+_coin_prep_thread = None
+_cancel_all_thread = None
+_boost_activation_thread = None
 _coin_prep_proc = (
     None  # Global ref to subprocess — used to kill old worker on re-trigger
 )
@@ -3443,52 +3872,21 @@ def _serialize_dict(d: dict) -> dict:
 
 
 def _graceful_shutdown(signum, _frame):
-    """Handle Ctrl+C or terminal close — stop bot cleanly before exit."""
+    """Handle Ctrl+C without releasing ownership ahead of live producers."""
     sig_name = (
         signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
     )
-    print(f"\n🛑 Received {sig_name} — shutting down gracefully...", flush=True)
-
-    if bot and bot.is_running():
-        print("   Stopping bot loop...", flush=True)
-        bot.stop()
-        print("   ✅ Bot loop stopped", flush=True)
-
-    try:
-        backup_database()
-        print("   ✅ Database backed up", flush=True)
-    except Exception:
-        pass
-
-    # Stop Splash node (in case bot.stop() didn't cover it)
-    try:
-        if bot and hasattr(bot, "splash_node") and bot.splash_node.is_running():
-            bot.splash_node.stop()
-            print("   ✅ Splash node stopped", flush=True)
-    except Exception:
-        pass
-
-    try:
-        if bot and hasattr(bot, "runtime_monitor"):
-            bot.runtime_monitor.stop()
-    except Exception:
-        pass
-
-    # Stop Chia services
-    print("   Stopping Chia services...", flush=True)
-    try:
-        import chia_node
-
-        result = chia_node.stop_chia("all")
-        if result.get("success"):
-            print("   ✅ Chia services stopped", flush=True)
-        else:
-            print(f"   ⚠️ Chia stop: {result.get('error', 'unknown')}", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ Could not stop Chia: {e}", flush=True)
-
-    release_mutation_runtime()
-    print("   Goodbye!", flush=True)
+    slog("SAFETY", "Shutdown requested", {"signal": sig_name})
+    result = quiesce_and_release_mutation_runtime(bot_instance=bot)
+    slog(
+        "SAFETY",
+        "Shutdown quiescence complete",
+        {
+            "released": bool(result.get("released")),
+            "reason": str(result.get("reason") or "")[:128],
+        },
+        level="info" if result.get("released") else "error",
+    )
     sys.exit(0)
 
 
@@ -3847,6 +4245,10 @@ if __name__ == "__main__":
 
     # Only the lease-seeking owner is allowed to initialize or migrate SQLite.
     init_database()
+    _startup_authorization = initialize_mutation_runtime()
+    if not _startup_authorization.get("allowed"):
+        _serve_read_only_diagnostics(_port)
+        sys.exit(0)
 
     # One-shot migration: mark all currently-designated reserve coins as
     # already-advised. Earlier coin-prep runs designated these coins but

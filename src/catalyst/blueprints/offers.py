@@ -11,7 +11,6 @@ can still inspect it.
 
 from __future__ import annotations
 
-import threading
 import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -547,10 +546,32 @@ def api_cancel_all():
                         f"Cancel all background worker failed: {_e}",
                     )
 
-            _t = threading.Thread(
-                target=_cancel_all_worker, name="cancel-all-bg", daemon=True
-            )
-            _t.start()
+            try:
+                _t = api_server.start_mutation_thread(
+                    operation="api:offers:cancel_all_worker",
+                    target=_cancel_all_worker,
+                    name="cancel-all-bg",
+                )
+            except api_server.mutation_gate.MutationBlocked as exc:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="Mutation shutdown is in progress",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message="Cancel all did not start because shutdown is in progress.",
+                )
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": "mutation_gate_blocked",
+                            "reason": exc.reason_code,
+                        }
+                    ),
+                    423,
+                )
+            api_server._cancel_all_thread = _t
 
             # Return immediately — frontend polls /api/offers/cancel_all/status
             return jsonify(

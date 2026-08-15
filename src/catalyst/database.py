@@ -6774,16 +6774,20 @@ def _stability_connection() -> sqlite3.Connection:
     """Return a short-lived autocommit connection for stability CAS writes."""
 
     conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
     try:
-        from super_log import trace_connection
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            from super_log import trace_connection
 
-        trace_connection(conn, f"stability-{threading.current_thread().name}")
-    except ImportError:
-        pass
-    return conn
+            trace_connection(conn, f"stability-{threading.current_thread().name}")
+        except ImportError:
+            pass
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _stability_read_only_connection() -> sqlite3.Connection:
@@ -6796,11 +6800,15 @@ def _stability_read_only_connection() -> sqlite3.Connection:
         isolation_level=None,
         uri=True,
     )
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _required_stability_text(value: Any, label: str) -> str:
@@ -7974,6 +7982,20 @@ def acquire_runtime_mutation_lease(
                 "reason": "compare_and_set_failed",
                 "lease": get_runtime_mutation_lease(),
             }
+        delegation_parents_to_revoke = set()
+        if not bool(current["active"]):
+            delegation_parents_to_revoke.add(owner)
+        if reason == "expired_lease_taken_over" and current.get("owner_run_id"):
+            delegation_parents_to_revoke.add(str(current["owner_run_id"]))
+        for prior_parent in delegation_parents_to_revoke:
+            conn.execute(
+                """
+                UPDATE runtime_worker_delegations
+                SET state='revoked', revoked_at=?, updated_at=?
+                WHERE parent_run_id=? AND state='active'
+                """,
+                (safety_at, safety_at, prior_parent),
+            )
         result = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
@@ -8083,6 +8105,15 @@ def release_runtime_mutation_lease(
             """,
             (at, at, owner, version),
         )
+        if cursor.rowcount == 1:
+            conn.execute(
+                """
+                UPDATE runtime_worker_delegations
+                SET state='revoked', revoked_at=?, updated_at=?
+                WHERE parent_run_id=? AND state='active'
+                """,
+                (at, at, owner),
+            )
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()

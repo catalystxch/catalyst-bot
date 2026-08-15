@@ -16,9 +16,11 @@ import os
 import secrets
 import socket
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Callable, Mapping, Optional
 
 import database
@@ -64,6 +66,7 @@ _ALLOWED_REASON_CODES = frozenset(
         "LEASE_UNAVAILABLE",
         "MUTATION_GATE_SAFETY_STOP",
         "MUTATION_RUNTIME_NOT_INITIALIZED",
+        "MUTATION_SHUTTING_DOWN",
         "OPERATION_UNKNOWN",
         "RECONCILIATION_REQUIRED",
         "UNRESOLVED_OPERATIONS",
@@ -84,6 +87,7 @@ _REASON_DESCRIPTIONS = {
     "LEASE_UNAVAILABLE": "No active mutation lease is owned by this run",
     "MUTATION_GATE_SAFETY_STOP": "Mutation stopped by the safety gate",
     "MUTATION_RUNTIME_NOT_INITIALIZED": "Mutation runtime is not initialized",
+    "MUTATION_SHUTTING_DOWN": "Mutation runtime is shutting down",
     "OPERATION_UNKNOWN": "Operation outcome requires reconciliation",
     "RECONCILIATION_REQUIRED": "Authoritative reconciliation is required",
     "UNRESOLVED_OPERATIONS": "Unresolved operation journal entries block mutation",
@@ -371,6 +375,23 @@ def pid_liveness(pid: int, owner_host: str) -> Optional[bool]:
     return True
 
 
+def _stop_callback_boundary(method):
+    """Dispatch a pending stop callback after the outer gate lock is released."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        depth = int(getattr(self._stop_dispatch_local, "depth", 0))
+        self._stop_dispatch_local.depth = depth + 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._stop_dispatch_local.depth = depth
+            if depth == 0:
+                self._flush_stop_handler()
+
+    return wrapped
+
+
 class MutationGate:
     """One process' view of the durable safety latch and mutation lease."""
 
@@ -401,12 +422,19 @@ class MutationGate:
         self._clock = clock
         self._pid_liveness = pid_liveness
         self._lock = threading.RLock()
+        self._mutation_condition = threading.Condition(self._lock)
+        self._active_mutations: dict[str, str] = {}
+        self._quiescing = False
         self._lease_version: Optional[int] = None
         self._lease_acquired_at: Optional[str] = None
         self._local_reason_code = ""
         self._local_latch_generation: Optional[int] = None
         self._stop_handler: Optional[Callable[[str], None]] = None
         self._notified_stop_handler: Optional[Callable[[str], None]] = None
+        self._pending_stop_notification: Optional[tuple[Callable[[str], None], str]] = (
+            None
+        )
+        self._stop_dispatch_local = threading.local()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self.last_acquire_result: dict[str, Any] = {
@@ -427,7 +455,6 @@ class MutationGate:
         self, reason_code: str, *, latch_generation: Optional[int] = None
     ) -> None:
         safe_reason = _safe_reason_code(reason_code)
-        callback = None
         with self._lock:
             if safe_reason in _TERMINAL_PROCESS_FENCES:
                 self._local_reason_code = safe_reason
@@ -442,9 +469,15 @@ class MutationGate:
             if self._stop_handler is not None and not _same_handler(
                 self._stop_handler, self._notified_stop_handler
             ):
-                callback = self._stop_handler
-                self._notified_stop_handler = callback
-        if callback is not None:
+                self._notified_stop_handler = self._stop_handler
+                self._pending_stop_notification = (self._stop_handler, safe_reason)
+
+    def _flush_stop_handler(self) -> None:
+        with self._lock:
+            notification = self._pending_stop_notification
+            self._pending_stop_notification = None
+        if notification is not None:
+            callback, safe_reason = notification
             try:
                 callback(safe_reason)
             except Exception:
@@ -455,6 +488,7 @@ class MutationGate:
                     level="error",
                 )
 
+    @_stop_callback_boundary
     def register_stop_handler(self, handler: Optional[Callable[[str], None]]) -> None:
         if handler is not None and not callable(handler):
             raise TypeError("stop handler must be callable or None")
@@ -470,6 +504,7 @@ class MutationGate:
             # asynchronous stop event.
             self.status()
 
+    @_stop_callback_boundary
     def acquire(self) -> dict[str, Any]:
         with self._lock:
             try:
@@ -512,14 +547,6 @@ class MutationGate:
                             self.last_acquire_result = result
                             return _lease_public_result(result)
                         prior_host = str(current.get("owner_host") or "")
-                        if prior_host.casefold() != self.owner_host.casefold():
-                            result = {
-                                "acquired": False,
-                                "reason": "prior_owner_liveness_unproven",
-                                "lease": current,
-                            }
-                            self.last_acquire_result = result
-                            return _lease_public_result(result)
                         alive = self._pid_liveness(
                             int(current.get("owner_pid") or 0), prior_host
                         )
@@ -647,13 +674,20 @@ class MutationGate:
             expected_version = self._lease_version
         if local_reason:
             return result(local_reason, "process")
+        if expected_version is not None and (
+            not lease_active or not owned or lease_version != expected_version
+        ):
+            self._set_local_block("LEASE_LOST")
+            return result("LEASE_LOST", "lease")
         if not lease_active:
             return result("LEASE_UNAVAILABLE", "lease")
         if not owned:
             return result("LEASE_OWNED_BY_OTHER", "lease")
-        if expected_version is None or lease_version != expected_version:
+        if expected_version is None:
+            self._set_local_block("LEASE_LOST")
             return result("LEASE_LOST", "lease")
         if lease_expiry is None or _as_utc(lease_expiry) <= self._now():
+            self._set_local_block("LEASE_EXPIRED")
             return result("LEASE_EXPIRED", "lease")
         return GateStatus(
             allowed=True,
@@ -669,21 +703,23 @@ class MutationGate:
             owner_is_this_run=True,
         )
 
+    @_stop_callback_boundary
     def status(self) -> GateStatus:
-        try:
-            authorization = self._authorization_snapshot()
-            return self._status_from_rows(
-                authorization["latch"],
-                authorization["lease"],
-                authorization["unresolved"],
-            )
-        except Exception:
-            self._set_local_block("DURABLE_STATE_UNAVAILABLE")
-            return GateStatus(
-                allowed=False,
-                reason_code="DURABLE_STATE_UNAVAILABLE",
-                source="durable_read",
-            )
+        with self._lock:
+            try:
+                authorization = self._authorization_snapshot()
+                return self._status_from_rows(
+                    authorization["latch"],
+                    authorization["lease"],
+                    authorization["unresolved"],
+                )
+            except Exception:
+                self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                return GateStatus(
+                    allowed=False,
+                    reason_code="DURABLE_STATE_UNAVAILABLE",
+                    source="durable_read",
+                )
 
     def require_allowed(self, operation: str) -> GateStatus:
         current = self.status()
@@ -691,6 +727,55 @@ class MutationGate:
             raise MutationBlocked(current.reason_code, operation)
         return current
 
+    @_stop_callback_boundary
+    def enter_mutation(self, operation: str) -> str:
+        """Register one guarded in-process mutation until its exact exit."""
+
+        safe_operation = _safe_operation(operation)
+        with self._lock:
+            if self._quiescing:
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
+            self.require_allowed(safe_operation)
+            permit = str(uuid.uuid4())
+            self._active_mutations[permit] = safe_operation
+            return permit
+
+    def exit_mutation(self, permit: str) -> bool:
+        """Finish one exact guarded mutation permit."""
+
+        if type(permit) is not str or not permit:
+            return False
+        with self._mutation_condition:
+            removed = self._active_mutations.pop(permit, None) is not None
+            if removed:
+                self._mutation_condition.notify_all()
+            return removed
+
+    def begin_quiesce(self) -> None:
+        """Deny new in-process mutations before shutdown drains existing work."""
+
+        with self._mutation_condition:
+            self._quiescing = True
+            self._mutation_condition.notify_all()
+
+    def wait_for_quiescence(self, timeout_seconds: float) -> bool:
+        """Wait boundedly until every guarded in-process mutation has exited."""
+
+        timeout = max(0.0, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
+        with self._mutation_condition:
+            while self._active_mutations:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._mutation_condition.wait(timeout=remaining)
+            return True
+
+    def active_mutation_count(self) -> int:
+        with self._lock:
+            return len(self._active_mutations)
+
+    @_stop_callback_boundary
     def trip(
         self, reason_code: str, blocking_operation_ids: list[str] | tuple[str, ...]
     ) -> GateStatus:
@@ -709,6 +794,7 @@ class MutationGate:
             self._set_local_block("DURABLE_STATE_UNAVAILABLE")
         return self.status()
 
+    @_stop_callback_boundary
     def release_resolved(
         self, expected_generation: int, resolved_operation_ids: list[str]
     ) -> dict[str, Any]:
@@ -781,6 +867,7 @@ class MutationGate:
                 "status": self.status().to_dict(),
             }
 
+    @_stop_callback_boundary
     def heartbeat(self) -> dict[str, Any]:
         with self._lock:
             version = self._lease_version
@@ -836,6 +923,7 @@ class MutationGate:
         if thread and thread is not threading.current_thread():
             thread.join(timeout=2)
 
+    @_stop_callback_boundary
     def release_lease(self) -> dict[str, Any]:
         self.stop_heartbeat()
         with self._lock:
@@ -857,6 +945,7 @@ class MutationGate:
                 self._set_local_block("LEASE_LOST")
             return result
 
+    @_stop_callback_boundary
     def issue_worker_delegation(
         self,
         *,
@@ -871,44 +960,62 @@ class MutationGate:
         ttl = _exact_positive_int(ttl_seconds, "ttl_seconds")
         if ttl > 3600:
             raise ValueError("ttl_seconds exceeds the maximum delegation lifetime")
-        current = self.require_allowed(f"delegate:{safe_purpose}")
-        now = self._now()
-        expires = now + timedelta(seconds=ttl)
-        database.expire_worker_delegations(now=now)
-        raw_token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-        delegation_id = str(uuid.uuid4())
-        metadata = {
-            "parent_acquired_at": self._lease_acquired_at,
-            "parent_host": self.owner_host,
-            "parent_pid": self.owner_pid,
-        }
-        database.issue_worker_delegation(
-            delegation_id=delegation_id,
-            delegation_token_hash=token_hash,
-            parent_run_id=self.run_id,
-            operation_id=operation,
-            worker_id=safe_worker,
-            purpose=safe_purpose,
-            wallet_fingerprint_hash=self.wallet_fingerprint_hash,
-            network=self.network,
-            issued_at=now,
-            expires_at=expires,
-            metadata_json=metadata,
-        )
-        # Re-read after issuance: a lost lease cannot produce a usable child.
-        self.require_allowed(f"delegate:{safe_purpose}:issued")
-        return WorkerDelegation(
-            delegation_id=delegation_id,
-            parent_run_id=self.run_id,
-            operation_id=operation,
-            purpose=safe_purpose,
-            worker_id=safe_worker,
-            wallet_fingerprint_hash=self.wallet_fingerprint_hash,
-            network=self.network,
-            expires_at=_timestamp(expires),
-            _raw_token=raw_token,
-        )
+        with self._lock:
+            self.require_allowed(f"delegate:{safe_purpose}")
+            now = self._now()
+            expires = now + timedelta(seconds=ttl)
+            database.expire_worker_delegations(now=now)
+            raw_token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+            delegation_id = str(uuid.uuid4())
+            metadata = {
+                "parent_acquired_at": self._lease_acquired_at,
+                "parent_host": self.owner_host,
+                "parent_pid": self.owner_pid,
+            }
+            inserted = False
+            try:
+                database.issue_worker_delegation(
+                    delegation_id=delegation_id,
+                    delegation_token_hash=token_hash,
+                    parent_run_id=self.run_id,
+                    operation_id=operation,
+                    worker_id=safe_worker,
+                    purpose=safe_purpose,
+                    wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+                    network=self.network,
+                    issued_at=now,
+                    expires_at=expires,
+                    metadata_json=metadata,
+                )
+                inserted = True
+                # Re-read after issuance: a lost lease cannot produce a usable child.
+                self.require_allowed(f"delegate:{safe_purpose}:issued")
+            except Exception:
+                if inserted:
+                    try:
+                        revoked = database.revoke_worker_delegation(
+                            delegation_id=delegation_id,
+                            parent_run_id=self.run_id,
+                            operation_id=operation,
+                            revoked_at=self._now(),
+                        )
+                        if not revoked.get("revoked"):
+                            self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                    except Exception:
+                        self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                raise
+            return WorkerDelegation(
+                delegation_id=delegation_id,
+                parent_run_id=self.run_id,
+                operation_id=operation,
+                purpose=safe_purpose,
+                worker_id=safe_worker,
+                wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+                network=self.network,
+                expires_at=_timestamp(expires),
+                _raw_token=raw_token,
+            )
 
     def validate_worker_delegation(
         self,
@@ -1171,6 +1278,22 @@ def require_allowed(operation: str) -> GateStatus:
     return runtime.require_allowed(operation)
 
 
+def enter_mutation(operation: str) -> str:
+    runtime = current_runtime()
+    if runtime is None:
+        # Route/bridge tests and embedders have historically overridden the
+        # module boundary. Preserve that boundary while still failing closed
+        # when no override is installed.
+        require_allowed(operation)
+        raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+    return runtime.enter_mutation(operation)
+
+
+def exit_mutation(permit: str) -> bool:
+    runtime = current_runtime()
+    return runtime.exit_mutation(permit) if runtime is not None else False
+
+
 def trip(reason_code: str, blocking_operation_ids: list[str]) -> GateStatus:
     runtime = current_runtime()
     if runtime is None:
@@ -1191,14 +1314,24 @@ def release_resolved(
     return runtime.release_resolved(expected_generation, resolved_operation_ids)
 
 
-def shutdown_runtime() -> dict[str, Any]:
+def shutdown_runtime(*, release_owned_lease: bool = False) -> dict[str, Any]:
+    """Detach the process runtime, releasing only after explicit proof.
+
+    The default is deliberately safe for ``atexit`` and diagnostic teardown:
+    stop heartbeats but leave an active lease to expire.  The API's centralized
+    quiescence path is the sole caller authorized to request a durable release.
+    """
+
     global _runtime
     with _runtime_lock:
         runtime = _runtime
         _runtime = None
     if runtime is None:
         return {"released": False, "reason": "not_initialized"}
-    return runtime.release_lease()
+    if release_owned_lease:
+        return runtime.release_lease()
+    runtime.stop_heartbeat()
+    return {"released": False, "reason": "lease_retained"}
 
 
 atexit.register(shutdown_runtime)
@@ -1216,6 +1349,8 @@ __all__ = [
     "GateStatus",
     "MutationBlocked",
     "MutationGate",
+    "enter_mutation",
+    "exit_mutation",
     "WorkerDelegation",
     "current_runtime",
     "initialize",

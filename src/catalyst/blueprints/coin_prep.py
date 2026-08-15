@@ -2169,7 +2169,12 @@ def _api_coin_prep_trigger_locked():
                             "Coin prep ended with an error — review details before retrying",
                         )
 
-        threading.Thread(target=do_prep, daemon=True).start()
+        api_server._coin_prep_thread = threading.Thread(
+            target=do_prep,
+            daemon=True,
+            name="coin-prep-api-worker",
+        )
+        api_server._coin_prep_thread.start()
         return jsonify({"success": True, "message": "Coin prep started"})
     except Exception as e:
         api_server._coin_prep_state["running"] = False

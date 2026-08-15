@@ -57,20 +57,7 @@ if sys.platform == "win32":
         elif _st is None and _under_pythonw:
             # pythonw.exe — open a startup log file so print() works
             if _pythonw_log is None:
-                try:
-                    _log_dir = os.path.join(
-                        os.environ.get("APPDATA", os.path.expanduser("~")),
-                        "Catalyst",
-                    )
-                    os.makedirs(_log_dir, exist_ok=True)
-                    _pythonw_log = open(
-                        os.path.join(_log_dir, "startup.log"),
-                        "w",
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                except Exception:
-                    _pythonw_log = open(os.devnull, "w", encoding="utf-8")
+                _pythonw_log = open(os.devnull, "w", encoding="utf-8")
             setattr(sys, _pair[0], _pythonw_log)
             setattr(sys, _pair[1], _pythonw_log)
 
@@ -177,14 +164,22 @@ def _kill_on_close_job_limit_flags() -> int:
     return JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
 
 
-# Window geometry persistence — lives in the user data directory so
-# the setting survives installs to read-only locations like Program Files.
-try:
-    from user_paths import window_state_file as _window_state_file
+# Window geometry persistence is resolved lazily.  The duplicate-process
+# diagnostics path must not import user_paths because that module performs a
+# first-run migration and creates files at import time.
+_WINDOW_STATE_FILE = None
 
-    _WINDOW_STATE_FILE = _window_state_file()
-except Exception:
-    _WINDOW_STATE_FILE = os.path.join(APP_DIR, ".window_state.json")
+
+def _window_state_path() -> str:
+    global _WINDOW_STATE_FILE
+    if _WINDOW_STATE_FILE is None:
+        try:
+            from user_paths import window_state_file
+
+            _WINDOW_STATE_FILE = window_state_file()
+        except Exception:
+            _WINDOW_STATE_FILE = os.path.join(APP_DIR, ".window_state.json")
+    return _WINDOW_STATE_FILE
 
 
 def _load_window_state() -> dict:
@@ -192,9 +187,10 @@ def _load_window_state() -> dict:
     try:
         import json as _json
 
-        if not os.path.exists(_WINDOW_STATE_FILE):
+        path = _window_state_path()
+        if not os.path.exists(path):
             return {}
-        with open(_WINDOW_STATE_FILE, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             data = _json.load(fh)
         if not isinstance(data, dict):
             return {}
@@ -233,7 +229,7 @@ def _save_window_state(window) -> None:
         # Skip obviously invalid snapshots (e.g. minimized window reports 0/0)
         if state["width"] < WINDOW_MIN_WIDTH or state["height"] < WINDOW_MIN_HEIGHT:
             return
-        with open(_WINDOW_STATE_FILE, "w", encoding="utf-8") as fh:
+        with open(_window_state_path(), "w", encoding="utf-8") as fh:
             _json.dump(state, fh)
     except Exception as e:
         print(f"[WINDOW] Could not save window state: {e}", flush=True)
@@ -472,14 +468,41 @@ _instance_lock_handle = None
 _kill_on_close_job = None
 
 
+def _enable_pythonw_startup_log() -> None:
+    """Enable persistent launcher logging only after startup ownership."""
+
+    global _pythonw_log
+    if not _under_pythonw:
+        return
+    try:
+        from read_only_diagnostics import _data_directory
+
+        log_dir = _data_directory()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        persistent = open(
+            log_dir / "startup.log",
+            "w",
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return
+    previous = _pythonw_log
+    _pythonw_log = persistent
+    for stream_name in ("stdout", "__stdout__", "stderr", "__stderr__"):
+        setattr(sys, stream_name, persistent)
+    if previous is not None and previous is not persistent:
+        try:
+            previous.close()
+        except Exception:
+            pass
+
+
 def _instance_lock_path() -> str:
     """Path to the cross-process singleton lock file."""
-    try:
-        from user_paths import data_dir
+    from read_only_diagnostics import _data_directory
 
-        return os.path.join(data_dir(), ".instance.lock")
-    except Exception:
-        return os.path.join(APP_DIR, ".instance.lock")
+    return str(_data_directory() / ".instance.lock")
 
 
 def _acquire_instance_lock() -> bool:
@@ -1100,9 +1123,9 @@ def _find_available_diagnostics_port(preferred: int) -> int:
 def run_read_only_diagnostics_mode(port: int) -> None:
     """Serve diagnostics without constructing the bot or acquiring a lease."""
 
-    import api_server
+    import read_only_diagnostics
 
-    api_server._serve_read_only_diagnostics(int(port))
+    read_only_diagnostics.serve(int(port))
 
 
 # ---------------------------------------------------------------------------
@@ -1209,25 +1232,16 @@ def _tray_graceful_quit(webview_module, tray):
 def _cleanup():
     """Clean shutdown of bot and modules."""
     try:
-        import api_server
-
-        if api_server.bot and api_server.bot._running:
-            print("  Stopping bot...")
-            api_server.bot.stop()
-    except Exception:
-        pass
-
-    try:
-        import api_server
-
-        api_server.release_mutation_runtime()
-    except Exception:
-        pass
-
-    try:
         from database import log_event
 
         log_event("info", "app_shutdown", f"Desktop app v{APP_VERSION} shutting down")
+    except Exception:
+        pass
+
+    try:
+        import api_server
+
+        api_server.quiesce_and_release_mutation_runtime()
     except Exception:
         pass
 
@@ -1425,6 +1439,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # Durable ownership outranks port and file-lock heuristics. This
+    # stdlib-only preflight cannot create/migrate SQLite or import user_paths.
+    from read_only_diagnostics import preflight_requires_diagnostics
+
+    if preflight_requires_diagnostics():
+        _open_existing_instance_in_browser()
+        diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
+        run_read_only_diagnostics_mode(diagnostics_port)
+        return 0
+
     if not args.flask and not args.dev and not args.show_console:
         if _respawn_under_pythonw():
             return 0
@@ -1439,6 +1463,8 @@ def main(argv=None):
         diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
         run_read_only_diagnostics_mode(diagnostics_port)
         return 0
+
+    _enable_pythonw_startup_log()
 
     # Kill-on-close Job Object: ensures default child processes (coin-prep
     # workers, helper commands, etc.) die when this parent dies, even on

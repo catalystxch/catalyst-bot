@@ -106,8 +106,9 @@ def _mutation_guard(operation: str):
         def wrapper(self, *args, **kwargs):
             api = self.api
             api._ensure_mutation_runtime()
+            permit = None
             try:
-                api.mutation_gate.require_allowed(operation)
+                permit = api.mutation_gate.enter_mutation(operation)
             except api.mutation_gate.MutationBlocked as exc:
                 return {
                     "success": False,
@@ -115,9 +116,13 @@ def _mutation_guard(operation: str):
                     "reason": exc.reason_code,
                     "operation": operation,
                 }
-            return func(self, *args, **kwargs)
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                api.mutation_gate.exit_mutation(permit)
 
         wrapper._mutation_operation = operation
+        wrapper._bridge_access = "mutation"
         return wrapper
 
     return decorate
@@ -137,6 +142,40 @@ class AppBridge:
         api_server to avoid circular imports.
         """
         self._api = None
+
+    def __getattribute__(self, name):
+        """Default every future public callable to mutation-guarded access."""
+
+        value = object.__getattribute__(self, name)
+        if name.startswith("_") or not callable(value):
+            return value
+        access = getattr(value, "_bridge_access", None)
+        if access in {"read_only", "control"} or (
+            access == "mutation" and bool(getattr(value, "_mutation_operation", None))
+        ):
+            return value
+
+        @wraps(value)
+        def guarded_future_method(*args, **kwargs):
+            api = object.__getattribute__(self, "api")
+            api._ensure_mutation_runtime()
+            operation = f"app_bridge:{name}"
+            permit = None
+            try:
+                permit = api.mutation_gate.enter_mutation(operation)
+            except api.mutation_gate.MutationBlocked as exc:
+                return {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                    "operation": operation,
+                }
+            try:
+                return value(*args, **kwargs)
+            finally:
+                api.mutation_gate.exit_mutation(permit)
+
+        return guarded_future_method
 
     @property
     def api(self):
@@ -1625,6 +1664,147 @@ class AppBridge:
         ):
             resp = api_server.api_open_external()
         return _unwrap_flask_response(resp)
+
+
+# Explicit PyWebView authority inventory.  Adding a method to AppBridge without
+# placing it in exactly one set makes import fail; a callable attached later at
+# runtime is still mutation-guarded by __getattribute__.
+_APP_BRIDGE_MUTATION_METHODS = {
+    "activate_boost",
+    "apply_config",
+    "begin_startup",
+    "cancel_all_offers",
+    "cancel_offer",
+    "cleanup_orphans",
+    "clear_logs",
+    "deactivate_boost",
+    "dismiss_alert",
+    "download_splash_setup",
+    "fresh_start",
+    "live_config",
+    "purge_fills",
+    "refresh_cat",
+    "reload_config",
+    "repost_dexie",
+    "reset_coin_prep",
+    "reset_full",
+    "reset_offer_history",
+    "reset_pnl",
+    "select_cat",
+    "set_sage_fingerprint",
+    "set_splash_receive",
+    "setup_certs",
+    "setup_spacescan",
+    "start_bot",
+    "start_splash_node",
+    "start_update_install",
+    "start_with_fingerprint",
+    "trigger_coin_prep",
+    "trigger_topup",
+    "update_config",
+}
+_APP_BRIDGE_CONTROL_METHODS = {
+    "browse_sage_cert",
+    "close_window",
+    "confirm_close_window",
+    "download_logs",
+    "export_fills",
+    "maximize_window",
+    "minimize_window",
+    "move_window",
+    "open_external",
+    "resize_window",
+    "restart_sage",
+    "shutdown",
+    "stop_bot",
+    "toggle_console",
+}
+_APP_BRIDGE_READ_ONLY_METHODS = {
+    "check_resume",
+    "check_splash_setup",
+    "check_update",
+    "get_alerts",
+    "get_app_info",
+    "get_boost_state",
+    "get_bot_state",
+    "get_cancel_all_status",
+    "get_cats",
+    "get_coin_prep_status",
+    "get_coins",
+    "get_config",
+    "get_console_status",
+    "get_dashboard",
+    "get_dexie_stats",
+    "get_fees_status",
+    "get_fills",
+    "get_fingerprint",
+    "get_fingerprints",
+    "get_health",
+    "get_inventory",
+    "get_logs",
+    "get_market_intel",
+    "get_market_orderbook",
+    "get_market_slippage",
+    "get_market_summary",
+    "get_offers",
+    "get_offers_diagnostic",
+    "get_pnl",
+    "get_pnl_reset_preview",
+    "get_price",
+    "get_price_info",
+    "get_reservations",
+    "get_risk_spreads",
+    "get_runtime_diagnostics",
+    "get_sage_cert_candidates",
+    "get_settings_defaults",
+    "get_smart_defaults",
+    "get_spacescan_status",
+    "get_splash_node",
+    "get_splash_receive",
+    "get_splash_setup_progress",
+    "get_splash_stats",
+    "get_startup_status",
+    "get_stats",
+    "get_status",
+    "get_update_status",
+    "get_window_pos",
+    "get_window_size",
+    "is_sage_running",
+    "read_clipboard",
+    "refresh_balances",
+    "run_doctor",
+    "validate_config",
+    "validate_settings",
+    "verify_coin_prep",
+}
+
+_APP_BRIDGE_ACCESS_SETS = (
+    ("mutation", _APP_BRIDGE_MUTATION_METHODS),
+    ("read_only", _APP_BRIDGE_READ_ONLY_METHODS),
+    ("control", _APP_BRIDGE_CONTROL_METHODS),
+)
+_classified_bridge_methods: set[str] = set()
+for _access, _names in _APP_BRIDGE_ACCESS_SETS:
+    if _classified_bridge_methods.intersection(_names):
+        raise RuntimeError("AppBridge access classification overlaps")
+    _classified_bridge_methods.update(_names)
+    for _name in _names:
+        _method = getattr(AppBridge, _name, None)
+        if not callable(_method):
+            raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
+        if _access == "mutation" and not getattr(_method, "_mutation_operation", None):
+            raise RuntimeError(
+                f"AppBridge mutation callable lacks mutation guard: {_name}"
+            )
+        setattr(_method, "_bridge_access", _access)
+
+_public_bridge_methods = {
+    _name
+    for _name, _value in vars(AppBridge).items()
+    if not _name.startswith("_") and callable(_value)
+}
+if _public_bridge_methods != _classified_bridge_methods:
+    raise RuntimeError("AppBridge public-callable access classification is incomplete")
 
 
 # ---------------------------------------------------------------------------

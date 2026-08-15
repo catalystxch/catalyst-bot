@@ -379,8 +379,34 @@ def api_shutdown():
     def _do_shutdown():
         """Run shutdown sequence in background thread so the HTTP response returns first."""
         time.sleep(0.5)  # Let the response reach the browser
+        cancel_permit = None
+        perform_cancel = cancel_first
+        if perform_cancel:
+            try:
+                cancel_permit = api_server.mutation_gate.enter_mutation(
+                    "api:bot.api_shutdown.background_cancel"
+                )
+            except api_server.mutation_gate.MutationBlocked:
+                perform_cancel = False
 
         print("\n🛑 SHUTDOWN sequence starting...", flush=True)
+
+        # Stop offer creation/repost loops before wallet-wide cancellation.
+        # Central cleanup repeats this stop and proves it before lease release.
+        if bot is not None:
+            try:
+                bot.stop(wait=True)
+            except Exception:
+                perform_cancel = False
+            if perform_cancel:
+                for producer in api_server._shutdown_thread_refs(bot):
+                    try:
+                        if producer.is_alive():
+                            perform_cancel = False
+                            break
+                    except Exception:
+                        perform_cancel = False
+                        break
 
         # 0. Kill coin prep subprocess if it's still running
         try:
@@ -406,14 +432,8 @@ def api_shutdown():
         except Exception as e:
             print(f"   ⚠️ Coin prep cleanup: {e}", flush=True)
 
-        # 1. Stop the bot loop
-        if bot and bot.is_running():
-            print("   Stopping bot loop...", flush=True)
-            bot.stop()
-            print("   ✅ Bot loop stopped", flush=True)
-
         # 2. Cancel all offers if requested
-        if cancel_first and bot and bot.offer_manager:
+        if perform_cancel and bot and bot.offer_manager:
             print("   Cancelling all offers...", flush=True)
             try:
                 result = bot.offer_manager.cancel_all()
@@ -469,6 +489,9 @@ def api_shutdown():
             except Exception as e:
                 print(f"   ⚠️ Cancel settle wait failed: {e}", flush=True)
 
+        if cancel_permit is not None:
+            api_server.mutation_gate.exit_mutation(cancel_permit)
+
         # 3. Stop Splash node (in case bot.stop() didn't cover it)
         try:
             if bot and hasattr(bot, "splash_node") and bot.splash_node.is_running():
@@ -508,8 +531,8 @@ def api_shutdown():
         print("   Shutting down server...", flush=True)
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
-        # 5. Release mutation ownership, then kill the process.
-        api_server.release_mutation_runtime()
+        # 5. Release ownership only after every producer is proven quiescent.
+        api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()

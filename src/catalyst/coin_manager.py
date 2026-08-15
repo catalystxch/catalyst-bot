@@ -10548,7 +10548,7 @@ class CoinManager:
                     f"Could not terminate previous coin prep worker (PID {self._prep_process.pid}): {e}",
                 )
             self._prep_process = None
-            if self._prep_delegation is not None:
+            if getattr(self, "_prep_delegation", None) is not None:
                 _revoke_coin_prep_worker_delegation(self._prep_delegation)
                 self._prep_delegation = None
             with self._lock:
@@ -10825,7 +10825,7 @@ class CoinManager:
             return True
 
         except Exception as e:
-            if self._prep_delegation is not None:
+            if getattr(self, "_prep_delegation", None) is not None:
                 _revoke_coin_prep_worker_delegation(self._prep_delegation)
                 self._prep_delegation = None
             with self._lock:
@@ -10890,7 +10890,7 @@ class CoinManager:
             with self._lock:
                 self._prep_running = False
             self._prep_process = None
-            if self._prep_delegation is not None:
+            if getattr(self, "_prep_delegation", None) is not None:
                 _revoke_coin_prep_worker_delegation(self._prep_delegation)
                 self._prep_delegation = None
             return {"running": False, "exit_code": -1, "killed_for_runtime": True}
@@ -10900,7 +10900,7 @@ class CoinManager:
         if poll is not None:
             with self._lock:
                 self._prep_running = False
-            if self._prep_delegation is not None:
+            if getattr(self, "_prep_delegation", None) is not None:
                 _revoke_coin_prep_worker_delegation(self._prep_delegation)
                 self._prep_delegation = None
 

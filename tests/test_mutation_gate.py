@@ -14,6 +14,9 @@ import socket
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 from pathlib import Path
@@ -99,6 +102,21 @@ def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
         reason_code=None if not blocks else "CREATE_UNKNOWN",
         blocks_mutation=blocks,
         created_at=NOW,
+    )
+
+
+def _active_delegation_row(handoff, environment, now):
+    return database.get_valid_worker_delegation(
+        delegation_id=handoff.delegation_id,
+        delegation_token_hash=hashlib.sha256(
+            environment[mutation_gate.DELEGATION_TOKEN_ENV].encode("utf-8")
+        ).hexdigest(),
+        parent_run_id=handoff.parent_run_id,
+        operation_id=handoff.operation_id,
+        purpose=handoff.purpose,
+        wallet_fingerprint_hash=handoff.wallet_fingerprint_hash,
+        network=handoff.network,
+        now=now,
     )
 
 
@@ -349,6 +367,89 @@ def test_expired_lease_is_not_stolen_while_prior_pid_is_alive(
     assert result["reason"] == "prior_owner_alive"
 
 
+@pytest.mark.parametrize(
+    ("prior_host", "contender_host"),
+    [
+        ("catalyst-host", "catalyst-host.example.test"),
+        ("catalyst-host.example.test", "catalyst-host"),
+    ],
+)
+def test_short_and_fqdn_local_aliases_delegate_takeover_to_pid_liveness(
+    isolated_gate_database,
+    prior_host: str,
+    contender_host: str,
+):
+    _path, clock = isolated_gate_database
+    first = _gate(clock, run_id="run-a", pid=111, host=prior_host)
+    assert first.acquire()["acquired"] is True
+    clock.advance(31)
+    probes = []
+    contender = _gate(
+        clock,
+        run_id="run-b",
+        pid=222,
+        host=contender_host,
+        pid_liveness=lambda pid, host: probes.append((pid, host)) or False,
+    )
+
+    result = contender.acquire()
+
+    assert result["acquired"] is True
+    assert probes == [(111, prior_host)]
+
+
+@pytest.mark.parametrize("owner_host", ["catalyst-host", "catalyst-host.example.test"])
+def test_default_pid_liveness_recognizes_local_short_and_fqdn_aliases(
+    monkeypatch,
+    owner_host: str,
+):
+    monkeypatch.setattr(socket, "gethostname", lambda: "catalyst-host")
+    monkeypatch.setattr(socket, "getfqdn", lambda: "catalyst-host.example.test")
+
+    def missing(_pid, _signal):
+        raise ProcessLookupError
+
+    if os.name != "nt":
+        monkeypatch.setattr(os, "kill", missing)
+        assert mutation_gate.pid_liveness(919191, owner_host) is False
+    else:
+        assert owner_host.casefold() in {
+            socket.gethostname().casefold(),
+            socket.getfqdn().casefold(),
+        }
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    ["_stability_connection", "_stability_read_only_connection"],
+)
+def test_stability_connection_factory_closes_handle_when_setup_pragma_fails(
+    monkeypatch,
+    factory_name: str,
+):
+    class BrokenConnection:
+        row_factory = None
+
+        def __init__(self):
+            self.closed = False
+
+        def execute(self, _statement):
+            raise sqlite3.OperationalError("pragma setup failed")
+
+        def close(self):
+            self.closed = True
+
+    connection = BrokenConnection()
+    monkeypatch.setattr(
+        database.sqlite3, "connect", lambda *_args, **_kwargs: connection
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        getattr(database, factory_name)()
+
+    assert connection.closed is True
+
+
 @pytest.mark.parametrize("liveness", [None, True])
 def test_remote_or_unknown_pid_state_never_proves_owner_dead(
     isolated_gate_database, liveness
@@ -368,7 +469,9 @@ def test_remote_or_unknown_pid_state_never_proves_owner_dead(
     result = contender.acquire()
 
     assert result["acquired"] is False
-    assert result["reason"] == "prior_owner_liveness_unproven"
+    assert result["reason"] == (
+        "prior_owner_alive" if liveness is True else "prior_owner_liveness_unproven"
+    )
 
 
 def test_dead_owner_takeover_requires_no_unresolved_journal_or_latch_work(
@@ -485,12 +588,21 @@ def test_concurrent_require_observes_process_fence_after_release(
     thread = threading.Thread(target=require)
     thread.start()
     assert lease_read.wait(timeout=5)
-    assert gate.release_lease()["released"] is True
+    releases = []
+    release_thread = threading.Thread(
+        target=lambda: releases.append(gate.release_lease())
+    )
+    release_thread.start()
+    release_thread.join(timeout=0.05)
+    assert release_thread.is_alive()
     continue_read.set()
     thread.join(timeout=5)
+    release_thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert outcomes == ["LEASE_LOST"]
+    assert not release_thread.is_alive()
+    assert outcomes == ["allowed"]
+    assert releases[0]["released"] is True
 
 
 def test_database_write_lock_during_heartbeat_fails_closed(
@@ -637,7 +749,8 @@ def test_delegation_expires_revokes_and_parent_lease_loss_invalidates_child(
     third_env = third.to_environment()
     assert gate.release_lease()["released"] is True
     assert (
-        gate.validate_worker_environment(third_env)["reason"] == "parent_lease_invalid"
+        gate.validate_worker_environment(third_env)["reason"]
+        == "worker_delegation_invalid"
     )
 
 
@@ -661,7 +774,9 @@ def test_parent_heartbeat_keeps_delegation_valid_but_new_lease_epoch_does_not(
     clock.advance(31)
     replacement = _gate(clock, run_id="run-next", pid=222)
     assert replacement.acquire()["acquired"] is True
-    assert parent.validate_worker_environment(env)["reason"] == "parent_lease_invalid"
+    assert (
+        parent.validate_worker_environment(env)["reason"] == "worker_delegation_invalid"
+    )
 
 
 def test_os_pid_liveness_is_fail_closed_for_remote_host_and_current_process():
@@ -764,7 +879,9 @@ def test_release_and_reacquire_same_run_invalidates_prior_delegation_epoch(
     clock.advance(1)
     assert parent.acquire()["acquired"] is True
 
-    assert parent.validate_worker_environment(env)["reason"] == "parent_lease_invalid"
+    assert (
+        parent.validate_worker_environment(env)["reason"] == "worker_delegation_invalid"
+    )
 
 
 def test_api_write_route_classification_is_exhaustive_and_explicit(monkeypatch):
@@ -992,6 +1109,105 @@ def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
     assert calls == []
 
 
+def test_every_existing_public_appbridge_callable_has_auditable_access_classification():
+    import app_bridge
+
+    public = {
+        name
+        for name, value in vars(app_bridge.AppBridge).items()
+        if not name.startswith("_") and callable(value)
+    }
+    classified = (
+        app_bridge._APP_BRIDGE_MUTATION_METHODS
+        | app_bridge._APP_BRIDGE_READ_ONLY_METHODS
+        | app_bridge._APP_BRIDGE_CONTROL_METHODS
+    )
+
+    assert public == classified
+    assert not (
+        app_bridge._APP_BRIDGE_MUTATION_METHODS
+        & app_bridge._APP_BRIDGE_READ_ONLY_METHODS
+    )
+    assert all(
+        getattr(getattr(app_bridge.AppBridge, name), "_bridge_access", None)
+        in {"mutation", "read_only", "control"}
+        for name in public
+    )
+
+
+def test_future_unclassified_appbridge_callable_defaults_to_mutation_guard(
+    monkeypatch,
+):
+    import app_bridge
+
+    writes = []
+
+    def future_write(_self, hostile_payload=None):
+        writes.append(hostile_payload)
+        return {"success": True}
+
+    monkeypatch.setattr(
+        app_bridge.AppBridge, "future_write", future_write, raising=False
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    bridge = app_bridge.AppBridge()
+    bridge._api = SimpleNamespace(
+        _ensure_mutation_runtime=lambda: None,
+        mutation_gate=mutation_gate,
+    )
+
+    result = bridge.future_write({"write": True})
+
+    assert result == {
+        "success": False,
+        "error": "mutation_gate_blocked",
+        "reason": "LEASE_OWNED_BY_OTHER",
+        "operation": "app_bridge:future_write",
+    }
+    assert writes == []
+
+
+def test_future_mutation_marker_without_guard_cannot_bypass_default_deny(
+    monkeypatch,
+):
+    import app_bridge
+
+    writes = []
+
+    def future_write(_self):
+        writes.append("wrote")
+        return {"success": True}
+
+    future_write._bridge_access = "mutation"
+    monkeypatch.setattr(
+        app_bridge.AppBridge, "future_marked_write", future_write, raising=False
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    bridge = app_bridge.AppBridge()
+    bridge._api = SimpleNamespace(
+        _ensure_mutation_runtime=lambda: None,
+        mutation_gate=mutation_gate,
+    )
+
+    result = bridge.future_marked_write()
+
+    assert result["success"] is False
+    assert result["reason"] == "LEASE_OWNED_BY_OTHER"
+    assert writes == []
+
+
 def test_parent_launcher_uses_environment_only_and_revokes_on_request(
     isolated_gate_database,
 ):
@@ -1172,6 +1388,348 @@ def test_terminal_process_fence_cannot_be_cleared_by_resolving_an_idle_latch(
 
     assert gate.heartbeat()["heartbeat"] is False
     assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
+def test_observed_lease_expiry_is_an_irreversible_runtime_fence(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="expiry-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+
+    clock.advance(31)
+    assert gate.status().reason_code == "LEASE_EXPIRED"
+    clock.advance(-31)
+
+    assert gate.status().reason_code == "LEASE_EXPIRED"
+    assert gate.release_resolved(0, [])["reason"] == "terminal_process_fence"
+    promoted = mutation_gate.initialize(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        run_id=gate.run_id,
+        owner_pid=gate.owner_pid,
+        owner_host=gate.owner_host,
+        lease_seconds=gate.lease_seconds,
+        start_heartbeat=False,
+        acquire_lease=True,
+    )
+    assert promoted is gate
+    assert promoted.status().reason_code == "LEASE_EXPIRED"
+
+
+def test_observed_lease_version_loss_is_an_irreversible_runtime_fence(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="lost-owner")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    heartbeat_at = clock() + timedelta(seconds=1)
+    external = database.heartbeat_runtime_mutation_lease(
+        owner_run_id=gate.run_id,
+        expected_lease_version=acquired["lease"]["lease_version"],
+        heartbeat_at=heartbeat_at,
+        lease_expires_at=heartbeat_at + timedelta(seconds=30),
+    )
+    assert external["heartbeat"] is True
+
+    assert gate.status().reason_code == "LEASE_LOST"
+    gate._lease_version = external["lease"]["lease_version"]
+
+    assert gate.status().reason_code == "LEASE_LOST"
+    assert gate.release_resolved(0, [])["reason"] == "terminal_process_fence"
+
+
+@pytest.mark.parametrize("change", ["deactivated", "owner_replaced"])
+def test_observed_lease_owner_loss_is_an_irreversible_runtime_fence(
+    isolated_gate_database, change
+):
+    path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="owner-loss-runtime")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    original = database.get_runtime_mutation_lease()
+    with sqlite3.connect(path) as conn:
+        if change == "deactivated":
+            conn.execute(
+                "UPDATE runtime_mutation_lease SET active=0, lease_version=lease_version+1 "
+                "WHERE singleton_id=1"
+            )
+        else:
+            conn.execute(
+                "UPDATE runtime_mutation_lease SET owner_run_id='replacement-owner', "
+                "owner_pid=222, lease_version=lease_version+1 WHERE singleton_id=1"
+            )
+        conn.commit()
+
+    assert gate.status().reason_code == "LEASE_LOST"
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=?,active=?,owner_run_id=?,owner_pid=?
+            WHERE singleton_id=1
+            """,
+            (
+                original["lease_version"],
+                original["active"],
+                original["owner_run_id"],
+                original["owner_pid"],
+            ),
+        )
+        conn.commit()
+
+    assert gate.status().reason_code == "LEASE_LOST"
+
+
+def test_stop_callback_runs_without_holding_the_gate_lock(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="callback-lock-owner")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    callback_read_completed = []
+
+    def stop_handler(_reason):
+        reader = threading.Thread(target=gate.active_mutation_count)
+        reader.start()
+        reader.join(timeout=0.5)
+        callback_read_completed.append(not reader.is_alive())
+
+    gate.register_stop_handler(stop_handler)
+    heartbeat_at = clock() + timedelta(seconds=1)
+    external = database.heartbeat_runtime_mutation_lease(
+        owner_run_id=gate.run_id,
+        expected_lease_version=acquired["lease"]["lease_version"],
+        heartbeat_at=heartbeat_at,
+        lease_expires_at=heartbeat_at + timedelta(seconds=30),
+    )
+    assert external["heartbeat"] is True
+
+    assert gate.status().reason_code == "LEASE_LOST"
+    assert callback_read_completed == [True]
+
+
+def test_status_snapshot_and_heartbeat_version_update_are_serialized(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="status-heartbeat-owner")
+    assert gate.acquire()["acquired"] is True
+    original_snapshot = database.get_mutation_authorization_snapshot
+    snapshot_captured = threading.Event()
+    release_snapshot = threading.Event()
+    heartbeat_done = threading.Event()
+    status_result = {}
+    heartbeat_result = {}
+
+    def delayed_snapshot(**kwargs):
+        snapshot = original_snapshot(**kwargs)
+        if threading.current_thread().name == "status-race":
+            snapshot_captured.set()
+            assert release_snapshot.wait(timeout=3)
+        return snapshot
+
+    monkeypatch.setattr(
+        database, "get_mutation_authorization_snapshot", delayed_snapshot
+    )
+
+    status_thread = threading.Thread(
+        target=lambda: status_result.setdefault("status", gate.status()),
+        name="status-race",
+    )
+
+    def run_heartbeat():
+        heartbeat_result.update(gate.heartbeat())
+        heartbeat_done.set()
+
+    status_thread.start()
+    assert snapshot_captured.wait(timeout=3)
+    clock.advance(1)
+    heartbeat_thread = threading.Thread(target=run_heartbeat, name="heartbeat-race")
+    heartbeat_thread.start()
+    heartbeat_done.wait(timeout=1)
+    release_snapshot.set()
+    status_thread.join(timeout=3)
+    heartbeat_thread.join(timeout=3)
+
+    assert not status_thread.is_alive()
+    assert not heartbeat_thread.is_alive()
+    assert status_result["status"].allowed is True
+    assert heartbeat_result["heartbeat"] is True
+    assert gate.status().allowed is True
+
+
+def test_failed_post_insert_delegation_check_revokes_the_exact_child_scope(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="delegation-cleanup-owner")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    inserted = {}
+    original_issue = database.issue_worker_delegation
+
+    def insert_then_lose_lease(**kwargs):
+        row = original_issue(**kwargs)
+        inserted.update(row)
+        heartbeat_at = clock() + timedelta(seconds=1)
+        external = database.heartbeat_runtime_mutation_lease(
+            owner_run_id=gate.run_id,
+            expected_lease_version=acquired["lease"]["lease_version"],
+            heartbeat_at=heartbeat_at,
+            lease_expires_at=heartbeat_at + timedelta(seconds=30),
+        )
+        assert external["heartbeat"] is True
+        return row
+
+    monkeypatch.setattr(database, "issue_worker_delegation", insert_then_lose_lease)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        gate.issue_worker_delegation(
+            operation_id="coin-prep:post-insert-loss",
+            purpose="coin_prep",
+            worker_id="worker-post-insert-loss",
+            ttl_seconds=30,
+        )
+
+    assert exc_info.value.reason_code == "LEASE_LOST"
+    assert inserted
+    assert (
+        database.get_valid_worker_delegation(
+            delegation_id=inserted["delegation_id"],
+            delegation_token_hash=inserted["delegation_token_hash"],
+            parent_run_id=inserted["parent_run_id"],
+            operation_id=inserted["operation_id"],
+            purpose=inserted["purpose"],
+            wallet_fingerprint_hash=inserted["wallet_fingerprint_hash"],
+            network=inserted["network"],
+            now=clock(),
+        )
+        is None
+    )
+
+
+def test_frozen_clock_release_and_reacquire_cannot_revive_old_delegation(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="frozen-epoch-owner")
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:frozen-epoch",
+        purpose="coin_prep",
+        worker_id="worker-frozen-epoch",
+        ttl_seconds=30,
+    )
+    environment = handoff.to_environment()
+    assert gate.validate_worker_environment(environment)["allowed"] is True
+
+    assert gate.release_lease()["released"] is True
+    assert gate.acquire()["acquired"] is True
+
+    assert gate.validate_worker_environment(environment)["allowed"] is False
+    assert _active_delegation_row(handoff, environment, clock()) is None
+
+
+def test_lease_release_revokes_children_atomically_and_cas_failure_does_not(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="atomic-release-owner")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:atomic-release",
+        purpose="coin_prep",
+        worker_id="worker-atomic-release",
+        ttl_seconds=30,
+    )
+    environment = handoff.to_environment()
+    version = acquired["lease"]["lease_version"]
+
+    stale = database.release_runtime_mutation_lease(
+        owner_run_id=gate.run_id,
+        expected_lease_version=version + 1,
+        released_at=clock(),
+    )
+    assert stale["released"] is False
+    assert _active_delegation_row(handoff, environment, clock()) is not None
+
+    released = database.release_runtime_mutation_lease(
+        owner_run_id=gate.run_id,
+        expected_lease_version=version,
+        released_at=clock(),
+    )
+    assert released["released"] is True
+    assert _active_delegation_row(handoff, environment, clock()) is None
+
+
+def test_lease_release_rolls_back_when_child_revocation_fails(
+    isolated_gate_database,
+):
+    path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="release-rollback-owner")
+    acquired = gate.acquire()
+    assert acquired["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:release-rollback",
+        purpose="coin_prep",
+        worker_id="worker-release-rollback",
+        ttl_seconds=30,
+    )
+    environment = handoff.to_environment()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TRIGGER fail_parent_delegation_revoke
+            BEFORE UPDATE OF state ON runtime_worker_delegations
+            WHEN NEW.state='revoked'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced delegation revoke failure');
+            END
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced delegation revoke"):
+        database.release_runtime_mutation_lease(
+            owner_run_id=gate.run_id,
+            expected_lease_version=acquired["lease"]["lease_version"],
+            released_at=clock(),
+        )
+
+    lease = database.get_runtime_mutation_lease()
+    assert lease["active"] == 1
+    assert lease["lease_version"] == acquired["lease"]["lease_version"]
+    assert _active_delegation_row(handoff, environment, clock()) is not None
+
+
+def test_expired_dead_owner_takeover_revokes_crashed_parent_delegations(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    parent = _gate(clock, run_id="crashed-parent", pid=111)
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:crashed-parent",
+        purpose="coin_prep",
+        worker_id="worker-crashed-parent",
+        ttl_seconds=120,
+    )
+    environment = handoff.to_environment()
+    clock.advance(31)
+    takeover = _gate(clock, run_id="takeover-owner", pid=222)
+
+    assert takeover.acquire()["acquired"] is True
+    assert parent.validate_worker_environment(environment)["allowed"] is False
+    assert _active_delegation_row(handoff, environment, clock()) is None
 
 
 def test_terminal_fence_overrides_an_existing_latch_mirror(
@@ -1663,29 +2221,736 @@ def test_coin_prep_reset_rejects_a_live_worker(monkeypatch):
     assert manager._prep_running is True
 
 
-def test_desktop_cleanup_releases_lease_even_when_bot_stop_fails(monkeypatch):
+def test_desktop_cleanup_uses_central_quiescence_and_never_releases_directly(
+    monkeypatch,
+):
     import api_server
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
-
-    class Bot:
-        _running = True
-
-        def stop(self):
-            raise RuntimeError("stop failed")
-
-    released = []
-    monkeypatch.setattr(api_server, "bot", Bot())
+    calls = []
     monkeypatch.setattr(
         api_server,
         "release_mutation_runtime",
-        lambda: released.append(True) or {"released": True},
+        lambda: (_ for _ in ()).throw(
+            AssertionError("desktop cleanup cannot release ownership directly")
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "quiesce_and_release_mutation_runtime",
+        lambda: calls.append("central") or {"released": False},
+        raising=False,
     )
     monkeypatch.setattr(database, "log_event", lambda *_args, **_kwargs: None)
 
     desktop_app._cleanup()
 
-    assert released == [True]
+    assert calls == ["central"]
+
+
+def test_gui_shutdown_stops_bot_before_cancelling_wallet_offers(monkeypatch):
+    import api_server
+    from blueprints import bot as bot_blueprint
+
+    order = []
+    captured = {}
+
+    class DeferredThread:
+        def __init__(self, target, **_kwargs):
+            captured["target"] = target
+
+        def start(self):
+            return None
+
+    class OfferManager:
+        def cancel_all(self):
+            order.append("cancel")
+            return {}
+
+        def sync_from_wallet(self):
+            return [], [], {}
+
+    fake_bot = SimpleNamespace(
+        offer_manager=OfferManager(),
+        coin_manager=SimpleNamespace(_prep_running=False),
+        runtime_monitor=SimpleNamespace(stop=lambda: None),
+        splash_node=SimpleNamespace(is_running=lambda: False),
+        stop=lambda wait=True: order.append("stop"),
+    )
+    monkeypatch.setattr(api_server, "bot", fake_bot)
+    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
+    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
+    monkeypatch.setattr(
+        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
+    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
+    monkeypatch.setattr(
+        api_server,
+        "quiesce_and_release_mutation_runtime",
+        lambda **_kwargs: order.append("central") or {"released": True},
+    )
+    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
+    monkeypatch.setattr(database, "get_open_offers", lambda: [])
+    monkeypatch.setattr(database, "update_offer_status", lambda *_args: None)
+    monkeypatch.setattr(
+        database,
+        "get_connection",
+        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
+    )
+
+    with api_server.app.test_request_context(
+        "/api/shutdown", method="POST", json={"cancel_offers": True}
+    ):
+        response = bot_blueprint.api_shutdown()
+    assert response.get_json()["success"] is True
+    captured["target"]()
+
+    assert order.index("stop") < order.index("cancel") < order.index("central")
+
+
+def test_inflight_mutation_quiescence_blocks_new_work_and_lease_release(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="inflight-shutdown-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+    permit = gate.enter_mutation("test:inflight")
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=None,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutations_in_flight"
+    assert database.get_runtime_mutation_lease()["active"] == 1
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        gate.enter_mutation("test:new-after-quiesce")
+    assert exc_info.value.reason_code == "MUTATION_SHUTTING_DOWN"
+    assert gate.exit_mutation(permit) is True
+
+
+def test_shutdown_stop_exception_or_live_thread_keeps_lease_until_expiry(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="failed-stop-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class LiveThread:
+        name = "stuck-bot-thread"
+
+        def is_alive(self):
+            return True
+
+    class Bot:
+        _running = True
+        _thread = LiveThread()
+        coin_manager = None
+        runtime_monitor = None
+
+        def stop(self, wait=True):
+            raise RuntimeError("stop failed")
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=Bot(),
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert "stuck-bot-thread" in result["live_threads"]
+    assert database.get_runtime_mutation_lease()["active"] == 1
+    heartbeat = getattr(gate, "_heartbeat_thread", None)
+    assert heartbeat is None or not heartbeat.is_alive()
+
+
+def test_shutdown_unknown_thread_liveness_fails_closed_and_stops_heartbeat(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="unknown-thread-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class UnknownThread:
+        name = "unknown-bot-thread"
+
+        def is_alive(self):
+            raise RuntimeError("liveness unavailable")
+
+    bot = SimpleNamespace(
+        _thread=UnknownThread(),
+        coin_manager=None,
+        runtime_monitor=None,
+        amm_monitor=None,
+        stop=lambda wait=True: True,
+    )
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["unverified_threads"] == ["unknown-bot-thread"]
+    assert database.get_runtime_mutation_lease()["active"] == 1
+    heartbeat = getattr(gate, "_heartbeat_thread", None)
+    assert heartbeat is None or not heartbeat.is_alive()
+
+
+def test_shutdown_tracks_every_background_wallet_mutation_producer(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="background-producer-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class LiveThread:
+        def __init__(self, name):
+            self.name = name
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    cancel_all = LiveThread("cancel-all-bg")
+    boost = LiveThread("boost-activate-bg")
+    ladder = LiveThread("create-buy")
+    graceful = LiveThread("graceful-cancel")
+    monkeypatch.setattr(api_server, "_cancel_all_thread", cancel_all, raising=False)
+    monkeypatch.setattr(api_server, "_boost_activation_thread", boost, raising=False)
+    bot = SimpleNamespace(
+        coin_manager=None,
+        runtime_monitor=None,
+        amm_monitor=None,
+        _ladder_threads=[ladder],
+        _graceful_cancel_thread=graceful,
+        stop=lambda wait=True: True,
+    )
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert set(result["live_threads"]) == {
+        "boost-activate-bg",
+        "cancel-all-bg",
+        "create-buy",
+        "graceful-cancel",
+    }
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_tracks_sniper_and_shape_fix_workers(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="nested-producer-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class LiveThread:
+        def __init__(self, name):
+            self.name = name
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    sniper = LiveThread("probe-sell")
+    shape_fix = LiveThread("shape_fix_buy")
+    aborts = []
+    orchestrator = SimpleNamespace(
+        _threads={"buy": shape_fix},
+        abort_flow=lambda side: aborts.append(side) or side == "buy",
+    )
+    bot = SimpleNamespace(
+        coin_manager=None,
+        runtime_monitor=None,
+        amm_monitor=None,
+        shape_fix_orchestrator=orchestrator,
+        _sniper_threads=[sniper],
+        stop=lambda wait=True: True,
+    )
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert set(result["live_threads"]) == {"probe-sell", "shape_fix_buy"}
+    assert aborts == ["buy", "sell"]
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_snapshots_shape_fix_threads_under_owner_lock():
+    import api_server
+
+    class TrackingLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.held = False
+
+    lock = TrackingLock()
+
+    class GuardedThreads(dict):
+        def values(self):
+            assert lock.held, "worker inventory must hold the owner's lock"
+            return super().values()
+
+    worker = SimpleNamespace(is_alive=lambda: True)
+    orchestrator = SimpleNamespace(
+        _lock=lock,
+        _threads=GuardedThreads(buy=worker),
+    )
+    bot = SimpleNamespace(
+        coin_manager=None,
+        runtime_monitor=None,
+        amm_monitor=None,
+        shape_fix_orchestrator=orchestrator,
+    )
+
+    assert worker in api_server._shutdown_thread_refs(bot)
+
+
+def test_process_exit_hook_cannot_release_after_quiescence_proof_failed(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="failed-exit-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class LiveThread:
+        name = "still-mutating"
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    bot = SimpleNamespace(
+        _thread=LiveThread(),
+        coin_manager=None,
+        runtime_monitor=None,
+        amm_monitor=None,
+        stop=lambda wait=True: True,
+    )
+    failed = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+    assert failed["released"] is False
+
+    exit_result = mutation_gate.shutdown_runtime()
+
+    assert exit_result["released"] is False
+    assert exit_result["reason"] == "lease_retained"
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_async_route_worker_cannot_start_after_shutdown_quiesces(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="route-shutdown-race-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+    parent_permit = gate.enter_mutation("api:test:parent")
+    shutdown_result = {}
+    shutdown_done = threading.Event()
+
+    def shutdown():
+        shutdown_result.update(
+            api_server.quiesce_and_release_mutation_runtime(
+                bot_instance=None,
+                wait_seconds=1,
+            )
+        )
+        shutdown_done.set()
+
+    shutdown_thread = threading.Thread(target=shutdown)
+    shutdown_thread.start()
+    deadline = time.monotonic() + 1
+    while not gate._quiescing and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate._quiescing is True
+    wallet_calls = []
+
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        api_server.start_mutation_thread(
+            operation="api:test:async",
+            target=lambda: wallet_calls.append("wallet"),
+            name="test-async-wallet",
+        )
+    assert exc_info.value.reason_code == "MUTATION_SHUTTING_DOWN"
+    assert wallet_calls == []
+
+    assert gate.exit_mutation(parent_permit) is True
+    shutdown_thread.join(timeout=2)
+    assert shutdown_done.is_set()
+    assert shutdown_result["released"] is True
+
+
+def test_shutdown_recaptures_thread_refs_after_request_permits_drain(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="late-publication-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+    parent_permit = gate.enter_mutation("api:coin-prep:request")
+    result = {}
+
+    def shutdown():
+        result.update(
+            api_server.quiesce_and_release_mutation_runtime(
+                bot_instance=None,
+                wait_seconds=1,
+            )
+        )
+
+    shutdown_thread = threading.Thread(target=shutdown)
+    shutdown_thread.start()
+    deadline = time.monotonic() + 1
+    while not gate._quiescing and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate._quiescing is True
+
+    class LateWorker:
+        name = "late-coin-prep"
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(api_server, "_coin_prep_thread", LateWorker())
+    assert gate.exit_mutation(parent_permit) is True
+    shutdown_thread.join(timeout=2)
+
+    assert not shutdown_thread.is_alive()
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["live_threads"] == ["late-coin-prep"]
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_recaptures_child_handles_after_request_permits_drain(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="late-child-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+    parent_permit = gate.enter_mutation("api:coin-prep:late-child-request")
+    result = {}
+
+    def shutdown():
+        result.update(
+            api_server.quiesce_and_release_mutation_runtime(
+                bot_instance=None,
+                wait_seconds=1,
+            )
+        )
+
+    shutdown_thread = threading.Thread(target=shutdown)
+    shutdown_thread.start()
+    deadline = time.monotonic() + 1
+    while not gate._quiescing and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate._quiescing is True
+
+    class LateChild:
+        pid = 9200
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise RuntimeError("still starting")
+
+        def kill(self):
+            raise RuntimeError("still starting")
+
+    late_child = LateChild()
+    monkeypatch.setattr(api_server, "_coin_prep_proc", late_child)
+    assert gate.exit_mutation(parent_permit) is True
+    shutdown_thread.join(timeout=2)
+
+    assert not shutdown_thread.is_alive()
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["live_child_pids"] == [9200]
+    assert api_server._coin_prep_proc is late_child
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_unverified_child_without_pid_retains_lease(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="unknown-child-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class UnknownChild:
+        pid = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise RuntimeError("terminate unavailable")
+
+        def kill(self):
+            raise RuntimeError("kill unavailable")
+
+    child = UnknownChild()
+    manager = SimpleNamespace(
+        _prep_process=child,
+        _prep_delegation=None,
+        _prep_running=False,
+        _topup_running=False,
+    )
+    bot = SimpleNamespace(
+        coin_manager=manager,
+        runtime_monitor=None,
+        amm_monitor=None,
+        stop=lambda wait=True: True,
+    )
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["live_child_pids"] == []
+    assert manager._prep_process is child
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_child_kill_failure_retains_handles_and_lease(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="failed-child-stop-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class UnkillableProcess:
+        pid = 9001
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise RuntimeError("terminate failed")
+
+        def kill(self):
+            raise RuntimeError("kill failed")
+
+    process = UnkillableProcess()
+    delegation = object()
+    manager = SimpleNamespace(
+        _prep_process=process,
+        _prep_delegation=delegation,
+        _prep_running=True,
+        _topup_thread=None,
+    )
+    bot = SimpleNamespace(
+        _running=False,
+        coin_manager=manager,
+        runtime_monitor=None,
+        stop=lambda wait=True: False,
+    )
+    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=bot,
+        wait_seconds=0,
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["live_child_pids"] == [9001]
+    assert manager._prep_process is process
+    assert manager._prep_delegation is delegation
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_safe_shutdown_stops_both_children_revokes_scope_then_releases(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="safe-shutdown-owner")
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:safe-shutdown",
+        purpose="coin_prep",
+        worker_id="worker-safe-shutdown",
+        ttl_seconds=30,
+    )
+    environment = handoff.to_environment()
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    import api_server
+
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.alive = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.alive = False
+
+    class BotThread:
+        name = "bot-main"
+
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+    manager_process = Process(9101)
+    blueprint_process = Process(9102)
+    bot_thread = BotThread()
+    manager = SimpleNamespace(
+        _prep_process=manager_process,
+        _prep_delegation=handoff,
+        _prep_running=True,
+        _topup_thread=None,
+    )
+
+    class Bot:
+        _running = True
+        _thread = bot_thread
+        coin_manager = manager
+        runtime_monitor = None
+
+        def stop(self, wait=True):
+            self._running = False
+            bot_thread.alive = False
+            return True
+
+    monkeypatch.setattr(api_server, "_coin_prep_proc", blueprint_process)
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=Bot(),
+        wait_seconds=0,
+    )
+
+    assert result["released"] is True
+    assert database.get_runtime_mutation_lease()["active"] == 0
+    assert manager_process.poll() == 0
+    assert blueprint_process.poll() == 0
+    assert manager._prep_process is None
+    assert manager._prep_delegation is None
+    assert api_server._coin_prep_proc is None
+    assert _active_delegation_row(handoff, environment, clock()) is None
 
 
 def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
@@ -1711,55 +2976,322 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     assert started == [desktop_app.FLASK_PORT + 7]
 
 
+def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
+    monkeypatch,
+):
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: True
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_acquire_instance_lock",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("foreign owner path must not open the lock file")
+        ),
+    )
+    monkeypatch.setattr(desktop_app, "_open_existing_instance_in_browser", lambda: None)
+    monkeypatch.setattr(
+        desktop_app,
+        "_find_available_diagnostics_port",
+        lambda preferred: preferred + 9,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_mode",
+        lambda port: calls.append(port),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert calls == [desktop_app.FLASK_PORT + 9]
+
+
+def test_desktop_instance_lock_path_is_stdlib_only_before_ownership(
+    tmp_path: Path, monkeypatch
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    data_dir = tmp_path / "lock-race"
+    monkeypatch.setenv("CMM_DATA_DIR", str(data_dir))
+    imported = []
+    real_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] == "user_paths":
+            imported.append(name)
+            raise AssertionError("lock preflight cannot import user_paths")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+
+    path = desktop_app._instance_lock_path()
+
+    assert imported == []
+    assert Path(path) == data_dir / ".instance.lock"
+    assert not data_dir.exists()
+
+
+def test_pythonw_import_before_ownership_creates_no_shared_files(tmp_path: Path):
+    data_dir = tmp_path / "pythonw-preflight"
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).parents[1] / "src" / "catalyst"),
+            str(Path(__file__).parents[1]),
+        ]
+    )
+    command = (
+        "import sys;"
+        "sys.executable='pythonw.exe';"
+        "sys.stdout=None;sys.stderr=None;"
+        "import desktop_app"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert not data_dir.exists()
+
+
+def test_diagnostics_preflight_fails_closed_if_checkpoint_races_snapshot_copy(
+    isolated_gate_database, monkeypatch
+):
+    path, clock = isolated_gate_database
+    import read_only_diagnostics
+
+    database.close_connection()
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="checkpoint-race-owner",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_expires_at=clock() + timedelta(minutes=5),
+        now=clock(),
+        expected_lease_version=0,
+    )
+    assert acquired["acquired"] is True
+    real_copy = read_only_diagnostics.shutil.copyfile
+    checkpointed = []
+
+    def copy_then_checkpoint(source, destination, *args, **kwargs):
+        result = real_copy(source, destination, *args, **kwargs)
+        if Path(source) == path and not checkpointed:
+            checkpointed.append(True)
+            database.close_connection()
+            with sqlite3.connect(path) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return result
+
+    monkeypatch.setattr(read_only_diagnostics.shutil, "copyfile", copy_then_checkpoint)
+
+    assert read_only_diagnostics.preflight_requires_diagnostics(path) is True
+    assert checkpointed == [True]
+
+
+def test_diagnostics_preflight_allows_valid_legacy_database_migration(tmp_path: Path):
+    import read_only_diagnostics
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO settings(key,value) VALUES ('NETWORK','mainnet')")
+        conn.commit()
+
+    assert read_only_diagnostics.preflight_requires_diagnostics(path) is False
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "offer_intents",
+        "offer_operation_journal",
+        "publication_outbox",
+        "runtime_mutation_lease",
+        "runtime_safety_latch",
+        "runtime_worker_delegations",
+    ],
+)
+def test_diagnostics_preflight_rejects_every_partial_stability_schema(
+    tmp_path: Path, table_name: str
+):
+    import read_only_diagnostics
+
+    path = tmp_path / f"partial-{table_name}.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(f'CREATE TABLE "{table_name}" (id INTEGER)')
+        conn.commit()
+
+    assert read_only_diagnostics.preflight_requires_diagnostics(path) is True
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _wait_for_diagnostics_status(process, port: int) -> dict:
+    deadline = time.monotonic() + 10
+    url = f"http://127.0.0.1:{port}/api/safety/status"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(
+                f"diagnostics process exited early: {process.communicate()[1]}"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=0.25) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError("diagnostics server did not become ready")
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_spawned_desktop_diagnostics_is_import_and_filesystem_side_effect_free(
+    tmp_path: Path,
+    corrupt: bool,
+):
+    data_dir = tmp_path / ("corrupt" if corrupt else "missing")
+    data_dir.mkdir()
+    database_path = data_dir / "bot.db"
+    if corrupt:
+        database_path.write_bytes(b"not-a-sqlite-database")
+    expected_files = {
+        item.name: item.read_bytes() for item in data_dir.iterdir() if item.is_file()
+    }
+    port = _free_loopback_port()
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).parents[1] / "src" / "catalyst"),
+            str(Path(__file__).parents[1]),
+        ]
+    )
+    command = (
+        "import builtins,desktop_app;"
+        "real=builtins.__import__;"
+        "blocked={'api_server','config','user_paths','super_log'};"
+        "builtins.__import__=lambda name,*a,**k: "
+        "(_ for _ in ()).throw(AssertionError(name)) "
+        "if name.split('.')[0] in blocked else real(name,*a,**k);"
+        f"desktop_app.run_read_only_diagnostics_mode({port})"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        payload = _wait_for_diagnostics_status(process, port)
+        assert payload["safety"]["allowed"] is False
+        assert payload["safety"]["reason_code"] == "DURABLE_STATE_UNAVAILABLE"
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    actual_files = {
+        item.name: item.read_bytes() for item in data_dir.iterdir() if item.is_file()
+    }
+    assert actual_files == expected_files
+
+
+def test_free_port_standalone_process_defers_to_existing_durable_owner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_dir = tmp_path / "standalone-foreign-owner"
+    data_dir.mkdir()
+    child_database = data_dir / "bot.db"
+    database.close_connection()
+    monkeypatch.setattr(database, "DB_PATH", str(child_database))
+    monkeypatch.setattr(database, "_db_initialized_path", "")
+    database.init_database()
+    now = datetime.now(timezone.utc)
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="already-running-owner",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_expires_at=now + timedelta(minutes=10),
+        now=now,
+        expected_lease_version=0,
+    )
+    assert acquired["acquired"] is True
+    database.close_connection()
+    before_names = {item.name for item in data_dir.iterdir()}
+    before_database = child_database.read_bytes()
+
+    port = _free_loopback_port()
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["CATALYST_FLASK_PORT"] = str(port)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).parents[1] / "src" / "catalyst"),
+            str(Path(__file__).parents[1]),
+        ]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "src" / "catalyst" / "api_server.py"),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        payload = _wait_for_diagnostics_status(process, port)
+        assert payload["safety"]["allowed"] is False
+        assert payload["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=1)
+        assert error.value.code == 423
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    assert {item.name for item in data_dir.iterdir()} == before_names
+    assert child_database.read_bytes() == before_database
+
+
 def test_diagnostics_server_never_constructs_bot_or_acquires_lease(monkeypatch):
-    import api_server
+    import read_only_diagnostics
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
     calls = []
     monkeypatch.setattr(
-        database,
-        "init_database",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("diagnostics cannot initialize or migrate the database")
-        ),
-    )
-    monkeypatch.setattr(
-        api_server,
-        "init_database",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("diagnostics cannot initialize or migrate the database")
-        ),
-    )
-    monkeypatch.setattr(
-        api_server,
-        "initialize_mutation_runtime",
-        lambda **kwargs: calls.append(("initialize", kwargs)) or {},
-    )
-    monkeypatch.setattr(
-        api_server,
-        "create_bot",
-        lambda: (_ for _ in ()).throw(AssertionError("diagnostics cannot create bot")),
-    )
-    monkeypatch.setattr(
-        api_server.app,
-        "run",
-        lambda **kwargs: calls.append(("run", kwargs)),
+        read_only_diagnostics,
+        "serve",
+        lambda port: calls.append(("minimal-serve", port)),
     )
 
     desktop_app.run_read_only_diagnostics_mode(5017)
 
-    assert ("initialize", {"start_heartbeat": False, "acquire_lease": False}) in calls
-    assert (
-        "run",
-        {
-            "host": "127.0.0.1",
-            "port": 5017,
-            "debug": False,
-            "threaded": True,
-            "use_reloader": False,
-        },
-    ) in calls
+    assert calls == [("minimal-serve", 5017)]
 
 
 def test_standalone_diagnostics_server_is_database_read_only(monkeypatch):

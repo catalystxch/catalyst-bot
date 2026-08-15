@@ -258,8 +258,21 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._coin_prep_proc = None  # no stale process
+        self._gate_patchers = [
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate,
+                "enter_mutation",
+                return_value="coin-prep-crash-unit-permit",
+            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+        ]
+        for patcher in self._gate_patchers:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self._gate_patchers):
+            patcher.stop()
         api_server._rate_limit_log.clear()
         api_server._coin_prep_state["running"] = False
         api_server._coin_prep_state["complete"] = False

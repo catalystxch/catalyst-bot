@@ -550,6 +550,8 @@ class BotLoop:
         self._state_lock = threading.Lock()
         self._probe_lock = threading.Lock()  # Protects _probe_state multi-key updates
         self._ladder_threads: list = []  # Track active ladder-creation threads
+        self._sniper_threads: list = []
+        self._graceful_cancel_thread = None
 
         # ---- Event bus (set by api_server after creation) ----
         self._event_bus = None
@@ -9729,8 +9731,13 @@ class BotLoop:
                         target=_fire_probe, args=("sell", sell_price)
                     )
                     buy_thread = threading.Thread(
-                        target=_fire_probe, args=("buy", buy_price)
+                        target=_fire_probe, args=("buy", buy_price), name="probe-buy"
                     )
+                    sell_thread.name = "probe-sell"
+                    self._sniper_threads = [
+                        thread for thread in self._sniper_threads if thread.is_alive()
+                    ]
+                    self._sniper_threads.extend((sell_thread, buy_thread))
                     sell_thread.start()
                     buy_thread.start()
                     sell_thread.join(timeout=30)
@@ -15795,6 +15802,7 @@ class BotLoop:
                     name="graceful-cancel",
                     daemon=True,
                 )
+                self._graceful_cancel_thread = cancel_thread
                 cancel_thread.start()
                 log_event(
                     "info",

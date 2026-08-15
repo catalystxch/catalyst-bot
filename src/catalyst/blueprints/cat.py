@@ -16,7 +16,6 @@ Helpers `_normalize_asset_id` and `_get_dexie_pairs` live here since
 
 from __future__ import annotations
 
-import threading
 from decimal import Decimal
 from typing import Dict
 
@@ -635,9 +634,23 @@ def api_cat_select():
             finally:
                 api_server.sync_active_cat_wallet_id(selected_wallet_id, asset_id)
 
-        threading.Thread(
-            target=_resolve_new_cat_tibet, daemon=True, name="cat-tibet-resolve"
-        ).start()
+        try:
+            api_server.start_mutation_thread(
+                operation="api:cat:tibet_resolve_worker",
+                target=_resolve_new_cat_tibet,
+                name="cat-tibet-resolve",
+            )
+        except api_server.mutation_gate.MutationBlocked as exc:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": exc.reason_code,
+                    }
+                ),
+                423,
+            )
 
     # Notify the Sage wallet adapter so _get_cat_asset_id() returns the new
     # asset ID immediately — without waiting for .env to be re-read.
