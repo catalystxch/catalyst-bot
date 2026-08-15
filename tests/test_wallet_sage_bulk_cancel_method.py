@@ -67,6 +67,7 @@ def _ensure_stubs():
 _ensure_stubs()
 
 import wallet_sage  # noqa: E402
+from cancel_outcomes import CANCEL_UNKNOWN, normalize_cancel_response  # noqa: E402
 from offer_manager import CANCEL_PENDING_METHODS  # noqa: E402
 
 
@@ -100,6 +101,34 @@ class BulkCancelMethodTagTests(unittest.TestCase):
                 f"Method '{method}' must be in CANCEL_PENDING_METHODS so "
                 f"offer_manager keeps DB status=open until on-chain confirm",
             )
+
+    def test_legacy_bulk_ack_is_not_a_canonical_success_without_identity(self):
+        """Task 2 keeps the old adapter response isolated until Task 8 wiring.
+
+        The bulk RPC's boolean acknowledgement lacks a transaction id or exact
+        spend identity, so the pure normalizer must preserve the uncertainty.
+        """
+        trade_ids = ["aaaa", "bbbb"]
+
+        with (
+            patch.object(wallet_sage, "_cancel_offers_bulk_proper", return_value=True),
+            patch.object(wallet_sage, "get_spendable_coin_count", return_value=10),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                trade_ids, secure=True, skip_confirmation=True
+            )
+
+        for result in results.values():
+            canonical = normalize_cancel_response(
+                result,
+                method=result["method"],
+                transaction_id=result.get("transaction_id", ""),
+                spend_identity=result.get("spend_identity", ""),
+            )
+            self.assertEqual(canonical["outcome"], CANCEL_UNKNOWN)
+            self.assertFalse(canonical["success"])
+            self.assertFalse(canonical["submitted"])
+            self.assertTrue(canonical["reconciliation_required"])
 
     def test_bulk_success_records_submission_path(self):
         """Even though method is renamed, we keep submission_path so logs
