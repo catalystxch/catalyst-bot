@@ -5832,48 +5832,30 @@ class CoinManager:
         return True
 
     def stop_topup(self, wait_secs: float = 10.0) -> bool:
-        """Request any running top-up worker to stop.
+        """Request stop and retain ownership state until definitive exit."""
 
-        ESCAPE HATCH: when the worker is wedged on a wallet RPC call, the
-        join() times out and the thread stays alive. Previously we left
-        ``_topup_running`` at True in that case, which made every
-        subsequent is_busy() check return True and permanently locked the
-        topup/prep path behind the zombie until the operator restarted
-        the bot. Now we clear the running flag once the join timeout
-        elapses and emit a critical log so the operator knows a zombie
-        topup thread may be mutating the wallet in the background.
-        The underlying thread is a daemon, so it terminates at process
-        exit regardless.
-        """
-        thread = None
         with self._lock:
             if not self._topup_running:
                 return False
             self._topup_stop_requested = True
             thread = self._topup_thread
         log_event("info", "topup_stop_requested", "Stopping background coin top-up")
-        if thread and thread.is_alive() and wait_secs > 0:
-            thread.join(timeout=wait_secs)
-        if thread and thread.is_alive():
+        try:
+            if thread and thread.is_alive() and wait_secs > 0:
+                thread.join(timeout=wait_secs)
+            alive = bool(thread and thread.is_alive())
+        except Exception:
+            alive = True
+        if alive:
             log_event(
                 "critical",
                 "topup_stop_zombie",
                 f"Coin top-up worker {thread.name!r} did not stop within "
-                f"{wait_secs:.0f}s. Clearing the busy latch so future topup/"
-                f"prep paths are not locked out behind this zombie; the "
-                f"thread is a daemon and will die when its blocking RPC "
-                f"returns or at process exit.",
+                f"{wait_secs:.0f}s. Mutation ownership remains busy until "
+                f"the worker's finalizer proves definitive exit.",
                 data={"thread": thread.name, "wait_secs": wait_secs},
             )
-        with self._lock:
-            # Force-release the busy latch even if the worker is still
-            # alive. A new topup cannot be queued while the old worker is
-            # still mutating the wallet (the wallet RPCs themselves
-            # serialise), but is_busy() will now correctly report idle so
-            # the rest of the bot does not wedge waiting on the latch.
-            self._topup_running = False
-            self._topup_stop_requested = False
-            self._topup_thread = None
+            return False
         return True
 
     def _topup_should_stop(self) -> bool:
@@ -7048,6 +7030,8 @@ class CoinManager:
                 with self._lock:
                     self._topup_running = False
                     self._topup_stop_requested = False
+                    if self._topup_thread is threading.current_thread():
+                        self._topup_thread = None
             except Exception as _flag_err:
                 log_event(
                     "error",

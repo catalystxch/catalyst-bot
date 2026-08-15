@@ -107,9 +107,21 @@ else:
 APP_NAME = "CATalyst"
 WINDOWS_APP_USER_MODEL_ID = APP_NAME
 FLASK_HOST = "127.0.0.1"
+
+
+def _normalize_flask_port(value) -> int:
+    """Return a valid configured loopback port or the stable default."""
+
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 5000
+    return port if 1 <= port <= 65535 else 5000
+
+
 try:
-    FLASK_PORT = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
-except (TypeError, ValueError):
+    FLASK_PORT = _normalize_flask_port(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+except Exception:
     FLASK_PORT = 5000
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1000
@@ -528,13 +540,14 @@ def _acquire_instance_lock() -> bool:
     global _instance_lock_handle
     lock_path = _instance_lock_path()
     try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fh = open(lock_path, "a+", encoding="utf-8")
     except Exception as e:
         print(
             f"[INSTANCE-LOCK] Could not open {lock_path}: {e} — skipping lock",
             flush=True,
         )
-        return True  # Fail open: don't block startup on a filesystem hiccup
+        return False
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -572,6 +585,34 @@ def _acquire_instance_lock() -> bool:
     except Exception:
         pass
     _instance_lock_handle = fh
+    return True
+
+
+def _release_instance_lock() -> bool:
+    """Close the desktop singleton handle on every rejected startup path."""
+
+    global _instance_lock_handle
+    handle = _instance_lock_handle
+    _instance_lock_handle = None
+    if handle is None:
+        return False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
     return True
 
 
@@ -1114,9 +1155,15 @@ def run_flask_mode():
 def _find_available_diagnostics_port(preferred: int) -> int:
     """Return a nearby loopback port for a non-owning diagnostic server."""
 
-    for candidate in range(max(1, int(preferred) + 1), min(65535, int(preferred) + 51)):
-        if check_port_free(candidate):
-            return candidate
+    preferred = _normalize_flask_port(preferred)
+    candidate_ranges = (
+        range(preferred + 1, min(65536, preferred + 51)),
+        range(preferred - 1, max(0, preferred - 51), -1),
+    )
+    for candidates in candidate_ranges:
+        for candidate in candidates:
+            if check_port_free(candidate):
+                return candidate
     raise RuntimeError("no loopback diagnostics port is available")
 
 
@@ -1410,6 +1457,49 @@ def _run_coin_prep_worker_mode(worker_args):
         sys.argv = old_argv
 
 
+def _initialize_startup_ownership() -> dict:
+    """Initialize the schema and acquire the mutation lease without wallet RPC."""
+
+    from database import init_database
+
+    init_database()
+    import api_server
+
+    authorization = api_server.initialize_mutation_runtime()
+    api_server._start_owned_runtime_services(authorization)
+    return authorization
+
+
+def _authorize_desktop_startup() -> bool:
+    """Serialize durable inspection through schema and lease acquisition."""
+
+    from read_only_diagnostics import (
+        acquire_startup_arbiter,
+        preflight_requires_diagnostics,
+    )
+
+    arbiter = acquire_startup_arbiter()
+    if not arbiter.acquired:
+        return False
+    try:
+        if preflight_requires_diagnostics():
+            return False
+        if not _acquire_instance_lock():
+            return False
+        try:
+            from database import attempt_db_recovery
+
+            attempt_db_recovery()
+        except Exception:
+            pass
+        authorization = _initialize_startup_ownership()
+        return bool(authorization.get("allowed"))
+    except Exception:
+        return False
+    finally:
+        arbiter.release()
+
+
 def main(argv=None):
     """Desktop app entry point for both .py and .pyw launchers."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -1439,31 +1529,24 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if not args.flask and not args.dev and not args.show_console:
+        if _respawn_under_pythonw():
+            return 0
+
     # Durable ownership outranks port and file-lock heuristics. This
     # stdlib-only preflight cannot create/migrate SQLite or import user_paths.
-    from read_only_diagnostics import preflight_requires_diagnostics
-
-    if preflight_requires_diagnostics():
+    if not _authorize_desktop_startup():
+        _release_instance_lock()
         _open_existing_instance_in_browser()
         diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
         run_read_only_diagnostics_mode(diagnostics_port)
         return 0
-
-    if not args.flask and not args.dev and not args.show_console:
-        if _respawn_under_pythonw():
-            return 0
 
     # Cross-process singleton: only ONE desktop_app may run at a time.
     # Without this, a second double-click within the 1-2s Python startup
     # window slips past the port check, both instances start their own
     # Flask/AppBridge/coin-prep workers, and the workers race the same
     # wallet coins → MEMPOOL_CONFLICT cascade in Sage.
-    if not _acquire_instance_lock():
-        _open_existing_instance_in_browser()
-        diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
-        run_read_only_diagnostics_mode(diagnostics_port)
-        return 0
-
     _enable_pythonw_startup_log()
 
     # Kill-on-close Job Object: ensures default child processes (coin-prep

@@ -8,6 +8,7 @@ database initialization modules when another process owns the mutation lease.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
@@ -41,6 +43,130 @@ def database_path() -> Path:
     return _data_directory() / "bot.db"
 
 
+def _canonical_data_directory(data_dir: str | os.PathLike[str] | None = None) -> str:
+    """Return one stable identity for aliases of the same CATalyst data path."""
+
+    candidate = Path(data_dir) if data_dir is not None else _data_directory()
+    resolved = candidate.expanduser().resolve(strict=False)
+    canonical = os.path.normcase(os.path.normpath(str(resolved)))
+    return canonical.casefold() if os.name == "nt" else canonical
+
+
+def _startup_lock_path(data_dir: str | os.PathLike[str] | None = None) -> Path:
+    identity = _canonical_data_directory(data_dir)
+    digest = hashlib.sha256(
+        identity.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return Path(tempfile.gettempdir()) / "catalyst-startup-arbiters" / f"{digest}.lock"
+
+
+def _open_startup_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        return handle
+    except Exception:
+        handle.close()
+        raise
+
+
+class StartupArbiter:
+    """An OS-released startup lock keyed outside the shared data directory."""
+
+    def __init__(self, *, lock_path: Path, handle=None, reason: str = ""):
+        self.lock_path = lock_path
+        self._handle = handle
+        self.acquired = handle is not None
+        self.reason = reason
+
+    def release(self) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        self._handle = None
+        was_acquired = self.acquired
+        self.acquired = False
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        return was_acquired
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.release()
+
+
+def acquire_startup_arbiter(
+    *,
+    data_dir: str | os.PathLike[str] | None = None,
+    wait_seconds: float = 60.0,
+) -> StartupArbiter:
+    """Acquire the startup arbiter, failing closed on every lock error."""
+
+    try:
+        timeout = max(0.0, float(wait_seconds))
+        lock_path = _startup_lock_path(data_dir)
+        handle = _open_startup_lock(lock_path)
+    except Exception:
+        return StartupArbiter(
+            lock_path=locals().get("lock_path", Path()),
+            reason="startup_arbiter_unavailable",
+        )
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return StartupArbiter(lock_path=lock_path, handle=handle)
+        except (OSError, IOError):
+            if time.monotonic() >= deadline:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                return StartupArbiter(
+                    lock_path=lock_path, reason="startup_arbiter_busy"
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            return StartupArbiter(
+                lock_path=lock_path, reason="startup_arbiter_unavailable"
+            )
+
+
 def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
     try:
         stat = path.stat()
@@ -60,10 +186,14 @@ def _copy_consistent_sqlite_snapshot(target: Path, directory: Path) -> Path:
     shutil.copyfile(target, snapshot)
     for source, identity in zip(sources[1:], before[1:]):
         if identity is not None:
-            shutil.copyfile(source, Path(f"{snapshot}{source.name[len(target.name) :]}"))
+            shutil.copyfile(
+                source, Path(f"{snapshot}{source.name[len(target.name) :]}")
+            )
     after = tuple(_file_identity(source) for source in sources)
     if after != before:
-        raise RuntimeError("SQLite source changed while diagnostics snapshot was copied")
+        raise RuntimeError(
+            "SQLite source changed while diagnostics snapshot was copied"
+        )
     return snapshot
 
 
@@ -126,9 +256,7 @@ def preflight_requires_diagnostics(path: Path | None = None) -> bool:
     conn = None
     try:
         snapshot_dir = tempfile.TemporaryDirectory(prefix="catalyst-preflight-")
-        snapshot = _copy_consistent_sqlite_snapshot(
-            target, Path(snapshot_dir.name)
-        )
+        snapshot = _copy_consistent_sqlite_snapshot(target, Path(snapshot_dir.name))
         uri = f"file:{quote(str(snapshot.absolute()).replace(os.sep, '/'), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -220,9 +348,7 @@ def read_safety_status(path: Path | None = None) -> dict[str, Any]:
         # create its -shm file. Copy the existing DB/WAL snapshot to an OS temp
         # directory so diagnostics never changes the shared data directory.
         snapshot_dir = tempfile.TemporaryDirectory(prefix="catalyst-diagnostics-")
-        snapshot = _copy_consistent_sqlite_snapshot(
-            target, Path(snapshot_dir.name)
-        )
+        snapshot = _copy_consistent_sqlite_snapshot(target, Path(snapshot_dir.name))
         uri = f"file:{quote(str(snapshot.absolute()).replace(os.sep, '/'), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
         conn.row_factory = sqlite3.Row

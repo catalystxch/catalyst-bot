@@ -269,6 +269,117 @@ def test_release_requires_generation_and_every_journal_blocker_resolved(
     assert gate.status().allowed is True
 
 
+def test_release_resolved_serializes_heartbeat_through_post_resolve_status(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    _append_event("create:release-race", blocks=True, suffix="unknown")
+    gate.trip("CREATE_UNKNOWN", ["create:release-race"])
+    _append_event("create:release-race", blocks=False, suffix="reconciled")
+    clock.advance(1)
+
+    progress = threading.Event()
+    snapshot_captured = threading.Event()
+    continue_release = threading.Event()
+    heartbeat_done = threading.Event()
+    observed = {}
+
+    class ObservableRLock:
+        def __init__(self):
+            self._inner = threading.RLock()
+            self._state_lock = threading.Lock()
+            self._owner = None
+            self._depth = 0
+
+        def acquire(self, *args, **kwargs):
+            thread_id = threading.get_ident()
+            with self._state_lock:
+                contended = self._owner is not None and self._owner != thread_id
+            if contended:
+                observed.setdefault("path", "contended")
+                progress.set()
+            acquired = self._inner.acquire(*args, **kwargs)
+            if acquired:
+                with self._state_lock:
+                    if self._owner == thread_id:
+                        self._depth += 1
+                    else:
+                        self._owner = thread_id
+                        self._depth = 1
+            return acquired
+
+        def release(self):
+            thread_id = threading.get_ident()
+            with self._state_lock:
+                assert self._owner == thread_id
+                self._depth -= 1
+                if self._depth == 0:
+                    self._owner = None
+            self._inner.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.release()
+
+    gate._lock = ObservableRLock()
+    original_snapshot = gate._authorization_snapshot
+    original_heartbeat = database.heartbeat_runtime_mutation_lease
+
+    def pause_after_snapshot():
+        snapshot = original_snapshot()
+        if not snapshot_captured.is_set():
+            snapshot_captured.set()
+            assert continue_release.wait(5)
+        return snapshot
+
+    def observe_heartbeat(**kwargs):
+        observed.setdefault("path", "heartbeat_entered")
+        progress.set()
+        try:
+            return original_heartbeat(**kwargs)
+        finally:
+            heartbeat_done.set()
+
+    monkeypatch.setattr(gate, "_authorization_snapshot", pause_after_snapshot)
+    monkeypatch.setattr(database, "heartbeat_runtime_mutation_lease", observe_heartbeat)
+    release_result = {}
+    heartbeat_result = {}
+    release_thread = threading.Thread(
+        target=lambda: release_result.update(
+            gate.release_resolved(1, ["create:release-race"])
+        )
+    )
+    heartbeat_thread = threading.Thread(
+        target=lambda: heartbeat_result.update(gate.heartbeat())
+    )
+
+    release_thread.start()
+    assert snapshot_captured.wait(5)
+    heartbeat_thread.start()
+    try:
+        assert progress.wait(5)
+        if observed.get("path") == "heartbeat_entered":
+            assert heartbeat_done.wait(5)
+    finally:
+        continue_release.set()
+    release_thread.join(5)
+    heartbeat_thread.join(5)
+
+    assert observed["path"] == "contended"
+    assert release_result["released"] is True
+    assert heartbeat_result.get("heartbeat") is True, heartbeat_result
+    assert gate.status().allowed is True
+    already_resolved = gate.release_resolved(1, ["create:release-race"])
+    assert already_resolved["released"] is False
+    assert already_resolved["reason"] == "not_tripped"
+    assert already_resolved["status"]["allowed"] is True
+
+
 def test_release_rejects_a_different_wallet_or_network_binding(
     isolated_gate_database,
 ):
@@ -980,6 +1091,84 @@ def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
     assert read_only_post.status_code == 200
 
 
+def test_api_import_does_not_start_cat_resolver_before_lease(tmp_path: Path):
+    data_dir = tmp_path / "resolver-import"
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src" / "catalyst")
+    code = r"""
+import threading
+real_thread = threading.Thread
+class GuardedThread(real_thread):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("name") == "cat-resolver":
+            raise AssertionError("CAT resolver started during import")
+        super().__init__(*args, **kwargs)
+threading.Thread = GuardedThread
+import api_server
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_generic_runtime_initialization_never_starts_cat_resolver(monkeypatch):
+    import api_server
+
+    starts = []
+
+    class Runtime:
+        def register_stop_handler(self, _handler):
+            return None
+
+        def status(self):
+            return mutation_gate.GateStatus(
+                allowed=True,
+                reason_code="",
+                source="lease",
+                lease_active=True,
+                owner_is_this_run=True,
+            )
+
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate, "initialize", lambda **_kwargs: Runtime()
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_start_background_cat_resolver",
+        lambda: starts.append("resolver"),
+        raising=False,
+    )
+
+    read_only = api_server.initialize_mutation_runtime(
+        start_heartbeat=False, acquire_lease=False
+    )
+    owner = api_server.initialize_mutation_runtime(
+        start_heartbeat=False, acquire_lease=True
+    )
+
+    assert read_only["allowed"] is True
+    assert owner["allowed"] is True
+    assert starts == []
+
+    api_server._start_owned_runtime_services(owner)
+
+    assert starts == ["resolver"]
+
+
 def test_non_owner_api_cannot_launch_or_restart_wallet_services(monkeypatch):
     import api_server
     import chia_node
@@ -1129,7 +1318,7 @@ def test_every_existing_public_appbridge_callable_has_auditable_access_classific
         & app_bridge._APP_BRIDGE_READ_ONLY_METHODS
     )
     assert all(
-        getattr(getattr(app_bridge.AppBridge, name), "_bridge_access", None)
+        app_bridge._APP_BRIDGE_ACCESS_BY_FUNCTION[vars(app_bridge.AppBridge)[name]]
         in {"mutation", "read_only", "control"}
         for name in public
     )
@@ -1206,6 +1395,241 @@ def test_future_mutation_marker_without_guard_cannot_bypass_default_deny(
     assert result["success"] is False
     assert result["reason"] == "LEASE_OWNED_BY_OTHER"
     assert writes == []
+
+
+def test_appbridge_callable_markers_and_dynamic_descriptors_cannot_spoof_trust(
+    monkeypatch,
+):
+    from functools import wraps
+
+    import app_bridge
+
+    writes = []
+
+    def marked_read_only(_self):
+        writes.append("class-monkeypatch")
+        return {"success": True}
+
+    marked_read_only._bridge_access = "read_only"
+    monkeypatch.setattr(
+        app_bridge.AppBridge, "future_marked_read", marked_read_only, raising=False
+    )
+
+    class OverrideBridge(app_bridge.AppBridge):
+        def get_status(self):
+            writes.append("subclass-override")
+            return {"success": True}
+
+    OverrideBridge.get_status._bridge_access = "control"
+
+    class HostileCallable:
+        def __init__(self, label):
+            self.label = label
+
+        def __getattr__(self, name):
+            if name == "_bridge_access":
+                return "read_only"
+            raise AttributeError(name)
+
+        def __call__(self):
+            writes.append(self.label)
+            return {"success": True}
+
+    class HostileDescriptor:
+        def __get__(self, _instance, _owner):
+            return HostileCallable("descriptor")
+
+    class DescriptorBridge(app_bridge.AppBridge):
+        future_descriptor = HostileDescriptor()
+
+    @wraps(app_bridge.AppBridge.get_status)
+    def spoofing_wrapper(_self):
+        writes.append("wrapper")
+        return {"success": True}
+
+    spoofing_wrapper._bridge_access = "read_only"
+
+    class WrapperBridge(app_bridge.AppBridge):
+        get_status = spoofing_wrapper
+
+    bridges_and_calls = []
+    ordinary = app_bridge.AppBridge()
+    bridges_and_calls.append((ordinary, lambda: ordinary.future_marked_read()))
+    override = OverrideBridge()
+    bridges_and_calls.append((override, override.get_status))
+    dynamic = app_bridge.AppBridge()
+    dynamic.future_dynamic = HostileCallable("instance-dynamic")
+    bridges_and_calls.append((dynamic, dynamic.future_dynamic))
+    descriptor = DescriptorBridge()
+    bridges_and_calls.append((descriptor, descriptor.future_descriptor))
+    wrapper = WrapperBridge()
+    bridges_and_calls.append((wrapper, wrapper.get_status))
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    fake_api = SimpleNamespace(
+        _ensure_mutation_runtime=lambda: None,
+        mutation_gate=mutation_gate,
+    )
+    results = []
+    for bridge, call in bridges_and_calls:
+        bridge._api = fake_api
+        results.append(call())
+
+    assert all(result["reason"] == "LEASE_OWNED_BY_OTHER" for result in results)
+    assert writes == []
+
+
+def test_untrusted_appbridge_descriptor_cannot_execute_before_mutation_permit(
+    monkeypatch,
+):
+    import app_bridge
+
+    writes = []
+
+    class EvilDescriptor:
+        def __get__(self, _instance, _owner):
+            writes.append("descriptor-get")
+            return lambda: writes.append("descriptor-call") or {"success": True}
+
+    class DescriptorBridge(app_bridge.AppBridge):
+        future_descriptor = EvilDescriptor()
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    bridge = DescriptorBridge()
+    app_bridge._APP_BRIDGE_API_SLOT.__set__(
+        bridge,
+        SimpleNamespace(
+            _ensure_mutation_runtime=lambda: None,
+            mutation_gate=mutation_gate,
+        ),
+    )
+
+    call = bridge.future_descriptor
+
+    assert writes == []
+    result = call()
+    assert result["reason"] == "LEASE_OWNED_BY_OTHER"
+    assert writes == []
+
+
+def test_appbridge_private_api_descriptor_cannot_execute_before_mutation_permit(
+    monkeypatch,
+):
+    import app_bridge
+
+    writes = []
+
+    class PrivateApiDescriptor:
+        def __get__(self, instance, _owner):
+            writes.append("private-api-get")
+            return object.__getattribute__(instance, "__dict__")["_api"]
+
+        def __set__(self, instance, value):
+            object.__getattribute__(instance, "__dict__")["_api"] = value
+
+    class DescriptorBridge(app_bridge.AppBridge):
+        _api = PrivateApiDescriptor()
+
+        def future_write(self):
+            writes.append("future-write")
+            return {"success": True}
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    bridge = DescriptorBridge()
+    app_bridge._APP_BRIDGE_API_SLOT.__set__(
+        bridge,
+        SimpleNamespace(
+            _ensure_mutation_runtime=lambda: None,
+            mutation_gate=mutation_gate,
+        ),
+    )
+
+    call = bridge.future_write
+
+    assert writes == []
+    result = call()
+    assert result["reason"] == "LEASE_OWNED_BY_OTHER"
+    assert writes == []
+
+
+def test_missing_appbridge_attribute_getattr_runs_only_inside_mutation_permit(
+    monkeypatch,
+):
+    import app_bridge
+
+    writes = []
+
+    class MissingBridge(app_bridge.AppBridge):
+        def __getattr__(self, name):
+            writes.append(f"getattr:{name}")
+            return lambda: writes.append("call") or {"success": True}
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+    bridge = MissingBridge()
+    bridge._api = SimpleNamespace(
+        _ensure_mutation_runtime=lambda: None,
+        mutation_gate=mutation_gate,
+    )
+
+    call = bridge.future_missing
+
+    assert writes == []
+    result = call()
+    assert result["reason"] == "LEASE_OWNED_BY_OTHER"
+    assert writes == []
+
+
+def test_appbridge_subclass_cannot_replace_enforcement_hook():
+    import app_bridge
+
+    with pytest.raises(TypeError, match="__getattribute__"):
+
+        class BypassBridge(app_bridge.AppBridge):
+            def __getattribute__(self, name):
+                return lambda: {"success": True, "name": name}
+
+
+def test_exact_registered_read_only_appbridge_method_preserves_read_only_ux(
+    monkeypatch,
+):
+    import app_bridge
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            AssertionError(f"read-only method was mutation guarded: {operation}")
+        ),
+    )
+
+    result = app_bridge.AppBridge().get_app_info()
+
+    assert result["name"] == "CATalyst"
+    assert result["mode"] == "desktop"
 
 
 def test_parent_launcher_uses_environment_only_and_revokes_on_request(
@@ -2528,6 +2952,55 @@ def test_shutdown_tracks_sniper_and_shape_fix_workers(
     assert database.get_runtime_mutation_lease()["active"] == 1
 
 
+def test_topup_stop_timeout_preserves_busy_state_and_thread_identity(monkeypatch):
+    import coin_manager
+
+    class LiveThread:
+        name = "coin-topup"
+
+        @staticmethod
+        def is_alive():
+            return True
+
+        @staticmethod
+        def join(timeout=None):
+            return None
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    manager._lock = threading.RLock()
+    manager._topup_running = True
+    manager._topup_stop_requested = False
+    manager._topup_thread = LiveThread()
+    monkeypatch.setattr(coin_manager, "log_event", lambda *_args, **_kwargs: None)
+
+    stopped = manager.stop_topup(wait_secs=0)
+
+    assert stopped is False
+    assert manager._topup_running is True
+    assert manager._topup_stop_requested is True
+    assert manager._topup_thread is not None
+    assert manager._topup_thread.is_alive() is True
+
+
+def test_topup_worker_finalizer_alone_clears_thread_and_busy_state(monkeypatch):
+    import coin_manager
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    manager._lock = threading.RLock()
+    manager._topup_running = True
+    manager._topup_stop_requested = True
+    manager._topup_thread = threading.current_thread()
+    manager.update_coin_counts = lambda: None
+    manager.log_inventory = lambda: None
+    monkeypatch.setattr(coin_manager, "log_event", lambda *_args, **_kwargs: None)
+
+    manager._topup_worker(0, 0)
+
+    assert manager._topup_running is False
+    assert manager._topup_stop_requested is False
+    assert manager._topup_thread is None
+
+
 def test_shutdown_snapshots_shape_fix_threads_under_owner_lock():
     import api_server
 
@@ -2702,6 +3175,69 @@ def test_shutdown_recaptures_thread_refs_after_request_permits_drain(
     assert result["released"] is False
     assert result["reason"] == "mutation_producers_not_stopped"
     assert result["live_threads"] == ["late-coin-prep"]
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
+def test_shutdown_retains_lease_for_topup_published_during_bot_stop(
+    isolated_gate_database, monkeypatch
+):
+    import api_server
+    import coin_manager
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="late-topup-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    monkeypatch.setattr(api_server, "_mutation_runtime", gate)
+    monkeypatch.setattr(
+        api_server, "_mutation_runtime_db_path", os.path.abspath(database.DB_PATH)
+    )
+    monkeypatch.setattr(coin_manager, "log_event", lambda *_args, **_kwargs: None)
+
+    class LiveTopup:
+        name = "late-coin-topup"
+
+        @staticmethod
+        def is_alive():
+            return True
+
+        @staticmethod
+        def join(timeout=None):
+            return None
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    manager._lock = threading.RLock()
+    manager._prep_process = None
+    manager._prep_delegation = None
+    manager._prep_running = False
+    manager._topup_running = False
+    manager._topup_stop_requested = False
+    manager._topup_thread = None
+    late_topup = LiveTopup()
+
+    class Bot:
+        coin_manager = manager
+        runtime_monitor = None
+        amm_monitor = None
+        shape_fix_orchestrator = None
+
+        @staticmethod
+        def stop(wait=True):
+            manager._topup_running = True
+            manager._topup_thread = late_topup
+            assert manager.stop_topup(wait_secs=0) is False
+            return False
+
+    result = api_server.quiesce_and_release_mutation_runtime(
+        bot_instance=Bot(), wait_seconds=0
+    )
+
+    assert result["released"] is False
+    assert result["reason"] == "mutation_producers_not_stopped"
+    assert result["live_threads"] == ["late-coin-topup"]
+    assert manager._topup_running is True
+    assert manager._topup_stop_requested is True
+    assert manager._topup_thread is late_topup
     assert database.get_runtime_mutation_lease()["active"] == 1
 
 
@@ -2976,6 +3512,94 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     assert started == [desktop_app.FLASK_PORT + 7]
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("1", 1),
+        ("65535", 65535),
+        ("0", 5000),
+        ("65536", 5000),
+        ("not-a-port", 5000),
+    ],
+)
+def test_desktop_port_normalization_matches_standalone(
+    monkeypatch, configured, expected
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    assert desktop_app._normalize_flask_port(configured) == expected
+
+
+def test_desktop_diagnostics_port_scan_includes_upper_and_lower_edges(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    monkeypatch.setattr(desktop_app, "check_port_free", lambda _port: True)
+
+    assert desktop_app._find_available_diagnostics_port(65534) == 65535
+    assert desktop_app._find_available_diagnostics_port(65535) == 65534
+    assert desktop_app._find_available_diagnostics_port(0) == 5001
+    assert desktop_app._find_available_diagnostics_port(70000) == 5001
+
+
+def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+
+    class Arbiter:
+        acquired = True
+        reason = ""
+        released = False
+
+        def release(self):
+            self.released = True
+            events.append("arbiter_release")
+            return True
+
+    arbiter = Arbiter()
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "acquire_startup_arbiter",
+        lambda: events.append("arbiter_acquire") or arbiter,
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "preflight_requires_diagnostics",
+        lambda: events.append("durable_preflight") or False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_acquire_instance_lock",
+        lambda: events.append("instance_lock") or True,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: events.append("lease_acquire") or {"allowed": not arbiter.released},
+        raising=False,
+    )
+    monkeypatch.setattr(desktop_app, "_enable_pythonw_startup_log", lambda: None)
+    monkeypatch.setattr(desktop_app, "_attach_to_kill_on_close_job", lambda: None)
+    monkeypatch.setattr(desktop_app, "_hide_windows_console", lambda: None)
+    monkeypatch.setattr(
+        desktop_app,
+        "run_flask_mode",
+        lambda: events.append(("run", arbiter.released)),
+    )
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+
+    assert desktop_app.main(["--flask", "--show-console"]) == 0
+    assert events == [
+        "arbiter_acquire",
+        "durable_preflight",
+        "instance_lock",
+        "lease_acquire",
+        "arbiter_release",
+        ("run", True),
+    ]
+
+
 def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
     monkeypatch,
 ):
@@ -3064,6 +3688,208 @@ def test_pythonw_import_before_ownership_creates_no_shared_files(tmp_path: Path)
     assert not data_dir.exists()
 
 
+def test_startup_arbiter_serializes_canonical_data_directory(tmp_path: Path):
+    import read_only_diagnostics
+
+    data_dir = tmp_path / "arbiter-data"
+    alias = data_dir.parent / "." / data_dir.name
+    first = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=data_dir, wait_seconds=0
+    )
+    try:
+        assert first.acquired is True
+        second = read_only_diagnostics.acquire_startup_arbiter(
+            data_dir=alias, wait_seconds=0
+        )
+        assert second.acquired is False
+        assert second.reason == "startup_arbiter_busy"
+        assert second.lock_path == first.lock_path
+    finally:
+        first.release()
+
+    successor = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=alias, wait_seconds=0
+    )
+    try:
+        assert successor.acquired is True
+        assert successor.lock_path == first.lock_path
+    finally:
+        successor.release()
+
+
+def test_startup_arbiter_symlink_case_and_unrelated_directory_identity(tmp_path: Path):
+    import read_only_diagnostics
+
+    target = tmp_path / "MixedCaseData"
+    target.mkdir()
+    case_alias = Path(str(target).swapcase()) if os.name == "nt" else target
+    assert read_only_diagnostics._startup_lock_path(
+        case_alias
+    ) == read_only_diagnostics._startup_lock_path(target)
+
+    symlink = tmp_path / "data-alias"
+    try:
+        symlink.symlink_to(target, target_is_directory=True)
+    except OSError:
+        symlink = target
+    assert read_only_diagnostics._startup_lock_path(
+        symlink
+    ) == read_only_diagnostics._startup_lock_path(target)
+
+    unrelated = tmp_path / "unrelated-data"
+    first = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=target, wait_seconds=0
+    )
+    second = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=unrelated, wait_seconds=0
+    )
+    try:
+        assert first.acquired is True
+        assert second.acquired is True
+        assert first.lock_path != second.lock_path
+    finally:
+        first.release()
+        second.release()
+
+
+@pytest.mark.parametrize(
+    ("platform", "environment", "expected_parts"),
+    [
+        ("win32", {"APPDATA": "platform-appdata"}, ("platform-appdata", "Catalyst")),
+        (
+            "darwin",
+            {},
+            ("home", "Library", "Application Support", "Catalyst"),
+        ),
+        ("linux", {"XDG_DATA_HOME": "platform-xdg"}, ("platform-xdg", "Catalyst")),
+    ],
+)
+def test_startup_arbiter_default_data_path_is_stdlib_and_platform_stable(
+    tmp_path: Path, monkeypatch, platform, environment, expected_parts
+):
+    import read_only_diagnostics
+
+    monkeypatch.delenv("CMM_DATA_DIR", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    for name, relative in environment.items():
+        monkeypatch.setenv(name, str(tmp_path / relative))
+    monkeypatch.setattr(read_only_diagnostics.sys, "platform", platform)
+    monkeypatch.setattr(
+        read_only_diagnostics.Path,
+        "home",
+        classmethod(lambda _cls: tmp_path / "home"),
+    )
+
+    resolved = read_only_diagnostics._data_directory()
+
+    expected = tmp_path.joinpath(*expected_parts)
+    assert resolved == expected
+    assert read_only_diagnostics._startup_lock_path().parent.name == (
+        "catalyst-startup-arbiters"
+    )
+
+
+def test_startup_arbiter_busy_and_setup_failures_close_the_open_handle(
+    tmp_path: Path, monkeypatch
+):
+    import read_only_diagnostics
+
+    class Handle:
+        closed = False
+
+        def seek(self, *_args):
+            raise RuntimeError("lock setup failed")
+
+        def close(self):
+            self.closed = True
+
+    handle = Handle()
+    monkeypatch.setattr(
+        read_only_diagnostics, "_open_startup_lock", lambda _path: handle
+    )
+
+    denied = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=tmp_path / "handle-close", wait_seconds=0
+    )
+
+    assert denied.acquired is False
+    assert denied.reason == "startup_arbiter_unavailable"
+    assert handle.closed is True
+
+
+def test_startup_arbiter_ignores_stale_file_without_live_os_lock(tmp_path: Path):
+    import read_only_diagnostics
+
+    data_dir = tmp_path / "stale-file"
+    lock_path = read_only_diagnostics._startup_lock_path(data_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"stale-owner-metadata")
+
+    arbiter = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=data_dir, wait_seconds=0
+    )
+    try:
+        assert arbiter.acquired is True
+    finally:
+        arbiter.release()
+
+
+def test_startup_arbiter_open_error_fails_closed(tmp_path: Path, monkeypatch):
+    import read_only_diagnostics
+
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "_open_startup_lock",
+        lambda _path: (_ for _ in ()).throw(OSError("lock denied")),
+    )
+
+    denied = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=tmp_path / "denied", wait_seconds=0
+    )
+
+    assert denied.acquired is False
+    assert denied.reason == "startup_arbiter_unavailable"
+
+
+def test_startup_arbiter_os_lock_is_released_after_process_crash(tmp_path: Path):
+    source_root = Path(__file__).resolve().parents[1] / "src" / "catalyst"
+    data_dir = tmp_path / "crash-release"
+    code = r"""
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import read_only_diagnostics
+arbiter = read_only_diagnostics.acquire_startup_arbiter(
+    data_dir=sys.argv[2], wait_seconds=0
+)
+sys.stdout.write("ACQUIRED\n" if arbiter.acquired else "DENIED\n")
+sys.stdout.flush()
+time.sleep(30)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(source_root), str(data_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ACQUIRED"
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+    import read_only_diagnostics
+
+    successor = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=data_dir, wait_seconds=2
+    )
+    try:
+        assert successor.acquired is True
+    finally:
+        successor.release()
+
+
 def test_diagnostics_preflight_fails_closed_if_checkpoint_races_snapshot_copy(
     isolated_gate_database, monkeypatch
 ):
@@ -3145,6 +3971,20 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _free_loopback_port_pair() -> tuple[int, int]:
+    for _attempt in range(100):
+        first = _free_loopback_port()
+        if first >= 65535:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as second_listener:
+            try:
+                second_listener.bind(("127.0.0.1", first + 1))
+            except Exception:
+                continue
+        return first, first + 1
+    raise AssertionError("could not reserve a free adjacent loopback port pair")
+
+
 def _wait_for_diagnostics_status(process, port: int) -> dict:
     deadline = time.monotonic() + 10
     url = f"http://127.0.0.1:{port}/api/safety/status"
@@ -3158,7 +3998,112 @@ def _wait_for_diagnostics_status(process, port: int) -> dict:
                 return json.loads(response.read().decode("utf-8"))
         except OSError:
             time.sleep(0.05)
-    raise AssertionError("diagnostics server did not become ready")
+    return_code = process.poll()
+    stderr = process.communicate(timeout=1)[1] if return_code is not None else ""
+    raise AssertionError(
+        f"diagnostics server did not become ready: code={return_code}, stderr={stderr}"
+    )
+
+
+def _wait_for_any_diagnostics_status(process, ports) -> tuple[int, dict]:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(
+                f"diagnostics process exited early: {process.communicate()[1]}"
+            )
+        for port in ports:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
+                ) as response:
+                    return port, json.loads(response.read().decode("utf-8"))
+            except Exception:
+                continue
+        time.sleep(0.02)
+    raise AssertionError("diagnostics server did not become ready on an allowed port")
+
+
+def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> dict:
+    """Build an isolated process environment without starting real CAT resolution."""
+
+    support = tmp_path / "standalone-test-support"
+    support.mkdir(exist_ok=True)
+    (support / "sitecustomize.py").write_text(
+        "import sys, types\n"
+        "module = types.ModuleType('cat_resolver')\n"
+        "module.resolve_and_apply = lambda _cfg: {}\n"
+        "sys.modules['cat_resolver'] = module\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["CATALYST_FLASK_PORT"] = str(port)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(support),
+            str(Path(__file__).parents[1] / "src" / "catalyst"),
+            str(Path(__file__).parents[1]),
+        ]
+    )
+    return env
+
+
+def _start_standalone_process(env: dict) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "src" / "catalyst" / "api_server.py"),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_for_safety_servers(processes, ports, count: int) -> dict[int, dict]:
+    deadline = time.monotonic() + 20
+    found = {}
+    while time.monotonic() < deadline:
+        exited = [process for process in processes if process.poll() is not None]
+        if exited:
+            details = [process.communicate()[1] for process in exited]
+            raise AssertionError(f"standalone process exited early: {details}")
+        for port in ports:
+            if port in found:
+                continue
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
+                ) as response:
+                    found[port] = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                continue
+        if len(found) >= count:
+            return found
+        time.sleep(0.02)
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    details = [process.communicate(timeout=10) for process in processes]
+    raise AssertionError(
+        f"expected {count} safety servers, found {found}; processes={details}"
+    )
+
+
+def _terminate_test_processes(processes) -> None:
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    for process in processes:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
@@ -3263,11 +4208,16 @@ def test_free_port_standalone_process_defers_to_existing_durable_owner(
         text=True,
     )
     try:
-        payload = _wait_for_diagnostics_status(process, port)
+        selected_port, payload = _wait_for_any_diagnostics_status(
+            process, range(port + 1, min(65536, port + 51))
+        )
+        assert selected_port > port
         assert payload["safety"]["allowed"] is False
         assert payload["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
         with pytest.raises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=1)
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{selected_port}/api/status", timeout=1
+            )
         assert error.value.code == 423
     finally:
         process.terminate()
@@ -3275,6 +4225,179 @@ def test_free_port_standalone_process_defers_to_existing_durable_owner(
 
     assert {item.name for item in data_dir.iterdir()} == before_names
     assert child_database.read_bytes() == before_database
+
+
+def test_simultaneous_first_run_standalone_processes_create_exactly_one_owner(
+    tmp_path: Path,
+):
+    data_dir = tmp_path / "simultaneous-first-run"
+    assert not data_dir.exists()
+    port = _free_loopback_port()
+    env = _standalone_test_environment(tmp_path, data_dir, port)
+    processes = [_start_standalone_process(env), _start_standalone_process(env)]
+    try:
+        servers = _wait_for_safety_servers(
+            processes, range(port, min(65536, port + 51)), count=2
+        )
+        allowed = [
+            (server_port, payload)
+            for server_port, payload in servers.items()
+            if payload["safety"]["allowed"]
+        ]
+        denied = [
+            (server_port, payload)
+            for server_port, payload in servers.items()
+            if not payload["safety"]["allowed"]
+        ]
+        assert len(allowed) == 1
+        assert len(denied) == 1
+        assert denied[0][1]["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
+
+        with sqlite3.connect(data_dir / "bot.db") as conn:
+            rows = conn.execute(
+                "SELECT active, owner_pid FROM runtime_mutation_lease"
+            ).fetchall()
+        assert rows == [(1, allowed[0][1]["safety"]["lease"]["owner_pid"])]
+        assert rows[0][1] in {process.pid for process in processes}
+    finally:
+        _terminate_test_processes(processes)
+
+    import read_only_diagnostics
+
+    successor = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=data_dir, wait_seconds=1
+    )
+    try:
+        assert successor.acquired is True
+    finally:
+        successor.release()
+
+
+def test_unrelated_port_occupancy_still_allows_one_full_owner_on_alternate_port(
+    tmp_path: Path,
+):
+    data_dir = tmp_path / "occupied-port-first-run"
+    port = _free_loopback_port()
+    env = _standalone_test_environment(tmp_path, data_dir, port)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unrelated_listener:
+        unrelated_listener.bind(("127.0.0.1", port))
+        unrelated_listener.listen(1)
+        process = _start_standalone_process(env)
+        try:
+            servers = _wait_for_safety_servers(
+                [process], range(port + 1, min(65536, port + 51)), count=1
+            )
+            selected_port, payload = next(iter(servers.items()))
+            assert selected_port > port
+            assert payload["safety"]["allowed"] is True
+            assert payload["safety"]["lease"]["owner_pid"] == process.pid
+        finally:
+            _terminate_test_processes([process])
+
+
+def test_spawned_desktop_waits_for_arbiter_before_foreign_owner_preflight(
+    tmp_path: Path, monkeypatch
+):
+    import read_only_diagnostics
+
+    data_dir = tmp_path / "desktop-startup-barrier"
+    data_dir.mkdir()
+    child_database = data_dir / "bot.db"
+    database.close_connection()
+    monkeypatch.setattr(database, "DB_PATH", str(child_database))
+    monkeypatch.setattr(database, "_db_initialized_path", "")
+    database.init_database()
+    database.close_connection()
+    arbiter = read_only_diagnostics.acquire_startup_arbiter(
+        data_dir=data_dir, wait_seconds=0
+    )
+    assert arbiter.acquired is True
+    attempt_marker = tmp_path / "child-attempted-arbiter"
+    port, diagnostics_port = _free_loopback_port_pair()
+    env = os.environ.copy()
+    env["CMM_DATA_DIR"] = str(data_dir)
+    env["CATALYST_FLASK_PORT"] = str(port)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).parents[1] / "src" / "catalyst"),
+            str(Path(__file__).parents[1]),
+        ]
+    )
+    command = r"""
+import builtins, pathlib, sys
+import read_only_diagnostics
+real_acquire = read_only_diagnostics.acquire_startup_arbiter
+marker = pathlib.Path(sys.argv[1])
+def observed_acquire(**kwargs):
+    marker.write_text(str(read_only_diagnostics._startup_lock_path()), encoding="utf-8")
+    return real_acquire(**kwargs)
+read_only_diagnostics.acquire_startup_arbiter = observed_acquire
+import desktop_app
+desktop_app._open_existing_instance_in_browser = lambda: None
+real_import = builtins.__import__
+blocked = {"api_server", "config", "user_paths", "super_log", "database"}
+def guarded_import(name, *args, **kwargs):
+    if name.split(".")[0] in blocked:
+        raise AssertionError(f"writable import before diagnostics: {name}")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+raise SystemExit(desktop_app.main(["--show-console"]))
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", command, str(attempt_marker)],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not attempt_marker.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError(process.communicate()[1])
+            time.sleep(0.02)
+        assert attempt_marker.exists()
+        assert Path(attempt_marker.read_text(encoding="utf-8")) == arbiter.lock_path
+        assert process.poll() is None
+
+        now = datetime.now(timezone.utc)
+        acquired = database.acquire_runtime_mutation_lease(
+            owner_run_id="barrier-parent-owner",
+            owner_pid=os.getpid(),
+            owner_host=socket.gethostname(),
+            wallet_fingerprint_hash=WALLET_HASH,
+            network="mainnet",
+            lease_expires_at=now + timedelta(minutes=5),
+            now=now,
+            expected_lease_version=0,
+        )
+        assert acquired["acquired"] is True
+        database.close_connection()
+        before = {
+            item.name: item.read_bytes()
+            for item in data_dir.iterdir()
+            if item.is_file()
+        }
+        arbiter.release()
+
+        selected_port, payload = _wait_for_any_diagnostics_status(
+            process, range(diagnostics_port, min(65536, port + 51))
+        )
+        assert selected_port > port
+        assert payload["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
+        after = {
+            item.name: item.read_bytes()
+            for item in data_dir.iterdir()
+            if item.is_file()
+        }
+        assert after == before
+    finally:
+        arbiter.release()
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+        database.close_connection()
 
 
 def test_diagnostics_server_never_constructs_bot_or_acquires_lease(monkeypatch):
@@ -3396,7 +4519,7 @@ def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch)
     assert calls == ["local-runtime"]
 
 
-def test_standalone_port_selection_honors_env_and_falls_back_to_diagnostics(
+def test_standalone_port_selection_honors_env_without_changing_owner_authority(
     monkeypatch,
 ):
     import api_server
@@ -3410,4 +4533,4 @@ def test_standalone_port_selection_honors_env_and_falls_back_to_diagnostics(
     )
 
     assert api_server._configured_flask_port() == 5123
-    assert api_server._select_standalone_server_mode(5123) == (5124, True)
+    assert api_server._select_standalone_server_mode(5123) == (5124, False)

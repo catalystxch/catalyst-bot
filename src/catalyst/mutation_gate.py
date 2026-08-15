@@ -801,64 +801,67 @@ class MutationGate:
         try:
             with self._lock:
                 local_reason = self._local_reason_code
-            if local_reason in _TERMINAL_PROCESS_FENCES:
-                return {
-                    "released": False,
-                    "reason": "terminal_process_fence",
-                    "status": self.status().to_dict(),
-                }
-            authorization = self._authorization_snapshot()
-            latch = authorization["latch"]
-            if str(latch.get("state") or "") != "tripped":
-                return {
-                    "released": False,
-                    "reason": "not_tripped",
-                    "status": self._status_from_rows(
-                        latch, authorization["lease"], authorization["unresolved"]
-                    ).to_dict(),
-                }
-            if int(latch.get("generation") or 0) != expected_generation:
-                return {
-                    "released": False,
-                    "reason": "generation_mismatch",
-                    "status": self._status_from_rows(
-                        latch, authorization["lease"], authorization["unresolved"]
-                    ).to_dict(),
-                }
-            if (
-                str(latch.get("wallet_fingerprint_hash") or "")
-                != self.wallet_fingerprint_hash
-                or str(latch.get("network") or "") != self.network
-            ):
-                return {
-                    "released": False,
-                    "reason": "latch_binding_mismatch",
-                    "status": self.status().to_dict(),
-                }
-            result = database.resolve_runtime_safety_latch(
-                expected_generation=expected_generation,
-                resolved_operation_ids=resolved_operation_ids,
-                resolved_at=self._now(),
-            )
-            if not result.get("resolved"):
-                return {
-                    "released": False,
-                    "reason": result.get("reason") or "not_resolved",
-                    "status": self.status().to_dict(),
-                }
-            with self._lock:
+                if local_reason in _TERMINAL_PROCESS_FENCES:
+                    return {
+                        "released": False,
+                        "reason": "terminal_process_fence",
+                        "status": self.status().to_dict(),
+                    }
+                authorization = self._authorization_snapshot()
+                latch = authorization["latch"]
+                if str(latch.get("state") or "") != "tripped":
+                    return {
+                        "released": False,
+                        "reason": "not_tripped",
+                        "status": self._status_from_rows(
+                            latch,
+                            authorization["lease"],
+                            authorization["unresolved"],
+                        ).to_dict(),
+                    }
+                if int(latch.get("generation") or 0) != expected_generation:
+                    return {
+                        "released": False,
+                        "reason": "generation_mismatch",
+                        "status": self._status_from_rows(
+                            latch,
+                            authorization["lease"],
+                            authorization["unresolved"],
+                        ).to_dict(),
+                    }
+                if (
+                    str(latch.get("wallet_fingerprint_hash") or "")
+                    != self.wallet_fingerprint_hash
+                    or str(latch.get("network") or "") != self.network
+                ):
+                    return {
+                        "released": False,
+                        "reason": "latch_binding_mismatch",
+                        "status": self.status().to_dict(),
+                    }
+                result = database.resolve_runtime_safety_latch(
+                    expected_generation=expected_generation,
+                    resolved_operation_ids=resolved_operation_ids,
+                    resolved_at=self._now(),
+                )
+                if not result.get("resolved"):
+                    return {
+                        "released": False,
+                        "reason": result.get("reason") or "not_resolved",
+                        "status": self.status().to_dict(),
+                    }
                 if self._local_latch_generation == expected_generation:
                     self._local_reason_code = ""
                     self._local_latch_generation = None
                     self._notified_stop_handler = None
-            current = self.status()
-            return {
-                "released": current.allowed,
-                "reason": "released"
-                if current.allowed
-                else current.reason_code.lower(),
-                "status": current.to_dict(),
-            }
+                current = self.status()
+                return {
+                    "released": current.allowed,
+                    "reason": "released"
+                    if current.allowed
+                    else current.reason_code.lower(),
+                    "status": current.to_dict(),
+                }
         except Exception:
             self._set_local_block("DURABLE_STATE_UNAVAILABLE")
             return {

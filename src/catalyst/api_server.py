@@ -41,13 +41,17 @@ import hashlib
 if __name__ == "__main__":
     sys.modules.setdefault("api_server", sys.modules[__name__])
 
-    # A standalone second process must discover durable ownership before
-    # importing CATalyst modules whose import hooks migrate config, start
-    # logging, or otherwise write into the shared data directory.
+    import atexit as _early_atexit
     import socket as _early_socket
     import read_only_diagnostics as _early_diagnostics
 
-    if _early_diagnostics.preflight_requires_diagnostics():
+    _early_startup_arbiter = _early_diagnostics.acquire_startup_arbiter()
+    _early_atexit.register(_early_startup_arbiter.release)
+    _early_diagnostics_only = not _early_startup_arbiter.acquired
+    if not _early_diagnostics_only:
+        _early_diagnostics_only = _early_diagnostics.preflight_requires_diagnostics()
+    if _early_diagnostics_only:
+        _early_startup_arbiter.release()
         try:
             _early_preferred_port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
         except (TypeError, ValueError):
@@ -55,9 +59,17 @@ if __name__ == "__main__":
         if not 1 <= _early_preferred_port <= 65535:
             _early_preferred_port = 5000
         _early_selected_port = None
-        for _early_candidate in range(
-            _early_preferred_port, min(65536, _early_preferred_port + 51)
-        ):
+        _early_candidates = list(
+            range(
+                _early_preferred_port + 1,
+                min(65536, _early_preferred_port + 51),
+            )
+        )
+        if not _early_candidates:
+            _early_candidates = list(
+                range(max(1, _early_preferred_port - 50), _early_preferred_port)
+            )
+        for _early_candidate in _early_candidates:
             _early_sock = _early_socket.socket(
                 _early_socket.AF_INET, _early_socket.SOCK_STREAM
             )
@@ -1285,6 +1297,28 @@ def initialize_mutation_runtime(
     return result
 
 
+def _start_owned_runtime_services(startup_authorization: dict) -> dict:
+    """Start tracked background services only from an actual owner entry path."""
+
+    if not isinstance(startup_authorization, dict) or (
+        startup_authorization.get("allowed") is not True
+    ):
+        return {"cat_resolver_started": False}
+    starter = globals().get("_start_background_cat_resolver")
+    if not callable(starter):
+        return {"cat_resolver_started": False}
+    try:
+        return {"cat_resolver_started": starter() is not None}
+    except Exception:
+        slog(
+            "SAFETY",
+            "Owned CAT resolver startup failed closed",
+            {"reason_code": "CAT_RESOLVER_START_FAILED"},
+            level="warning",
+        )
+        return {"cat_resolver_started": False}
+
+
 def _ensure_mutation_runtime() -> None:
     global _mutation_runtime, _mutation_runtime_db_path
     with _mutation_runtime_init_lock:
@@ -1943,11 +1977,33 @@ def _background_cat_resolve():
         print(f"[STARTUP] CAT metadata resolve failed (non-critical): {e}")
 
 
-import threading as _threading
+_startup_cat_resolver_thread = None
+_startup_cat_resolver_lock = threading.Lock()
 
-_threading.Thread(
-    target=_background_cat_resolve, daemon=True, name="cat-resolver"
-).start()
+
+def _start_background_cat_resolver():
+    """Start the CAT resolver only under an owned mutation permit."""
+
+    global _startup_cat_resolver_thread
+    with _startup_cat_resolver_lock:
+        current = _startup_cat_resolver_thread
+        if current is not None:
+            try:
+                if current.is_alive():
+                    return current
+            except Exception:
+                return None
+        try:
+            current = start_mutation_thread(
+                operation="startup:cat_metadata_resolve",
+                target=_background_cat_resolve,
+                name="cat-resolver",
+            )
+        except mutation_gate.MutationBlocked:
+            return None
+        _startup_cat_resolver_thread = current
+        return current
+
 
 # Track when the GUI log panel was last cleared.
 # Events older than this timestamp are hidden from the GUI but still
@@ -4155,15 +4211,15 @@ def _loopback_port_is_available(port: int) -> bool:
 
 
 def _select_standalone_server_mode(preferred_port: int) -> tuple[int, bool]:
-    """Choose the normal port or an alternate read-only diagnostic port."""
+    """Choose a free port without changing durable ownership authority."""
 
     preferred = int(preferred_port)
     if _loopback_port_is_available(preferred):
         return preferred, False
     for candidate in range(preferred + 1, min(65536, preferred + 51)):
         if _loopback_port_is_available(candidate):
-            return candidate, True
-    raise RuntimeError("no loopback diagnostics port is available")
+            return candidate, False
+    raise RuntimeError("no loopback server port is available")
 
 
 def _read_only_diagnostics_shutdown(_signum, _frame) -> None:
@@ -4204,11 +4260,30 @@ if __name__ == "__main__":
     print("  CATalyst V2 - The Smart One")
     print("=" * 60)
 
+    try:
+        init_database()
+        _startup_authorization = initialize_mutation_runtime()
+        _start_owned_runtime_services(_startup_authorization)
+    except Exception:
+        _startup_authorization = {
+            "allowed": False,
+            "reason_code": "DURABLE_STATE_UNAVAILABLE",
+        }
+    finally:
+        _early_startup_arbiter.release()
+
     # Confirm the selected normal/diagnostic port is not unexpectedly occupied.
     import socket as _socket
 
     _requested_port = _configured_flask_port()
     _port, _diagnostics_only = _select_standalone_server_mode(_requested_port)
+    if not _startup_authorization.get("allowed"):
+        signal.signal(signal.SIGINT, _read_only_diagnostics_shutdown)
+        signal.signal(signal.SIGTERM, _read_only_diagnostics_shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _read_only_diagnostics_shutdown)
+        _early_diagnostics.serve(_port)
+        sys.exit(0)
     _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
         _sock.settimeout(1)
@@ -4240,13 +4315,6 @@ if __name__ == "__main__":
         signal.signal(signal.SIGBREAK, _shutdown_handler)
 
     if _diagnostics_only:
-        _serve_read_only_diagnostics(_port)
-        sys.exit(0)
-
-    # Only the lease-seeking owner is allowed to initialize or migrate SQLite.
-    init_database()
-    _startup_authorization = initialize_mutation_runtime()
-    if not _startup_authorization.get("allowed"):
         _serve_read_only_diagnostics(_port)
         sys.exit(0)
 

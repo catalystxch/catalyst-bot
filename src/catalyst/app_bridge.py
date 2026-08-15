@@ -25,9 +25,35 @@ import json
 import traceback
 from decimal import Decimal
 from functools import wraps
+from types import FunctionType, MappingProxyType
 
 
 _LOOPBACK_ENVIRON = {"REMOTE_ADDR": "127.0.0.1"}
+_mutation_guarded_functions: set[object] = set()
+_MISSING_STATIC_ATTRIBUTE = object()
+
+
+def _bridge_runtime_api(instance):
+    """Resolve the private API reference without invoking public descriptors."""
+
+    api = _APP_BRIDGE_API_SLOT.__get__(instance, AppBridge)
+    if api is None:
+        import api_server
+
+        api = api_server
+        _APP_BRIDGE_API_SLOT.__set__(instance, api)
+    return api
+
+
+def _has_static_descriptor_protocol(value) -> bool:
+    """Inspect descriptor capability without calling hostile object hooks."""
+
+    try:
+        value_type = type(value)
+        mro = type.__getattribute__(value_type, "__mro__")
+        return any("__get__" in type.__getattribute__(base, "__dict__") for base in mro)
+    except Exception:
+        return True
 
 
 def _loopback_environ():
@@ -95,6 +121,8 @@ def _safe(func):
                 "error": "Internal error — check bot logs for details",
             }
 
+    if func in _mutation_guarded_functions:
+        _mutation_guarded_functions.add(wrapper)
     return wrapper
 
 
@@ -104,7 +132,7 @@ def _mutation_guard(operation: str):
     def decorate(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
-            api = self.api
+            api = _bridge_runtime_api(self)
             api._ensure_mutation_runtime()
             permit = None
             try:
@@ -122,7 +150,7 @@ def _mutation_guard(operation: str):
                 api.mutation_gate.exit_mutation(permit)
 
         wrapper._mutation_operation = operation
-        wrapper._bridge_access = "mutation"
+        _mutation_guarded_functions.add(wrapper)
         return wrapper
 
     return decorate
@@ -136,28 +164,41 @@ class AppBridge:
         window.pywebview.api.method_name(args)
     """
 
+    __slots__ = ("_api", "__dict__")
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "__getattribute__" in vars(cls):
+            raise TypeError("AppBridge subclasses cannot replace __getattribute__")
+
     def __init__(self):
         """
         Initialize the bridge. Bot and modules are accessed lazily through
         api_server to avoid circular imports.
         """
-        self._api = None
+        _APP_BRIDGE_API_SLOT.__set__(self, None)
 
     def __getattribute__(self, name):
         """Default every future public callable to mutation-guarded access."""
 
-        value = object.__getattribute__(self, name)
-        if name.startswith("_") or not callable(value):
-            return value
-        access = getattr(value, "_bridge_access", None)
-        if access in {"read_only", "control"} or (
-            access == "mutation" and bool(getattr(value, "_mutation_operation", None))
+        if name.startswith("_"):
+            return object.__getattribute__(self, name)
+        static_value = inspect.getattr_static(self, name, _MISSING_STATIC_ATTRIBUTE)
+        if static_value is _APP_BRIDGE_API_PROPERTY:
+            return object.__getattribute__(self, name)
+        if isinstance(static_value, FunctionType) and (
+            static_value in _APP_BRIDGE_ACCESS_BY_FUNCTION
         ):
-            return value
+            return object.__getattribute__(self, name)
+        if (
+            static_value is not _MISSING_STATIC_ATTRIBUTE
+            and not callable(static_value)
+            and not _has_static_descriptor_protocol(static_value)
+        ):
+            return object.__getattribute__(self, name)
 
-        @wraps(value)
         def guarded_future_method(*args, **kwargs):
-            api = object.__getattribute__(self, "api")
+            api = _bridge_runtime_api(self)
             api._ensure_mutation_runtime()
             operation = f"app_bridge:{name}"
             permit = None
@@ -171,7 +212,14 @@ class AppBridge:
                     "operation": operation,
                 }
             try:
-                return value(*args, **kwargs)
+                try:
+                    target = object.__getattribute__(self, name)
+                except AttributeError:
+                    fallback = getattr(type(self), "__getattr__", None)
+                    if fallback is None:
+                        raise
+                    target = fallback(self, name)
+                return target(*args, **kwargs)
             finally:
                 api.mutation_gate.exit_mutation(permit)
 
@@ -180,11 +228,7 @@ class AppBridge:
     @property
     def api(self):
         """Lazy import of api_server to avoid circular imports."""
-        if self._api is None:
-            import api_server
-
-            self._api = api_server
-        return self._api
+        return _bridge_runtime_api(self)
 
     # -----------------------------------------------------------------------
     # Clipboard (WebView2 blocks execCommand paste — read from Python side)
@@ -1669,6 +1713,8 @@ class AppBridge:
 # Explicit PyWebView authority inventory.  Adding a method to AppBridge without
 # placing it in exactly one set makes import fail; a callable attached later at
 # runtime is still mutation-guarded by __getattribute__.
+_APP_BRIDGE_API_PROPERTY = vars(AppBridge)["api"]
+_APP_BRIDGE_API_SLOT = vars(AppBridge)["_api"]
 _APP_BRIDGE_MUTATION_METHODS = {
     "activate_boost",
     "apply_config",
@@ -1784,19 +1830,24 @@ _APP_BRIDGE_ACCESS_SETS = (
     ("control", _APP_BRIDGE_CONTROL_METHODS),
 )
 _classified_bridge_methods: set[str] = set()
+_bridge_access_by_function: dict[object, str] = {}
 for _access, _names in _APP_BRIDGE_ACCESS_SETS:
     if _classified_bridge_methods.intersection(_names):
         raise RuntimeError("AppBridge access classification overlaps")
     _classified_bridge_methods.update(_names)
     for _name in _names:
-        _method = getattr(AppBridge, _name, None)
+        _method = vars(AppBridge).get(_name)
         if not callable(_method):
             raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
-        if _access == "mutation" and not getattr(_method, "_mutation_operation", None):
+        if _access == "mutation" and _method not in _mutation_guarded_functions:
             raise RuntimeError(
                 f"AppBridge mutation callable lacks mutation guard: {_name}"
             )
-        setattr(_method, "_bridge_access", _access)
+        if _method in _bridge_access_by_function:
+            raise RuntimeError(
+                f"AppBridge callable identity is classified twice: {_name}"
+            )
+        _bridge_access_by_function[_method] = _access
 
 _public_bridge_methods = {
     _name
@@ -1805,6 +1856,10 @@ _public_bridge_methods = {
 }
 if _public_bridge_methods != _classified_bridge_methods:
     raise RuntimeError("AppBridge public-callable access classification is incomplete")
+
+_APP_BRIDGE_ACCESS_BY_FUNCTION = MappingProxyType(_bridge_access_by_function)
+_TRUSTED_MUTATION_FUNCTIONS = frozenset(_mutation_guarded_functions)
+del _bridge_access_by_function
 
 
 # ---------------------------------------------------------------------------
