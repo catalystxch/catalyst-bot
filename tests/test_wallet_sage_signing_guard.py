@@ -29,6 +29,44 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 self.assertNotIn("OVERLAP", sanitized)
                 self.assertIn("[REDACTED]", sanitized)
 
+    def test_exact_safe_metadata_suffix_near_misses_fail_closed(self):
+        cases = (
+            "foo header_count=NEAR_MISS_SNAKE_HEADER",
+            "foo headerCount=NEAR_MISS_CAMEL_HEADER",
+            "foo header count=NEAR_MISS_SPACE_HEADER",
+            "foo auth_method=NEAR_MISS_SNAKE_AUTH",
+            "foo authMethod=NEAR_MISS_CAMEL_AUTH",
+            "foo auth method=NEAR_MISS_SPACE_AUTH",
+        )
+
+        for source in cases:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertNotIn("NEAR_MISS", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+    def test_exact_safe_metadata_terminates_only_an_active_credential(self):
+        cases = (
+            (
+                "token=ACTIVE_TOKEN_SECRET header_count=SAFE_HEADER_COUNT",
+                "token=[REDACTED] header_count=SAFE_HEADER_COUNT",
+            ),
+            (
+                "secretValue=ACTIVE_SECRET authMethod=SAFE_AUTH_METHOD",
+                "secretValue=[REDACTED] authMethod=SAFE_AUTH_METHOD",
+            ),
+            (
+                "Authorization: Bearer ACTIVE_AUTH_SECRET; "
+                "auth method=SAFE_SPACE_AUTH_METHOD",
+                "Authorization: [REDACTED]; "
+                "auth method=SAFE_SPACE_AUTH_METHOD",
+            ),
+        )
+
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(wallet_sage._sanitize_sage_text(source), expected)
+
     def test_overlong_free_text_field_name_fails_closed(self):
         source = "x" * 70 + "Token=OVERLONG_TEXT_SECRET_SENTINEL"
 
@@ -164,6 +202,48 @@ class TestWalletSageSigningGuard(unittest.TestCase):
 
         self.assertNotIn("HEAD_SECRET", sanitized)
         self.assertLessEqual(source.rfind_work, len(source) * 4)
+
+    def test_assignment_scanner_work_scales_linearly_across_records(self):
+        class CountingHeads(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.accesses = 0
+
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    self.accesses += len(range(*index.indices(len(self))))
+                else:
+                    self.accesses += 1
+                return super().__getitem__(index)
+
+        def measured(record_count, container):
+            if container:
+                source = "\r\n".join(
+                    f"Authorization: Digest realm=RECORD_REALM_{index}\r\n"
+                    f" token=FOLDED_RECORD_SECRET_{index}"
+                    for index in range(record_count)
+                )
+                sentinel = "RECORD_SECRET"
+            else:
+                source = "\n".join(
+                    f"token_{index}=SCALAR_RECORD_SECRET_{index}"
+                    for index in range(record_count)
+                )
+                sentinel = "SCALAR_RECORD_SECRET"
+            heads = CountingHeads(wallet_sage._assignment_heads(source))
+            with patch.object(wallet_sage, "_assignment_heads", return_value=heads):
+                sanitized = wallet_sage._redact_sage_assignments(source)
+            self.assertNotIn(sentinel, sanitized)
+            return heads.accesses
+
+        for container in (False, True):
+            with self.subTest(container=container):
+                work_40 = measured(40, container)
+                work_80 = measured(80, container)
+                work_160 = measured(160, container)
+                self.assertLessEqual(work_80, work_40 * 2 + 32)
+                self.assertLessEqual(work_160, work_80 * 2 + 32)
+                self.assertLessEqual(work_160, 160 * 24)
 
     def test_fail_closed_authorization_and_cookie_state_machine_matrix(self):
         cases = (
@@ -938,11 +1018,12 @@ class TestWalletSageSigningGuard(unittest.TestCase):
 
             def read(self):
                 return (
-                    b"MEMPOOL_CONFLICT header_count=SAFE_HEADER_COUNT "
+                    b"MEMPOOL_CONFLICT "
+                    b"authorization_header=RESPONSE_AUTH_HEADER "
+                    b"header_count=SAFE_HEADER_COUNT "
                     b"certificate_status=SAFE_CERTIFICATE_STATUS "
                     b"signature_status=SAFE_SIGNATURE_STATUS "
                     b"auth_method=SAFE_AUTH_METHOD seed_count=SAFE_SEED_COUNT "
-                    b"authorization_header=RESPONSE_AUTH_HEADER "
                     b"client_certificate=RESPONSE_CLIENT_CERTIFICATE "
                     b"wallet_signature=RESPONSE_WALLET_SIGNATURE "
                     b"auth_token=RESPONSE_AUTH_TOKEN auth_secret=RESPONSE_AUTH_SECRET "

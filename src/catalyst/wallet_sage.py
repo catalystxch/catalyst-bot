@@ -314,12 +314,6 @@ def _assignment_heads(text: str) -> list[dict[str, Any]]:
             safe_suffix = max(
                 valid_safe_suffixes, key=lambda head: head["name_start"]
             )
-            prefix = text[
-                full_head["name_start"] : safe_suffix["name_start"]
-            ].strip(" \t\"'")
-            if _classify_sage_field(prefix) == _FIELD_ORDINARY:
-                heads.append(safe_suffix)
-                continue
             heads.append(full_head)
             heads.append(safe_suffix)
             continue
@@ -398,6 +392,8 @@ def _credential_value_end(
     record_end = _logical_record_end(text, start, folded=container)
     candidate_index = current_index + 1
     while candidate_index < len(heads):
+        if heads[candidate_index]["name_start"] >= record_end:
+            break
         value_start = heads[candidate_index]["value_start"]
         group_end = candidate_index + 1
         while (
