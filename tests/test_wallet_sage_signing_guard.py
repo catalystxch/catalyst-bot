@@ -16,6 +16,90 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageSigningGuard(unittest.TestCase):
+    def test_colon_credentials_preserve_trailing_assignments_and_clean_marker(self):
+        cases = (
+            (
+                "authorization: first-word SECRET_TAIL "
+                "header_count=SAFE_HEADER_COUNT",
+                "authorization: [REDACTED] header_count=SAFE_HEADER_COUNT",
+            ),
+            (
+                "proxy_authorization: first-word SECRET_TAIL "
+                "auth_method=SAFE_AUTH_METHOD",
+                "proxy_authorization: [REDACTED] auth_method=SAFE_AUTH_METHOD",
+            ),
+        )
+
+        for source, expected in cases:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertEqual(sanitized, expected)
+                self.assertEqual(sanitized.count("[REDACTED]"), 1)
+                self.assertNotIn("[REDACTED]]", sanitized)
+
+    def test_assignment_redactions_share_clean_structural_boundaries(self):
+        cases = (
+            (
+                "Authorization: Bearer CRLF_AUTH_SECRET\r\n"
+                "Proxy-Authorization: Basic CRLF_PROXY_SECRET\r\n"
+                "header_count=SAFE_HEADER_COUNT",
+                "Authorization: [REDACTED]\r\n"
+                "Proxy-Authorization: [REDACTED]\r\n"
+                "header_count=SAFE_HEADER_COUNT",
+                2,
+            ),
+            (
+                "authorization: first-word COMMA_SECRET, "
+                "header_count=SAFE_HEADER_COUNT",
+                "authorization: [REDACTED], header_count=SAFE_HEADER_COUNT",
+                1,
+            ),
+            (
+                "proxy_authorization: first-word SEMICOLON_SECRET; "
+                "auth_method=SAFE_AUTH_METHOD",
+                "proxy_authorization: [REDACTED]; auth_method=SAFE_AUTH_METHOD",
+                1,
+            ),
+            (
+                '{"authorization": "Bearer JSON_AUTH_SECRET", '
+                '"header_count": "SAFE_HEADER_COUNT", '
+                '"proxy_authorization": "Basic JSON_PROXY_SECRET", '
+                '"auth_method": "SAFE_AUTH_METHOD"}',
+                '{"authorization": [REDACTED], '
+                '"header_count": "SAFE_HEADER_COUNT", '
+                '"proxy_authorization": [REDACTED], '
+                '"auth_method": "SAFE_AUTH_METHOD"}',
+                2,
+            ),
+            (
+                "Cookie: session=COOKIE_SECRET\r\n"
+                "Set-Cookie: session=SET_COOKIE_SECRET; Path=/\r\n"
+                "auth_method=SAFE_AUTH_METHOD",
+                "Cookie: [REDACTED]\r\n"
+                "Set-Cookie: [REDACTED]; Path=/\r\n"
+                "auth_method=SAFE_AUTH_METHOD",
+                2,
+            ),
+            (
+                "authorization: first AUTH_SECRET "
+                "header_count=SAFE_HEADER_COUNT "
+                "proxy_authorization: second PROXY_SECRET "
+                "auth_method=SAFE_AUTH_METHOD",
+                "authorization: [REDACTED] "
+                "header_count=SAFE_HEADER_COUNT "
+                "proxy_authorization: [REDACTED] "
+                "auth_method=SAFE_AUTH_METHOD",
+                2,
+            ),
+        )
+
+        for source, expected, redaction_count in cases:
+            with self.subTest(source=source):
+                sanitized = wallet_sage._sanitize_sage_text(source)
+                self.assertEqual(sanitized, expected)
+                self.assertEqual(sanitized.count("[REDACTED]"), redaction_count)
+                self.assertNotIn("[REDACTED]]", sanitized)
+
     def test_free_form_sanitizer_redacts_header_value_assignment_bypasses(self):
         bypasses = (
             ("cookie_header=COOKIE_HEADER_SECRET", "COOKIE_HEADER_SECRET"),

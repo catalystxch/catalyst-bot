@@ -53,11 +53,6 @@ _ASSIGNMENT_HEAD_CANDIDATE_RE = re.compile(
     re.IGNORECASE,
 )
 _ASSIGNMENT_VALUE_DELIMITER_RE = re.compile(r"[,;}\]\r\n]")
-_SENSITIVE_HEADER_RE = re.compile(
-    r"(?P<name>(?:proxy[-_ ]?authorization|authorization|set[-_ ]?cookie|cookie|"
-    r"x[-_ ]?api[-_ ]?(?:key|token))\s*:\s*)(?P<value>[^\r\n]+)",
-    re.IGNORECASE,
-)
 _PRIVATE_KEY_BLOCK_RE = re.compile(
     r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----.*?-----END(?: [A-Z]+)? PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL,
@@ -213,7 +208,10 @@ def _sage_assignment_value_end(text: str, start: int, next_head: int) -> int:
         if closing_quote >= 0:
             return closing_quote + 1
     delimiter = _ASSIGNMENT_VALUE_DELIMITER_RE.search(text, start, next_head)
-    return delimiter.start() if delimiter else next_head
+    value_end = delimiter.start() if delimiter else next_head
+    while value_end > start and text[value_end - 1] in " \t":
+        value_end -= 1
+    return value_end
 
 
 def _redact_sage_assignments(text: str) -> str:
@@ -225,7 +223,7 @@ def _redact_sage_assignments(text: str) -> str:
             continue
         next_head = len(text)
         for candidate in heads[index + 1 :]:
-            if candidate["name_start"] >= head["value_start"]:
+            if candidate["name_start"] > head["value_start"]:
                 next_head = candidate["name_start"]
                 break
         value_end = _sage_assignment_value_end(
@@ -250,9 +248,6 @@ def _redact_sage_assignments(text: str) -> str:
 def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
     """Redact secret-bearing text before it reaches a caller or any log sink."""
     text = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, str(value))
-    text = _SENSITIVE_HEADER_RE.sub(
-        lambda match: f"{match.group('name')}{_REDACTED}", text
-    )
     text = _redact_sage_assignments(text)
     return text[:limit]
 
