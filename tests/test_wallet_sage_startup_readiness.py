@@ -38,6 +38,16 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
                     "C:/configured/ssl/wallet.key",
                 ),
                 patch.object(wallet_sage.cfg, "sage_connection_settings"),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SAGE_RPC_URL": "https://127.0.0.1:9999",
+                        "SAGE_CERT_PATH": "C:/process/ssl/wallet.crt",
+                        "SAGE_KEY_PATH": "C:/process/ssl/wallet.key",
+                        "_CATALYST_PRESERVE_PROCESS_ENV": "",
+                    },
+                    clear=False,
+                ),
             ):
                 wallet_sage.cfg.sage_connection_settings.return_value = (
                     "https://127.0.0.1:9257",
@@ -48,6 +58,7 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
                 wallet_sage.reload_connection_settings()
                 self.assertEqual(wallet_sage.CERT_PATH, "C:/configured/ssl/wallet.crt")
                 self.assertEqual(wallet_sage.KEY_PATH, "C:/configured/ssl/wallet.key")
+                self.assertEqual(wallet_sage.WALLET_URL, "https://127.0.0.1:9257")
         finally:
             wallet_sage.CERT_PATH = old_cert
             wallet_sage.KEY_PATH = old_key
@@ -124,6 +135,7 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
                     patch.dict(
                         os.environ,
                         {
+                            "_CATALYST_PRESERVE_PROCESS_ENV": "1",
                             "SAGE_RPC_URL": "https://127.0.0.1:9257",
                             "SAGE_CERT_PATH": cert_path,
                             "SAGE_KEY_PATH": key_path,
@@ -139,6 +151,41 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
                 wallet_sage.KEY_PATH = old_key
                 wallet_sage.WALLET_URL = old_url
                 wallet_sage._conn_local.conn = None
+
+    def test_reload_connection_settings_does_not_mix_partial_process_cert_pair(self):
+        old_cert = wallet_sage.CERT_PATH
+        old_key = wallet_sage.KEY_PATH
+        old_url = wallet_sage.WALLET_URL
+        try:
+            with (
+                patch.object(
+                    wallet_sage.cfg,
+                    "sage_connection_settings",
+                    return_value=(
+                        "https://127.0.0.1:9257",
+                        "C:/configured/ssl/wallet.crt",
+                        "C:/configured/ssl/wallet.key",
+                        "",
+                    ),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "_CATALYST_PRESERVE_PROCESS_ENV": "1",
+                        "SAGE_CERT_PATH": "C:/process/ssl/wallet.crt",
+                        "SAGE_KEY_PATH": "",
+                    },
+                    clear=False,
+                ),
+            ):
+                wallet_sage.reload_connection_settings()
+                self.assertEqual(wallet_sage.CERT_PATH, "C:/configured/ssl/wallet.crt")
+                self.assertEqual(wallet_sage.KEY_PATH, "C:/configured/ssl/wallet.key")
+        finally:
+            wallet_sage.CERT_PATH = old_cert
+            wallet_sage.KEY_PATH = old_key
+            wallet_sage.WALLET_URL = old_url
+            wallet_sage._conn_local.conn = None
 
     def test_get_chia_health_reports_syncing_when_wallet_not_synced(self):
         # Mock get_peer_connections to avoid real network calls that may fail

@@ -22,6 +22,7 @@ offer is already gone from the wallet's view.
 """
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
@@ -41,6 +42,56 @@ def _console(msg: str) -> None:
         print(msg, flush=True)
     except UnicodeEncodeError:
         print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+_REDACTED = "[REDACTED]"
+_SENSITIVE_NAME_RE = re.compile(
+    r"(?:api[_-]?(?:key|token)|private[_-]?key|secret|token|password|"
+    r"passphrase|authorization|auth|credential|mnemonic|seed|puzzle[_-]?reveal|"
+    r"signature|certificate|cert)$",
+    re.IGNORECASE,
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?P<name>[\"']?(?:api[_-]?(?:key|token)|private[_-]?key|secret|token|"
+    r"password|passphrase|authorization|auth|credential|mnemonic|seed|"
+    r"puzzle[_-]?reveal|signature|certificate|cert)[\"']?\s*[:=]\s*)"
+    r"(?:\[REDACTED\]|\"[^\"]*\"|'[^']*'|[^,\s;}\]]+)",
+    re.IGNORECASE,
+)
+_PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----.*?-----END(?: [A-Z]+)? PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_sensitive_name(name: Any) -> bool:
+    """Return whether a structured field name may contain a secret."""
+    return bool(_SENSITIVE_NAME_RE.search(str(name)))
+
+
+def _sanitize_sage_text(value: Any, limit: int = 500) -> str:
+    """Redact secret-bearing text before it reaches a caller or any log sink."""
+    text = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, str(value))
+    text = _SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('name')}{_REDACTED}", text
+    )
+    return text[:limit]
+
+
+def _sanitize_sage_data(value: Any, limit: int = 80) -> Any:
+    """Produce bounded, recursively redacted structured data for diagnostics."""
+    if isinstance(value, dict):
+        return {
+            str(key): _REDACTED
+            if _is_sensitive_name(key)
+            else _sanitize_sage_data(item, limit)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_sage_data(item, limit) for item in value]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _sanitize_sage_text(value, limit)
 
 
 # Sage defaults to port 9257 — uses HTTPS with self-signed cert
@@ -202,10 +253,13 @@ def _platform_sage_ssl_dirs(sage_data_dir: str) -> List[str]:
 def _connection_settings() -> Tuple[str, str, str, str]:
     """Return cfg settings with explicit process overrides for startup helpers."""
     url, cert_path, key_path, data_dir = cfg.sage_connection_settings()
-    url = os.getenv("SAGE_RPC_URL") or url
-    cert_path = os.getenv("SAGE_CERT_PATH") or cert_path
-    key_path = os.getenv("SAGE_KEY_PATH") or key_path
-    data_dir = os.getenv("SAGE_DATA_DIR") or data_dir
+    if os.getenv("_CATALYST_PRESERVE_PROCESS_ENV") == "1":
+        url = os.getenv("SAGE_RPC_URL") or url
+        data_dir = os.getenv("SAGE_DATA_DIR") or data_dir
+        process_cert = os.getenv("SAGE_CERT_PATH")
+        process_key = os.getenv("SAGE_KEY_PATH")
+        if process_cert and process_key:
+            cert_path, key_path = process_cert, process_key
     return url, cert_path, key_path, data_dir
 
 
@@ -551,21 +605,23 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
 
             level = _sage_tx_error_level(kind, path)
             expected_cancel_settlement = level == "info"
+            safe_path = _sanitize_sage_text(path, 120)
+            safe_snippet = _sanitize_sage_text(snippet, 500)
             if expected_cancel_settlement:
                 message = (
-                    f"Sage {kind} on {path}: cancel appears in flight; "
+                    f"Sage {kind} on {safe_path}: cancel appears in flight; "
                     "the bot will verify before marking it cancelled"
                 )
             else:
-                message = f"⚠️ Sage {kind} on {path}: {snippet[:200]}"
+                message = f"⚠️ Sage {kind} on {safe_path}: {safe_snippet[:200]}"
             _le(
                 level,
                 f"sage_{kind.lower()}",
                 message,
                 data={
-                    "endpoint": path,
+                    "endpoint": safe_path,
                     "kind": kind,
-                    "snippet": snippet[:500],
+                    "snippet": safe_snippet,
                     "expected_cancel_settlement": expected_cancel_settlement,
                     "thread": _t.current_thread().name,
                 },
@@ -601,16 +657,23 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
         # Check for specific error types in non-200 responses
         if "MEMPOOL_CONFLICT" in data:
             _log_sage_error("MEMPOOL_CONFLICT", data)
-            raise SageMempoolConflict(f"MEMPOOL_CONFLICT on {path}: {data[:200]}")
+            raise SageMempoolConflict(
+                f"MEMPOOL_CONFLICT on {path}: {_sanitize_sage_text(data, 200)}"
+            )
         if "UNKNOWN_UNSPENT" in data:
             _log_sage_error("UNKNOWN_UNSPENT", data)
-            raise SageUnknownUnspent(f"UNKNOWN_UNSPENT on {path}: {data[:200]}")
+            raise SageUnknownUnspent(
+                f"UNKNOWN_UNSPENT on {path}: {_sanitize_sage_text(data, 200)}"
+            )
         if "ALREADY_INCLUDING_TRANSACTION" in data:
             _log_sage_error("ALREADY_INCLUDING", data)
             raise SageAlreadyIncluding(
-                f"ALREADY_INCLUDING_TRANSACTION on {path}: {data[:200]}"
+                "ALREADY_INCLUDING_TRANSACTION on "
+                f"{path}: {_sanitize_sage_text(data, 200)}"
             )
-        raise ConnectionError(f"Sage HTTP {resp.status}: {data[:300]}")
+        raise ConnectionError(
+            f"Sage HTTP {resp.status}: {_sanitize_sage_text(data, 300)}"
+        )
 
 
 # Quiet mode: suppress RPC error logging
@@ -641,6 +704,7 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
             return None
 
     start = time.time()
+    safe_endpoint = _sanitize_sage_text(endpoint, 120)
 
     try:
         result = _sage_post(endpoint, payload, timeout=timeout)
@@ -648,20 +712,22 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         if WALLET_DEBUG:
             elapsed = time.time() - start
             if elapsed > 1.0:
-                _console(f"⏱️  [Sage] {endpoint} took {elapsed:.2f}s")
+                _console(f"⏱️  [Sage] {safe_endpoint} took {elapsed:.2f}s")
 
         return result
     except SageMempoolConflict as e:
         elapsed = time.time() - start
+        safe_error = _sanitize_sage_text(e)
         _conflict_level = _sage_tx_error_level("MEMPOOL_CONFLICT", endpoint)
         if _conflict_level == "info":
             _console(
-                f"   [Sage] cancel already in flight on {endpoint} "
+                f"   [Sage] cancel already in flight on {safe_endpoint} "
                 f"(after {elapsed:.2f}s); will verify"
             )
         else:
             _console(
-                f"⚠️  [Sage] MEMPOOL_CONFLICT on {endpoint} (after {elapsed:.2f}s): {e}"
+                "⚠️  [Sage] MEMPOOL_CONFLICT on "
+                f"{safe_endpoint} (after {elapsed:.2f}s): {safe_error}"
             )
         # Structured event so we can query/display these in the GUI and
         # diagnose root cause. Includes payload key summary so we know
@@ -669,29 +735,25 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         try:
             from database import log_event as _le
 
-            _payload_summary = {
-                k: (str(v)[:80] if not isinstance(v, (int, float, bool)) else v)
-                for k, v in (payload or {}).items()
-                if k != "puzzle_reveal"
-            }
+            _payload_summary = _sanitize_sage_data(payload or {})
             if _conflict_level == "info":
                 message = (
-                    f"Sage MEMPOOL_CONFLICT on {endpoint} after {elapsed:.2f}s: "
+                    f"Sage MEMPOOL_CONFLICT on {safe_endpoint} after {elapsed:.2f}s: "
                     "cancel appears in flight; bot will verify"
                 )
             else:
                 message = (
-                    f"⚠️ Sage MEMPOOL_CONFLICT on {endpoint} after {elapsed:.2f}s: "
-                    f"{str(e)[:200]}"
+                    f"⚠️ Sage MEMPOOL_CONFLICT on {safe_endpoint} after {elapsed:.2f}s: "
+                    f"{safe_error[:200]}"
                 )
             _le(
                 _conflict_level,
                 "sage_mempool_conflict",
                 message,
                 data={
-                    "endpoint": endpoint,
+                    "endpoint": safe_endpoint,
                     "elapsed_secs": round(elapsed, 2),
-                    "error_message": str(e)[:500],
+                    "error_message": safe_error,
                     "expected_cancel_settlement": _conflict_level == "info",
                     "payload_summary": _payload_summary,
                 },
@@ -702,22 +764,27 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         return {
             "error": "MEMPOOL_CONFLICT",
             "success": False,
-            "message": str(e),
-            "endpoint": endpoint,
+            "message": safe_error,
+            "endpoint": safe_endpoint,
         }
     except SageUnknownUnspent as e:
         elapsed = time.time() - start
-        _console(f"⚠️  [Sage] UNKNOWN_UNSPENT on {endpoint} (after {elapsed:.2f}s): {e}")
+        safe_error = _sanitize_sage_text(e)
+        _console(
+            f"⚠️  [Sage] UNKNOWN_UNSPENT on {safe_endpoint} (after {elapsed:.2f}s): "
+            f"{safe_error}"
+        )
         # Return structured error — coin not confirmed on-chain yet or already spent
         return {
             "error": "UNKNOWN_UNSPENT",
             "success": False,
-            "message": str(e),
-            "endpoint": endpoint,
+            "message": safe_error,
+            "endpoint": safe_endpoint,
         }
     except ConnectionError as e:
         elapsed = time.time() - start
         err_str = str(e)
+        safe_error = _sanitize_sage_text(e, 300)
         # Suppress the noisy error print for the one expected 404 case:
         # `initialize` returns 404 on Sage versions that don't require an
         # explicit init RPC. ensure_initialized() handles this dict and
@@ -725,14 +792,20 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
         # with a ❌ line in the log every startup.
         _is_expected_init_404 = endpoint == "initialize" and "404" in err_str
         if not _quiet_mode and not _is_expected_init_404:
-            _console(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+            _console(
+                f"❌ Sage RPC error calling {safe_endpoint} (after {elapsed:.2f}s): "
+                f"{safe_error}"
+            )
         # Return structured error so callers can see the actual message
         # (previously returned None which became "Unknown error" in logs)
-        return {"error": err_str[:300], "success": False, "endpoint": endpoint}
+        return {"error": safe_error, "success": False, "endpoint": safe_endpoint}
     except Exception as e:
         elapsed = time.time() - start
         if not _quiet_mode:
-            _console(f"❌ Sage RPC error calling {endpoint} (after {elapsed:.2f}s): {e}")
+            _console(
+                f"❌ Sage RPC error calling {safe_endpoint} (after {elapsed:.2f}s): "
+                f"{_sanitize_sage_text(e)}"
+            )
         return None
 
 
