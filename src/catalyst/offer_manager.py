@@ -1447,6 +1447,78 @@ class OfferManager:
         )
 
     @staticmethod
+    def _canonical_sage_trade_id(value: Any) -> Optional[str]:
+        if type(value) is not str or len(value) != 64:
+            return None
+        if any(character not in "0123456789abcdef" for character in value):
+            return None
+        return value
+
+    @staticmethod
+    def _canonical_sage_offer_text(value: Any) -> Optional[str]:
+        if (
+            type(value) is not str
+            or not value.startswith("offer1")
+            or value != value.strip()
+            or len(value) > 4 * 1024 * 1024
+        ):
+            return None
+        try:
+            from chia.util.bech32m import bech32_decode
+            from chia.wallet.trading.offer import Offer
+
+            human_readable_part, data = bech32_decode(value, max_length=len(value))
+            if human_readable_part != "offer" or data is None:
+                return None
+            Offer.from_bech32(value)
+        except Exception:
+            return None
+        return value
+
+    @staticmethod
+    def _canonical_sage_creation_identity(result: Any) -> Optional[tuple[str, str]]:
+        if type(result) is not dict or result.get("success") is not True:
+            return None
+        for error_key in ("error", "error_message"):
+            error = result.get(error_key)
+            if error is not None and not (type(error) is str and error == ""):
+                return None
+        status = result.get("status")
+        if status is not None and type(status) is not str:
+            return None
+        if type(status) is str and status.strip().lower() in {
+            "error",
+            "failed",
+            "failure",
+            "rejected",
+        }:
+            return None
+        trade_record_value = result.get("trade_record")
+        if trade_record_value is None:
+            trade_record = {}
+        elif type(trade_record_value) is dict:
+            trade_record = trade_record_value
+        else:
+            return None
+
+        def supplied_trade_id(value: Any) -> tuple[bool, Optional[str]]:
+            if value is None or (type(value) is str and value == ""):
+                return False, None
+            return True, OfferManager._canonical_sage_trade_id(value)
+
+        direct_present, direct = supplied_trade_id(result.get("trade_id"))
+        nested_present, nested = supplied_trade_id(trade_record.get("trade_id"))
+        if (direct_present and direct is None) or (nested_present and nested is None):
+            return None
+        if direct is not None and nested is not None and direct != nested:
+            return None
+        trade_id = direct if direct is not None else nested
+        offer_text = OfferManager._canonical_sage_offer_text(result.get("offer"))
+        if trade_id is None or offer_text is None:
+            return None
+        return trade_id, offer_text
+
+    @staticmethod
     def _canonical_selected_coin_id(value: Any) -> str:
         if type(value) is not str:
             raise ValueError("selected coin ID must be canonical text")
@@ -1690,7 +1762,9 @@ class OfferManager:
         state = str(existing.get("lifecycle_state") or "")
         if state == "created":
             trade_id = str(existing.get("sage_trade_id") or "")
-            offer_max_time = OfferManager._persisted_creation_offer_max_time(intent)
+            offer_max_time = OfferManager._persisted_creation_offer_max_time(
+                intent, existing
+            )
             if offer_max_time is None:
                 OfferManager._trip_creation_latch(
                     intent,
@@ -1728,6 +1802,7 @@ class OfferManager:
     @staticmethod
     def _persisted_creation_offer_max_time(
         intent: _CanonicalOfferCreationIntent,
+        existing: dict,
     ) -> Optional[int]:
         try:
             events = database.get_offer_operation_events(intent.operation_id)
@@ -1739,6 +1814,10 @@ class OfferManager:
             try:
                 canonical_event = database.validate_offer_operation_event(event)
                 evidence = json.loads(canonical_event["evidence_json"])
+                journal = json.loads(canonical_event["wallet_identity_json"])
+                journal, run_id, wallet_hash, network = (
+                    OfferManager._verified_continuation_journal(journal, intent)
+                )
             except (KeyError, TypeError, ValueError):
                 return None
             if (
@@ -1769,6 +1848,10 @@ class OfferManager:
                 != [list(item) for item in intent.offer_items]
                 or evidence["offer_size_uniqueness"] != intent.offer_size_uniqueness()
                 or evidence["selected_coin_ids"] != [intent.selected_coin_id]
+                or evidence["continuation_journal_sha256"] != journal["snapshot_sha256"]
+                or run_id != existing.get("run_id")
+                or wallet_hash != existing.get("wallet_fingerprint_hash")
+                or network != existing.get("network")
             ):
                 return None
             continuation_digest = evidence["continuation_journal_sha256"]
@@ -2220,29 +2303,16 @@ class OfferManager:
                 and result.get("_catalyst_effect_attempted") is True
             )
             success = type(result) is dict and result.get("success") is True
-            trade_record_value = result.get("trade_record") if success else None
-            trade_record = (
-                trade_record_value if type(trade_record_value) is dict else {}
-            )
-            direct_trade_id = result.get("trade_id") if success else None
-            nested_trade_id = trade_record.get("trade_id") if success else None
-            trade_id = (
-                direct_trade_id
-                if type(direct_trade_id) is str and direct_trade_id
-                else (
-                    nested_trade_id
-                    if type(nested_trade_id) is str and nested_trade_id
-                    else ""
-                )
-            )
-            offer_value = result.get("offer") if success else None
-            offer_text = offer_value if type(offer_value) is str and offer_value else ""
+            sage_identity = self._canonical_sage_creation_identity(result)
+            trade_id, offer_text = sage_identity or ("", "")
             result_reason = result.get("reason") if type(result) is dict else None
             safe_result_reason = (
                 result_reason[:128]
                 if type(result_reason) is str and result_reason
                 else "MALFORMED_RESULT"
             )
+            if success and sage_identity is None:
+                safe_result_reason = "MALFORMED_RESULT"
             finalized_at = datetime.now(timezone.utc).isoformat()
             base_evidence = {
                 "canonical_intent_sha256": intent.canonical_intent_sha256,

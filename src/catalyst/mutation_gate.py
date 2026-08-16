@@ -560,15 +560,22 @@ def _is_exact_prepared_creation_blocker(
     if type(unresolved) is not list or len(unresolved) != 1:
         return False
     blocker = unresolved[0]
-    return type(blocker) is dict and {
-        "operation_id": blocker.get("operation_id"),
-        "intent_id": blocker.get("intent_id"),
-        "operation_type": blocker.get("operation_type"),
-        "attempt": blocker.get("attempt"),
-        "phase": blocker.get("phase"),
-        "outcome": blocker.get("outcome"),
-        "reason_code": blocker.get("reason_code"),
-        "blocks_mutation": blocker.get("blocks_mutation"),
+    try:
+        blocker = database.validate_offer_operation_event(blocker)
+    except (TypeError, ValueError):
+        return False
+    return {
+        "operation_id": blocker["operation_id"],
+        "intent_id": blocker["intent_id"],
+        "operation_type": blocker["operation_type"],
+        "attempt": blocker["attempt"],
+        "phase": blocker["phase"],
+        "outcome": blocker["outcome"],
+        "transaction_id": blocker["transaction_id"],
+        "spend_identity": blocker["spend_identity"],
+        "reason_code": blocker["reason_code"],
+        "blocks_mutation": blocker["blocks_mutation"],
+        "timestamps_match": blocker["request_timestamp"] == blocker["created_at"],
     } == {
         "operation_id": operation_id,
         "intent_id": intent_id,
@@ -576,8 +583,11 @@ def _is_exact_prepared_creation_blocker(
         "attempt": 1,
         "phase": "PREPARED",
         "outcome": "PREPARED",
+        "transaction_id": None,
+        "spend_identity": None,
         "reason_code": "INTENT_PREPARED",
         "blocks_mutation": 1,
+        "timestamps_match": True,
     }
 
 

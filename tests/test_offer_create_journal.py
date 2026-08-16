@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import socket
 import os
 import hashlib
@@ -21,6 +22,7 @@ COIN_A = "a" * 64
 COIN_B = "b" * 64
 COIN_C = "d" * 64
 AT = "2026-08-16T12:00:00Z"
+VALID_SAGE_OFFER = "offer1qqr83wcuu2rykccqsgpsedq9qpyxgqxptsfxvk"
 CREATION_CONTEXT = {
     "slot_key": "ladder:buy:7",
     "generation": 3,
@@ -774,12 +776,13 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
     monkeypatch,
 ):
     def explode(*_args, **_kwargs):
+        _kwargs["_identity_recheck"]("make_offer")
         raise RuntimeError("response lost")
 
     permit, identities, exits, checks = _stub_continuation_authority(
         monkeypatch,
         effect=explode,
-        identity_count=2,
+        identity_count=3,
     )
     continuation = wallet.begin_offer_creation_continuation(
         operation_id="create:intent-a",
@@ -799,6 +802,51 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
         "reason": "WALLET_MUTATION_FAILED",
         "_catalyst_effect_attempted": True,
     }
+    assert checks == [
+        (permit, "wallet:create_offer", "create:intent-a", "intent-a"),
+        (
+            permit,
+            "wallet:create_offer:make_offer:identity",
+            "create:intent-a",
+            "intent-a",
+        ),
+    ]
+    assert exits == [permit]
+    assert identities == []
+
+
+def test_offer_creation_continuation_local_rejection_is_proven_no_effect(
+    monkeypatch,
+):
+    adapter_calls = []
+
+    def reject_locally(*_args, **_kwargs):
+        adapter_calls.append(True)
+        return {"success": False, "reason": "LOCAL_VALIDATION_REJECTED"}
+
+    permit, identities, exits, checks = _stub_continuation_authority(
+        monkeypatch,
+        effect=reject_locally,
+        identity_count=2,
+    )
+    continuation = wallet.begin_offer_creation_continuation(
+        operation_id="create:intent-a",
+        intent_id="intent-a",
+    )
+
+    result = wallet.create_offer(
+        {"1": -1000, "2": 2000},
+        _creation_continuation=continuation,
+        _creation_operation_id="create:intent-a",
+        _creation_intent_id="intent-a",
+    )
+
+    assert result == {
+        "success": False,
+        "reason": "LOCAL_VALIDATION_REJECTED",
+        "_catalyst_effect_attempted": False,
+    }
+    assert adapter_calls == [True]
     assert checks == [(permit, "wallet:create_offer", "create:intent-a", "intent-a")]
     assert exits == [permit]
     assert identities == []
@@ -839,7 +887,7 @@ def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1journaled",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -893,7 +941,10 @@ def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(
     assert intent["slot_key"] == CREATION_CONTEXT["slot_key"]
     assert intent["generation"] == CREATION_CONTEXT["generation"]
     assert intent["sage_trade_id"] == "3" * 64
-    assert intent["offer_text_sha256"] == hashlib.sha256(b"offer1journaled").hexdigest()
+    assert (
+        intent["offer_text_sha256"]
+        == hashlib.sha256(VALID_SAGE_OFFER.encode()).hexdigest()
+    )
     assert database.get_offer_intent_coin_reservations(intent["intent_id"]) == [
         {
             "coin_id": COIN_A,
@@ -976,7 +1027,7 @@ def test_offer_manager_ladder_generation_advances_after_failure_but_not_created(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1generation",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -1195,7 +1246,7 @@ def test_offer_manager_effect_arguments_are_part_of_canonical_intent_identity(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1canonicaleffect",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -1251,7 +1302,7 @@ def test_offer_manager_wall_clock_drift_does_not_change_idempotency_identity(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1clockstable",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -1295,6 +1346,7 @@ def test_offer_manager_wall_clock_drift_does_not_change_idempotency_identity(
         "extra_field",
         "missing_prepared",
         "unparseable_evidence",
+        "journal_cross_binding",
     ],
 )
 def test_offer_manager_created_replay_rejects_tampered_prepared_evidence(
@@ -1310,7 +1362,7 @@ def test_offer_manager_created_replay_rejects_tampered_prepared_evidence(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1tamperedreplay",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -1352,6 +1404,18 @@ def test_offer_manager_created_replay_rejects_tampered_prepared_evidence(
             prepared["reason_code"] = "ALTERED_PREPARED_REASON"
         elif tamper == "extra_field":
             prepared["unexpected_field"] = "not an exact journal row"
+        elif tamper == "journal_cross_binding":
+            journal = json.loads(prepared["wallet_identity_json"])
+            journal["snapshot"]["authority"]["authority_generation_digest"] = "5" * 64
+            snapshot_encoded = json.dumps(
+                journal["snapshot"], sort_keys=True, separators=(",", ":")
+            )
+            journal["snapshot_sha256"] = hashlib.sha256(
+                snapshot_encoded.encode()
+            ).hexdigest()
+            prepared["wallet_identity_json"] = json.dumps(
+                journal, sort_keys=True, separators=(",", ":")
+            )
         else:
             prepared["evidence_json"] = "{"
         return rows
@@ -1467,7 +1531,7 @@ def test_offer_manager_sage_backend_authority_ignores_mutable_type_drift(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1authority",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -1711,6 +1775,166 @@ class _HostileWalletResultValue:
 
     def __str__(self):
         raise AssertionError("wallet result values must not be coerced to str")
+
+
+class _HostileStatus(str):
+    pass
+
+
+def test_canonical_sage_offer_parser_dependency_absence_fails_closed(monkeypatch):
+    real_import = builtins.__import__
+
+    def unavailable_chia(name, *args, **kwargs):
+        if name in {"chia.util.bech32m", "chia.wallet.trading.offer"}:
+            raise ImportError("parser unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable_chia)
+
+    assert (
+        offer_manager.OfferManager._canonical_sage_offer_text(VALID_SAGE_OFFER) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "wallet_result",
+    [
+        {
+            "success": True,
+            "trade_id": "not-a-sage-id",
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "trade_record": {"trade_id": "4" * 64},
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": "not-a-sage-offer",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "error": "contradictory wallet error",
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": "offer1",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": "offer1b",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": "offer1qqqqqq",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": "offer1qygzyaw",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER.upper(),
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "error_message": "contradictory wallet error",
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "status": "failed",
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER + " ",
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "status": _HostileStatus("failed"),
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+        {
+            "success": True,
+            "status": object(),
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        },
+    ],
+)
+def test_offer_manager_malformed_or_contradictory_sage_identity_is_unknown(
+    isolated_database,
+    monkeypatch,
+    wallet_result,
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+
+    def effect(*_args, **_kwargs):
+        effects.append(True)
+        return dict(wallet_result)
+
+    begun, _closed = _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    manager = offer_manager.OfferManager()
+    monkeypatch.setattr(
+        manager,
+        "_verify_sage_offer_locked_inputs",
+        lambda *_args, **_kwargs: {
+            "verified": True,
+            "locked_coin_ids": ["0x" + COIN_A],
+            "selected_present": True,
+        },
+    )
+
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+    )
+
+    intent = database.get_offer_intent(begun[0]["intent_id"])
+    assert result["success"] is False
+    assert result["reason"] == "OFFER_CREATION_RECONCILIATION_REQUIRED"
+    assert effects == [True]
+    assert intent["lifecycle_state"] == "creation_unknown"
+    assert intent["sage_trade_id"] is None
+    assert intent["offer_text_sha256"] is None
+    assert (
+        database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
+        == "reserved"
+    )
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
 def test_offer_manager_hostile_success_fields_finalize_unknown_without_raising(
@@ -1966,7 +2190,7 @@ def test_offer_manager_post_effect_exception_is_stable_unknown_and_latched(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1exceptionwindow",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -2033,7 +2257,7 @@ def test_offer_manager_latch_failure_does_not_mask_reconciliation_result(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1latchfailure",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -2175,7 +2399,7 @@ def test_offer_manager_crash_boundaries_never_resubmit_ambiguous_intent(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1journaled",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -2263,7 +2487,7 @@ def test_offer_manager_concurrent_creation_has_exactly_one_effect_winner(
         return {
             "success": True,
             "trade_id": ("3" if len(effects) == 1 else "4") * 64,
-            "offer": f"offer1journaled{len(effects)}",
+            "offer": VALID_SAGE_OFFER,
             "_catalyst_effect_attempted": True,
         }
 
@@ -2394,6 +2618,27 @@ def test_mutation_gate_continuation_allows_only_its_prepared_blocker(
     assert fresh_binding is binding
     assert fresh_adapter is adapter
     assert identity_decision["allowed"] is True
+    real_authorization_snapshot = database.get_mutation_authorization_snapshot
+
+    def corrupt_authorization_snapshot(*args, **kwargs):
+        snapshot = real_authorization_snapshot(*args, **kwargs)
+        snapshot["unresolved"] = [dict(row) for row in snapshot["unresolved"]]
+        snapshot["unresolved"][0]["evidence_sha256"] = "0" * 64
+        return snapshot
+
+    monkeypatch.setattr(
+        database,
+        "get_mutation_authorization_snapshot",
+        corrupt_authorization_snapshot,
+    )
+    with pytest.raises(mutation_gate.MutationBlocked) as corrupt:
+        mutation_gate.require_wallet_operation_continuation(
+            permit,
+            "wallet:create_offer",
+            "create:intent-a",
+            "intent-a",
+        )
+    assert corrupt.value.reason_code == "UNRESOLVED_OPERATIONS"
     with pytest.raises(mutation_gate.MutationBlocked) as wrong:
         mutation_gate.require_wallet_operation_continuation(
             permit,
@@ -2496,6 +2741,27 @@ def test_worker_continuation_journals_exact_delegation_generation_and_epoch(
         assert len(proof["authority_generation_digest"]) == 64
         assert authorized_binding == binding
         assert authorized_adapter is adapter
+        real_authorization_snapshot = database.get_mutation_authorization_snapshot
+
+        def corrupt_authorization_snapshot(*args, **kwargs):
+            snapshot = real_authorization_snapshot(*args, **kwargs)
+            snapshot["unresolved"] = [dict(row) for row in snapshot["unresolved"]]
+            snapshot["unresolved"][0]["evidence_sha256"] = "0" * 64
+            return snapshot
+
+        monkeypatch.setattr(
+            database,
+            "get_mutation_authorization_snapshot",
+            corrupt_authorization_snapshot,
+        )
+        with pytest.raises(mutation_gate.MutationBlocked) as corrupt:
+            mutation_gate.require_wallet_operation_continuation(
+                permit,
+                "wallet:create_offer",
+                "create:intent-worker",
+                "intent-worker",
+            )
+        assert corrupt.value.reason_code == "WORKER_PARENT_LEASE_INVALID"
         database.finalize_offer_intent(
             intent_id="intent-worker",
             operation_id="create:intent-worker",
@@ -2541,7 +2807,7 @@ def test_offer_manager_real_gate_and_wallet_continuation_cross_prepared_blocker(
         return {
             "success": True,
             "trade_id": "3" * 64,
-            "offer": "offer1integrated",
+            "offer": VALID_SAGE_OFFER,
         }
 
     adapter = SimpleNamespace(
@@ -2594,3 +2860,60 @@ def test_offer_manager_real_gate_and_wallet_continuation_cross_prepared_blocker(
         database.get_offer_intent(result["_catalyst_intent_id"])["lifecycle_state"]
         == "created"
     )
+
+
+def test_offer_manager_adapter_local_rejection_finalizes_failed_and_releases(
+    isolated_database,
+    monkeypatch,
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    identities = [_identity(0), _identity(1)]
+    adapter_calls = []
+
+    def reject_before_effect(*_args, **_kwargs):
+        adapter_calls.append(True)
+        return {"success": False, "reason": "LOCAL_VALIDATION_REJECTED"}
+
+    adapter = SimpleNamespace(
+        get_wallet_identity=lambda: identities.pop(0),
+        create_offer=reject_before_effect,
+    )
+    binding = _binding()
+    gate = mutation_gate.MutationGate(
+        run_id="run-task7",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network="mainnet",
+        lease_seconds=30,
+        clock=lambda: datetime(2026, 8, 16, 12, 0, 10, tzinfo=timezone.utc),
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+
+    result = offer_manager.OfferManager().create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+    )
+
+    intent = database.get_offer_intent(result["_catalyst_intent_id"])
+    assert result["success"] is False
+    assert result["reason"] == "LOCAL_VALIDATION_REJECTED"
+    assert result["_catalyst_effect_attempted"] is False
+    assert adapter_calls == [True]
+    assert identities == []
+    assert intent["lifecycle_state"] == "creation_failed"
+    assert (
+        database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
+        == "released"
+    )
+    assert database.get_runtime_safety_latch()["state"] == "resolved"

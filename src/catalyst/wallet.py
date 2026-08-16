@@ -555,6 +555,7 @@ def _run_offer_creation_continuation(
             )
 
         def identity_recheck(step: str) -> None:
+            nonlocal effect_attempted
             safe_step = (
                 step if type(step) is str and step and len(step) <= 64 else "effect"
             )
@@ -577,10 +578,10 @@ def _run_offer_creation_continuation(
                     "WALLET_IDENTITY_BINDING_INVALID",
                     f"{wallet_operation}:{safe_step}",
                 )
+            effect_attempted = True
 
         kwargs["_identity_recheck"] = identity_recheck
         callback = getattr(adapter, "create_offer")
-        effect_attempted = True
         result = callback(*args, **kwargs)
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
@@ -591,15 +592,15 @@ def _run_offer_creation_continuation(
                     pass
             return _blocked_offer_creation_continuation(
                 "WALLET_BACKEND_UNSUPPORTED",
-                effect_attempted=True,
+                effect_attempted=effect_attempted,
             )
         if type(result) is not dict:
             return _blocked_offer_creation_continuation(
                 "WALLET_MUTATION_FAILED",
-                effect_attempted=True,
+                effect_attempted=effect_attempted,
             )
         result = dict(result)
-        result["_catalyst_effect_attempted"] = True
+        result["_catalyst_effect_attempted"] = effect_attempted
         return result
     except mutation_gate.MutationBlocked as exc:
         return _blocked_offer_creation_continuation(
