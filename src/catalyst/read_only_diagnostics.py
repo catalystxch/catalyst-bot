@@ -16,12 +16,43 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
+
+
+_SOCKET_TYPE = socket.socket
+
+
+def _close_socket_handle(handle) -> tuple[bool, BaseException | None]:
+    """Close one socket even when an override raises before releasing it."""
+
+    close_error = None
+    try:
+        handle.close()
+    except BaseException as exc:
+        close_error = exc
+
+    if isinstance(handle, _SOCKET_TYPE):
+        try:
+            _SOCKET_TYPE.close(handle)
+        except BaseException:
+            return False, close_error
+        try:
+            return handle.fileno() == -1, close_error
+        except BaseException:
+            return False, close_error
+
+    if close_error is not None:
+        try:
+            handle.close()
+        except BaseException:
+            return False, close_error
+    return True, close_error
 
 
 def _data_directory() -> Path:
@@ -77,6 +108,7 @@ class LoopbackPortReservation:
         self._handle = handle
         self.port = int(handle.getsockname()[1])
         self._listening = False
+        self._release_lock = threading.Lock()
 
     def fileno(self) -> int:
         handle = self._handle
@@ -85,15 +117,17 @@ class LoopbackPortReservation:
         return int(handle.fileno())
 
     def release(self) -> bool:
-        handle = self._handle
-        if handle is None:
-            return False
-        self._handle = None
-        try:
-            handle.close()
-        except Exception:
-            pass
-        return True
+        with self._release_lock:
+            handle = self._handle
+            if handle is None:
+                return False
+            closed, close_error = _close_socket_handle(handle)
+            if closed:
+                self._handle = None
+                self._listening = False
+            if close_error is not None and not isinstance(close_error, Exception):
+                raise close_error
+            return closed
 
     def listen(self) -> None:
         handle = self._handle
@@ -156,9 +190,13 @@ def reserve_loopback_port(
             handle.bind(("127.0.0.1", candidate))
             return LoopbackPortReservation(handle)
         except OSError:
-            handle.close()
-        except Exception:
-            handle.close()
+            closed, close_error = _close_socket_handle(handle)
+            if close_error is not None and not isinstance(close_error, Exception):
+                raise close_error
+            if not closed:
+                raise RuntimeError("loopback socket cleanup failed") from close_error
+        except BaseException:
+            _close_socket_handle(handle)
             raise
     raise RuntimeError("no loopback server port is available")
 

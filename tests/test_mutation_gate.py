@@ -1720,7 +1720,7 @@ def test_coin_prep_log_delivery_uses_selected_owner_port_not_preferred_listener(
     )
 
 
-def test_tray_fallback_uses_selected_owner_port_before_callbacks_are_wired(
+def test_tray_fallback_uses_selected_owner_port_and_token_before_callbacks_are_wired(
     monkeypatch,
 ):
     import tray_manager
@@ -1738,18 +1738,125 @@ def test_tray_fallback_uses_selected_owner_port_before_callbacks_are_wired(
             return b"{}"
 
     monkeypatch.setenv("CATALYST_FLASK_PORT", "6133")
+    monkeypatch.setenv("BOT_LOCAL_WRITE_TOKEN", "tray-selected-token")
     monkeypatch.setattr(
         tray_manager.urllib.request,
         "urlopen",
         lambda request, timeout: (
-            requests.append((request.full_url, timeout)) or Response()
+            requests.append((request.full_url, timeout, dict(request.header_items())))
+            or Response()
         ),
     )
 
     tray = object.__new__(tray_manager.TrayManager)
     tray._call_flask_api("/api/bot/start")
 
-    assert requests == [("http://127.0.0.1:6133/api/bot/start", 5)]
+    assert requests == [
+        (
+            "http://127.0.0.1:6133/api/bot/start",
+            5,
+            {
+                "Content-type": "application/json",
+                "X-bot-local-token": "tray-selected-token",
+            },
+        )
+    ]
+
+
+def test_tray_fallback_missing_or_hostile_token_fails_closed_without_logging(
+    monkeypatch, capsys
+):
+    import tray_manager
+
+    requests = []
+    monkeypatch.delenv("BOT_LOCAL_WRITE_TOKEN", raising=False)
+    monkeypatch.setattr(
+        tray_manager.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: requests.append("sent"),
+    )
+    tray = object.__new__(tray_manager.TrayManager)
+
+    tray._call_flask_api("/api/bot/start")
+
+    class HostileEnvironment:
+        def get(self, _name, _default=None):
+            raise RuntimeError("hostile-secret-value")
+
+    monkeypatch.setattr(
+        tray_manager,
+        "os",
+        SimpleNamespace(environ=HostileEnvironment()),
+    )
+    tray._call_flask_api("/api/bot/stop")
+
+    captured = capsys.readouterr()
+    assert requests == []
+    assert "hostile-secret-value" not in captured.out
+    assert "hostile-secret-value" not in captured.err
+
+
+@pytest.mark.parametrize("port_value", [None, "0", "not-a-port"])
+def test_tray_fallback_missing_or_invalid_selected_port_fails_closed(
+    monkeypatch,
+    port_value,
+):
+    import tray_manager
+
+    requests = []
+    monkeypatch.setenv("BOT_LOCAL_WRITE_TOKEN", "tray-selected-token")
+    if port_value is None:
+        monkeypatch.delenv("CATALYST_FLASK_PORT", raising=False)
+    else:
+        monkeypatch.setenv("CATALYST_FLASK_PORT", port_value)
+    monkeypatch.setattr(
+        tray_manager.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: requests.append("sent"),
+    )
+
+    object.__new__(tray_manager.TrayManager)._call_flask_api("/api/bot/start")
+
+    assert requests == []
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_tray_fallback_hostile_port_environment_fails_closed_without_logging(
+    monkeypatch,
+    capsys,
+    control_error,
+):
+    import tray_manager
+
+    requests = []
+    escaped = []
+
+    class HostilePortEnvironment:
+        def get(self, name, _default=None):
+            if name == "BOT_LOCAL_WRITE_TOKEN":
+                return "tray-selected-token"
+            raise control_error("hostile-port-secret")
+
+    monkeypatch.setattr(
+        tray_manager,
+        "os",
+        SimpleNamespace(environ=HostilePortEnvironment()),
+    )
+    monkeypatch.setattr(
+        tray_manager.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: requests.append("sent"),
+    )
+    try:
+        object.__new__(tray_manager.TrayManager)._call_flask_api("/api/bot/stop")
+    except BaseException as exc:
+        escaped.append(type(exc))
+
+    captured = capsys.readouterr()
+    assert escaped == []
+    assert requests == []
+    assert "hostile-port-secret" not in captured.out
+    assert "hostile-port-secret" not in captured.err
 
 
 def test_worker_rejects_missing_wrong_and_dead_parent_before_wallet_callback(
@@ -3801,6 +3908,220 @@ def test_real_loopback_reservation_prevents_concurrent_port_steal():
         for handle in (thief, successor, unrelated):
             if handle is not None:
                 handle.close()
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_loopback_reservation_release_closes_before_reraising_control_flow(
+    control_error,
+):
+    import read_only_diagnostics
+
+    real_socket_type = socket.socket
+
+    class InterruptingCloseSocket(real_socket_type):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise control_error("close interrupted")
+
+    handle = InterruptingCloseSocket(socket.AF_INET, socket.SOCK_STREAM)
+    handle.bind(("127.0.0.1", 0))
+    reservation = read_only_diagnostics.LoopbackPortReservation(handle)
+    try:
+        with pytest.raises(control_error, match="close interrupted"):
+            reservation.release()
+
+        assert handle.close_calls == 1
+        assert handle.fileno() == -1
+        assert reservation.release() is False
+    finally:
+        real_socket_type.close(handle)
+
+
+def test_loopback_reservation_release_recovers_from_hostile_close_idempotently():
+    import read_only_diagnostics
+
+    real_socket_type = socket.socket
+
+    class HostileCloseSocket(real_socket_type):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("hostile close")
+
+    handle = HostileCloseSocket(socket.AF_INET, socket.SOCK_STREAM)
+    handle.bind(("127.0.0.1", 0))
+    reservation = read_only_diagnostics.LoopbackPortReservation(handle)
+    try:
+        assert reservation.release() is True
+        assert handle.close_calls == 1
+        assert handle.fileno() == -1
+        assert reservation.release() is False
+    finally:
+        real_socket_type.close(handle)
+
+
+def test_loopback_reservation_release_proves_noop_override_closed():
+    import read_only_diagnostics
+
+    real_socket_type = socket.socket
+
+    class NoOpCloseSocket(real_socket_type):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    handle = NoOpCloseSocket(socket.AF_INET, socket.SOCK_STREAM)
+    handle.bind(("127.0.0.1", 0))
+    port = int(handle.getsockname()[1])
+    reservation = read_only_diagnostics.LoopbackPortReservation(handle)
+    try:
+        assert reservation.release() is True
+        assert handle.close_calls == 1
+        assert handle.fileno() == -1
+        assert reservation.release() is False
+        replacement = real_socket_type(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            replacement.bind(("127.0.0.1", port))
+        finally:
+            replacement.close()
+    finally:
+        real_socket_type.close(handle)
+
+
+def test_loopback_reservation_failed_close_retains_ownership_for_retry():
+    import read_only_diagnostics
+
+    class RetryCloseHandle:
+        def __init__(self):
+            self.close_calls = 0
+
+        def getsockname(self):
+            return ("127.0.0.1", 6133)
+
+        def fileno(self):
+            return 42
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls <= 2:
+                raise RuntimeError("retry close")
+
+    handle = RetryCloseHandle()
+    reservation = read_only_diagnostics.LoopbackPortReservation(handle)
+
+    assert reservation.release() is False
+    assert reservation.fileno() == 42
+    assert handle.close_calls == 2
+    assert reservation.release() is True
+    assert handle.close_calls == 3
+    assert reservation.release() is False
+
+
+def test_loopback_reservation_concurrent_release_closes_exactly_once():
+    import read_only_diagnostics
+
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    class SlowCloseHandle:
+        def __init__(self):
+            self.close_calls = 0
+
+        def getsockname(self):
+            return ("127.0.0.1", 6133)
+
+        def close(self):
+            self.close_calls += 1
+            entered.set()
+            assert proceed.wait(timeout=2)
+
+    handle = SlowCloseHandle()
+    reservation = read_only_diagnostics.LoopbackPortReservation(handle)
+    results = []
+    workers = [
+        threading.Thread(target=lambda: results.append(reservation.release()))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    assert entered.wait(timeout=2)
+    proceed.set()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+    assert sorted(results) == [False, True]
+    assert handle.close_calls == 1
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_loopback_reservation_setup_closes_socket_before_reraising_control_flow(
+    monkeypatch,
+    control_error,
+):
+    import read_only_diagnostics
+
+    real_socket_type = socket.socket
+
+    class InterruptingSetupSocket(real_socket_type):
+        close_calls = 0
+
+        def set_inheritable(self, _value):
+            raise control_error("setup interrupted")
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError("hostile setup close")
+
+    handle = InterruptingSetupSocket(socket.AF_INET, socket.SOCK_STREAM)
+    monkeypatch.setattr(
+        read_only_diagnostics.socket,
+        "socket",
+        lambda *_args, **_kwargs: handle,
+    )
+    try:
+        with pytest.raises(control_error, match="setup interrupted"):
+            read_only_diagnostics.reserve_loopback_port(5000, search_limit=0)
+
+        assert handle.close_calls == 1
+        assert handle.fileno() == -1
+    finally:
+        real_socket_type.close(handle)
+
+
+def test_loopback_reservation_setup_proves_noop_override_closed(monkeypatch):
+    import read_only_diagnostics
+
+    real_socket_type = socket.socket
+    blocker = real_socket_type(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    port = int(blocker.getsockname()[1])
+
+    class NoOpCloseSocket(real_socket_type):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    handle = NoOpCloseSocket(socket.AF_INET, socket.SOCK_STREAM)
+    monkeypatch.setattr(
+        read_only_diagnostics.socket,
+        "socket",
+        lambda *_args, **_kwargs: handle,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="no loopback server port"):
+            read_only_diagnostics.reserve_loopback_port(port, search_limit=0)
+
+        assert handle.close_calls == 1
+        assert handle.fileno() == -1
+    finally:
+        real_socket_type.close(handle)
+        blocker.close()
 
 
 def test_reserved_port_does_not_report_server_ready_before_handoff():

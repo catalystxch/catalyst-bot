@@ -64,6 +64,36 @@ def _flask_base() -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _local_api_context() -> tuple[str, dict[str, str]] | None:
+    """Return the exact owner endpoint/auth pair, or deny the fallback call."""
+
+    try:
+        environment = os.environ
+        token = environment.get("BOT_LOCAL_WRITE_TOKEN")
+        port_value = environment.get("CATALYST_FLASK_PORT")
+    except BaseException:
+        return None
+    if type(token) is not str or not 1 <= len(token) <= 256:
+        return None
+    if any(ord(character) < 33 or ord(character) > 126 for character in token):
+        return None
+    if type(port_value) is not str:
+        return None
+    try:
+        port = int(port_value)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return (
+        f"http://127.0.0.1:{port}",
+        {
+            "Content-Type": "application/json",
+            "X-Bot-Local-Token": token,
+        },
+    )
+
+
 class TrayManager:
     """
     Manages the system tray icon and menu.
@@ -339,13 +369,17 @@ class TrayManager:
         Call a local Flask API endpoint.  Runs in a background thread.
         Failures are silently ignored — the tray is a convenience, not critical path.
         """
-        url = f"{_flask_base()}{path}"
         try:
+            context = _local_api_context()
+            if context is None:
+                return
+            base_url, headers = context
+            url = f"{base_url}{path}"
             req = urllib.request.Request(
                 url,
                 data=b"{}",
                 method=method,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 _ = resp.read()  # Consume response
