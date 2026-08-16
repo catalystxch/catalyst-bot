@@ -183,28 +183,25 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
     or 'cancel_sent' and status='open'. The bot fired a cancel RPC and is
     waiting for on-chain confirmation. This check uses Dexie as the source
     of truth — Dexie watches the mempool and on-chain state and reflects
-    each offer's actual status within seconds.
+    each offer's observed third-party status. Cancellation observations stay
+    nonterminal here; Task 9 owns authoritative cancellation reconciliation.
 
     Anomaly types detected:
-      A. Dexie says ACTIVE but DB says pending-cancel → real zombie, retry
-         the cancel with a single-offer (priority-fee) RPC.
-      B. Dexie says CANCELLED/EXPIRED → cancel succeeded, mark DB.
+      A. Dexie says ACTIVE but DB says pending-cancel → report a zombie.
+      B. Dexie says CANCELLED/EXPIRED → report external terminal evidence.
       C. Dexie says COMPLETED → offer was filled, NOT cancelled. Flag for
          the fill flow to handle (do not auto-process — needs careful
          coin/position bookkeeping that lives in fill_tracker).
       D. Dexie returns nothing / unreachable → leave as pending, try again
          next cycle.
 
-    Repairs (when auto_repair=True):
-      - For B: mark_offer_cancelled + transition_offer("cancel_confirmed")
-      - For A (when age > 5 min since last attempt): re-issue cancel via
-        the single-offer path with a priority fee (no aggregate-sig bug)
+    No cancellation repair or terminal write occurs in this check. The
+    existing verified-fill recovery remains independent of cancellation.
     """
     from database import (
         get_open_offers,
         update_offer_status,
         transition_offer,
-        mark_cancel_attempted,
     )
 
     pending = get_open_offers(include_pending_cancel=True)
@@ -220,7 +217,7 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
             category="offers",
             status="pass",
             severity="info",
-            message="No pending cancels — all confirmed or none in flight.",
+            message="No pending cancellation journals are in flight.",
         )
 
     now = time.time()
@@ -253,96 +250,6 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
 
     repair_log = []
     repaired = 0
-
-    # --- Repair B: confirm cancellations ---
-    if auto_repair and confirmed_cancelled:
-        for off, st in confirmed_cancelled:
-            tid = off.get("trade_id")
-            try:
-                update_offer_status(tid, "cancelled")
-                try:
-                    transition_offer(tid, "cancel_confirmed")
-                except Exception:
-                    pass
-                msg = f"confirmed_cancelled tid={tid[:16]}... (dexie_status={st})"
-                repair_log.append(msg)
-                slog("BOT_HEALTH", msg, level="info")
-                repaired += 1
-            except Exception as e:
-                slog(
-                    "BOT_HEALTH",
-                    f"Failed to mark confirmed-cancelled tid={tid[:16]}...: {e}",
-                    level="warn",
-                )
-
-    # --- Repair A: re-cancel zombies (with backoff) ---
-    if auto_repair and truly_zombie:
-        try:
-            from wallet import cancel_offer
-            from wallet_sage import get_effective_transaction_fee_mojos
-        except Exception as imp_err:
-            slog(
-                "BOT_HEALTH",
-                f"Cannot import cancel_offer for retry: {imp_err}",
-                level="warn",
-            )
-            cancel_offer = None
-
-            def get_effective_transaction_fee_mojos():
-                return 0
-
-        for off, _dexie_off in truly_zombie:
-            tid = off.get("trade_id")
-            last_attempt = off.get("cancel_last_attempt_at")
-            age = _seconds_since(last_attempt, now)
-
-            if age is None:
-                # First attempt was via fire-and-forget that didn't stamp the
-                # column. Treat as unknown age — initial grace then retry.
-                age = _CANCEL_INITIAL_GRACE_SECS + 1
-
-            if age < _CANCEL_INITIAL_GRACE_SECS:
-                continue  # let the original cancel TX settle first
-
-            if age < _CANCEL_RETRY_BACKOFF_SECS:
-                # Still within retry backoff window — wait
-                continue
-
-            if not cancel_offer:
-                continue
-
-            # Re-issue with single-offer path + priority fee. The single-
-            # offer path is NOT subject to the BAD_AGGREGATE_SIGNATURE bug
-            # that forces fee=0 on bulk, so we can pay a priority fee here.
-            try:
-                fee = max(int(get_effective_transaction_fee_mojos()), 0)
-                result = cancel_offer(tid, secure=True, timeout=20, fee_mojos=fee)
-                if result and result.get("success"):
-                    method = (result.get("method") or "").strip()
-                    msg = (
-                        f"re_cancelled tid={tid[:16]}... "
-                        f"(dexie still ACTIVE after {int(age)}s, retry method={method})"
-                    )
-                    repair_log.append(msg)
-                    slog("BOT_HEALTH", msg, level="info")
-                    try:
-                        mark_cancel_attempted(tid)
-                    except Exception:
-                        pass
-                    repaired += 1
-                else:
-                    err = (result or {}).get("error") or "unknown"
-                    slog(
-                        "BOT_HEALTH",
-                        f"Re-cancel RPC failed for tid={tid[:16]}...: {err}",
-                        level="warn",
-                    )
-            except Exception as e:
-                slog(
-                    "BOT_HEALTH",
-                    f"Re-cancel exception for tid={tid[:16]}...: {e}",
-                    level="warn",
-                )
 
     # --- C: suspected fills — attempt Spacescan-verified recovery ---
     # A pending-cancel row with Dexie status COMPLETED means the offer
@@ -462,7 +369,10 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
 
     parts = []
     if confirmed_cancelled:
-        parts.append(f"{len(confirmed_cancelled)} confirmed cancelled")
+        parts.append(
+            f"{len(confirmed_cancelled)} observed cancelled/expired on Dexie; "
+            "awaiting authoritative reconciliation"
+        )
     if truly_zombie:
         parts.append(f"{len(truly_zombie)} still active on Dexie")
     if suspected_fills:

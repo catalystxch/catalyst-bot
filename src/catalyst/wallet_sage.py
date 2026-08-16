@@ -31,6 +31,13 @@ from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal, ROUND_DOWN
 from tx_fees import get_effective_transaction_fee_mojos
 from config import cfg
+import mutation_gate
+from cancel_outcomes import (
+    CANCEL_FAILED,
+    cancellation_result,
+    normalize_cancel_response,
+    validate_cancel_result,
+)
 
 # Silence warnings for localhost self-signed cert
 import urllib3
@@ -1313,7 +1320,13 @@ def _raise_sage_response_failure(
     raise SageHTTPError(**failure_args)
 
 
-def _sage_post(path: str, payload: dict, timeout: int = 10):
+def _sage_post(
+    path: str,
+    payload: dict,
+    timeout: int = 10,
+    *,
+    retry_transport_error: bool = True,
+):
     """Low-level HTTPS POST to Sage, bypassing requests library entirely.
 
     Uses http.client + ssl for complete control over TLS negotiation.
@@ -1334,6 +1347,8 @@ def _sage_post(path: str, payload: dict, timeout: int = 10):
         except Exception:
             # Connection was stale — recreate and retry once.
             _conn_local.conn = None
+            if not retry_transport_error:
+                raise
             ctx = ssl._create_unverified_context()
             if CERT_PATH and KEY_PATH:
                 ctx.load_cert_chain(CERT_PATH, KEY_PATH)
@@ -4111,7 +4126,12 @@ def cancel_offer(
     Returns dict with 'success' key, or error dict on failure.
     """
     if not _require_signing_capability():
-        return {"success": False, "error": "Watch-only wallet cannot cancel offers"}
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={"success": False, "error_code": "REJECTED"},
+            error="REJECTED",
+        )
 
     resolved_fee = (
         0
@@ -4134,140 +4154,47 @@ def cancel_offer(
     if _identity_recheck is not None:
         _identity_recheck("cancel_offer")
     try:
-        result = _sage_post("cancel_offer", payload, timeout=timeout)
+        result = _sage_post(
+            "cancel_offer",
+            payload,
+            timeout=timeout,
+            retry_transport_error=False,
+        )
 
-        if WALLET_DEBUG:
-            print(f"   [Sage] cancel_offer {trade_id[:16]}... → {str(result)[:200]}")
+        return normalize_cancel_response(result, method="single_rpc")
 
-        if result is None:
-            return {
-                "success": False,
-                "error": f"Cancel RPC returned None for {trade_id[:16]}...",
-            }
-
-        # Sage may not include 'success' key — add it if missing, but only
-        # when there are no failure indicators (error key or failed status)
-        if isinstance(result, dict) and "success" not in result:
-            if (
-                "error" in result
-                or "reason" in result
-                or result.get("status") in ("failed", "error", "rejected")
-            ):
-                result["success"] = False
-            else:
-                result["success"] = True
-
-        return result
-
-    except SageAlreadyIncluding as e:
-        print(f"   [Sage] cancel_offer {trade_id[:16]}... already in mempool")
-        return {
-            "success": True,
-            "method": "already_in_mempool",
-            "note": f"Sage cancel already in mempool: {str(e)[:160]}",
-        }
-
-    except SageMempoolConflict as e:
-        print(f"   [Sage] cancel_offer {trade_id[:16]}... cancel conflict in flight")
-        return {
-            "success": True,
-            "method": "mempool_conflict_inflight",
-            "note": f"Sage cancel conflict appears in-flight: {str(e)[:160]}",
-        }
-
-    except SageHTTPError as e:
-        if e.status == 404:
-            print(
-                f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), deferring to on-chain verification"
-            )
-            return {
-                "success": True,
-                "already_gone": True,
-                "method": "already_gone_ambiguous",
-                "note": "Sage 404 — offer gone, fill_tracker / bot_health will verify",
-            }
-        result = {
-            "success": False,
-            "error": e.error_code,
-            "error_code": e.error_code,
-            "http_status": e.status,
-        }
-        if e.status in {202, 500}:
-            result["uncertain"] = True
-        return result
-
-    except SageOperationalError as e:
-        return {
-            "success": False,
-            "error": e.error_code,
-            "error_code": e.error_code,
-            "http_status": e.status,
-        }
-
-    except ConnectionError as e:
-        err_str = str(e)
-        # Sage may return non-200 but still process the cancel.
-        # Log the actual status for debugging, but DON'T assume failure yet —
-        # the confirmation poll in cancel_offers_batch will verify.
-        print(f"   [Sage] cancel_offer {trade_id[:16]}... HTTP error: {err_str[:200]}")
-
-        # Sage returns 404 "Missing offer" when the offer is no longer in
-        # the wallet. That can mean CANCELLED, FILLED, or EXPIRED — we do
-        # not yet know which. Earlier versions returned success=True here,
-        # which caused the bot to confidently write `status=cancelled` in
-        # the DB even when the offer had actually filled. We now return a
-        # distinct "already_gone_ambiguous" method so the caller leaves
-        # DB status open and lets fill_tracker / bot_health decide the
-        # final state from on-chain evidence.
-        if (
-            "404" in err_str
-            or "Missing offer" in err_str
-            or "not found" in err_str.lower()
-        ):
-            print(
-                f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), deferring to on-chain verification"
-            )
-            return {
-                "success": True,
-                "already_gone": True,
-                "method": "already_gone_ambiguous",
-                "note": "Sage 404 — offer gone, fill_tracker / bot_health will verify",
-            }
-
-        # HTTP 500/202 are NOT success — don't promote them.
-        # The retry mechanism in cancel_offers will handle re-attempts.
-        # Previously these were treated as success which masked real failures.
-        if "HTTP 500" in err_str or "HTTP 202" in err_str:
-            print(
-                f"   [Sage] cancel_offer {trade_id[:16]}... got {err_str[:50]} — not treating as success"
-            )
-            return {
-                "success": False,
-                "uncertain": True,
-                "error": f"Sage returned non-200: {err_str[:100]}",
-            }
-
-        return {"success": False, "error": err_str[:200]}
-
-    except Exception as e:
-        err_str = str(e)
-        # V5 FIX: Also catch 404/Missing offer from non-ConnectionError exceptions
-        if (
-            "404" in err_str
-            or "Missing offer" in err_str
-            or "not found" in err_str.lower()
-        ):
-            print(
-                f"   [Sage] cancel_offer {trade_id[:16]}... → offer already gone (404), treating as success"
-            )
-            return {
-                "success": True,
-                "already_gone": True,
-                "note": "Sage 404 — offer already gone",
-            }
-        if not _quiet_mode:
-            print(f"   [Sage] cancel_offer {trade_id[:16]}... error: {e}")
-        return {"success": False, "error": err_str[:200]}
+    except SageHTTPError as exc:
+        return normalize_cancel_response(
+            {"error_code": exc.error_code, "http_status": exc.status},
+            method="single_rpc",
+            error=exc.error_code,
+            http_status=exc.status,
+        )
+    except SageOperationalError as exc:
+        return normalize_cancel_response(
+            {"success": False, "error_code": exc.error_code},
+            method="single_rpc",
+            error=exc.error_code,
+            http_status=exc.status,
+        )
+    except (SageAlreadyIncluding, SageMempoolConflict) as exc:
+        return normalize_cancel_response(
+            {"error_code": exc.error_code},
+            method="single_rpc",
+            error=exc.error_code,
+        )
+    except (SageConnectionError, ConnectionError) as exc:
+        return normalize_cancel_response(
+            None,
+            method="single_rpc",
+            error=getattr(exc, "error_code", "SAGE_CONNECTION_ERROR"),
+        )
+    except Exception:
+        return normalize_cancel_response(
+            None,
+            method="single_rpc",
+            error="CANCEL_ERROR_UNCLASSIFIED",
+        )
 
 
 def is_offer_time_expired(offer: dict) -> bool:
@@ -4314,62 +4241,25 @@ def get_offer_expiry_info(offer: dict) -> dict:
 
 
 def cleanup_expired_offers(log_fn=None, *, _identity_recheck=None) -> int:
-    """Cancel any offers whose max_time has passed.
+    """Report expired offers without issuing an unjournaled cancellation.
 
-    Same logic as Chia version — works on the offer dicts.
+    OfferManager owns the durable per-offer cancellation journal. Adapter-level
+    cleanup cannot manufacture that authority, so it remains read-only.
     """
 
-    def _log(level, msg):
-        if log_fn:
-            log_fn(level, msg)
-
     offers = get_all_offers(include_completed=False, start=0, end=200)
-    if not offers:
-        return 0
-
-    now = int(time.time())
-    cancelled = 0
-    expired_found = 0
-
-    for offer in offers:
-        if not isinstance(offer, dict):
-            continue
-
-        if is_offer_time_expired(offer):
-            expired_found += 1
-            trade_id = offer.get("trade_id", "")
-            valid_times = offer.get("valid_times") or {}
-            max_time = valid_times.get("max_time", 0) or offer.get("max_time", 0)
-            expired_ago = now - max_time if max_time else 0
-            trade_id_short = str(trade_id)[:16]
-
-            _log(
-                "info",
-                f"  Cancelling expired offer {trade_id_short}... "
-                f"(expired {expired_ago}s / {expired_ago // 60}m ago)",
-            )
-
-            if _identity_recheck is not None:
-                _identity_recheck(f"cleanup_expired_offers:{expired_found - 1}")
-            result = cancel_offer(
-                str(trade_id),
-                secure=False,
-                _identity_recheck=_identity_recheck,
-            )
-            if result and result.get("success"):
-                cancelled += 1
-            else:
-                _log("warning", f"  Failed to cancel {trade_id_short}: {result}")
-
-            time.sleep(0.3)
-
-    if expired_found > 0:
-        _log(
-            "success" if cancelled > 0 else "warning",
-            f"Expired offer cleanup: found {expired_found}, cancelled {cancelled}",
+    expired_count = sum(
+        1
+        for offer in offers or []
+        if type(offer) is dict and is_offer_time_expired(offer)
+    )
+    if expired_count and log_fn:
+        log_fn(
+            "warning",
+            f"Expired offer cleanup deferred {expired_count} offer(s) "
+            "to the durable cancellation coordinator",
         )
-
-    return cancelled
+    return 0
 
 
 def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50):
@@ -4831,230 +4721,6 @@ def classify_open_offers_for_pair(asset_id_mz: str):
     return open_buy, open_sell
 
 
-def _normalize_offer_lock_id(offer_id: Any) -> Optional[str]:
-    """Normalize offer/trade ids for lock matching.
-
-    Sage coin records may report offer_id/offer_hash with or without a 0x
-    prefix, while the app may track trade ids in either form.
-    """
-    if not isinstance(offer_id, str):
-        return None
-    normalized = offer_id.strip().lower()
-    if normalized.startswith("0x"):
-        normalized = normalized[2:]
-    return normalized or None
-
-
-def _get_still_locked_trade_ids(trade_ids: set, owned_coin_map: Optional[Dict]) -> set:
-    """Return trade ids that still have owned coins locked by offer_id."""
-    if not trade_ids or not owned_coin_map:
-        return set()
-    locked_offer_ids = set()
-    for info in owned_coin_map.values():
-        if not isinstance(info, dict):
-            continue
-        normalized = _normalize_offer_lock_id(info.get("offer_id"))
-        if normalized:
-            locked_offer_ids.add(normalized)
-    still_locked = set()
-    for trade_id in trade_ids:
-        normalized = _normalize_offer_lock_id(trade_id)
-        if normalized and normalized in locked_offer_ids:
-            still_locked.add(trade_id)
-    return still_locked
-
-
-def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        raw = os.getenv(name)
-        if raw is None or str(raw).strip() == "":
-            return default
-        return max(minimum, min(int(raw), maximum))
-    except Exception:
-        return default
-
-
-def _bounded_env_float(
-    name: str, default: float, minimum: float, maximum: float
-) -> float:
-    try:
-        raw = os.getenv(name)
-        if raw is None or str(raw).strip() == "":
-            return default
-        return max(minimum, min(float(raw), maximum))
-    except Exception:
-        return default
-
-
-def _chunked(items: list, size: int) -> list:
-    size = max(1, int(size or 1))
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def _sage_bulk_cancel_batch_size() -> int:
-    return _bounded_env_int("SAGE_BULK_CANCEL_BATCH_SIZE", 25, 1, 100)
-
-
-def _sage_bulk_cancel_batch_pause_secs() -> float:
-    return _bounded_env_float("SAGE_BULK_CANCEL_BATCH_PAUSE_SECS", 0.5, 0.0, 10.0)
-
-
-def _is_no_spendable_coin_error(result: Optional[Dict]) -> bool:
-    if not isinstance(result, dict):
-        return False
-    error_code = str(result.get("error_code") or result.get("error") or "").upper()
-    if error_code == "NO_SPENDABLE_COINS":
-        return True
-    error = str(result.get("error") or result.get("reason") or "").lower()
-    return "no spendable coins" in error or "coin selection error" in error
-
-
-def _cancel_offers_bulk_proper(
-    offer_ids: list, fee_mojos: int = 0, *, _identity_recheck=None
-) -> bool | str:
-    """Cancel multiple offers using the same 3-step path the Sage GUI uses.
-
-    The Sage 'Cancel All Active' button does NOT use auto_submit=True.  It uses:
-      1. cancel_offers(auto_submit=False)  → unsigned coin_spends returned
-      2. sign_coin_spends(coin_spends)     → aggregated_signature produced
-      3. submit_transaction(spend_bundle)  → broadcast to peers
-
-    Using auto_submit=True in the HTTP RPC path signs server-side via a different
-    code path that silently produces an invalid/incomplete signature, causing the
-    transaction to fail on-chain.  The explicit sign+submit path always works.
-
-    Returns True if all three steps succeeded, "already_in_mempool" when Sage
-    proves this exact transaction is already pending, or False for
-    fallback-worthy failures. A generic MEMPOOL_CONFLICT can mean only one input
-    in the batch is already spent, so the caller must keep sequential fallback
-    available for the remaining offers.
-    """
-    num = len(offer_ids)
-    print(f"   [Bulk] Step 1: cancel_offers(auto_submit=False, fee=0, n={num})...")
-    if _identity_recheck is not None:
-        _identity_recheck("cancel_offers_bulk:cancel")
-    try:
-        cancel_resp = _sage_post(
-            "cancel_offers",
-            {
-                "offer_ids": offer_ids,
-                "fee": fee_mojos,  # integer, not string — matches Tauri path
-                "auto_submit": False,  # CRITICAL: get unsigned coin_spends back
-            },
-            timeout=max(30, num * 2),
-        )
-    except SageMempoolConflict as e:
-        print(f"   [Bulk] cancel_offers mempool conflict; falling back: {e}")
-        return False
-    except SageAlreadyIncluding as e:
-        print(f"   [Bulk] cancel_offers already including transaction: {e}")
-        return "already_in_mempool"
-    except Exception as e:
-        print(f"   [Bulk] cancel_offers failed: {e}")
-        return False
-
-    if not cancel_resp or not isinstance(cancel_resp, dict):
-        print(f"   [Bulk] cancel_offers returned unexpected: {str(cancel_resp)[:200]}")
-        return False
-
-    coin_spends = cancel_resp.get("coin_spends")
-    if not coin_spends:
-        print(
-            f"   [Bulk] cancel_offers response has no coin_spends: {str(cancel_resp)[:300]}"
-        )
-        return False
-
-    print(f"   [Bulk] Got {len(coin_spends)} coin_spends.  Step 2: sign_coin_spends...")
-    sign_timeout = max(30, min(180, len(coin_spends) * 2))
-    if _identity_recheck is not None:
-        _identity_recheck("cancel_offers_bulk:sign")
-    try:
-        sign_resp = _sage_post(
-            "sign_coin_spends",
-            {
-                "coin_spends": coin_spends,
-                "auto_submit": False,
-                "partial": False,
-            },
-            timeout=sign_timeout,
-        )
-    except SageMempoolConflict as e:
-        print(f"   [Bulk] sign_coin_spends mempool conflict; falling back: {e}")
-        return False
-    except SageAlreadyIncluding as e:
-        print(f"   [Bulk] sign_coin_spends already including transaction: {e}")
-        return "already_in_mempool"
-    except Exception as e:
-        print(f"   [Bulk] sign_coin_spends failed: {e}")
-        return False
-
-    if not sign_resp or not isinstance(sign_resp, dict):
-        print(f"   [Bulk] sign_coin_spends returned unexpected: {str(sign_resp)[:200]}")
-        return False
-
-    spend_bundle = sign_resp.get("spend_bundle")
-    if not spend_bundle or not spend_bundle.get("aggregated_signature"):
-        print(
-            f"   [Bulk] sign_coin_spends response missing spend_bundle/sig: "
-            f"{str(sign_resp)[:300]}"
-        )
-        return False
-
-    sig = spend_bundle.get("aggregated_signature", "")[:20]
-    print(f"   [Bulk] Signed OK (sig={sig}...).  Step 3: submit_transaction...")
-    if _identity_recheck is not None:
-        _identity_recheck("cancel_offers_bulk:submit")
-    try:
-        submit_resp = _sage_post(
-            "submit_transaction",
-            {
-                "spend_bundle": spend_bundle,
-            },
-            timeout=30,
-        )
-    except SageMempoolConflict as e:
-        print(f"   [Bulk] submit_transaction mempool conflict; falling back: {e}")
-        return False
-    except SageAlreadyIncluding as e:
-        print(f"   [Bulk] submit_transaction already including transaction: {e}")
-        return "already_in_mempool"
-    except Exception as e:
-        print(f"   [Bulk] submit_transaction failed: {e}")
-        return False
-
-    print(f"   [Bulk] submit_transaction returned: {str(submit_resp)[:200]}")
-    # HTTP 200 alone is not enough — Sage sometimes returns a 200 with
-    # success:false / a populated error field when the signed bundle is
-    # rejected (bad aggregate signature, already-spent inputs, etc.).
-    # Previously we trusted the 200 status and every caller thought the
-    # bulk cancel was in the mempool even though it was rejected, so the
-    # sequential fallback never ran and the book stayed live under fake
-    # "pending cancel" rows. Validate the JSON body before claiming
-    # success.
-    if not isinstance(submit_resp, dict):
-        print("   [Bulk] submit_transaction response not a dict — falling back")
-        return False
-    _sub_err = submit_resp.get("error") or submit_resp.get("reason")
-    _sub_status = str(submit_resp.get("status", "") or "").lower()
-    _sub_text = f"{_sub_err or ''} {_sub_status}".upper()
-    if "MEMPOOL_CONFLICT" in _sub_text:
-        print("   [Bulk] submit_transaction mempool conflict - falling back")
-        return False
-    if "ALREADY_INCLUDING_TRANSACTION" in _sub_text:
-        print("   [Bulk] submit_transaction already in mempool - marking pending")
-        return "already_in_mempool"
-    if _sub_err or _sub_status in ("failed", "error", "rejected"):
-        print(
-            f"   [Bulk] submit_transaction rejected payload "
-            f"(error={_sub_err!r}, status={_sub_status!r}) — falling back"
-        )
-        return False
-    if "success" in submit_resp and submit_resp.get("success") is False:
-        print("   [Bulk] submit_transaction success=false — falling back")
-        return False
-    return True
-
-
 def cancel_offers_batch(
     trade_ids: list,
     secure: bool = True,
@@ -5094,396 +4760,28 @@ def cancel_offers_batch(
     if not trade_ids:
         return results
 
-    resolved_fee = (
-        0
-        if not secure
-        else (
-            max(0, int(fee_mojos))
-            if fee_mojos is not None
-            else get_effective_transaction_fee_mojos()
-        )
-    )
-
-    num_offers = len(trade_ids)
-
-    # ── Wallet IDs for coin count checks ──
-    _wallet_ids: set = {1}
-    try:
-        from config import cfg as _cfg_ref
-
-        _wallet_ids.add(int(getattr(_cfg_ref, "CAT_WALLET_ID", 1)))
-    except Exception:
-        pass
-
-    def _total_spendable():
-        """Total spendable coins across XCH + CAT wallets, or None on RPC failure."""
-        total = 0
-        for _wid in _wallet_ids:
-            try:
-                count = get_spendable_coin_count(wallet_id=_wid)
-                if count is None or count < 0:
-                    return None
-                total += count
-            except Exception:
-                return None
-        return total
-
-    target_trade_ids = set(trade_ids)
-
-    def _pending_count():
-        """Return pending transaction count, or None if Sage cannot answer."""
+    for trade_id in trade_ids:
         try:
-            pending = get_pending_transactions()
-            if isinstance(pending, list):
-                return len(pending)
-        except Exception:
-            pass
-        return None
-
-    def _locked_trade_ids():
-        """Return trade ids still locking wallet coins, or None on RPC failure."""
-        locked = set()
-        for _wid in _wallet_ids:
-            try:
-                owned = get_owned_coins_detailed(_wid)
-            except Exception:
-                return None
-            if owned is None:
-                return None
-            locked.update(_get_still_locked_trade_ids(target_trade_ids, owned))
-        return locked
-
-    # ── 1. Pre-cancel snapshot ──
-    pre_coins = _total_spendable()
-    if pre_coins is not None:
-        print(f"   📸 [Sage] Pre-cancel: {pre_coins} spendable coins")
-    else:
-        print("   ⚠️ [Sage] Could not snapshot pre-cancel coins")
-
-    # ── 2. Bulk cancel (GUI-identical 3-step path) with sequential fallback ──
-    #
-    # The Sage GUI's "Cancel All Active" button does:
-    #   cancel_offers(auto_submit=False) → sign_coin_spends → submit_transaction
-    # NOT auto_submit=True (which signs server-side via a different code path
-    # that silently produces an invalid signature → transaction rejected on-chain).
-    # _cancel_offers_bulk_proper() replicates the exact GUI path.
-    cancel_submitted = False
-
-    def _mark_bulk_submitted(
-        batch_ids: list,
-        method: str = "submitted_pending_confirm",
-    ) -> None:
-        for tid in batch_ids:
-            results[tid] = {
-                "success": True,
-                "method": method,
-                "submission_path": "bulk_3step",
-            }
-
-    def _cancel_sequential(batch_ids: list, batch_label: str = "") -> bool:
-        nonlocal cancel_submitted
-        delay = 0.3
-        label = f" {batch_label}" if batch_label else ""
-        print(
-            f"📋 [Sage] Cancelling {len(batch_ids)} offers sequentially{label} ({delay}s delay)..."
-        )
-        any_submitted = False
-        for i, tid in enumerate(batch_ids):
-            if _identity_recheck is not None:
-                _identity_recheck(f"cancel_offer:{i}")
-            result = cancel_offer(
-                tid,
-                secure,
-                timeout=15,
-                fee_mojos=resolved_fee,
+            raw_result = cancel_offer(
+                trade_id,
+                secure=secure,
+                timeout=120 if len(trade_ids) > 10 else 60,
+                fee_mojos=fee_mojos,
                 _identity_recheck=_identity_recheck,
             )
-
-            if (
-                resolved_fee > 0
-                and result
-                and not result.get("success")
-                and _is_no_spendable_coin_error(result)
-            ):
-                print(
-                    f"   ⚠️ [Sage] No fee coin for {tid[:16]}...; retrying cancel with fee=0"
-                )
-                if _identity_recheck is not None:
-                    _identity_recheck(f"cancel_offer:{i}:retry")
-                result = cancel_offer(
-                    tid,
-                    secure,
-                    timeout=15,
-                    fee_mojos=0,
-                    _identity_recheck=_identity_recheck,
-                )
-
-            results[tid] = result or {
-                "success": False,
-                "error": "RPC returned None",
-            }
-            if result and result.get("success"):
-                cancel_submitted = True
-                any_submitted = True
-                if (i + 1) % 10 == 0 or (i + 1) == len(batch_ids):
-                    print(f"   ✅ [Sage] Cancelled {i + 1}/{len(batch_ids)}")
-            else:
-                error = (result or {}).get("error", "unknown")
-                print(f"   ❌ [Sage] Failed {tid[:16]}...: {error}")
-            if i < len(batch_ids) - 1:
-                time.sleep(delay)
-        return any_submitted
-
-    bulk_batch_size = _sage_bulk_cancel_batch_size()
-    bulk_pause = _sage_bulk_cancel_batch_pause_secs()
-    batches = _chunked(trade_ids, bulk_batch_size)
-
-    if num_offers >= 2 and len(batches) > 1:
-        print(
-            f"📋 [Sage] Splitting bulk cancel of {num_offers} offers "
-            f"into {len(batches)} batches of up to {bulk_batch_size}"
-        )
-
-    for batch_index, batch_ids in enumerate(batches, start=1):
-        batch_label = f"(batch {batch_index}/{len(batches)})"
-        batch_submitted = False
-
-        if len(batch_ids) >= 2:
-            print(
-                f"📋 [Sage] Bulk cancel {batch_label}: "
-                f"{len(batch_ids)} offers (GUI 3-step path)..."
-            )
-            bulk_kwargs = {}
-            if _identity_recheck is not None:
-                bulk_kwargs["_identity_recheck"] = _identity_recheck
-            bulk_result = _cancel_offers_bulk_proper(
-                batch_ids, fee_mojos=0, **bulk_kwargs
-            )
-            if bulk_result is True:
-                print(f"   ✅ [Sage] Bulk cancel {batch_label} submitted successfully")
-                cancel_submitted = True
-                batch_submitted = True
-                _mark_bulk_submitted(batch_ids)
-            elif bulk_result == "already_in_mempool":
-                print(
-                    f"   [Sage] Bulk cancel {batch_label} is pending in mempool "
-                    f"({bulk_result})"
-                )
-                cancel_submitted = True
-                batch_submitted = True
-                _mark_bulk_submitted(batch_ids, method=bulk_result)
-            else:
-                print(
-                    f"   ⚠️ [Sage] Bulk cancel {batch_label} failed — falling back to sequential"
-                )
-
-        if not batch_submitted:
-            _cancel_sequential(batch_ids, batch_label if len(batches) > 1 else "")
-
-        if bulk_pause > 0 and batch_index < len(batches):
-            time.sleep(bulk_pause)
-
-    if not cancel_submitted:
-        print("   ❌ [Sage] No cancel RPCs succeeded — aborting")
-        return results
-
-    # ── 3. Skip confirmation if requested (requote fire-and-forget) ──
-    if skip_confirmation:
-        print("   📨 [Sage] Skipping confirmation (fire-and-forget mode)")
-        return results
-
-    # ── 4. Wait for coins to return ──
-    # When cancels confirm on-chain the locked coins are released back as
-    # new spendable coins (new IDs, same values). We just poll the total
-    # spendable count and wait for it to increase — that's the definitive
-    # signal that the cancel TX landed in a block.
-    try:
-        from config import cfg as _cfg
-
-        poll_interval = max(
-            3, min(int(getattr(_cfg, "CANCEL_POLL_INTERVAL_SECS", 10) or 10), 30)
-        )
-        max_wait = max(
-            30, min(int(getattr(_cfg, "CANCEL_MAX_WAIT_SECS", 120) or 120), 600)
-        )
-    except Exception:
-        poll_interval, max_wait = 10, 120
-
-    print(
-        f"🔄 [Sage] Waiting for coins to return (poll every {poll_interval}s, "
-        f"max {max_wait}s)..."
-    )
-
-    start_time = time.time()
-    confirmed = False
-
-    while (time.time() - start_time) < max_wait:
-        time.sleep(poll_interval)
-        elapsed = int(time.time() - start_time)
-        try:
-            current_coins = _total_spendable()
-            if current_coins is None:
-                print(f"   🔄 [{elapsed}s] spendable=? (RPC error, retrying)")
-                continue
-
-            delta = (current_coins - pre_coins) if pre_coins is not None else 0
-            # Also check how many open offers remain
-            open_remaining = 0
             try:
-                open_offers = get_all_offers(include_completed=False, end=500)
-                if open_offers and isinstance(open_offers, list):
-                    for o in open_offers:
-                        tid = o.get("trade_id", "") or o.get("offer_id", "")
-                        if tid in target_trade_ids:
-                            raw_status = o.get("status")
-                            # Count fillable offers (includes PENDING_CANCEL
-                            # — the cancel TX is in the mempool but the
-                            # counterparty can still take the offer until
-                            # it confirms). Previously we used
-                            # _is_open_status which counted PENDING_CANCEL
-                            # as closed, so the batch could declare
-                            # success while offers were still accepting
-                            # fills in a flash-move window. Under
-                            # congestion that let adverse fills stack
-                            # into the move.
-                            if _is_still_fillable(raw_status, o):
-                                open_remaining += 1
-            except Exception:
-                open_remaining = -1  # unknown
-
-            pending_count = _pending_count()
-            still_locked = _locked_trade_ids()
-            coins_returned = pre_coins is not None and delta >= num_offers
-            locks_clear = still_locked is not None and not still_locked
-            pending_clear = pending_count == 0
-
-            print(
-                f"   🔄 [{elapsed}s] spendable={current_coins} "
-                f"(delta=+{delta}), open_remaining={open_remaining}"
+                result = validate_cancel_result(raw_result)
+            except (TypeError, ValueError):
+                result = normalize_cancel_response(raw_result, method="batch_rpc")
+        except mutation_gate.MutationBlocked:
+            raise
+        except Exception:
+            result = normalize_cancel_response(
+                None,
+                method="batch_rpc",
+                error="CANCEL_ERROR_UNCLASSIFIED",
             )
-
-            # Success: no more fillable offers from our batch (offers
-            # off-book and cancels confirmed on-chain — PENDING_CANCEL
-            # rows are NOT counted as success because a fill can still
-            # beat an in-mempool cancel).
-            if open_remaining == 0 and (
-                coins_returned or (locks_clear and pending_clear)
-            ):
-                print(
-                    f"   ✅ [Sage] All offers cancelled — coins returned "
-                    f"(spendable={current_coins}, delta=+{delta})"
-                )
-                confirmed = True
-                for tid in trade_ids:
-                    entry = results.get(tid, {})
-                    entry["success"] = True
-                    entry["method"] = "confirmed_by_unlock"
-                    results[tid] = entry
-                break
-
-            if open_remaining == 0:
-                print(
-                    "   [Sage] Offers are off-book, waiting for cancel "
-                    "settlement before releasing coins to coin prep"
-                )
-
-            # Secondary: coin count jumped significantly even if status is lagging
-            if coins_returned and open_remaining <= 0:
-                print(
-                    f"   ✅ [Sage] Coin count confirms cancels "
-                    f"(+{delta} coins, expected ~{num_offers})"
-                )
-                confirmed = True
-                for tid in trade_ids:
-                    results[tid] = {
-                        "success": True,
-                        "method": "confirmed_by_coin_delta",
-                    }
-                break
-
-        except Exception as e:
-            print(f"   ⚠️ [{elapsed}s] Poll error: {e}")
-
-    # ── 5. Final result ──
-    elapsed = int(time.time() - start_time)
-    if not confirmed:
-        # Sequential-phase entries already in `results` look success=True
-        # even though the cancel TX was only SUBMITTED, never verified on
-        # chain. If we leave them alone here, offer_manager sees method=""
-        # and writes status='cancelled' in the DB — corrupting state when
-        # the TX is actually still pending or has been displaced.
-        # Demote every unconfirmed success to submitted_pending_confirm
-        # so the CANCEL_PENDING_METHODS guard keeps DB status open until
-        # bot_health / fill_tracker observes the real on-chain outcome.
-        # Duplicated (not imported) to avoid a circular import with
-        # offer_manager. Keep in sync with offer_manager.CANCEL_PENDING_METHODS.
-        PENDING_METHODS = frozenset(
-            {
-                "submitted_pending_confirm",
-                "already_in_mempool",
-                "mempool_conflict_inflight",
-                "already_gone_ambiguous",
-            }
-        )
-        try:
-            final_coins = _total_spendable()
-            final_delta = (
-                (final_coins - pre_coins) if (final_coins and pre_coins) else 0
-            )
-            print(
-                f"   ⏱️ [Sage] Timeout after {elapsed}s — spendable={final_coins}, "
-                f"delta=+{final_delta}"
-            )
-            demoted = 0
-            for tid in trade_ids:
-                existing = results.get(tid)
-                if existing is None:
-                    # Never made it into the sequential-phase dict: mark as
-                    # submitted_pending_confirm so DB stays open.
-                    results[tid] = {
-                        "success": True,
-                        "method": "submitted_pending_confirm",
-                        "note": f"Cancel submitted, awaiting on-chain confirm "
-                        f"(timed out after {elapsed}s)",
-                    }
-                    demoted += 1
-                    continue
-                if not existing.get("success"):
-                    # Real failure from the sequential phase — leave alone
-                    # so the retry queue can re-attempt.
-                    continue
-                method = str(existing.get("method") or "")
-                if method in PENDING_METHODS:
-                    # Already flagged pending; nothing to do.
-                    continue
-                # An unconfirmed "success" with no pending tag. Demote it
-                # so downstream consumers do not mistake it for a verified
-                # on-chain cancel.
-                demoted_entry = dict(existing)
-                demoted_entry["method"] = "submitted_pending_confirm"
-                demoted_entry.setdefault("previous_method", method or "unspecified")
-                demoted_entry["note"] = (
-                    f"Cancel submitted but not confirmed within {elapsed}s "
-                    f"— leaving DB open for verifier to settle."
-                )
-                results[tid] = demoted_entry
-                demoted += 1
-            if demoted:
-                print(
-                    f"   ⏱️ [Sage] Demoted {demoted} unconfirmed cancels to "
-                    f"submitted_pending_confirm"
-                )
-        except Exception as _final_err:
-            print(f"   ⚠️ [Sage] Timeout post-processing failed: {_final_err}")
-            for tid in trade_ids:
-                if tid not in results:
-                    results[tid] = {
-                        "success": False,
-                        "error": f"Timed out after {elapsed}s",
-                    }
-    else:
-        print(f"   ✅ [Sage] Cancel batch complete in {elapsed}s")
-
+        results[trade_id] = result
     return results
 
 

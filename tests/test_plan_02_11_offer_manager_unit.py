@@ -24,7 +24,6 @@ try:
         mojos_to_xch,
         cat_to_mojos,
         mojos_to_cat,
-        CANCEL_PENDING_METHODS,
     )
 
     _SKIP = None
@@ -115,23 +114,6 @@ class TestConversionHelpers(unittest.TestCase):
     def test_cat_to_mojos_large_decimals(self):
         # CAT with 12 decimals (same as XCH)
         self.assertEqual(cat_to_mojos(Decimal("1"), 12), 1_000_000_000_000)
-
-
-# ===========================================================================
-# CANCEL_PENDING_METHODS frozenset
-# ===========================================================================
-
-
-@unittest.skipIf(_SKIP is not None, f"offer_manager unavailable: {_SKIP}")
-class TestCancelPendingMethods(unittest.TestCase):
-    def test_submitted_pending_in_set(self):
-        self.assertIn("submitted_pending_confirm", CANCEL_PENDING_METHODS)
-
-    def test_already_in_mempool_in_set(self):
-        self.assertIn("already_in_mempool", CANCEL_PENDING_METHODS)
-
-    def test_confirmed_not_in_set(self):
-        self.assertNotIn("confirmed", CANCEL_PENDING_METHODS)
 
 
 # ===========================================================================

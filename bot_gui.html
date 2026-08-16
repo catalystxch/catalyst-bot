@@ -31261,9 +31261,9 @@
                                 await fetchStatus();
                                 try { updateResumeOverview(); } catch (_re) { /* non-fatal */ }
                                 if (st.phase === 'complete') {
-                                    const msg = st.message || 'Cancel all complete';
-                                    addLogEntry('success', `   ✅ ${msg}`);
-                                    showToast(msg, st.failed > 0 ? 'warning' : 'success');
+                                    const view = cancelAllProgressView(st, total);
+                                    addLogEntry(view.severity, `   ${view.message}`);
+                                    showToast(view.message, view.severity);
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
@@ -31282,15 +31282,15 @@
                 }
 
                 // Synchronous response (bot-running path or legacy)
-                const cancelled = result.cancelled || 0;
+                const pending = Number(result.pending || result.cancelled || 0);
                 const failed = result.failed || 0;
 
-                if (cancelled === 0 && failed === 0) {
+                if (pending === 0 && failed === 0) {
                     addLogEntry('warning', '   No offers found to cancel');
                 } else {
-                    addLogEntry('success', `   ✅ Cancelled ${cancelled} offer${cancelled !== 1 ? 's' : ''}`);
+                    addLogEntry('warning', `   ${pending} cancellation request${pending !== 1 ? 's' : ''} pending authoritative reconciliation`);
                     if (failed > 0) {
-                        addLogEntry('warning', `   ⚠️ ${failed} offer${failed !== 1 ? 's' : ''} failed to cancel`);
+                        addLogEntry('warning', `   ${failed} offer${failed !== 1 ? 's' : ''} rejected without effect`);
                     }
                 }
 
@@ -31340,15 +31340,37 @@
             if (modal) modal.classList.remove('active');
         }
 
-        function renderCancelAllProgress(status = {}, totalHint = 0) {
+        function cancelAllProgressView(status = {}, totalHint = 0) {
             const total = Math.max(Number(status.total) || 0, Number(totalHint) || 0);
-            const cancelled = Number(status.cancelled) || 0;
+            const pending = Number(status.pending) || 0;
             const failed = Number(status.failed) || 0;
-            const processed = Math.min(total || (cancelled + failed), cancelled + failed);
+            const processed = Math.min(total || (pending + failed), pending + failed);
+            const phase = String(status.phase || 'starting').toLowerCase();
+            const isDone = phase === 'complete' || phase === 'error';
+            const remaining = Math.max(0, total - processed);
+            let title = 'Journaling cancellation requests';
+            let message = status.message || 'Preparing cancellation journals...';
+            let severity = 'info';
+            if (phase === 'complete') {
+                title = 'Cancellation requests journaled';
+                message = `${pending} pending authoritative reconciliation, ${failed} rejected without effect.`;
+                severity = 'warning';
+            } else if (phase === 'error') {
+                title = 'Cancellation journal stopped';
+                message = status.message || 'The cancellation journal stopped before all requests were recorded.';
+                severity = 'error';
+            } else if (total > 0) {
+                message = `${processed} journaled, ${remaining} remaining.`;
+            }
+            return { total, pending, failed, processed, phase, isDone, title, message, severity };
+        }
+
+        function renderCancelAllProgress(status = {}, totalHint = 0) {
+            const view = cancelAllProgressView(status, totalHint);
+            const { total, pending, failed, processed, phase, isDone } = view;
             const batchSize = Number(status.batch_size) || 0;
             const totalBatches = Number(status.total_batches) || (total > 0 && batchSize ? Math.ceil(total / batchSize) : 0);
             const currentBatch = Number(status.current_batch) || 0;
-            const phase = status.phase || 'starting';
 
             const titleEl = document.getElementById('cancelProgressTitle');
             const messageEl = document.getElementById('cancelProgressMessage');
@@ -31363,26 +31385,19 @@
             const dotsEl = document.getElementById('cancelProgressDots');
             const timeNoteEl = document.getElementById('cancelProgressTimeNote');
             const iconEl = document.getElementById('cancelProgressIcon');
-            const isDone = phase === 'complete' || phase === 'error';
             if (titleEl) {
                 // Update the text node before the dots span
                 const firstChild = titleEl.firstChild;
                 if (firstChild && firstChild.nodeType === Node.TEXT_NODE) {
-                    firstChild.textContent = phase === 'complete' ? 'Cancel complete' : phase === 'error' ? 'Cancel failed' : 'Cancelling offers';
+                    firstChild.textContent = view.title;
                 } else {
-                    titleEl.childNodes[0] && (titleEl.childNodes[0].textContent = phase === 'complete' ? 'Cancel complete' : phase === 'error' ? 'Cancel failed' : 'Cancelling offers');
+                    titleEl.childNodes[0] && (titleEl.childNodes[0].textContent = view.title);
                 }
             }
             if (dotsEl) dotsEl.style.display = isDone ? 'none' : '';
             if (timeNoteEl) timeNoteEl.style.display = isDone ? 'none' : '';
             if (iconEl) iconEl.textContent = phase === 'complete' ? '✅' : phase === 'error' ? '❌' : '⏳';
-            if (messageEl) {
-                messageEl.textContent = phase === 'complete'
-                    ? 'Cancel transaction confirmed on-chain. The offer list will refresh automatically.'
-                    : phase === 'error'
-                        ? 'The cancel run stopped early. Check the status below for the wallet error.'
-                        : 'Submitting all cancels in a single bulk transaction, then waiting for on-chain confirmation.';
-            }
+            if (messageEl) messageEl.textContent = view.message;
             if (summaryEl) {
                 summaryEl.textContent = total > 0
                     ? `${processed} of ${total} offers processed`
@@ -31416,21 +31431,21 @@
 
                 renderCancelAllProgress(status, totalHint);
 
-                const progressKey = `${status.phase || ''}|${status.current_batch || 0}|${status.cancelled || 0}|${status.failed || 0}|${status.message || ''}`;
+                const progressKey = `${status.phase || ''}|${status.current_batch || 0}|${status.pending || 0}|${status.failed || 0}|${status.message || ''}`;
                 if (status.message && progressKey !== _cancelAllLastProgressKey) {
                     const severity = status.phase === 'error'
                         ? 'error'
                         : status.phase === 'complete'
-                            ? 'success'
+                            ? 'warning'
                             : 'info';
                     addLogEntry(severity, `   ${status.message}`);
                     _cancelAllLastProgressKey = progressKey;
                 }
 
-                const offerRefreshKey = `${status.cancelled || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
+                const offerRefreshKey = `${status.pending || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
                 const shouldRefreshOffers = (
                     offerRefreshKey !== _cancelAllLastOfferRefreshKey
-                    && (status.cancelled || status.failed || status.phase === 'complete' || status.phase === 'error')
+                    && (status.pending || status.failed || status.phase === 'complete' || status.phase === 'error')
                 );
                 if (shouldRefreshOffers) {
                     _cancelAllLastOfferRefreshKey = offerRefreshKey;
@@ -31468,7 +31483,7 @@
             renderCancelAllProgress({
                 phase: 'starting',
                 total: totalActive,
-                cancelled: 0,
+                pending: 0,
                 failed: 0,
                 current_batch: 0,
                 total_batches: 0,
@@ -31911,25 +31926,27 @@
                 if (!state || !state.success) return;
 
                 const total = Number(state.total || 0);
-                const cancelled = Number(state.cancelled || 0);
+                const pending = Number(state.pending || 0);
                 const failed = Number(state.failed || 0);
-                const processed = Math.max(0, cancelled + failed);
+                const processed = Math.max(0, pending + failed);
                 const remaining = Math.max(0, total - processed);
                 const batchNum = Number(state.current_batch || 0);
                 const batchTotal = Number(state.total_batches || 0);
                 const batchLabel = batchTotal > 0 ? `Batch ${batchNum}/${batchTotal}` : '';
                 const phase = String(state.phase || '').toLowerCase();
                 const summary = total > 0
-                    ? `${cancelled} cancelled, ${failed} failed, ${remaining} remaining`
-                    : 'Checking active offers...';
+                    ? (phase === 'complete'
+                        ? `${pending} pending authoritative reconciliation, ${failed} rejected without effect`
+                        : `${processed} journaled, ${remaining} remaining`)
+                    : 'Checking cancellation journals...';
                 const suffix = state.message ? ` ${state.message}` : '';
 
                 if (phase === 'complete') {
                     setShutdownStep('Offers', 'done', total > 0
-                        ? `Offer cancel finished. ${summary}.`
+                        ? `Cancellation journal complete. ${summary}.`
                         : 'No open offers needed cancelling.');
                     updateShutdownProgress('Cancelling offers...', total > 0
-                        ? `Offer cancel finished. ${summary}.`
+                        ? `Cancellation journal complete. ${summary}.`
                         : 'No open offers needed cancelling.');
                 } else if (phase === 'error') {
                     setShutdownStep('Offers', 'error', state.message || 'Offer cancel hit a problem.');
@@ -31952,6 +31969,29 @@
             stopShutdownCancelAllPoll();
             pollShutdownCancelAllStatusOnce();
             _shutdownCancelAllPollTimer = setInterval(pollShutdownCancelAllStatusOnce, 1000);
+        }
+
+        async function waitForShutdownCancelAllCompletion(timeoutMs = 180000) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+                const statusResp = await apiFetch(`${API_URL}/offers/cancel_all/status`);
+                const statusData = await statusResp.json();
+                if (!statusData || statusData.success !== true) {
+                    throw new Error('Cancellation status returned an invalid response.');
+                }
+                const phase = String(statusData.phase || '').toLowerCase();
+                if (phase === 'error' || statusData.error) {
+                    throw new Error(statusData.message || statusData.error || 'Cancellation worker failed.');
+                }
+                if (statusData.complete === true && statusData.running === false) {
+                    return statusData;
+                }
+                if (statusData.running === false) {
+                    throw new Error('Cancellation worker stopped before journaling completed.');
+                }
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            throw new Error('Cancellation worker did not finish before the shutdown timeout.');
         }
 
         function finishShutdownProgress(success, detailText) {
@@ -32037,67 +32077,44 @@
                         const cancelResult = await cancelResp.json();
                         stopShutdownCancelAllPoll();
 
-                        if (cancelResult.success) {
-                            const count = cancelResult.cancelled || 0;
-                            if (count > 0) {
-                                addLogEntry('info', `   Cancel submitted for ${count} offers — waiting for on-chain confirmation...`);
-                                // Poll until Sage reports 0 active offers or timeout
-                                const _cancelPollStart = Date.now();
-                                const _cancelTimeout = 180000; // 3 minutes max
-                                let _remainingActive = count;
-                                while (Date.now() - _cancelPollStart < _cancelTimeout) {
-                                    await new Promise(r => setTimeout(r, 5000));
-                                    try {
-                                        const statusResp = await apiFetch(`${API_URL}/offers/cancel_all/status`);
-                                        const statusData = await statusResp.json();
-                                        // cancel_all/status tracks batch progress; check if
-                                        // it's finished AND get live wallet offer count
-                                        if (statusData.complete || !statusData.running) {
-                                            // Cancel RPC finished — now check actual wallet state
-                                            try {
-                                                const walletResp = await apiFetch(`${API_URL}/offers/open_count`);
-                                                const walletData = await walletResp.json();
-                                                _remainingActive = walletData.open_count || 0;
-                                            } catch(_wc) {
-                                                _remainingActive = 0; // assume done if can't check
-                                            }
-                                        } else {
-                                            // Still running — show batch progress
-                                            _remainingActive = Math.max(0,
-                                                (statusData.total || 0) - (statusData.batch_cancelled || 0));
-                                        }
-                                        const elapsed = Math.round((Date.now() - _cancelPollStart) / 1000);
-                                        updateShutdownProgress(
-                                            `Confirming cancellations... (${elapsed}s)`,
-                                            _remainingActive > 0
-                                                ? `${_remainingActive} offers still active on-chain`
-                                                : 'All offers cancelled'
-                                        );
-                                        setShutdownStep('Offers', 'active',
-                                            `Confirming: ${_remainingActive} still active (${elapsed}s)`);
-                                        if (_remainingActive === 0) break;
-                                    } catch(_pe) { /* keep polling */ }
-                                }
-                                if (_remainingActive === 0) {
-                                    setShutdownStep('Offers', 'done', `All ${count} offers cancelled and confirmed.`);
-                                    addLogEntry('success', `   All ${count} offers confirmed cancelled`);
-                                } else {
-                                    setShutdownStep('Offers', 'error',
-                                        `${_remainingActive} offers still active after 3 min — proceeding with shutdown.`);
-                                    addLogEntry('warning', `   ${_remainingActive} offers may still be active on-chain`);
-                                }
-                            } else {
-                                setShutdownStep('Offers', 'done', 'No open offers needed cancelling.');
-                                addLogEntry('success', '   No offers to cancel');
+                        if (!cancelResult.success) {
+                            throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');
+                        }
+
+                        const isAsyncCancel = cancelResult.async === true;
+                        const count = isAsyncCancel
+                            ? Number(cancelResult.total)
+                            : Number(cancelResult.cancelled || 0);
+                        if (!Number.isInteger(count) || count < 0 || (isAsyncCancel && count === 0)) {
+                            throw new Error('Cancel all returned an invalid offer count.');
+                        }
+
+                        if (isAsyncCancel) {
+                            addLogEntry('info', `   Journaling cancellation requests for ${count} offers...`);
+                            const finalStatus = await waitForShutdownCancelAllCompletion(180000);
+                            stopShutdownCancelAllPoll();
+                            const pending = Number(finalStatus.pending);
+                            const failed = Number(finalStatus.failed);
+                            if (!Number.isInteger(pending) || pending < 0 ||
+                                !Number.isInteger(failed) || failed < 0 ||
+                                pending + failed !== count) {
+                                throw new Error('Cancellation worker returned inconsistent completion totals.');
                             }
+                            const journalSummary = `${pending} pending authoritative reconciliation, ${failed} rejected without effect.`;
+                            setShutdownStep('Offers', 'done', `Cancellation requests journaled: ${journalSummary}`);
+                            addLogEntry('success', `   Cancellation requests journaled: ${journalSummary}`);
+                        } else if (count > 0) {
+                            setShutdownStep('Offers', 'done', `Cancellation handler completed for ${count} offers.`);
+                            addLogEntry('success', `   Cancellation handler completed for ${count} offers`);
                         } else {
-                            setShutdownStep('Offers', 'error', cancelResult.error || 'Cancel all returned an unexpected response.');
-                            addLogEntry('warning', '   Cancel returned: ' + (cancelResult.error || 'no offers'));
+                            setShutdownStep('Offers', 'done', 'No open offers needed cancelling.');
+                            addLogEntry('success', '   No offers to cancel');
                         }
                     } catch(e) {
                         stopShutdownCancelAllPoll();
                         setShutdownStep('Offers', 'error', e.message || 'Could not cancel offers before shutdown.');
                         addLogEntry('warning', '   Could not cancel offers: ' + e.message);
+                        throw e;
                     }
                 } else {
                     setShutdownStep('Offers', 'done', 'Offers left open.');

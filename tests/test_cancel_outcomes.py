@@ -17,6 +17,7 @@ from cancel_outcomes import (
     decode_evidence_code,
     normalize_cancel_response,
     safe_raw_response,
+    validate_cancel_result,
 )
 
 
@@ -262,13 +263,11 @@ def test_submitted_requires_transaction_id_or_exact_spend_identity(
         ),
         ({"status": "not already_including"}, CANCEL_UNKNOWN),
         ({"code": "MEMPOOL_CONFLICT_RETRY"}, CANCEL_UNKNOWN),
-        ({"success": False, "error_code": "MEMPOOL_CONFLICT"}, CANCEL_FAILED),
-        ({"status": "REJECTED", "code": "MEMPOOL_CONFLICT"}, CANCEL_FAILED),
+        ({"success": False, "error_code": "MEMPOOL_CONFLICT"}, CANCEL_UNKNOWN),
+        ({"status": "REJECTED", "code": "MEMPOOL_CONFLICT"}, CANCEL_UNKNOWN),
     ],
 )
-def test_only_exact_positive_mempool_codes_can_mark_submission(
-    response, want_outcome
-):
+def test_only_exact_positive_mempool_codes_can_mark_submission(response, want_outcome):
     """Negated or rejected prose must never become a submitted cancellation."""
     result = normalize_cancel_response(
         response,
@@ -287,12 +286,12 @@ def test_only_exact_positive_mempool_codes_can_mark_submission(
         (
             {"success": False, "error_code": "MEMPOOL_CONFLICT"},
             "MEMPOOL_CONFLICT",
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN,
         ),
         (
             {"status": "REJECTED", "code": "MEMPOOL_CONFLICT"},
             "MEMPOOL_CONFLICT",
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN,
         ),
         (
             {"status": "NOT_ALREADY_INCLUDING", "error_code": "MEMPOOL_CONFLICT"},
@@ -327,6 +326,31 @@ def test_full_evidence_scan_blocks_positive_submission_on_rejection_or_negation(
 
 
 @pytest.mark.parametrize(
+    ("response", "transaction_id", "spend_identity"),
+    [
+        ({"success": False, "error_code": "REJECTED"}, "b" * 64, ""),
+        ({"status": "REJECTED"}, "", "sha256:" + "c" * 64),
+    ],
+)
+def test_rejection_with_submission_identity_is_unknown(
+    response, transaction_id, spend_identity
+):
+    result = normalize_cancel_response(
+        response,
+        method="submit_transaction",
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+
+    assert result["outcome"] == CANCEL_UNKNOWN
+    assert result["submitted"] is False
+    assert result["reconciliation_required"] is True
+    assert result["transaction_id"] == transaction_id
+    assert result["spend_identity"] == spend_identity
+    validate_cancel_result(result)
+
+
+@pytest.mark.parametrize(
     "positive_code",
     [
         "MEMPOOL_CONFLICT",
@@ -349,8 +373,8 @@ def test_every_not_positive_code_blocks_submitted_classification(positive_code):
 @pytest.mark.parametrize(
     ("message", "want_outcome"),
     [
-        ("cancel rejected", CANCEL_FAILED),
-        ("transaction rejected", CANCEL_FAILED),
+        ("cancel rejected", CANCEL_UNKNOWN),
+        ("transaction rejected", CANCEL_UNKNOWN),
         ("cancellation was not rejected", CANCEL_UNKNOWN),
         ("rejection not observed", CANCEL_UNKNOWN),
         ('history: "cancel rejected" yesterday', CANCEL_UNKNOWN),
@@ -382,9 +406,7 @@ def test_rejection_prose_requires_an_exact_unnegated_phrase(message, want_outcom
         ({"transaction_id": "a" * 64}, False),
     ],
 )
-def test_submitted_accepts_only_bounded_transaction_id_grammars(
-    transaction_id, valid
-):
+def test_submitted_accepts_only_bounded_transaction_id_grammars(transaction_id, valid):
     """Coercing arbitrary values to strings would fabricate reconciliation IDs."""
     result = cancellation_result(
         CANCEL_SUBMITTED_UNCONFIRMED,
@@ -492,7 +514,7 @@ def test_compact_evidence_keeps_longest_decision_code_with_transaction_id(limit)
     [
         (
             {"code": "MEMPOOL_CONFLICT", "status": "REJECTED"},
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN,
             "REJECTED",
         ),
         (
@@ -663,9 +685,7 @@ def test_compact_evidence_schema_is_immutable_unique_and_round_trips():
     aliases = tuple(COMPACT_EVIDENCE_CODE_ALIASES.values())
     assert len(aliases) == len(set(aliases))
     for code, alias in COMPACT_EVIDENCE_CODE_ALIASES.items():
-        evidence = json.loads(
-            safe_raw_response({}, limit=192, decision_code=code)
-        )
+        evidence = json.loads(safe_raw_response({}, limit=192, decision_code=code))
         assert evidence["v"] == 4
         assert evidence["code"] == alias
         assert decode_evidence_code(alias) == code

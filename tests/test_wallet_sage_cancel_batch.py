@@ -50,23 +50,16 @@ if "urllib3" not in sys.modules:
     sys.modules["urllib3"] = urllib3_stub
 
 import wallet_sage
+from cancel_outcomes import (
+    CANCEL_FAILED,
+    CANCEL_SUBMITTED_UNCONFIRMED,
+    CANCEL_UNKNOWN,
+    validate_cancel_result,
+)
 
 
 class WalletSageCancelBatchTests(unittest.TestCase):
-    def test_get_still_locked_trade_ids_ignores_0x_prefix(self):
-        owned = {
-            "0xcoin1": {"offer_id": "0xABC123"},
-            "0xcoin2": {"offer_id": "def456"},
-            "0xcoin3": {"offer_id": None},
-        }
-
-        locked = wallet_sage._get_still_locked_trade_ids(
-            {"abc123", "0xdef456", "zzz999"}, owned
-        )
-
-        self.assertEqual(locked, {"abc123", "0xdef456"})
-
-    def test_cancel_batch_confirms_by_unlock_when_offer_not_active_or_locked(self):
+    def test_cancel_batch_never_confirms_by_unlock_or_absence(self):
         ticks = itertools.count(start=0, step=1)
 
         with (
@@ -81,8 +74,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
-        self.assertTrue(results["0xabc123"]["success"])
-        self.assertEqual(results["0xabc123"]["method"], "confirmed_by_unlock")
+        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
+        self.assertFalse(results["0xabc123"]["success"])
+        validate_cancel_result(results["0xabc123"])
 
     def test_cancel_batch_does_not_confirm_when_offer_disappears_but_tx_pending(self):
         ticks = itertools.count(start=0, step=31)
@@ -103,11 +97,8 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
-        self.assertTrue(results["0xabc123"]["success"])
-        self.assertEqual(
-            results["0xabc123"]["method"],
-            "submitted_pending_confirm",
-        )
+        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
+        validate_cancel_result(results["0xabc123"])
 
     def test_cancel_batch_does_not_confirm_when_offer_lock_still_visible(self):
         ticks = itertools.count(start=0, step=31)
@@ -128,11 +119,8 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
-        self.assertTrue(results["0xabc123"]["success"])
-        self.assertEqual(
-            results["0xabc123"]["method"],
-            "submitted_pending_confirm",
-        )
+        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
+        validate_cancel_result(results["0xabc123"])
 
     def test_sequential_cancel_retries_without_fee_when_fee_coin_unavailable(self):
         no_fee_coin = {
@@ -158,9 +146,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
                 skip_confirmation=True,
             )
 
-        self.assertTrue(results["0xabc123"]["success"])
+        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_FAILED)
         self.assertEqual(cancel.call_args_list[0].kwargs["fee_mojos"], 100)
-        self.assertEqual(cancel.call_args_list[1].kwargs["fee_mojos"], 0)
+        self.assertEqual(cancel.call_count, 1)
 
     def test_cancel_offer_treats_mempool_conflict_as_pending_cancel(self):
         with (
@@ -174,8 +162,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             result = wallet_sage.cancel_offer("0xabc123", secure=False)
 
-        self.assertTrue(result["success"])
-        self.assertEqual(result["method"], "mempool_conflict_inflight")
+        self.assertEqual(result["outcome"], CANCEL_UNKNOWN)
+        self.assertFalse(result["success"])
+        validate_cancel_result(result)
 
     def test_cancel_offer_uses_typed_http_404_for_already_gone(self):
         with (
@@ -189,9 +178,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             result = wallet_sage.cancel_offer("0xabc123", secure=False)
 
-        self.assertTrue(result["success"])
-        self.assertTrue(result["already_gone"])
-        self.assertEqual(result["method"], "already_gone_ambiguous")
+        self.assertEqual(result["outcome"], CANCEL_UNKNOWN)
+        self.assertFalse(result["success"])
+        validate_cancel_result(result)
 
     def test_cancel_offer_preserves_stable_no_spendable_code(self):
         with (
@@ -207,9 +196,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         ):
             result = wallet_sage.cancel_offer("0xabc123", secure=True, fee_mojos=100)
 
+        self.assertEqual(result["outcome"], CANCEL_FAILED)
         self.assertFalse(result["success"])
-        self.assertEqual(result["error"], "NO_SPENDABLE_COINS")
-        self.assertEqual(result["error_code"], "NO_SPENDABLE_COINS")
+        validate_cancel_result(result)
 
     def test_sequential_cancel_retries_stable_no_spendable_code_without_fee(self):
         stable_no_fee_coin = {
@@ -236,10 +225,118 @@ class WalletSageCancelBatchTests(unittest.TestCase):
                 skip_confirmation=True,
             )
 
-        self.assertTrue(results["0xabc123"]["success"])
-        self.assertEqual(cancel.call_count, 2)
+        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_FAILED)
+        self.assertEqual(cancel.call_count, 1)
         self.assertEqual(cancel.call_args_list[0].kwargs["fee_mojos"], 100)
-        self.assertEqual(cancel.call_args_list[1].kwargs["fee_mojos"], 0)
+
+    def test_cancel_offer_success_without_identity_is_unknown(self):
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(wallet_sage, "_sage_post", return_value={"success": True}),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertEqual(result["outcome"], CANCEL_UNKNOWN)
+        validate_cancel_result(result)
+
+    def test_cancel_offer_exact_transaction_identity_is_submitted(self):
+        transaction_id = "1" * 64
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                return_value={"success": True, "transaction_id": transaction_id},
+            ),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertEqual(result["outcome"], CANCEL_SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result["transaction_id"], transaction_id)
+        validate_cancel_result(result)
+
+    def test_cancel_offer_local_signing_rejection_is_failed_without_effect(self):
+        rechecks = []
+        with (
+            patch.object(
+                wallet_sage, "_require_signing_capability", return_value=False
+            ),
+            patch.object(wallet_sage, "_sage_post") as post,
+        ):
+            result = wallet_sage.cancel_offer(
+                "0xabc123",
+                secure=False,
+                _identity_recheck=lambda step: rechecks.append(step),
+            )
+
+        self.assertEqual(result["outcome"], CANCEL_FAILED)
+        self.assertEqual(rechecks, [])
+        post.assert_not_called()
+        validate_cancel_result(result)
+
+    def test_cancel_offer_disconnect_after_effect_boundary_is_unknown(self):
+        rechecks = []
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=wallet_sage.SageConnectionError(
+                    error_code="SAGE_CONNECTION_ERROR"
+                ),
+            ),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer(
+                "0xabc123",
+                secure=False,
+                _identity_recheck=lambda step: rechecks.append(step),
+            )
+
+        self.assertEqual(result["outcome"], CANCEL_UNKNOWN)
+        self.assertEqual(rechecks, ["cancel_offer"])
+        validate_cancel_result(result)
+
+    def test_cancel_offer_response_loss_never_resubmits_transport_request(self):
+        sends = []
+
+        class LostResponseConnection:
+            def request(self, method, path, **kwargs):
+                sends.append((method, path))
+
+            def getresponse(self):
+                raise ConnectionResetError("response lost after dispatch")
+
+        class RetryWouldSubmitConnection:
+            def request(self, method, path, **kwargs):
+                sends.append((method, path))
+
+            def getresponse(self):
+                raise AssertionError("cancel transport must not retry")
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_get_sage_connection",
+                return_value=LostResponseConnection(),
+            ),
+            patch.object(
+                wallet_sage.http.client,
+                "HTTPSConnection",
+                return_value=RetryWouldSubmitConnection(),
+            ),
+            patch.object(wallet_sage, "CERT_PATH", None),
+            patch.object(wallet_sage, "KEY_PATH", None),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertEqual(sends, [("POST", "/cancel_offer")])
+        self.assertEqual(result["outcome"], CANCEL_UNKNOWN)
+        self.assertFalse(result["success"])
+        validate_cancel_result(result)
 
     def test_already_including_transaction_is_info_for_cancel(self):
         self.assertEqual(

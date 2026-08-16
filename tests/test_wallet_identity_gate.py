@@ -346,7 +346,7 @@ def test_create_offer_preserves_selected_adapter_defaults(
     assert calls[0][1]["_reuse_puzhash"] is expected_reuse
 
 
-def test_mutation_requires_lease_even_when_identity_matches(monkeypatch):
+def test_unjournaled_cancel_is_blocked_before_lease_or_adapter(monkeypatch):
     adapter_calls = []
     monkeypatch.setattr(
         wallet,
@@ -367,7 +367,9 @@ def test_mutation_requires_lease_even_when_identity_matches(monkeypatch):
     result = wallet.cancel_offer("a" * 64)
 
     assert result["success"] is False
-    assert result["reason"] == "LEASE_LOST"
+    assert result["outcome"] == "CANCEL_UNKNOWN"
+    assert result["method"] == "continuation"
+    assert result["_catalyst_effect_attempted"] is False
     assert adapter_calls == []
 
 
@@ -454,7 +456,7 @@ def test_mutation_exceptions_preserve_stable_dict_and_release_permit(monkeypatch
 def test_exit_failure_never_raises_through_wallet_boundary(monkeypatch):
     fake_adapter = SimpleNamespace(
         get_wallet_identity=lambda: _identity(),
-        cancel_offer=lambda *args, **kwargs: {"success": True},
+        send_transaction=lambda *args, **kwargs: {"success": True},
     )
     monkeypatch.setattr(
         wallet,
@@ -487,7 +489,7 @@ def test_exit_failure_never_raises_through_wallet_boundary(monkeypatch):
         lambda permit, operation: (_binding(), fake_adapter),
     )
 
-    assert wallet.cancel_offer("a" * 64) == {"success": True}
+    assert wallet.send_transaction(1, 1, "xch1destination") == {"success": True}
 
 
 def test_async_adapter_callback_is_not_returned_outside_permit(monkeypatch):
@@ -600,7 +602,7 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
 
     fake_adapter = SimpleNamespace(
         get_wallet_identity=lambda: identity_calls.append(True) or _identity(),
-        cancel_offers_batch=adapter_batch,
+        split_coins_bulk=adapter_batch,
     )
     monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
@@ -627,14 +629,14 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
         ),
     )
 
-    result = wallet.cancel_offers_batch(["a" * 64, "b" * 64])
+    result = wallet.split_coins_bulk(1, 2, 100)
 
     assert result == {"success": True}
     assert identity_calls == [True, True, True]
     assert authorization_calls == [
-        "wallet:cancel_offers_batch",
-        "wallet:cancel_offers_batch:first",
-        "wallet:cancel_offers_batch:second",
+        "wallet:split_coins_bulk",
+        "wallet:split_coins_bulk:first",
+        "wallet:split_coins_bulk:second",
     ]
 
 
@@ -749,7 +751,7 @@ def test_sage_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):
             _identity_recheck=recheck,
         )
 
-    assert events == ["check:cancel_offer:0", "check:cancel_offer"]
+    assert events == ["check:cancel_offer"]
 
 
 def test_chia_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):
@@ -776,7 +778,7 @@ def test_chia_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):
             _identity_recheck=recheck,
         )
 
-    assert events == ["check:cancel_offer:0", "check:cancel_offer"]
+    assert events == ["check:cancel_offer"]
 
 
 def test_chia_multi_send_rechecks_before_each_submission_attempt(monkeypatch):
@@ -890,7 +892,9 @@ def test_chia_cancel_batch_rechecks_each_offer(monkeypatch):
         wallet_chia,
         "cancel_offer",
         lambda trade_id, *args, **kwargs: (
-            events.append(f"cancel:{trade_id}") or {"success": True}
+            kwargs["_identity_recheck"]("cancel_offer")
+            or events.append(f"cancel:{trade_id}")
+            or {"success": True}
         ),
     )
     monkeypatch.setattr(wallet_chia.time, "sleep", lambda seconds: None)
@@ -900,11 +904,11 @@ def test_chia_cancel_batch_rechecks_each_offer(monkeypatch):
         _identity_recheck=lambda step: events.append(f"check:{step}"),
     )
 
-    assert result["offer-1"]["success"] is True
+    assert result["offer-1"]["outcome"] == "CANCEL_UNKNOWN"
     assert events == [
-        "check:cancel_offer:0",
+        "check:cancel_offer",
         "cancel:offer-1",
-        "check:cancel_offer:1",
+        "check:cancel_offer",
         "cancel:offer-2",
     ]
 
@@ -1040,7 +1044,11 @@ def test_compound_adapter_propagates_identity_block_without_fallback(monkeypatch
     monkeypatch.setattr(
         wallet_chia,
         "cancel_offer",
-        lambda *args, **kwargs: calls.append("cancel") or {"success": True},
+        lambda *args, **kwargs: (
+            kwargs["_identity_recheck"]("cancel_offer")
+            or calls.append("cancel")
+            or {"success": True}
+        ),
     )
     monkeypatch.setattr(wallet_chia.time, "sleep", lambda seconds: None)
 

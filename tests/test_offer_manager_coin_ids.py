@@ -50,6 +50,8 @@ _ORIG_MODULES = {
         "coin_manager",
         "tx_fees",
         "win_subprocess",
+        "mutation_gate",
+        "offer_registry",
         "offer_manager",
     )
 }
@@ -72,6 +74,7 @@ fake_database.lock_coin = lambda *args, **kwargs: None
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
 fake_database.transition_offer = lambda *args, **kwargs: None
 fake_database.mark_cancel_attempted = lambda *args, **kwargs: None
+fake_database.get_retryable_failed_offer_cancels = lambda: []
 sys.modules["database"] = fake_database
 
 fake_wallet = types.ModuleType("wallet")
@@ -118,6 +121,23 @@ sys.modules["win_subprocess"] = fake_win_subprocess
 # version loaded by test_api_local_guard (which uses real config/wallet).
 sys.modules.pop("offer_manager", None)
 import offer_manager
+from cancel_outcomes import (
+    CANCEL_SUBMITTED_UNCONFIRMED,
+    cancellation_result,
+)
+
+
+def _submitted_cancel_results(trade_ids):
+    return {
+        trade_id: cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="unit_requote",
+            raw_response={"success": True, "transaction_id": "1" * 64},
+            transaction_id="1" * 64,
+        )
+        for trade_id in trade_ids
+    }
+
 
 # Restore originals after import so we don't pollute subsequent test files.
 for _name, _mod in _ORIG_MODULES.items():
@@ -145,45 +165,11 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             self.assertEqual(manager._get_ladder_parallelism(True), 1)
             self.assertEqual(manager._get_ladder_parallelism(False), 1)
 
-    def test_cancel_offers_logs_only_confirmed_cancels(self):
-        manager = offer_manager.OfferManager()
-        events = []
-
-        with (
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "trade-ok": {"success": True},
-                    "trade-fail": {"success": False},
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(
-                offer_manager,
-                "log_event",
-                side_effect=lambda level, event_type, message: events.append(
-                    (level, event_type, message)
-                ),
-            ),
-        ):
-            result = manager.cancel_offers(["trade-ok", "trade-fail"], reason="test")
-
-        self.assertTrue(result["trade-ok"]["success"])
-        mock_update.assert_called_once_with("trade-ok", "cancelled")
-        event_types = [event_type for _, event_type, _ in events]
-        self.assertIn("cancel_result", event_types)
-        self.assertIn("offers_cancelled", event_types)
-        self.assertIn("offers_cancel_pending", event_types)
-        cancelled_msgs = [
-            msg for _, event_type, msg in events if event_type == "offers_cancelled"
-        ]
-        self.assertEqual(cancelled_msgs, ["Cancelled 1 offers (reason: test)"])
-
-    def test_requote_side_cancels_most_at_risk_first(self):
-        """Single-pass requote cancels the most-at-risk old offers first."""
+    def test_requote_side_journals_most_at_risk_first_without_overstacking(self):
+        """Single-pass requote journals the most-at-risk old offers first."""
         manager = offer_manager.OfferManager()
         cancel_batches = []
+        create_batches = []
         open_offers = [
             {
                 "trade_id": "extreme-trade",
@@ -213,6 +199,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -220,7 +207,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             del reason, skip_confirmation, force_storm
             cancel_batches.append(list(trade_ids))
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         # Two spare trading coins (DB-first path in requote_side).
         # Must have designation in {"tier_spare","tier_active"} and assigned_tier
@@ -244,11 +231,14 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("buy", Decimal("0.1200"))
 
-        # Single pass: 2 spares → create 2, cancel 2 most-at-risk
-        self.assertEqual(result["replaced_count"], 2)
+        # Single pass: journal the two most-at-risk without publishing replacements.
+        self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 4)
         self.assertFalse(result["fully_replaced"])
-        self.assertEqual(len(result["offers"]), 2)
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["pending_cancel_count"], 2)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertEqual(create_batches, [])
         # Only one cancel batch (single pass, no rolling waves)
         self.assertEqual(len(cancel_batches), 1)
         # Most-at-risk first: inner (closest to mid), then mid
@@ -259,6 +249,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         manager = offer_manager.OfferManager()
         cancel_batches = []
         force_flags = []
+        create_batches = []
         open_offers = []
         for idx, price in enumerate(
             [
@@ -300,6 +291,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -308,7 +300,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             del reason, skip_confirmation
             cancel_batches.append(list(trade_ids))
             force_flags.append(force_storm)
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         _eight_spare_coins = [
             {"designation": "tier_spare", "assigned_tier": "inner"} for _ in range(8)
@@ -323,9 +315,12 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("buy", Decimal("0.1200"))
 
-        self.assertEqual(result["replaced_count"], 8)
+        self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 10)
         self.assertFalse(result["fully_replaced"])
+        self.assertEqual(result["pending_cancel_count"], 8)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertEqual(create_batches, [])
         self.assertEqual(len(cancel_batches), 1)
         self.assertEqual(
             cancel_batches[0][:6],
@@ -345,6 +340,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
     def test_requote_side_can_force_intentional_cancel_storm(self):
         manager = offer_manager.OfferManager()
         force_flags = []
+        create_batches = []
         open_offers = [
             {
                 "trade_id": f"old-{idx}",
@@ -358,6 +354,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             del mid_price, side, kwargs
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -365,7 +362,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             del reason, skip_confirmation
             force_flags.append(force_storm)
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         _six_spare_coins = [
             {"designation": "tier_spare", "assigned_tier": "inner"} for _ in range(6)
@@ -384,7 +381,10 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 force_cancel_storm=True,
             )
 
-        self.assertEqual(result["replaced_count"], 6)
+        self.assertEqual(result["replaced_count"], 0)
+        self.assertEqual(result["pending_cancel_count"], 6)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertEqual(create_batches, [])
         self.assertEqual(force_flags, [True])
 
     def test_requote_side_does_not_create_when_cancel_is_pending(self):
@@ -431,6 +431,49 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["pending_cancel_count"], 1)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertFalse(result["fully_replaced"])
+
+    def test_requote_side_does_not_overstack_after_typed_cancel_failure(self):
+        manager = offer_manager.OfferManager()
+        open_offers = [
+            {
+                "trade_id": "old-sell",
+                "tier": "inner",
+                "price_xch": "0.1200",
+                "created_at": "2026-03-29T00:00:01+00:00",
+            }
+        ]
+        calls = []
+
+        def fake_create_ladder(*args, **kwargs):
+            del args, kwargs
+            calls.append("create")
+            return [{"trade_id": "new-sell"}]
+
+        def fake_cancel_offers(
+            trade_ids, reason="requote", skip_confirmation=False, force_storm=False
+        ):
+            del trade_ids, reason, skip_confirmation, force_storm
+            calls.append("cancel")
+            return {"old-sell": {"outcome": "CANCEL_FAILED"}}
+
+        with (
+            patch.object(offer_manager, "get_open_offers", return_value=open_offers),
+            patch(
+                "database.get_free_coins",
+                return_value=[{"designation": "tier_spare", "assigned_tier": "inner"}],
+            ),
+            patch.object(manager, "create_ladder", side_effect=fake_create_ladder),
+            patch.object(manager, "cancel_offers", side_effect=fake_cancel_offers),
+            patch.object(offer_manager, "log_event"),
+        ):
+            result = manager.requote_side("sell", Decimal("0.1200"))
+
+        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["replaced_count"], 0)
+        self.assertEqual(result["pending_cancel_count"], 0)
+        self.assertEqual(result["failed_cancel_count"], 1)
         self.assertFalse(result["fully_replaced"])
 
     def test_retry_failed_cancels_exhaustion_does_not_mark_cancelled(self):
@@ -1825,129 +1868,8 @@ class CancelPendingMempoolTests(unittest.TestCase):
     the offer is still live and can still fill. Previously the bot did
     flip the DB, producing ghost offers during mempool congestion."""
 
-    def test_pending_methods_constant_covers_all_unconfirmed_sage_paths(self):
-        self.assertIn("submitted_pending_confirm", offer_manager.CANCEL_PENDING_METHODS)
-        self.assertIn("already_in_mempool", offer_manager.CANCEL_PENDING_METHODS)
-        self.assertIn("mempool_conflict_inflight", offer_manager.CANCEL_PENDING_METHODS)
-
-    def test_cancel_offers_skips_db_update_for_pending_methods(self):
-        manager = offer_manager.OfferManager()
-
-        # Mock the DB open-offers lookup to return one offer we want to cancel.
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[
-                    {"trade_id": "tid-pending", "coin_id": "0xc1", "side": "buy"}
-                ],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-pending": {
-                        "success": True,
-                        "method": "submitted_pending_confirm",
-                        "note": "Cancel submitted, awaiting on-chain confirm",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-pending"], reason="test")
-
-        # The DB must NOT be flipped to cancelled — the offer is still live.
-        cancelled_calls = [
-            c
-            for c in mock_update.call_args_list
-            if len(c.args) >= 2 and c.args[1] == "cancelled"
-        ]
-        self.assertEqual(
-            cancelled_calls,
-            [],
-            "DB must not be marked cancelled while cancel TX is "
-            "still pending in the mempool",
-        )
-
-    def test_cancel_offers_flips_db_for_confirmed_methods(self):
-        """Sanity check: the happy path (truly confirmed) DOES flip the DB."""
-        manager = offer_manager.OfferManager()
-
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[{"trade_id": "tid-ok", "coin_id": "0xc2", "side": "buy"}],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-ok": {
-                        "success": True,
-                        "method": "confirmed_by_unlock",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-ok"], reason="test")
-
-        cancelled_calls = [
-            c
-            for c in mock_update.call_args_list
-            if len(c.args) >= 2 and c.args[1] == "cancelled"
-        ]
-        self.assertEqual(
-            len(cancelled_calls),
-            1,
-            "DB must be flipped to cancelled when Sage confirms "
-            "the cancel via coin unlock",
-        )
-
-    def test_cancel_offers_purges_public_post_queues(self):
-        manager = offer_manager.OfferManager()
-        purged = {"dexie": [], "splash": []}
-
-        class QueueStub:
-            def __init__(self, name):
-                self.name = name
-
-            def purge_trade_ids(self, trade_ids):
-                purged[self.name].append(list(trade_ids))
-
-        manager.dexie_manager = QueueStub("dexie")
-        manager.splash_manager = QueueStub("splash")
-
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[{"trade_id": "tid-ok", "coin_id": "0xc2", "side": "buy"}],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-ok": {
-                        "success": True,
-                        "method": "confirmed_by_unlock",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status"),
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-ok"], reason="test")
-
-        self.assertEqual(purged["dexie"], [["tid-ok"]])
-        self.assertEqual(purged["splash"], [["tid-ok"]])
+    def test_pending_methods_string_policy_is_removed(self):
+        self.assertFalse(hasattr(offer_manager, "CANCEL_PENDING_METHODS"))
 
 
 if __name__ == "__main__":

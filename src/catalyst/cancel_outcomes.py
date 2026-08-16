@@ -32,6 +32,7 @@ _EXACT_SPEND_IDENTITY = re.compile(r"^sha256:[0-9a-f]{64}$", re.IGNORECASE)
 _HEX_TRANSACTION_ID = re.compile(r"^(?:0x)?[0-9a-f]{64}$", re.IGNORECASE)
 _STABLE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 _METHOD_TAG = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _POSITIVE_SUBMISSION_CODES = frozenset(
     {
         "MEMPOOL_CONFLICT",
@@ -44,7 +45,10 @@ _NEGATED_SUBMISSION_CODES = frozenset(
     f"NOT_{code}" for code in _POSITIVE_SUBMISSION_CODES
 )
 _SAFE_DIAGNOSTIC_CODES = (
-    _POSITIVE_SUBMISSION_CODES | _REJECTION_CODES | _NEGATED_SUBMISSION_CODES
+    _POSITIVE_SUBMISSION_CODES
+    | _REJECTION_CODES
+    | _NEGATED_SUBMISSION_CODES
+    | {CANCEL_UNKNOWN, "CANCEL_ERROR_UNCLASSIFIED"}
 )
 _EXACT_REJECTION_PHRASES = frozenset(
     {"rejected", "cancel rejected", "transaction rejected"}
@@ -77,10 +81,9 @@ COMPACT_EVIDENCE_CODE_ALIASES: Mapping[str, str] = MappingProxyType(
 _COMPACT_EVIDENCE_CODE_DECODER: Mapping[str, str] = MappingProxyType(
     {alias: code for code, alias in _COMPACT_EVIDENCE_CODE_SCHEMA}
 )
-if (
-    len(COMPACT_EVIDENCE_CODE_ALIASES) != len(_COMPACT_EVIDENCE_CODE_SCHEMA)
-    or len(_COMPACT_EVIDENCE_CODE_DECODER) != len(_COMPACT_EVIDENCE_CODE_SCHEMA)
-):
+if len(COMPACT_EVIDENCE_CODE_ALIASES) != len(_COMPACT_EVIDENCE_CODE_SCHEMA) or len(
+    _COMPACT_EVIDENCE_CODE_DECODER
+) != len(_COMPACT_EVIDENCE_CODE_SCHEMA):
     raise RuntimeError("compact evidence v4 codes and aliases must be unique")
 
 
@@ -160,7 +163,11 @@ def _evidence_reason_from_raw(value: Any) -> str:
         return CANCEL_UNKNOWN
     codes = _response_codes(value)
     if value.get("success") is False or codes & _REJECTION_CODES:
-        return sorted(codes & _REJECTION_CODES)[0] if codes & _REJECTION_CODES else CANCEL_FAILED
+        return (
+            sorted(codes & _REJECTION_CODES)[0]
+            if codes & _REJECTION_CODES
+            else CANCEL_FAILED
+        )
     if codes & _NEGATED_SUBMISSION_CODES:
         return sorted(codes & _NEGATED_SUBMISSION_CODES)[0]
     if codes & _POSITIVE_SUBMISSION_CODES:
@@ -316,9 +323,7 @@ def cancellation_result(
 
     submitted = normalized == CANCEL_SUBMITTED_UNCONFIRMED
     evidence_reason = (
-        error_text
-        if error_text in COMPACT_EVIDENCE_CODE_ALIASES
-        else normalized
+        error_text if error_text in COMPACT_EVIDENCE_CODE_ALIASES else normalized
     )
     raw_evidence = safe_raw_response(raw_response, decision_code=evidence_reason)
     result: dict[str, Any] = {
@@ -337,6 +342,81 @@ def cancellation_result(
     return result
 
 
+def validate_cancel_result(value: Any) -> dict[str, Any]:
+    """Return a detached exact typed result, or reject it without coercion."""
+
+    required = {
+        "outcome",
+        "success",
+        "submitted",
+        "reconciliation_required",
+        "method",
+        "transaction_id",
+        "spend_identity",
+        "raw_response",
+        "evidence_digest",
+    }
+    if type(value) is not dict or set(value) not in (
+        required,
+        required | {"error"},
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    outcome = value["outcome"]
+    transaction_id = value["transaction_id"]
+    spend_identity = value["spend_identity"]
+    method = value["method"]
+    raw_response = value["raw_response"]
+    evidence_sha256 = value["evidence_digest"]
+    if type(outcome) is not str or outcome not in _OUTCOMES:
+        raise ValueError("canonical cancellation result is invalid")
+    if type(transaction_id) is not str or (
+        transaction_id and _validated_transaction_id(transaction_id) != transaction_id
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    if type(spend_identity) is not str or (
+        spend_identity and _validated_spend_identity(spend_identity) != spend_identity
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    if type(method) is not str or not (
+        _METHOD_TAG.fullmatch(method) or method == "CANCEL_METHOD_UNCLASSIFIED"
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    if type(evidence_sha256) is not str or not _SHA256_HEX.fullmatch(evidence_sha256):
+        raise ValueError("canonical cancellation result is invalid")
+    if type(raw_response) is not str or len(raw_response.encode("utf-8")) > 4096:
+        raise ValueError("canonical cancellation result is invalid")
+    try:
+        decoded_response = json.loads(raw_response)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("canonical cancellation result is invalid") from exc
+    if (
+        type(decoded_response) is not dict
+        or _canonical_json(decoded_response) != raw_response
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    expected_success = outcome == CANCEL_CONFIRMED
+    expected_submitted = outcome == CANCEL_SUBMITTED_UNCONFIRMED
+    expected_reconciliation = expected_submitted or outcome == CANCEL_UNKNOWN
+    if (
+        type(value["success"]) is not bool
+        or value["success"] is not expected_success
+        or type(value["submitted"]) is not bool
+        or value["submitted"] is not expected_submitted
+        or type(value["reconciliation_required"]) is not bool
+        or value["reconciliation_required"] is not expected_reconciliation
+        or (
+            expected_submitted
+            and not _has_submission_identity(transaction_id, spend_identity)
+        )
+    ):
+        raise ValueError("canonical cancellation result is invalid")
+    if "error" in value:
+        error = value["error"]
+        if type(error) is not str or _safe_error_code(error) != error:
+            raise ValueError("canonical cancellation result is invalid")
+    return dict(value)
+
+
 def normalize_cancel_response(
     response: Any,
     *,
@@ -353,8 +433,8 @@ def normalize_cancel_response(
     in an RPC payload such as ``success`` or ``confirmed`` are never proof.
     """
     if isinstance(response, Mapping):
-        transaction_id = transaction_id or response.get("transaction_id") or response.get(
-            "tx_id"
+        transaction_id = (
+            transaction_id or response.get("transaction_id") or response.get("tx_id")
         )
         spend_identity = spend_identity or response.get("spend_identity")
     transaction_id = _validated_transaction_id(transaction_id)
@@ -374,7 +454,7 @@ def normalize_cancel_response(
     if _has_explicit_rejection(response, values):
         rejection_codes = sorted(all_codes & _REJECTION_CODES)
         return cancellation_result(
-            CANCEL_FAILED,
+            CANCEL_UNKNOWN if identity_present else CANCEL_FAILED,
             method=method,
             raw_response=response,
             error=rejection_codes[0] if rejection_codes else "REJECTED",
@@ -472,4 +552,5 @@ __all__ = [
     "normalize_cancel_response",
     "normalize_cancel_result",
     "safe_raw_response",
+    "validate_cancel_result",
 ]

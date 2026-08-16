@@ -26,6 +26,7 @@ import time
 from dotenv import load_dotenv
 from config import cfg
 import mutation_gate
+from cancel_outcomes import CANCEL_UNKNOWN, cancellation_result
 
 load_dotenv()
 
@@ -308,6 +309,20 @@ def _blocked_offer_creation_continuation(
     return result
 
 
+def _blocked_offer_cancel_continuation(
+    reason: str = "OFFER_CANCEL_CONTINUATION_INVALID",
+    *,
+    effect_attempted: bool = False,
+) -> dict:
+    result = cancellation_result(
+        CANCEL_UNKNOWN,
+        method="continuation",
+        raw_response={"reason_code": reason},
+    )
+    result["_catalyst_effect_attempted"] = effect_attempted
+    return result
+
+
 class _OfferCreationContinuation:
     """Opaque process-local capability with no serializable token material."""
 
@@ -330,6 +345,8 @@ class _OfferCreationContinuationState:
         "journal",
         "operation_id",
         "permit",
+        "target_trade_id",
+        "wallet_operation",
     )
 
     def __init__(
@@ -343,6 +360,8 @@ class _OfferCreationContinuationState:
         journal,
         operation_id,
         permit,
+        target_trade_id,
+        wallet_operation,
     ):
         self.adapter = adapter
         self.binding = binding
@@ -352,6 +371,8 @@ class _OfferCreationContinuationState:
         self.journal = journal
         self.operation_id = operation_id
         self.permit = permit
+        self.target_trade_id = target_trade_id
+        self.wallet_operation = wallet_operation
 
 
 _offer_creation_continuation_lock = threading.RLock()
@@ -366,6 +387,17 @@ def _exact_continuation_text(value, name: str) -> str:
     if value != value.strip() or any(ord(character) < 0x20 for character in value):
         raise ValueError(f"{name} must be non-empty canonical text")
     return value
+
+
+def _exact_continuation_trade_id(value) -> str:
+    trade_id = _exact_continuation_text(value, "trade_id")
+    if len(trade_id) != 64 or trade_id.lower() != trade_id:
+        raise ValueError("trade_id must be canonical lowercase hex")
+    try:
+        bytes.fromhex(trade_id)
+    except ValueError as exc:
+        raise ValueError("trade_id must be canonical lowercase hex") from exc
+    return trade_id
 
 
 def _canonical_json(value) -> str:
@@ -389,19 +421,18 @@ def _canonical_identity_observation(snapshot: dict, decision: dict) -> dict:
     }
 
 
-def begin_offer_creation_continuation(
+def _begin_offer_operation_continuation(
     *,
     operation_id: str,
     intent_id: str,
+    wallet_operation: str,
+    target_trade_id: str = None,
     ttl_seconds: int = 30,
 ):
-    """Enter offer authority before PREPARED and return an opaque one-shot handle."""
-
     operation = _exact_continuation_text(operation_id, "operation_id")
     intent = _exact_continuation_text(intent_id, "intent_id")
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 60:
         raise ValueError("ttl_seconds must be an exact integer from 1 to 60")
-    wallet_operation = "wallet:create_offer"
     permit = None
     try:
         permit = mutation_gate.enter_wallet_mutation(wallet_operation)
@@ -453,6 +484,8 @@ def begin_offer_creation_continuation(
             "observation_digest": observation_digest,
             "authority": authority,
         }
+        if target_trade_id is not None:
+            journal_snapshot["trade_id"] = target_trade_id
         journal = {
             "snapshot": journal_snapshot,
             "snapshot_sha256": hashlib.sha256(
@@ -469,6 +502,8 @@ def begin_offer_creation_continuation(
             journal=journal,
             operation_id=operation,
             permit=permit,
+            target_trade_id=target_trade_id,
+            wallet_operation=wallet_operation,
         )
         with _offer_creation_continuation_lock:
             _offer_creation_continuations[continuation] = state
@@ -482,6 +517,41 @@ def begin_offer_creation_continuation(
                 pass
 
 
+def begin_offer_creation_continuation(
+    *,
+    operation_id: str,
+    intent_id: str,
+    ttl_seconds: int = 30,
+):
+    """Enter offer authority before PREPARED and return an opaque one-shot handle."""
+
+    return _begin_offer_operation_continuation(
+        operation_id=operation_id,
+        intent_id=intent_id,
+        wallet_operation="wallet:create_offer",
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def begin_offer_cancel_continuation(
+    *,
+    operation_id: str,
+    intent_id: str,
+    trade_id: str,
+    ttl_seconds: int = 30,
+):
+    """Enter cancellation authority before PREPARED and return a one-shot handle."""
+
+    target_trade_id = _exact_continuation_trade_id(trade_id)
+    return _begin_offer_operation_continuation(
+        operation_id=operation_id,
+        intent_id=intent_id,
+        wallet_operation="wallet:cancel_offer",
+        target_trade_id=target_trade_id,
+        ttl_seconds=ttl_seconds,
+    )
+
+
 def offer_creation_continuation_journal(continuation) -> dict:
     """Return a detached canonical snapshot; never expose the held permit."""
 
@@ -490,6 +560,12 @@ def offer_creation_continuation_journal(continuation) -> dict:
         if state is None or threading.get_ident() != state.creator_thread_id:
             raise ValueError("offer creation continuation is invalid")
         return json.loads(_canonical_json(state.journal))
+
+
+def offer_cancel_continuation_journal(continuation) -> dict:
+    """Return the detached authority snapshot for a cancellation continuation."""
+
+    return offer_creation_continuation_journal(continuation)
 
 
 def close_offer_creation_continuation(continuation) -> bool:
@@ -505,32 +581,44 @@ def close_offer_creation_continuation(continuation) -> bool:
         return False
 
 
-def _run_offer_creation_continuation(
+def close_offer_cancel_continuation(continuation) -> bool:
+    """Close an unused cancellation continuation exactly once."""
+
+    return close_offer_creation_continuation(continuation)
+
+
+def _run_offer_operation_continuation(
     continuation,
     operation_id,
     intent_id,
-    *args,
-    **kwargs,
+    *,
+    wallet_operation,
+    adapter_method,
+    blocked_result,
+    callback_args,
+    callback_kwargs,
+    target_trade_id=None,
 ):
-    wallet_operation = "wallet:create_offer"
     with _offer_creation_continuation_lock:
         state = _offer_creation_continuations.pop(continuation, None)
     if state is None:
-        return _blocked_offer_creation_continuation()
+        return blocked_result()
     effect_attempted = False
     try:
         try:
             operation = _exact_continuation_text(operation_id, "operation_id")
             intent = _exact_continuation_text(intent_id, "intent_id")
         except (TypeError, ValueError):
-            return _blocked_offer_creation_continuation()
+            return blocked_result()
         if (
             threading.get_ident() != state.creator_thread_id
             or time.monotonic() > state.deadline
             or operation != state.operation_id
             or intent != state.intent_id
+            or wallet_operation != state.wallet_operation
+            or target_trade_id != state.target_trade_id
         ):
-            return _blocked_offer_creation_continuation()
+            return blocked_result()
         snapshot = _identity_from_adapter(state.adapter)
         binding, adapter, _decision = (
             mutation_gate.require_fresh_wallet_operation_continuation(
@@ -580,9 +668,9 @@ def _run_offer_creation_continuation(
                 )
             effect_attempted = True
 
-        kwargs["_identity_recheck"] = identity_recheck
-        callback = getattr(adapter, "create_offer")
-        result = callback(*args, **kwargs)
+        callback_kwargs["_identity_recheck"] = identity_recheck
+        callback = getattr(adapter, adapter_method)
+        result = callback(*callback_args, **callback_kwargs)
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if callable(close):
@@ -590,12 +678,12 @@ def _run_offer_creation_continuation(
                     close()
                 except Exception:
                     pass
-            return _blocked_offer_creation_continuation(
+            return blocked_result(
                 "WALLET_BACKEND_UNSUPPORTED",
                 effect_attempted=effect_attempted,
             )
         if type(result) is not dict:
-            return _blocked_offer_creation_continuation(
+            return blocked_result(
                 "WALLET_MUTATION_FAILED",
                 effect_attempted=effect_attempted,
             )
@@ -603,12 +691,12 @@ def _run_offer_creation_continuation(
         result["_catalyst_effect_attempted"] = effect_attempted
         return result
     except mutation_gate.MutationBlocked as exc:
-        return _blocked_offer_creation_continuation(
+        return blocked_result(
             exc.reason_code,
             effect_attempted=effect_attempted,
         )
     except Exception:
-        return _blocked_offer_creation_continuation(
+        return blocked_result(
             "WALLET_MUTATION_FAILED",
             effect_attempted=effect_attempted,
         )
@@ -617,6 +705,26 @@ def _run_offer_creation_continuation(
             mutation_gate.exit_wallet_mutation(state.permit)
         except BaseException:
             pass
+
+
+def _run_offer_creation_continuation(
+    continuation,
+    operation_id,
+    intent_id,
+    *args,
+    **kwargs,
+):
+    return _run_offer_operation_continuation(
+        continuation,
+        operation_id,
+        intent_id,
+        wallet_operation="wallet:create_offer",
+        adapter_method="create_offer",
+        blocked_result=_blocked_offer_creation_continuation,
+        callback_args=args,
+        callback_kwargs=kwargs,
+        target_trade_id=None,
+    )
 
 
 def _require_bound_target_fingerprint(
@@ -697,9 +805,9 @@ def wallet_mutation_count(result) -> int:
     return result if type(result) is int and result >= 0 else 0
 
 
-def _expected_identity_authority() -> tuple[
-    mutation_gate.WalletIdentityBinding, object
-]:
+def _expected_identity_authority() -> (
+    tuple[mutation_gate.WalletIdentityBinding, object]
+):
     """Return the frozen binding and adapter selected at authority acquisition."""
 
     candidate_adapter = _wallet_adapter
@@ -1106,13 +1214,32 @@ def cancel_offer(
     secure: bool = True,
     timeout: int = 60,
     fee_mojos: int = None,
+    _cancel_continuation=None,
+    _cancel_operation_id: str = None,
+    _cancel_intent_id: str = None,
 ):
-    return _run_wallet_mutation(
-        "cancel_offer",
-        trade_id,
-        secure,
-        timeout,
-        fee_mojos,
+    continuation_arguments = (
+        _cancel_continuation,
+        _cancel_operation_id,
+        _cancel_intent_id,
+    )
+    if any(value is not None for value in continuation_arguments):
+        if not all(value is not None for value in continuation_arguments):
+            return _blocked_offer_cancel_continuation()
+        return _run_offer_operation_continuation(
+            _cancel_continuation,
+            _cancel_operation_id,
+            _cancel_intent_id,
+            wallet_operation="wallet:cancel_offer",
+            adapter_method="cancel_offer",
+            blocked_result=_blocked_offer_cancel_continuation,
+            callback_args=(trade_id, secure, timeout, fee_mojos),
+            callback_kwargs={},
+            target_trade_id=(trade_id if type(trade_id) is str else None),
+        )
+    return _blocked_offer_cancel_continuation(
+        "OFFER_CANCEL_JOURNAL_REQUIRED",
+        effect_attempted=False,
     )
 
 
@@ -1123,14 +1250,19 @@ def cancel_offers_batch(
     fee_mojos: int = None,
     skip_confirmation: bool = False,
 ):
-    return _run_wallet_mutation(
-        "cancel_offers_batch",
-        trade_ids,
-        secure,
-        max_workers,
-        fee_mojos,
-        skip_confirmation,
-    )
+    if type(trade_ids) is not list:
+        return _blocked_offer_cancel_continuation(
+            "OFFER_CANCEL_JOURNAL_REQUIRED",
+            effect_attempted=False,
+        )
+    return {
+        trade_id: _blocked_offer_cancel_continuation(
+            "OFFER_CANCEL_JOURNAL_REQUIRED",
+            effect_attempted=False,
+        )
+        for trade_id in trade_ids
+        if type(trade_id) is str
+    }
 
 
 def cleanup_expired_offers(log_fn=None):

@@ -362,9 +362,7 @@ def api_cancel_all():
         try:
             from wallet import (
                 get_all_offers,
-                cancel_offers_batch,
                 is_offer_time_expired,
-                wallet_batch_results,
             )
 
             all_offers = get_all_offers(include_completed=False, end=500)
@@ -437,6 +435,30 @@ def api_cancel_all():
                     }
                 )
 
+            durable_manager = (
+                getattr(bot, "offer_manager", None) if bot is not None else None
+            )
+            if durable_manager is None:
+                coordinator_error = "Offer cancellation coordinator is unavailable"
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=coordinator_error,
+                    phase="error",
+                    message=coordinator_error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": coordinator_error,
+                            "reason": "DURABLE_CANCEL_COORDINATOR_UNAVAILABLE",
+                        }
+                    ),
+                    503,
+                )
+
             # Set initial progress state — frontend polls this immediately.
             _set_cancel_all_state(
                 running=True,
@@ -449,44 +471,38 @@ def api_cancel_all():
                 current_batch=1,
                 cancelled=0,
                 failed=0,
-                message=f"Cancelling {len(open_ids)} offers directly from the wallet...",
+                message=f"Journaling {len(open_ids)} offer cancellation requests...",
             )
             log_event(
                 "info",
-                "cancel_all_direct",
-                f"Cancelling {len(open_ids)} offers directly via wallet "
-                f"(bot stopped, bypassing DB)",
+                "cancel_all_durable",
+                f"Journaling {len(open_ids)} offer cancellation requests "
+                "while the bot is stopped",
             )
 
             # ---- Background worker ----
             _cancel_open_ids = list(open_ids)  # snapshot
 
             def _cancel_all_worker():
-                _w_cancelled = 0
+                _w_pending = 0
                 _w_failed = 0
                 try:
-                    _results = cancel_offers_batch(_cancel_open_ids, secure=True)
-                    _results = wallet_batch_results(_results, _cancel_open_ids)
-                    _cancelled_ids = []
-                    for _tid, _res in _results.items():
-                        if _res and _res.get("success"):
-                            _w_cancelled += 1
-                            _cancelled_ids.append(_tid)
-                        else:
+                    _results = durable_manager.cancel_offers(
+                        _cancel_open_ids,
+                        reason="manual_cancel_all",
+                        force_storm=True,
+                    )
+                    for _tid in _cancel_open_ids:
+                        _res = _results.get(_tid) if type(_results) is dict else None
+                        if (
+                            type(_res) is dict
+                            and _res.get("outcome") == "CANCEL_FAILED"
+                        ):
                             _w_failed += 1
-                    # Sync DB: mark cancelled offers so they don't reappear
-                    if _cancelled_ids:
-                        try:
-                            conn = get_connection()
-                            for _tid in _cancelled_ids:
-                                conn.execute(
-                                    "UPDATE offers SET status='cancelled' "
-                                    "WHERE trade_id=? AND status='open'",
-                                    (_tid,),
-                                )
-                            conn.commit()
-                        except Exception:
-                            pass  # DB sync is best-effort
+                        else:
+                            # Submitted, unknown, malformed, and any claimed
+                            # confirmation all remain nonterminal here.
+                            _w_pending += 1
                     _set_cancel_all_state(
                         running=False,
                         complete=True,
@@ -496,43 +512,33 @@ def api_cancel_all():
                         batch_size=len(_cancel_open_ids),
                         total_batches=1,
                         current_batch=1,
-                        batch_cancelled=_w_cancelled,
+                        batch_cancelled=0,
                         batch_failed=_w_failed,
-                        cancelled=_w_cancelled,
+                        cancelled=0,
+                        pending=_w_pending,
                         failed=_w_failed,
                         finished_at=datetime.now(timezone.utc).isoformat(),
-                        message=f"Cancel all complete: {_w_cancelled} succeeded, {_w_failed} failed.",
+                        message=(
+                            "Cancellation requests journaled: "
+                            f"{_w_pending} pending reconciliation, "
+                            f"{_w_failed} rejected without effect."
+                        ),
                     )
                     api_server.events.emit(
-                        "offers_cancelled",
-                        {"count": _w_cancelled, "reason": "manual_cancel_all"},
+                        "offer_cancels_journaled",
+                        {
+                            "count": len(_cancel_open_ids),
+                            "pending": _w_pending,
+                            "failed": _w_failed,
+                            "reason": "manual_cancel_all",
+                        },
                     )
-                    if (
-                        _w_cancelled > 0
-                        and _w_failed == 0
-                        and bot
-                        and getattr(bot, "offer_manager", None)
-                    ):
-                        bot.offer_manager.expect_empty_wallet_offer_book(
-                            "manual_cancel_all"
-                        )
                     log_event(
                         "info",
-                        "cancel_all_complete",
-                        f"Cancel all finished: {_w_cancelled} succeeded, {_w_failed} failed",
+                        "cancel_all_journaled",
+                        f"Cancel all journaled: {_w_pending} pending, "
+                        f"{_w_failed} failed",
                     )
-                    # Reset gap closer state if active
-                    if bot and getattr(bot, "boost_manager", None):
-                        try:
-                            if bot.boost_manager._boost_active:
-                                bot.boost_manager._boost_active = False
-                                bot.boost_manager._active_boost_ids.clear()
-                                bot.boost_manager._boost_mid_price = Decimal("0")
-                                bot.boost_manager._gap_spread_bps = 0
-                                bot.boost_manager._convergence_factor = Decimal("1.0")
-                                api_server.events.emit("boost", {"active": False})
-                        except Exception:
-                            pass
                 except Exception as _e:
                     _set_cancel_all_state(
                         running=False,
@@ -661,6 +667,35 @@ def api_cancel_offer():
     if type(result) is dict and result.get("error"):
         return jsonify({"success": False, "trade_id": trade_id, **result}), 400
     trade_result = result.get(trade_id) if type(result) is dict else None
+    outcome = trade_result.get("outcome") if type(trade_result) is dict else None
+    if outcome == "CANCEL_SUBMITTED_UNCONFIRMED":
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "status": "pending_reconciliation",
+                    "confirmed": False,
+                    "outcome": outcome,
+                    "trade_id": trade_id,
+                }
+            ),
+            202,
+        )
+    if outcome in {"CANCEL_UNKNOWN", "CANCEL_CONFIRMED"}:
+        # A manager-side confirmation claim is not authoritative in Task 8;
+        # expose the same fail-closed reconciliation state as an unknown.
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "status": "pending_reconciliation",
+                    "confirmed": False,
+                    "outcome": "CANCEL_UNKNOWN",
+                    "trade_id": trade_id,
+                }
+            ),
+            202,
+        )
     if type(trade_result) is not dict or trade_result.get("success") is not True:
         reason_value = (
             trade_result.get("reason") if type(trade_result) is dict else None
@@ -695,7 +730,18 @@ def api_cancel_offer():
             ),
             400,
         )
-    return jsonify({"success": True, "status": "cancelled", "trade_id": trade_id})
+    # Legacy truthy success without a typed outcome is never terminal proof.
+    return (
+        jsonify(
+            {
+                "success": False,
+                "trade_id": trade_id,
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            }
+        ),
+        400,
+    )
 
 
 @bp.route("/api/fills")

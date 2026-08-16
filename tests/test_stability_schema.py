@@ -20,6 +20,7 @@ import database
 STABILITY_TABLES = {
     "offer_intents",
     "offer_operation_journal",
+    "offer_cancel_effect_claims",
     "runtime_safety_latch",
     "runtime_mutation_lease",
     "runtime_worker_delegations",
@@ -521,9 +522,7 @@ def test_case_variant_trigger_is_rejected_before_timestamp_normalization_side_ef
         database.init_database()
 
     with sqlite3.connect(isolated_database) as conn:
-        effects = conn.execute(
-            "SELECT value FROM migration_trigger_effects"
-        ).fetchall()
+        effects = conn.execute("SELECT value FROM migration_trigger_effects").fetchall()
         stored = conn.execute(
             "SELECT updated_at FROM offer_intents "
             "WHERE intent_id='intent-trigger-side-effect'"
@@ -830,7 +829,11 @@ def test_migration_normalizes_existing_mutable_stability_timestamps(
     with sqlite3.connect(isolated_database) as conn:
         conn.execute(
             "UPDATE offer_intents SET prepared_at=?, updated_at=? WHERE intent_id=?",
-            ("2026-08-15 13:00:00+01:00", "2026-08-15 12:01:00.5", "intent-legacy-time"),
+            (
+                "2026-08-15 13:00:00+01:00",
+                "2026-08-15 12:01:00.5",
+                "intent-legacy-time",
+            ),
         )
         conn.execute(
             "UPDATE runtime_safety_latch SET updated_at=? WHERE singleton_id=1",
@@ -952,7 +955,9 @@ def test_invalid_stored_safety_timestamp_fails_closed_and_rolls_back_migration(
 def test_schema_has_exact_identity_uniqueness_and_singletons(isolated_database):
     database.init_database()
     _prepare_intent("intent-a")
-    _finalize_intent("intent-a", trade_id=_sha("shared-trade"), offer_hash=_sha("offer-a"))
+    _finalize_intent(
+        "intent-a", trade_id=_sha("shared-trade"), offer_hash=_sha("offer-a")
+    )
     _prepare_intent("intent-b", generation=8)
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -1063,6 +1068,83 @@ def test_journal_constraints_are_idempotent_and_append_only(isolated_database):
     conn.rollback()
 
 
+def test_cancel_effect_claim_schema_is_unique_validated_and_append_only(
+    isolated_database,
+):
+    database.init_database()
+    operation_id = f"cancel:{'a' * 64}"
+    prepared_event_id = f"{operation_id}:attempt:1:prepared"
+    conn = database.get_connection()
+    conn.execute(
+        """
+        INSERT INTO offer_cancel_effect_claims (
+            operation_id, attempt, prepared_event_id, claimed_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (operation_id, 1, prepared_event_id, AT),
+    )
+    conn.commit()
+
+    assert database.get_offer_cancel_effect_claim(
+        operation_id=operation_id, attempt=1
+    ) == {
+        "operation_id": operation_id,
+        "attempt": 1,
+        "prepared_event_id": prepared_event_id,
+        "claimed_at": AT,
+    }
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO offer_cancel_effect_claims (
+                operation_id, attempt, prepared_event_id, claimed_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (operation_id, 1, f"{operation_id}:duplicate", LATER),
+        )
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE offer_cancel_effect_claims SET claimed_at=? WHERE operation_id=?",
+            (LATER, operation_id),
+        )
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "DELETE FROM offer_cancel_effect_claims WHERE operation_id=?",
+            (operation_id,),
+        )
+    conn.rollback()
+
+
+def test_cancel_effect_claim_migration_rejects_malformed_existing_table(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TABLE offer_cancel_effect_claims")
+        conn.execute(
+            """
+            CREATE TABLE offer_cancel_effect_claims (
+                claim_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                prepared_event_id TEXT NOT NULL,
+                UNIQUE(operation_id, attempt),
+                UNIQUE(prepared_event_id)
+            )
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(
+        RuntimeError,
+        match="offer_cancel_effect_claims.*missing required columns.*claimed_at",
+    ):
+        database.init_database()
+
+
 def test_prepare_and_finalize_preserve_exact_amounts_hashes_and_canonical_json(
     isolated_database,
 ):
@@ -1070,15 +1152,20 @@ def test_prepare_and_finalize_preserve_exact_amounts_hashes_and_canonical_json(
     prepared = _prepare_intent()
 
     assert prepared["offered_amount_atomic"] == "18446744073709551616000000000000000001"
-    assert prepared["requested_amount_atomic"] == "340282366920938463463374607431768211457"
+    assert (
+        prepared["requested_amount_atomic"] == "340282366920938463463374607431768211457"
+    )
     assert prepared["selected_coin_ids_json"] == json.dumps(
         sorted({_sha("coin-b"), _sha("coin-a")}),
         separators=(",", ":"),
         sort_keys=True,
     )
-    assert prepared["selected_coin_ids_sha256"] == hashlib.sha256(
-        prepared["selected_coin_ids_json"].encode("utf-8")
-    ).hexdigest()
+    assert (
+        prepared["selected_coin_ids_sha256"]
+        == hashlib.sha256(
+            prepared["selected_coin_ids_json"].encode("utf-8")
+        ).hexdigest()
+    )
     assert prepared["lifecycle_state"] == "prepared"
     assert prepared["row_version"] == 0
 
@@ -1091,9 +1178,10 @@ def test_prepare_and_finalize_preserve_exact_amounts_hashes_and_canonical_json(
     assert finalized["row_version"] == 1
     events = database.get_offer_operation_events("create:intent-1")
     assert [event["phase"] for event in events] == ["PREPARED", "FINALIZED"]
-    assert events[-1]["evidence_sha256"] == hashlib.sha256(
-        events[-1]["evidence_json"].encode("utf-8")
-    ).hexdigest()
+    assert (
+        events[-1]["evidence_sha256"]
+        == hashlib.sha256(events[-1]["evidence_json"].encode("utf-8")).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1447,7 +1535,9 @@ def test_historical_exact_replay_after_reconciliation_returns_current_intent(
     )
 
     assert replayed == reconciled
-    assert len(database.get_offer_operation_events("create:intent-historical-replay")) == 3
+    assert (
+        len(database.get_offer_operation_events("create:intent-historical-replay")) == 3
+    )
 
     with pytest.raises(ValueError, match="different journal data"):
         _finalize_intent(
@@ -1490,9 +1580,7 @@ def test_finalize_exact_replay_includes_publication_and_child_identity(
 
 
 @pytest.mark.parametrize("generation", [True, 7.0, "7"])
-def test_prepare_rejects_coercible_noninteger_generation(
-    isolated_database, generation
-):
+def test_prepare_rejects_coercible_noninteger_generation(isolated_database, generation):
     database.init_database()
 
     with pytest.raises(ValueError, match="generation must be an integer"):
@@ -1571,10 +1659,13 @@ def test_racing_prepares_cannot_claim_same_active_slot_generation(
         results = list(executor.map(prepare, ["intent-race-a", "intent-race-b"]))
 
     assert sorted(result[0] for result in results) == ["conflict", "ok"]
-    assert sum(
-        database.get_offer_intent(intent_id) is not None
-        for intent_id in ("intent-race-a", "intent-race-b")
-    ) == 1
+    assert (
+        sum(
+            database.get_offer_intent(intent_id) is not None
+            for intent_id in ("intent-race-a", "intent-race-b")
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize("attempt", [True, 1.0, "1"])
@@ -1661,9 +1752,10 @@ def test_latest_append_only_event_derives_unresolved_blockers(isolated_database)
         blocks_mutation=True,
         created_at=LATER,
     )
-    assert [row["operation_id"] for row in database.get_unresolved_offer_operation_blockers()] == [
-        "cancel:intent-1"
-    ]
+    assert [
+        row["operation_id"]
+        for row in database.get_unresolved_offer_operation_blockers()
+    ] == ["cancel:intent-1"]
 
     database.append_offer_operation_event(
         event_id="event:cancel:reconciled",
@@ -2097,9 +2189,7 @@ def test_lease_waiter_uses_post_lock_wall_clock_and_cannot_cross_expiry(
     monkeypatch.setattr(
         database,
         "_stability_wall_clock",
-        lambda: database._stability_timestamp(
-            datetime.now(timezone.utc), "wall clock"
-        ),
+        lambda: database._stability_timestamp(datetime.now(timezone.utc), "wall clock"),
         raising=False,
     )
     database.init_database()
@@ -2156,9 +2246,7 @@ def test_lease_waiter_uses_post_lock_wall_clock_and_cannot_cross_expiry(
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1"])
-def test_lease_cas_rejects_coercible_noninteger_versions(
-    isolated_database, version
-):
+def test_lease_cas_rejects_coercible_noninteger_versions(isolated_database, version):
     database.init_database()
     database.acquire_runtime_mutation_lease(
         owner_run_id="run-a",

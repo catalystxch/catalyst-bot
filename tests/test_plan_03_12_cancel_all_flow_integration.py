@@ -114,12 +114,12 @@ class _TempDB(unittest.TestCase):
 )
 class TestCancelAllConfirmed(_TempDB):
     def _run_cancel(self, trade_ids, bulk_response):
-        """Patch cancel_offers_batch and run cancel_all()."""
+        """Patch the durable typed cancellation entrypoint and run cancel_all()."""
         om = OfferManager()
         fake_cfg = _fake_cfg()
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
-            patch.object(_om_mod, "cancel_offers_batch", return_value=bulk_response),
+            patch.object(om, "cancel_offers", return_value=bulk_response),
             patch.object(_om_mod, "get_all_offers", return_value=[]),
         ):
             return om.cancel_all(cat_asset_id=_ASSET)
@@ -128,20 +128,20 @@ class TestCancelAllConfirmed(_TempDB):
         result = self._run_cancel([], {})
         self.assertEqual(result, {})
 
-    def test_single_offer_cancelled_on_success(self):
+    def test_single_legacy_success_does_not_terminalize(self):
         _add_offer("tid-a")
         bulk = {"tid-a": {"success": True, "method": "bulk"}}
         self._run_cancel(["tid-a"], bulk)
-        self.assertEqual(self._offer_status("tid-a"), "cancelled")
+        self.assertEqual(self._offer_status("tid-a"), "open")
 
-    def test_multiple_offers_all_cancelled(self):
+    def test_multiple_legacy_successes_remain_open_without_terminal_proof(self):
         for i in range(3):
             _add_offer(f"tid-{i}")
         self.assertEqual(self._open_offer_count(), 3)
 
         bulk = {f"tid-{i}": {"success": True, "method": "bulk"} for i in range(3)}
         self._run_cancel([f"tid-{i}" for i in range(3)], bulk)
-        self.assertEqual(self._open_offer_count(), 0)
+        self.assertEqual(self._open_offer_count(), 3)
 
     def test_failed_cancel_leaves_offer_open(self):
         _add_offer("tid-fail")
@@ -159,7 +159,7 @@ class TestCancelAllConfirmed(_TempDB):
             "tid-nok": {"success": False, "error": "timeout"},
         }
         self._run_cancel(["tid-ok", "tid-nok"], bulk)
-        self.assertEqual(self._offer_status("tid-ok"), "cancelled")
+        self.assertEqual(self._offer_status("tid-ok"), "open")
         self.assertNotEqual(self._offer_status("tid-nok"), "cancelled")
 
     def test_return_dict_contains_all_trade_ids(self):
@@ -185,11 +185,11 @@ class TestCancelAllPending(_TempDB):
         _add_offer("tid-pending")
         om = OfferManager()
         fake_cfg = _fake_cfg()
-        # "submitted_pending_confirm" is in CANCEL_PENDING_METHODS
+        # Legacy truthy method strings are not terminal cancellation proof.
         bulk = {"tid-pending": {"success": True, "method": "submitted_pending_confirm"}}
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
-            patch.object(_om_mod, "cancel_offers_batch", return_value=bulk),
+            patch.object(om, "cancel_offers", return_value=bulk),
             patch.object(_om_mod, "get_all_offers", return_value=[]),
         ):
             om.cancel_all(cat_asset_id=_ASSET)
@@ -212,7 +212,7 @@ class TestCancelAllSideFilter(_TempDB):
         fake_cfg = _fake_cfg()
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
-            patch.object(_om_mod, "cancel_offers_batch", return_value=bulk_response),
+            patch.object(om, "cancel_offers", return_value=bulk_response),
             patch.object(_om_mod, "get_all_offers", return_value=[]),
         ):
             return om.cancel_all(cat_asset_id=_ASSET, side_filter=side_filter)
@@ -222,7 +222,7 @@ class TestCancelAllSideFilter(_TempDB):
         _add_offer("sell-1", "sell")
         bulk = {"buy-1": {"success": True, "method": "bulk"}}
         self._cancel_side("buy", bulk)
-        self.assertEqual(self._offer_status("buy-1"), "cancelled")
+        self.assertEqual(self._offer_status("buy-1"), "open")
         self.assertEqual(self._offer_status("sell-1"), "open")
 
     def test_sell_filter_cancels_only_sell_offers(self):
@@ -231,7 +231,7 @@ class TestCancelAllSideFilter(_TempDB):
         bulk = {"sell-2": {"success": True, "method": "bulk"}}
         self._cancel_side("sell", bulk)
         self.assertEqual(self._offer_status("buy-2"), "open")
-        self.assertEqual(self._offer_status("sell-2"), "cancelled")
+        self.assertEqual(self._offer_status("sell-2"), "open")
 
     def test_no_filter_cancels_all_sides(self):
         _add_offer("buy-3", "buy")
@@ -241,8 +241,8 @@ class TestCancelAllSideFilter(_TempDB):
             "sell-3": {"success": True, "method": "bulk"},
         }
         self._cancel_side("", bulk)
-        self.assertEqual(self._offer_status("buy-3"), "cancelled")
-        self.assertEqual(self._offer_status("sell-3"), "cancelled")
+        self.assertEqual(self._offer_status("buy-3"), "open")
+        self.assertEqual(self._offer_status("sell-3"), "open")
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +262,8 @@ class TestCancelAllExceptionHandling(_TempDB):
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
             patch.object(
-                _om_mod,
-                "cancel_offers_batch",
+                om,
+                "cancel_offers",
                 side_effect=RuntimeError("wallet offline"),
             ),
             patch.object(_om_mod, "get_all_offers", return_value=[]),

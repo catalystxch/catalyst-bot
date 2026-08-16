@@ -551,20 +551,48 @@ def _safe_operation(operation: Any) -> str:
     return "".join(ch if ch.isalnum() or ch in "._:-" else "_" for ch in value)
 
 
-def _is_exact_prepared_creation_blocker(
+def _is_exact_prepared_operation_blocker(
     unresolved: Any,
     *,
+    operation: str,
     operation_id: str,
     intent_id: str,
 ) -> bool:
-    if type(unresolved) is not list or len(unresolved) != 1:
+    if type(unresolved) is not list or not unresolved:
         return False
-    blocker = unresolved[0]
     try:
-        blocker = database.validate_offer_operation_event(blocker)
+        blockers = [
+            database.validate_offer_operation_event(blocker) for blocker in unresolved
+        ]
     except (TypeError, ValueError):
         return False
-    return {
+    base_operation = next(
+        (
+            candidate
+            for candidate in ("wallet:create_offer", "wallet:cancel_offer")
+            if operation == candidate or operation.startswith(f"{candidate}:")
+        ),
+        None,
+    )
+    expected_by_operation = {
+        "wallet:create_offer": ("CREATE", "INTENT_PREPARED"),
+        "wallet:cancel_offer": ("CANCEL", "CANCEL_PREPARED"),
+    }
+    expected = expected_by_operation.get(base_operation)
+    if expected is None:
+        return False
+    operation_type, reason_code = expected
+    own_blockers = [
+        blocker
+        for blocker in blockers
+        if blocker["operation_id"] == operation_id and blocker["intent_id"] == intent_id
+    ]
+    if len(own_blockers) != 1:
+        return False
+    blocker = own_blockers[0]
+    expected_attempt = blocker["attempt"] if operation_type == "CANCEL" else 1
+    exact_own_blocker = {
+        "event_id": blocker["event_id"],
         "operation_id": blocker["operation_id"],
         "intent_id": blocker["intent_id"],
         "operation_type": blocker["operation_type"],
@@ -577,18 +605,163 @@ def _is_exact_prepared_creation_blocker(
         "blocks_mutation": blocker["blocks_mutation"],
         "timestamps_match": blocker["request_timestamp"] == blocker["created_at"],
     } == {
+        "event_id": (
+            f"{operation_id}:attempt:{expected_attempt}:prepared"
+            if operation_type == "CANCEL"
+            else blocker["event_id"]
+        ),
         "operation_id": operation_id,
         "intent_id": intent_id,
-        "operation_type": "CREATE",
-        "attempt": 1,
+        "operation_type": operation_type,
+        "attempt": expected_attempt,
         "phase": "PREPARED",
         "outcome": "PREPARED",
         "transaction_id": None,
         "spend_identity": None,
-        "reason_code": "INTENT_PREPARED",
+        "reason_code": reason_code,
         "blocks_mutation": 1,
         "timestamps_match": True,
     }
+    if not exact_own_blocker:
+        return False
+    if len(blockers) == 1:
+        if operation_type != "CANCEL":
+            return True
+        try:
+            single_evidence = json.loads(blocker["evidence_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return True
+        if (
+            type(single_evidence) is not dict
+            or "effect_claim_protocol" not in single_evidence
+        ):
+            return True
+    if operation_type != "CANCEL":
+        return False
+
+    required_evidence_keys = {
+        "trade_id",
+        "intent_id",
+        "operation_id",
+        "attempt",
+        "cohort_id",
+        "cohort_size",
+        "member_id",
+        "reason",
+        "continuation_journal_sha256",
+        "wallet_effect",
+        "effect_claim_protocol",
+    }
+
+    def cohort_member(event: dict) -> Optional[dict]:
+        try:
+            evidence = json.loads(event["evidence_json"])
+            if type(evidence) is not dict or frozenset(evidence) not in {
+                frozenset(required_evidence_keys),
+                frozenset(required_evidence_keys | {"prior_lifecycle_state"}),
+            }:
+                return None
+            trade_id = evidence["trade_id"]
+            attempt = evidence["attempt"]
+            cohort_id = evidence["cohort_id"]
+            cohort_size = evidence["cohort_size"]
+            if (
+                type(trade_id) is not str
+                or len(trade_id) != 64
+                or trade_id.lower() != trade_id
+                or type(attempt) is not int
+                or isinstance(attempt, bool)
+                or attempt < 1
+                or type(cohort_size) is not int
+                or isinstance(cohort_size, bool)
+                or cohort_size < 2
+                or evidence["operation_id"] != event["operation_id"]
+                or evidence["intent_id"] != event["intent_id"]
+                or event["operation_id"] != f"cancel:{trade_id}"
+                or event["event_id"]
+                != f"{event['operation_id']}:attempt:{attempt}:prepared"
+                or event["attempt"] != attempt
+                or event["operation_type"] != "CANCEL"
+                or event["phase"] != "PREPARED"
+                or event["outcome"] != "PREPARED"
+                or event["reason_code"] != "CANCEL_PREPARED"
+                or event["blocks_mutation"] != 1
+                or event["transaction_id"] is not None
+                or event["spend_identity"] is not None
+                or event["request_timestamp"] != event["created_at"]
+                or evidence["effect_claim_protocol"] != "durable_cohort_claim_v1"
+                or evidence["wallet_effect"]
+                != {"secure": True, "timeout": 60, "fee_mojos": None}
+            ):
+                return None
+            bytes.fromhex(trade_id)
+            expected_member_id = (
+                "cancel-member:"
+                + hashlib.sha256(
+                    json.dumps(
+                        {
+                            "attempt": attempt,
+                            "cohort_id": cohort_id,
+                            "operation_id": event["operation_id"],
+                            "trade_id": trade_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            if evidence["member_id"] != expected_member_id:
+                return None
+            return {
+                "trade_id": trade_id,
+                "attempt": attempt,
+                "cohort_id": cohort_id,
+                "cohort_size": cohort_size,
+                "operation_id": event["operation_id"],
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    contexts = [cohort_member(blocker) for blocker in blockers]
+    if any(context is None for context in contexts):
+        return False
+    own_context = cohort_member(blocker)
+    if own_context is None:
+        return False
+    cohort_id = own_context["cohort_id"]
+    cohort_size = own_context["cohort_size"]
+    if any(
+        context["cohort_id"] != cohort_id or context["cohort_size"] != cohort_size
+        for context in contexts
+    ):
+        return False
+    try:
+        full_events = database.get_offer_cancel_cohort_prepared_events(cohort_id)
+        full_contexts = [cohort_member(event) for event in full_events]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if (
+        len(full_contexts) != cohort_size
+        or any(context is None for context in full_contexts)
+        or len({context["operation_id"] for context in full_contexts}) != cohort_size
+    ):
+        return False
+    trade_ids = sorted(context["trade_id"] for context in full_contexts)
+    expected_cohort_id = (
+        "cancel-cohort:"
+        + hashlib.sha256(
+            json.dumps(trade_ids, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    if cohort_id != expected_cohort_id:
+        return False
+    return (
+        database.get_offer_cancel_effect_claim(
+            operation_id=operation_id,
+            attempt=own_context["attempt"],
+        )
+        is not None
+    )
 
 
 def _same_handler(first: Optional[Callable], second: Optional[Callable]) -> bool:
@@ -1222,8 +1395,9 @@ class MutationGate:
                     raise MutationBlocked(
                         _safe_reason_code(latch.get("reason_code")), safe_operation
                     )
-                if not _is_exact_prepared_creation_blocker(
+                if not _is_exact_prepared_operation_blocker(
                     unresolved,
+                    operation=safe_operation,
                     operation_id=blocker,
                     intent_id=intent,
                 ):
@@ -1765,6 +1939,7 @@ def _validate_worker_delegation(
     parent_lease_epoch: Any = None,
     allowed_blocking_operation_id: Optional[str] = None,
     allowed_blocking_intent_id: Optional[str] = None,
+    allowed_blocking_wallet_operation: str = "wallet:create_offer",
 ) -> dict[str, Any]:
     try:
         values = {
@@ -1856,8 +2031,9 @@ def _validate_worker_delegation(
             if (
                 type(allowed_blocking_operation_id) is not str
                 or type(allowed_blocking_intent_id) is not str
-                or not _is_exact_prepared_creation_blocker(
+                or not _is_exact_prepared_operation_blocker(
                     unresolved,
+                    operation=allowed_blocking_wallet_operation,
                     operation_id=allowed_blocking_operation_id,
                     intent_id=allowed_blocking_intent_id,
                 )
@@ -1907,6 +2083,7 @@ def _validate_worker_environment(
     now: Optional[datetime] = None,
     allowed_blocking_operation_id: Optional[str] = None,
     allowed_blocking_intent_id: Optional[str] = None,
+    allowed_blocking_wallet_operation: str = "wallet:create_offer",
 ) -> dict[str, Any]:
     if not isinstance(environment, Mapping):
         return _invalid_worker()
@@ -1927,6 +2104,7 @@ def _validate_worker_environment(
             now=_as_utc(now or _utc_now()),
             allowed_blocking_operation_id=allowed_blocking_operation_id,
             allowed_blocking_intent_id=allowed_blocking_intent_id,
+            allowed_blocking_wallet_operation=allowed_blocking_wallet_operation,
         )
     except Exception:
         return _invalid_worker()
@@ -2427,6 +2605,7 @@ def require_wallet_operation_continuation(
         environment,
         allowed_blocking_operation_id=blocker,
         allowed_blocking_intent_id=intent,
+        allowed_blocking_wallet_operation=safe_operation,
     )
     if result.get("allowed") is not True:
         reason = (

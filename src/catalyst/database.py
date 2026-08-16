@@ -678,6 +678,29 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
 END;
 
+-- An append-only per-attempt marker written immediately before a cohort
+-- member may cross the wallet effect boundary.  Absence is meaningful only
+-- for PREPARED rows explicitly tagged with the durable cohort-claim protocol.
+CREATE TABLE IF NOT EXISTS offer_cancel_effect_claims (
+    claim_sequence              INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id                TEXT NOT NULL,
+    attempt                     INTEGER NOT NULL CHECK(attempt >= 1),
+    prepared_event_id           TEXT NOT NULL,
+    claimed_at                  TEXT NOT NULL,
+    UNIQUE(operation_id, attempt),
+    UNIQUE(prepared_event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_cancel_effect_claims_no_update
+BEFORE UPDATE ON offer_cancel_effect_claims
+BEGIN
+    SELECT RAISE(ABORT, 'offer_cancel_effect_claims is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_cancel_effect_claims_no_delete
+BEFORE DELETE ON offer_cancel_effect_claims
+BEGIN
+    SELECT RAISE(ABORT, 'offer_cancel_effect_claims is append-only');
+END;
+
 -- One durable fail-closed latch for a data directory.
 CREATE TABLE IF NOT EXISTS runtime_safety_latch (
     singleton_id                INTEGER PRIMARY KEY CHECK(singleton_id = 1),
@@ -823,6 +846,13 @@ _STABILITY_REQUIRED_COLUMNS = {
         "reason_code",
         "blocks_mutation",
         "created_at",
+    },
+    "offer_cancel_effect_claims": {
+        "claim_sequence",
+        "operation_id",
+        "attempt",
+        "prepared_event_id",
+        "claimed_at",
     },
     "runtime_safety_latch": {
         "singleton_id",
@@ -1149,6 +1179,8 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
     )
+    _require_unique_key(conn, "offer_cancel_effect_claims", ("operation_id", "attempt"))
+    _require_unique_key(conn, "offer_cancel_effect_claims", ("prepared_event_id",))
     _require_unique_key(conn, "runtime_worker_delegations", ("delegation_token_hash",))
     _require_unique_key(conn, "publication_outbox", ("idempotency_key",))
     _require_unique_key(
@@ -2052,8 +2084,7 @@ def _canonical_stored_stability_timestamp(value: Any) -> str:
         raise ValueError("stored stability timestamp must be text")
     text = value.strip()
     legacy_match = re.fullmatch(
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
-        r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?",
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}" r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?",
         text,
     )
     if legacy_match is not None:
@@ -7021,8 +7052,16 @@ def _insert_offer_operation_event(
     ).fetchone()
     if existing is not None:
         row = dict(existing)
-        if any(row[column] != values[column] for column in _JOURNAL_COMPARE_COLUMNS):
-            raise ValueError("event_id already exists with different journal data")
+        mismatched = [
+            column
+            for column in _JOURNAL_COMPARE_COLUMNS
+            if row[column] != values[column]
+        ]
+        if mismatched:
+            raise ValueError(
+                "event_id already exists with different journal data: "
+                + ",".join(mismatched)
+            )
         return row
     conn.execute(
         """
@@ -7090,6 +7129,504 @@ def append_offer_operation_event(
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = _insert_offer_operation_event(conn, values)
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _canonical_cancel_identifiers(
+    *,
+    operation_id: Any,
+    event_id: Any,
+    trade_id: Any,
+    attempt: Any,
+    phase: str,
+) -> str:
+    if type(trade_id) is not str or len(trade_id) != 64 or trade_id.lower() != trade_id:
+        raise ValueError("canonical cancellation identifiers are required")
+    try:
+        bytes.fromhex(trade_id)
+    except ValueError as exc:
+        raise ValueError("canonical cancellation identifiers are required") from exc
+    safe_attempt = _exact_integer(attempt, "attempt", minimum=1)
+    expected_operation_id = f"cancel:{trade_id}"
+    expected_event_id = (
+        f"{expected_operation_id}:attempt:{safe_attempt}:{phase.lower()}"
+    )
+    if (
+        type(operation_id) is not str
+        or type(event_id) is not str
+        or operation_id != expected_operation_id
+        or event_id != expected_event_id
+    ):
+        raise ValueError("canonical cancellation identifiers are required")
+    return trade_id
+
+
+def prepare_offer_cancel(
+    *,
+    operation_id: str,
+    event_id: str,
+    trade_id: str,
+    intent_id: Optional[str],
+    attempt: int,
+    wallet_identity_json: Any,
+    evidence_json: Any,
+    prepared_at: Any = None,
+    claim_effect: bool = False,
+) -> Dict[str, Any]:
+    """Persist one exact cancellation request before any wallet effect.
+
+    When ``claim_effect`` is true, return the atomic insertion-winner result.
+    An exact PREPARED replay is never allowed to claim a second wallet effect.
+    """
+
+    if type(claim_effect) is not bool:
+        raise ValueError("claim_effect must be an exact boolean")
+    if type(wallet_identity_json) is not dict:
+        raise ValueError("wallet_identity_json must be an exact dictionary")
+    if type(evidence_json) is not dict:
+        raise ValueError("evidence_json must be an exact dictionary")
+    safe_trade_id = _canonical_cancel_identifiers(
+        operation_id=operation_id,
+        event_id=event_id,
+        trade_id=trade_id,
+        attempt=attempt,
+        phase="PREPARED",
+    )
+    safe_attempt = _exact_integer(attempt, "attempt", minimum=1)
+    evidence = dict(evidence_json)
+    if "prior_lifecycle_state" in evidence:
+        raise ValueError("prior_lifecycle_state is repository-derived")
+    if evidence.get("trade_id") != safe_trade_id:
+        raise ValueError("cancellation evidence must contain the exact trade_id")
+    prepared = _stability_timestamp_or_now(prepared_at, "prepared_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        legacy_offer = conn.execute(
+            "SELECT status, lifecycle_state FROM offers WHERE trade_id=?",
+            (safe_trade_id,),
+        ).fetchone()
+        if legacy_offer is not None and legacy_offer["status"] != "open":
+            raise ValueError("only an open legacy offer may be cancelled")
+        existing = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        prior_lifecycle_state = None
+        if existing is None:
+            prior_rows = conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? ORDER BY sequence
+                """,
+                (operation_id,),
+            ).fetchall()
+            prior_events = [
+                validate_offer_operation_event(dict(row)) for row in prior_rows
+            ]
+            if safe_attempt == 1:
+                if prior_events:
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+            else:
+                expected_count = (safe_attempt - 1) * 2
+                if len(prior_events) != expected_count:
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+                for prior_attempt in range(1, safe_attempt):
+                    prepared_prior, finalized_prior = prior_events[
+                        (prior_attempt - 1) * 2 : prior_attempt * 2
+                    ]
+                    if (
+                        prepared_prior["attempt"] != prior_attempt
+                        or prepared_prior["phase"] != "PREPARED"
+                        or prepared_prior["outcome"] != "PREPARED"
+                        or finalized_prior["attempt"] != prior_attempt
+                        or finalized_prior["phase"] != "FINALIZED"
+                        or finalized_prior["outcome"] != "CANCEL_FAILED"
+                        or finalized_prior["blocks_mutation"] != 0
+                    ):
+                        raise ValueError(
+                            "cancellation attempt must follow exact prior failed"
+                        )
+            if legacy_offer is not None:
+                prior_lifecycle_state = str(
+                    legacy_offer["lifecycle_state"] or "open"
+                ).strip()
+                if (
+                    not prior_lifecycle_state
+                    or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+                ):
+                    raise ValueError(
+                        "cancellation requires an actionable open lifecycle"
+                    )
+        else:
+            existing_event = validate_offer_operation_event(dict(existing))
+            existing_evidence = json.loads(existing_event["evidence_json"])
+            prior_lifecycle_state = existing_evidence.get("prior_lifecycle_state")
+        if prior_lifecycle_state is not None:
+            evidence["prior_lifecycle_state"] = prior_lifecycle_state
+        safe_evidence_json = _canonical_json_text(
+            evidence,
+            "evidence_json",
+            expected_type=dict,
+            max_bytes=65536,
+        )
+        journal = _journal_values(
+            event_id=event_id,
+            operation_id=operation_id,
+            intent_id=intent_id,
+            operation_type="CANCEL",
+            attempt=safe_attempt,
+            phase="PREPARED",
+            outcome="PREPARED",
+            request_timestamp=prepared,
+            wallet_identity_json=wallet_identity_json,
+            transaction_id=None,
+            spend_identity=None,
+            evidence_json=safe_evidence_json,
+            evidence_sha256=None,
+            reason_code="CANCEL_PREPARED",
+            blocks_mutation=True,
+            created_at=prepared,
+        )
+        row = _insert_offer_operation_event(conn, journal)
+        effect_claimed = existing is None
+        if effect_claimed and legacy_offer is not None:
+            conn.execute(
+                """
+                UPDATE offers
+                SET lifecycle_state='cancel_requested', cancel_last_attempt_at=?
+                WHERE trade_id=? AND status='open'
+                """,
+                (prepared, safe_trade_id),
+            )
+        conn.commit()
+        if claim_effect:
+            return {
+                "event": row,
+                "effect_claimed": effect_claimed,
+            }
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _validated_offer_cancel_effect_claim(row: Any) -> Dict[str, Any]:
+    if type(row) is not dict or set(row) != {
+        "operation_id",
+        "attempt",
+        "prepared_event_id",
+        "claimed_at",
+    }:
+        raise ValueError("cancellation effect claim fields are invalid")
+    attempt = _exact_integer(row["attempt"], "attempt", minimum=1)
+    operation_id = _required_stability_text(row["operation_id"], "operation_id")
+    prepared_event_id = _required_stability_text(
+        row["prepared_event_id"], "prepared_event_id"
+    )
+    if prepared_event_id != f"{operation_id}:attempt:{attempt}:prepared":
+        raise ValueError("cancellation effect claim identifiers are invalid")
+    return {
+        "operation_id": operation_id,
+        "attempt": attempt,
+        "prepared_event_id": prepared_event_id,
+        "claimed_at": _stability_timestamp(row["claimed_at"], "claimed_at"),
+    }
+
+
+def get_offer_cancel_effect_claim(
+    *, operation_id: str, attempt: int
+) -> Optional[Dict[str, Any]]:
+    """Return one exact append-only wallet-effect claim, if it exists."""
+
+    safe_operation_id = _required_stability_text(operation_id, "operation_id")
+    safe_attempt = _exact_integer(attempt, "attempt", minimum=1)
+    row = (
+        get_connection()
+        .execute(
+            """
+            SELECT operation_id, attempt, prepared_event_id, claimed_at
+            FROM offer_cancel_effect_claims
+            WHERE operation_id=? AND attempt=?
+            """,
+            (safe_operation_id, safe_attempt),
+        )
+        .fetchone()
+    )
+    return None if row is None else _validated_offer_cancel_effect_claim(dict(row))
+
+
+def claim_offer_cancel_effect(
+    *,
+    operation_id: str,
+    trade_id: str,
+    attempt: int,
+    claimed_at: Any = None,
+) -> bool:
+    """Atomically grant one cohort member its only wallet-effect boundary."""
+
+    safe_attempt = _exact_integer(attempt, "attempt", minimum=1)
+    prepared_event_id = f"{operation_id}:attempt:{safe_attempt}:prepared"
+    _canonical_cancel_identifiers(
+        operation_id=operation_id,
+        event_id=prepared_event_id,
+        trade_id=trade_id,
+        attempt=safe_attempt,
+        phase="PREPARED",
+    )
+    claim = {
+        "operation_id": operation_id,
+        "attempt": safe_attempt,
+        "prepared_event_id": prepared_event_id,
+        "claimed_at": _stability_timestamp_or_now(claimed_at, "claimed_at"),
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prepared_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (prepared_event_id,),
+        ).fetchone()
+        if prepared_row is None:
+            raise ValueError("cancellation effect claim requires PREPARED evidence")
+        prepared = validate_offer_operation_event(dict(prepared_row))
+        evidence = json.loads(prepared["evidence_json"])
+        if (
+            prepared["operation_id"] != operation_id
+            or prepared["attempt"] != safe_attempt
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or type(evidence) is not dict
+            or evidence.get("trade_id") != trade_id
+            or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
+        ):
+            raise ValueError("cancellation effect claim lacks exact cohort authority")
+        finalized = conn.execute(
+            """
+            SELECT 1 FROM offer_operation_journal
+            WHERE operation_id=? AND attempt=? AND phase='FINALIZED'
+            """,
+            (operation_id, safe_attempt),
+        ).fetchone()
+        if finalized is not None:
+            raise ValueError("finalized cancellation cannot claim a wallet effect")
+        existing = conn.execute(
+            """
+            SELECT operation_id, attempt, prepared_event_id, claimed_at
+            FROM offer_cancel_effect_claims
+            WHERE operation_id=? AND attempt=?
+            """,
+            (operation_id, safe_attempt),
+        ).fetchone()
+        if existing is not None:
+            _validated_offer_cancel_effect_claim(dict(existing))
+            conn.commit()
+            return False
+        conn.execute(
+            """
+            INSERT INTO offer_cancel_effect_claims (
+                operation_id, attempt, prepared_event_id, claimed_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                claim["operation_id"],
+                claim["attempt"],
+                claim["prepared_event_id"],
+                claim["claimed_at"],
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finalize_offer_cancel(
+    *,
+    operation_id: str,
+    event_id: str,
+    trade_id: str,
+    intent_id: Optional[str],
+    attempt: int,
+    cancel_result: Any,
+    wallet_identity_json: Any,
+    evidence_json: Any,
+    finalized_at: Any = None,
+    require_unclaimed: bool = False,
+) -> Dict[str, Any]:
+    """Append one typed nonterminal cancellation result atomically.
+
+    Task 8 deliberately has no terminal-proof authority.  A claimed confirmed
+    result is rejected until Task 9 supplies the separate proof boundary.
+    """
+
+    from cancel_outcomes import (
+        CANCEL_CONFIRMED,
+        CANCEL_FAILED,
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_UNKNOWN,
+        validate_cancel_result,
+    )
+
+    if type(require_unclaimed) is not bool:
+        raise TypeError("require_unclaimed must be an exact bool")
+    if type(wallet_identity_json) is not dict:
+        raise ValueError("wallet_identity_json must be an exact dictionary")
+    if type(evidence_json) is not dict:
+        raise ValueError("evidence_json must be an exact dictionary")
+    safe_trade_id = _canonical_cancel_identifiers(
+        operation_id=operation_id,
+        event_id=event_id,
+        trade_id=trade_id,
+        attempt=attempt,
+        phase="FINALIZED",
+    )
+    result = validate_cancel_result(cancel_result)
+    outcome = result["outcome"]
+    if outcome == CANCEL_CONFIRMED:
+        raise ValueError("confirmed cancellation requires authoritative terminal proof")
+    derived_blocker = outcome in {
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_UNKNOWN,
+    }
+    if outcome not in {
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_FAILED,
+        CANCEL_UNKNOWN,
+    }:
+        raise ValueError("cancellation outcome is not supported")
+    final_time = _stability_timestamp_or_now(finalized_at, "finalized_at")
+    safe_wallet_json = _canonical_json_text(
+        wallet_identity_json,
+        "wallet_identity_json",
+        expected_type=dict,
+    )
+    safe_evidence_json = _canonical_json_text(
+        evidence_json,
+        "evidence_json",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    evidence = json.loads(safe_evidence_json)
+    if (
+        evidence.get("trade_id") != safe_trade_id
+        or evidence.get("cancel_result") != result
+    ):
+        raise ValueError("cancellation evidence does not match the typed result")
+    if require_unclaimed and (
+        outcome != CANCEL_FAILED or evidence.get("effect_attempted") is not False
+    ):
+        raise ValueError(
+            "unclaimed cancellation finalization requires an exact no-effect failure"
+        )
+    journal = _journal_values(
+        event_id=event_id,
+        operation_id=operation_id,
+        intent_id=intent_id,
+        operation_type="CANCEL",
+        attempt=attempt,
+        phase="FINALIZED",
+        outcome=outcome,
+        request_timestamp=final_time,
+        wallet_identity_json=safe_wallet_json,
+        transaction_id=result["transaction_id"] or None,
+        spend_identity=result["spend_identity"] or None,
+        evidence_json=safe_evidence_json,
+        evidence_sha256=None,
+        reason_code=outcome,
+        blocks_mutation=derived_blocker,
+        created_at=final_time,
+    )
+    safe_operation_id = journal["operation_id"]
+    safe_intent_id = journal["intent_id"]
+    safe_attempt = journal["attempt"]
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prepared_row = conn.execute(
+            """
+            SELECT * FROM offer_operation_journal
+            WHERE operation_id=? AND attempt=? AND phase='PREPARED'
+            """,
+            (safe_operation_id, safe_attempt),
+        ).fetchone()
+        if prepared_row is None:
+            raise ValueError("cancellation result has no prepared request")
+        prepared_event = validate_offer_operation_event(dict(prepared_row))
+        if (
+            prepared_event["operation_type"] != "CANCEL"
+            or prepared_event["outcome"] != "PREPARED"
+            or prepared_event["blocks_mutation"] != 1
+            or prepared_event["intent_id"] != safe_intent_id
+            or prepared_event["wallet_identity_json"] != safe_wallet_json
+        ):
+            raise ValueError("cancellation prepared request does not match result")
+        prepared_evidence = json.loads(prepared_event["evidence_json"])
+        if prepared_evidence.get("trade_id") != safe_trade_id:
+            raise ValueError("cancellation prepared trade identity does not match")
+        if require_unclaimed:
+            if (
+                prepared_evidence.get("effect_claim_protocol")
+                != "durable_cohort_claim_v1"
+            ):
+                raise ValueError(
+                    "unclaimed cancellation finalization lacks cohort authority"
+                )
+            effect_claim = conn.execute(
+                """
+                SELECT operation_id, attempt, prepared_event_id, claimed_at
+                FROM offer_cancel_effect_claims
+                WHERE operation_id=? AND attempt=?
+                """,
+                (safe_operation_id, safe_attempt),
+            ).fetchone()
+            if effect_claim is not None:
+                _validated_offer_cancel_effect_claim(dict(effect_claim))
+                raise ValueError(
+                    "unclaimed cancellation finalization conflicts with effect claim"
+                )
+        prior_lifecycle_state = prepared_evidence.get("prior_lifecycle_state")
+        if prior_lifecycle_state is not None and (
+            type(prior_lifecycle_state) is not str
+            or not prior_lifecycle_state
+            or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+        ):
+            raise ValueError("cancellation prior lifecycle is invalid")
+        legacy_offer = conn.execute(
+            "SELECT status FROM offers WHERE trade_id=?",
+            (safe_trade_id,),
+        ).fetchone()
+        if legacy_offer is not None and legacy_offer["status"] != "open":
+            raise ValueError("cancellation cannot rewrite a terminal legacy offer")
+        row = _insert_offer_operation_event(conn, journal)
+        if legacy_offer is not None:
+            next_lifecycle_state = (
+                prior_lifecycle_state
+                if outcome == CANCEL_FAILED and prior_lifecycle_state is not None
+                else "cancel_requested"
+            )
+            conn.execute(
+                """
+                UPDATE offers SET lifecycle_state=?
+                WHERE trade_id=? AND status='open'
+                """,
+                (next_lifecycle_state, safe_trade_id),
+            )
         conn.commit()
         return row
     except Exception:
@@ -7735,6 +8272,75 @@ def get_offer_operation_events(operation_id: str) -> List[Dict[str, Any]]:
         .fetchall()
     )
     return [dict(row) for row in rows]
+
+
+def get_offer_cancel_cohort_prepared_events(cohort_id: str) -> List[Dict[str, Any]]:
+    """Return validated PREPARED events carrying one exact cohort identifier."""
+
+    safe_cohort_id = _required_stability_text(cohort_id, "cohort_id")
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT * FROM offer_operation_journal
+            WHERE operation_type='CANCEL' AND phase='PREPARED'
+            ORDER BY sequence
+            """
+        )
+        .fetchall()
+    )
+    matches_by_operation = {}
+    for row in rows:
+        event = validate_offer_operation_event(dict(row))
+        evidence = json.loads(event["evidence_json"])
+        if type(evidence) is dict and evidence.get("cohort_id") == safe_cohort_id:
+            previous = matches_by_operation.get(event["operation_id"])
+            if previous is None or event["attempt"] > previous["attempt"]:
+                matches_by_operation[event["operation_id"]] = event
+    return sorted(matches_by_operation.values(), key=lambda event: event["sequence"])
+
+
+def get_retryable_failed_offer_cancels() -> List[Dict[str, Any]]:
+    """Return latest exact no-effect cancel failures eligible for retry policy."""
+
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT journal.*
+            FROM offer_operation_journal AS journal
+            JOIN (
+                SELECT operation_id, MAX(sequence) AS latest_sequence
+                FROM offer_operation_journal
+                WHERE operation_type='CANCEL'
+                GROUP BY operation_id
+            ) AS latest
+              ON latest.operation_id = journal.operation_id
+             AND latest.latest_sequence = journal.sequence
+            WHERE journal.operation_type='CANCEL'
+              AND journal.phase='FINALIZED'
+              AND journal.outcome='CANCEL_FAILED'
+              AND journal.blocks_mutation=0
+            ORDER BY journal.sequence
+            """
+        )
+        .fetchall()
+    )
+    candidates = []
+    for row in rows:
+        event = validate_offer_operation_event(dict(row))
+        evidence = json.loads(event["evidence_json"])
+        if type(evidence) is not dict:
+            raise ValueError("cancellation retry evidence must be an exact dictionary")
+        trade_id = _canonical_cancel_identifiers(
+            operation_id=event["operation_id"],
+            event_id=event["event_id"],
+            trade_id=evidence.get("trade_id"),
+            attempt=event["attempt"],
+            phase="FINALIZED",
+        )
+        candidates.append({**event, "trade_id": trade_id})
+    return candidates
 
 
 def get_unresolved_offer_operation_blockers() -> List[Dict[str, Any]]:

@@ -232,6 +232,11 @@ def isolated_database(tmp_path, monkeypatch):
     database.close_connection()
     monkeypatch.setattr(database, "DB_PATH", str(path))
     monkeypatch.setattr(database, "_db_initialized_path", "")
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-16T12:00:00.000000Z",
+    )
     database.init_database()
     yield path
     database.close_connection()

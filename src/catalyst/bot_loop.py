@@ -15518,7 +15518,7 @@ class BotLoop:
         Returns dict with counts and details of what was found/cancelled.
         """
         from database import get_open_offers
-        from wallet import get_all_offers, cancel_offers_batch, wallet_batch_results
+        from wallet import get_all_offers
 
         log_event("info", "orphan_cleanup_start", "Starting orphaned offer cleanup...")
 
@@ -15585,19 +15585,25 @@ class BotLoop:
                     f"Cancelling orphan batch {done}/{total}...",
                 )
 
-                batch_results = cancel_offers_batch(batch, secure=True)
-                batch_results = wallet_batch_results(batch_results, batch)
+                batch_results = self.offer_manager.cancel_offers(
+                    batch,
+                    reason="orphan_cleanup",
+                    force_storm=True,
+                )
                 all_cancel_results.update(batch_results)
 
                 # Summary for this batch
-                successes = sum(
-                    1 for r in batch_results.values() if r and r.get("success")
+                pending = sum(
+                    1
+                    for r in batch_results.values()
+                    if type(r) is not dict or r.get("outcome") != "CANCEL_FAILED"
                 )
-                failures = len(batch_results) - successes
+                failures = len(batch_results) - pending
                 log_event(
                     "info",
                     "orphan_cancel_batch_result",
-                    f"Batch {done}/{total}: {successes} confirmed, {failures} failed",
+                    f"Batch {done}/{total}: {pending} pending reconciliation, "
+                    f"{failures} rejected without effect",
                 )
 
                 if i + BATCH_SIZE < total:
@@ -15605,22 +15611,25 @@ class BotLoop:
 
             result["cancel_results"] = {
                 "total": total,
-                "confirmed": sum(
-                    1 for r in all_cancel_results.values() if r and r.get("success")
+                "confirmed": 0,
+                "pending": sum(
+                    1
+                    for r in all_cancel_results.values()
+                    if type(r) is not dict or r.get("outcome") != "CANCEL_FAILED"
                 ),
                 "failed": sum(
                     1
                     for r in all_cancel_results.values()
-                    if not r or not r.get("success")
+                    if type(r) is dict and r.get("outcome") == "CANCEL_FAILED"
                 ),
             }
 
             log_event(
                 "info",
                 "orphan_cleanup_done",
-                f"Orphan cleanup complete: "
-                f"{result['cancel_results']['confirmed']}/{total} "
-                f"confirmed cancelled, "
+                f"Orphan cleanup journaled: "
+                f"{result['cancel_results']['pending']}/{total} "
+                f"pending reconciliation, "
                 f"{result['cancel_results']['failed']} failed",
             )
 

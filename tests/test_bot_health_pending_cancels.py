@@ -130,7 +130,7 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
 
     # ─── Repair B: confirmed cancel ─────────────────────────────────
 
-    def test_dexie_cancelled_marks_db_cancelled(self):
+    def test_dexie_cancelled_does_not_cross_authoritative_terminal_boundary(self):
         offers = [_offer("tid1")]
         fake_db = self._patch_db(offers)
         # Dexie says status=3 (CANCELLED)
@@ -139,11 +139,16 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
             return_value={"status": bot_health.DEXIE_STATUS_CANCELLED},
         ):
             check = bot_health.check_pending_cancels(auto_repair=True)
-        self.assertEqual(check.repaired_count, 1)
-        fake_db.update_offer_status.assert_called_once_with("tid1", "cancelled")
-        self.assertIn("confirmed_cancelled", check.repair_log[0])
+        self.assertEqual(check.repaired_count, 0)
+        fake_db.update_offer_status.assert_not_called()
+        self.assertEqual(check.anomaly_count, 1)
+        self.assertNotIn("confirmed cancelled", check.message)
+        self.assertIn(
+            "observed cancelled/expired on Dexie; awaiting authoritative reconciliation",
+            check.message,
+        )
 
-    def test_dexie_expired_marks_db_cancelled(self):
+    def test_dexie_expired_does_not_cross_authoritative_terminal_boundary(self):
         offers = [_offer("tid1")]
         fake_db = self._patch_db(offers)
         with patch(
@@ -151,8 +156,8 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
             return_value={"status": bot_health.DEXIE_STATUS_EXPIRED},
         ):
             check = bot_health.check_pending_cancels(auto_repair=True)
-        self.assertEqual(check.repaired_count, 1)
-        fake_db.update_offer_status.assert_called_once_with("tid1", "cancelled")
+        self.assertEqual(check.repaired_count, 0)
+        fake_db.update_offer_status.assert_not_called()
 
     # ─── Repair A: zombie re-cancel with backoff ────────────────────
 
@@ -181,7 +186,7 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
         self.assertEqual(check.anomaly_count, 1)
         self.assertIn("still active on Dexie", check.message)
 
-    def test_dexie_active_past_backoff_re_cancels_with_priority_fee(self):
+    def test_dexie_active_past_backoff_does_not_bypass_cancel_journal(self):
         # Cancel attempt 10 minutes ago — past 5-min retry window
         from datetime import datetime, timezone, timedelta
 
@@ -209,16 +214,9 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
         ):
             check = bot_health.check_pending_cancels(auto_repair=True)
 
-        cancel_offer_mock.assert_called_once()
-        args, kwargs = cancel_offer_mock.call_args
-        # Verify priority fee was passed (not zero)
-        self.assertEqual(args[0], "tid1")
-        self.assertEqual(kwargs.get("fee_mojos"), 13_079_100)
-        self.assertGreater(
-            kwargs.get("fee_mojos"), 0, "Re-cancel must use a priority fee, not zero"
-        )
-        self.assertEqual(check.repaired_count, 1)
-        self.assertIn("re_cancelled", check.repair_log[0])
+        cancel_offer_mock.assert_not_called()
+        self.assertEqual(check.repaired_count, 0)
+        self.assertEqual(check.anomaly_count, 1)
 
     # ─── Repair C: suspected fill — flag only, no auto-process ──────
 
@@ -305,10 +303,9 @@ class CheckPendingCancelsTests(_ModuleStubMixin, unittest.TestCase):
             check = bot_health.check_pending_cancels(auto_repair=True)
 
         self.assertEqual(check.anomaly_count, 3)  # cancelled + zombie + fill
-        self.assertEqual(check.repaired_count, 2)  # mark-cancelled + re-cancel
-        cancel_offer_mock.assert_called_once()
-        # Confirm DB updated for the cancelled one
-        fake_db.update_offer_status.assert_called_once_with("ok_cancelled", "cancelled")
+        self.assertEqual(check.repaired_count, 0)
+        cancel_offer_mock.assert_not_called()
+        fake_db.update_offer_status.assert_not_called()
 
 
 class RunRuntimeChecksTests(_ModuleStubMixin, unittest.TestCase):
