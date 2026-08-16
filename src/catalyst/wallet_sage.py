@@ -1178,7 +1178,7 @@ def _sage_rpc_port_reachable() -> bool:
             pass
 
 
-def ensure_initialized(force_retry: bool = False) -> bool:
+def ensure_initialized(force_retry: bool = False, *, _identity_recheck=None) -> bool:
     """Ensure Sage wallet manager has been initialized.
 
     Returns True if already initialized or initialization succeeds now.
@@ -1219,6 +1219,8 @@ def ensure_initialized(force_retry: bool = False) -> bool:
         # Attempt initialization under the lock.
         # Some Sage versions don't have /initialize (returns 404) — that's OK,
         # it means the wallet doesn't require explicit init.
+        if _identity_recheck is not None:
+            _identity_recheck("sage_initialize")
         try:
             result = rpc("initialize", {}, timeout=_INIT_RPC_TIMEOUT)
             if _rpc_succeeded(result):
@@ -1501,7 +1503,7 @@ def _emit_sage_diagnostic(diagnostic: dict[str, Any], endpoint: Any) -> None:
         pass
 
 
-def rpc(endpoint: str, payload: dict, timeout: int = 10):
+def rpc(endpoint: str, payload: dict, timeout: int = 10, *, _identity_recheck=None):
     """Make RPC call to Sage wallet on port 9257.
 
     Uses direct http.client + ssl (bypasses requests/urllib3 SSL issues).
@@ -1520,6 +1522,8 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10):
 
     start = time.time()
 
+    if _identity_recheck is not None:
+        _identity_recheck(f"rpc:{endpoint}")
     try:
         result = _sage_post(endpoint, payload, timeout=timeout)
 
@@ -1594,17 +1598,7 @@ def get_current_key() -> dict:
     Returns:
         Dict with key info {name, fingerprint, ...} or None if not logged in.
     """
-    if not ensure_initialized():
-        return None
-    try:
-        result = rpc("get_key", {}, timeout=5)
-        if result and isinstance(result, dict):
-            key = result.get("key")
-            if key and isinstance(key, dict):
-                return key
-    except Exception as e:
-        print(f"  [Sage] get_current_key error: {e}")
-    return None
+    return _get_current_key_read_only()
 
 
 def _get_current_key_read_only() -> Optional[dict]:
@@ -1763,13 +1757,16 @@ def _require_signing_capability() -> bool:
         return False
 
 
-def sage_initialize() -> bool:
+def sage_initialize(*, _identity_recheck=None) -> bool:
     """Explicit Sage wallet manager initialization — required before wallet ops.
 
     Delegates to ensure_initialized() with force_retry=True so that
     an explicit init request always retries even within the cooldown window.
     """
-    return ensure_initialized(force_retry=True)
+    return ensure_initialized(
+        force_retry=True,
+        _identity_recheck=_identity_recheck,
+    )
 
 
 def sage_login(
@@ -1790,7 +1787,8 @@ def sage_login(
     Returns:
         True if login succeeded and get_key confirms the right fingerprint.
     """
-    fingerprint = int(fingerprint)
+    if type(fingerprint) is not int or fingerprint <= 0:
+        return False
     print(f"  [Sage] Logging in to fingerprint {fingerprint}...")
 
     # Step 0: verify Sage is reachable before attempting login.
@@ -1812,7 +1810,7 @@ def sage_login(
     # Step 1: explicit initialize
     if _identity_recheck is not None:
         _identity_recheck("sage_login:initialize")
-    if not sage_initialize():
+    if not sage_initialize(_identity_recheck=_identity_recheck):
         return False
 
     time.sleep(1)
@@ -1884,13 +1882,6 @@ def get_wallet_sync_status() -> dict:
     versions (0.12.x+) omit it and only report synced_coins/total_coins.
     We infer sync state from these counts when no explicit boolean is present.
     """
-    if not ensure_initialized():
-        return {
-            "reachable": False,
-            "synced": False,
-            "syncing": False,
-            "sync_state": "offline",
-        }
     try:
         result = rpc("get_sync_status", {}, timeout=5)
         if _rpc_succeeded(result):
@@ -2565,8 +2556,6 @@ def get_spendable_coin_count(wallet_id: int) -> int:
     Sage API: get_spendable_coin_count { asset_id: Option<String> }
     Returns: { count: u32 }
     """
-    ensure_initialized()
-
     if _is_cat_wallet(wallet_id):
         asset_id = _resolve_asset_id(wallet_id)
         if not asset_id:
@@ -2617,8 +2606,6 @@ def get_pending_transactions() -> Optional[list]:
     Sage API: get_pending_transactions {}
     Returns: { pending_transactions: [...] }
     """
-    ensure_initialized()
-
     result = rpc("get_pending_transactions", {}, timeout=10)
 
     if _rpc_succeeded(result):
@@ -3448,9 +3435,6 @@ def get_wallets():
       - The configured CAT (from .env) gets CAT_WALLET_ID (typically 5)
       - Other discovered CATs get IDs starting from 100, incrementing
     """
-    if not ensure_initialized():
-        return {"success": False, "wallets": None, "error": "Sage not initialized"}
-
     global _wallet_id_to_asset_id
 
     wallets = [
@@ -3722,18 +3706,8 @@ def set_change_address(
     if not address:
         return {"success": False, "error": "invalid_change_address"}
 
-    try:
-        if fingerprint is None:
-            key = _get_current_key_read_only()
-            if not key or not key.get("fingerprint"):
-                return {"success": False, "error": "no_active_fingerprint"}
-            fingerprint = int(key["fingerprint"])
-        else:
-            fingerprint = int(fingerprint)
-
-    except Exception as e:
-        print(f"  [Sage] set_change_address error: {e}", flush=True)
-        return {"success": False, "error": str(e)}
+    if type(fingerprint) is not int or fingerprint <= 0:
+        return {"success": False, "error": "invalid_fingerprint"}
 
     if _identity_recheck is not None:
         _identity_recheck("set_change_address")
@@ -3746,13 +3720,16 @@ def set_change_address(
             },
             timeout=10,
         )
-        if result is None:
-            return {"success": False, "error": "rpc_failed"}
+        if (
+            type(result) is not dict
+            or result.get("success") is not True
+            or not _rpc_succeeded(result)
+        ):
+            return {"success": False, "error": "set_change_address_failed"}
 
         return {"success": True, "fingerprint": fingerprint, "address": address}
-    except Exception as e:
-        print(f"  [Sage] set_change_address error: {e}", flush=True)
-        return {"success": False, "error": str(e)}
+    except Exception:
+        return {"success": False, "error": "set_change_address_failed"}
 
 
 def send_transaction(

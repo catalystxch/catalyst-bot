@@ -161,6 +161,20 @@ def _int(key: str, default: int = 0) -> int:
         return default
 
 
+def _identity_max_age(key: str, default: int = 10):
+    """Parse identity freshness without turning malformed input into a default."""
+
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    if type(raw) is not str or not raw or not raw.isascii() or not raw.isdigit():
+        return None
+    value = int(raw)
+    if str(value) != raw or not 1 <= value <= 300:
+        return None
+    return value
+
+
 def _decimal(key: str, default: str = "0") -> Decimal:
     val = _strip_quotes(os.getenv(key, ""))
     try:
@@ -273,7 +287,7 @@ class Config:
         self.WALLET_DEBUG = _bool("WALLET_DEBUG", False)
         self.WALLET_EXPECTED_NAME = _str("WALLET_EXPECTED_NAME")
         self.WALLET_EXPECTED_KEY_KIND = _str("WALLET_EXPECTED_KEY_KIND", "bls")
-        self.WALLET_IDENTITY_MAX_AGE_SECONDS = _int(
+        self.WALLET_IDENTITY_MAX_AGE_SECONDS = _identity_max_age(
             "WALLET_IDENTITY_MAX_AGE_SECONDS", 10
         )
 

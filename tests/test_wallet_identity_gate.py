@@ -244,6 +244,7 @@ def test_wallet_mutation_inventory_is_exact_and_facade_owned():
         "rpc",
         "sage_delete_offer",
         "sage_delete_offers_batch",
+        "sage_initialize",
         "sage_login",
         "sage_topup_split",
         "send_cat_multi",
@@ -872,7 +873,7 @@ def test_sage_login_rechecks_before_each_wallet_state_change(monkeypatch):
     monkeypatch.setattr(
         wallet_sage,
         "sage_initialize",
-        lambda: events.append("initialize") or True,
+        lambda **kwargs: events.append("initialize") or True,
     )
     monkeypatch.setattr(
         wallet_sage,
@@ -1392,7 +1393,9 @@ def test_owner_runtime_identity_binding_ignores_later_cfg_mutation(monkeypatch):
     monkeypatch.setattr(
         mutation_gate,
         "current_runtime",
-        lambda: SimpleNamespace(wallet_identity_binding=frozen),
+        lambda: SimpleNamespace(
+            require_wallet_identity_authority=lambda operation: frozen
+        ),
     )
 
     monkeypatch.setattr(wallet.cfg, "SAGE_FINGERPRINT", "987654321")
@@ -1421,6 +1424,9 @@ def test_worker_installs_delegation_for_adapter_bound_rechecks(monkeypatch):
         mutation_gate.DELEGATION_WORKER_ENV: "coin-prep-worker:run-1",
         mutation_gate.DELEGATION_WALLET_ENV: "a" * 64,
         mutation_gate.DELEGATION_NETWORK_ENV: "mainnet",
+        mutation_gate.DELEGATION_IDENTITY_ENV: "{}",
+        mutation_gate.DELEGATION_IDENTITY_DIGEST_ENV: "b" * 64,
+        mutation_gate.DELEGATION_PARENT_EPOCH_ENV: "2026-08-16T12:00:00Z",
     }
     installed = []
     monkeypatch.setattr(
@@ -1531,10 +1537,14 @@ def test_delegated_expected_binding_rejects_malformed_config(
 
 
 def test_delegated_identity_binding_is_frozen_across_cfg_mutation(monkeypatch):
+    frozen = _binding(bound_at_utc="2026-08-16T12:02:00.000000Z")
     delegated = {
         "wallet_fingerprint_hash": mutation_gate.wallet_fingerprint_hash(123456789),
         "network": "mainnet",
         "bound_at_utc": "2026-08-16T12:02:00.000000Z",
+        "binding": frozen,
+        "binding_digest": mutation_gate.wallet_identity_binding_digest(frozen),
+        "parent_lease_epoch": "2026-08-16T12:01:59.000000Z",
     }
     monkeypatch.setattr(mutation_gate, "current_runtime", lambda: None)
     monkeypatch.setattr(
@@ -1563,7 +1573,7 @@ def test_delegated_identity_binding_is_frozen_across_cfg_mutation(monkeypatch):
     )
 
     assert wallet._expected_identity_binding() is original
-    assert original == _binding(bound_at_utc=delegated["bound_at_utc"])
+    assert original == frozen
 
 
 def test_identity_gate_public_api_is_explicitly_exported():

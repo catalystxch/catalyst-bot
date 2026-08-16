@@ -4567,7 +4567,7 @@ class BotLoop:
             from wallet import get_wallet_type
 
             if get_wallet_type() == "sage":
-                from wallet_sage import get_current_key
+                from wallet import get_current_key
 
                 key = get_current_key() or {}
                 has_secrets = key.get("has_secrets", False)
@@ -14770,7 +14770,7 @@ class BotLoop:
         """
         try:
             import sage_node
-            from wallet_sage import get_current_key
+            from wallet import get_current_key
         except Exception:
             return
 

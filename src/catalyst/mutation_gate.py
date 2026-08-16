@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -41,6 +42,9 @@ DELEGATION_PURPOSE_ENV = "_CATALYST_DELEGATION_PURPOSE"
 DELEGATION_WORKER_ENV = "_CATALYST_DELEGATION_WORKER_ID"
 DELEGATION_WALLET_ENV = "_CATALYST_DELEGATION_WALLET_HASH"
 DELEGATION_NETWORK_ENV = "_CATALYST_DELEGATION_NETWORK"
+DELEGATION_IDENTITY_ENV = "_CATALYST_DELEGATION_IDENTITY"
+DELEGATION_IDENTITY_DIGEST_ENV = "_CATALYST_DELEGATION_IDENTITY_DIGEST"
+DELEGATION_PARENT_EPOCH_ENV = "_CATALYST_DELEGATION_PARENT_EPOCH"
 
 _DELEGATION_ENV_NAMES = (
     DELEGATION_ID_ENV,
@@ -51,6 +55,9 @@ _DELEGATION_ENV_NAMES = (
     DELEGATION_WORKER_ENV,
     DELEGATION_WALLET_ENV,
     DELEGATION_NETWORK_ENV,
+    DELEGATION_IDENTITY_ENV,
+    DELEGATION_IDENTITY_DIGEST_ENV,
+    DELEGATION_PARENT_EPOCH_ENV,
 )
 
 _ALLOWED_REASON_CODES = frozenset(
@@ -217,6 +224,102 @@ class WalletIdentityBinding:
         object.__setattr__(self, "bound_at_utc", bound_timestamp)
 
 
+def wallet_identity_binding_payload(binding: Any) -> dict[str, Any]:
+    """Return the complete canonical non-secret mutation identity authority."""
+
+    if type(binding) is not WalletIdentityBinding:
+        raise ValueError("wallet identity binding must have the exact type")
+    return {
+        "backend": binding.backend,
+        "name": binding.name,
+        "fingerprint": binding.fingerprint,
+        "network_id": binding.network_id,
+        "kind": binding.kind,
+        "has_secrets": binding.has_secrets,
+        "bound_at_utc": binding.bound_at_utc,
+        "maximum_age_seconds": binding.maximum_age_seconds,
+    }
+
+
+def wallet_identity_binding_digest(binding: Any) -> str:
+    """Authenticate every field in a complete wallet identity authority."""
+
+    encoded = json.dumps(
+        wallet_identity_binding_payload(binding),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class _OwnerIdentityAuthority:
+    """Process-private immutable copy of an owner's acquired identity authority."""
+
+    binding: Optional[WalletIdentityBinding]
+    binding_digest: Optional[str]
+    wallet_fingerprint_hash: str
+    network: str
+    backend: Optional[str]
+
+
+_owner_identity_authorities_lock = threading.RLock()
+_owner_identity_authorities: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _registered_owner_identity_authority(
+    owner: Any,
+) -> Optional[_OwnerIdentityAuthority]:
+    with _owner_identity_authorities_lock:
+        return _owner_identity_authorities.get(owner)
+
+
+def _binding_wallet_hash(binding: WalletIdentityBinding) -> str:
+    return wallet_fingerprint_hash(binding.fingerprint)
+
+
+def _wallet_identity_payload_text(
+    binding: Optional[WalletIdentityBinding],
+) -> str:
+    payload = wallet_identity_binding_payload(binding) if binding is not None else {}
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _wallet_identity_from_payload_text(
+    payload_text: Any,
+) -> Optional[WalletIdentityBinding]:
+    text = _exact_text(payload_text, "wallet_identity_payload", max_length=2048)
+    payload = json.loads(text)
+    if type(payload) is not dict:
+        raise ValueError("wallet identity payload must be an exact object")
+    if payload == {}:
+        if text != "{}":
+            raise ValueError("empty wallet identity payload is not canonical")
+        return None
+    expected_keys = {
+        "backend",
+        "name",
+        "fingerprint",
+        "network_id",
+        "kind",
+        "has_secrets",
+        "bound_at_utc",
+        "maximum_age_seconds",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError("wallet identity payload fields are invalid")
+    binding = WalletIdentityBinding(**payload)
+    if text != _wallet_identity_payload_text(binding):
+        raise ValueError("wallet identity payload is not canonical")
+    return binding
+
+
 def validate_wallet_identity(
     binding: Any,
     snapshot: Any,
@@ -304,6 +407,9 @@ class WorkerDelegation:
         "worker_id",
         "wallet_fingerprint_hash",
         "network",
+        "wallet_identity_payload",
+        "wallet_identity_digest",
+        "parent_lease_epoch",
         "expires_at",
         "_raw_token",
     )
@@ -318,6 +424,9 @@ class WorkerDelegation:
         worker_id: str,
         wallet_fingerprint_hash: str,
         network: str,
+        wallet_identity_payload: str,
+        wallet_identity_digest: str,
+        parent_lease_epoch: str,
         expires_at: str,
         _raw_token: str,
     ):
@@ -328,6 +437,9 @@ class WorkerDelegation:
         object.__setattr__(self, "worker_id", worker_id)
         object.__setattr__(self, "wallet_fingerprint_hash", wallet_fingerprint_hash)
         object.__setattr__(self, "network", network)
+        object.__setattr__(self, "wallet_identity_payload", wallet_identity_payload)
+        object.__setattr__(self, "wallet_identity_digest", wallet_identity_digest)
+        object.__setattr__(self, "parent_lease_epoch", parent_lease_epoch)
         object.__setattr__(self, "expires_at", expires_at)
         object.__setattr__(self, "_raw_token", _raw_token)
 
@@ -356,6 +468,8 @@ class WorkerDelegation:
             "worker_id": self.worker_id,
             "wallet_fingerprint_hash": self.wallet_fingerprint_hash,
             "network": self.network,
+            "wallet_identity_digest": self.wallet_identity_digest,
+            "parent_lease_epoch": self.parent_lease_epoch,
             "expires_at": self.expires_at,
         }
 
@@ -371,6 +485,9 @@ class WorkerDelegation:
             DELEGATION_WORKER_ENV: self.worker_id,
             DELEGATION_WALLET_ENV: self.wallet_fingerprint_hash,
             DELEGATION_NETWORK_ENV: self.network,
+            DELEGATION_IDENTITY_ENV: self.wallet_identity_payload,
+            DELEGATION_IDENTITY_DIGEST_ENV: self.wallet_identity_digest,
+            DELEGATION_PARENT_EPOCH_ENV: self.parent_lease_epoch,
         }
 
 
@@ -540,6 +657,37 @@ def _stop_callback_boundary(method):
 class MutationGate:
     """One process' view of the durable safety latch and mutation lease."""
 
+    _IMMUTABLE_IDENTITY_ATTRIBUTES = frozenset(
+        {
+            "wallet_identity_binding",
+            "wallet_identity_binding_digest",
+            "_wallet_identity_binding",
+            "_wallet_identity_binding_digest",
+            "_identity_wallet_fingerprint_hash",
+            "_identity_network",
+            "_identity_backend",
+            "_identity_authority_installed",
+        }
+    )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            name in self._IMMUTABLE_IDENTITY_ATTRIBUTES
+            and self.__dict__.get("_identity_authority_installed") is True
+        ):
+            raise AttributeError("wallet identity authority is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def wallet_identity_binding(self) -> Optional[WalletIdentityBinding]:
+        authority = _registered_owner_identity_authority(self)
+        return authority.binding if authority is not None else None
+
+    @property
+    def wallet_identity_binding_digest(self) -> Optional[str]:
+        authority = _registered_owner_identity_authority(self)
+        return authority.binding_digest if authority is not None else None
+
     def __init__(
         self,
         *,
@@ -554,6 +702,7 @@ class MutationGate:
         read_only: bool = False,
         wallet_identity_binding: Optional[WalletIdentityBinding] = None,
     ):
+        object.__setattr__(self, "_identity_authority_installed", False)
         self.run_id = _exact_text(run_id, "run_id")
         self.owner_pid = _exact_positive_int(owner_pid, "owner_pid")
         self.owner_host = _exact_text(owner_host, "owner_host")
@@ -576,7 +725,40 @@ class MutationGate:
             or wallet_identity_binding.network_id != self.network.lower()
         ):
             raise ValueError("wallet identity binding does not match lease binding")
-        self.wallet_identity_binding = wallet_identity_binding
+        identity_digest = (
+            wallet_identity_binding_digest(wallet_identity_binding)
+            if wallet_identity_binding is not None
+            else None
+        )
+        object.__setattr__(self, "_wallet_identity_binding", wallet_identity_binding)
+        object.__setattr__(self, "_wallet_identity_binding_digest", identity_digest)
+        object.__setattr__(
+            self,
+            "_identity_wallet_fingerprint_hash",
+            self.wallet_fingerprint_hash,
+        )
+        object.__setattr__(self, "_identity_network", self.network)
+        object.__setattr__(
+            self,
+            "_identity_backend",
+            wallet_identity_binding.backend
+            if wallet_identity_binding is not None
+            else None,
+        )
+        authority = _OwnerIdentityAuthority(
+            binding=wallet_identity_binding,
+            binding_digest=identity_digest,
+            wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+            network=self.network,
+            backend=(
+                wallet_identity_binding.backend
+                if wallet_identity_binding is not None
+                else None
+            ),
+        )
+        with _owner_identity_authorities_lock:
+            _owner_identity_authorities[self] = authority
+        object.__setattr__(self, "_identity_authority_installed", True)
         self._last_wallet_identity_observed_at_utc: Optional[str] = None
         self._lock = threading.RLock()
         self._mutation_condition = threading.Condition(self._lock)
@@ -598,6 +780,39 @@ class MutationGate:
             "acquired": False,
             "reason": "not_attempted",
         }
+
+    def require_wallet_identity_authority(
+        self, operation: str
+    ) -> WalletIdentityBinding:
+        """Revalidate the frozen complete authority at a wallet boundary."""
+
+        try:
+            authority = _registered_owner_identity_authority(self)
+            binding = self._wallet_identity_binding
+            valid = (
+                type(authority) is _OwnerIdentityAuthority
+                and type(binding) is WalletIdentityBinding
+                and binding is authority.binding
+                and wallet_identity_binding_digest(binding) == authority.binding_digest
+                and self._wallet_identity_binding_digest == authority.binding_digest
+                and self.wallet_identity_binding is authority.binding
+                and self.wallet_identity_binding_digest == authority.binding_digest
+                and self.wallet_fingerprint_hash == authority.wallet_fingerprint_hash
+                and self.network == authority.network
+                and self.wallet_fingerprint_hash
+                == self._identity_wallet_fingerprint_hash
+                and self.network == self._identity_network
+                and binding.backend == authority.backend
+                and self._identity_backend == authority.backend
+                and wallet_fingerprint_hash(binding.fingerprint)
+                == authority.wallet_fingerprint_hash
+                and binding.network_id == authority.network.lower()
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        return binding
 
     def _authorization_snapshot(self) -> dict[str, Any]:
         if self._read_only:
@@ -891,9 +1106,10 @@ class MutationGate:
 
         safe_operation = _safe_operation(operation)
         with self._lock:
+            binding = self.require_wallet_identity_authority(safe_operation)
             self.require_allowed(safe_operation)
             decision = validate_wallet_identity(
-                self.wallet_identity_binding,
+                binding,
                 snapshot,
                 now=self._now(),
                 last_observed_at_utc=self._last_wallet_identity_observed_at_utc,
@@ -1134,15 +1350,40 @@ class MutationGate:
         purpose: str,
         worker_id: str,
         ttl_seconds: int,
+        require_wallet_identity: bool = False,
     ) -> WorkerDelegation:
         operation = _exact_text(operation_id, "operation_id")
         safe_purpose = _exact_text(purpose, "purpose", max_length=64)
         safe_worker = _exact_text(worker_id, "worker_id")
         ttl = _exact_positive_int(ttl_seconds, "ttl_seconds")
+        if type(require_wallet_identity) is not bool:
+            raise TypeError("require_wallet_identity must be an exact bool")
+        wallet_identity_required = require_wallet_identity
         if ttl > 3600:
             raise ValueError("ttl_seconds exceeds the maximum delegation lifetime")
         with self._lock:
             self.require_allowed(f"delegate:{safe_purpose}")
+            binding = self.wallet_identity_binding
+            if wallet_identity_required and binding is None:
+                raise MutationBlocked(
+                    "WALLET_IDENTITY_BINDING_INVALID",
+                    f"delegate:{safe_purpose}:identity",
+                )
+            if binding is not None:
+                binding = self.require_wallet_identity_authority(
+                    f"delegate:{safe_purpose}:identity"
+                )
+            identity_payload = _wallet_identity_payload_text(binding)
+            identity_digest = (
+                wallet_identity_binding_digest(binding)
+                if binding is not None
+                else hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+            )
+            parent_epoch = _exact_text(
+                self._lease_acquired_at,
+                "parent_lease_epoch",
+                max_length=64,
+            )
             now = self._now()
             expires = now + timedelta(seconds=ttl)
             database.expire_worker_delegations(now=now)
@@ -1153,6 +1394,10 @@ class MutationGate:
                 "parent_acquired_at": self._lease_acquired_at,
                 "parent_host": self.owner_host,
                 "parent_pid": self.owner_pid,
+                "wallet_identity_payload": identity_payload,
+                "wallet_identity_digest": identity_digest,
+                "parent_lease_epoch": parent_epoch,
+                "wallet_identity_required": wallet_identity_required,
             }
             inserted = False
             try:
@@ -1194,6 +1439,9 @@ class MutationGate:
                 worker_id=safe_worker,
                 wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                 network=self.network,
+                wallet_identity_payload=identity_payload,
+                wallet_identity_digest=identity_digest,
+                parent_lease_epoch=parent_epoch,
                 expires_at=_timestamp(expires),
                 _raw_token=raw_token,
             )
@@ -1255,6 +1503,9 @@ def _validate_worker_delegation(
     wallet_fingerprint_hash: Any,
     network: Any,
     now: datetime,
+    wallet_identity_payload: Any = None,
+    wallet_identity_digest: Any = None,
+    parent_lease_epoch: Any = None,
 ) -> dict[str, Any]:
     try:
         values = {
@@ -1288,7 +1539,55 @@ def _validate_worker_delegation(
         ):
             return _invalid_worker()
         metadata = json.loads(str(row.get("metadata_json") or "{}"))
-        if not isinstance(metadata, dict):
+        if type(metadata) is not dict:
+            return _invalid_worker()
+        metadata_payload = _exact_text(
+            metadata.get("wallet_identity_payload"),
+            "wallet_identity_payload",
+            max_length=2048,
+        )
+        metadata_digest = _exact_text(
+            metadata.get("wallet_identity_digest"),
+            "wallet_identity_digest",
+            max_length=64,
+        )
+        metadata_epoch = _exact_text(
+            metadata.get("parent_lease_epoch"),
+            "parent_lease_epoch",
+            max_length=64,
+        )
+        _strict_utc_timestamp(metadata_epoch, "parent_lease_epoch")
+        binding = _wallet_identity_from_payload_text(metadata_payload)
+        identity_required = metadata.get("wallet_identity_required", False)
+        if type(identity_required) is not bool or (
+            identity_required and binding is None
+        ):
+            return _invalid_worker()
+        recomputed_digest = (
+            wallet_identity_binding_digest(binding)
+            if binding is not None
+            else hashlib.sha256(metadata_payload.encode("utf-8")).hexdigest()
+        )
+        if not hmac.compare_digest(metadata_digest, recomputed_digest):
+            return _invalid_worker()
+        supplied_identity = (
+            wallet_identity_payload,
+            wallet_identity_digest,
+            parent_lease_epoch,
+        )
+        if any(value is not None for value in supplied_identity):
+            if not all(type(value) is str for value in supplied_identity):
+                return _invalid_worker()
+            if supplied_identity != (
+                metadata_payload,
+                metadata_digest,
+                metadata_epoch,
+            ):
+                return _invalid_worker()
+        if binding is not None and (
+            _binding_wallet_hash(binding) != values["wallet_fingerprint_hash"]
+            or binding.network_id != values["network"].lower()
+        ):
             return _invalid_worker()
         latch = authorization["latch"]
         if str(latch.get("state") or "") != "resolved":
@@ -1303,7 +1602,7 @@ def _validate_worker_delegation(
             values["network"],
             metadata.get("parent_pid"),
             metadata.get("parent_host"),
-            metadata.get("parent_acquired_at"),
+            metadata_epoch,
         )
         actual = (
             bool(lease.get("active")),
@@ -1325,6 +1624,9 @@ def _validate_worker_delegation(
             "operation_id": values["operation_id"],
             "purpose": values["purpose"],
             "worker_id": values["worker_id"],
+            "wallet_identity_binding": binding,
+            "wallet_identity_digest": metadata_digest,
+            "parent_lease_epoch": metadata_epoch,
         }
     except Exception:
         return _invalid_worker()
@@ -1346,6 +1648,9 @@ def validate_worker_environment(
             worker_id=values[DELEGATION_WORKER_ENV],
             wallet_fingerprint_hash=values[DELEGATION_WALLET_ENV],
             network=values[DELEGATION_NETWORK_ENV],
+            wallet_identity_payload=values[DELEGATION_IDENTITY_ENV],
+            wallet_identity_digest=values[DELEGATION_IDENTITY_DIGEST_ENV],
+            parent_lease_epoch=values[DELEGATION_PARENT_EPOCH_ENV],
             now=_as_utc(now or _utc_now()),
         )
     except Exception:
@@ -1374,6 +1679,9 @@ _worker_authority_lock = threading.RLock()
 _worker_authority_environment: Optional[dict[str, str]] = None
 _worker_authority_bound_at_utc: Optional[str] = None
 _worker_identity_last_observed_at_utc: Optional[str] = None
+_worker_wallet_identity_binding: Optional[WalletIdentityBinding] = None
+_worker_wallet_identity_digest: Optional[str] = None
+_worker_parent_lease_epoch: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1388,9 +1696,29 @@ def install_worker_authority_environment(environment: Mapping[str, str]) -> None
     result = validate_worker_environment(environment)
     if result.get("allowed") is not True:
         raise MutationBlocked("WORKER_DELEGATION_INVALID", "worker.install")
+    binding = result.get("wallet_identity_binding")
+    identity_digest = result.get("wallet_identity_digest")
+    parent_epoch = result.get("parent_lease_epoch")
+    try:
+        if (
+            type(binding) is not WalletIdentityBinding
+            or type(identity_digest) is not str
+            or not hmac.compare_digest(
+                identity_digest, wallet_identity_binding_digest(binding)
+            )
+            or type(parent_epoch) is not str
+        ):
+            raise ValueError("delegation has no complete wallet identity")
+        _strict_utc_timestamp(parent_epoch, "parent_lease_epoch")
+    except Exception as exc:
+        raise MutationBlocked("WORKER_DELEGATION_INVALID", "worker.install") from exc
     try:
         copied = {
-            name: _exact_text(environment.get(name), name, max_length=512)
+            name: _exact_text(
+                environment.get(name),
+                name,
+                max_length=2048 if name == DELEGATION_IDENTITY_ENV else 512,
+            )
             for name in _DELEGATION_ENV_NAMES
         }
     except Exception as exc:
@@ -1398,8 +1726,13 @@ def install_worker_authority_environment(environment: Mapping[str, str]) -> None
     with _worker_authority_lock:
         global _worker_authority_environment, _worker_authority_bound_at_utc
         global _worker_identity_last_observed_at_utc
+        global _worker_wallet_identity_binding, _worker_wallet_identity_digest
+        global _worker_parent_lease_epoch
         _worker_authority_environment = copied
-        _worker_authority_bound_at_utc = _timestamp(_utc_now())
+        _worker_authority_bound_at_utc = binding.bound_at_utc
+        _worker_wallet_identity_binding = binding
+        _worker_wallet_identity_digest = identity_digest
+        _worker_parent_lease_epoch = parent_epoch
         _worker_identity_last_observed_at_utc = None
 
 
@@ -1407,13 +1740,18 @@ def clear_worker_authority_environment() -> None:
     with _worker_authority_lock:
         global _worker_authority_environment, _worker_authority_bound_at_utc
         global _worker_identity_last_observed_at_utc
+        global _worker_wallet_identity_binding, _worker_wallet_identity_digest
+        global _worker_parent_lease_epoch
         _worker_authority_environment = None
         _worker_authority_bound_at_utc = None
+        _worker_wallet_identity_binding = None
+        _worker_wallet_identity_digest = None
+        _worker_parent_lease_epoch = None
         _worker_identity_last_observed_at_utc = None
 
 
-def worker_identity_lease_binding() -> Optional[dict[str, str]]:
-    """Return only the non-token identity binding after fresh delegation proof."""
+def worker_identity_lease_binding() -> Optional[dict[str, Any]]:
+    """Return the frozen complete identity after fresh delegation proof."""
 
     with _worker_authority_lock:
         environment = (
@@ -1421,6 +1759,9 @@ def worker_identity_lease_binding() -> Optional[dict[str, str]]:
             if _worker_authority_environment is not None
             else None
         )
+        binding = _worker_wallet_identity_binding
+        identity_digest = _worker_wallet_identity_digest
+        parent_epoch = _worker_parent_lease_epoch
     if environment is None:
         return None
     require_worker_allowed_from_environment("wallet:identity", environment)
@@ -1428,12 +1769,32 @@ def worker_identity_lease_binding() -> Optional[dict[str, str]]:
         if (
             _worker_authority_environment != environment
             or _worker_authority_bound_at_utc is None
+            or _worker_wallet_identity_binding is not binding
+            or _worker_wallet_identity_digest != identity_digest
+            or _worker_parent_lease_epoch != parent_epoch
         ):
+            return None
+        try:
+            if (
+                type(binding) is not WalletIdentityBinding
+                or type(identity_digest) is not str
+                or not hmac.compare_digest(
+                    identity_digest, wallet_identity_binding_digest(binding)
+                )
+                or parent_epoch != environment[DELEGATION_PARENT_EPOCH_ENV]
+                or _binding_wallet_hash(binding) != environment[DELEGATION_WALLET_ENV]
+                or binding.network_id != environment[DELEGATION_NETWORK_ENV].lower()
+            ):
+                return None
+        except Exception:
             return None
         return {
             "wallet_fingerprint_hash": environment[DELEGATION_WALLET_ENV],
             "network": environment[DELEGATION_NETWORK_ENV],
-            "bound_at_utc": _worker_authority_bound_at_utc,
+            "bound_at_utc": binding.bound_at_utc,
+            "binding": binding,
+            "binding_digest": identity_digest,
+            "parent_lease_epoch": parent_epoch,
         }
 
 
@@ -1442,6 +1803,7 @@ def enter_wallet_mutation(operation: str) -> WalletMutationPermit:
 
     runtime = current_runtime()
     if runtime is not None:
+        runtime.require_wallet_identity_authority(operation)
         return WalletMutationPermit("runtime", runtime.enter_mutation(operation))
     with _worker_authority_lock:
         environment = (
@@ -1472,7 +1834,13 @@ def require_fresh_wallet_identity(
 
     runtime = current_runtime()
     if runtime is not None:
-        if runtime.wallet_identity_binding != binding:
+        authority = runtime.require_wallet_identity_authority(operation)
+        if (
+            type(binding) is not WalletIdentityBinding
+            or wallet_identity_binding_digest(binding)
+            != runtime.wallet_identity_binding_digest
+            or authority != binding
+        ):
             raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
         return runtime.require_fresh_wallet_identity(snapshot, operation)
 
@@ -1481,7 +1849,11 @@ def require_fresh_wallet_identity(
         raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
     try:
         binding_matches = (
-            wallet_fingerprint_hash(binding.fingerprint)
+            type(binding) is WalletIdentityBinding
+            and wallet_identity_binding_digest(binding)
+            == lease_binding["binding_digest"]
+            and binding == lease_binding["binding"]
+            and wallet_fingerprint_hash(binding.fingerprint)
             == lease_binding["wallet_fingerprint_hash"]
             and binding.network_id == lease_binding["network"].lower()
             and binding.bound_at_utc == lease_binding["bound_at_utc"]
@@ -1521,6 +1893,8 @@ def initialize(
         safe_host = owner_host or socket.gethostname()
         previous = _runtime
         if previous is not None:
+            if previous.wallet_identity_binding is not None:
+                previous.require_wallet_identity_authority("runtime:initialize")
             same_binding = (
                 previous.owner_pid == safe_pid
                 and previous.owner_host == safe_host
@@ -1654,10 +2028,13 @@ atexit.register(shutdown_runtime)
 
 __all__ = [
     "DELEGATION_ID_ENV",
+    "DELEGATION_IDENTITY_ENV",
+    "DELEGATION_IDENTITY_DIGEST_ENV",
     "DELEGATION_NETWORK_ENV",
     "DELEGATION_OPERATION_ENV",
     "DELEGATION_PARENT_RUN_ENV",
     "DELEGATION_PURPOSE_ENV",
+    "DELEGATION_PARENT_EPOCH_ENV",
     "DELEGATION_TOKEN_ENV",
     "DELEGATION_WALLET_ENV",
     "DELEGATION_WORKER_ENV",
@@ -1686,5 +2063,7 @@ __all__ = [
     "validate_wallet_identity",
     "validate_worker_environment",
     "wallet_fingerprint_hash",
+    "wallet_identity_binding_digest",
+    "wallet_identity_binding_payload",
     "worker_identity_lease_binding",
 ]

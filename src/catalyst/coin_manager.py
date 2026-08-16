@@ -300,6 +300,7 @@ def _issue_coin_prep_worker_delegation(
         purpose="coin_prep",
         worker_id=worker_id,
         ttl_seconds=ttl_seconds,
+        require_wallet_identity=True,
     )
     env.update(handoff.to_environment())
     return handoff
@@ -1981,7 +1982,7 @@ class CoinManager:
 
     def _sage_pending_transaction_count(self) -> Optional[int]:
         try:
-            from wallet_sage import get_pending_transactions
+            from wallet import get_pending_transactions
 
             pending = get_pending_transactions()
             if pending is not None:
@@ -8840,7 +8841,7 @@ class CoinManager:
 
         def _sage_pending_count() -> Optional[int]:
             try:
-                from wallet_sage import get_pending_transactions
+                from wallet import get_pending_transactions
 
                 pending = get_pending_transactions()
                 if pending is not None:
@@ -9457,7 +9458,7 @@ class CoinManager:
             if 118 < elapsed < 125:
                 try:
                     if get_wallet_type() == "sage":
-                        from wallet_sage import get_pending_transactions
+                        from wallet import get_pending_transactions
 
                         pending = get_pending_transactions() or []
                         pending_count = len(pending) if isinstance(pending, list) else 0

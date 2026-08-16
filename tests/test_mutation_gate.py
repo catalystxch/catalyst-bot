@@ -89,6 +89,35 @@ def _gate(
     )
 
 
+def _identity_gate(clock: Clock):
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Delegated Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(NOW - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    gate = mutation_gate.MutationGate(
+        run_id="identity-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network=binding.network_id,
+        lease_seconds=30,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+    )
+    return gate, binding
+
+
 def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
     database.append_offer_operation_event(
         event_id=f"event:{operation_id}:{suffix}",
@@ -816,6 +845,128 @@ def test_delegation_is_hash_only_secret_safe_and_exactly_scoped(
         candidate[key] = value
         denied = gate.validate_worker_delegation(**candidate)
         assert denied == {"allowed": False, "reason": "worker_delegation_invalid"}
+
+
+def test_worker_delegation_authenticates_complete_parent_identity(
+    isolated_gate_database,
+):
+    """The child handoff contains the exact parent binding and lease epoch."""
+
+    _path, clock = isolated_gate_database
+    gate, binding = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:identity",
+        purpose="coin_prep",
+        worker_id="worker-identity",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+
+    payload = json.loads(environment[mutation_gate.DELEGATION_IDENTITY_ENV])
+    assert payload == mutation_gate.wallet_identity_binding_payload(binding)
+    assert environment[mutation_gate.DELEGATION_IDENTITY_DIGEST_ENV] == (
+        mutation_gate.wallet_identity_binding_digest(binding)
+    )
+    assert environment[mutation_gate.DELEGATION_PARENT_EPOCH_ENV]
+    assert gate.validate_worker_environment(environment)["allowed"] is True
+
+
+@pytest.mark.parametrize("field", ["payload", "digest", "epoch"])
+def test_worker_delegation_rejects_identity_or_epoch_environment_tamper(
+    isolated_gate_database, field
+):
+    """Full binding and parent epoch are authenticated, not trusted env config."""
+
+    _path, clock = isolated_gate_database
+    gate, _binding_value = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id=f"coin-prep:tamper:{field}",
+        purpose="coin_prep",
+        worker_id=f"worker-{field}",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    if field == "payload":
+        payload = json.loads(environment[mutation_gate.DELEGATION_IDENTITY_ENV])
+        payload["name"] = "Hostile Wallet"
+        environment[mutation_gate.DELEGATION_IDENTITY_ENV] = json.dumps(payload)
+    elif field == "digest":
+        environment[mutation_gate.DELEGATION_IDENTITY_DIGEST_ENV] = "0" * 64
+    else:
+        environment[mutation_gate.DELEGATION_PARENT_EPOCH_ENV] = (
+            "2026-08-15T11:59:59.000000Z"
+        )
+
+    assert gate.validate_worker_environment(environment) == {
+        "allowed": False,
+        "reason": "worker_delegation_invalid",
+    }
+
+
+def test_installed_worker_binding_is_complete_and_cfg_independent(
+    isolated_gate_database, monkeypatch
+):
+    """The full parent authority freezes at install, before the first effect."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    gate, binding = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:freeze",
+        purpose="coin_prep",
+        worker_id="worker-freeze",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    mutation_gate.install_worker_authority_environment(environment)
+
+    monkeypatch.setattr(wallet.cfg, "SAGE_FINGERPRINT", "999999999")
+    monkeypatch.setattr(
+        wallet.cfg, "WALLET_EXPECTED_NAME", "Hostile Wallet", raising=False
+    )
+    monkeypatch.setattr(
+        wallet.cfg, "WALLET_EXPECTED_KEY_KIND", "hostile-kind", raising=False
+    )
+    monkeypatch.setattr(
+        wallet.cfg, "WALLET_IDENTITY_MAX_AGE_SECONDS", 300, raising=False
+    )
+
+    authority = mutation_gate.worker_identity_lease_binding()
+    assert authority["binding"] == binding
+    assert authority["binding_digest"] == (
+        mutation_gate.wallet_identity_binding_digest(binding)
+    )
+    assert wallet._expected_identity_binding() == binding
+
+
+def test_installed_worker_binding_rechecks_revocation_before_effect(
+    isolated_gate_database, monkeypatch
+):
+    """A frozen child binding never outlives its durable delegation."""
+
+    _path, clock = isolated_gate_database
+    gate, _binding_value = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:revoked-identity",
+        purpose="coin_prep",
+        worker_id="worker-revoked-identity",
+        ttl_seconds=20,
+    )
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    mutation_gate.install_worker_authority_environment(handoff.to_environment())
+    assert gate.revoke_worker_delegation(handoff)["revoked"] is True
+
+    with pytest.raises(mutation_gate.MutationBlocked) as error:
+        mutation_gate.worker_identity_lease_binding()
+
+    assert error.value.reason_code == "WORKER_DELEGATION_INVALID"
 
 
 def test_delegation_expires_revokes_and_parent_lease_loss_invalidates_child(
@@ -1656,7 +1807,7 @@ def test_parent_launcher_uses_environment_only_and_revokes_on_request(
     isolated_gate_database,
 ):
     _path, clock = isolated_gate_database
-    parent = _gate(clock)
+    parent, _binding_value = _identity_gate(clock)
     assert parent.acquire()["acquired"] is True
     mutation_gate.shutdown_runtime()
     mutation_gate._runtime = parent
@@ -1904,7 +2055,7 @@ def test_worker_consumes_handoff_without_leaking_token_to_grandchildren(
 ):
     _path, clock = isolated_gate_database
     monkeypatch.setattr(mutation_gate, "_utc_now", clock)
-    parent = _gate(clock)
+    parent, _binding_value = _identity_gate(clock)
     assert parent.acquire()["acquired"] is True
     handoff = parent.issue_worker_delegation(
         operation_id="coin-prep:consume",
@@ -1920,19 +2071,7 @@ def test_worker_consumes_handoff_without_leaking_token_to_grandchildren(
     args = SimpleNamespace(run_id="consume", sage_rpc_smoke=False)
 
     assert coin_prep_worker._validate_coin_prep_worker_delegation(args)["allowed"]
-    assert all(
-        key not in os.environ
-        for key in (
-            mutation_gate.DELEGATION_ID_ENV,
-            mutation_gate.DELEGATION_TOKEN_ENV,
-            mutation_gate.DELEGATION_PARENT_RUN_ENV,
-            mutation_gate.DELEGATION_OPERATION_ENV,
-            mutation_gate.DELEGATION_PURPOSE_ENV,
-            mutation_gate.DELEGATION_WORKER_ENV,
-            mutation_gate.DELEGATION_WALLET_ENV,
-            mutation_gate.DELEGATION_NETWORK_ENV,
-        )
-    )
+    assert all(key not in os.environ for key in mutation_gate._DELEGATION_ENV_NAMES)
     calls = []
     coin_prep_worker._guarded_wallet_mutation(
         "coin.split", lambda: calls.append("called")

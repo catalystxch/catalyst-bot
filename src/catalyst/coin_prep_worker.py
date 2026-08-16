@@ -83,6 +83,9 @@ _WORKER_DELEGATION_ENV_NAMES = (
     mutation_gate.DELEGATION_WORKER_ENV,
     mutation_gate.DELEGATION_WALLET_ENV,
     mutation_gate.DELEGATION_NETWORK_ENV,
+    mutation_gate.DELEGATION_IDENTITY_ENV,
+    mutation_gate.DELEGATION_IDENTITY_DIGEST_ENV,
+    mutation_gate.DELEGATION_PARENT_EPOCH_ENV,
 )
 _worker_delegation_environment = None
 
@@ -851,10 +854,7 @@ class CoinPrepWorker:
         return _guarded_wallet_mutation(operation, callback, *args, **kwargs)
 
     def _require_cli_mutation(self, operation: str) -> None:
-        if getattr(self, "_is_subprocess", False):
-            mutation_gate.require_worker_allowed_from_environment(
-                operation, _worker_authority_environment()
-            )
+        raise mutation_gate.MutationBlocked("WALLET_BACKEND_UNSUPPORTED", operation)
 
     def _format_cat_amount(self, amount) -> str:
         return format_cat_display_amount(amount, self.cat_decimals)
@@ -1470,7 +1470,7 @@ class CoinPrepWorker:
 
         try:
             from wallet import combine_coins
-            from wallet_sage import get_pending_transactions
+            from wallet import get_pending_transactions
         except Exception as e:
             self.log(f"XCH fee cleanup unavailable: {e}")
             return False
@@ -2010,10 +2010,10 @@ class CoinPrepWorker:
 
     def _get_fingerprint(self) -> str:
         """Get wallet fingerprint — tries RPC first (fast), then CLI (slow fallback)."""
-        # Sage: use get_current_key() from wallet_sage
+        # Sage: use the backend-neutral non-initializing key read.
         if self.is_sage:
             try:
-                from wallet_sage import get_current_key
+                from wallet import get_current_key
 
                 key = get_current_key()
                 if key and key.get("fingerprint"):
@@ -2360,10 +2360,8 @@ class CoinPrepWorker:
         """
         if self.is_sage:
             try:
-                from wallet_sage import (
-                    get_selectable_coins_only,
-                    get_spendable_coin_count,
-                )
+                from wallet import get_spendable_coin_count
+                from wallet_sage import get_selectable_coins_only
 
                 count = get_spendable_coin_count(wallet_id)
                 if count > 0:
@@ -3381,7 +3379,7 @@ class CoinPrepWorker:
         )
         try:
             from wallet import sage_login, wallet_mutation_succeeded
-            from wallet_sage import get_current_key
+            from wallet import get_current_key
 
             key = get_current_key() or {}
             fingerprint = key.get("fingerprint")
@@ -3907,8 +3905,6 @@ class CoinPrepWorker:
             send_cat_multi,
             split_coins_rpc,
             sage_topup_split,
-        )
-        from wallet_sage import (
             get_pending_transactions,
         )
 
@@ -8451,10 +8447,8 @@ class CoinPrepWorker:
                 self.log(
                     "\n⏳ Spendability gate: waiting for consolidated coins to become selectable..."
                 )
-                from wallet_sage import (
-                    get_pending_transactions,
-                    get_selectable_coins_only,
-                )
+                from wallet import get_pending_transactions
+                from wallet_sage import get_selectable_coins_only
 
                 gate_timeout = 120  # 2 minutes max
                 gate_poll = 5
@@ -8860,7 +8854,7 @@ def _safe_path_status(path: str) -> str:
 
 
 def _run_sage_rpc_smoke() -> int:
-    """Exercise the worker's Sage RPC path without touching funds."""
+    """Exercise only noninitializing Sage reads without touching wallet state."""
     try:
         import wallet_sage
 
@@ -8878,11 +8872,14 @@ def _run_sage_rpc_smoke() -> int:
             f"key={_safe_path_status(key_path)}"
         )
 
-        if not wallet_sage.ensure_initialized(force_retry=True):
-            print("[SAGE_RPC_SMOKE] initialize failed")
+        from wallet import get_current_key, rpc
+
+        version = rpc("get_version", {}, timeout=5)
+        if type(version) is not dict or not version.get("version"):
+            print("[SAGE_RPC_SMOKE] get_version failed")
             return 1
 
-        key = wallet_sage.get_current_key()
+        key = get_current_key()
         fingerprint = key.get("fingerprint") if isinstance(key, dict) else None
         if not fingerprint:
             print(f"[SAGE_RPC_SMOKE] get_key failed: {key!r}")

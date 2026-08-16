@@ -45,6 +45,7 @@ class _FlaskBase(unittest.TestCase):
                 return_value="coin-prep-unit-permit",
             ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+            patch("wallet.get_spendable_coin_count", return_value=0),
         ]
         for patcher in self._gate_patchers:
             patcher.start()
