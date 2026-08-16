@@ -5182,6 +5182,49 @@ class OfferManager:
         result["_catalyst_attempt"] = attempt
         return result
 
+    def _recover_persisted_cancel_cohorts(self) -> Dict[str, dict]:
+        """Close every discoverable manifest member that provably had no effect."""
+
+        recovered = {}
+        for manifest in database.get_unresolved_offer_cancel_cohort_manifests():
+            cohort_id = manifest["cohort_id"]
+            cohort_size = manifest["member_count"]
+            for member in manifest["members"]:
+                intent = self._canonical_cancel_intent(member["trade_id"])
+                if (
+                    intent.operation_id != member["operation_id"]
+                    or intent.intent_id != member["intent_id"]
+                ):
+                    raise ValueError("durable cancellation manifest identity changed")
+                context = self._recoverable_unclaimed_cohort_cancel(
+                    intent,
+                    attempt=member["attempt"],
+                    cohort_id=cohort_id,
+                    cohort_size=cohort_size,
+                    member_id=member["member_id"],
+                )
+                if context is None:
+                    result = self._existing_cancel_result(intent)
+                    if result is None:
+                        result = self._cancel_reconciliation_result(
+                            intent,
+                            idempotent_replay=True,
+                            effect_attempted=False,
+                            attempt=member["attempt"],
+                        )
+                else:
+                    result = self._finalize_unattempted_cohort_cancel(
+                        intent,
+                        attempt=member["attempt"],
+                        cohort_id=cohort_id,
+                        cohort_size=cohort_size,
+                        member_id=member["member_id"],
+                        context=context,
+                        reason_code="COHORT_RECOVERY_UNATTEMPTED",
+                    )
+                recovered[intent.trade_id] = result
+        return recovered
+
     def _abort_cancel_after_ambiguous_peer(
         self,
         *,
@@ -5770,6 +5813,7 @@ class OfferManager:
                     }
 
         canonical_intents = [self._canonical_cancel_intent(tid) for tid in trade_ids]
+        self._recover_persisted_cancel_cohorts()
         unique_intents = []
         seen_trade_ids = set()
         for intent in canonical_intents:
@@ -5868,34 +5912,54 @@ class OfferManager:
                 if existing_results[intent.trade_id] is None
                 or retry_eligible[intent.trade_id]
             ]
-            participating_trade_ids = sorted(
-                intent.trade_id for intent, _attempt in participating
-            )
-            cohort_id = (
-                "cancel-cohort:"
-                + hashlib.sha256(
-                    self._canonical_creation_json(participating_trade_ids).encode(
-                        "utf-8"
-                    )
-                ).hexdigest()
-            )
-            members = []
-            for intent, attempt in participating:
-                member_id = (
-                    "cancel-member:"
-                    + hashlib.sha256(
-                        self._canonical_creation_json(
-                            {
-                                "cohort_id": cohort_id,
-                                "operation_id": intent.operation_id,
-                                "attempt": attempt,
-                                "trade_id": intent.trade_id,
-                            }
-                        ).encode("utf-8")
-                    ).hexdigest()
+            manifest = None
+            if len(participating) > 1:
+                manifest = database.canonical_offer_cancel_cohort_manifest(
+                    [
+                        {
+                            "trade_id": intent.trade_id,
+                            "operation_id": intent.operation_id,
+                            "intent_id": intent.intent_id,
+                            "attempt": attempt,
+                            "prepared_event_id": (
+                                f"{intent.operation_id}:attempt:{attempt}:prepared"
+                            ),
+                        }
+                        for intent, attempt in participating
+                    ]
                 )
-                members.append((intent, attempt, member_id))
+                cohort_id = manifest["cohort_id"]
+                intents_by_trade_id = {
+                    intent.trade_id: intent for intent, _attempt in participating
+                }
+                members = [
+                    (
+                        intents_by_trade_id[member["trade_id"]],
+                        member["attempt"],
+                        member["member_id"],
+                    )
+                    for member in manifest["members"]
+                ]
+            else:
+                members = []
+                for intent, attempt in participating:
+                    member_id = (
+                        "cancel-member:"
+                        + hashlib.sha256(
+                            self._canonical_creation_json(
+                                {
+                                    "cohort_id": cohort_id,
+                                    "operation_id": intent.operation_id,
+                                    "attempt": attempt,
+                                    "trade_id": intent.trade_id,
+                                }
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
+                    members.append((intent, attempt, member_id))
             is_cohort = len(members) > 1
+        else:
+            manifest = None
 
         authorities = {}
         try:
@@ -5909,35 +5973,75 @@ class OfferManager:
                     )
 
             if is_cohort:
-                for intent, attempt, member_id in members:
-                    authority = authorities.get(intent.trade_id)
-                    if authority is None:
-                        continue
-                    _continuation, journal, _wallet_hash, _network = authority
-                    self._offer_cancel_crash_boundary("before_cohort_prepare", intent)
-                    try:
-                        self._prepare_cancel_member(
-                            intent,
-                            attempt=attempt,
-                            reason=reason,
-                            cohort_id=cohort_id,
-                            cohort_size=len(members),
-                            member_id=member_id,
-                            journal=journal,
-                            claim_effect=False,
+                if manifest is not None:
+                    requests = []
+                    for intent, attempt, member_id in members:
+                        self._offer_cancel_crash_boundary(
+                            "before_cohort_prepare", intent
                         )
-                    except (TypeError, ValueError):
-                        context = self._recoverable_unclaimed_cohort_cancel(
-                            intent,
-                            attempt=attempt,
-                            cohort_id=cohort_id,
-                            cohort_size=len(members),
-                            member_id=member_id,
+                        authority = authorities.get(intent.trade_id)
+                        if authority is None:
+                            raise ValueError(
+                                "cancellation cohort authority is incomplete"
+                            )
+                        _continuation, journal, _wallet_hash, _network = authority
+                        requests.append(
+                            {
+                                "operation_id": intent.operation_id,
+                                "event_id": (
+                                    f"{intent.operation_id}:attempt:{attempt}:prepared"
+                                ),
+                                "trade_id": intent.trade_id,
+                                "intent_id": intent.intent_id,
+                                "attempt": attempt,
+                                "wallet_identity_json": journal,
+                                "evidence_json": self._cancel_prepared_evidence(
+                                    intent,
+                                    attempt=attempt,
+                                    reason=reason,
+                                    cohort_id=cohort_id,
+                                    cohort_size=len(members),
+                                    member_id=member_id,
+                                    journal=journal,
+                                ),
+                            }
                         )
-                        if context is None:
-                            raise
-                        recoverable_contexts[intent.trade_id] = context
-                        recovering_interrupted_cohort = True
+                    database.prepare_offer_cancel_cohort(
+                        manifest_json=manifest,
+                        member_requests_json=requests,
+                    )
+                else:
+                    for intent, attempt, member_id in members:
+                        authority = authorities.get(intent.trade_id)
+                        if authority is None:
+                            continue
+                        _continuation, journal, _wallet_hash, _network = authority
+                        self._offer_cancel_crash_boundary(
+                            "before_cohort_prepare", intent
+                        )
+                        try:
+                            self._prepare_cancel_member(
+                                intent,
+                                attempt=attempt,
+                                reason=reason,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                                journal=journal,
+                                claim_effect=False,
+                            )
+                        except (TypeError, ValueError):
+                            context = self._recoverable_unclaimed_cohort_cancel(
+                                intent,
+                                attempt=attempt,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                            )
+                            if context is None:
+                                raise
+                            recoverable_contexts[intent.trade_id] = context
+                            recovering_interrupted_cohort = True
                 self._offer_cancel_crash_boundary(
                     "after_cohort_prepare",
                     members[0][0],

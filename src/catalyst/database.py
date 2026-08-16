@@ -678,6 +678,30 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
 END;
 
+-- One canonical durable description of every multi-member cancellation
+-- cohort.  The row and all referenced PREPARED journal events are inserted in
+-- the same transaction, so a stored manifest is always complete and
+-- discoverable without the original caller's list.
+CREATE TABLE IF NOT EXISTS offer_cancel_cohort_manifests (
+    manifest_sequence           INTEGER PRIMARY KEY AUTOINCREMENT,
+    cohort_id                   TEXT NOT NULL UNIQUE,
+    manifest_sha256             TEXT NOT NULL UNIQUE,
+    member_count                INTEGER NOT NULL
+        CHECK(member_count BETWEEN 2 AND 64),
+    manifest_json               TEXT NOT NULL,
+    created_at                  TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS offer_cancel_cohort_manifests_no_update
+BEFORE UPDATE ON offer_cancel_cohort_manifests
+BEGIN
+    SELECT RAISE(ABORT, 'offer_cancel_cohort_manifests is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_cancel_cohort_manifests_no_delete
+BEFORE DELETE ON offer_cancel_cohort_manifests
+BEGIN
+    SELECT RAISE(ABORT, 'offer_cancel_cohort_manifests is append-only');
+END;
+
 -- An append-only per-attempt marker written immediately before a cohort
 -- member may cross the wallet effect boundary.  Absence is meaningful only
 -- for PREPARED rows explicitly tagged with the durable cohort-claim protocol.
@@ -845,6 +869,14 @@ _STABILITY_REQUIRED_COLUMNS = {
         "evidence_sha256",
         "reason_code",
         "blocks_mutation",
+        "created_at",
+    },
+    "offer_cancel_cohort_manifests": {
+        "manifest_sequence",
+        "cohort_id",
+        "manifest_sha256",
+        "member_count",
+        "manifest_json",
         "created_at",
     },
     "offer_cancel_effect_claims": {
@@ -1179,6 +1211,8 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
     )
+    _require_unique_key(conn, "offer_cancel_cohort_manifests", ("cohort_id",))
+    _require_unique_key(conn, "offer_cancel_cohort_manifests", ("manifest_sha256",))
     _require_unique_key(conn, "offer_cancel_effect_claims", ("operation_id", "attempt"))
     _require_unique_key(conn, "offer_cancel_effect_claims", ("prepared_event_id",))
     _require_unique_key(conn, "runtime_worker_delegations", ("delegation_token_hash",))
@@ -7167,6 +7201,296 @@ def _canonical_cancel_identifiers(
     return trade_id
 
 
+_CANCEL_COHORT_MEMBER_LIMIT = 64
+
+
+def canonical_offer_cancel_cohort_manifest(members: Any) -> Dict[str, Any]:
+    """Build the one canonical ordered identity manifest for a cancel cohort."""
+
+    if (
+        type(members) is not list
+        or not 2 <= len(members) <= _CANCEL_COHORT_MEMBER_LIMIT
+    ):
+        raise ValueError("cancellation cohort must contain 2 to 64 exact members")
+    expected_keys = {
+        "trade_id",
+        "operation_id",
+        "intent_id",
+        "attempt",
+        "prepared_event_id",
+    }
+    canonical_members = []
+    for raw_member in members:
+        if type(raw_member) is not dict or set(raw_member) != expected_keys:
+            raise ValueError("cancellation cohort member fields are invalid")
+        trade_id = _canonical_cancel_identifiers(
+            operation_id=raw_member["operation_id"],
+            event_id=raw_member["prepared_event_id"],
+            trade_id=raw_member["trade_id"],
+            attempt=raw_member["attempt"],
+            phase="PREPARED",
+        )
+        intent_id = _required_stability_text(raw_member["intent_id"], "intent_id")
+        if intent_id != f"cancel-target:{trade_id}":
+            raise ValueError("cancellation cohort intent identity is invalid")
+        canonical_members.append(
+            {
+                "trade_id": trade_id,
+                "operation_id": raw_member["operation_id"],
+                "intent_id": intent_id,
+                "attempt": _exact_integer(raw_member["attempt"], "attempt", minimum=1),
+                "prepared_event_id": raw_member["prepared_event_id"],
+            }
+        )
+    canonical_members.sort(
+        key=lambda member: (
+            member["trade_id"],
+            member["attempt"],
+            member["operation_id"],
+        )
+    )
+    if len({member["trade_id"] for member in canonical_members}) != len(
+        canonical_members
+    ):
+        raise ValueError("cancellation cohort members must be unique")
+    cohort_source = {
+        "schema_version": 1,
+        "members": canonical_members,
+    }
+    cohort_source_json = json.dumps(
+        cohort_source,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cohort_id = (
+        "cancel-cohort:"
+        + hashlib.sha256(cohort_source_json.encode("utf-8")).hexdigest()
+    )
+    manifested_members = []
+    for position, member in enumerate(canonical_members):
+        member_source = {
+            "attempt": member["attempt"],
+            "cohort_id": cohort_id,
+            "operation_id": member["operation_id"],
+            "trade_id": member["trade_id"],
+        }
+        member_id = (
+            "cancel-member:"
+            + hashlib.sha256(
+                json.dumps(
+                    member_source,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        manifested_members.append(
+            {
+                "position": position,
+                **member,
+                "member_id": member_id,
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "cohort_id": cohort_id,
+        "member_count": len(manifested_members),
+        "members": manifested_members,
+    }
+    manifest_json = json.dumps(
+        manifest,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        **manifest,
+        "manifest_sha256": hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
+    }
+
+
+def validate_offer_cancel_cohort_manifest(value: Any) -> Dict[str, Any]:
+    """Validate and detach one exact canonical cancellation cohort manifest."""
+
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "cohort_id",
+        "manifest_sha256",
+        "member_count",
+        "members",
+    }:
+        raise ValueError("cancellation cohort manifest fields are invalid")
+    if type(value["members"]) is not list:
+        raise ValueError("cancellation cohort manifest members are invalid")
+    core_members = []
+    expected_member_keys = {
+        "position",
+        "trade_id",
+        "operation_id",
+        "intent_id",
+        "attempt",
+        "prepared_event_id",
+        "member_id",
+    }
+    for member in value["members"]:
+        if type(member) is not dict or set(member) != expected_member_keys:
+            raise ValueError("cancellation cohort manifest member fields are invalid")
+        core_members.append(
+            {
+                "trade_id": member["trade_id"],
+                "operation_id": member["operation_id"],
+                "intent_id": member["intent_id"],
+                "attempt": member["attempt"],
+                "prepared_event_id": member["prepared_event_id"],
+            }
+        )
+    canonical = canonical_offer_cancel_cohort_manifest(core_members)
+    if value != canonical:
+        raise ValueError("cancellation cohort manifest is not canonical")
+    return json.loads(
+        json.dumps(canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _validated_offer_cancel_cohort_manifest_row(row: Any) -> Dict[str, Any]:
+    if type(row) is not dict or set(row) != {
+        "manifest_sequence",
+        "cohort_id",
+        "manifest_sha256",
+        "member_count",
+        "manifest_json",
+        "created_at",
+    }:
+        raise ValueError("cancellation cohort manifest row fields are invalid")
+    _exact_integer(row["manifest_sequence"], "manifest_sequence", minimum=1)
+    manifest_text = _canonical_json_text(
+        row["manifest_json"],
+        "manifest_json",
+        expected_type=dict,
+        max_bytes=262144,
+    )
+    manifest = validate_offer_cancel_cohort_manifest(json.loads(manifest_text))
+    if (
+        row["cohort_id"] != manifest["cohort_id"]
+        or row["manifest_sha256"] != manifest["manifest_sha256"]
+        or row["member_count"] != manifest["member_count"]
+    ):
+        raise ValueError("cancellation cohort manifest row is not exact")
+    _stability_timestamp(row["created_at"], "created_at")
+    return manifest
+
+
+def _prepare_offer_cancel_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str,
+    event_id: str,
+    safe_trade_id: str,
+    intent_id: Optional[str],
+    safe_attempt: int,
+    wallet_identity_json: Dict[str, Any],
+    evidence: Dict[str, Any],
+    prepared: str,
+) -> tuple[Dict[str, Any], bool]:
+    legacy_offer = conn.execute(
+        "SELECT status, lifecycle_state FROM offers WHERE trade_id=?",
+        (safe_trade_id,),
+    ).fetchone()
+    if legacy_offer is not None and legacy_offer["status"] != "open":
+        raise ValueError("only an open legacy offer may be cancelled")
+    existing = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    prior_lifecycle_state = None
+    if existing is None:
+        prior_rows = conn.execute(
+            """
+            SELECT * FROM offer_operation_journal
+            WHERE operation_id=? ORDER BY sequence
+            """,
+            (operation_id,),
+        ).fetchall()
+        prior_events = [validate_offer_operation_event(dict(row)) for row in prior_rows]
+        if safe_attempt == 1:
+            if prior_events:
+                raise ValueError("cancellation attempt must follow exact prior failed")
+        else:
+            expected_count = (safe_attempt - 1) * 2
+            if len(prior_events) != expected_count:
+                raise ValueError("cancellation attempt must follow exact prior failed")
+            for prior_attempt in range(1, safe_attempt):
+                prepared_prior, finalized_prior = prior_events[
+                    (prior_attempt - 1) * 2 : prior_attempt * 2
+                ]
+                if (
+                    prepared_prior["attempt"] != prior_attempt
+                    or prepared_prior["phase"] != "PREPARED"
+                    or prepared_prior["outcome"] != "PREPARED"
+                    or finalized_prior["attempt"] != prior_attempt
+                    or finalized_prior["phase"] != "FINALIZED"
+                    or finalized_prior["outcome"] != "CANCEL_FAILED"
+                    or finalized_prior["blocks_mutation"] != 0
+                ):
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+        if legacy_offer is not None:
+            prior_lifecycle_state = str(
+                legacy_offer["lifecycle_state"] or "open"
+            ).strip()
+            if (
+                not prior_lifecycle_state
+                or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+            ):
+                raise ValueError("cancellation requires an actionable open lifecycle")
+    else:
+        existing_event = validate_offer_operation_event(dict(existing))
+        existing_evidence = json.loads(existing_event["evidence_json"])
+        prior_lifecycle_state = existing_evidence.get("prior_lifecycle_state")
+    stored_evidence = dict(evidence)
+    if prior_lifecycle_state is not None:
+        stored_evidence["prior_lifecycle_state"] = prior_lifecycle_state
+    safe_evidence_json = _canonical_json_text(
+        stored_evidence,
+        "evidence_json",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    journal = _journal_values(
+        event_id=event_id,
+        operation_id=operation_id,
+        intent_id=intent_id,
+        operation_type="CANCEL",
+        attempt=safe_attempt,
+        phase="PREPARED",
+        outcome="PREPARED",
+        request_timestamp=prepared,
+        wallet_identity_json=wallet_identity_json,
+        transaction_id=None,
+        spend_identity=None,
+        evidence_json=safe_evidence_json,
+        evidence_sha256=None,
+        reason_code="CANCEL_PREPARED",
+        blocks_mutation=True,
+        created_at=prepared,
+    )
+    row = _insert_offer_operation_event(conn, journal)
+    inserted = existing is None
+    if inserted and legacy_offer is not None:
+        conn.execute(
+            """
+            UPDATE offers
+            SET lifecycle_state='cancel_requested', cancel_last_attempt_at=?
+            WHERE trade_id=? AND status='open'
+            """,
+            (prepared, safe_trade_id),
+        )
+    return row, inserted
+
+
 def prepare_offer_cancel(
     *,
     operation_id: str,
@@ -7208,107 +7532,17 @@ def prepare_offer_cancel(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        legacy_offer = conn.execute(
-            "SELECT status, lifecycle_state FROM offers WHERE trade_id=?",
-            (safe_trade_id,),
-        ).fetchone()
-        if legacy_offer is not None and legacy_offer["status"] != "open":
-            raise ValueError("only an open legacy offer may be cancelled")
-        existing = conn.execute(
-            "SELECT * FROM offer_operation_journal WHERE event_id=?",
-            (event_id,),
-        ).fetchone()
-        prior_lifecycle_state = None
-        if existing is None:
-            prior_rows = conn.execute(
-                """
-                SELECT * FROM offer_operation_journal
-                WHERE operation_id=? ORDER BY sequence
-                """,
-                (operation_id,),
-            ).fetchall()
-            prior_events = [
-                validate_offer_operation_event(dict(row)) for row in prior_rows
-            ]
-            if safe_attempt == 1:
-                if prior_events:
-                    raise ValueError(
-                        "cancellation attempt must follow exact prior failed"
-                    )
-            else:
-                expected_count = (safe_attempt - 1) * 2
-                if len(prior_events) != expected_count:
-                    raise ValueError(
-                        "cancellation attempt must follow exact prior failed"
-                    )
-                for prior_attempt in range(1, safe_attempt):
-                    prepared_prior, finalized_prior = prior_events[
-                        (prior_attempt - 1) * 2 : prior_attempt * 2
-                    ]
-                    if (
-                        prepared_prior["attempt"] != prior_attempt
-                        or prepared_prior["phase"] != "PREPARED"
-                        or prepared_prior["outcome"] != "PREPARED"
-                        or finalized_prior["attempt"] != prior_attempt
-                        or finalized_prior["phase"] != "FINALIZED"
-                        or finalized_prior["outcome"] != "CANCEL_FAILED"
-                        or finalized_prior["blocks_mutation"] != 0
-                    ):
-                        raise ValueError(
-                            "cancellation attempt must follow exact prior failed"
-                        )
-            if legacy_offer is not None:
-                prior_lifecycle_state = str(
-                    legacy_offer["lifecycle_state"] or "open"
-                ).strip()
-                if (
-                    not prior_lifecycle_state
-                    or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
-                ):
-                    raise ValueError(
-                        "cancellation requires an actionable open lifecycle"
-                    )
-        else:
-            existing_event = validate_offer_operation_event(dict(existing))
-            existing_evidence = json.loads(existing_event["evidence_json"])
-            prior_lifecycle_state = existing_evidence.get("prior_lifecycle_state")
-        if prior_lifecycle_state is not None:
-            evidence["prior_lifecycle_state"] = prior_lifecycle_state
-        safe_evidence_json = _canonical_json_text(
-            evidence,
-            "evidence_json",
-            expected_type=dict,
-            max_bytes=65536,
-        )
-        journal = _journal_values(
+        row, effect_claimed = _prepare_offer_cancel_in_transaction(
+            conn,
             event_id=event_id,
             operation_id=operation_id,
             intent_id=intent_id,
-            operation_type="CANCEL",
-            attempt=safe_attempt,
-            phase="PREPARED",
-            outcome="PREPARED",
-            request_timestamp=prepared,
+            safe_trade_id=safe_trade_id,
+            safe_attempt=safe_attempt,
             wallet_identity_json=wallet_identity_json,
-            transaction_id=None,
-            spend_identity=None,
-            evidence_json=safe_evidence_json,
-            evidence_sha256=None,
-            reason_code="CANCEL_PREPARED",
-            blocks_mutation=True,
-            created_at=prepared,
+            evidence=evidence,
+            prepared=prepared,
         )
-        row = _insert_offer_operation_event(conn, journal)
-        effect_claimed = existing is None
-        if effect_claimed and legacy_offer is not None:
-            conn.execute(
-                """
-                UPDATE offers
-                SET lifecycle_state='cancel_requested', cancel_last_attempt_at=?
-                WHERE trade_id=? AND status='open'
-                """,
-                (prepared, safe_trade_id),
-            )
         conn.commit()
         if claim_effect:
             return {
@@ -7321,6 +7555,260 @@ def prepare_offer_cancel(
         raise
     finally:
         conn.close()
+
+
+def prepare_offer_cancel_cohort(
+    *,
+    manifest_json: Any,
+    member_requests_json: Any,
+    prepared_at: Any = None,
+) -> Dict[str, Any]:
+    """Atomically persist a complete manifest and every PREPARED member."""
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    if (
+        type(member_requests_json) is not list
+        or len(member_requests_json) != manifest["member_count"]
+    ):
+        raise ValueError("cancellation cohort requests do not match the manifest")
+    request_keys = {
+        "operation_id",
+        "event_id",
+        "trade_id",
+        "intent_id",
+        "attempt",
+        "wallet_identity_json",
+        "evidence_json",
+    }
+    requests = []
+    for member, request in zip(manifest["members"], member_requests_json):
+        if type(request) is not dict or set(request) != request_keys:
+            raise ValueError("cancellation cohort request fields are invalid")
+        if type(request["wallet_identity_json"]) is not dict:
+            raise ValueError("wallet_identity_json must be an exact dictionary")
+        if type(request["evidence_json"]) is not dict:
+            raise ValueError("evidence_json must be an exact dictionary")
+        trade_id = _canonical_cancel_identifiers(
+            operation_id=request["operation_id"],
+            event_id=request["event_id"],
+            trade_id=request["trade_id"],
+            attempt=request["attempt"],
+            phase="PREPARED",
+        )
+        identity = {
+            "operation_id": request["operation_id"],
+            "prepared_event_id": request["event_id"],
+            "trade_id": trade_id,
+            "intent_id": request["intent_id"],
+            "attempt": request["attempt"],
+        }
+        if any(identity[key] != member[key] for key in identity):
+            raise ValueError("cancellation cohort request is not manifest-bound")
+        evidence = dict(request["evidence_json"])
+        if "prior_lifecycle_state" in evidence:
+            raise ValueError("prior_lifecycle_state is repository-derived")
+        if (
+            evidence.get("trade_id") != trade_id
+            or evidence.get("cohort_id") != manifest["cohort_id"]
+            or evidence.get("cohort_size") != manifest["member_count"]
+            or evidence.get("member_id") != member["member_id"]
+            or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
+        ):
+            raise ValueError("cancellation cohort evidence is not manifest-bound")
+        requests.append((member, request, evidence))
+    prepared = _stability_timestamp_or_now(prepared_at, "prepared_at")
+    manifest_text = _canonical_json_text(
+        manifest,
+        "manifest_json",
+        expected_type=dict,
+        max_bytes=262144,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+                   manifest_json, created_at
+            FROM offer_cancel_cohort_manifests WHERE cohort_id=?
+            """,
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO offer_cancel_cohort_manifests (
+                    cohort_id, manifest_sha256, member_count, manifest_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    manifest["cohort_id"],
+                    manifest["manifest_sha256"],
+                    manifest["member_count"],
+                    manifest_text,
+                    prepared,
+                ),
+            )
+            event_prepared = prepared
+        else:
+            if _validated_offer_cancel_cohort_manifest_row(dict(existing)) != manifest:
+                raise ValueError("cancellation cohort manifest replay is not exact")
+            event_prepared = _stability_timestamp(existing["created_at"], "created_at")
+        events = []
+        inserted_members = []
+        for member, request, evidence in requests:
+            event, inserted = _prepare_offer_cancel_in_transaction(
+                conn,
+                operation_id=member["operation_id"],
+                event_id=member["prepared_event_id"],
+                safe_trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                safe_attempt=member["attempt"],
+                wallet_identity_json=request["wallet_identity_json"],
+                evidence=evidence,
+                prepared=event_prepared,
+            )
+            events.append(event)
+            inserted_members.append(inserted)
+        if any(inserted_members) and not all(inserted_members):
+            raise ValueError("cancellation cohort replay is incomplete")
+        conn.commit()
+        return {
+            "manifest": manifest,
+            "events": events,
+            "inserted": all(inserted_members),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_offer_cancel_cohort_manifest(cohort_id: str) -> Optional[Dict[str, Any]]:
+    """Return one exact detached durable cohort manifest, if present."""
+
+    safe_cohort_id = _required_stability_text(cohort_id, "cohort_id")
+    row = (
+        get_connection()
+        .execute(
+            """
+            SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+                   manifest_json, created_at
+            FROM offer_cancel_cohort_manifests WHERE cohort_id=?
+            """,
+            (safe_cohort_id,),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    return _validated_offer_cancel_cohort_manifest_row(dict(row))
+
+
+def validate_offer_cancel_cohort_prepared_event(
+    event: Any,
+    manifest: Any,
+) -> Dict[str, Any]:
+    """Cross-bind one PREPARED event to its exact durable manifest member."""
+
+    safe_manifest = validate_offer_cancel_cohort_manifest(manifest)
+    safe_event = validate_offer_operation_event(event)
+    matching = [
+        member
+        for member in safe_manifest["members"]
+        if member["operation_id"] == safe_event["operation_id"]
+        and member["attempt"] == safe_event["attempt"]
+    ]
+    if len(matching) != 1:
+        raise ValueError("cancellation PREPARED event is not a manifest member")
+    member = matching[0]
+    evidence = json.loads(safe_event["evidence_json"])
+    required_keys = {
+        "trade_id",
+        "intent_id",
+        "operation_id",
+        "attempt",
+        "cohort_id",
+        "cohort_size",
+        "member_id",
+        "reason",
+        "continuation_journal_sha256",
+        "wallet_effect",
+        "effect_claim_protocol",
+    }
+    if type(evidence) is not dict or frozenset(evidence) not in {
+        frozenset(required_keys),
+        frozenset(required_keys | {"prior_lifecycle_state"}),
+    }:
+        raise ValueError("cancellation PREPARED manifest evidence is invalid")
+    if (
+        safe_event["event_id"] != member["prepared_event_id"]
+        or safe_event["intent_id"] != member["intent_id"]
+        or safe_event["operation_type"] != "CANCEL"
+        or safe_event["phase"] != "PREPARED"
+        or safe_event["outcome"] != "PREPARED"
+        or safe_event["transaction_id"] is not None
+        or safe_event["spend_identity"] is not None
+        or safe_event["reason_code"] != "CANCEL_PREPARED"
+        or safe_event["blocks_mutation"] != 1
+        or safe_event["request_timestamp"] != safe_event["created_at"]
+        or evidence["trade_id"] != member["trade_id"]
+        or evidence["intent_id"] != member["intent_id"]
+        or evidence["operation_id"] != member["operation_id"]
+        or evidence["attempt"] != member["attempt"]
+        or evidence["cohort_id"] != safe_manifest["cohort_id"]
+        or evidence["cohort_size"] != safe_manifest["member_count"]
+        or evidence["member_id"] != member["member_id"]
+        or evidence["effect_claim_protocol"] != "durable_cohort_claim_v1"
+    ):
+        raise ValueError("cancellation PREPARED event is not manifest-bound")
+    return safe_event
+
+
+def get_unresolved_offer_cancel_cohort_manifests() -> List[Dict[str, Any]]:
+    """Return complete manifests with at least one PREPARED-only member."""
+
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+               manifest_json, created_at
+        FROM offer_cancel_cohort_manifests ORDER BY manifest_sequence
+        """
+    ).fetchall()
+    unresolved = []
+    for row in rows:
+        manifest = _validated_offer_cancel_cohort_manifest_row(dict(row))
+        has_unresolved = False
+        for member in manifest["members"]:
+            prepared = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            if prepared is None:
+                raise ValueError("durable cancellation manifest is incomplete")
+            validate_offer_cancel_cohort_prepared_event(dict(prepared), manifest)
+            finalized = conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? AND attempt=? AND phase='FINALIZED'
+                """,
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            if finalized is None:
+                has_unresolved = True
+            else:
+                final_event = validate_offer_operation_event(dict(finalized))
+                if (
+                    final_event["operation_id"] != member["operation_id"]
+                    or final_event["attempt"] != member["attempt"]
+                    or final_event["phase"] != "FINALIZED"
+                ):
+                    raise ValueError("durable cancellation manifest final is invalid")
+        if has_unresolved:
+            unresolved.append(manifest)
+    return unresolved
 
 
 def _validated_offer_cancel_effect_claim(row: Any) -> Dict[str, Any]:

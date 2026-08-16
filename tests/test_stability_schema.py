@@ -20,6 +20,7 @@ import database
 STABILITY_TABLES = {
     "offer_intents",
     "offer_operation_journal",
+    "offer_cancel_cohort_manifests",
     "offer_cancel_effect_claims",
     "runtime_safety_latch",
     "runtime_mutation_lease",
@@ -1115,6 +1116,86 @@ def test_cancel_effect_claim_schema_is_unique_validated_and_append_only(
             (operation_id,),
         )
     conn.rollback()
+
+
+def test_cancel_cohort_manifest_schema_is_unique_and_append_only(
+    isolated_database,
+):
+    database.init_database()
+    conn = database.get_connection()
+    manifest = {
+        "schema_version": 1,
+        "cohort_id": "cancel-cohort:" + "a" * 64,
+        "member_count": 2,
+        "members": [],
+    }
+    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest_sha256 = hashlib.sha256(manifest_json.encode()).hexdigest()
+    conn.execute(
+        """
+        INSERT INTO offer_cancel_cohort_manifests (
+            cohort_id, manifest_sha256, member_count, manifest_json, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            manifest["cohort_id"],
+            manifest_sha256,
+            manifest["member_count"],
+            manifest_json,
+            AT,
+        ),
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO offer_cancel_cohort_manifests (
+                cohort_id, manifest_sha256, member_count, manifest_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (manifest["cohort_id"], _sha("other"), 2, "{}", LATER),
+        )
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE offer_cancel_cohort_manifests SET created_at=? WHERE cohort_id=?",
+            (LATER, manifest["cohort_id"]),
+        )
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "DELETE FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        )
+    conn.rollback()
+
+
+def test_cancel_cohort_manifest_migration_rejects_malformed_existing_table(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TABLE offer_cancel_cohort_manifests")
+        conn.execute(
+            """
+            CREATE TABLE offer_cancel_cohort_manifests (
+                manifest_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                cohort_id TEXT NOT NULL UNIQUE,
+                manifest_sha256 TEXT NOT NULL UNIQUE,
+                member_count INTEGER NOT NULL,
+                manifest_json TEXT NOT NULL
+            )
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(
+        RuntimeError,
+        match="offer_cancel_cohort_manifests.*missing required columns.*created_at",
+    ):
+        database.init_database()
 
 
 def test_cancel_effect_claim_migration_rejects_malformed_existing_table(

@@ -5,14 +5,35 @@ Covers: _bps_to_pct (pure), BoostManager._find_stale_offers
 No offer creation, network calls, or database access.
 """
 
+import socket
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
+
+_SOCKET_ATTEMPTS = []
+
+
+def _blocked_socket(*args, **kwargs):
+    _SOCKET_ATTEMPTS.append((args, kwargs))
+    raise AssertionError("network access is forbidden in boost manager tests")
+
+
+socket.socket.connect = _blocked_socket
+socket.socket.connect_ex = _blocked_socket
+socket.create_connection = _blocked_socket
+
 try:
     import boost_manager as _bm_mod
     from boost_manager import _bps_to_pct, BoostManager
+    from cancel_outcomes import (
+        CANCEL_CONFIRMED,
+        CANCEL_FAILED,
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_UNKNOWN,
+        cancellation_result,
+    )
 
     _SKIP = None
 except ModuleNotFoundError as exc:
@@ -29,6 +50,37 @@ class _FakeOfferManager:
             tid: {"price": price} for tid, price in (prices or {}).items()
         }
         self._cycle_used_coin_ids = set()
+
+
+def _cancel_result(outcome):
+    transaction_id = "a" * 64 if outcome == CANCEL_SUBMITTED_UNCONFIRMED else ""
+    return cancellation_result(
+        outcome,
+        method="boost_manager_test",
+        raw_response={"outcome": outcome},
+        transaction_id=transaction_id,
+        error="REJECTED" if outcome == CANCEL_FAILED else None,
+    )
+
+
+class _ReplacementOfferManager:
+    def __init__(self, cancel_result=None):
+        self._bot_cancelled_ids = set()
+        self._cycle_used_coin_ids = set()
+        self._offer_details_cache = {}
+        self.cancel_calls = []
+        self.create_calls = []
+        self.cancel_result = cancel_result or _cancel_result(CANCEL_FAILED)
+
+    def cancel_offers(self, trade_ids, **kwargs):
+        trade_ids = list(trade_ids)
+        self.cancel_calls.append((trade_ids, kwargs))
+        return {trade_id: self.cancel_result for trade_id in trade_ids}
+
+    def create_ladder(self, *args, **kwargs):
+        self.create_calls.append((args, kwargs))
+        side = args[1]
+        return [{"trade_id": f"{side}-new", "offer_bech32": f"offer-{side}"}]
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +403,341 @@ class TestFlexibleProbeSize(unittest.TestCase):
 
 
 @unittest.skipIf(_SKIP is not None, _SKIP_MSG)
+class TestReplacementCancellationBoundary(unittest.TestCase):
+    def _step_manager(self, side, cancel_result=None):
+        offer_manager = _ReplacementOfferManager(cancel_result)
+        manager = BoostManager(offer_manager=offer_manager)
+        manager._boost_active = True
+        manager._boost_mid_price = Decimal("0.0001")
+        manager._buy_offset_bps = 80
+        manager._sell_offset_bps = 80
+        manager._buy_probe_tid = "buy-old"
+        manager._sell_probe_tid = "sell-old"
+        manager._active_boost_ids = ["buy-old", "sell-old"]
+        manager._next_step_is_buy = side == "buy"
+        manager._stable_since = 1
+        manager._last_step_time = 1
+        return manager, offer_manager
+
+    def _step_cfg(self):
+        return SimpleNamespace(
+            ENABLE_BUY=True,
+            ENABLE_SELL=True,
+            GAP_CLOSE_STEP_COOLDOWN_SECS=60,
+            GAP_PROBE_MAX_PAST_FEE_BPS=500,
+            GAP_PROBE_STEP_BPS=30,
+            TIBETSWAP_FEE_BPS=70,
+        )
+
+    def test_buy_step_failed_cancel_retains_old_probe_and_creates_nothing(self):
+        manager, offer_manager = self._step_manager("buy")
+        with (
+            patch.object(_bm_mod, "cfg", self._step_cfg()),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+            patch.object(_bm_mod.time, "sleep"),
+            patch.object(manager, "_create_single_offer") as create,
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager.step_tighter(Decimal("0"))
+
+        self.assertFalse(acted)
+        self.assertEqual(manager._buy_offset_bps, 80)
+        self.assertEqual(manager._buy_probe_tid, "buy-old")
+        self.assertIn("buy-old", manager._active_boost_ids)
+        create.assert_not_called()
+        self.assertEqual(len(offer_manager.cancel_calls), 1)
+
+    def test_sell_step_failed_cancel_retains_old_probe_and_creates_nothing(self):
+        manager, offer_manager = self._step_manager("sell")
+        with (
+            patch.object(_bm_mod, "cfg", self._step_cfg()),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+            patch.object(_bm_mod.time, "sleep"),
+            patch.object(manager, "_create_single_offer") as create,
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager.step_tighter(Decimal("0"))
+
+        self.assertFalse(acted)
+        self.assertEqual(manager._sell_offset_bps, 80)
+        self.assertEqual(manager._sell_probe_tid, "sell-old")
+        self.assertIn("sell-old", manager._active_boost_ids)
+        create.assert_not_called()
+        self.assertEqual(len(offer_manager.cancel_calls), 1)
+
+    def test_buy_step_submitted_unknown_and_malformed_results_all_block(self):
+        blocked_results = (
+            _cancel_result(CANCEL_SUBMITTED_UNCONFIRMED),
+            _cancel_result(CANCEL_UNKNOWN),
+            {"success": True},
+        )
+        for cancel_result in blocked_results:
+            with self.subTest(cancel_result=cancel_result):
+                manager, _offer_manager = self._step_manager("buy", cancel_result)
+                with (
+                    patch.object(_bm_mod, "cfg", self._step_cfg()),
+                    patch.object(_bm_mod.time, "time", return_value=1000),
+                    patch.object(_bm_mod.time, "sleep"),
+                    patch.object(manager, "_create_single_offer") as create,
+                    patch.object(_bm_mod, "log_event"),
+                ):
+                    acted = manager.step_tighter(Decimal("0"))
+
+                self.assertFalse(acted)
+                self.assertEqual(manager._buy_probe_tid, "buy-old")
+                self.assertIn("buy-old", manager._active_boost_ids)
+                create.assert_not_called()
+
+    def test_buy_step_exact_confirmed_result_releases_one_slot_then_creates(self):
+        manager, _offer_manager = self._step_manager(
+            "buy", _cancel_result(CANCEL_CONFIRMED)
+        )
+        new_offer = {"trade_id": "buy-new", "offer_bech32": "offer-buy-new"}
+        config = self._step_cfg()
+        config.DEXIE_AUTO_POST = False
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+            patch.object(_bm_mod.time, "sleep"),
+            patch.object(manager, "_create_single_offer", return_value=new_offer),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager.step_tighter(Decimal("0"))
+
+        self.assertTrue(acted)
+        self.assertEqual(manager._buy_probe_tid, "buy-new")
+        self.assertNotIn("buy-old", manager._active_boost_ids)
+        self.assertIn("buy-new", manager._active_boost_ids)
+
+    def test_legacy_subprobe_failed_cancel_retains_pair_and_spread(self):
+        offer_manager = _ReplacementOfferManager()
+        manager = BoostManager(offer_manager=offer_manager)
+        manager._boost_active = True
+        manager._boost_mid_price = Decimal("0.0001")
+        manager._gap_spread_bps = 100
+        manager._active_boost_ids = ["buy-old", "sell-old"]
+        manager._stable_since = 1
+        manager._last_step_time = 1
+        config = SimpleNamespace(
+            GAP_CLOSE_BELOW_FLOOR_MULT=0.25,
+            GAP_CLOSE_SAFETY_BUFFER_BPS=20,
+            GAP_CLOSE_STEP_COOLDOWN_SECS=60,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+            patch.object(manager, "_create_gap_closer_pair") as create,
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager._legacy_step_tighter(Decimal("100"))
+
+        self.assertFalse(acted)
+        self.assertEqual(manager._gap_spread_bps, 100)
+        self.assertEqual(manager._active_boost_ids, ["buy-old", "sell-old"])
+        create.assert_not_called()
+
+    def test_legacy_step_failed_cancel_retains_pair_and_spread(self):
+        offer_manager = _ReplacementOfferManager()
+        manager = BoostManager(offer_manager=offer_manager)
+        manager._boost_active = True
+        manager._boost_mid_price = Decimal("0.0001")
+        manager._gap_spread_bps = 200
+        manager._active_boost_ids = ["buy-old", "sell-old"]
+        manager._stable_since = 1
+        manager._last_step_time = 1
+        config = SimpleNamespace(
+            GAP_CLOSE_SAFETY_BUFFER_BPS=20,
+            GAP_CLOSE_STEP_COOLDOWN_SECS=60,
+            GAP_CLOSE_STEP_PCT=10,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(_bm_mod.time, "time", return_value=1000),
+            patch.object(manager, "_create_gap_closer_pair") as create,
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager._legacy_step_tighter(Decimal("0"))
+
+        self.assertFalse(acted)
+        self.assertEqual(manager._gap_spread_bps, 200)
+        self.assertEqual(manager._active_boost_ids, ["buy-old", "sell-old"])
+        create.assert_not_called()
+
+    def test_refresh_failed_cancel_retains_old_pair_and_creates_nothing(self):
+        offer_manager = _ReplacementOfferManager()
+        manager = BoostManager(offer_manager=offer_manager)
+        manager._boost_active = True
+        manager._boost_mid_price = Decimal("0.0001")
+        manager._gap_spread_bps = 100
+        manager._buy_probe_tid = "buy-old"
+        manager._sell_probe_tid = "sell-old"
+        manager._active_boost_ids = ["buy-old", "sell-old"]
+        config = SimpleNamespace()
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(_bm_mod.time, "sleep"),
+            patch.object(manager, "_create_inverted_probe_pair") as create,
+            patch.object(_bm_mod, "log_event"),
+        ):
+            acted = manager.refresh_if_needed(Decimal("0.0002"))
+
+        self.assertFalse(acted)
+        self.assertEqual(manager._active_boost_ids, ["buy-old", "sell-old"])
+        self.assertEqual(manager._buy_probe_tid, "buy-old")
+        self.assertEqual(manager._sell_probe_tid, "sell-old")
+        create.assert_not_called()
+
+    def test_handoff_failed_cancel_creates_and_posts_nothing(self):
+        offer_manager = _ReplacementOfferManager()
+        offer_manager._offer_details_cache["buy-old"] = {"price": "0.00008"}
+        dexie = SimpleNamespace(queue_post=unittest.mock.Mock())
+        manager = BoostManager(
+            offer_manager=offer_manager,
+            dexie_manager=dexie,
+            risk_manager=object(),
+        )
+        manager._boost_mid_price = Decimal("0.0001")
+        manager._gap_spread_bps = 100
+        config = SimpleNamespace(
+            CAT_ASSET_ID="asset",
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=True,
+            ENABLE_BUY=True,
+            ENABLE_SELL=False,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(
+                _bm_mod,
+                "db_get_open_offers",
+                return_value=[{"trade_id": "buy-old", "tier": "inner"}],
+            ),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            manager._handoff_to_inner_tier()
+
+        self.assertEqual(len(offer_manager.cancel_calls), 1)
+        self.assertEqual(offer_manager.create_calls, [])
+        dexie.queue_post.assert_not_called()
+
+    def test_inverted_cascade_failed_cancel_creates_and_posts_nothing(self):
+        offer_manager = _ReplacementOfferManager()
+        dexie = SimpleNamespace(queue_post=unittest.mock.Mock())
+        splash = SimpleNamespace(queue_post=unittest.mock.Mock())
+        manager = BoostManager(
+            offer_manager=offer_manager,
+            dexie_manager=dexie,
+            risk_manager=object(),
+            splash_manager=splash,
+        )
+        manager._boost_mid_price = Decimal("0.0001")
+        config = SimpleNamespace(
+            CAT_ASSET_ID="asset",
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=True,
+            ENABLE_BUY=True,
+            ENABLE_SELL=False,
+            GAP_PROBE_CASCADE_COUNT_PER_SIDE=1,
+            GAP_PROBE_CASCADE_HALF_SPREAD_BPS=50,
+            SPLASH_ENABLED=True,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch(
+                "database.get_open_offers",
+                return_value=[
+                    {"trade_id": "buy-old", "tier": "inner", "price": "0.00008"}
+                ],
+            ),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            manager._cascade_after_inverted_floor()
+
+        self.assertEqual(len(offer_manager.cancel_calls), 1)
+        self.assertEqual(offer_manager.create_calls, [])
+        dexie.queue_post.assert_not_called()
+        splash.queue_post.assert_not_called()
+
+    def test_main_book_cascade_failed_cancel_creates_and_posts_nothing(self):
+        offer_manager = _ReplacementOfferManager()
+        risk_manager = SimpleNamespace(
+            get_adjusted_spread=lambda _side: Decimal("0.01")
+        )
+        dexie = SimpleNamespace(queue_post=unittest.mock.Mock())
+        manager = BoostManager(
+            offer_manager=offer_manager,
+            dexie_manager=dexie,
+            risk_manager=risk_manager,
+        )
+        manager._boost_active = True
+        manager._gap_spread_bps = 100
+        stale = {"trade_id": "buy-old", "price": "0.00008"}
+        config = SimpleNamespace(
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=True,
+            ENABLE_BUY=True,
+            ENABLE_SELL=False,
+            GAP_CLOSE_CASCADE_BATCH_SIZE=1,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(manager, "_find_stale_offers", return_value=[stale]),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            result = manager.cascade_main_book(Decimal("0.0001"), [stale], [])
+
+        self.assertFalse(result["success"])
+        self.assertEqual(len(offer_manager.cancel_calls), 1)
+        self.assertEqual(offer_manager.create_calls, [])
+        dexie.queue_post.assert_not_called()
+
+    def test_main_book_cascade_replaces_only_exact_confirmed_member(self):
+        class MixedOfferManager(_ReplacementOfferManager):
+            def cancel_offers(self, trade_ids, **kwargs):
+                trade_ids = list(trade_ids)
+                self.cancel_calls.append((trade_ids, kwargs))
+                return {
+                    trade_ids[0]: _cancel_result(CANCEL_CONFIRMED),
+                    trade_ids[1]: _cancel_result(CANCEL_FAILED),
+                }
+
+        offer_manager = MixedOfferManager()
+        risk_manager = SimpleNamespace(
+            get_adjusted_spread=lambda _side: Decimal("0.01")
+        )
+        manager = BoostManager(
+            offer_manager=offer_manager,
+            risk_manager=risk_manager,
+        )
+        manager._boost_active = True
+        manager._gap_spread_bps = 100
+        stale = [
+            {"trade_id": "buy-confirmed", "price": "0.00008"},
+            {"trade_id": "buy-failed", "price": "0.00007"},
+        ]
+        config = SimpleNamespace(
+            COIN_IDS_ENABLED=True,
+            DEXIE_AUTO_POST=False,
+            ENABLE_BUY=True,
+            ENABLE_SELL=False,
+            GAP_CLOSE_CASCADE_BATCH_SIZE=2,
+        )
+        with (
+            patch.object(_bm_mod, "cfg", config),
+            patch.object(manager, "_find_stale_offers", return_value=stale),
+            patch.object(_bm_mod, "log_event"),
+        ):
+            result = manager.cascade_main_book(Decimal("0.0001"), stale, [])
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_created"], 1)
+        self.assertEqual(result["total_cancelled"], 1)
+        self.assertEqual(offer_manager.create_calls[0][1]["num_offers"], 1)
+        self.assertIn("buy-confirmed", offer_manager._bot_cancelled_ids)
+        self.assertNotIn("buy-failed", offer_manager._bot_cancelled_ids)
+
+
+@unittest.skipIf(_SKIP is not None, _SKIP_MSG)
 class TestInvertedCascadeBroadcast(unittest.TestCase):
     def test_inverted_cascade_queues_new_offers_to_dexie_and_splash(self):
         class QueuePoster:
@@ -379,7 +766,7 @@ class TestInvertedCascadeBroadcast(unittest.TestCase):
 
             def cancel_offers(self, trade_ids, **_kwargs):
                 self.cancelled.extend(trade_ids)
-                return {tid: {"success": True} for tid in trade_ids}
+                return {tid: _cancel_result(CANCEL_CONFIRMED) for tid in trade_ids}
 
         fake_cfg = SimpleNamespace(
             CAT_ASSET_ID="asset",

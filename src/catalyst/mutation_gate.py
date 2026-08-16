@@ -746,15 +746,54 @@ def _is_exact_prepared_operation_blocker(
         or len({context["operation_id"] for context in full_contexts}) != cohort_size
     ):
         return False
-    trade_ids = sorted(context["trade_id"] for context in full_contexts)
-    expected_cohort_id = (
-        "cancel-cohort:"
-        + hashlib.sha256(
-            json.dumps(trade_ids, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-    )
-    if cohort_id != expected_cohort_id:
+    try:
+        manifest = database.get_offer_cancel_cohort_manifest(cohort_id)
+    except (TypeError, ValueError, json.JSONDecodeError):
         return False
+    if manifest is not None:
+        if (
+            manifest["member_count"] != cohort_size
+            or len(manifest["members"]) != cohort_size
+        ):
+            return False
+        expected_members = {
+            (
+                member["operation_id"],
+                member["attempt"],
+                member["trade_id"],
+            )
+            for member in manifest["members"]
+        }
+        actual_members = {
+            (
+                context["operation_id"],
+                context["attempt"],
+                context["trade_id"],
+            )
+            for context in full_contexts
+        }
+        if actual_members != expected_members:
+            return False
+        try:
+            for event in full_events:
+                database.validate_offer_cancel_cohort_prepared_event(event, manifest)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    else:
+        # Compatibility for PREPARED cohorts written before durable manifests
+        # existed.  They can complete only under the original exact digest
+        # contract; every new cohort is manifest-bound above.
+        trade_ids = sorted(context["trade_id"] for context in full_contexts)
+        expected_cohort_id = (
+            "cancel-cohort:"
+            + hashlib.sha256(
+                json.dumps(trade_ids, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        )
+        if cohort_id != expected_cohort_id:
+            return False
     return (
         database.get_offer_cancel_effect_claim(
             operation_id=operation_id,

@@ -1350,11 +1350,9 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
     ]
 
 
-@pytest.mark.parametrize("crash_mode", ["mid_prepare", "after_cohort_prepare"])
-def test_offer_manager_restart_closes_unattempted_prepared_cohort_without_effect(
+def test_offer_manager_restart_closes_atomically_prepared_cohort_without_effect(
     isolated_database,
     monkeypatch,
-    crash_mode,
 ):
     trade_ids = ["a" * 64, "b" * 64, "c" * 64]
     effects = []
@@ -1374,30 +1372,17 @@ def test_offer_manager_restart_closes_unattempted_prepared_cohort_without_effect
         identity_count=12,
     )
     manager = OfferManager()
-    real_prepare = database.prepare_offer_cancel
-    prepare_count = 0
+    manager._offer_cancel_crash_hook = lambda phase, _intent: (
+        (_ for _ in ()).throw(RuntimeError("crash:after_cohort_prepare"))
+        if phase == "after_cohort_prepare"
+        else None
+    )
 
-    def crash_during_prepare(*args, **kwargs):
-        nonlocal prepare_count
-        prepare_count += 1
-        if crash_mode == "mid_prepare" and prepare_count == 2:
-            raise RuntimeError("crash:mid_prepare")
-        return real_prepare(*args, **kwargs)
-
-    monkeypatch.setattr(database, "prepare_offer_cancel", crash_during_prepare)
-    if crash_mode == "after_cohort_prepare":
-        manager._offer_cancel_crash_hook = lambda phase, _intent: (
-            (_ for _ in ()).throw(RuntimeError("crash:after_cohort_prepare"))
-            if phase == "after_cohort_prepare"
-            else None
-        )
-
-    with pytest.raises(RuntimeError, match=f"crash:{crash_mode}"):
+    with pytest.raises(RuntimeError, match="crash:after_cohort_prepare"):
         manager.cancel_offers(trade_ids, force_storm=True)
 
     assert effects == []
     manager._offer_cancel_crash_hook = None
-    monkeypatch.setattr(database, "prepare_offer_cancel", real_prepare)
     replay = OfferManager().cancel_offers(trade_ids, force_storm=True)
 
     assert effects == []
@@ -1406,6 +1391,133 @@ def test_offer_manager_restart_closes_unattempted_prepared_cohort_without_effect
         assert replay[trade_id]["method"] == "cohort_recovery_unattempted"
         assert replay[trade_id]["_catalyst_effect_attempted"] is False
         assert len(database.get_offer_operation_events(f"cancel:{trade_id}")) == 2
+
+
+def test_cohort_prepare_crash_before_atomic_commit_persists_no_partial_member(
+    isolated_database,
+    monkeypatch,
+):
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(CANCEL_FAILED, method="single_rpc")
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=12,
+    )
+    manager = OfferManager()
+    prepare_members = []
+
+    def crash_before_second_member(phase, intent):
+        if phase != "before_cohort_prepare":
+            return
+        prepare_members.append(intent.trade_id)
+        if len(prepare_members) == 2:
+            raise RuntimeError("crash:before_atomic_cohort_commit")
+
+    manager._offer_cancel_crash_hook = crash_before_second_member
+
+    with pytest.raises(RuntimeError, match="crash:before_atomic_cohort_commit"):
+        manager.cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == []
+    assert [
+        len(database.get_offer_operation_events(f"cancel:{trade_id}"))
+        for trade_id in trade_ids
+    ] == [0, 0, 0]
+    assert database.get_unresolved_offer_operation_blockers() == []
+
+
+def test_persisted_cohort_recovery_discovers_member_omitted_by_restart_subset(
+    isolated_database,
+    monkeypatch,
+):
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(CANCEL_FAILED, method="single_rpc")
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=16,
+    )
+    manager = OfferManager()
+    manager._offer_cancel_crash_hook = lambda phase, _intent: (
+        (_ for _ in ()).throw(RuntimeError("crash:after_atomic_cohort_commit"))
+        if phase == "after_cohort_prepare"
+        else None
+    )
+    with pytest.raises(RuntimeError, match="crash:after_atomic_cohort_commit"):
+        manager.cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == []
+    assert [
+        len(database.get_offer_operation_events(f"cancel:{trade_id}"))
+        for trade_id in trade_ids
+    ] == [1, 1, 1]
+
+    replay = OfferManager().cancel_offers(trade_ids[1:], force_storm=True)
+
+    assert effects == []
+    assert set(replay) == set(trade_ids[1:])
+    assert all(result["outcome"] == CANCEL_FAILED for result in replay.values())
+    assert [
+        len(database.get_offer_operation_events(f"cancel:{trade_id}"))
+        for trade_id in trade_ids
+    ] == [2, 2, 2]
+    assert database.get_unresolved_offer_operation_blockers() == []
+
+
+def test_persisted_cohort_recovery_precedes_fresh_member_from_restart_superset(
+    isolated_database,
+    monkeypatch,
+):
+    cohort_trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    fresh_trade_id = "d" * 64
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(CANCEL_FAILED, method="single_rpc")
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=20,
+    )
+    manager = OfferManager()
+    manager._offer_cancel_crash_hook = lambda phase, _intent: (
+        (_ for _ in ()).throw(RuntimeError("crash:after_atomic_cohort_commit"))
+        if phase == "after_cohort_prepare"
+        else None
+    )
+    with pytest.raises(RuntimeError, match="crash:after_atomic_cohort_commit"):
+        manager.cancel_offers(cohort_trade_ids, force_storm=True)
+
+    replay = OfferManager().cancel_offers(
+        [cohort_trade_ids[1], fresh_trade_id],
+        force_storm=True,
+    )
+
+    assert effects == [fresh_trade_id]
+    assert replay[cohort_trade_ids[1]]["outcome"] == CANCEL_FAILED
+    assert replay[fresh_trade_id]["outcome"] == CANCEL_FAILED
+    assert [
+        len(database.get_offer_operation_events(f"cancel:{trade_id}"))
+        for trade_id in cohort_trade_ids
+    ] == [2, 2, 2]
+    assert len(database.get_offer_operation_events(f"cancel:{fresh_trade_id}")) == 2
+    assert database.get_unresolved_offer_operation_blockers() == []
 
 
 def test_offer_manager_post_claim_crash_keeps_only_claimed_member_unknown(
@@ -1570,6 +1682,121 @@ def test_no_effect_finalize_atomically_rejects_existing_effect_claim(
     # finalize path even though authority was durably claimed.
     finalized = database.finalize_offer_cancel(**finalize)
     assert finalized["outcome"] == CANCEL_FAILED
+
+
+def test_prepare_cancel_cohort_transaction_rolls_back_and_exactly_replays(
+    isolated_database,
+    monkeypatch,
+):
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    core_members = [
+        {
+            "trade_id": trade_id,
+            "operation_id": f"cancel:{trade_id}",
+            "intent_id": f"cancel-target:{trade_id}",
+            "attempt": 1,
+            "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+        }
+        for trade_id in trade_ids
+    ]
+    manifest = database.canonical_offer_cancel_cohort_manifest(core_members)
+    requests = []
+    for member in manifest["members"]:
+        requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": member["attempt"],
+                "wallet_identity_json": {"snapshot_sha256": member["trade_id"]},
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "cohort_id": manifest["cohort_id"],
+                    "cohort_size": manifest["member_count"],
+                    "member_id": member["member_id"],
+                    "effect_claim_protocol": "durable_cohort_claim_v1",
+                },
+            }
+        )
+
+    real_insert = database._insert_offer_operation_event
+    insert_count = 0
+
+    def crash_on_second_insert(conn, values):
+        nonlocal insert_count
+        insert_count += 1
+        if insert_count == 2:
+            raise RuntimeError("crash:inside_atomic_cohort_prepare")
+        return real_insert(conn, values)
+
+    monkeypatch.setattr(
+        database,
+        "_insert_offer_operation_event",
+        crash_on_second_insert,
+    )
+    with pytest.raises(RuntimeError, match="crash:inside_atomic_cohort_prepare"):
+        database.prepare_offer_cancel_cohort(
+            manifest_json=manifest,
+            member_requests_json=requests,
+            prepared_at=AT,
+        )
+
+    assert database.get_offer_cancel_cohort_manifest(manifest["cohort_id"]) is None
+    assert [
+        database.get_offer_operation_events(member["operation_id"])
+        for member in manifest["members"]
+    ] == [[], [], []]
+
+    monkeypatch.setattr(database, "_insert_offer_operation_event", real_insert)
+    first = database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=requests,
+        prepared_at=AT,
+    )
+    replay = database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=json.loads(json.dumps(requests)),
+        prepared_at="2026-08-16T12:00:09Z",
+    )
+
+    assert first["inserted"] is True
+    assert replay["inserted"] is False
+    assert replay["manifest"] == manifest
+    assert [event["event_id"] for event in replay["events"]] == [
+        member["prepared_event_id"] for member in manifest["members"]
+    ]
+
+
+def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(
+    isolated_database,
+):
+    def member(index):
+        trade_id = f"{index:064x}"
+        return {
+            "trade_id": trade_id,
+            "operation_id": f"cancel:{trade_id}",
+            "intent_id": f"cancel-target:{trade_id}",
+            "attempt": 1,
+            "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+        }
+
+    with pytest.raises(ValueError, match="2 to 64"):
+        database.canonical_offer_cancel_cohort_manifest([member(1)])
+    with pytest.raises(ValueError, match="2 to 64"):
+        database.canonical_offer_cancel_cohort_manifest(
+            [member(index) for index in range(1, 66)]
+        )
+
+    manifest = database.canonical_offer_cancel_cohort_manifest([member(1), member(2)])
+    tampered_digest = json.loads(json.dumps(manifest))
+    tampered_digest["manifest_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="not canonical"):
+        database.validate_offer_cancel_cohort_manifest(tampered_digest)
+    tampered_member = json.loads(json.dumps(manifest))
+    tampered_member["members"][0]["member_id"] = "cancel-member:" + "0" * 64
+    with pytest.raises(ValueError, match="not canonical"):
+        database.validate_offer_cancel_cohort_manifest(tampered_member)
 
 
 def test_no_effect_finalize_wins_before_claim_in_one_atomic_order(
