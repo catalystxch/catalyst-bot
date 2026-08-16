@@ -1781,19 +1781,50 @@ class _HostileStatus(str):
     pass
 
 
-def test_canonical_sage_offer_parser_dependency_absence_fails_closed(monkeypatch):
+def test_canonical_sage_offer_validation_does_not_require_full_chia(monkeypatch):
     real_import = builtins.__import__
 
     def unavailable_chia(name, *args, **kwargs):
-        if name in {"chia.util.bech32m", "chia.wallet.trading.offer"}:
-            raise ImportError("parser unavailable")
+        if name == "chia" or name.startswith("chia."):
+            raise ImportError("full chia-blockchain is unavailable")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", unavailable_chia)
 
     assert (
+        offer_manager.OfferManager._canonical_sage_offer_text(VALID_SAGE_OFFER)
+        == VALID_SAGE_OFFER
+    )
+
+
+def test_canonical_sage_offer_validation_fails_closed_without_chia_rs(monkeypatch):
+    real_import = builtins.__import__
+
+    def unavailable_chia_rs(name, *args, **kwargs):
+        if name == "chia_rs" or name.startswith("chia_rs."):
+            raise ImportError("chia_rs is unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", unavailable_chia_rs)
+
+    assert (
         offer_manager.OfferManager._canonical_sage_offer_text(VALID_SAGE_OFFER) is None
     )
+
+
+@pytest.mark.parametrize(
+    "offer_text",
+    [
+        # A canonical/checksummed, version-6 zlib stream whose payload is not a
+        # SpendBundle.  A checksum/zlib-only validator would accept this.
+        "offer1qqr83wcuu2rykjevft9zc2229j4dfnwt9lg5m4pd9eyv6j73f54v6j7ffyzsp83kpt9s66nysm",
+        # A valid empty SpendBundle plus trailing bytes, recompressed and
+        # Bech32 encoded with a valid checksum.
+        "offer1qqr83wcuu2rykccqsgpsedq9z5qyn8gp8yxcrgqg",
+    ],
+)
+def test_canonical_sage_offer_rejects_valid_wire_non_spend_bundles(offer_text):
+    assert offer_manager.OfferManager._canonical_sage_offer_text(offer_text) is None
 
 
 @pytest.mark.parametrize(

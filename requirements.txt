@@ -6,3 +6,4 @@ pystray>=0.19.5,<1
 plyer>=2.1,<3
 Pillow>=12.2,<13
 cryptography>=50.0.0,<51
+chia_rs>=0.30,<0.31

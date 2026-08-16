@@ -28,3 +28,38 @@ of their respective owners.
 
 If an asset owner asks for an image or name usage to be changed, replace the
 asset with a text label or a neutral local icon before the next release.
+
+## Embedded source-code material
+
+### Pieter Wuille Bech32m reference implementation
+
+`src/catalyst/sage_offer_wire.py` adapts the Bech32m checksum, HRP expansion,
+decode, and bit-conversion algorithms from Pieter Wuille's reference
+implementation at <https://github.com/sipa/bech32/tree/bip-bech32m>.
+
+Copyright (c) 2017 Pieter Wuille. Licensed under the MIT License; the complete
+copyright and permission notice is retained in
+`licenses/Pieter-Wuille-bech32-MIT.txt` and bundled with CATalyst releases.
+
+CATalyst changes require exact lowercase `offer` HRP text, reject surrounding
+whitespace and noncanonical padding, and apply explicit encoded-size bounds.
+
+### Chia Network chia-blockchain 2.5.7
+
+`src/catalyst/sage_offer_wire.py` embeds the cumulative version-6 puzzle
+compression dictionary from Chia Network's `chia-blockchain` 2.5.7
+`chia.wallet.util.puzzle_compression` module. The exact 7,827 embedded bytes
+have SHA-256
+`7c2632368f37f21a33b179c9bfd07c383d23c12fb48b47a9b24fa5029f8690a1`.
+
+Copyright Chia Network Inc. and contributors. Licensed under Apache License
+2.0; the complete license text is retained in
+`licenses/Chia-Network-chia-blockchain-Apache-2.0.txt` and bundled with
+CATalyst releases. The Chia 2.5.7 wheel used to verify this material did not
+ship a separate NOTICE file.
+
+CATalyst changes store the bytes as base64, pin their hash and version offsets,
+apply bounded canonical zlib stream checks, and pass the decompressed bytes to
+the separately declared `chia_rs` runtime dependency for exact SpendBundle
+parsing and byte-for-byte round-trip validation. No Chia Python runtime code is
+copied into or required by this parser.

@@ -53,6 +53,7 @@ from wallet import (
 import database
 import mutation_gate
 import offer_registry
+from sage_offer_wire import canonical_sage_offer_text
 import wallet
 
 
@@ -1456,24 +1457,7 @@ class OfferManager:
 
     @staticmethod
     def _canonical_sage_offer_text(value: Any) -> Optional[str]:
-        if (
-            type(value) is not str
-            or not value.startswith("offer1")
-            or value != value.strip()
-            or len(value) > 4 * 1024 * 1024
-        ):
-            return None
-        try:
-            from chia.util.bech32m import bech32_decode
-            from chia.wallet.trading.offer import Offer
-
-            human_readable_part, data = bech32_decode(value, max_length=len(value))
-            if human_readable_part != "offer" or data is None:
-                return None
-            Offer.from_bech32(value)
-        except Exception:
-            return None
-        return value
+        return canonical_sage_offer_text(value)
 
     @staticmethod
     def _canonical_sage_creation_identity(result: Any) -> Optional[tuple[str, str]]:
