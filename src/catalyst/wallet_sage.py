@@ -3722,8 +3722,8 @@ def set_change_address(
         )
         if (
             type(result) is not dict
-            or result.get("success") is not True
-            or not _rpc_succeeded(result)
+            or set(result) != {"success"}
+            or result["success"] is not True
         ):
             return {"success": False, "error": "set_change_address_failed"}
 

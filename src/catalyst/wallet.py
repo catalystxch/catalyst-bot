@@ -210,6 +210,12 @@ else:
 _WALLET_ADAPTER_AUTHORITY = _wallet_adapter
 
 
+def get_wallet_adapter_authority():
+    """Return the exact adapter object selected for runtime acquisition."""
+
+    return _wallet_adapter
+
+
 def get_wallet_type() -> str:
     """Return which wallet backend is active: 'chia' or 'sage'."""
     return WALLET_TYPE
@@ -359,18 +365,23 @@ def wallet_mutation_count(result) -> int:
     return result if type(result) is int and result >= 0 else 0
 
 
-def _expected_identity_binding() -> mutation_gate.WalletIdentityBinding:
-    """Return the lease/delegation-bound exact identity expected for mutation."""
+def _expected_identity_authority() -> (
+    tuple[mutation_gate.WalletIdentityBinding, object]
+):
+    """Return the frozen binding and adapter selected at authority acquisition."""
 
+    candidate_adapter = _wallet_adapter
     runtime = mutation_gate.current_runtime()
     if runtime is not None:
         binding = runtime.require_wallet_identity_authority("wallet:identity")
+        adapter = runtime.require_wallet_adapter_authority(
+            candidate_adapter, "wallet:identity"
+        )
         if (
             type(binding) is mutation_gate.WalletIdentityBinding
             and binding.backend == WALLET_TYPE
-            and _wallet_adapter is _WALLET_ADAPTER_AUTHORITY
         ):
-            return binding
+            return binding, adapter
         raise mutation_gate.MutationBlocked(
             "WALLET_IDENTITY_BINDING_INVALID", "wallet:identity"
         )
@@ -383,12 +394,14 @@ def _expected_identity_binding() -> mutation_gate.WalletIdentityBinding:
     try:
         binding = delegated["binding"]
         digest = delegated["binding_digest"]
+        adapter = mutation_gate.worker_wallet_adapter_authority(
+            candidate_adapter, "wallet:identity"
+        )
         valid = (
             type(binding) is mutation_gate.WalletIdentityBinding
             and type(digest) is str
             and mutation_gate.wallet_identity_binding_digest(binding) == digest
             and binding.backend == WALLET_TYPE
-            and _wallet_adapter is _WALLET_ADAPTER_AUTHORITY
             and mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
             == delegated["wallet_fingerprint_hash"]
             and binding.network_id == delegated["network"].lower()
@@ -400,14 +413,41 @@ def _expected_identity_binding() -> mutation_gate.WalletIdentityBinding:
         raise mutation_gate.MutationBlocked(
             "WALLET_IDENTITY_BINDING_INVALID", "wallet:identity"
         )
-    return binding
+    return binding, adapter
+
+
+def _expected_identity_binding() -> mutation_gate.WalletIdentityBinding:
+    """Return the lease/delegation-bound exact identity expected for mutation."""
+
+    return _expected_identity_authority()[0]
+
+
+def _identity_from_adapter(adapter) -> dict:
+    """Observe identity through one already-authorized adapter object."""
+
+    return adapter.get_wallet_identity()
+
+
+def _revalidate_adapter_authority(adapter, operation: str) -> None:
+    runtime = mutation_gate.current_runtime()
+    if runtime is not None:
+        runtime.require_wallet_adapter_authority(adapter, operation)
+        return
+    mutation_gate.worker_wallet_adapter_authority(adapter, operation)
 
 
 def get_wallet_identity() -> dict:
     """Read identity directly from the selected adapter; this is never cached."""
 
     try:
-        result = _wallet_adapter.get_wallet_identity()
+        runtime = mutation_gate.current_runtime()
+        if runtime is not None:
+            adapter = runtime.require_wallet_adapter_authority(
+                _wallet_adapter, "wallet:identity:read"
+            )
+        else:
+            adapter = _wallet_adapter
+        result = _identity_from_adapter(adapter)
     except Exception:
         return {
             "success": False,
@@ -427,8 +467,9 @@ def preflight_wallet_identity() -> dict:
     """Read-only UX preflight; the mutation-bound read remains authoritative."""
 
     try:
-        binding = _expected_identity_binding()
-        snapshot = get_wallet_identity()
+        binding, adapter = _expected_identity_authority()
+        snapshot = _identity_from_adapter(adapter)
+        _revalidate_adapter_authority(adapter, "wallet:preflight")
         decision = mutation_gate.validate_wallet_identity(binding, snapshot)
         if decision.get("allowed") is True:
             return {"success": True, "reason": "identity_verified"}
@@ -463,25 +504,46 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
     permit = None
     try:
         permit = mutation_gate.enter_wallet_mutation(operation)
-        binding = _expected_identity_binding()
+        binding, adapter = mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:acquire"
+        )
+        if binding.backend != WALLET_TYPE or adapter is not _wallet_adapter:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID", operation
+            )
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
-        snapshot = get_wallet_identity()
+        snapshot = _identity_from_adapter(adapter)
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:identity"
+        )
         mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:dispatch"
+        )
         if export_name in _COMPOUND_MUTATION_EXPORTS:
 
             def identity_recheck(step: str) -> None:
                 safe_step = (
                     step if type(step) is str and step and len(step) <= 64 else "effect"
                 )
-                fresh_snapshot = get_wallet_identity()
+                fresh_snapshot = _identity_from_adapter(adapter)
+                mutation_gate.require_wallet_mutation_permit_authority(
+                    permit, f"{operation}:{safe_step}:identity"
+                )
                 mutation_gate.require_fresh_wallet_identity(
                     binding,
                     fresh_snapshot,
                     f"{operation}:{safe_step}",
                 )
+                mutation_gate.require_wallet_mutation_permit_authority(
+                    permit, f"{operation}:{safe_step}:dispatch"
+                )
 
             kwargs["_identity_recheck"] = identity_recheck
-        callback = getattr(_wallet_adapter, export_name)
+        callback = getattr(adapter, export_name)
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:effect"
+        )
         result = callback(*args, **kwargs)
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)

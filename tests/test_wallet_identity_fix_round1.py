@@ -43,12 +43,23 @@ def _authorize_wallet(monkeypatch, adapter, *, fingerprint: int = 123456):
     binding = _binding(fingerprint=fingerprint)
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: binding)
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (binding, adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda received, operation: None
+    )
     monkeypatch.setattr(mutation_gate, "enter_wallet_mutation", lambda operation: "p")
     monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
     monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (binding, adapter),
+    )
+    monkeypatch.setattr(
         wallet,
-        "get_wallet_identity",
-        lambda: {
+        "_identity_from_adapter",
+        lambda received: {
             "success": True,
             "backend": "sage",
             "name": "Expected Wallet",
@@ -401,7 +412,7 @@ def test_generic_login_freezes_validated_target_across_identity_read(monkeypatch
 
     _authorize_wallet(monkeypatch, SimpleNamespace(rpc=adapter_rpc))
 
-    def mutate_payload_during_identity_read():
+    def mutate_payload_during_identity_read(received_adapter):
         payload["fingerprint"] = 654321
         return {
             "success": True,
@@ -415,7 +426,7 @@ def test_generic_login_freezes_validated_target_across_identity_read(monkeypatch
         }
 
     monkeypatch.setattr(
-        wallet, "get_wallet_identity", mutate_payload_during_identity_read
+        wallet, "_identity_from_adapter", mutate_payload_during_identity_read
     )
 
     result = wallet.rpc("login", payload)
@@ -691,6 +702,7 @@ def test_owner_identity_authority_tamper_fails_every_wallet_boundary(monkeypatch
     )
     gate = _owner_gate(original)
     monkeypatch.setattr(gate, "require_allowed", lambda operation: SimpleNamespace())
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
     monkeypatch.setattr(mutation_gate, "current_runtime", lambda: gate)
     gate.__dict__["wallet_identity_binding"] = hostile
     gate.__dict__["_wallet_identity_binding"] = hostile

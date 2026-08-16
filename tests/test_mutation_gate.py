@@ -48,6 +48,7 @@ class Clock:
 def isolated_gate_database(tmp_path: Path, monkeypatch):
     original_path = database.DB_PATH
     original_initialized_path = database._db_initialized_path
+    mutation_gate.clear_worker_authority_environment()
     database.close_connection()
     path = tmp_path / "mutation-gate.db"
     database.DB_PATH = str(path)
@@ -64,6 +65,7 @@ def isolated_gate_database(tmp_path: Path, monkeypatch):
         yield path, clock
     finally:
         mutation_gate.shutdown_runtime()
+        mutation_gate.clear_worker_authority_environment()
         database.close_connection()
         database.DB_PATH = original_path
         database._db_initialized_path = original_initialized_path
@@ -116,6 +118,52 @@ def _identity_gate(clock: Clock):
         wallet_identity_binding=binding,
     )
     return gate, binding
+
+
+def _wallet_owner(clock: Clock, adapter, *, run_id: str, pid: int = 111):
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Permit Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(clock() - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    runtime = mutation_gate.MutationGate(
+        run_id=run_id,
+        owner_pid=pid,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network=binding.network_id,
+        lease_seconds=30,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    return runtime, binding
+
+
+def _wallet_snapshot(clock: Clock, binding):
+    clock.advance(1)
+    return {
+        "success": True,
+        "backend": "sage",
+        "name": binding.name,
+        "fingerprint": binding.fingerprint,
+        "network_id": binding.network_id,
+        "kind": binding.kind,
+        "has_secrets": True,
+        "observed_at_utc": clock()
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+    }
 
 
 def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
@@ -924,7 +972,10 @@ def test_installed_worker_binding_is_complete_and_cfg_independent(
     )
     environment = handoff.to_environment()
     monkeypatch.setattr(mutation_gate, "_utc_now", clock)
-    mutation_gate.install_worker_authority_environment(environment)
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=wallet.get_wallet_adapter_authority(),
+    )
 
     monkeypatch.setattr(wallet.cfg, "SAGE_FINGERPRINT", "999999999")
     monkeypatch.setattr(
@@ -950,6 +1001,8 @@ def test_installed_worker_binding_rechecks_revocation_before_effect(
 ):
     """A frozen child binding never outlives its durable delegation."""
 
+    import wallet
+
     _path, clock = isolated_gate_database
     gate, _binding_value = _identity_gate(clock)
     assert gate.acquire()["acquired"] is True
@@ -960,13 +1013,638 @@ def test_installed_worker_binding_rechecks_revocation_before_effect(
         ttl_seconds=20,
     )
     monkeypatch.setattr(mutation_gate, "_utc_now", clock)
-    mutation_gate.install_worker_authority_environment(handoff.to_environment())
+    mutation_gate.install_worker_authority_environment(
+        handoff.to_environment(),
+        wallet_adapter_authority=wallet.get_wallet_adapter_authority(),
+    )
     assert gate.revoke_worker_delegation(handoff)["revoked"] is True
 
     with pytest.raises(mutation_gate.MutationBlocked) as error:
         mutation_gate.worker_identity_lease_binding()
 
     assert error.value.reason_code == "WORKER_DELEGATION_INVALID"
+
+
+def test_installed_worker_adapter_rejects_self_consistent_facade_global_swap(
+    isolated_gate_database, monkeypatch
+):
+    """A delegated worker cannot redirect effects by replacing facade globals."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    gate, _binding_value = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:adapter-pin",
+        purpose="coin_prep",
+        worker_id="worker-adapter-pin",
+        ttl_seconds=20,
+    )
+    original = wallet.get_wallet_adapter_authority()
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    mutation_gate.install_worker_authority_environment(
+        handoff.to_environment(),
+        wallet_adapter_authority=original,
+    )
+    evil = SimpleNamespace()
+    monkeypatch.setattr(wallet, "_wallet_adapter", evil)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", evil)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as error:
+        wallet._expected_identity_authority()
+
+    assert error.value.reason_code == "WALLET_IDENTITY_BINDING_INVALID"
+
+
+def test_installed_worker_adapter_cannot_be_rebound_without_clear(
+    isolated_gate_database, monkeypatch
+):
+    """A live worker authority is immutable until explicit lifecycle cleanup."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    gate, _binding_value = _identity_gate(clock)
+    assert gate.acquire()["acquired"] is True
+    handoff = gate.issue_worker_delegation(
+        operation_id="coin-prep:adapter-rebind",
+        purpose="coin_prep",
+        worker_id="worker-adapter-rebind",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    original = wallet.get_wallet_adapter_authority()
+    evil = SimpleNamespace()
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=original,
+    )
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=original,
+    )
+
+    with pytest.raises(mutation_gate.MutationBlocked) as error:
+        mutation_gate.install_worker_authority_environment(
+            environment,
+            wallet_adapter_authority=evil,
+        )
+
+    assert error.value.reason_code == "WALLET_IDENTITY_BINDING_INVALID"
+    assert mutation_gate.worker_wallet_adapter_authority(original, "test") is original
+
+
+def test_owner_wallet_effect_cannot_cross_runtime_generation_aba(
+    isolated_gate_database, monkeypatch
+):
+    """A stale R1 permit cannot authorize or strand an effect under equal R2."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    effects = []
+    lifecycle_results = []
+    lifecycle_errors = []
+    swapped = False
+
+    def identity_snapshot():
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+
+            def replace_runtime():
+                try:
+                    lifecycle_results.append(
+                        mutation_gate.shutdown_runtime(release_owned_lease=True)
+                    )
+                except BaseException as exc:
+                    lifecycle_errors.append(exc)
+
+            lifecycle = threading.Thread(target=replace_runtime)
+            lifecycle.start()
+            lifecycle.join(timeout=2)
+            assert not lifecycle.is_alive()
+            assert lifecycle_errors == []
+        clock.advance(1)
+        return {
+            "success": True,
+            "backend": "sage",
+            "name": binding.name,
+            "fingerprint": binding.fingerprint,
+            "network_id": binding.network_id,
+            "kind": binding.kind,
+            "has_secrets": True,
+            "observed_at_utc": clock()
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    adapter = SimpleNamespace(
+        get_wallet_identity=identity_snapshot,
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Delegated Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(clock() - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    original = mutation_gate.MutationGate(
+        run_id="identity-original",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network=binding.network_id,
+        lease_seconds=30,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    assert original.acquire()["acquired"] is True
+    mutation_gate._runtime = original
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle_results == [
+        {"released": False, "reason": "active_wallet_mutations"}
+    ]
+    assert original.active_mutation_count() == 0
+    assert mutation_gate.current_runtime() is original
+
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True)["released"] is True
+    replacement = mutation_gate.MutationGate(
+        run_id="identity-replacement",
+        owner_pid=222,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network=binding.network_id,
+        lease_seconds=30,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    assert replacement.acquire()["acquired"] is True
+    mutation_gate._runtime = replacement
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+    assert replacement.active_mutation_count() == 0
+
+    adapter.create_offer = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("private backend failure")
+    )
+    failed = wallet.create_offer({1: -1})
+    assert failed["success"] is False
+    assert failed["reason"] == "WALLET_MUTATION_FAILED"
+    assert "private backend failure" not in str(failed)
+    assert replacement.active_mutation_count() == 0
+    assert replacement.active_wallet_mutation_count() == 0
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True)["released"] is True
+
+
+def test_owner_wallet_effect_cannot_cross_same_runtime_reacquire_generation(
+    isolated_gate_database, monkeypatch
+):
+    """A fresh lease acquisition on the same runtime invalidates old permits."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    effects = []
+    lifecycle_results = []
+    cycled = False
+
+    def identity_snapshot():
+        nonlocal cycled
+        if not cycled:
+            cycled = True
+            lifecycle_results.append(runtime.release_lease())
+            lifecycle_results.append(runtime.acquire())
+        clock.advance(1)
+        return {
+            "success": True,
+            "backend": "sage",
+            "name": binding.name,
+            "fingerprint": binding.fingerprint,
+            "network_id": binding.network_id,
+            "kind": binding.kind,
+            "has_secrets": True,
+            "observed_at_utc": clock()
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    adapter = SimpleNamespace(
+        get_wallet_identity=identity_snapshot,
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Reacquired Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(clock() - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    runtime = mutation_gate.MutationGate(
+        run_id="same-runtime-reacquire",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network=binding.network_id,
+        lease_seconds=30,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    assert runtime.acquire()["acquired"] is True
+    mutation_gate._runtime = runtime
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle_results == [
+        {"released": False, "reason": "active_wallet_mutations"},
+        {"acquired": False, "reason": "active_wallet_mutations"},
+    ]
+    assert runtime.active_mutation_count() == 0
+
+    assert runtime.release_lease()["released"] is True
+    assert runtime.acquire()["acquired"] is True
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+    assert runtime.active_mutation_count() == 0
+
+
+def test_owner_shutdown_cannot_replace_runtime_after_final_wallet_check(
+    isolated_gate_database, monkeypatch
+):
+    """Shutdown refuses after the final check until the exact permit exits."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    effects = []
+    lifecycle = {}
+    adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    runtime, binding = _wallet_owner(clock, adapter, run_id="final-check-owner")
+    assert runtime.acquire()["acquired"] is True
+    mutation_gate._runtime = runtime
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+    original_check = mutation_gate.require_wallet_mutation_permit_authority
+
+    def replace_after_final_check(permit, operation):
+        result = original_check(permit, operation)
+        if operation == "wallet:create_offer:effect" and "shutdown" not in lifecycle:
+            lifecycle["shutdown"] = mutation_gate.shutdown_runtime(
+                release_owned_lease=True
+            )
+            if lifecycle["shutdown"].get("released") is True:
+                replacement, _ = _wallet_owner(
+                    clock,
+                    adapter,
+                    run_id="final-check-replacement",
+                    pid=222,
+                )
+                lifecycle["replacement_acquire"] = replacement.acquire()
+                mutation_gate._runtime = replacement
+                lifecycle["replacement"] = replacement
+        return result
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        replace_after_final_check,
+    )
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle["shutdown"] == {
+        "released": False,
+        "reason": "active_wallet_mutations",
+    }
+    assert "replacement" not in lifecycle
+    assert mutation_gate.current_runtime() is runtime
+    assert runtime.active_mutation_count() == 0
+
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True)["released"] is True
+    replacement, _ = _wallet_owner(
+        clock,
+        adapter,
+        run_id="final-check-replacement",
+        pid=222,
+    )
+    assert replacement.acquire()["acquired"] is True
+    mutation_gate._runtime = replacement
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+    assert replacement.active_mutation_count() == 0
+
+
+def test_owner_release_and_reacquire_refuse_after_final_wallet_check(
+    isolated_gate_database, monkeypatch
+):
+    """The same runtime cannot rotate its lease while a wallet permit is active."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    effects = []
+    lifecycle = {}
+    adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    runtime, binding = _wallet_owner(clock, adapter, run_id="final-check-reacquire")
+    assert runtime.acquire()["acquired"] is True
+    mutation_gate._runtime = runtime
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+    original_check = mutation_gate.require_wallet_mutation_permit_authority
+
+    def reacquire_after_final_check(permit, operation):
+        result = original_check(permit, operation)
+        if operation == "wallet:create_offer:effect" and "release" not in lifecycle:
+            lifecycle["release"] = runtime.release_lease()
+            lifecycle["acquire"] = runtime.acquire()
+        return result
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        reacquire_after_final_check,
+    )
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle["release"] == {
+        "released": False,
+        "reason": "active_wallet_mutations",
+    }
+    assert lifecycle["acquire"] == {
+        "acquired": False,
+        "reason": "active_wallet_mutations",
+    }
+    assert runtime.last_acquire_result["acquired"] is True
+    assert runtime.status().allowed is True
+    assert runtime.active_mutation_count() == 0
+
+    assert runtime.release_lease()["released"] is True
+    assert runtime.acquire()["acquired"] is True
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+    assert runtime.active_mutation_count() == 0
+
+
+def test_worker_wallet_effect_cannot_cross_install_generation_aba(
+    isolated_gate_database, monkeypatch
+):
+    """Clear/reinstall cannot make an old worker permit current again."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    parent, binding = _identity_gate(clock)
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:worker-generation-aba",
+        purpose="coin_prep",
+        worker_id="worker-generation-aba",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    effects = []
+    lifecycle_errors = []
+    lifecycle_results = []
+    swapped = False
+
+    def identity_snapshot():
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+
+            def replace_worker_authority():
+                try:
+                    lifecycle_results.append(
+                        mutation_gate.clear_worker_authority_environment()
+                    )
+                    try:
+                        mutation_gate.install_worker_authority_environment(
+                            environment,
+                            wallet_adapter_authority=adapter,
+                        )
+                    except mutation_gate.MutationBlocked as exc:
+                        lifecycle_results.append(exc.reason_code)
+                    else:
+                        lifecycle_results.append("allowed")
+                except BaseException as exc:
+                    lifecycle_errors.append(exc)
+
+            lifecycle = threading.Thread(target=replace_worker_authority)
+            lifecycle.start()
+            lifecycle.join(timeout=2)
+            assert not lifecycle.is_alive()
+            assert lifecycle_errors == []
+        clock.advance(1)
+        return {
+            "success": True,
+            "backend": "sage",
+            "name": binding.name,
+            "fingerprint": binding.fingerprint,
+            "network_id": binding.network_id,
+            "kind": binding.kind,
+            "has_secrets": True,
+            "observed_at_utc": clock()
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    adapter = SimpleNamespace(
+        get_wallet_identity=identity_snapshot,
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=adapter,
+    )
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle_results == [False, "MUTATION_SHUTTING_DOWN"]
+
+    assert mutation_gate.clear_worker_authority_environment() is True
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=adapter,
+    )
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+
+    adapter.create_offer = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("private worker failure")
+    )
+    failed = wallet.create_offer({1: -1})
+    assert failed["success"] is False
+    assert failed["reason"] == "WALLET_MUTATION_FAILED"
+    assert "private worker failure" not in str(failed)
+    assert mutation_gate.clear_worker_authority_environment() is True
+
+
+def test_worker_clear_and_reinstall_refuse_after_final_wallet_check(
+    isolated_gate_database, monkeypatch
+):
+    """Worker lifecycle cannot replace an install until its exact permit exits."""
+
+    import wallet
+
+    _path, clock = isolated_gate_database
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    parent, binding = _identity_gate(clock)
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:worker-final-check",
+        purpose="coin_prep",
+        worker_id="worker-final-check",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    effects = []
+    lifecycle = {}
+    adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
+        create_offer=lambda *args, **kwargs: effects.append("effect")
+        or {"success": True},
+    )
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=adapter,
+    )
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
+    original_check = mutation_gate.require_wallet_mutation_permit_authority
+
+    def reinstall_after_final_check(permit, operation):
+        result = original_check(permit, operation)
+        if operation == "wallet:create_offer:effect" and "clear" not in lifecycle:
+            lifecycle["clear"] = mutation_gate.clear_worker_authority_environment()
+            try:
+                mutation_gate.install_worker_authority_environment(
+                    environment,
+                    wallet_adapter_authority=adapter,
+                )
+            except mutation_gate.MutationBlocked as exc:
+                lifecycle["install"] = exc.reason_code
+            else:
+                lifecycle["install"] = "allowed"
+        return result
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        reinstall_after_final_check,
+    )
+
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect"]
+    assert lifecycle == {"clear": False, "install": "MUTATION_SHUTTING_DOWN"}
+
+    assert mutation_gate.clear_worker_authority_environment() is True
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=adapter,
+    )
+    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert effects == ["effect", "effect"]
+
+
+def test_wallet_lifecycle_waits_for_every_generation_scoped_permit(
+    isolated_gate_database, monkeypatch
+):
+    """Owner and worker lifecycle remain refused until all permits drain."""
+
+    _path, clock = isolated_gate_database
+    monkeypatch.setattr(mutation_gate, "_utc_now", clock)
+    adapter = SimpleNamespace(get_wallet_identity=lambda: {})
+    runtime, _binding = _wallet_owner(clock, adapter, run_id="permit-drain-owner")
+    assert runtime.acquire()["acquired"] is True
+    mutation_gate._runtime = runtime
+    first = mutation_gate.enter_wallet_mutation("wallet:first")
+    second = mutation_gate.enter_wallet_mutation("wallet:second")
+
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True) == {
+        "released": False,
+        "reason": "active_wallet_mutations",
+    }
+    assert mutation_gate.exit_wallet_mutation(first) is True
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True) == {
+        "released": False,
+        "reason": "active_wallet_mutations",
+    }
+    assert mutation_gate.exit_wallet_mutation(second) is True
+    assert mutation_gate.shutdown_runtime(release_owned_lease=True)["released"] is True
+
+    parent, _binding = _identity_gate(clock)
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:worker-permit-drain",
+        purpose="coin_prep",
+        worker_id="worker-permit-drain",
+        ttl_seconds=20,
+    )
+    environment = handoff.to_environment()
+    mutation_gate.install_worker_authority_environment(
+        environment,
+        wallet_adapter_authority=adapter,
+    )
+    first = mutation_gate.enter_wallet_mutation("wallet:first")
+    second = mutation_gate.enter_wallet_mutation("wallet:second")
+
+    assert mutation_gate.clear_worker_authority_environment() is False
+    assert mutation_gate.exit_wallet_mutation(first) is True
+    assert mutation_gate.clear_worker_authority_environment() is False
+    assert mutation_gate.exit_wallet_mutation(second) is True
+    assert mutation_gate.clear_worker_authority_environment() is True
 
 
 def test_delegation_expires_revokes_and_parent_lease_loss_invalidates_child(

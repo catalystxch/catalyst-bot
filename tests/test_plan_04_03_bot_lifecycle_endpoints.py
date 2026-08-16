@@ -61,6 +61,12 @@ class _FlaskBase(unittest.TestCase):
         )
         self._wallet_identity_read.start()
         self.addCleanup(self._wallet_identity_read.stop)
+        self._wallet_sync_read = patch(
+            "wallet.get_wallet_sync_status",
+            return_value={"reachable": True, "sync_state": "synced"},
+        )
+        self._wallet_sync_read.start()
+        self.addCleanup(self._wallet_sync_read.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()

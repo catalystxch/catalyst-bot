@@ -166,6 +166,12 @@ def test_exported_mutation_reads_identity_again_after_preflight(monkeypatch):
     monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
     monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
+    monkeypatch.setattr(
         mutation_gate,
         "validate_wallet_identity",
         lambda binding, snapshot, **kwargs: (
@@ -192,6 +198,11 @@ def test_exported_mutation_reads_identity_again_after_preflight(monkeypatch):
         lambda operation: checked.append(operation) or "permit",
     )
     monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
 
     assert wallet.preflight_wallet_identity() == {
         "success": True,
@@ -385,17 +396,24 @@ def test_read_only_exports_remain_usable_when_mutation_is_blocked(monkeypatch):
 
 def test_mutation_exceptions_preserve_stable_dict_and_release_permit(monkeypatch):
     exits = []
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _identity(),
+        send_transaction=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("private remote text")
+        ),
+    )
     monkeypatch.setattr(
         wallet,
         "_wallet_adapter",
-        SimpleNamespace(
-            get_wallet_identity=lambda: _identity(),
-            send_transaction=lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("private remote text")
-            ),
-        ),
+        fake_adapter,
     )
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
     monkeypatch.setattr(
         mutation_gate,
         "enter_wallet_mutation",
@@ -416,6 +434,11 @@ def test_mutation_exceptions_preserve_stable_dict_and_release_permit(monkeypatch
         "exit_wallet_mutation",
         lambda permit: exits.append(permit) or True,
     )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
 
     result = wallet.send_transaction(1, 1, "xch1destination")
 
@@ -429,15 +452,22 @@ def test_mutation_exceptions_preserve_stable_dict_and_release_permit(monkeypatch
 
 
 def test_exit_failure_never_raises_through_wallet_boundary(monkeypatch):
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _identity(),
+        cancel_offer=lambda *args, **kwargs: {"success": True},
+    )
     monkeypatch.setattr(
         wallet,
         "_wallet_adapter",
-        SimpleNamespace(
-            get_wallet_identity=lambda: _identity(),
-            cancel_offer=lambda *args, **kwargs: {"success": True},
-        ),
+        fake_adapter,
     )
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
     monkeypatch.setattr(
         mutation_gate, "enter_wallet_mutation", lambda operation: "permit"
     )
@@ -450,6 +480,11 @@ def test_exit_failure_never_raises_through_wallet_boundary(monkeypatch):
         mutation_gate,
         "exit_wallet_mutation",
         lambda permit: (_ for _ in ()).throw(RuntimeError("private exit error")),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
     )
 
     assert wallet.cancel_offer("a" * 64) == {"success": True}
@@ -465,15 +500,18 @@ def test_async_adapter_callback_is_not_returned_outside_permit(monkeypatch):
         def close(self):
             closed.append(True)
 
-    monkeypatch.setattr(
-        wallet,
-        "_wallet_adapter",
-        SimpleNamespace(
-            get_wallet_identity=lambda: _identity(),
-            send_transaction=lambda *args, **kwargs: AwaitableResult(),
-        ),
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _identity(),
+        send_transaction=lambda *args, **kwargs: AwaitableResult(),
     )
+    monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
     monkeypatch.setattr(
         mutation_gate, "enter_wallet_mutation", lambda operation: "permit"
     )
@@ -483,6 +521,11 @@ def test_async_adapter_callback_is_not_returned_outside_permit(monkeypatch):
         lambda *args, **kwargs: {"allowed": True},
     )
     monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
 
     result = wallet.send_transaction(1, 1, "xch1destination")
 
@@ -555,19 +598,27 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
         recheck("second")
         return {"success": True}
 
-    monkeypatch.setattr(
-        wallet,
-        "_wallet_adapter",
-        SimpleNamespace(
-            get_wallet_identity=lambda: identity_calls.append(True) or _identity(),
-            cancel_offers_batch=adapter_batch,
-        ),
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=lambda: identity_calls.append(True) or _identity(),
+        cancel_offers_batch=adapter_batch,
     )
+    monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
     monkeypatch.setattr(wallet, "_expected_identity_binding", lambda: _binding())
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
     monkeypatch.setattr(
         mutation_gate, "enter_wallet_mutation", lambda operation: "permit"
     )
     monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
     monkeypatch.setattr(
         mutation_gate,
         "require_fresh_wallet_identity",
@@ -1394,7 +1445,8 @@ def test_owner_runtime_identity_binding_ignores_later_cfg_mutation(monkeypatch):
         mutation_gate,
         "current_runtime",
         lambda: SimpleNamespace(
-            require_wallet_identity_authority=lambda operation: frozen
+            require_wallet_identity_authority=lambda operation: frozen,
+            require_wallet_adapter_authority=lambda candidate, operation: candidate,
         ),
     )
 
@@ -1437,7 +1489,7 @@ def test_worker_installs_delegation_for_adapter_bound_rechecks(monkeypatch):
     monkeypatch.setattr(
         coin_prep_worker.mutation_gate,
         "install_worker_authority_environment",
-        lambda received: installed.append(dict(received)),
+        lambda received, **kwargs: installed.append((dict(received), kwargs)),
     )
 
     monkeypatch.setattr(coin_prep_worker, "_worker_delegation_environment", None)
@@ -1449,7 +1501,12 @@ def test_worker_installs_delegation_for_adapter_bound_rechecks(monkeypatch):
         )
 
     assert result["allowed"] is True
-    assert installed == [environment]
+    assert installed == [
+        (
+            environment,
+            {"wallet_adapter_authority": wallet.get_wallet_adapter_authority()},
+        )
+    ]
 
 
 def test_worker_identity_binding_fails_if_authority_is_cleared_during_recheck(
@@ -1549,6 +1606,11 @@ def test_delegated_identity_binding_is_frozen_across_cfg_mutation(monkeypatch):
     monkeypatch.setattr(mutation_gate, "current_runtime", lambda: None)
     monkeypatch.setattr(
         mutation_gate, "worker_identity_lease_binding", lambda: dict(delegated)
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "worker_wallet_adapter_authority",
+        lambda candidate, operation: candidate,
     )
     monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
     monkeypatch.setattr(wallet.cfg, "SAGE_FINGERPRINT", "123456789")

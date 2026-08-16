@@ -46,6 +46,7 @@ from wallet import (
     get_wallet_sync_status,
     get_spendable_coins_rpc,
     get_transaction,
+    get_wallet_adapter_authority,
 )
 from coin_prep_utils import (
     should_extend_pending_consumed_split_grace,
@@ -164,7 +165,10 @@ def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
         "coin_prep.start", handoff_environment
     )
     if environment is None:
-        mutation_gate.install_worker_authority_environment(handoff_environment)
+        mutation_gate.install_worker_authority_environment(
+            handoff_environment,
+            wallet_adapter_authority=get_wallet_adapter_authority(),
+        )
         _worker_delegation_environment = dict(handoff_environment)
         for key in _WORKER_DELEGATION_ENV_NAMES:
             os.environ.pop(key, None)

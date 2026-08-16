@@ -262,6 +262,7 @@ class _OwnerIdentityAuthority:
     wallet_fingerprint_hash: str
     network: str
     backend: Optional[str]
+    wallet_adapter_authority: Any
 
 
 _owner_identity_authorities_lock = threading.RLock()
@@ -273,6 +274,24 @@ def _registered_owner_identity_authority(
 ) -> Optional[_OwnerIdentityAuthority]:
     with _owner_identity_authorities_lock:
         return _owner_identity_authorities.get(owner)
+
+
+def _rotate_owner_identity_authority(owner: Any) -> bool:
+    """Install a fresh opaque authority generation after lease acquisition."""
+
+    with _owner_identity_authorities_lock:
+        authority = _owner_identity_authorities.get(owner)
+        if type(authority) is not _OwnerIdentityAuthority:
+            return False
+        _owner_identity_authorities[owner] = _OwnerIdentityAuthority(
+            binding=authority.binding,
+            binding_digest=authority.binding_digest,
+            wallet_fingerprint_hash=authority.wallet_fingerprint_hash,
+            network=authority.network,
+            backend=authority.backend,
+            wallet_adapter_authority=authority.wallet_adapter_authority,
+        )
+        return True
 
 
 def _binding_wallet_hash(binding: WalletIdentityBinding) -> str:
@@ -666,6 +685,7 @@ class MutationGate:
             "_identity_wallet_fingerprint_hash",
             "_identity_network",
             "_identity_backend",
+            "_wallet_adapter_authority",
             "_identity_authority_installed",
         }
     )
@@ -701,6 +721,7 @@ class MutationGate:
         pid_liveness: Callable[[int, str], Optional[bool]] = pid_liveness,
         read_only: bool = False,
         wallet_identity_binding: Optional[WalletIdentityBinding] = None,
+        wallet_adapter_authority: Any = None,
     ):
         object.__setattr__(self, "_identity_authority_installed", False)
         self.run_id = _exact_text(run_id, "run_id")
@@ -745,6 +766,7 @@ class MutationGate:
             if wallet_identity_binding is not None
             else None,
         )
+        object.__setattr__(self, "_wallet_adapter_authority", wallet_adapter_authority)
         authority = _OwnerIdentityAuthority(
             binding=wallet_identity_binding,
             binding_digest=identity_digest,
@@ -755,6 +777,7 @@ class MutationGate:
                 if wallet_identity_binding is not None
                 else None
             ),
+            wallet_adapter_authority=wallet_adapter_authority,
         )
         with _owner_identity_authorities_lock:
             _owner_identity_authorities[self] = authority
@@ -763,6 +786,8 @@ class MutationGate:
         self._lock = threading.RLock()
         self._mutation_condition = threading.Condition(self._lock)
         self._active_mutations: dict[str, str] = {}
+        self._active_wallet_mutations: set[str] = set()
+        self._wallet_lifecycle_transitioning = False
         self._quiescing = False
         self._lease_version: Optional[int] = None
         self._lease_acquired_at: Optional[str] = None
@@ -813,6 +838,20 @@ class MutationGate:
         if not valid:
             raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
         return binding
+
+    def require_wallet_adapter_authority(self, candidate: Any, operation: str) -> Any:
+        """Return the acquired adapter only when its external pin is intact."""
+
+        self.require_wallet_identity_authority(operation)
+        authority = _registered_owner_identity_authority(self)
+        if (
+            type(authority) is not _OwnerIdentityAuthority
+            or authority.wallet_adapter_authority is None
+            or candidate is not authority.wallet_adapter_authority
+            or self._wallet_adapter_authority is not authority.wallet_adapter_authority
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        return authority.wallet_adapter_authority
 
     def _authorization_snapshot(self) -> dict[str, Any]:
         if self._read_only:
@@ -879,6 +918,12 @@ class MutationGate:
     @_stop_callback_boundary
     def acquire(self) -> dict[str, Any]:
         with self._lock:
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                result = {
+                    "acquired": False,
+                    "reason": "active_wallet_mutations",
+                }
+                return result
             try:
                 authorization = self._authorization_snapshot()
                 current = authorization["lease"]
@@ -973,6 +1018,8 @@ class MutationGate:
                     lease = result["lease"]
                     self._lease_version = int(lease["lease_version"])
                     self._lease_acquired_at = str(lease.get("acquired_at") or "")
+                    if not _rotate_owner_identity_authority(self):
+                        self._set_local_block("WALLET_IDENTITY_BINDING_INVALID")
                 self.last_acquire_result = result
                 return result
             except Exception:
@@ -1127,12 +1174,26 @@ class MutationGate:
 
         safe_operation = _safe_operation(operation)
         with self._lock:
-            if self._quiescing:
+            if self._quiescing or self._wallet_lifecycle_transitioning:
                 raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
             self.require_allowed(safe_operation)
             permit = str(uuid.uuid4())
             self._active_mutations[permit] = safe_operation
             return permit
+
+    def register_wallet_mutation_permit(self, permit: str, operation: str) -> None:
+        """Bind an active generic token to wallet lifecycle coordination."""
+
+        safe_operation = _safe_operation(operation)
+        with self._lock:
+            if (
+                type(permit) is not str
+                or permit not in self._active_mutations
+                or self._quiescing
+                or self._wallet_lifecycle_transitioning
+            ):
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
+            self._active_wallet_mutations.add(permit)
 
     def exit_mutation(self, permit: str) -> bool:
         """Finish one exact guarded mutation permit."""
@@ -1140,10 +1201,36 @@ class MutationGate:
         if type(permit) is not str or not permit:
             return False
         with self._mutation_condition:
+            self._active_wallet_mutations.discard(permit)
             removed = self._active_mutations.pop(permit, None) is not None
             if removed:
                 self._mutation_condition.notify_all()
             return removed
+
+    def require_active_mutation_permit(self, permit: str, operation: str) -> None:
+        """Require that an exact permit still belongs to this runtime."""
+
+        safe_operation = _safe_operation(operation)
+        if type(permit) is not str or not permit:
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        with self._lock:
+            if permit not in self._active_mutations:
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+
+    def require_active_wallet_mutation_permit(
+        self, permit: str, operation: str
+    ) -> None:
+        """Require an exact active token registered for wallet lifecycle fencing."""
+
+        safe_operation = _safe_operation(operation)
+        if type(permit) is not str or not permit:
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        with self._lock:
+            if (
+                permit not in self._active_mutations
+                or permit not in self._active_wallet_mutations
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
 
     def begin_quiesce(self) -> None:
         """Deny new in-process mutations before shutdown drains existing work."""
@@ -1168,6 +1255,10 @@ class MutationGate:
     def active_mutation_count(self) -> int:
         with self._lock:
             return len(self._active_mutations)
+
+    def active_wallet_mutation_count(self) -> int:
+        with self._lock:
+            return len(self._active_wallet_mutations)
 
     @_stop_callback_boundary
     def trip(
@@ -1322,25 +1413,39 @@ class MutationGate:
 
     @_stop_callback_boundary
     def release_lease(self) -> dict[str, Any]:
-        self.stop_heartbeat()
         with self._lock:
-            version = self._lease_version
-            if version is None:
-                return {"released": False, "reason": "not_owned"}
-            try:
-                result = database.release_runtime_mutation_lease(
-                    owner_run_id=self.run_id,
-                    expected_lease_version=version,
-                    released_at=self._now(),
-                )
-                result = _lease_public_result(result)
-            except Exception:
-                result = {"released": False, "reason": "durable_state_unavailable"}
-            if result.get("released"):
-                self._lease_version = None
-            else:
-                self._set_local_block("LEASE_LOST")
-            return result
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                return {
+                    "released": False,
+                    "reason": "active_wallet_mutations",
+                }
+            self._wallet_lifecycle_transitioning = True
+        try:
+            self.stop_heartbeat()
+            with self._lock:
+                version = self._lease_version
+                if version is None:
+                    return {"released": False, "reason": "not_owned"}
+                try:
+                    result = database.release_runtime_mutation_lease(
+                        owner_run_id=self.run_id,
+                        expected_lease_version=version,
+                        released_at=self._now(),
+                    )
+                    result = _lease_public_result(result)
+                except Exception:
+                    result = {
+                        "released": False,
+                        "reason": "durable_state_unavailable",
+                    }
+                if result.get("released"):
+                    self._lease_version = None
+                else:
+                    self._set_local_block("LEASE_LOST")
+                return result
+        finally:
+            with self._lock:
+                self._wallet_lifecycle_transitioning = False
 
     @_stop_callback_boundary
     def issue_worker_delegation(
@@ -1682,17 +1787,29 @@ _worker_identity_last_observed_at_utc: Optional[str] = None
 _worker_wallet_identity_binding: Optional[WalletIdentityBinding] = None
 _worker_wallet_identity_digest: Optional[str] = None
 _worker_parent_lease_epoch: Optional[str] = None
+_worker_wallet_adapter_authorities: dict[int, tuple[WalletIdentityBinding, Any]] = {}
+_worker_authority_generation: Any = None
+_worker_active_wallet_mutations: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
 class WalletMutationPermit:
     mode: str
     permit: Optional[str] = None
+    runtime_authority: Any = None
+    authority_generation: Any = None
+    wallet_identity_binding: Optional[WalletIdentityBinding] = None
+    wallet_adapter_authority: Any = None
 
 
-def install_worker_authority_environment(environment: Mapping[str, str]) -> None:
+def install_worker_authority_environment(
+    environment: Mapping[str, str], *, wallet_adapter_authority: Any = None
+) -> None:
     """Retain a validated child delegation for fresh per-effect checks."""
 
+    with _worker_authority_lock:
+        if _worker_active_wallet_mutations:
+            raise MutationBlocked("MUTATION_SHUTTING_DOWN", "worker.install")
     result = validate_worker_environment(environment)
     if result.get("allowed") is not True:
         raise MutationBlocked("WORKER_DELEGATION_INVALID", "worker.install")
@@ -1707,6 +1824,7 @@ def install_worker_authority_environment(environment: Mapping[str, str]) -> None
                 identity_digest, wallet_identity_binding_digest(binding)
             )
             or type(parent_epoch) is not str
+            or wallet_adapter_authority is None
         ):
             raise ValueError("delegation has no complete wallet identity")
         _strict_utc_timestamp(parent_epoch, "parent_lease_epoch")
@@ -1728,26 +1846,62 @@ def install_worker_authority_environment(environment: Mapping[str, str]) -> None
         global _worker_identity_last_observed_at_utc
         global _worker_wallet_identity_binding, _worker_wallet_identity_digest
         global _worker_parent_lease_epoch
+        global _worker_authority_generation
+        if _worker_active_wallet_mutations:
+            raise MutationBlocked("MUTATION_SHUTTING_DOWN", "worker.install")
+        if _worker_authority_environment is not None:
+            installed_binding = _worker_wallet_identity_binding
+            registered = (
+                _worker_wallet_adapter_authorities.get(id(installed_binding))
+                if installed_binding is not None
+                else None
+            )
+            if (
+                type(_worker_authority_environment) is dict
+                and _worker_authority_environment == copied
+                and installed_binding == binding
+                and _worker_wallet_identity_digest == identity_digest
+                and _worker_parent_lease_epoch == parent_epoch
+                and type(registered) is tuple
+                and len(registered) == 2
+                and registered[0] is installed_binding
+                and registered[1] is wallet_adapter_authority
+            ):
+                return
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", "worker.install")
         _worker_authority_environment = copied
         _worker_authority_bound_at_utc = binding.bound_at_utc
         _worker_wallet_identity_binding = binding
         _worker_wallet_identity_digest = identity_digest
         _worker_parent_lease_epoch = parent_epoch
         _worker_identity_last_observed_at_utc = None
+        _worker_authority_generation = object()
+        _worker_wallet_adapter_authorities[id(binding)] = (
+            binding,
+            wallet_adapter_authority,
+        )
 
 
-def clear_worker_authority_environment() -> None:
+def clear_worker_authority_environment() -> bool:
     with _worker_authority_lock:
         global _worker_authority_environment, _worker_authority_bound_at_utc
         global _worker_identity_last_observed_at_utc
         global _worker_wallet_identity_binding, _worker_wallet_identity_digest
         global _worker_parent_lease_epoch
+        global _worker_authority_generation
+        if _worker_active_wallet_mutations:
+            return False
+        binding = _worker_wallet_identity_binding
         _worker_authority_environment = None
         _worker_authority_bound_at_utc = None
         _worker_wallet_identity_binding = None
         _worker_wallet_identity_digest = None
         _worker_parent_lease_epoch = None
         _worker_identity_last_observed_at_utc = None
+        _worker_authority_generation = None
+        if binding is not None:
+            _worker_wallet_adapter_authorities.pop(id(binding), None)
+        return True
 
 
 def worker_identity_lease_binding() -> Optional[dict[str, Any]]:
@@ -1798,33 +1952,193 @@ def worker_identity_lease_binding() -> Optional[dict[str, Any]]:
         }
 
 
+def worker_wallet_adapter_authority(candidate: Any, operation: str) -> Any:
+    """Return the installed worker adapter only while delegation proof is fresh."""
+
+    lease_binding = worker_identity_lease_binding()
+    if lease_binding is None:
+        raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+    binding = lease_binding["binding"]
+    with _worker_authority_lock:
+        registered = _worker_wallet_adapter_authorities.get(id(binding))
+        if (
+            type(registered) is not tuple
+            or len(registered) != 2
+            or registered[0] is not binding
+            or registered[1] is not candidate
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        return registered[1]
+
+
 def enter_wallet_mutation(operation: str) -> WalletMutationPermit:
     """Enter either an owned-runtime or delegated-worker mutation boundary."""
 
-    runtime = current_runtime()
-    if runtime is not None:
-        runtime.require_wallet_identity_authority(operation)
-        return WalletMutationPermit("runtime", runtime.enter_mutation(operation))
+    with _runtime_lock:
+        runtime = _runtime
+        if runtime is not None:
+            binding = runtime.require_wallet_identity_authority(operation)
+            authority = _registered_owner_identity_authority(runtime)
+            if (
+                type(authority) is not _OwnerIdentityAuthority
+                or authority.binding is not binding
+                or authority.wallet_adapter_authority is None
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            token = runtime.enter_mutation(operation)
+            try:
+                runtime.register_wallet_mutation_permit(token, operation)
+            except Exception:
+                runtime.exit_mutation(token)
+                raise
+            result = WalletMutationPermit(
+                "runtime",
+                token,
+                runtime,
+                authority,
+                binding,
+                authority.wallet_adapter_authority,
+            )
+        else:
+            result = None
+    if result is not None:
+        try:
+            require_wallet_mutation_permit_authority(result, operation)
+        except Exception:
+            runtime.exit_mutation(token)
+            raise
+        return result
     with _worker_authority_lock:
         environment = (
             dict(_worker_authority_environment)
             if _worker_authority_environment is not None
             else None
         )
+        generation = _worker_authority_generation
+        binding = _worker_wallet_identity_binding
+        registered = (
+            _worker_wallet_adapter_authorities.get(id(binding))
+            if binding is not None
+            else None
+        )
     if environment is None:
         raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
     require_worker_allowed_from_environment(operation, environment)
-    return WalletMutationPermit("worker")
+    with _worker_authority_lock:
+        if (
+            generation is None
+            or generation is not _worker_authority_generation
+            or binding is not _worker_wallet_identity_binding
+            or type(registered) is not tuple
+            or len(registered) != 2
+            or registered[0] is not binding
+            or registered[1] is None
+            or _worker_authority_environment != environment
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        token = str(uuid.uuid4())
+        _worker_active_wallet_mutations[token] = generation
+    return WalletMutationPermit(
+        "worker",
+        permit=token,
+        authority_generation=generation,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=registered[1],
+    )
+
+
+def require_wallet_mutation_permit_authority(
+    permit: Any, operation: str
+) -> tuple[WalletIdentityBinding, Any]:
+    """Revalidate one exact owner/worker authority generation."""
+
+    if (
+        type(permit) is not WalletMutationPermit
+        or type(permit.permit) is not str
+        or not permit.permit
+        or type(permit.wallet_identity_binding) is not WalletIdentityBinding
+        or permit.wallet_adapter_authority is None
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    if permit.mode == "runtime":
+        runtime = permit.runtime_authority
+        authority = permit.authority_generation
+        if (
+            type(runtime) is not MutationGate
+            or type(authority) is not _OwnerIdentityAuthority
+            or current_runtime() is not runtime
+            or _registered_owner_identity_authority(runtime) is not authority
+            or authority.binding is not permit.wallet_identity_binding
+            or authority.wallet_adapter_authority is not permit.wallet_adapter_authority
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        runtime.require_active_wallet_mutation_permit(permit.permit, operation)
+        runtime.require_wallet_identity_authority(operation)
+        runtime.require_wallet_adapter_authority(
+            permit.wallet_adapter_authority, operation
+        )
+        runtime.require_allowed(operation)
+        return permit.wallet_identity_binding, permit.wallet_adapter_authority
+    if permit.mode != "worker" or permit.runtime_authority is not None:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    with _worker_authority_lock:
+        generation = _worker_authority_generation
+        binding = _worker_wallet_identity_binding
+        registered = (
+            _worker_wallet_adapter_authorities.get(id(binding))
+            if binding is not None
+            else None
+        )
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+        if (
+            generation is None
+            or generation is not permit.authority_generation
+            or binding is not permit.wallet_identity_binding
+            or type(registered) is not tuple
+            or len(registered) != 2
+            or registered[0] is not binding
+            or registered[1] is not permit.wallet_adapter_authority
+            or _worker_active_wallet_mutations.get(permit.permit)
+            is not permit.authority_generation
+            or environment is None
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    require_worker_allowed_from_environment(operation, environment)
+    with _worker_authority_lock:
+        if (
+            generation is not _worker_authority_generation
+            or binding is not _worker_wallet_identity_binding
+            or _worker_active_wallet_mutations.get(permit.permit)
+            is not permit.authority_generation
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    return permit.wallet_identity_binding, permit.wallet_adapter_authority
 
 
 def exit_wallet_mutation(permit: Any) -> bool:
     if type(permit) is not WalletMutationPermit:
         return False
     if permit.mode == "worker":
-        return True
-    if permit.mode != "runtime" or permit.permit is None:
+        with _worker_authority_lock:
+            if (
+                type(permit.permit) is not str
+                or _worker_active_wallet_mutations.get(permit.permit)
+                is not permit.authority_generation
+            ):
+                return False
+            _worker_active_wallet_mutations.pop(permit.permit, None)
+            return True
+    if (
+        permit.mode != "runtime"
+        or permit.permit is None
+        or type(permit.runtime_authority) is not MutationGate
+    ):
         return False
-    return exit_mutation(permit.permit)
+    return permit.runtime_authority.exit_mutation(permit.permit)
 
 
 def require_fresh_wallet_identity(
@@ -1886,6 +2200,7 @@ def initialize(
     start_heartbeat: bool = True,
     acquire_lease: bool = True,
     wallet_identity_binding: Optional[WalletIdentityBinding] = None,
+    wallet_adapter_authority: Any = None,
 ) -> MutationGate:
     global _runtime
     with _runtime_lock:
@@ -1902,6 +2217,7 @@ def initialize(
                 and previous.network == network
                 and previous.lease_seconds == lease_seconds
                 and previous.wallet_identity_binding == wallet_identity_binding
+                and previous._wallet_adapter_authority is wallet_adapter_authority
                 and (run_id is None or previous.run_id == run_id)
             )
             if not same_binding:
@@ -1933,6 +2249,7 @@ def initialize(
             lease_seconds=lease_seconds,
             read_only=not acquire_lease,
             wallet_identity_binding=wallet_identity_binding,
+            wallet_adapter_authority=wallet_adapter_authority,
         )
         if acquire_lease:
             gate.acquire()
@@ -2014,6 +2331,11 @@ def shutdown_runtime(*, release_owned_lease: bool = False) -> dict[str, Any]:
     global _runtime
     with _runtime_lock:
         runtime = _runtime
+        if runtime is not None and runtime.active_wallet_mutation_count() > 0:
+            return {
+                "released": False,
+                "reason": "active_wallet_mutations",
+            }
         _runtime = None
     if runtime is None:
         return {"released": False, "reason": "not_initialized"}
@@ -2056,6 +2378,7 @@ __all__ = [
     "release_resolved",
     "require_allowed",
     "require_fresh_wallet_identity",
+    "require_wallet_mutation_permit_authority",
     "require_worker_allowed_from_environment",
     "shutdown_runtime",
     "status",
@@ -2066,4 +2389,5 @@ __all__ = [
     "wallet_identity_binding_digest",
     "wallet_identity_binding_payload",
     "worker_identity_lease_binding",
+    "worker_wallet_adapter_authority",
 ]

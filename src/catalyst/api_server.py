@@ -174,7 +174,7 @@ _SPACESCAN_PUBLIC_PLANS = {
 intercept_log_event()
 
 from bot_loop import BotLoop
-from wallet import get_wallet_type
+from wallet import get_wallet_adapter_authority, get_wallet_type
 
 # ---- Super Log: hook ALL module methods for complete visibility ----
 try:
@@ -1325,6 +1325,7 @@ def initialize_mutation_runtime(
             wallet_fingerprint_hash=wallet_hash,
             network=network,
             wallet_identity_binding=wallet_identity_binding,
+            wallet_adapter_authority=get_wallet_adapter_authority(),
             start_heartbeat=start_heartbeat,
             acquire_lease=acquire_lease,
         )
