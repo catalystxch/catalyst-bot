@@ -150,7 +150,7 @@ def _configure_linux_webengine_env() -> None:
 def _initial_desktop_url() -> str:
     """Return the first URL shown in the native desktop window."""
     flask_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
-    if sys.platform.startswith("linux"):
+    if sys.platform.startswith("linux") or FLASK_PORT != 5000:
         return flask_url
 
     splash_path = _bundle_path("splash.html")
@@ -616,9 +616,10 @@ def _release_instance_lock() -> bool:
     return True
 
 
-def _open_existing_instance_in_browser() -> None:
-    """Bring the already-running instance forward when our own start was rejected."""
-    _app_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+def _open_existing_instance_in_browser(port: int) -> None:
+    """Open this non-owner process's exact read-only diagnostics endpoint."""
+
+    _app_url = f"http://{FLASK_HOST}:{int(port)}/"
     print(f"\n  {APP_NAME} is already running — opening {_app_url}", flush=True)
     try:
         import webbrowser
@@ -756,7 +757,30 @@ def wait_for_flask(timeout: float = 15.0) -> bool:
     return False
 
 
-def start_flask_server():
+def _reserve_owner_server_port():
+    """Reserve and publish the exact loopback port selected by this owner."""
+
+    import read_only_diagnostics
+
+    global FLASK_PORT
+    reservation = read_only_diagnostics.reserve_loopback_port(FLASK_PORT)
+    FLASK_PORT = reservation.port
+    os.environ["CATALYST_FLASK_PORT"] = str(FLASK_PORT)
+    return reservation
+
+
+def _start_owned_runtime_services() -> None:
+    """Start owner-only services after the HTTP socket is safely reserved."""
+
+    import api_server
+
+    authorization = api_server.initialize_mutation_runtime()
+    if not authorization.get("allowed"):
+        raise RuntimeError("mutation lease was lost before server startup")
+    api_server._start_owned_runtime_services(authorization)
+
+
+def start_flask_server(reservation):
     """
     Start the Flask API server in the current thread.
     This runs in a daemon thread so it dies when the main process exits.
@@ -809,13 +833,7 @@ def start_flask_server():
         f"Desktop app v{APP_VERSION} starting Flask on port {FLASK_PORT}",
     )
 
-    api_server.app.run(
-        host=FLASK_HOST,
-        port=FLASK_PORT,
-        debug=False,
-        threaded=True,
-        use_reloader=False,  # Important: don't use reloader in desktop mode
-    )
+    api_server._serve_flask_app_on_reservation(reservation)
 
 
 def run_desktop_mode(dev_mode: bool = False):
@@ -840,34 +858,38 @@ def run_desktop_mode(dev_mode: bool = False):
     print(f"\n  {APP_NAME} v{APP_VERSION}")
     print(f"  {'=' * 40}")
 
-    # Check port — if our app is already running, open it in the browser
-    # instead of showing an error and quitting.
-    if not check_port_free(FLASK_PORT):
-        _app_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
-        print(f"\n  {APP_NAME} is already running — opening {_app_url}")
-        try:
-            import webbrowser
-
-            webbrowser.open(_app_url)
-        except Exception:
-            pass
-        if _CONSOLE_HIDDEN or _under_pythonw:
-            # Only show dialog if browser open fails silently (edge case)
-            pass
-        sys.exit(0)
+    reservation = None
+    try:
+        reservation = _reserve_owner_server_port()
+        _start_owned_runtime_services()
+    except BaseException:
+        if reservation is not None:
+            reservation.release()
+        _cleanup()
+        raise
 
     # Start Flask in background thread
     print(f"  Starting Flask server on port {FLASK_PORT}...")
-    flask_thread = threading.Thread(
-        target=start_flask_server, daemon=True, name="FlaskServer"
-    )
-    flask_thread.start()
+    try:
+        flask_thread = threading.Thread(
+            target=start_flask_server,
+            args=(reservation,),
+            daemon=True,
+            name="FlaskServer",
+        )
+        flask_thread.start()
+    except BaseException:
+        reservation.release()
+        _cleanup()
+        raise
 
     # Wait for Flask to be ready
     print("  Waiting for Flask to accept connections...")
     if not wait_for_flask(timeout=20.0):
         print("\n  ERROR: Flask didn't start within 20 seconds.")
         print("  Check the console output above for errors.")
+        reservation.release()
+        _cleanup()
         sys.exit(1)
 
     print("  Flask is ready.")
@@ -1129,14 +1151,20 @@ def run_desktop_mode(dev_mode: bool = False):
 
 def run_flask_mode():
     """Fallback: run as plain Flask server (like v3)."""
+    reservation = None
+    try:
+        reservation = _reserve_owner_server_port()
+        _start_owned_runtime_services()
+    except BaseException:
+        if reservation is not None:
+            reservation.release()
+        _cleanup()
+        raise
+
     print(f"\n  {APP_NAME} v{APP_VERSION} - Flask Mode")
     print(f"  {'=' * 40}")
     print(f"  Open http://{FLASK_HOST}:{FLASK_PORT}/ in your browser")
     print("  Press Ctrl+C to stop\n")
-
-    if not check_port_free(FLASK_PORT):
-        print(f"  Port {FLASK_PORT} is already in use!")
-        sys.exit(1)
 
     # Register signal handlers — must call sys.exit() so Werkzeug's
     # serve_forever() loop actually terminates after cleanup.
@@ -1144,35 +1172,33 @@ def run_flask_mode():
         _cleanup()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _flask_shutdown)
-    signal.signal(signal.SIGTERM, _flask_shutdown)
-    if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _flask_shutdown)
+    try:
+        signal.signal(signal.SIGINT, _flask_shutdown)
+        signal.signal(signal.SIGTERM, _flask_shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _flask_shutdown)
+        start_flask_server(reservation)
+    finally:
+        reservation.release()
+        _cleanup()
 
-    start_flask_server()
 
+def _reserve_diagnostics_server_port():
+    """Atomically reserve a nearby port without claiming owner authority."""
 
-def _find_available_diagnostics_port(preferred: int) -> int:
-    """Return a nearby loopback port for a non-owning diagnostic server."""
+    import read_only_diagnostics
 
-    preferred = _normalize_flask_port(preferred)
-    candidate_ranges = (
-        range(preferred + 1, min(65536, preferred + 51)),
-        range(preferred - 1, max(0, preferred - 51), -1),
+    return read_only_diagnostics.reserve_loopback_port(
+        FLASK_PORT, include_preferred=False
     )
-    for candidates in candidate_ranges:
-        for candidate in candidates:
-            if check_port_free(candidate):
-                return candidate
-    raise RuntimeError("no loopback diagnostics port is available")
 
 
-def run_read_only_diagnostics_mode(port: int) -> None:
+def run_read_only_diagnostics_mode(reservation, *, ready_callback=None) -> None:
     """Serve diagnostics without constructing the bot or acquiring a lease."""
 
     import read_only_diagnostics
 
-    read_only_diagnostics.serve(int(port))
+    read_only_diagnostics.serve(reservation=reservation, ready_callback=ready_callback)
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1492,6 @@ def _initialize_startup_ownership() -> dict:
     import api_server
 
     authorization = api_server.initialize_mutation_runtime()
-    api_server._start_owned_runtime_services(authorization)
     return authorization
 
 
@@ -1537,9 +1562,13 @@ def main(argv=None):
     # stdlib-only preflight cannot create/migrate SQLite or import user_paths.
     if not _authorize_desktop_startup():
         _release_instance_lock()
-        _open_existing_instance_in_browser()
-        diagnostics_port = _find_available_diagnostics_port(FLASK_PORT)
-        run_read_only_diagnostics_mode(diagnostics_port)
+        diagnostics_reservation = _reserve_diagnostics_server_port()
+        run_read_only_diagnostics_mode(
+            diagnostics_reservation,
+            ready_callback=lambda: _open_existing_instance_in_browser(
+                diagnostics_reservation.port
+            ),
+        )
         return 0
 
     # Cross-process singleton: only ONE desktop_app may run at a time.
@@ -1593,6 +1622,7 @@ def main(argv=None):
             run_desktop_mode(dev_mode=args.dev)
         return 0
     except Exception as e:
+        _cleanup()
         # Log crash to file so we can diagnose even if console is hidden.
         # The crash log lives under the user data directory so it's
         # writable regardless of install location.

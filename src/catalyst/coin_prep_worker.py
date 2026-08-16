@@ -94,6 +94,18 @@ def _local_api_headers() -> dict:
     return headers
 
 
+def _local_api_log_url() -> str:
+    """Return the exact loopback API selected by the owning parent process."""
+
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        port = 5000
+    if not 1 <= port <= 65535:
+        port = 5000
+    return f"http://127.0.0.1:{port}/api/log"
+
+
 def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
     """Validate the exact parent/run scope before constructing the worker."""
 
@@ -421,7 +433,7 @@ class ApiMirrorStream:
             import requests as _req
 
             _req.post(
-                "http://localhost:5000/api/log",
+                _local_api_log_url(),
                 json={
                     "severity": self.severity,
                     "event_type": self.event_type,
@@ -2146,7 +2158,7 @@ class CoinPrepWorker:
             if session is not None:
                 try:
                     session.post(
-                        "http://localhost:5000/api/log",
+                        _local_api_log_url(),
                         json=payload,
                         headers=_local_api_headers(),
                         timeout=_API_LOG_POST_TIMEOUT_S,

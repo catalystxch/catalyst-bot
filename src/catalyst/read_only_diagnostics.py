@@ -43,6 +43,126 @@ def database_path() -> Path:
     return _data_directory() / "bot.db"
 
 
+def _normalized_loopback_port(value: int | str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 5000
+    return port if 1 <= port <= 65535 else 5000
+
+
+def _candidate_loopback_ports(
+    preferred_port: int | str,
+    *,
+    include_preferred: bool,
+    search_limit: int,
+):
+    preferred = _normalized_loopback_port(preferred_port)
+    limit = max(0, min(65534, int(search_limit)))
+    if include_preferred:
+        yield preferred
+    for offset in range(1, limit + 1):
+        upper = preferred + offset
+        lower = preferred - offset
+        if upper <= 65535:
+            yield upper
+        if lower >= 1:
+            yield lower
+
+
+class LoopbackPortReservation:
+    """Own one bound/listening loopback socket until its server takes over."""
+
+    def __init__(self, handle):
+        self._handle = handle
+        self.port = int(handle.getsockname()[1])
+        self._listening = False
+
+    def fileno(self) -> int:
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError("loopback port reservation is released")
+        return int(handle.fileno())
+
+    def release(self) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        self._handle = None
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return True
+
+    def listen(self) -> None:
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError("loopback port reservation is released")
+        if not self._listening:
+            handle.listen(socket.SOMAXCONN)
+            self._listening = True
+
+    def into_http_server(self, handler):
+        """Transfer this exact listening socket to a stdlib HTTP server."""
+
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError("loopback port reservation is released")
+        try:
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", self.port), handler, bind_and_activate=False
+            )
+        except BaseException:
+            self.release()
+            raise
+        try:
+            server.socket.close()
+            self.listen()
+            self._handle = None
+            server.socket = handle
+            server.server_address = handle.getsockname()
+            server.server_name = "localhost"
+            server.server_port = self.port
+            return server
+        except BaseException:
+            try:
+                server.server_close()
+            except BaseException:
+                pass
+            self.release()
+            raise
+
+
+def reserve_loopback_port(
+    preferred_port: int | str,
+    *,
+    include_preferred: bool = True,
+    search_limit: int = 50,
+) -> LoopbackPortReservation:
+    """Atomically reserve a bounded preferred/upper/lower loopback port."""
+
+    for candidate in _candidate_loopback_ports(
+        preferred_port,
+        include_preferred=bool(include_preferred),
+        search_limit=search_limit,
+    ):
+        handle = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                handle.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            if hasattr(handle, "set_inheritable"):
+                handle.set_inheritable(False)
+            handle.bind(("127.0.0.1", candidate))
+            return LoopbackPortReservation(handle)
+        except OSError:
+            handle.close()
+        except Exception:
+            handle.close()
+            raise
+    raise RuntimeError("no loopback server port is available")
+
+
 def _canonical_data_directory(data_dir: str | os.PathLike[str] | None = None) -> str:
     """Return one stable identity for aliases of the same CATalyst data path."""
 
@@ -478,13 +598,26 @@ def _handler(database: Path):
     return Handler
 
 
-def serve(port: int, path: Path | None = None) -> None:
-    safe_port = int(port)
-    if not 1 <= safe_port <= 65535:
-        raise ValueError("diagnostics port is out of range")
+def serve(
+    port: int | None = None,
+    path: Path | None = None,
+    *,
+    reservation: LoopbackPortReservation | None = None,
+    ready_callback=None,
+) -> None:
+    if reservation is None:
+        if port is None:
+            raise ValueError("diagnostics port is required")
+        reservation = reserve_loopback_port(port, search_limit=0)
     target = Path(path) if path is not None else database_path()
-    server = ThreadingHTTPServer(("127.0.0.1", safe_port), _handler(target))
     try:
+        server = reservation.into_http_server(_handler(target))
+    except BaseException:
+        reservation.release()
+        raise
+    try:
+        if ready_callback is not None:
+            ready_callback()
         server.serve_forever(poll_interval=0.2)
     finally:
         server.server_close()

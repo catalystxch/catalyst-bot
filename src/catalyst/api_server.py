@@ -42,7 +42,6 @@ if __name__ == "__main__":
     sys.modules.setdefault("api_server", sys.modules[__name__])
 
     import atexit as _early_atexit
-    import socket as _early_socket
     import read_only_diagnostics as _early_diagnostics
 
     _early_startup_arbiter = _early_diagnostics.acquire_startup_arbiter()
@@ -58,32 +57,14 @@ if __name__ == "__main__":
             _early_preferred_port = 5000
         if not 1 <= _early_preferred_port <= 65535:
             _early_preferred_port = 5000
-        _early_selected_port = None
-        _early_candidates = list(
-            range(
-                _early_preferred_port + 1,
-                min(65536, _early_preferred_port + 51),
+        try:
+            _early_reservation = _early_diagnostics.reserve_loopback_port(
+                _early_preferred_port,
+                include_preferred=False,
             )
-        )
-        if not _early_candidates:
-            _early_candidates = list(
-                range(max(1, _early_preferred_port - 50), _early_preferred_port)
-            )
-        for _early_candidate in _early_candidates:
-            _early_sock = _early_socket.socket(
-                _early_socket.AF_INET, _early_socket.SOCK_STREAM
-            )
-            try:
-                _early_sock.bind(("127.0.0.1", _early_candidate))
-                _early_selected_port = _early_candidate
-                break
-            except OSError:
-                continue
-            finally:
-                _early_sock.close()
-        if _early_selected_port is None:
+        except Exception:
             raise SystemExit(1)
-        _early_diagnostics.serve(_early_selected_port)
+        _early_diagnostics.serve(reservation=_early_reservation)
         raise SystemExit(0)
 
 import database
@@ -4197,29 +4178,49 @@ def _configured_flask_port() -> int:
     return port if 1 <= port <= 65535 else 5000
 
 
-def _loopback_port_is_available(port: int) -> bool:
-    import socket
+def _build_flask_server_on_reservation(reservation):
+    """Build Werkzeug around the exact pre-bound socket without a bind gap."""
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    from werkzeug.serving import make_server
+
+    server = None
     try:
-        sock.bind(("127.0.0.1", int(port)))
-        return True
-    except OSError:
-        return False
+        server = make_server(
+            "127.0.0.1",
+            int(reservation.port),
+            app,
+            threaded=True,
+            fd=reservation.fileno(),
+        )
+        server.server_activate()
+    except BaseException:
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        reservation.release()
+        raise
+    reservation.release()
+    return server
+
+
+def _serve_flask_app_on_reservation(reservation) -> None:
+    server = _build_flask_server_on_reservation(reservation)
+    try:
+        server.serve_forever()
     finally:
-        sock.close()
+        server.server_close()
 
 
-def _select_standalone_server_mode(preferred_port: int) -> tuple[int, bool]:
-    """Choose a free port without changing durable ownership authority."""
+def _reserve_standalone_server_port(preferred_port: int):
+    """Atomically select the preferred or nearest bounded owner port."""
 
-    preferred = int(preferred_port)
-    if _loopback_port_is_available(preferred):
-        return preferred, False
-    for candidate in range(preferred + 1, min(65536, preferred + 51)):
-        if _loopback_port_is_available(candidate):
-            return candidate, False
-    raise RuntimeError("no loopback server port is available")
+    import read_only_diagnostics
+
+    return read_only_diagnostics.reserve_loopback_port(
+        preferred_port, include_preferred=True
+    )
 
 
 def _read_only_diagnostics_shutdown(_signum, _frame) -> None:
@@ -4229,7 +4230,7 @@ def _read_only_diagnostics_shutdown(_signum, _frame) -> None:
     raise SystemExit(0)
 
 
-def _serve_read_only_diagnostics(port: int) -> None:
+def _serve_read_only_diagnostics(reservation) -> None:
     """Serve a fail-closed view using only the existing database in read-only mode."""
 
     global _read_only_diagnostics_active
@@ -4240,17 +4241,15 @@ def _serve_read_only_diagnostics(port: int) -> None:
         slog(
             "SAFETY",
             "Read-only diagnostics server starting",
-            {"port": int(port), "reason_code": "DIAGNOSTICS_READ_ONLY"},
+            {
+                "port": int(reservation.port),
+                "reason_code": "DIAGNOSTICS_READ_ONLY",
+            },
             level="warning",
         )
-        app.run(
-            host="127.0.0.1",
-            port=int(port),
-            debug=False,
-            threaded=True,
-            use_reloader=False,
-        )
+        _serve_flask_app_on_reservation(reservation)
     finally:
+        reservation.release()
         _read_only_diagnostics_active = previous_mode
         release_mutation_runtime()
 
@@ -4260,63 +4259,43 @@ if __name__ == "__main__":
     print("  CATalyst V2 - The Smart One")
     print("=" * 60)
 
+    _reservation = None
     try:
         init_database()
         _startup_authorization = initialize_mutation_runtime()
-        _start_owned_runtime_services(_startup_authorization)
     except Exception:
         _startup_authorization = {
             "allowed": False,
             "reason_code": "DURABLE_STATE_UNAVAILABLE",
         }
+    try:
+        _reservation = _reserve_standalone_server_port(_configured_flask_port())
+    except Exception:
+        if _startup_authorization.get("allowed"):
+            quiesce_and_release_mutation_runtime(bot_instance=None)
+        raise
     finally:
         _early_startup_arbiter.release()
 
-    # Confirm the selected normal/diagnostic port is not unexpectedly occupied.
-    import socket as _socket
-
-    _requested_port = _configured_flask_port()
-    _port, _diagnostics_only = _select_standalone_server_mode(_requested_port)
     if not _startup_authorization.get("allowed"):
         signal.signal(signal.SIGINT, _read_only_diagnostics_shutdown)
         signal.signal(signal.SIGTERM, _read_only_diagnostics_shutdown)
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, _read_only_diagnostics_shutdown)
-        _early_diagnostics.serve(_port)
+        _early_diagnostics.serve(reservation=_reservation)
         sys.exit(0)
-    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    try:
-        _sock.settimeout(1)
-        _sock.connect(("127.0.0.1", _port))
-        _sock.close()
-        # Port is in use — another instance is running
-        print(f"\n  ⚠️  Port {_port} is already in use!")
-        print("  Another bot instance appears to be running.")
-        print("  Please close the other instance first (Ctrl+C in its terminal),")
-        print("  or kill it via Task Manager (look for 'python api_server.py').")
-        print("\n  Exiting to avoid running multiple instances.\n")
-        sys.exit(1)
-    except (ConnectionRefusedError, OSError, _socket.timeout):
-        pass  # Port is free — good to go
-    finally:
-        try:
-            _sock.close()
-        except Exception:
-            pass
+
+    _port = int(_reservation.port)
+    os.environ["CATALYST_FLASK_PORT"] = str(_port)
+    _start_owned_runtime_services(_startup_authorization)
 
     # A non-owner diagnostic process must never stop shared wallet services.
-    _shutdown_handler = (
-        _read_only_diagnostics_shutdown if _diagnostics_only else _graceful_shutdown
-    )
+    _shutdown_handler = _graceful_shutdown
     signal.signal(signal.SIGINT, _shutdown_handler)  # Ctrl+C
     signal.signal(signal.SIGTERM, _shutdown_handler)  # kill / task manager
     # SIGBREAK is Windows-only (terminal close / Ctrl+Break)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _shutdown_handler)
-
-    if _diagnostics_only:
-        _serve_read_only_diagnostics(_port)
-        sys.exit(0)
 
     # One-shot migration: mark all currently-designated reserve coins as
     # already-advised. Earlier coin-prep runs designated these coins but
@@ -4410,4 +4389,9 @@ if __name__ == "__main__":
 
     log_event("info", "server_started", f"API server starting on port {_port}")
 
-    app.run(host="127.0.0.1", port=_port, debug=False, threaded=True)
+    try:
+        _serve_flask_app_on_reservation(_reservation)
+    except BaseException:
+        _reservation.release()
+        quiesce_and_release_mutation_runtime()
+        raise

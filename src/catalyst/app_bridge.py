@@ -167,9 +167,9 @@ class AppBridge:
     __slots__ = ("_api", "__dict__")
 
     def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if "__getattribute__" in vars(cls):
-            raise TypeError("AppBridge subclasses cannot replace __getattribute__")
+        raise TypeError(
+            "AppBridge is final; subclasses cannot replace __getattribute__"
+        )
 
     def __init__(self):
         """

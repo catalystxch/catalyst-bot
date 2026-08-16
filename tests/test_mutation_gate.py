@@ -1411,16 +1411,6 @@ def test_appbridge_callable_markers_and_dynamic_descriptors_cannot_spoof_trust(
         return {"success": True}
 
     marked_read_only._bridge_access = "read_only"
-    monkeypatch.setattr(
-        app_bridge.AppBridge, "future_marked_read", marked_read_only, raising=False
-    )
-
-    class OverrideBridge(app_bridge.AppBridge):
-        def get_status(self):
-            writes.append("subclass-override")
-            return {"success": True}
-
-    OverrideBridge.get_status._bridge_access = "control"
 
     class HostileCallable:
         def __init__(self, label):
@@ -1439,31 +1429,12 @@ def test_appbridge_callable_markers_and_dynamic_descriptors_cannot_spoof_trust(
         def __get__(self, _instance, _owner):
             return HostileCallable("descriptor")
 
-    class DescriptorBridge(app_bridge.AppBridge):
-        future_descriptor = HostileDescriptor()
-
     @wraps(app_bridge.AppBridge.get_status)
     def spoofing_wrapper(_self):
         writes.append("wrapper")
         return {"success": True}
 
     spoofing_wrapper._bridge_access = "read_only"
-
-    class WrapperBridge(app_bridge.AppBridge):
-        get_status = spoofing_wrapper
-
-    bridges_and_calls = []
-    ordinary = app_bridge.AppBridge()
-    bridges_and_calls.append((ordinary, lambda: ordinary.future_marked_read()))
-    override = OverrideBridge()
-    bridges_and_calls.append((override, override.get_status))
-    dynamic = app_bridge.AppBridge()
-    dynamic.future_dynamic = HostileCallable("instance-dynamic")
-    bridges_and_calls.append((dynamic, dynamic.future_dynamic))
-    descriptor = DescriptorBridge()
-    bridges_and_calls.append((descriptor, descriptor.future_descriptor))
-    wrapper = WrapperBridge()
-    bridges_and_calls.append((wrapper, wrapper.get_status))
 
     monkeypatch.setattr(
         mutation_gate,
@@ -1477,9 +1448,27 @@ def test_appbridge_callable_markers_and_dynamic_descriptors_cannot_spoof_trust(
         mutation_gate=mutation_gate,
     )
     results = []
-    for bridge, call in bridges_and_calls:
-        bridge._api = fake_api
-        results.append(call())
+
+    class_cases = (
+        ("future_marked_read", marked_read_only),
+        (
+            "get_status",
+            lambda _self: writes.append("class-override") or {"success": True},
+        ),
+        ("future_descriptor", HostileDescriptor()),
+        ("get_status", spoofing_wrapper),
+    )
+    for name, value in class_cases:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(app_bridge.AppBridge, name, value, raising=False)
+            bridge = app_bridge.AppBridge()
+            bridge._api = fake_api
+            results.append(getattr(bridge, name)())
+
+    dynamic = app_bridge.AppBridge()
+    dynamic._api = fake_api
+    dynamic.future_dynamic = HostileCallable("instance-dynamic")
+    results.append(dynamic.future_dynamic())
 
     assert all(result["reason"] == "LEASE_OWNED_BY_OTHER" for result in results)
     assert writes == []
@@ -1497,9 +1486,6 @@ def test_untrusted_appbridge_descriptor_cannot_execute_before_mutation_permit(
             writes.append("descriptor-get")
             return lambda: writes.append("descriptor-call") or {"success": True}
 
-    class DescriptorBridge(app_bridge.AppBridge):
-        future_descriptor = EvilDescriptor()
-
     monkeypatch.setattr(
         mutation_gate,
         "enter_mutation",
@@ -1507,7 +1493,13 @@ def test_untrusted_appbridge_descriptor_cannot_execute_before_mutation_permit(
             mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
         ),
     )
-    bridge = DescriptorBridge()
+    monkeypatch.setattr(
+        app_bridge.AppBridge,
+        "future_descriptor",
+        EvilDescriptor(),
+        raising=False,
+    )
+    bridge = app_bridge.AppBridge()
     app_bridge._APP_BRIDGE_API_SLOT.__set__(
         bridge,
         SimpleNamespace(
@@ -1539,12 +1531,9 @@ def test_appbridge_private_api_descriptor_cannot_execute_before_mutation_permit(
         def __set__(self, instance, value):
             object.__getattribute__(instance, "__dict__")["_api"] = value
 
-    class DescriptorBridge(app_bridge.AppBridge):
-        _api = PrivateApiDescriptor()
-
-        def future_write(self):
-            writes.append("future-write")
-            return {"success": True}
+    def future_write(_self):
+        writes.append("future-write")
+        return {"success": True}
 
     monkeypatch.setattr(
         mutation_gate,
@@ -1553,7 +1542,11 @@ def test_appbridge_private_api_descriptor_cannot_execute_before_mutation_permit(
             mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
         ),
     )
-    bridge = DescriptorBridge()
+    monkeypatch.setattr(app_bridge.AppBridge, "_api", PrivateApiDescriptor())
+    monkeypatch.setattr(
+        app_bridge.AppBridge, "future_write", future_write, raising=False
+    )
+    bridge = app_bridge.AppBridge()
     app_bridge._APP_BRIDGE_API_SLOT.__set__(
         bridge,
         SimpleNamespace(
@@ -1577,10 +1570,9 @@ def test_missing_appbridge_attribute_getattr_runs_only_inside_mutation_permit(
 
     writes = []
 
-    class MissingBridge(app_bridge.AppBridge):
-        def __getattr__(self, name):
-            writes.append(f"getattr:{name}")
-            return lambda: writes.append("call") or {"success": True}
+    def hostile_getattr(_self, name):
+        writes.append(f"getattr:{name}")
+        return lambda: writes.append("call") or {"success": True}
 
     monkeypatch.setattr(
         mutation_gate,
@@ -1589,7 +1581,10 @@ def test_missing_appbridge_attribute_getattr_runs_only_inside_mutation_permit(
             mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
         ),
     )
-    bridge = MissingBridge()
+    monkeypatch.setattr(
+        app_bridge.AppBridge, "__getattr__", hostile_getattr, raising=False
+    )
+    bridge = app_bridge.AppBridge()
     bridge._api = SimpleNamespace(
         _ensure_mutation_runtime=lambda: None,
         mutation_gate=mutation_gate,
@@ -1611,6 +1606,31 @@ def test_appbridge_subclass_cannot_replace_enforcement_hook():
         class BypassBridge(app_bridge.AppBridge):
             def __getattribute__(self, name):
                 return lambda: {"success": True, "name": name}
+
+
+def test_appbridge_hostile_metaclass_cannot_install_late_enforcement_bypass():
+    import app_bridge
+
+    writes = []
+
+    class LateBypassMeta(type):
+        def __new__(metaclass, name, bases, namespace):
+            subclass = super().__new__(metaclass, name, bases, namespace)
+
+            def bypass(_self, attribute):
+                if attribute == "future_write":
+                    return lambda: writes.append("write") or {"success": True}
+                return object.__getattribute__(_self, attribute)
+
+            type.__setattr__(subclass, "__getattribute__", bypass)
+            return subclass
+
+    with pytest.raises(TypeError, match="final"):
+
+        class BypassBridge(app_bridge.AppBridge, metaclass=LateBypassMeta):
+            pass
+
+    assert writes == []
 
 
 def test_exact_registered_read_only_appbridge_method_preserves_read_only_ux(
@@ -1655,6 +1675,81 @@ def test_parent_launcher_uses_environment_only_and_revokes_on_request(
     assert env[mutation_gate.DELEGATION_TOKEN_ENV] not in " ".join(cmd)
     assert coin_manager._revoke_coin_prep_worker_delegation(handoff)["revoked"] is True
     assert parent.validate_worker_environment(env)["allowed"] is False
+
+
+def test_coin_prep_log_delivery_uses_selected_owner_port_not_preferred_listener(
+    monkeypatch,
+):
+    import coin_prep_worker
+
+    selected_port = 6128
+    preferred_url = "http://127.0.0.1:5000/api/log"
+    selected_url = f"http://127.0.0.1:{selected_port}/api/log"
+    deliveries = []
+
+    class Session:
+        def post(self, url, **kwargs):
+            deliveries.append((url, kwargs))
+
+    fake_requests = SimpleNamespace(
+        post=lambda url, **kwargs: deliveries.append((url, kwargs)),
+        Session=Session,
+    )
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    monkeypatch.setenv("CATALYST_FLASK_PORT", str(selected_port))
+    monkeypatch.setattr(coin_prep_worker, "_LOCAL_API_TOKEN", "selected-token")
+
+    mirror = coin_prep_worker.ApiMirrorStream(
+        SimpleNamespace(write=lambda _data: None, flush=lambda: None),
+        event_type="coin_prep_stdout",
+        severity="info",
+    )
+    mirror._emit_line("mirror log")
+
+    queued_worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    queued_worker._api_log_queue = coin_prep_worker.Queue()
+    queued_worker._api_log_queue.put({"message": "queued log"})
+    queued_worker._api_log_queue.put(None)
+    queued_worker._api_log_loop()
+
+    assert [url for url, _kwargs in deliveries] == [selected_url, selected_url]
+    assert all(url != preferred_url for url, _kwargs in deliveries)
+    assert all(
+        kwargs["headers"] == {"X-Bot-Local-Token": "selected-token"}
+        for _url, kwargs in deliveries
+    )
+
+
+def test_tray_fallback_uses_selected_owner_port_before_callbacks_are_wired(
+    monkeypatch,
+):
+    import tray_manager
+
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setenv("CATALYST_FLASK_PORT", "6133")
+    monkeypatch.setattr(
+        tray_manager.urllib.request,
+        "urlopen",
+        lambda request, timeout: (
+            requests.append((request.full_url, timeout)) or Response()
+        ),
+    )
+
+    tray = object.__new__(tray_manager.TrayManager)
+    tray._call_flask_api("/api/bot/start")
+
+    assert requests == [("http://127.0.0.1:6133/api/bot/start", 5)]
 
 
 def test_worker_rejects_missing_wrong_and_dead_parent_before_wallet_callback(
@@ -3493,23 +3588,93 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
     started = []
+    reservation = SimpleNamespace(port=desktop_app.FLASK_PORT + 7)
     monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: False)
-    monkeypatch.setattr(desktop_app, "_open_existing_instance_in_browser", lambda: None)
+    monkeypatch.setattr(
+        desktop_app, "_open_existing_instance_in_browser", lambda _port: None
+    )
     monkeypatch.setattr(
         desktop_app,
-        "_find_available_diagnostics_port",
-        lambda preferred: preferred + 7,
+        "_reserve_diagnostics_server_port",
+        lambda: reservation,
         raising=False,
     )
     monkeypatch.setattr(
         desktop_app,
         "run_read_only_diagnostics_mode",
-        lambda port: started.append(port),
+        lambda supplied, **_kwargs: started.append(supplied),
         raising=False,
     )
 
     assert desktop_app.main(["--show-console"]) == 0
-    assert started == [desktop_app.FLASK_PORT + 7]
+    assert started == [reservation]
+
+
+def test_second_desktop_opens_exact_diagnostics_port_not_unrelated_preferred(
+    monkeypatch,
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    reservation = SimpleNamespace(port=6130)
+    opened = []
+    served = []
+
+    monkeypatch.setattr(desktop_app, "FLASK_PORT", 5000)
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
+    monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
+    monkeypatch.setattr(
+        desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_mode",
+        lambda supplied, *, ready_callback: (
+            served.append(supplied),
+            ready_callback(),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "webbrowser",
+        SimpleNamespace(open=lambda url: opened.append(url)),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert served == [reservation]
+    assert opened == ["http://127.0.0.1:6130/"]
+
+
+def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    reservation = SimpleNamespace(port=6131)
+    events = []
+
+    def serve_after_handoff(supplied, *, ready_callback=None):
+        assert supplied is reservation
+        events.append("handoff")
+        assert ready_callback is not None
+        ready_callback()
+        events.append("serve")
+
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
+    monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
+    monkeypatch.setattr(
+        desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
+    )
+    monkeypatch.setattr(
+        desktop_app, "run_read_only_diagnostics_mode", serve_after_handoff
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "webbrowser",
+        SimpleNamespace(open=lambda url: events.append(("open", url))),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == [
+        "handoff",
+        ("open", "http://127.0.0.1:6131/"),
+        "serve",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3530,15 +3695,619 @@ def test_desktop_port_normalization_matches_standalone(
     assert desktop_app._normalize_flask_port(configured) == expected
 
 
-def test_desktop_diagnostics_port_scan_includes_upper_and_lower_edges(monkeypatch):
+def test_desktop_diagnostics_reservation_excludes_owner_preferred_port(monkeypatch):
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    calls = []
+    reservation = SimpleNamespace(port=65534)
+    monkeypatch.setattr(desktop_app, "FLASK_PORT", 65535)
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "reserve_loopback_port",
+        lambda preferred, **kwargs: calls.append((preferred, kwargs)) or reservation,
+    )
+
+    assert desktop_app._reserve_diagnostics_server_port() is reservation
+    assert calls == [(65535, {"include_preferred": False})]
+
+
+def test_loopback_port_reservation_scans_down_from_65535_and_closes_losers(
+    monkeypatch,
+):
+    import read_only_diagnostics
+
+    attempts = []
+    sockets = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.bound_port = None
+            self.closed = False
+            sockets.append(self)
+
+        def setsockopt(self, *_args):
+            return None
+
+        def set_inheritable(self, _value):
+            return None
+
+        def bind(self, address):
+            self.bound_port = int(address[1])
+            attempts.append(self.bound_port)
+            if self.bound_port != 65534:
+                raise OSError("occupied")
+
+        def listen(self, _backlog):
+            return None
+
+        def getsockname(self):
+            return ("127.0.0.1", self.bound_port)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        read_only_diagnostics.socket,
+        "socket",
+        lambda *_args, **_kwargs: FakeSocket(),
+    )
+
+    reservation = read_only_diagnostics.reserve_loopback_port(
+        65535, include_preferred=True, search_limit=1
+    )
+    try:
+        assert reservation.port == 65534
+        assert attempts == [65535, 65534]
+        assert sockets[0].closed is True
+        assert sockets[1].closed is False
+    finally:
+        reservation.release()
+
+    assert sockets[1].closed is True
+
+
+def test_real_loopback_reservation_prevents_concurrent_port_steal():
+    import read_only_diagnostics
+
+    unrelated = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name == "nt":
+        unrelated.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    unrelated.bind(("127.0.0.1", 0))
+    unrelated.listen(1)
+    preferred = int(unrelated.getsockname()[1])
+    reservation = None
+    thief = None
+    successor = None
+    try:
+        reservation = read_only_diagnostics.reserve_loopback_port(preferred)
+        assert reservation.port != preferred
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name == "nt":
+            thief.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        with pytest.raises(OSError):
+            thief.bind(("127.0.0.1", reservation.port))
+
+        claimed_port = reservation.port
+        assert reservation.release() is True
+        successor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name == "nt":
+            successor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        successor.bind(("127.0.0.1", claimed_port))
+    finally:
+        if reservation is not None:
+            reservation.release()
+        for handle in (thief, successor, unrelated):
+            if handle is not None:
+                handle.close()
+
+
+def test_reserved_port_does_not_report_server_ready_before_handoff():
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.settimeout(0.2)
+    try:
+        with pytest.raises(OSError):
+            client.connect(("127.0.0.1", reservation.port))
+    finally:
+        client.close()
+        reservation.release()
+
+
+def test_desktop_constructor_failure_cannot_publish_false_server_readiness(
+    monkeypatch,
+):
+    import api_server
+    import werkzeug.serving
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    constructor_done = threading.Event()
+    thread_errors = []
+    events = []
+
+    class Reservation:
+        port = 6129
+        listening = False
+
+        def listen(self):
+            self.listening = True
+            events.append("listen")
+
+        def fileno(self):
+            return 99
+
+        def release(self):
+            events.append("release")
+            return True
+
+    reservation = Reservation()
+
+    def fail_constructor(*_args, **_kwargs):
+        constructor_done.set()
+        raise RuntimeError("werkzeug constructor failed")
+
+    real_thread = threading.Thread
+
+    class CapturingThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self._target = target
+            self._args = args
+            self._thread = None
+
+        def start(self):
+            def invoke():
+                try:
+                    api_server._build_flask_server_on_reservation(self._args[0])
+                except BaseException as exc:
+                    thread_errors.append(exc)
+
+            self._thread = real_thread(target=invoke, daemon=True)
+            self._thread.start()
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace())
+    monkeypatch.setattr(desktop_app, "_reserve_owner_server_port", lambda: reservation)
+    monkeypatch.setattr(desktop_app, "_start_owned_runtime_services", lambda: None)
+    monkeypatch.setattr(
+        desktop_app, "threading", SimpleNamespace(Thread=CapturingThread)
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "wait_for_flask",
+        lambda timeout: constructor_done.wait(timeout) and reservation.listening,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_start_system_tray",
+        lambda: (_ for _ in ()).throw(AssertionError("false readiness advanced")),
+    )
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
+    monkeypatch.setattr(werkzeug.serving, "make_server", fail_constructor)
+
+    with pytest.raises(SystemExit) as exc_info:
+        desktop_app.run_desktop_mode()
+
+    assert exc_info.value.code == 1
+    assert reservation.listening is False
+    assert len(thread_errors) == 1
+    assert isinstance(thread_errors[0], RuntimeError)
+    assert "cleanup" in events
+
+
+def test_diagnostics_http_handoff_keeps_exact_reserved_socket_exclusive():
+    from http.server import BaseHTTPRequestHandler
+
+    import read_only_diagnostics
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return None
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    server = reservation.into_http_server(Handler)
+    thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    successor = None
+    try:
+        if os.name == "nt":
+            thief.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        with pytest.raises(OSError):
+            thief.bind(("127.0.0.1", selected))
+    finally:
+        thief.close()
+        server.server_close()
+
+    try:
+        successor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name == "nt":
+            successor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        successor.bind(("127.0.0.1", selected))
+    finally:
+        if successor is not None:
+            successor.close()
+
+
+def test_diagnostics_http_constructor_failure_releases_reserved_socket(
+    monkeypatch,
+):
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "ThreadingHTTPServer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("constructor")),
+    )
+
+    with pytest.raises(RuntimeError, match="constructor"):
+        reservation.into_http_server(object)
+
+    assert reservation.release() is False
+    successor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt":
+            successor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        successor.bind(("127.0.0.1", selected))
+    finally:
+        successor.close()
+
+
+def test_diagnostics_http_interrupted_handoff_releases_reserved_socket(
+    monkeypatch,
+):
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    monkeypatch.setattr(
+        reservation,
+        "listen",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        reservation.into_http_server(object)
+
+    assert reservation.release() is False
+    successor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt":
+            successor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        successor.bind(("127.0.0.1", selected))
+    finally:
+        successor.close()
+
+
+def test_minimal_diagnostics_serve_consumes_supplied_reservation(monkeypatch):
+    import read_only_diagnostics
+
+    events = []
+
+    class Server:
+        def serve_forever(self, poll_interval):
+            events.append(("serve", poll_interval))
+
+        def server_close(self):
+            events.append("close")
+
+    class Reservation:
+        port = 6123
+
+        def into_http_server(self, handler):
+            events.append(("handoff", handler))
+            return Server()
+
+    read_only_diagnostics.serve(reservation=Reservation())
+
+    assert events[0][0] == "handoff"
+    assert events[1:] == [("serve", 0.2), "close"]
+
+
+def test_minimal_diagnostics_never_signals_ready_when_handoff_fails():
+    import read_only_diagnostics
+
+    events = []
+
+    class Reservation:
+        port = 6132
+
+        def into_http_server(self, _handler):
+            events.append("handoff")
+            raise RuntimeError("handoff failed")
+
+        def release(self):
+            events.append("release")
+            return True
+
+    with pytest.raises(RuntimeError, match="handoff failed"):
+        read_only_diagnostics.serve(
+            reservation=Reservation(),
+            ready_callback=lambda: events.append("ready"),
+        )
+
+    assert events == ["handoff", "release"]
+
+
+def test_werkzeug_server_handoff_retains_exact_loopback_reservation():
+    import api_server
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    server = api_server._build_flask_server_on_reservation(reservation)
+    thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    successor = None
+    try:
+        assert reservation.release() is False
+        if os.name == "nt":
+            thief.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        with pytest.raises(OSError):
+            thief.bind(("127.0.0.1", selected))
+    finally:
+        thief.close()
+        server.server_close()
+
+    try:
+        successor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name == "nt":
+            successor.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        successor.bind(("127.0.0.1", selected))
+    finally:
+        if successor is not None:
+            successor.close()
+
+
+def test_desktop_owner_reserves_alternate_port_and_propagates_exact_binding(
+    monkeypatch,
+):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
-    monkeypatch.setattr(desktop_app, "check_port_free", lambda _port: True)
+    unrelated = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    unrelated.bind(("127.0.0.1", 0))
+    unrelated.listen(1)
+    preferred = int(unrelated.getsockname()[1])
+    monkeypatch.setattr(desktop_app, "FLASK_PORT", preferred)
+    reservation = None
+    try:
+        reservation = desktop_app._reserve_owner_server_port()
 
-    assert desktop_app._find_available_diagnostics_port(65534) == 65535
-    assert desktop_app._find_available_diagnostics_port(65535) == 65534
-    assert desktop_app._find_available_diagnostics_port(0) == 5001
-    assert desktop_app._find_available_diagnostics_port(70000) == 5001
+        assert reservation.port != preferred
+        assert desktop_app.FLASK_PORT == reservation.port
+        assert os.environ["CATALYST_FLASK_PORT"] == str(reservation.port)
+        assert unrelated.getsockname()[1] == preferred
+    finally:
+        if reservation is not None:
+            reservation.release()
+        unrelated.close()
+
+
+def test_authorized_desktop_flask_mode_hands_reservation_to_exact_server(
+    monkeypatch,
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    reservation = SimpleNamespace(port=6124, release=lambda: events.append("release"))
+
+    monkeypatch.setattr(
+        desktop_app,
+        "_reserve_owner_server_port",
+        lambda: events.append("reserve") or reservation,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_start_owned_runtime_services",
+        lambda: events.append("services"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "start_flask_server",
+        lambda supplied: events.append(("serve", supplied)),
+    )
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
+    monkeypatch.setattr(desktop_app.signal, "signal", lambda *_args: None)
+
+    desktop_app.run_flask_mode()
+
+    assert events == [
+        "reserve",
+        "services",
+        ("serve", reservation),
+        "release",
+        "cleanup",
+    ]
+
+
+def test_authorized_desktop_mode_uses_alternate_reserved_port_for_server_and_window(
+    monkeypatch,
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    selected_port = 6125
+
+    class StopDesktop(Exception):
+        pass
+
+    class ClosingEvent:
+        def __iadd__(self, _handler):
+            return self
+
+    window = SimpleNamespace(events=SimpleNamespace(closing=ClosingEvent()))
+
+    def create_window(**kwargs):
+        events.append(("window", kwargs["url"]))
+        return window
+
+    fake_webview = SimpleNamespace(
+        create_window=create_window,
+        start=lambda **_kwargs: (_ for _ in ()).throw(StopDesktop()),
+    )
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    monkeypatch.setitem(sys.modules, "notification_manager", None)
+
+    reservation = SimpleNamespace(port=selected_port)
+
+    def reserve():
+        desktop_app.FLASK_PORT = selected_port
+        os.environ["CATALYST_FLASK_PORT"] = str(selected_port)
+        events.append("reserve")
+        return reservation
+
+    class ImmediateThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(desktop_app, "check_port_free", lambda _port: False)
+    monkeypatch.setattr(
+        desktop_app, "_reserve_owner_server_port", reserve, raising=False
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_start_owned_runtime_services",
+        lambda: events.append("services"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "start_flask_server",
+        lambda supplied: events.append(("serve", supplied)),
+    )
+    monkeypatch.setattr(desktop_app.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(desktop_app, "wait_for_flask", lambda timeout: True)
+    monkeypatch.setattr(desktop_app, "_start_system_tray", lambda: (None, None))
+    monkeypatch.setattr(desktop_app, "_load_window_state", lambda: {})
+    monkeypatch.setattr(
+        desktop_app, "_should_restore_saved_window_position", lambda: False
+    )
+
+    with pytest.raises(StopDesktop):
+        desktop_app.run_desktop_mode()
+
+    assert events[:3] == ["reserve", "services", ("serve", reservation)]
+    assert ("window", f"http://127.0.0.1:{selected_port}/") in events
+
+
+def test_desktop_thread_construction_failure_releases_port_and_lease(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+
+    class Reservation:
+        port = 6126
+
+        def release(self):
+            events.append("release")
+            return True
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace())
+    monkeypatch.setattr(
+        desktop_app,
+        "_reserve_owner_server_port",
+        lambda: events.append("reserve") or Reservation(),
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_start_owned_runtime_services",
+        lambda: events.append("services"),
+    )
+    monkeypatch.setattr(
+        desktop_app.threading,
+        "Thread",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("thread constructor")),
+    )
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
+
+    with pytest.raises(RuntimeError, match="thread constructor"):
+        desktop_app.run_desktop_mode()
+
+    assert events == ["reserve", "services", "release", "cleanup"]
+
+
+def test_flask_signal_setup_failure_releases_port_and_lease(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+
+    class Reservation:
+        port = 6127
+
+        def release(self):
+            events.append("release")
+            return True
+
+    monkeypatch.setattr(
+        desktop_app,
+        "_reserve_owner_server_port",
+        lambda: events.append("reserve") or Reservation(),
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_start_owned_runtime_services",
+        lambda: events.append("services"),
+    )
+    monkeypatch.setattr(
+        desktop_app.signal,
+        "signal",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("signal setup")),
+    )
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
+
+    with pytest.raises(RuntimeError, match="signal setup"):
+        desktop_app.run_flask_mode()
+
+    assert events == ["reserve", "services", "release", "cleanup"]
+
+
+def test_authorized_desktop_startup_exception_runs_central_lease_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    monkeypatch.setenv("CMM_DATA_DIR", str(tmp_path / "startup-failure"))
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: True)
+    monkeypatch.setattr(desktop_app, "_enable_pythonw_startup_log", lambda: None)
+    monkeypatch.setattr(desktop_app, "_attach_to_kill_on_close_job", lambda: None)
+    monkeypatch.setattr(
+        desktop_app,
+        "run_desktop_mode",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("server startup failed")),
+    )
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
+    monkeypatch.setattr(desktop_app, "_CONSOLE_HIDDEN", True)
+    monkeypatch.setattr(desktop_app, "_show_fatal_error_dialog", lambda _msg: None)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+
+    assert desktop_app.main(["--show-console"]) == 1
+    assert events == ["cleanup"]
+
+
+def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
+    monkeypatch,
+):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("lease") or {"allowed": True},
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_start_owned_runtime_services",
+        lambda _authorization: events.append("services"),
+    )
+
+    assert desktop_app._initialize_startup_ownership() == {"allowed": True}
+    assert events == ["database", "lease"]
 
 
 def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
@@ -3617,20 +4386,23 @@ def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
             AssertionError("foreign owner path must not open the lock file")
         ),
     )
-    monkeypatch.setattr(desktop_app, "_open_existing_instance_in_browser", lambda: None)
+    monkeypatch.setattr(
+        desktop_app, "_open_existing_instance_in_browser", lambda _port: None
+    )
+    reservation = SimpleNamespace(port=desktop_app.FLASK_PORT + 9)
     monkeypatch.setattr(
         desktop_app,
-        "_find_available_diagnostics_port",
-        lambda preferred: preferred + 9,
+        "_reserve_diagnostics_server_port",
+        lambda: reservation,
     )
     monkeypatch.setattr(
         desktop_app,
         "run_read_only_diagnostics_mode",
-        lambda port: calls.append(port),
+        lambda supplied, **_kwargs: calls.append(supplied),
     )
 
     assert desktop_app.main(["--show-console"]) == 0
-    assert calls == [desktop_app.FLASK_PORT + 9]
+    assert calls == [reservation]
 
 
 def test_desktop_instance_lock_path_is_stdlib_only_before_ownership(
@@ -3985,6 +4757,20 @@ def _free_loopback_port_pair() -> tuple[int, int]:
     raise AssertionError("could not reserve a free adjacent loopback port pair")
 
 
+def _bounded_loopback_candidates(
+    preferred: int, *, include_preferred: bool
+) -> tuple[int, ...]:
+    import read_only_diagnostics
+
+    return tuple(
+        read_only_diagnostics._candidate_loopback_ports(
+            preferred,
+            include_preferred=include_preferred,
+            search_limit=50,
+        )
+    )
+
+
 def _wait_for_diagnostics_status(process, port: int) -> dict:
     deadline = time.monotonic() + 10
     url = f"http://127.0.0.1:{port}/api/safety/status"
@@ -4006,13 +4792,17 @@ def _wait_for_diagnostics_status(process, port: int) -> dict:
 
 
 def _wait_for_any_diagnostics_status(process, ports) -> tuple[int, dict]:
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise AssertionError(
                 f"diagnostics process exited early: {process.communicate()[1]}"
             )
         for port in ports:
+            if process.poll() is not None:
+                raise AssertionError(
+                    f"diagnostics process exited early: {process.communicate()[1]}"
+                )
             try:
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
@@ -4021,7 +4811,12 @@ def _wait_for_any_diagnostics_status(process, ports) -> tuple[int, dict]:
             except Exception:
                 continue
         time.sleep(0.02)
-    raise AssertionError("diagnostics server did not become ready on an allowed port")
+    process.terminate()
+    stdout, stderr = process.communicate(timeout=10)
+    raise AssertionError(
+        "diagnostics server did not become ready on an allowed port: "
+        f"stdout={stdout!r}, stderr={stderr!r}"
+    )
 
 
 def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> dict:
@@ -4065,8 +4860,9 @@ def _start_standalone_process(env: dict) -> subprocess.Popen:
 
 
 def _wait_for_safety_servers(processes, ports, count: int) -> dict[int, dict]:
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 60
     found = {}
+    process_ids = {process.pid for process in processes}
     while time.monotonic() < deadline:
         exited = [process for process in processes if process.poll() is not None]
         if exited:
@@ -4079,7 +4875,12 @@ def _wait_for_safety_servers(processes, ports, count: int) -> dict[int, dict]:
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
                 ) as response:
-                    found[port] = json.loads(response.read().decode("utf-8"))
+                    payload = json.loads(response.read().decode("utf-8"))
+                    owner_pid = (
+                        payload.get("safety", {}).get("lease", {}).get("owner_pid")
+                    )
+                    if owner_pid in process_ids:
+                        found[port] = payload
             except Exception:
                 continue
         if len(found) >= count:
@@ -4129,13 +4930,14 @@ def test_spawned_desktop_diagnostics_is_import_and_filesystem_side_effect_free(
         ]
     )
     command = (
-        "import builtins,desktop_app;"
+        "import builtins,desktop_app,read_only_diagnostics;"
         "real=builtins.__import__;"
         "blocked={'api_server','config','user_paths','super_log'};"
         "builtins.__import__=lambda name,*a,**k: "
         "(_ for _ in ()).throw(AssertionError(name)) "
         "if name.split('.')[0] in blocked else real(name,*a,**k);"
-        f"desktop_app.run_read_only_diagnostics_mode({port})"
+        f"r=read_only_diagnostics.reserve_loopback_port({port},search_limit=0);"
+        "desktop_app.run_read_only_diagnostics_mode(r)"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", command],
@@ -4209,9 +5011,10 @@ def test_free_port_standalone_process_defers_to_existing_durable_owner(
     )
     try:
         selected_port, payload = _wait_for_any_diagnostics_status(
-            process, range(port + 1, min(65536, port + 51))
+            process,
+            _bounded_loopback_candidates(port, include_preferred=False),
         )
-        assert selected_port > port
+        assert selected_port != port
         assert payload["safety"]["allowed"] is False
         assert payload["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
         with pytest.raises(urllib.error.HTTPError) as error:
@@ -4237,7 +5040,9 @@ def test_simultaneous_first_run_standalone_processes_create_exactly_one_owner(
     processes = [_start_standalone_process(env), _start_standalone_process(env)]
     try:
         servers = _wait_for_safety_servers(
-            processes, range(port, min(65536, port + 51)), count=2
+            processes,
+            _bounded_loopback_candidates(port, include_preferred=True),
+            count=2,
         )
         allowed = [
             (server_port, payload)
@@ -4285,10 +5090,12 @@ def test_unrelated_port_occupancy_still_allows_one_full_owner_on_alternate_port(
         process = _start_standalone_process(env)
         try:
             servers = _wait_for_safety_servers(
-                [process], range(port + 1, min(65536, port + 51)), count=1
+                [process],
+                _bounded_loopback_candidates(port, include_preferred=True),
+                count=1,
             )
             selected_port, payload = next(iter(servers.items()))
-            assert selected_port > port
+            assert selected_port != port
             assert payload["safety"]["allowed"] is True
             assert payload["safety"]["lease"]["owner_pid"] == process.pid
         finally:
@@ -4313,7 +5120,7 @@ def test_spawned_desktop_waits_for_arbiter_before_foreign_owner_preflight(
     )
     assert arbiter.acquired is True
     attempt_marker = tmp_path / "child-attempted-arbiter"
-    port, diagnostics_port = _free_loopback_port_pair()
+    port, _diagnostics_port = _free_loopback_port_pair()
     env = os.environ.copy()
     env["CMM_DATA_DIR"] = str(data_dir)
     env["CATALYST_FLASK_PORT"] = str(port)
@@ -4333,7 +5140,7 @@ def observed_acquire(**kwargs):
     return real_acquire(**kwargs)
 read_only_diagnostics.acquire_startup_arbiter = observed_acquire
 import desktop_app
-desktop_app._open_existing_instance_in_browser = lambda: None
+desktop_app._open_existing_instance_in_browser = lambda _port: None
 real_import = builtins.__import__
 blocked = {"api_server", "config", "user_paths", "super_log", "database"}
 def guarded_import(name, *args, **kwargs):
@@ -4382,9 +5189,10 @@ raise SystemExit(desktop_app.main(["--show-console"]))
         arbiter.release()
 
         selected_port, payload = _wait_for_any_diagnostics_status(
-            process, range(diagnostics_port, min(65536, port + 51))
+            process,
+            _bounded_loopback_candidates(port, include_preferred=False),
         )
-        assert selected_port > port
+        assert selected_port != port
         assert payload["safety"]["reason_code"] == "LEASE_OWNED_BY_OTHER"
         after = {
             item.name: item.read_bytes()
@@ -4406,21 +5214,28 @@ def test_diagnostics_server_never_constructs_bot_or_acquires_lease(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
     calls = []
+    reservation = SimpleNamespace(port=5017)
     monkeypatch.setattr(
         read_only_diagnostics,
         "serve",
-        lambda port: calls.append(("minimal-serve", port)),
+        lambda **kwargs: calls.append(("minimal-serve", kwargs)),
     )
 
-    desktop_app.run_read_only_diagnostics_mode(5017)
+    desktop_app.run_read_only_diagnostics_mode(reservation)
 
-    assert calls == [("minimal-serve", 5017)]
+    assert calls == [
+        (
+            "minimal-serve",
+            {"reservation": reservation, "ready_callback": None},
+        )
+    ]
 
 
 def test_standalone_diagnostics_server_is_database_read_only(monkeypatch):
     import api_server
 
     calls = []
+    reservation = SimpleNamespace(port=5018, release=lambda: calls.append("release"))
     monkeypatch.setattr(
         api_server,
         "init_database",
@@ -4434,25 +5249,17 @@ def test_standalone_diagnostics_server_is_database_read_only(monkeypatch):
         lambda **kwargs: calls.append(("initialize", kwargs)) or {},
     )
     monkeypatch.setattr(
-        api_server.app,
-        "run",
-        lambda **kwargs: calls.append(("run", kwargs)),
+        api_server,
+        "_serve_flask_app_on_reservation",
+        lambda supplied: calls.append(("serve", supplied)),
     )
 
-    api_server._serve_read_only_diagnostics(5018)
+    api_server._serve_read_only_diagnostics(reservation)
 
     assert calls == [
         ("initialize", {"start_heartbeat": False, "acquire_lease": False}),
-        (
-            "run",
-            {
-                "host": "127.0.0.1",
-                "port": 5018,
-                "debug": False,
-                "threaded": True,
-                "use_reloader": False,
-            },
-        ),
+        ("serve", reservation),
+        "release",
     ]
 
 
@@ -4519,18 +5326,19 @@ def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch)
     assert calls == ["local-runtime"]
 
 
-def test_standalone_port_selection_honors_env_without_changing_owner_authority(
-    monkeypatch,
-):
+def test_standalone_port_reservation_uses_atomic_bidirectional_selector(monkeypatch):
     import api_server
+    import read_only_diagnostics
 
     monkeypatch.setenv("CATALYST_FLASK_PORT", "5123")
+    calls = []
+    reservation = SimpleNamespace(port=65534)
     monkeypatch.setattr(
-        api_server,
-        "_loopback_port_is_available",
-        lambda port: port == 5124,
-        raising=False,
+        read_only_diagnostics,
+        "reserve_loopback_port",
+        lambda preferred, **kwargs: calls.append((preferred, kwargs)) or reservation,
     )
 
     assert api_server._configured_flask_port() == 5123
-    assert api_server._select_standalone_server_mode(5123) == (5124, False)
+    assert api_server._reserve_standalone_server_port(65535) is reservation
+    assert calls == [(65535, {"include_preferred": True})]

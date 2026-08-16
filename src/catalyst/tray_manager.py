@@ -18,6 +18,7 @@ The module imports `pystray` and `PIL` behind try/except so the rest of the
 app still starts in headless or reduced-dependency environments.
 """
 
+import os
 import sys
 import threading
 
@@ -50,7 +51,17 @@ COLOUR_RED = (239, 68, 68)  # Error, critical
 COLOUR_GREY = (107, 114, 128)  # Stopped, unknown
 COLOUR_INDIGO = (99, 102, 241)  # Brand accent (used for default icon)
 
-FLASK_BASE = "http://127.0.0.1:5000"
+
+def _flask_base() -> str:
+    """Return the exact loopback server port selected by the desktop owner."""
+
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        port = 5000
+    if not 1 <= port <= 65535:
+        port = 5000
+    return f"http://127.0.0.1:{port}"
 
 
 class TrayManager:
@@ -328,7 +339,7 @@ class TrayManager:
         Call a local Flask API endpoint.  Runs in a background thread.
         Failures are silently ignored — the tray is a convenience, not critical path.
         """
-        url = f"{FLASK_BASE}{path}"
+        url = f"{_flask_base()}{path}"
         try:
             req = urllib.request.Request(
                 url,
