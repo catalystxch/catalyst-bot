@@ -294,6 +294,52 @@ def api_bot_start():
             )
             warnings.append("Coin-prep gate skipped - check logs before trading")
 
+    # Give API/AppBridge callers an early, stable identity error after cheap
+    # validation but before the bot starts orchestration. Every adapter effect
+    # still performs its own fresh authoritative recheck to close the
+    # preflight-to-call race.
+    if not errors:
+        try:
+            from wallet import preflight_wallet_identity
+
+            identity_preflight = preflight_wallet_identity()
+        except Exception:
+            identity_preflight = {
+                "success": False,
+                "reason": "WALLET_IDENTITY_UNAVAILABLE",
+            }
+        if (
+            type(identity_preflight) is not dict
+            or identity_preflight.get("success") is not True
+        ):
+            safe_reasons = {
+                "WALLET_BACKEND_UNSUPPORTED",
+                "WALLET_IDENTITY_BINDING_INVALID",
+                "WALLET_IDENTITY_MALFORMED",
+                "WALLET_IDENTITY_MISMATCH",
+                "WALLET_IDENTITY_NON_SIGNING",
+                "WALLET_IDENTITY_STALE",
+                "WALLET_IDENTITY_UNAVAILABLE",
+            }
+            reason = (
+                identity_preflight.get("reason")
+                if type(identity_preflight) is dict
+                else None
+            )
+            if reason not in safe_reasons:
+                reason = "WALLET_IDENTITY_MALFORMED"
+            error = "Wallet mutation blocked by identity safety check"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "error": error,
+                    "reason": reason,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 400
+
     # Block start on critical errors
     if errors:
         payload = {

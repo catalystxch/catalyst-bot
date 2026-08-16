@@ -259,7 +259,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         # spacescan confirms the split landed on-chain, so the method recovers
         # and waits until the output coins become selectable.
         with (
-            patch("wallet_sage.sage_topup_split", return_value=None),
+            patch("wallet.sage_topup_split", return_value=None),
             patch.object(
                 coin_manager,
                 "get_next_address",
@@ -333,7 +333,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         # The method should accept tx-confirmed + owned outputs as sufficient.
         with (
             patch(
-                "wallet_sage.sage_topup_split",
+                "wallet.sage_topup_split",
                 return_value={"transaction_id": "def456"},
             ),
             patch.object(
@@ -575,7 +575,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split",
+                "wallet.sage_topup_split",
                 return_value={"transaction_id": "fee123"},
             ) as split_mock,
             patch.object(
@@ -628,7 +628,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split", return_value={"transaction_id": "0xtx"}
+                "wallet.sage_topup_split", return_value={"transaction_id": "0xtx"}
             ) as split_mock,
             patch.object(
                 coin_manager,
@@ -692,7 +692,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split", return_value={"success": True}
+                "wallet.sage_topup_split", return_value={"success": True}
             ) as split_mock,
             patch("wallet_sage.get_pending_transactions", return_value=[]),
             patch.object(
@@ -804,7 +804,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split",
+                "wallet.sage_topup_split",
                 return_value=weak_success,
             ) as split_mock,
             patch("wallet_sage.get_pending_transactions", return_value=[]),
@@ -917,7 +917,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         manager._coinset_client = FakeCoinset()
 
         with (
-            patch("wallet_sage.sage_topup_split") as split_mock,
+            patch("wallet.sage_topup_split") as split_mock,
             patch.object(
                 coin_manager,
                 "get_next_address",
@@ -975,7 +975,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split", return_value={"success": True}
+                "wallet.sage_topup_split", return_value={"success": True}
             ) as split_mock,
             patch("wallet_sage.get_pending_transactions", return_value=[]),
             patch.object(
@@ -1041,7 +1041,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch(
-                "wallet_sage.sage_topup_split",
+                "wallet.sage_topup_split",
                 return_value={"transaction_id": "sniper123"},
             ),
             patch("database.upsert_coin") as upsert_coin,
@@ -1503,7 +1503,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             patch.object(manager, "_record_topup_pool_refund"),
             patch("database.set_setting", return_value=True),
             patch(
-                "wallet_sage.combine_coins",
+                "wallet.combine_coins",
                 return_value={
                     "success": True,
                     "transaction_id": "0xabsorbtx",
@@ -1565,7 +1565,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             patch.object(manager, "_record_topup_pool_refund") as refund,
             patch("wallet_sage.get_pending_transactions", return_value=[]),
             patch(
-                "wallet_sage.combine_coins",
+                "wallet.combine_coins",
                 return_value={
                     "summary": {},
                     "coin_spends": [{}, {}],
@@ -1729,7 +1729,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),
             patch(
-                "wallet_sage.combine_coins",
+                "wallet.combine_coins",
                 return_value={
                     "success": True,
                     "transaction_id": "0xcombinetx",
@@ -1775,7 +1775,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             ),
             patch("wallet_sage.get_pending_transactions", return_value=[]),
             patch(
-                "wallet_sage.combine_coins",
+                "wallet.combine_coins",
                 return_value={
                     "summary": {},
                     "coin_spends": [{}, {}, {}],
@@ -1827,7 +1827,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             ),
             patch("wallet_sage.get_pending_transactions", return_value=[]),
             patch(
-                "wallet_sage.combine_coins",
+                "wallet.combine_coins",
                 return_value={
                     "summary": {},
                     "coin_spends": [{}, {}, {}],

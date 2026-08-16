@@ -1010,13 +1010,15 @@ def _get_sage_signing_block_reason():
         return None
 
     try:
-        from wallet_sage import get_current_key
+        from wallet import get_wallet_identity
 
-        key = get_current_key() or {}
-        if not key.get("has_secrets", False):
-            fp = key.get("fingerprint")
+        identity = get_wallet_identity()
+        if type(identity) is not dict or identity.get("success") is not True:
+            return None
+        if identity.get("has_secrets") is not True:
+            fp = identity.get("fingerprint")
             msg = "Active Sage wallet is watch-only and cannot sign offers"
-            if fp:
+            if type(fp) is int and fp > 0:
                 msg += f" (fingerprint {fp})"
             return msg
     except Exception:
@@ -1203,11 +1205,15 @@ _mutation_runtime_init_lock = threading.RLock()
 def _configured_mutation_binding() -> tuple[str, str]:
     """Return a deterministic config-only binding without wallet RPC."""
 
-    raw_fingerprint = str(
+    backend = str(getattr(cfg, "WALLET_TYPE", "") or "").strip().lower()
+    configured_fingerprint = (
         getattr(cfg, "SAGE_FINGERPRINT", "")
-        or getattr(cfg, "WALLET_FINGERPRINT", "")
-        or "unconfigured"
-    ).strip()
+        if backend == "sage"
+        else getattr(cfg, "WALLET_FINGERPRINT", "")
+        if backend == "chia"
+        else ""
+    )
+    raw_fingerprint = str(configured_fingerprint or "unconfigured").strip()
     fingerprint_hash = hashlib.sha256(
         f"fingerprint:{raw_fingerprint}".encode("utf-8")
     ).hexdigest()
@@ -1219,6 +1225,64 @@ def _configured_mutation_binding() -> tuple[str, str]:
     if not network or len(network) > 64:
         network = "mainnet"
     return fingerprint_hash, network
+
+
+def _configured_wallet_identity_binding(
+    network: str,
+) -> Optional[mutation_gate.WalletIdentityBinding]:
+    """Build exact expected identity from canonical config without wallet RPC."""
+
+    try:
+        raw_backend = getattr(cfg, "WALLET_TYPE", "")
+        if type(raw_backend) is not str:
+            return None
+        backend = raw_backend.strip().lower()
+        if backend not in {"sage", "chia"}:
+            return None
+        raw_fingerprint = (
+            getattr(cfg, "SAGE_FINGERPRINT", "")
+            if backend == "sage"
+            else getattr(cfg, "WALLET_FINGERPRINT", "")
+        )
+        if type(raw_fingerprint) is not str:
+            return None
+        if not raw_fingerprint.isascii() or not raw_fingerprint.isdigit():
+            return None
+        fingerprint = int(raw_fingerprint)
+        if str(fingerprint) != raw_fingerprint:
+            return None
+        raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
+        if type(raw_expected_name) is not str:
+            return None
+        expected_name = raw_expected_name.strip()
+        if not expected_name:
+            return None
+        raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+        if type(raw_expected_kind) is not str:
+            return None
+        expected_kind = raw_expected_kind.strip()
+        if not expected_kind:
+            return None
+        maximum_age = getattr(cfg, "WALLET_IDENTITY_MAX_AGE_SECONDS", None)
+        if type(maximum_age) is not int:
+            return None
+        bound_at = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        return mutation_gate.WalletIdentityBinding(
+            backend=backend,
+            name=expected_name,
+            fingerprint=fingerprint,
+            network_id=network,
+            kind=expected_kind,
+            has_secrets=True,
+            bound_at_utc=bound_at,
+            maximum_age_seconds=maximum_age,
+        )
+    except Exception:
+        return None
 
 
 def _mutation_stop_handler(reason_code: str) -> None:
@@ -1256,9 +1320,11 @@ def initialize_mutation_runtime(
     global _mutation_runtime, _mutation_runtime_db_path
     with _mutation_runtime_init_lock:
         wallet_hash, network = _configured_mutation_binding()
+        wallet_identity_binding = _configured_wallet_identity_binding(network)
         _mutation_runtime = mutation_gate.initialize(
             wallet_fingerprint_hash=wallet_hash,
             network=network,
+            wallet_identity_binding=wallet_identity_binding,
             start_heartbeat=start_heartbeat,
             acquire_lease=acquire_lease,
         )

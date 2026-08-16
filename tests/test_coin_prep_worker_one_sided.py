@@ -26,6 +26,16 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
     )
     fake_wallet_sage.get_pending_transactions = lambda *args, **kwargs: []
     fake_wallet_sage.get_peer_connections = lambda: [{"peer_id": "peer"}]
+    fake_wallet = types.ModuleType("wallet")
+    for name in (
+        "get_next_address",
+        "send_transaction",
+        "send_transaction_multi",
+        "send_cat_multi",
+        "split_coins_rpc",
+        "sage_topup_split",
+    ):
+        setattr(fake_wallet, name, getattr(fake_wallet_sage, name))
 
     worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
     worker.is_sage = True
@@ -78,7 +88,10 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
     worker._are_coin_ids_selectable = lambda wallet_id, coin_ids, name: True
 
     with (
-        patch.dict(sys.modules, {"wallet_sage": fake_wallet_sage}),
+        patch.dict(
+            sys.modules,
+            {"wallet_sage": fake_wallet_sage, "wallet": fake_wallet},
+        ),
         patch("coin_prep_worker.time.sleep", return_value=None),
     ):
         assert (

@@ -58,8 +58,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
             (
                 "Authorization: Bearer ACTIVE_AUTH_SECRET; "
                 "auth method=SAFE_SPACE_AUTH_METHOD",
-                "Authorization: [REDACTED]; "
-                "auth method=SAFE_SPACE_AUTH_METHOD",
+                "Authorization: [REDACTED]; auth method=SAFE_SPACE_AUTH_METHOD",
             ),
         )
 
@@ -193,9 +192,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
 
         source = CountingText(
             "Authorization: Digest "
-            + " ".join(
-                f"token_{index}=HEAD_SECRET_{index}" for index in range(120)
-            )
+            + " ".join(f"token_{index}=HEAD_SECRET_{index}" for index in range(120))
         )
 
         sanitized = wallet_sage._redact_sage_assignments(source)
@@ -284,9 +281,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                     self.assertNotIn(sentinel, sanitized)
                 if compatibility_value is not None:
                     self.assertIn(compatibility_value, sanitized)
-                self.assertEqual(
-                    wallet_sage._sanitize_sage_text(sanitized), sanitized
-                )
+                self.assertEqual(wallet_sage._sanitize_sage_text(sanitized), sanitized)
 
     def test_fail_closed_scalar_metadata_and_negative_name_matrix(self):
         sensitive = (
@@ -303,9 +298,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
         )
         for source in sensitive:
             with self.subTest(source=source):
-                sanitized = wallet_sage._sanitize_sage_text(
-                    "benign prefix: " + source
-                )
+                sanitized = wallet_sage._sanitize_sage_text("benign prefix: " + source)
                 self.assertNotIn("TWO", sanitized)
                 self.assertNotIn("STILL_", sanitized)
                 self.assertIn("[REDACTED]", sanitized)
@@ -351,14 +344,12 @@ class TestWalletSageSigningGuard(unittest.TestCase):
         source = {
             "nested": {
                 "authorization": "JSON_AUTH_SENTINEL",
-                "safe": "escaped quote: \\\" and bracket ]",
+                "safe": 'escaped quote: \\" and bracket ]',
                 "metadata": {"headerCount": "SAFE_HEADER_COUNT"},
             },
             "items": [{"password": "JSON_PASSWORD_SENTINEL"}],
         }
-        sanitized_json = wallet_sage._sanitize_sage_text(
-            json.dumps(source, indent=2)
-        )
+        sanitized_json = wallet_sage._sanitize_sage_text(json.dumps(source, indent=2))
         parsed = json.loads(sanitized_json)
         self.assertEqual(parsed["nested"]["authorization"], "[REDACTED]")
         self.assertEqual(parsed["items"][0]["password"], "[REDACTED]")
@@ -512,6 +503,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
             ("prefix MEMPOOL_CONFLICT is only remote prose", "SAGE_HTTP_ERROR"),
         )
         for remote_error, expected_code in cases:
+
             class FakeResponse:
                 status = 409
 
@@ -548,7 +540,9 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 wallet_sage._sage_post("get_balance", {})
 
         self.assertEqual(str(raised.exception), "SAGE_CONNECTION_ERROR")
-        self.assertNotIn("TRANSPORT_EXCEPTION_SENTINEL", repr(raised.exception.__dict__))
+        self.assertNotIn(
+            "TRANSPORT_EXCEPTION_SENTINEL", repr(raised.exception.__dict__)
+        )
 
     def test_rpc_diagnostic_emit_is_bounded_for_large_structured_inputs(self):
         payload = {
@@ -615,8 +609,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
     def test_colon_credentials_preserve_trailing_assignments_and_clean_marker(self):
         cases = (
             (
-                "authorization: first-word SECRET_TAIL "
-                "header_count=SAFE_HEADER_COUNT",
+                "authorization: first-word SECRET_TAIL header_count=SAFE_HEADER_COUNT",
                 "authorization: [REDACTED] header_count=SAFE_HEADER_COUNT",
             ),
             (
@@ -757,8 +750,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
             for separator in ("=", ":"):
                 with self.subTest(name=name, separator=separator):
                     source = (
-                        f"{name}{separator}first-word {secret_tail} "
-                        f"{safe_assignment}"
+                        f"{name}{separator}first-word {secret_tail} {safe_assignment}"
                     )
                     sanitized = wallet_sage._sanitize_sage_text(source)
                     self.assertNotIn("first-word", sanitized)
@@ -1099,7 +1091,9 @@ class TestWalletSageSigningGuard(unittest.TestCase):
             with self.subTest(secret=secret):
                 self.assertNotIn(secret, observed)
 
-    def test_rpc_recursively_redacts_secret_name_variants_without_over_redacting_safe_fields(self):
+    def test_rpc_recursively_redacts_secret_name_variants_without_over_redacting_safe_fields(
+        self,
+    ):
         class FakeResponse:
             status = 500
 
@@ -1294,31 +1288,39 @@ class TestWalletSageSigningGuard(unittest.TestCase):
             RuntimeError("snowman: ☃"),
         )
         for error in exceptions:
-            with self.subTest(error=type(error).__name__), patch(
-                "builtins.print", side_effect=cp1252_console
-            ), patch.object(wallet_sage, "_sage_post", side_effect=error):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch("builtins.print", side_effect=cp1252_console),
+                patch.object(wallet_sage, "_sage_post", side_effect=error),
+            ):
                 result = wallet_sage.rpc("test", {})
             self.assertFalse(result["success"])
 
     def test_allows_wallet_with_secrets(self):
         with patch.object(
-            wallet_sage, "get_current_key", return_value={"has_secrets": True}
+            wallet_sage,
+            "_get_current_key_read_only",
+            return_value={"has_secrets": True},
         ):
             self.assertTrue(wallet_sage._require_signing_capability())
 
     def test_blocks_watch_only_wallet(self):
         with patch.object(
-            wallet_sage, "get_current_key", return_value={"has_secrets": False}
+            wallet_sage,
+            "_get_current_key_read_only",
+            return_value={"has_secrets": False},
         ):
             self.assertFalse(wallet_sage._require_signing_capability())
 
     def test_blocks_when_active_key_missing(self):
-        with patch.object(wallet_sage, "get_current_key", return_value=None):
+        with patch.object(wallet_sage, "_get_current_key_read_only", return_value=None):
             self.assertFalse(wallet_sage._require_signing_capability())
 
     def test_blocks_when_lookup_errors(self):
         with patch.object(
-            wallet_sage, "get_current_key", side_effect=RuntimeError("boom")
+            wallet_sage,
+            "_get_current_key_read_only",
+            side_effect=RuntimeError("boom"),
         ):
             self.assertFalse(wallet_sage._require_signing_capability())
 

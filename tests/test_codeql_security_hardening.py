@@ -186,6 +186,10 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
             "wallet.get_wallet_sync_status",
             side_effect=RuntimeError("secret wallet traceback"),
         ),
+        patch(
+            "wallet.preflight_wallet_identity",
+            return_value={"success": True, "reason": "identity_verified"},
+        ),
         patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
     ):
         resp = client.post(
@@ -315,7 +319,7 @@ def test_config_change_address_result_hides_wallet_exception_details(monkeypatch
             return_value={"success": True, "address": "xch1safeaddress"},
         ),
         patch(
-            "wallet_sage.set_change_address",
+            "wallet.set_change_address",
             return_value={"success": False, "error": "secret change traceback"},
         ),
     ):

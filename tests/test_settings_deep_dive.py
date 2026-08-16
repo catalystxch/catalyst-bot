@@ -204,6 +204,10 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
             "wallet.get_wallet_sync_status",
             return_value={"reachable": True, "sync_state": "synced"},
         ),
+        patch(
+            "wallet.preflight_wallet_identity",
+            return_value={"success": True, "reason": "identity_verified"},
+        ),
         patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
     ):
         resp = client.post(

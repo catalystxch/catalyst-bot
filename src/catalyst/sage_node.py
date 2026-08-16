@@ -411,9 +411,13 @@ def _log_in_fingerprint(fingerprint: str) -> bool:
 
             # Sage: use the resync → login → verify sequence
             try:
-                from wallet_sage import sage_login
+                from wallet import sage_login
 
-                success = sage_login(int(fingerprint))
+                login_result = sage_login(int(fingerprint))
+                success = login_result is True or (
+                    isinstance(login_result, dict)
+                    and login_result.get("success") is True
+                )
                 if success:
                     with _phase_lock:
                         _sage_startup_phase = (

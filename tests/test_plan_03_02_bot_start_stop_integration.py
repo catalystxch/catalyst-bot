@@ -129,6 +129,10 @@ class _TempDB(unittest.TestCase):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
+            patch(
+                "wallet.preflight_wallet_identity",
+                return_value={"success": True, "reason": "identity_verified"},
+            ),
             patch.object(api_server.cfg, "CAT_ASSET_ID", _FAKE_ASSET),
             patch.object(api_server.cfg, "SPREAD_BPS", 50),
             patch("api_server.events") as mock_events,

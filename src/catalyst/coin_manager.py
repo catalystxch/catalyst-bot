@@ -8556,7 +8556,7 @@ class CoinManager:
         _two_step_split step 2 — poll for num_to_create new owned coins that
         match trading_size_mojos.
         """
-        from wallet_sage import sage_topup_split
+        from wallet import sage_topup_split
 
         tag = f"topup_{name.lower()}"
 
@@ -9915,7 +9915,7 @@ class CoinManager:
                     return _TOPUP_PENDING
 
             fee = self._tx_fee_mojos()
-            from wallet_sage import combine_coins
+            from wallet import combine_coins
 
             result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 
@@ -10334,7 +10334,7 @@ class CoinManager:
                 f"[{reserve_id[:12]}...] — new reserve will be {amt_str}",
             )
 
-            from wallet_sage import combine_coins
+            from wallet import combine_coins
 
             result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 

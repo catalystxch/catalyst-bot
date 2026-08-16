@@ -72,6 +72,14 @@ _ALLOWED_REASON_CODES = frozenset(
         "UNRESOLVED_OPERATIONS",
         "WORKER_DELEGATION_INVALID",
         "WORKER_PARENT_LEASE_INVALID",
+        "WALLET_BACKEND_UNSUPPORTED",
+        "WALLET_IDENTITY_BINDING_INVALID",
+        "WALLET_IDENTITY_MALFORMED",
+        "WALLET_IDENTITY_MISMATCH",
+        "WALLET_IDENTITY_NON_SIGNING",
+        "WALLET_IDENTITY_STALE",
+        "WALLET_IDENTITY_UNAVAILABLE",
+        "WALLET_MUTATION_FAILED",
     }
 )
 
@@ -93,6 +101,14 @@ _REASON_DESCRIPTIONS = {
     "UNRESOLVED_OPERATIONS": "Unresolved operation journal entries block mutation",
     "WORKER_DELEGATION_INVALID": "Worker mutation delegation is invalid",
     "WORKER_PARENT_LEASE_INVALID": "Worker parent lease is no longer valid",
+    "WALLET_BACKEND_UNSUPPORTED": "Wallet backend cannot prove mutation identity",
+    "WALLET_IDENTITY_BINDING_INVALID": "Expected wallet identity binding is invalid",
+    "WALLET_IDENTITY_MALFORMED": "Wallet returned malformed identity evidence",
+    "WALLET_IDENTITY_MISMATCH": "Active wallet identity does not match the expected binding",
+    "WALLET_IDENTITY_NON_SIGNING": "Active wallet cannot sign mutations",
+    "WALLET_IDENTITY_STALE": "Wallet identity evidence is stale or replayed",
+    "WALLET_IDENTITY_UNAVAILABLE": "Fresh wallet identity is unavailable",
+    "WALLET_MUTATION_FAILED": "Wallet mutation failed after authorization",
 }
 
 _TERMINAL_PROCESS_FENCES = frozenset(
@@ -146,6 +162,135 @@ class GateStatus:
                 "owned_by_this_run": bool(self.owner_is_this_run),
             },
         }
+
+
+def _strict_utc_timestamp(value: Any, name: str) -> tuple[datetime, str]:
+    """Parse the canonical Task-1 identity timestamp without local ambiguity."""
+
+    if type(value) is not str or not value.endswith("Z"):
+        raise ValueError(f"{name} must be a canonical UTC timestamp")
+    parsed = _as_utc(value)
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{name} must be UTC")
+    return parsed, _timestamp(parsed)
+
+
+def wallet_fingerprint_hash(fingerprint: Any) -> str:
+    """Return the exact stable lease binding for a wallet fingerprint."""
+
+    if type(fingerprint) is not int or fingerprint < 1:
+        raise ValueError("fingerprint must be a positive exact integer")
+    return hashlib.sha256(f"fingerprint:{fingerprint}".encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class WalletIdentityBinding:
+    """Exact expected wallet identity and freshness contract for mutations."""
+
+    backend: str
+    fingerprint: int
+    network_id: str
+    kind: str
+    has_secrets: bool
+    bound_at_utc: str
+    name: str = ""
+    maximum_age_seconds: int = 10
+
+    def __post_init__(self) -> None:
+        backend = _exact_text(self.backend, "backend", max_length=16).lower()
+        network = _exact_text(self.network_id, "network_id", max_length=64).lower()
+        kind = _exact_text(self.kind, "kind", max_length=64).lower()
+        if type(self.fingerprint) is not int or self.fingerprint < 1:
+            raise ValueError("fingerprint must be a positive exact integer")
+        if self.has_secrets is not True:
+            raise ValueError("mutation binding must require signing capability")
+        name = _exact_text(self.name, "name", max_length=128)
+        object.__setattr__(self, "name", name)
+        if type(self.maximum_age_seconds) is not int or not (
+            1 <= self.maximum_age_seconds <= 300
+        ):
+            raise ValueError("maximum_age_seconds is invalid")
+        _, bound_timestamp = _strict_utc_timestamp(self.bound_at_utc, "bound_at_utc")
+        object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "network_id", network)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "bound_at_utc", bound_timestamp)
+
+
+def validate_wallet_identity(
+    binding: Any,
+    snapshot: Any,
+    *,
+    now: Optional[datetime] = None,
+    last_observed_at_utc: Optional[str] = None,
+) -> dict[str, Any]:
+    """Pure, total fail-closed check over one uncached identity observation."""
+
+    if type(binding) is not WalletIdentityBinding:
+        return {"allowed": False, "reason": "WALLET_IDENTITY_BINDING_INVALID"}
+    if binding.backend not in {"sage", "chia"}:
+        return {"allowed": False, "reason": "WALLET_BACKEND_UNSUPPORTED"}
+    if type(snapshot) is not dict:
+        return {"allowed": False, "reason": "WALLET_IDENTITY_MALFORMED"}
+    try:
+        success = snapshot.get("success")
+        if success is False:
+            return {"allowed": False, "reason": "WALLET_IDENTITY_UNAVAILABLE"}
+        if success is not True:
+            return {"allowed": False, "reason": "WALLET_IDENTITY_MALFORMED"}
+
+        backend = snapshot.get("backend")
+        fingerprint = snapshot.get("fingerprint")
+        network = snapshot.get("network_id")
+        kind = snapshot.get("kind")
+        signing = snapshot.get("has_secrets")
+        name = snapshot.get("name")
+        observed_raw = snapshot.get("observed_at_utc")
+        if (
+            binding.backend == "chia"
+            and backend == "chia"
+            and (network is None or kind is None or signing is None)
+        ):
+            return {"allowed": False, "reason": "WALLET_BACKEND_UNSUPPORTED"}
+        if (
+            type(backend) is not str
+            or type(fingerprint) is not int
+            or fingerprint < 1
+            or type(network) is not str
+            or type(kind) is not str
+            or type(signing) is not bool
+            or (name is not None and type(name) is not str)
+        ):
+            return {"allowed": False, "reason": "WALLET_IDENTITY_MALFORMED"}
+        observed, observed_text = _strict_utc_timestamp(observed_raw, "observed_at_utc")
+        current = _as_utc(now or _utc_now())
+        bound_at = _as_utc(binding.bound_at_utc)
+        previous = (
+            _strict_utc_timestamp(last_observed_at_utc, "last_observed_at_utc")[0]
+            if last_observed_at_utc is not None
+            else bound_at
+        )
+    except Exception:
+        return {"allowed": False, "reason": "WALLET_IDENTITY_MALFORMED"}
+
+    if signing is not True:
+        return {"allowed": False, "reason": "WALLET_IDENTITY_NON_SIGNING"}
+    if (
+        backend != binding.backend
+        or fingerprint != binding.fingerprint
+        or network.lower() != binding.network_id
+        or kind.lower() != binding.kind
+        or name != binding.name
+    ):
+        return {"allowed": False, "reason": "WALLET_IDENTITY_MISMATCH"}
+    age = (current - observed).total_seconds()
+    if age < 0 or age > binding.maximum_age_seconds or observed <= previous:
+        return {"allowed": False, "reason": "WALLET_IDENTITY_STALE"}
+    return {
+        "allowed": True,
+        "reason": "identity_verified",
+        "observed_at_utc": observed_text,
+    }
 
 
 class WorkerDelegation:
@@ -407,6 +552,7 @@ class MutationGate:
         clock: Callable[[], datetime] = _utc_now,
         pid_liveness: Callable[[int, str], Optional[bool]] = pid_liveness,
         read_only: bool = False,
+        wallet_identity_binding: Optional[WalletIdentityBinding] = None,
     ):
         self.run_id = _exact_text(run_id, "run_id")
         self.owner_pid = _exact_positive_int(owner_pid, "owner_pid")
@@ -421,6 +567,17 @@ class MutationGate:
         self._read_only = read_only
         self._clock = clock
         self._pid_liveness = pid_liveness
+        if wallet_identity_binding is not None and (
+            type(wallet_identity_binding) is not WalletIdentityBinding
+            or hashlib.sha256(
+                f"fingerprint:{wallet_identity_binding.fingerprint}".encode("utf-8")
+            ).hexdigest()
+            != self.wallet_fingerprint_hash
+            or wallet_identity_binding.network_id != self.network.lower()
+        ):
+            raise ValueError("wallet identity binding does not match lease binding")
+        self.wallet_identity_binding = wallet_identity_binding
+        self._last_wallet_identity_observed_at_utc: Optional[str] = None
         self._lock = threading.RLock()
         self._mutation_condition = threading.Condition(self._lock)
         self._active_mutations: dict[str, str] = {}
@@ -726,6 +883,27 @@ class MutationGate:
         if not current.allowed:
             raise MutationBlocked(current.reason_code, operation)
         return current
+
+    def require_fresh_wallet_identity(
+        self, snapshot: Any, operation: str
+    ) -> dict[str, Any]:
+        """Require a new exact identity observation under current lease authority."""
+
+        safe_operation = _safe_operation(operation)
+        with self._lock:
+            self.require_allowed(safe_operation)
+            decision = validate_wallet_identity(
+                self.wallet_identity_binding,
+                snapshot,
+                now=self._now(),
+                last_observed_at_utc=self._last_wallet_identity_observed_at_utc,
+            )
+            if decision.get("allowed") is not True:
+                raise MutationBlocked(decision.get("reason"), safe_operation)
+            self._last_wallet_identity_observed_at_utc = str(
+                decision["observed_at_utc"]
+            )
+            return decision
 
     @_stop_callback_boundary
     def enter_mutation(self, operation: str) -> str:
@@ -1192,6 +1370,137 @@ def require_worker_allowed_from_environment(
 
 _runtime_lock = threading.RLock()
 _runtime: Optional[MutationGate] = None
+_worker_authority_lock = threading.RLock()
+_worker_authority_environment: Optional[dict[str, str]] = None
+_worker_authority_bound_at_utc: Optional[str] = None
+_worker_identity_last_observed_at_utc: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WalletMutationPermit:
+    mode: str
+    permit: Optional[str] = None
+
+
+def install_worker_authority_environment(environment: Mapping[str, str]) -> None:
+    """Retain a validated child delegation for fresh per-effect checks."""
+
+    result = validate_worker_environment(environment)
+    if result.get("allowed") is not True:
+        raise MutationBlocked("WORKER_DELEGATION_INVALID", "worker.install")
+    try:
+        copied = {
+            name: _exact_text(environment.get(name), name, max_length=512)
+            for name in _DELEGATION_ENV_NAMES
+        }
+    except Exception as exc:
+        raise MutationBlocked("WORKER_DELEGATION_INVALID", "worker.install") from exc
+    with _worker_authority_lock:
+        global _worker_authority_environment, _worker_authority_bound_at_utc
+        global _worker_identity_last_observed_at_utc
+        _worker_authority_environment = copied
+        _worker_authority_bound_at_utc = _timestamp(_utc_now())
+        _worker_identity_last_observed_at_utc = None
+
+
+def clear_worker_authority_environment() -> None:
+    with _worker_authority_lock:
+        global _worker_authority_environment, _worker_authority_bound_at_utc
+        global _worker_identity_last_observed_at_utc
+        _worker_authority_environment = None
+        _worker_authority_bound_at_utc = None
+        _worker_identity_last_observed_at_utc = None
+
+
+def worker_identity_lease_binding() -> Optional[dict[str, str]]:
+    """Return only the non-token identity binding after fresh delegation proof."""
+
+    with _worker_authority_lock:
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+    if environment is None:
+        return None
+    require_worker_allowed_from_environment("wallet:identity", environment)
+    with _worker_authority_lock:
+        if (
+            _worker_authority_environment != environment
+            or _worker_authority_bound_at_utc is None
+        ):
+            return None
+        return {
+            "wallet_fingerprint_hash": environment[DELEGATION_WALLET_ENV],
+            "network": environment[DELEGATION_NETWORK_ENV],
+            "bound_at_utc": _worker_authority_bound_at_utc,
+        }
+
+
+def enter_wallet_mutation(operation: str) -> WalletMutationPermit:
+    """Enter either an owned-runtime or delegated-worker mutation boundary."""
+
+    runtime = current_runtime()
+    if runtime is not None:
+        return WalletMutationPermit("runtime", runtime.enter_mutation(operation))
+    with _worker_authority_lock:
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+    if environment is None:
+        raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+    require_worker_allowed_from_environment(operation, environment)
+    return WalletMutationPermit("worker")
+
+
+def exit_wallet_mutation(permit: Any) -> bool:
+    if type(permit) is not WalletMutationPermit:
+        return False
+    if permit.mode == "worker":
+        return True
+    if permit.mode != "runtime" or permit.permit is None:
+        return False
+    return exit_mutation(permit.permit)
+
+
+def require_fresh_wallet_identity(
+    binding: WalletIdentityBinding, snapshot: Any, operation: str
+) -> dict[str, Any]:
+    """Apply identity proof to the active owner or delegated worker."""
+
+    runtime = current_runtime()
+    if runtime is not None:
+        if runtime.wallet_identity_binding != binding:
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        return runtime.require_fresh_wallet_identity(snapshot, operation)
+
+    lease_binding = worker_identity_lease_binding()
+    if lease_binding is None:
+        raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+    try:
+        binding_matches = (
+            wallet_fingerprint_hash(binding.fingerprint)
+            == lease_binding["wallet_fingerprint_hash"]
+            and binding.network_id == lease_binding["network"].lower()
+            and binding.bound_at_utc == lease_binding["bound_at_utc"]
+        )
+    except Exception:
+        binding_matches = False
+    if not binding_matches:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    with _worker_authority_lock:
+        global _worker_identity_last_observed_at_utc
+        decision = validate_wallet_identity(
+            binding,
+            snapshot,
+            last_observed_at_utc=_worker_identity_last_observed_at_utc,
+        )
+        if decision.get("allowed") is not True:
+            raise MutationBlocked(decision.get("reason"), operation)
+        _worker_identity_last_observed_at_utc = str(decision["observed_at_utc"])
+        return decision
 
 
 def initialize(
@@ -1204,6 +1513,7 @@ def initialize(
     lease_seconds: int = 30,
     start_heartbeat: bool = True,
     acquire_lease: bool = True,
+    wallet_identity_binding: Optional[WalletIdentityBinding] = None,
 ) -> MutationGate:
     global _runtime
     with _runtime_lock:
@@ -1217,6 +1527,7 @@ def initialize(
                 and previous.wallet_fingerprint_hash == wallet_fingerprint_hash
                 and previous.network == network
                 and previous.lease_seconds == lease_seconds
+                and previous.wallet_identity_binding == wallet_identity_binding
                 and (run_id is None or previous.run_id == run_id)
             )
             if not same_binding:
@@ -1247,6 +1558,7 @@ def initialize(
             network=network,
             lease_seconds=lease_seconds,
             read_only=not acquire_lease,
+            wallet_identity_binding=wallet_identity_binding,
         )
         if acquire_lease:
             gate.acquire()
@@ -1352,17 +1664,27 @@ __all__ = [
     "GateStatus",
     "MutationBlocked",
     "MutationGate",
+    "WalletIdentityBinding",
+    "WalletMutationPermit",
+    "clear_worker_authority_environment",
     "enter_mutation",
+    "enter_wallet_mutation",
     "exit_mutation",
+    "exit_wallet_mutation",
+    "install_worker_authority_environment",
     "WorkerDelegation",
     "current_runtime",
     "initialize",
     "pid_liveness",
     "release_resolved",
     "require_allowed",
+    "require_fresh_wallet_identity",
     "require_worker_allowed_from_environment",
     "shutdown_runtime",
     "status",
     "trip",
+    "validate_wallet_identity",
     "validate_worker_environment",
+    "wallet_fingerprint_hash",
+    "worker_identity_lease_binding",
 ]

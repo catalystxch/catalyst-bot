@@ -18,13 +18,19 @@ logic of its own beyond the shim.
 """
 
 import os
+import inspect
+import threading
 from dotenv import load_dotenv
+from config import cfg
+import mutation_gate
 
 load_dotenv()
 
 WALLET_TYPE = os.getenv("WALLET_TYPE", "sage").strip().lower()
 
 if WALLET_TYPE == "chia":
+    import wallet_chia as _wallet_adapter
+
     print("🔄 [Wallet] Using Chia wallet backend (port 9256)")
     try:
         from database import log_event as _log_wallet
@@ -113,6 +119,8 @@ if WALLET_TYPE == "chia":
     # Chia's spendable RPC is already the exact selectable view.
     get_exact_spendable_coins_rpc = get_spendable_coins_rpc
 else:
+    import wallet_sage as _wallet_adapter
+
     # Default: Sage (or unknown type falls back to Sage)
     def _safe_console(msg: str) -> None:
         try:
@@ -203,3 +211,527 @@ else:
 def get_wallet_type() -> str:
     """Return which wallet backend is active: 'chia' or 'sage'."""
     return WALLET_TYPE
+
+
+MUTATING_WALLET_EXPORTS = frozenset(
+    {
+        "cancel_offer",
+        "cancel_offers_batch",
+        "cleanup_expired_offers",
+        "create_offer",
+        "full_node_rpc",
+        "get_next_address",
+        "rpc",
+        "send_transaction",
+        "send_transaction_multi",
+        "split_coins_bulk",
+        "split_coins_rpc",
+        "sign_message_by_address",
+        "auto_combine_cat",
+        "auto_combine_xch",
+        "combine_coins",
+        "create_transaction_rpc",
+        "sage_login",
+        "sage_topup_split",
+        "send_cat_multi",
+        "sage_delete_offer",
+        "sage_delete_offers_batch",
+        "set_change_address",
+    }
+)
+
+_IDENTITY_BLOCK_ERROR = "Wallet mutation blocked by identity safety check"
+_ADAPTER_DEFAULT = object()
+_COMPOUND_MUTATION_EXPORTS = frozenset(
+    {
+        "auto_combine_cat",
+        "auto_combine_xch",
+        "cancel_offer",
+        "cancel_offers_batch",
+        "cleanup_expired_offers",
+        "combine_coins",
+        "create_offer",
+        "create_transaction_rpc",
+        "delete_offer",
+        "delete_offers_batch",
+        "get_next_address",
+        "sage_login",
+        "sage_topup_split",
+        "send_cat_multi",
+        "send_transaction",
+        "send_transaction_multi",
+        "set_change_address",
+        "sign_message_by_address",
+        "split_coins_rpc",
+        "split_coins_bulk",
+    }
+)
+
+
+def _blocked_mutation(reason: str) -> dict:
+    return {
+        "success": False,
+        "error": _IDENTITY_BLOCK_ERROR,
+        "reason": str(reason or "MUTATION_GATE_SAFETY_STOP"),
+    }
+
+
+def wallet_mutation_succeeded(result) -> bool:
+    """Interpret legacy bool and structured mutation results without truthiness."""
+
+    return result is True or (
+        isinstance(result, dict) and result.get("success") is True
+    )
+
+
+def wallet_batch_results(result, item_ids) -> dict:
+    """Expand a top-level guarded denial into the legacy per-item result shape."""
+
+    if type(result) is dict and result.get("success") is False:
+        return {str(item_id): dict(result) for item_id in item_ids}
+    if type(result) is dict:
+        return result
+    failure = {
+        "success": False,
+        "error": "Wallet mutation returned malformed batch result",
+        "reason": "WALLET_MUTATION_FAILED",
+    }
+    return {str(item_id): dict(failure) for item_id in item_ids}
+
+
+def wallet_mutation_count(result) -> int:
+    """Interpret legacy count results without treating a denial dict as a count."""
+
+    return result if type(result) is int and result >= 0 else 0
+
+
+_delegated_identity_binding_lock = threading.RLock()
+_delegated_identity_binding_key = None
+_delegated_identity_binding = None
+
+
+def _expected_identity_binding() -> mutation_gate.WalletIdentityBinding:
+    """Return the lease/delegation-bound exact identity expected for mutation."""
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is not None:
+        binding = runtime.wallet_identity_binding
+        if type(binding) is mutation_gate.WalletIdentityBinding:
+            return binding
+        raise mutation_gate.MutationBlocked(
+            "WALLET_IDENTITY_BINDING_INVALID", "wallet:identity"
+        )
+
+    delegated = mutation_gate.worker_identity_lease_binding()
+    if not isinstance(delegated, dict):
+        raise mutation_gate.MutationBlocked(
+            "MUTATION_RUNTIME_NOT_INITIALIZED", "wallet:identity"
+        )
+    try:
+        delegated_key = (
+            delegated["wallet_fingerprint_hash"],
+            delegated["network"],
+            delegated["bound_at_utc"],
+        )
+        if not all(type(value) is str and value for value in delegated_key):
+            raise ValueError("delegated identity binding is malformed")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise mutation_gate.MutationBlocked(
+            "WALLET_IDENTITY_BINDING_INVALID", "wallet:identity"
+        ) from exc
+
+    with _delegated_identity_binding_lock:
+        if (
+            delegated_key == _delegated_identity_binding_key
+            and type(_delegated_identity_binding) is mutation_gate.WalletIdentityBinding
+        ):
+            return _delegated_identity_binding
+
+        try:
+            if WALLET_TYPE not in {"sage", "chia"}:
+                raise mutation_gate.MutationBlocked(
+                    "WALLET_BACKEND_UNSUPPORTED", "wallet:identity"
+                )
+            raw_fingerprint = (
+                getattr(cfg, "SAGE_FINGERPRINT", "")
+                if WALLET_TYPE == "sage"
+                else getattr(cfg, "WALLET_FINGERPRINT", "")
+            )
+            if (
+                type(raw_fingerprint) is not str
+                or not raw_fingerprint.isascii()
+                or not raw_fingerprint.isdigit()
+            ):
+                raise ValueError("fingerprint must be canonical decimal text")
+            fingerprint = int(raw_fingerprint)
+            if str(fingerprint) != raw_fingerprint:
+                raise ValueError("fingerprint must be canonical decimal text")
+            raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
+            raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+            maximum_age = getattr(cfg, "WALLET_IDENTITY_MAX_AGE_SECONDS", None)
+            if type(raw_expected_name) is not str or type(raw_expected_kind) is not str:
+                raise ValueError("expected identity text must be exact")
+            expected_name = raw_expected_name.strip()
+            expected_kind = raw_expected_kind.strip()
+            if not expected_name or not expected_kind or type(maximum_age) is not int:
+                raise ValueError("expected identity config is malformed")
+            candidate = mutation_gate.WalletIdentityBinding(
+                backend=WALLET_TYPE,
+                name=expected_name,
+                fingerprint=fingerprint,
+                network_id=delegated["network"],
+                kind=expected_kind,
+                has_secrets=True,
+                bound_at_utc=delegated["bound_at_utc"],
+                maximum_age_seconds=maximum_age,
+            )
+            if (
+                mutation_gate.wallet_fingerprint_hash(candidate.fingerprint)
+                != delegated["wallet_fingerprint_hash"]
+                or candidate.network_id != delegated["network"].lower()
+            ):
+                raise ValueError("expected identity does not match delegation")
+            globals()["_delegated_identity_binding_key"] = delegated_key
+            globals()["_delegated_identity_binding"] = candidate
+            return candidate
+        except mutation_gate.MutationBlocked:
+            raise
+        except Exception as exc:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID", "wallet:identity"
+            ) from exc
+
+
+def get_wallet_identity() -> dict:
+    """Read identity directly from the selected adapter; this is never cached."""
+
+    try:
+        result = _wallet_adapter.get_wallet_identity()
+    except Exception:
+        return {
+            "success": False,
+            "backend": WALLET_TYPE,
+            "name": None,
+            "fingerprint": None,
+            "network_id": None,
+            "kind": None,
+            "has_secrets": None,
+            "observed_at_utc": "",
+            "error": "identity_lookup_failed",
+        }
+    return result
+
+
+def preflight_wallet_identity() -> dict:
+    """Read-only UX preflight; the mutation-bound read remains authoritative."""
+
+    try:
+        binding = _expected_identity_binding()
+        snapshot = get_wallet_identity()
+        decision = mutation_gate.validate_wallet_identity(binding, snapshot)
+        if decision.get("allowed") is True:
+            return {"success": True, "reason": "identity_verified"}
+        return _blocked_mutation(str(decision.get("reason") or ""))
+    except mutation_gate.MutationBlocked as exc:
+        return _blocked_mutation(exc.reason_code)
+    except Exception:
+        return _blocked_mutation("WALLET_IDENTITY_MALFORMED")
+
+
+def _run_wallet_mutation(export_name: str, *args, **kwargs):
+    operation = f"wallet:{export_name}"
+    permit = None
+    try:
+        permit = mutation_gate.enter_wallet_mutation(operation)
+        binding = _expected_identity_binding()
+        snapshot = get_wallet_identity()
+        mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+        if export_name in _COMPOUND_MUTATION_EXPORTS:
+
+            def identity_recheck(step: str) -> None:
+                safe_step = (
+                    step if type(step) is str and step and len(step) <= 64 else "effect"
+                )
+                fresh_snapshot = get_wallet_identity()
+                mutation_gate.require_fresh_wallet_identity(
+                    binding,
+                    fresh_snapshot,
+                    f"{operation}:{safe_step}",
+                )
+
+            kwargs["_identity_recheck"] = identity_recheck
+        callback = getattr(_wallet_adapter, export_name)
+        result = callback(*args, **kwargs)
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+        return result
+    except mutation_gate.MutationBlocked as exc:
+        return _blocked_mutation(exc.reason_code)
+    except Exception:
+        return {
+            "success": False,
+            "error": "Wallet mutation failed after authorization",
+            "reason": "WALLET_MUTATION_FAILED",
+        }
+    finally:
+        if permit is not None:
+            try:
+                mutation_gate.exit_wallet_mutation(permit)
+            except BaseException:
+                pass
+
+
+def get_wallet_balance(wallet_id: int):
+    """Read-only balance calls remain available while mutation is blocked."""
+
+    return _wallet_adapter.get_wallet_balance(wallet_id)
+
+
+def get_next_address(wallet_id: int = WALLET_ID_XCH, new_address: bool = True):
+    """Guard derivation-state changes while keeping existing-address reads usable."""
+
+    if new_address is True:
+        return _run_wallet_mutation("get_next_address", wallet_id, True)
+    return _wallet_adapter.get_next_address(wallet_id, new_address=False)
+
+
+_READ_ONLY_RPC_ENDPOINTS = frozenset(
+    {
+        "get_coins",
+        "get_logged_in_fingerprint",
+        "get_version",
+    }
+)
+
+
+def rpc(endpoint: str, payload: dict, timeout: int = 10):
+    """Default unknown generic RPC endpoints to the guarded mutation path."""
+
+    if type(endpoint) is str and endpoint in _READ_ONLY_RPC_ENDPOINTS:
+        return _wallet_adapter.rpc(endpoint, payload, timeout)
+    return _run_wallet_mutation("rpc", endpoint, payload, timeout)
+
+
+_READ_ONLY_FULL_NODE_RPC_ENDPOINTS = frozenset(
+    {
+        "get_blockchain_state",
+        "get_connections",
+        "get_fee_estimate",
+    }
+)
+
+
+def full_node_rpc(endpoint: str, payload: dict, timeout: int = 5):
+    """Default unknown full-node RPC endpoints to the guarded mutation path."""
+
+    if type(endpoint) is str and endpoint in _READ_ONLY_FULL_NODE_RPC_ENDPOINTS:
+        return _wallet_adapter.full_node_rpc(endpoint, payload, timeout)
+    return _run_wallet_mutation("full_node_rpc", endpoint, payload, timeout)
+
+
+def split_coins_rpc(
+    wallet_id: int,
+    target_coin_id: str,
+    num_coins: int,
+    amount_per_coin: int,
+    fee_mojos: int = 0,
+    is_cat: bool = False,
+):
+    return _run_wallet_mutation(
+        "split_coins_rpc",
+        wallet_id,
+        target_coin_id,
+        num_coins,
+        amount_per_coin,
+        fee_mojos,
+        is_cat,
+    )
+
+
+def split_coins_bulk(
+    wallet_id: int,
+    num_coins: int,
+    coin_size_mojos: int,
+    fee_mojos: int = 0,
+    reserve_multiplier: float = 2.0,
+    is_cat: bool = False,
+    cat_decimals: int = 3,
+):
+    return _run_wallet_mutation(
+        "split_coins_bulk",
+        wallet_id,
+        num_coins,
+        coin_size_mojos,
+        fee_mojos,
+        reserve_multiplier,
+        is_cat,
+        cat_decimals,
+    )
+
+
+def send_transaction(
+    wallet_id: int,
+    amount_mojos: int,
+    address: str,
+    fee_mojos: int = 0,
+    source_coin_ids: list = None,
+):
+    kwargs = {}
+    if WALLET_TYPE == "sage":
+        kwargs["source_coin_ids"] = source_coin_ids
+    elif source_coin_ids:
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return _run_wallet_mutation(
+        "send_transaction",
+        wallet_id,
+        amount_mojos,
+        address,
+        fee_mojos,
+        **kwargs,
+    )
+
+
+def send_transaction_multi(payments: list, fee_mojos: int = 0):
+    return _run_wallet_mutation("send_transaction_multi", payments, fee_mojos)
+
+
+def create_offer(
+    offer_dict: dict,
+    validate_only: bool = _ADAPTER_DEFAULT,
+    max_time: int = None,
+    _reuse_puzhash: bool = _ADAPTER_DEFAULT,
+    min_coin_amount: int = None,
+    max_coin_amount: int = None,
+    coin_ids: list = None,
+    fee_mojos: int = 0,
+):
+    if validate_only is _ADAPTER_DEFAULT:
+        validate_only = WALLET_TYPE == "chia"
+    if _reuse_puzhash is _ADAPTER_DEFAULT:
+        _reuse_puzhash = WALLET_TYPE == "sage"
+    kwargs = {
+        "validate_only": validate_only,
+        "max_time": max_time,
+        "_reuse_puzhash": _reuse_puzhash,
+        "min_coin_amount": min_coin_amount,
+        "max_coin_amount": max_coin_amount,
+        "coin_ids": coin_ids,
+    }
+    if WALLET_TYPE == "sage":
+        kwargs["fee_mojos"] = fee_mojos
+    elif fee_mojos:
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return _run_wallet_mutation("create_offer", offer_dict, **kwargs)
+
+
+def cancel_offer(
+    trade_id: str,
+    secure: bool = True,
+    timeout: int = 60,
+    fee_mojos: int = None,
+):
+    return _run_wallet_mutation(
+        "cancel_offer",
+        trade_id,
+        secure,
+        timeout,
+        fee_mojos,
+    )
+
+
+def cancel_offers_batch(
+    trade_ids: list,
+    secure: bool = True,
+    max_workers: int = 3,
+    fee_mojos: int = None,
+    skip_confirmation: bool = False,
+):
+    return _run_wallet_mutation(
+        "cancel_offers_batch",
+        trade_ids,
+        secure,
+        max_workers,
+        fee_mojos,
+        skip_confirmation,
+    )
+
+
+def cleanup_expired_offers(log_fn=None):
+    return _run_wallet_mutation("cleanup_expired_offers", log_fn)
+
+
+def _run_sage_mutation(export_name: str, *args, **kwargs):
+    if WALLET_TYPE != "sage" or not hasattr(_wallet_adapter, export_name):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return _run_wallet_mutation(export_name, *args, **kwargs)
+
+
+def create_transaction_rpc(
+    selected_coin_ids: list, actions: list, auto_submit: bool = True
+):
+    return _run_sage_mutation(
+        "create_transaction_rpc", selected_coin_ids, actions, auto_submit
+    )
+
+
+def sage_topup_split(
+    source_coin_id: str,
+    num_coins: int,
+    trading_size_mojos: int,
+    own_address: str,
+    fee_mojos: int = 0,
+    is_cat: bool = False,
+    fee_coin_id=None,
+):
+    return _run_sage_mutation(
+        "sage_topup_split",
+        source_coin_id,
+        num_coins,
+        trading_size_mojos,
+        own_address,
+        fee_mojos,
+        is_cat,
+        fee_coin_id,
+    )
+
+
+def combine_coins(coin_ids: list, fee_mojos: int = 0):
+    return _run_sage_mutation("combine_coins", coin_ids, fee_mojos)
+
+
+def send_cat_multi(payments: list, fee_mojos: int = 0):
+    return _run_sage_mutation("send_cat_multi", payments, fee_mojos)
+
+
+def sign_message_by_address(address: str, message: str):
+    return _run_sage_mutation("sign_message_by_address", address, message)
+
+
+def auto_combine_xch(fee_mojos: int = 0, max_coins: int = 500):
+    return _run_sage_mutation("auto_combine_xch", fee_mojos, max_coins)
+
+
+def auto_combine_cat(asset_id: str = None, fee_mojos: int = 0, max_coins: int = 500):
+    return _run_sage_mutation("auto_combine_cat", asset_id, fee_mojos, max_coins)
+
+
+def sage_login(fingerprint: int, force_resync: bool = False):
+    return _run_sage_mutation("sage_login", fingerprint, force_resync)
+
+
+def set_change_address(change_address: str, fingerprint: int = None):
+    return _run_sage_mutation("set_change_address", change_address, fingerprint)
+
+
+def sage_delete_offer(offer_id: str):
+    return _run_sage_mutation("delete_offer", offer_id)
+
+
+def sage_delete_offers_batch(offer_ids: list):
+    return _run_sage_mutation("delete_offers_batch", offer_ids)

@@ -419,6 +419,10 @@ class TestStartupPhase6BotStartValidation(_TempDB):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
+            patch(
+                "wallet.preflight_wallet_identity",
+                return_value={"success": True, "reason": "identity_verified"},
+            ),
             patch.object(api_server.cfg, "CAT_ASSET_ID", asset_id),
             patch.object(api_server.cfg, "SPREAD_BPS", spread_bps),
             patch("api_server.events"),

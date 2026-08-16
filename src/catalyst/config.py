@@ -271,6 +271,11 @@ class Config:
         self.WALLET_ID_XCH = _int("CHIA_WALLET_ID_XCH", 1)
         self.WALLET_FINGERPRINT = _str("WALLET_FINGERPRINT")
         self.WALLET_DEBUG = _bool("WALLET_DEBUG", False)
+        self.WALLET_EXPECTED_NAME = _str("WALLET_EXPECTED_NAME")
+        self.WALLET_EXPECTED_KEY_KIND = _str("WALLET_EXPECTED_KEY_KIND", "bls")
+        self.WALLET_IDENTITY_MAX_AGE_SECONDS = _int(
+            "WALLET_IDENTITY_MAX_AGE_SECONDS", 10
+        )
 
         # ----- Sage Wallet (alternative backend) -----
         self.SAGE_RPC_URL = _str("SAGE_RPC_URL", "https://localhost:9257")

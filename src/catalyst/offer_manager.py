@@ -49,6 +49,25 @@ from wallet import (
 )
 
 
+def _wallet_batch_results(result, item_ids) -> dict:
+    """Preserve identity-denial details in this module's per-offer shape."""
+
+    if type(result) is dict and result.get("success") is False:
+        return {str(item_id): dict(result) for item_id in item_ids}
+    if type(result) is dict:
+        return result
+    failure = {
+        "success": False,
+        "error": "Wallet mutation returned malformed batch result",
+        "reason": "WALLET_MUTATION_FAILED",
+    }
+    return {str(item_id): dict(failure) for item_id in item_ids}
+
+
+def _wallet_mutation_count(result) -> int:
+    return result if type(result) is int and result >= 0 else 0
+
+
 # ---------------------------------------------------------------------------
 # Amount conversion helpers (from V1 — critical to get right)
 # ---------------------------------------------------------------------------
@@ -3681,6 +3700,7 @@ class OfferManager:
         results = cancel_offers_batch(
             trade_ids, secure=True, skip_confirmation=skip_confirmation
         )
+        results = _wallet_batch_results(results, trade_ids)
 
         # Log results summary
         successes = sum(1 for r in results.values() if r and r.get("success"))
@@ -3970,6 +3990,7 @@ class OfferManager:
 
         try:
             bulk_results = cancel_offers_batch(trade_ids, secure=True)
+            bulk_results = _wallet_batch_results(bulk_results, trade_ids)
             all_results.update(bulk_results)
             apply_batch_results(bulk_results)
         except Exception as e:
@@ -4134,7 +4155,7 @@ class OfferManager:
         We must check valid_times.max_time manually and cancel stale ones.
         """
         count = cleanup_expired_offers()
-        return count + len(self.cleanup_expired_db_offers())
+        return _wallet_mutation_count(count) + len(self.cleanup_expired_db_offers())
 
     def cleanup_expired_db_offers(self) -> List[str]:
         """Retire DB-open offers whose local expires_at has elapsed.

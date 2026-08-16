@@ -40,6 +40,27 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        self._wallet_identity_preflight = patch(
+            "wallet.preflight_wallet_identity",
+            return_value={"success": True, "reason": "identity_verified"},
+        )
+        self._wallet_identity_preflight.start()
+        self.addCleanup(self._wallet_identity_preflight.stop)
+        self._wallet_identity_read = patch(
+            "wallet.get_wallet_identity",
+            return_value={
+                "success": True,
+                "backend": "sage",
+                "name": "Test Wallet",
+                "fingerprint": 123456789,
+                "network_id": "mainnet",
+                "kind": "bls",
+                "has_secrets": True,
+                "observed_at_utc": "2026-08-16T12:00:00.000000Z",
+            },
+        )
+        self._wallet_identity_read.start()
+        self.addCleanup(self._wallet_identity_read.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -73,6 +94,8 @@ def _fake_cfg(cat_asset_id="abc123", spread_bps=200):
         SPREAD_BPS=spread_bps,
         HARD_MIN_PRICE_XCH=Decimal("0.001"),
         HARD_MAX_PRICE_XCH=Decimal("1.0"),
+        MAX_ACTIVE_BUY_OFFERS=1,
+        MAX_ACTIVE_SELL_OFFERS=1,
     )
 
 
@@ -145,6 +168,45 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertEqual(body.get("status"), "started")
+
+    def test_wallet_identity_preflight_denial_blocks_start_with_stable_error(self):
+        fake_cfg = _fake_cfg()
+        bot = _make_bot(running=False, start_returns=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "wallet.preflight_wallet_identity",
+                return_value={
+                    "success": False,
+                    "error": "Wallet mutation blocked by identity safety check",
+                    "reason": "WALLET_IDENTITY_MISMATCH",
+                },
+            ) as preflight,
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "status": "error",
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+                "errors": ["Wallet mutation blocked by identity safety check"],
+                "warnings": [],
+            },
+        )
+        preflight.assert_called_once_with()
+        bot.start.assert_not_called()
 
     def test_start_blocked_by_bot_returns_400(self):
         fake_cfg = _fake_cfg()

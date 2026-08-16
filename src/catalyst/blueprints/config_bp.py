@@ -65,7 +65,7 @@ def _apply_sage_change_address_setting() -> dict:
             }
 
         cfg.WALLET_ADDRESS = addr_result["address"]
-        from wallet_sage import set_change_address as _sage_set_change_address
+        from wallet import set_change_address as _sage_set_change_address
 
         result = _sage_set_change_address(cfg.WALLET_ADDRESS)
         if result and result.get("success"):
@@ -133,6 +133,9 @@ _BLOCKED_KEYS = {
     "SAGE_KEY_PATH",
     "SAGE_DATA_DIR",
     "SAGE_FINGERPRINT",
+    "WALLET_EXPECTED_NAME",
+    "WALLET_EXPECTED_KEY_KIND",
+    "WALLET_IDENTITY_MAX_AGE_SECONDS",
     "CHIA_WALLET_RPC_URL",
     "CHIA_FULL_NODE_RPC_URL",
     "SAGE_RPC_URL",

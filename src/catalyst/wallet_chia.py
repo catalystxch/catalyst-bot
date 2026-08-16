@@ -98,15 +98,26 @@ def set_quiet_mode(quiet: bool):
     _quiet_mode = quiet
 
 
+def _identity_now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _identity_observed_at_utc() -> str:
+    return (
+        _identity_now_utc()
+        .astimezone(datetime.timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def get_wallet_identity() -> dict:
     """Read the closest available Chia wallet identity snapshot without mutation."""
-    observed_at_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
     try:
         result = rpc("get_logged_in_fingerprint", {}, timeout=5)
     except Exception:
         result = None
+    observed_at_utc = _identity_observed_at_utc()
     if not isinstance(result, dict) or result.get("success") is False:
         return {
             "success": False,
@@ -119,9 +130,19 @@ def get_wallet_identity() -> dict:
             "observed_at_utc": observed_at_utc,
             "error": "identity_lookup_failed",
         }
-    try:
-        fingerprint = int(result.get("fingerprint"))
-    except (TypeError, ValueError):
+    fingerprint_value = result.get("fingerprint")
+    if type(fingerprint_value) is int:
+        fingerprint = fingerprint_value
+    elif (
+        type(fingerprint_value) is str
+        and fingerprint_value.isascii()
+        and fingerprint_value.isdigit()
+        and not fingerprint_value.startswith("0")
+    ):
+        fingerprint = int(fingerprint_value)
+    else:
+        fingerprint = None
+    if fingerprint is None or fingerprint < 1:
         return {
             "success": False,
             "backend": "chia",
@@ -508,6 +529,8 @@ def split_coins_rpc(
     amount_per_coin: int,
     fee_mojos: int = 0,
     is_cat: bool = False,
+    *,
+    _identity_recheck=None,
 ) -> Optional[Dict]:
     """
     Split a single coin into multiple coins using native RPC.
@@ -537,6 +560,8 @@ def split_coins_rpc(
         "amount_per_coin": amount_per_coin,
         "fee": fee_mojos,
     }
+    if _identity_recheck is not None:
+        _identity_recheck("split_coins_rpc")
     return rpc("split_coins", payload, timeout=30)
 
 
@@ -548,6 +573,8 @@ def split_coins_bulk(
     reserve_multiplier: float = 2.0,
     is_cat: bool = False,
     cat_decimals: int = 3,
+    *,
+    _identity_recheck=None,
 ) -> Optional[Dict]:
     """
     Split wallet balance using NATIVE split_coins RPC
@@ -731,6 +758,8 @@ def split_coins_bulk(
     print("   📦 Trying split_coins RPC (fast method)...")
 
     # Call split_coins RPC
+    if _identity_recheck is not None:
+        _identity_recheck("split_coins_bulk:split")
     result = split_coins_rpc(
         wallet_id=wallet_id,
         target_coin_id=coin_id,
@@ -738,6 +767,7 @@ def split_coins_bulk(
         amount_per_coin=amount_per_coin,
         fee_mojos=fee_mojos,
         is_cat=is_cat,
+        _identity_recheck=_identity_recheck,
     )
 
     if result and result.get("success"):
@@ -758,62 +788,67 @@ def split_coins_bulk(
         try:
             # Get a receive address
             addr_result = get_next_address(wallet_id=wallet_id, new_address=False)
-            if not addr_result or not addr_result.get("success"):
-                return {"success": False, "error": "Could not get receive address"}
+        except Exception as e:
+            return {"success": False, "error": f"Fallback method failed: {e}"}
 
-            address = addr_result["address"]
+        if not addr_result or not addr_result.get("success"):
+            return {"success": False, "error": "Could not get receive address"}
 
-            # Send multiple small transactions to ourselves
-            print(f"   📤 Creating {num_coins} coins via self-payments...")
-            success_count = 0
+        address = addr_result["address"]
 
-            # Create in small batches to avoid overwhelming the wallet
-            batch_size = 5
-            for i in range(0, num_coins, batch_size):
-                batch_end = min(i + batch_size, num_coins)
-                batch_count = batch_end - i
+        # Send multiple small transactions to ourselves
+        print(f"   📤 Creating {num_coins} coins via self-payments...")
+        success_count = 0
 
-                for j in range(batch_count):
-                    tx_result = send_transaction(
-                        wallet_id=wallet_id,
-                        amount_mojos=int(amount_per_coin)
-                        if not is_cat
-                        else int(amount_per_coin * (10**cat_decimals)),
-                        address=address,
-                        fee_mojos=get_effective_transaction_fee_mojos(),
-                    )
+        # Create in small batches to avoid overwhelming the wallet
+        batch_size = 5
+        for i in range(0, num_coins, batch_size):
+            batch_end = min(i + batch_size, num_coins)
+            batch_count = batch_end - i
 
-                    if tx_result and tx_result.get("success"):
-                        success_count += 1
-                    else:
-                        print(f"   ⚠️  Transaction {i + j + 1} failed")
-                        break
+            for j in range(batch_count):
+                if _identity_recheck is not None:
+                    _identity_recheck(f"split_coins_bulk:fallback:{i + j}")
+                tx_result = send_transaction(
+                    wallet_id=wallet_id,
+                    amount_mojos=int(amount_per_coin)
+                    if not is_cat
+                    else int(amount_per_coin * (10**cat_decimals)),
+                    address=address,
+                    fee_mojos=get_effective_transaction_fee_mojos(),
+                    _identity_recheck=_identity_recheck,
+                )
 
-                # Small delay between batches
-                if batch_end < num_coins:
-                    import time
+                if tx_result and tx_result.get("success"):
+                    success_count += 1
+                else:
+                    print(f"   ⚠️  Transaction {i + j + 1} failed")
+                    break
 
+            # Small delay between batches
+            if batch_end < num_coins:
+                import time
+
+                try:
                     time.sleep(0.5)
                     print("   ⏳ Waiting 60s for change coin to confirm...")
                     time.sleep(60)  # Wait for blockchain confirmation
                     print(
                         f"   ⏳ Progress: {success_count}/{num_coins} coins created..."
                     )
+                except Exception as e:
+                    return {"success": False, "error": f"Fallback method failed: {e}"}
 
-            if success_count > 0:
-                print(
-                    f"   ✅ Created {success_count}/{num_coins} coins via fallback method!"
-                )
-                return {
-                    "success": True,
-                    "coins_created": success_count,
-                    "method": "sequential_fallback",
-                }
-            else:
-                return {"success": False, "error": "All fallback transactions failed"}
-
-        except Exception as e:
-            return {"success": False, "error": f"Fallback method failed: {e}"}
+        if success_count > 0:
+            print(
+                f"   ✅ Created {success_count}/{num_coins} coins via fallback method!"
+            )
+            return {
+                "success": True,
+                "coins_created": success_count,
+                "method": "sequential_fallback",
+            }
+        return {"success": False, "error": "All fallback transactions failed"}
 
 
 def wait_for_coin_confirmations(
@@ -888,13 +923,25 @@ def get_wallet_balance(wallet_id: int):
     return rpc("get_wallet_balance", {"wallet_id": wallet_id})
 
 
-def get_next_address(wallet_id: int = WALLET_ID_XCH, new_address: bool = True):
+def get_next_address(
+    wallet_id: int = WALLET_ID_XCH,
+    new_address: bool = True,
+    *,
+    _identity_recheck=None,
+):
     """Get next address for a wallet"""
+    if _identity_recheck is not None:
+        _identity_recheck("get_next_address")
     return rpc("get_next_address", {"wallet_id": wallet_id, "new_address": new_address})
 
 
 def send_transaction(
-    wallet_id: int, amount_mojos: int, address: str, fee_mojos: int = 0
+    wallet_id: int,
+    amount_mojos: int,
+    address: str,
+    fee_mojos: int = 0,
+    *,
+    _identity_recheck=None,
 ):
     """Send transaction (works for XCH and CAT wallets)"""
     payload = {
@@ -903,10 +950,14 @@ def send_transaction(
         "address": str(address),
         "fee": int(fee_mojos),
     }
+    if _identity_recheck is not None:
+        _identity_recheck("send_transaction")
     return rpc("send_transaction", payload)
 
 
-def send_transaction_multi(payments: list, fee_mojos: int = 0):
+def send_transaction_multi(
+    payments: list, fee_mojos: int = 0, *, _identity_recheck=None
+):
     """Send multiple payments in one transaction"""
     # Try with "additions" first
     payload1 = {
@@ -914,12 +965,16 @@ def send_transaction_multi(payments: list, fee_mojos: int = 0):
         "additions": payments,
         "fee": int(fee_mojos),
     }
+    if _identity_recheck is not None:
+        _identity_recheck("send_transaction_multi:additions")
     res = rpc("send_transaction_multi", payload1)
     if res and res.get("success"):
         return res
 
     # Fallback: try with "payments"
     payload2 = {"wallet_id": WALLET_ID_XCH, "payments": payments, "fee": int(fee_mojos)}
+    if _identity_recheck is not None:
+        _identity_recheck("send_transaction_multi:payments")
     res = rpc("send_transaction_multi", payload2)
     if res and res.get("success"):
         return res
@@ -935,6 +990,8 @@ def create_offer(
     min_coin_amount: int = None,
     max_coin_amount: int = None,
     coin_ids: list = None,
+    *,
+    _identity_recheck=None,
 ):
     """Create offer for tokens
 
@@ -961,6 +1018,8 @@ def create_offer(
         payload["min_coin_amount"] = min_coin_amount
     if max_coin_amount is not None:
         payload["max_coin_amount"] = max_coin_amount
+    if _identity_recheck is not None:
+        _identity_recheck("create_offer")
     return rpc("create_offer_for_ids", payload, timeout=15)
 
 
@@ -969,6 +1028,8 @@ def cancel_offer(
     secure: bool = True,
     timeout: int = 60,
     fee_mojos: Optional[int] = None,
+    *,
+    _identity_recheck=None,
 ):
     payload = {"trade_id": trade_id, "secure": secure}
     if secure:
@@ -978,6 +1039,8 @@ def cancel_offer(
             else get_effective_transaction_fee_mojos()
         )
         payload["fee"] = int(resolved_fee)
+    if _identity_recheck is not None:
+        _identity_recheck("cancel_offer")
     return rpc("cancel_offer", payload, timeout=timeout)
 
 
@@ -1019,7 +1082,7 @@ def get_offer_expiry_info(offer: dict) -> dict:
     }
 
 
-def cleanup_expired_offers(log_fn=None) -> int:
+def cleanup_expired_offers(log_fn=None, *, _identity_recheck=None) -> int:
     """Cancel any offers whose max_time has passed to free locked coins.
 
     Uses secure=False (off-chain cancel) because expired offers can't be
@@ -1067,7 +1130,13 @@ def cleanup_expired_offers(log_fn=None) -> int:
 
             # secure=False is safe for expired offers — they can't be taken
             # on-chain anyway. This just removes from wallet's local list.
-            result = cancel_offer(str(trade_id), secure=False)
+            if _identity_recheck is not None:
+                _identity_recheck(f"cleanup_expired_offers:{expired_found - 1}")
+            result = cancel_offer(
+                str(trade_id),
+                secure=False,
+                _identity_recheck=_identity_recheck,
+            )
             if result and result.get("success"):
                 cancelled += 1
             else:
@@ -1281,6 +1350,8 @@ def cancel_offers_batch(
     max_workers: int = 3,
     fee_mojos: Optional[int] = None,
     skip_confirmation: bool = False,
+    *,
+    _identity_recheck=None,
 ):
     """Cancel multiple offers — always serialized to avoid overwhelming wallet RPC.
 
@@ -1297,52 +1368,55 @@ def cancel_offers_batch(
         print(f"📋 Cancelling {len(trade_ids)} offers sequentially (large batch)...")
 
     for i, tid in enumerate(trade_ids):
-        try:
-            # Use longer timeout for large batches — wallet is under load
-            timeout = 120 if len(trade_ids) > 10 else 60
-            result = cancel_offer(tid, secure, timeout=timeout)
-            results[tid] = result or {"success": False, "error": "RPC returned None"}
+        if _identity_recheck is not None:
+            _identity_recheck(f"cancel_offer:{i}")
+        # Use longer timeout for large batches — wallet is under load
+        timeout = 120 if len(trade_ids) > 10 else 60
+        result = cancel_offer(
+            tid,
+            secure,
+            timeout=timeout,
+            _identity_recheck=_identity_recheck,
+        )
+        results[tid] = result or {"success": False, "error": "RPC returned None"}
 
-            # Chia wallet doesn't special-case "offer already gone" like Sage.
-            # If the error indicates the offer no longer exists (filled, expired,
-            # already cancelled), treat it as success — the goal (offer is gone)
-            # is achieved. Without this, offer_manager queues infinite retries.
-            if result and not result.get("success"):
-                err_str = str(result.get("error", "")).lower()
-                if any(
-                    phrase in err_str
-                    for phrase in (
-                        "not found",
-                        "no offer",
-                        "unknown trade",
-                        "already",
-                        "cannot cancel",
-                        "not pending",
-                    )
-                ):
-                    result["success"] = True
-                    result["already_gone"] = True
+        # Chia wallet doesn't special-case "offer already gone" like Sage.
+        # If the error indicates the offer no longer exists (filled, expired,
+        # already cancelled), treat it as success — the goal (offer is gone)
+        # is achieved. Without this, offer_manager queues infinite retries.
+        if result and not result.get("success"):
+            err_str = str(result.get("error", "")).lower()
+            if any(
+                phrase in err_str
+                for phrase in (
+                    "not found",
+                    "no offer",
+                    "unknown trade",
+                    "already",
+                    "cannot cancel",
+                    "not pending",
+                )
+            ):
+                result["success"] = True
+                result["already_gone"] = True
 
-            if result and result.get("success"):
-                if len(trade_ids) > 10 and (i + 1) % 10 == 0:
-                    print(f"   ✅ Cancelled {i + 1}/{len(trade_ids)}")
-            else:
-                error = (result or {}).get("error", "unknown")
-                print(f"   ❌ Failed {tid[:16]}...: {error}")
-            # Brief delay between cancels to let wallet breathe
-            # Shorter delays for small batches (wallet handles these fine),
-            # longer for large batches to avoid overwhelming the RPC.
-            import time
+        if result and result.get("success"):
+            if len(trade_ids) > 10 and (i + 1) % 10 == 0:
+                print(f"   ✅ Cancelled {i + 1}/{len(trade_ids)}")
+        else:
+            error = (result or {}).get("error", "unknown")
+            print(f"   ❌ Failed {tid[:16]}...: {error}")
+        # Brief delay between cancels to let wallet breathe
+        # Shorter delays for small batches (wallet handles these fine),
+        # longer for large batches to avoid overwhelming the RPC.
+        import time
 
-            if len(trade_ids) > 10:
-                time.sleep(1.0)
-            elif len(trade_ids) > 5:
-                time.sleep(0.5)
-            else:
-                time.sleep(0.3)
-        except Exception as e:
-            print(f"❌ Failed to cancel offer {tid}: {e}")
-            results[tid] = {"success": False, "error": str(e)}
+        if len(trade_ids) > 10:
+            time.sleep(1.0)
+        elif len(trade_ids) > 5:
+            time.sleep(0.5)
+        else:
+            time.sleep(0.3)
 
     return results
 

@@ -364,6 +364,7 @@ def api_cancel_all():
                 get_all_offers,
                 cancel_offers_batch,
                 is_offer_time_expired,
+                wallet_batch_results,
             )
 
             all_offers = get_all_offers(include_completed=False, end=500)
@@ -465,6 +466,7 @@ def api_cancel_all():
                 _w_failed = 0
                 try:
                     _results = cancel_offers_batch(_cancel_open_ids, secure=True)
+                    _results = wallet_batch_results(_results, _cancel_open_ids)
                     _cancelled_ids = []
                     for _tid, _res in _results.items():
                         if _res and _res.get("success"):
@@ -656,8 +658,43 @@ def api_cancel_offer():
     except Exception:
         return api_server._api_exception(request.path)
     # cancel_offers returns a dict; surface any storm-protection refusal
-    if isinstance(result, dict) and result.get("error"):
+    if type(result) is dict and result.get("error"):
         return jsonify({"success": False, "trade_id": trade_id, **result}), 400
+    trade_result = result.get(trade_id) if type(result) is dict else None
+    if type(trade_result) is not dict or trade_result.get("success") is not True:
+        reason_value = (
+            trade_result.get("reason") if type(trade_result) is dict else None
+        )
+        reason = (
+            reason_value
+            if type(reason_value) is str and reason_value
+            else "WALLET_MUTATION_FAILED"
+        )
+        identity_reasons = {
+            "WALLET_BACKEND_UNSUPPORTED",
+            "WALLET_IDENTITY_BINDING_INVALID",
+            "WALLET_IDENTITY_MALFORMED",
+            "WALLET_IDENTITY_MISMATCH",
+            "WALLET_IDENTITY_NON_SIGNING",
+            "WALLET_IDENTITY_STALE",
+            "WALLET_IDENTITY_UNAVAILABLE",
+        }
+        if reason in identity_reasons:
+            error = "Wallet mutation blocked by identity safety check"
+        else:
+            error = "Offer cancellation failed"
+            reason = "WALLET_MUTATION_FAILED"
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "trade_id": trade_id,
+                    "error": error,
+                    "reason": reason,
+                }
+            ),
+            400,
+        )
     return jsonify({"success": True, "status": "cancelled", "trade_id": trade_id})
 
 

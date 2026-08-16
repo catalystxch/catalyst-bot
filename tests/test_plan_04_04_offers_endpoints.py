@@ -198,7 +198,9 @@ class TestCancelOffer(_FlaskBase):
 
     def test_successful_cancel_returns_200(self):
         bot = _make_bot()
-        bot.offer_manager.cancel_offers.return_value = {}
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {"success": True}
+        }
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
         self.assertEqual(resp.status_code, 200)
@@ -207,11 +209,49 @@ class TestCancelOffer(_FlaskBase):
 
     def test_cancel_response_has_trade_id(self):
         bot = _make_bot()
-        bot.offer_manager.cancel_offers.return_value = {}
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {"success": True}
+        }
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
         body = resp.get_json()
         self.assertEqual(body.get("trade_id"), "trade-abc-001")
+
+    def test_missing_requested_trade_result_fails_closed(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "different-trade": {"success": True}
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
+
+    def test_malformed_requested_trade_result_fails_closed(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {"trade-abc-001": ["hostile"]}
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
 
     def test_cancel_result_error_returns_400(self):
         bot = _make_bot()
@@ -219,6 +259,52 @@ class TestCancelOffer(_FlaskBase):
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
         self.assertEqual(resp.status_code, 400)
+
+    def test_identity_denial_is_not_reported_as_cancelled(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {
+                "success": False,
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+            }
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+            },
+        )
+
+    def test_cancel_denial_does_not_echo_hostile_wallet_reason_or_error(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {
+                "success": False,
+                "error": "secret backend traceback",
+                "reason": "WALLET_HOSTILE_REASON",
+            }
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

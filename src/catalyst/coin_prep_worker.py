@@ -161,6 +161,7 @@ def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
         "coin_prep.start", handoff_environment
     )
     if environment is None:
+        mutation_gate.install_worker_authority_environment(handoff_environment)
         _worker_delegation_environment = dict(handoff_environment)
         for key in _WORKER_DELEGATION_ENV_NAMES:
             os.environ.pop(key, None)
@@ -1468,7 +1469,8 @@ class CoinPrepWorker:
             return False
 
         try:
-            from wallet_sage import combine_coins, get_pending_transactions
+            from wallet import combine_coins
+            from wallet_sage import get_pending_transactions
         except Exception as e:
             self.log(f"XCH fee cleanup unavailable: {e}")
             return False
@@ -3080,7 +3082,7 @@ class CoinPrepWorker:
         The /combine endpoint is generic — works for both XCH and CAT coins.
         """
         try:
-            from wallet_sage import combine_coins, get_spendable_coins_rpc
+            from wallet import combine_coins, get_spendable_coins_rpc
 
             # Get all spendable coins to extract their IDs
             coins_result = get_spendable_coins_rpc(wallet_id)
@@ -3378,7 +3380,8 @@ class CoinPrepWorker:
             else max(1, int(target_count))
         )
         try:
-            from wallet_sage import get_current_key, sage_login
+            from wallet import sage_login, wallet_mutation_succeeded
+            from wallet_sage import get_current_key
 
             key = get_current_key() or {}
             fingerprint = key.get("fingerprint")
@@ -3391,12 +3394,13 @@ class CoinPrepWorker:
             self.log(
                 f"Forcing Sage resync for {name} after stale consolidation view..."
             )
-            if not self._call_wallet_mutation(
+            login_result = self._call_wallet_mutation(
                 "coin_prep.sage_resync",
                 sage_login,
                 int(fingerprint),
                 force_resync=True,
-            ):
+            )
+            if not wallet_mutation_succeeded(login_result):
                 self.log(f"Sage resync failed for {name}")
                 return False
 
@@ -3438,7 +3442,7 @@ class CoinPrepWorker:
         Used if Sage's auto_combine fails (e.g. older Sage version).
         """
         try:
-            from wallet_sage import (
+            from wallet import (
                 get_next_address,
                 get_spendable_coins_rpc,
                 send_transaction,
@@ -3747,7 +3751,7 @@ class CoinPrepWorker:
     ) -> bool:
         """Create trading pool via Sage RPC — send exact amount to self."""
         try:
-            from wallet_sage import get_next_address, send_transaction
+            from wallet import get_next_address, send_transaction
 
             # Get receive address
             addr_result = get_next_address(wallet_id, new_address=False)
@@ -3896,13 +3900,15 @@ class CoinPrepWorker:
         NO DB DESIGNATION: The bot identifies tiers by coin size at runtime.
         Inner=1.6 XCH, mid=0.8, outer=0.4, extreme=0.16 — sizes are unique per tier.
         """
-        from wallet_sage import (
+        from wallet import (
             get_next_address,
             send_transaction,
             send_transaction_multi,
             send_cat_multi,
             split_coins_rpc,
             sage_topup_split,
+        )
+        from wallet_sage import (
             get_pending_transactions,
         )
 
@@ -6899,7 +6905,7 @@ class CoinPrepWorker:
         if self.is_sage:
             # --- Sage RPC split ---
             try:
-                from wallet_sage import split_coins_rpc as sage_split
+                from wallet import split_coins_rpc as sage_split
 
                 bare_coin_id = coin_id.replace("0x", "")
                 self.log(

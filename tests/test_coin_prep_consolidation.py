@@ -48,12 +48,28 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_wallet.cancel_offer = lambda *args, **kwargs: {"success": True}
         fake_wallet.cancel_offers_batch = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_wallet_sync_status = lambda *args, **kwargs: {"synced": True}
-        fake_wallet.get_spendable_coins_rpc = lambda wallet_id: {
-            "success": True,
-            "records": [],
-        }
+
+        def _spendable_coins(wallet_id):
+            adapter = sys.modules.get("wallet_sage")
+            if adapter is not None and hasattr(adapter, "get_spendable_coins_rpc"):
+                return adapter.get_spendable_coins_rpc(wallet_id)
+            return {"success": True, "records": []}
+
+        fake_wallet.get_spendable_coins_rpc = _spendable_coins
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
+        fake_wallet.wallet_mutation_succeeded = lambda result: (
+            result is True
+            or (isinstance(result, dict) and result.get("success") is True)
+        )
+
+        def _wallet_adapter_export(name):
+            adapter = sys.modules.get("wallet_sage")
+            if adapter is not None and hasattr(adapter, name):
+                return getattr(adapter, name)
+            raise AttributeError(name)
+
+        fake_wallet.__getattr__ = _wallet_adapter_export
         sys.modules["wallet"] = fake_wallet
 
         fake_database = types.ModuleType("database")

@@ -216,7 +216,14 @@ class BulkCancelMethodTagTests(unittest.TestCase):
     def test_bulk_mempool_conflict_runs_sequential_fallback(self):
         trade_ids = ["aaaa", "bbbb", "cccc"]
 
-        def fake_cancel_offer(trade_id, secure, timeout=0, fee_mojos=None):
+        def fake_cancel_offer(
+            trade_id,
+            secure,
+            timeout=0,
+            fee_mojos=None,
+            *,
+            _identity_recheck=None,
+        ):
             return {
                 "success": True,
                 "method": "submitted_pending_confirm",

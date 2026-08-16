@@ -6779,7 +6779,7 @@ class BotLoop:
                         cfg, "SAGE_SET_CHANGE_ADDRESS", False
                     ):
                         try:
-                            from wallet_sage import (
+                            from wallet import (
                                 set_change_address as _sage_set_change_address,
                             )
 
@@ -13038,7 +13038,7 @@ class BotLoop:
             from wallet import get_wallet_type
 
             if get_wallet_type() == "sage":
-                from wallet import sage_delete_offer
+                from wallet import sage_delete_offer, wallet_mutation_succeeded
 
                 all_sage_offers = get_all_offers(
                     include_completed=True, start=0, end=500
@@ -13200,7 +13200,7 @@ class BotLoop:
                         deleted = 0
                         status_updates = 0
                         for tid, local_status in to_delete[:50]:  # Cap at 50 per cycle
-                            if sage_delete_offer(tid):
+                            if wallet_mutation_succeeded(sage_delete_offer(tid)):
                                 deleted += 1
                                 if local_status:
                                     try:
@@ -15518,7 +15518,7 @@ class BotLoop:
         Returns dict with counts and details of what was found/cancelled.
         """
         from database import get_open_offers
-        from wallet import get_all_offers, cancel_offers_batch
+        from wallet import get_all_offers, cancel_offers_batch, wallet_batch_results
 
         log_event("info", "orphan_cleanup_start", "Starting orphaned offer cleanup...")
 
@@ -15586,6 +15586,7 @@ class BotLoop:
                 )
 
                 batch_results = cancel_offers_batch(batch, secure=True)
+                batch_results = wallet_batch_results(batch_results, batch)
                 all_cancel_results.update(batch_results)
 
                 # Summary for this batch
