@@ -91,6 +91,7 @@ fake_wallet.get_spendable_coins_rpc = lambda *args, **kwargs: {
 fake_wallet.get_exact_spendable_coins_rpc = fake_wallet.get_spendable_coins_rpc
 fake_wallet.get_owned_coins_detailed = lambda *args, **kwargs: None
 fake_wallet.get_wallet_type = lambda: "sage"
+fake_wallet.get_wallet_backend_authority = lambda: "sage"
 fake_wallet.WALLET_ID_XCH = 1
 sys.modules["wallet"] = fake_wallet
 
@@ -452,27 +453,25 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
     def test_create_offer_with_retry_uses_selected_coin_id_directly(self):
         manager = offer_manager.OfferManager()
-        selected_coin_id = "0xabc123"
+        selected_coin_id = "a" * 64
         seen = {}
 
-        def fake_create_offer(
-            offer_dict,
-            validate_only=False,
-            max_time=None,
-            min_coin_amount=None,
-            max_coin_amount=None,
-            coin_ids=None,
-        ):
-            seen["coin_ids"] = coin_ids
+        def fake_journaled_create(*, intent, **_kwargs):
+            seen["coin_ids"] = [intent.selected_coin_id]
             return {
                 "success": True,
                 "offer": "offer1selectedcoin",
                 "trade_id": "trade-selected",
                 "trade_record": {"trade_id": "trade-selected"},
+                "locked_coin_id": intent.selected_coin_id,
             }
 
         with (
-            patch.object(offer_manager, "create_offer", side_effect=fake_create_offer),
+            patch.object(
+                manager,
+                "_create_offer_from_journal",
+                side_effect=fake_journaled_create,
+            ),
             patch.object(
                 offer_manager.OfferManager,
                 "_select_coin_for_offer",
@@ -507,6 +506,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             seen.append(selected_coin_id)
@@ -559,6 +559,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -849,6 +850,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -945,6 +947,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1035,6 +1038,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1120,6 +1124,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1216,6 +1221,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             return {
@@ -1323,6 +1329,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1425,6 +1432,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             return {
@@ -1480,6 +1488,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             coin_ids_enabled=False,
             selected_coin_id=None,
             preferred_tier=None,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1603,6 +1612,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             del self, offer_dict, max_retries, expiry_offset, expiry_secs
             del used_coins, coin_ids_enabled, preferred_tier, strict_preferred_tier
@@ -1695,6 +1705,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             del self, offer_dict, max_retries, expiry_offset, expiry_secs
             del used_coins, coin_ids_enabled, preferred_tier, strict_preferred_tier

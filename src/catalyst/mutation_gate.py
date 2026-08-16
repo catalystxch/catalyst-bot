@@ -263,10 +263,17 @@ class _OwnerIdentityAuthority:
     network: str
     backend: Optional[str]
     wallet_adapter_authority: Any
+    generation_digest: str
 
 
 _owner_identity_authorities_lock = threading.RLock()
 _owner_identity_authorities: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _new_authority_generation_digest() -> str:
+    """Return a non-revivable journal identity for one process-local generation."""
+
+    return hashlib.sha256(secrets.token_bytes(32)).hexdigest()
 
 
 def _registered_owner_identity_authority(
@@ -290,6 +297,7 @@ def _rotate_owner_identity_authority(owner: Any) -> bool:
             network=authority.network,
             backend=authority.backend,
             wallet_adapter_authority=authority.wallet_adapter_authority,
+            generation_digest=_new_authority_generation_digest(),
         )
         return True
 
@@ -543,6 +551,36 @@ def _safe_operation(operation: Any) -> str:
     return "".join(ch if ch.isalnum() or ch in "._:-" else "_" for ch in value)
 
 
+def _is_exact_prepared_creation_blocker(
+    unresolved: Any,
+    *,
+    operation_id: str,
+    intent_id: str,
+) -> bool:
+    if type(unresolved) is not list or len(unresolved) != 1:
+        return False
+    blocker = unresolved[0]
+    return type(blocker) is dict and {
+        "operation_id": blocker.get("operation_id"),
+        "intent_id": blocker.get("intent_id"),
+        "operation_type": blocker.get("operation_type"),
+        "attempt": blocker.get("attempt"),
+        "phase": blocker.get("phase"),
+        "outcome": blocker.get("outcome"),
+        "reason_code": blocker.get("reason_code"),
+        "blocks_mutation": blocker.get("blocks_mutation"),
+    } == {
+        "operation_id": operation_id,
+        "intent_id": intent_id,
+        "operation_type": "CREATE",
+        "attempt": 1,
+        "phase": "PREPARED",
+        "outcome": "PREPARED",
+        "reason_code": "INTENT_PREPARED",
+        "blocks_mutation": 1,
+    }
+
+
 def _same_handler(first: Optional[Callable], second: Optional[Callable]) -> bool:
     if first is second:
         return True
@@ -778,6 +816,7 @@ class MutationGate:
                 else None
             ),
             wallet_adapter_authority=wallet_adapter_authority,
+            generation_digest=_new_authority_generation_digest(),
         )
         with _owner_identity_authorities_lock:
             _owner_identity_authorities[self] = authority
@@ -1145,6 +1184,109 @@ class MutationGate:
         if not current.allowed:
             raise MutationBlocked(current.reason_code, operation)
         return current
+
+    def require_operation_continuation(
+        self,
+        permit: str,
+        operation: str,
+        blocking_operation_id: str,
+        blocking_intent_id: str,
+    ) -> tuple[WalletIdentityBinding, Any]:
+        """Allow one already-entered wallet effect past only its own PREPARED blocker."""
+
+        safe_operation = _safe_operation(operation)
+        blocker = _exact_text(blocking_operation_id, "blocking_operation_id")
+        intent = _exact_text(blocking_intent_id, "blocking_intent_id")
+        with self._lock:
+            self.require_active_wallet_mutation_permit(permit, safe_operation)
+            if self._quiescing or self._wallet_lifecycle_transitioning:
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
+            if self._local_reason_code:
+                raise MutationBlocked(self._local_reason_code, safe_operation)
+            try:
+                authorization = self._authorization_snapshot()
+                latch = authorization["latch"]
+                unresolved = authorization["unresolved"]
+                lease = authorization["lease"]
+                if str(latch.get("state") or "") != "resolved":
+                    raise MutationBlocked(
+                        _safe_reason_code(latch.get("reason_code")), safe_operation
+                    )
+                if not _is_exact_prepared_creation_blocker(
+                    unresolved,
+                    operation_id=blocker,
+                    intent_id=intent,
+                ):
+                    raise MutationBlocked("UNRESOLVED_OPERATIONS", safe_operation)
+                expected_lease = (
+                    True,
+                    self.run_id,
+                    self.owner_pid,
+                    self.owner_host,
+                    self.wallet_fingerprint_hash,
+                    self.network,
+                    self._lease_version,
+                    self._lease_acquired_at,
+                )
+                actual_lease = (
+                    bool(lease.get("active")),
+                    str(lease.get("owner_run_id") or ""),
+                    lease.get("owner_pid"),
+                    str(lease.get("owner_host") or ""),
+                    str(lease.get("wallet_fingerprint_hash") or ""),
+                    str(lease.get("network") or ""),
+                    int(lease.get("lease_version") or 0),
+                    str(lease.get("acquired_at") or ""),
+                )
+                if actual_lease != expected_lease:
+                    self._set_local_block("LEASE_LOST")
+                    raise MutationBlocked("LEASE_LOST", safe_operation)
+                if _as_utc(lease.get("expires_at")) <= self._now():
+                    self._set_local_block("LEASE_EXPIRED")
+                    raise MutationBlocked("LEASE_EXPIRED", safe_operation)
+            except MutationBlocked:
+                raise
+            except Exception as exc:
+                self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                raise MutationBlocked(
+                    "DURABLE_STATE_UNAVAILABLE", safe_operation
+                ) from exc
+            binding = self.require_wallet_identity_authority(safe_operation)
+            adapter = self.require_wallet_adapter_authority(
+                self._wallet_adapter_authority, safe_operation
+            )
+            return binding, adapter
+
+    def require_fresh_operation_continuation(
+        self,
+        permit: str,
+        snapshot: Any,
+        operation: str,
+        blocking_operation_id: str,
+        blocking_intent_id: str,
+    ) -> tuple[WalletIdentityBinding, Any, dict[str, Any]]:
+        """Validate fresh identity while allowing only the effect's own blocker."""
+
+        safe_operation = _safe_operation(operation)
+        with self._lock:
+            binding, adapter = self.require_operation_continuation(
+                permit,
+                safe_operation,
+                blocking_operation_id,
+                blocking_intent_id,
+            )
+            decision = validate_wallet_identity(
+                binding,
+                snapshot,
+                now=self._now(),
+                last_observed_at_utc=self._last_wallet_identity_observed_at_utc,
+            )
+            if decision.get("allowed") is not True:
+                raise MutationBlocked(decision.get("reason"), safe_operation)
+            self._last_wallet_identity_observed_at_utc = str(
+                decision["observed_at_utc"]
+            )
+            return binding, adapter, decision
 
     def require_fresh_wallet_identity(
         self, snapshot: Any, operation: str
@@ -1611,6 +1753,8 @@ def _validate_worker_delegation(
     wallet_identity_payload: Any = None,
     wallet_identity_digest: Any = None,
     parent_lease_epoch: Any = None,
+    allowed_blocking_operation_id: Optional[str] = None,
+    allowed_blocking_intent_id: Optional[str] = None,
 ) -> dict[str, Any]:
     try:
         values = {
@@ -1697,8 +1841,18 @@ def _validate_worker_delegation(
         latch = authorization["latch"]
         if str(latch.get("state") or "") != "resolved":
             return _invalid_worker("parent_gate_blocked")
-        if authorization["unresolved"]:
-            return _invalid_worker("parent_gate_blocked")
+        unresolved = authorization["unresolved"]
+        if unresolved:
+            if (
+                type(allowed_blocking_operation_id) is not str
+                or type(allowed_blocking_intent_id) is not str
+                or not _is_exact_prepared_creation_blocker(
+                    unresolved,
+                    operation_id=allowed_blocking_operation_id,
+                    intent_id=allowed_blocking_intent_id,
+                )
+            ):
+                return _invalid_worker("parent_gate_blocked")
         lease = authorization["lease"]
         expected = (
             True,
@@ -1737,8 +1891,12 @@ def _validate_worker_delegation(
         return _invalid_worker()
 
 
-def validate_worker_environment(
-    environment: Mapping[str, str], *, now: Optional[datetime] = None
+def _validate_worker_environment(
+    environment: Mapping[str, str],
+    *,
+    now: Optional[datetime] = None,
+    allowed_blocking_operation_id: Optional[str] = None,
+    allowed_blocking_intent_id: Optional[str] = None,
 ) -> dict[str, Any]:
     if not isinstance(environment, Mapping):
         return _invalid_worker()
@@ -1757,9 +1915,17 @@ def validate_worker_environment(
             wallet_identity_digest=values[DELEGATION_IDENTITY_DIGEST_ENV],
             parent_lease_epoch=values[DELEGATION_PARENT_EPOCH_ENV],
             now=_as_utc(now or _utc_now()),
+            allowed_blocking_operation_id=allowed_blocking_operation_id,
+            allowed_blocking_intent_id=allowed_blocking_intent_id,
         )
     except Exception:
         return _invalid_worker()
+
+
+def validate_worker_environment(
+    environment: Mapping[str, str], *, now: Optional[datetime] = None
+) -> dict[str, Any]:
+    return _validate_worker_environment(environment, now=now)
 
 
 def require_worker_allowed_from_environment(
@@ -1789,6 +1955,7 @@ _worker_wallet_identity_digest: Optional[str] = None
 _worker_parent_lease_epoch: Optional[str] = None
 _worker_wallet_adapter_authorities: dict[int, tuple[WalletIdentityBinding, Any]] = {}
 _worker_authority_generation: Any = None
+_worker_authority_generation_digest: Optional[str] = None
 _worker_active_wallet_mutations: dict[str, Any] = {}
 
 
@@ -1846,7 +2013,7 @@ def install_worker_authority_environment(
         global _worker_identity_last_observed_at_utc
         global _worker_wallet_identity_binding, _worker_wallet_identity_digest
         global _worker_parent_lease_epoch
-        global _worker_authority_generation
+        global _worker_authority_generation, _worker_authority_generation_digest
         if _worker_active_wallet_mutations:
             raise MutationBlocked("MUTATION_SHUTTING_DOWN", "worker.install")
         if _worker_authority_environment is not None:
@@ -1876,6 +2043,7 @@ def install_worker_authority_environment(
         _worker_parent_lease_epoch = parent_epoch
         _worker_identity_last_observed_at_utc = None
         _worker_authority_generation = object()
+        _worker_authority_generation_digest = _new_authority_generation_digest()
         _worker_wallet_adapter_authorities[id(binding)] = (
             binding,
             wallet_adapter_authority,
@@ -1888,7 +2056,7 @@ def clear_worker_authority_environment() -> bool:
         global _worker_identity_last_observed_at_utc
         global _worker_wallet_identity_binding, _worker_wallet_identity_digest
         global _worker_parent_lease_epoch
-        global _worker_authority_generation
+        global _worker_authority_generation, _worker_authority_generation_digest
         if _worker_active_wallet_mutations:
             return False
         binding = _worker_wallet_identity_binding
@@ -1899,6 +2067,7 @@ def clear_worker_authority_environment() -> bool:
         _worker_parent_lease_epoch = None
         _worker_identity_last_observed_at_utc = None
         _worker_authority_generation = None
+        _worker_authority_generation_digest = None
         if binding is not None:
             _worker_wallet_adapter_authorities.pop(id(binding), None)
         return True
@@ -2117,6 +2286,226 @@ def require_wallet_mutation_permit_authority(
         ):
             raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
     return permit.wallet_identity_binding, permit.wallet_adapter_authority
+
+
+def wallet_mutation_permit_journal_authority(
+    permit: Any, operation: str
+) -> dict[str, Any]:
+    """Return the exact non-secret authority generation held by one permit."""
+
+    binding, _adapter = require_wallet_mutation_permit_authority(permit, operation)
+    binding_digest = wallet_identity_binding_digest(binding)
+    if permit.mode == "runtime":
+        runtime = permit.runtime_authority
+        authority = permit.authority_generation
+        with runtime._lock:
+            if (
+                _registered_owner_identity_authority(runtime) is not authority
+                or type(runtime._lease_version) is not int
+                or runtime._lease_version <= 0
+                or type(runtime._lease_acquired_at) is not str
+                or not runtime._lease_acquired_at
+                or type(authority.generation_digest) is not str
+                or len(authority.generation_digest) != 64
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            return {
+                "mode": "runtime",
+                "owner_run_id": runtime.run_id,
+                "owner_pid": runtime.owner_pid,
+                "owner_host": runtime.owner_host,
+                "lease_version": runtime._lease_version,
+                "lease_epoch": runtime._lease_acquired_at,
+                "authority_generation_digest": authority.generation_digest,
+                "binding_digest": binding_digest,
+            }
+    with _worker_authority_lock:
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+        generation_digest = _worker_authority_generation_digest
+        if (
+            environment is None
+            or _worker_authority_generation is not permit.authority_generation
+            or type(generation_digest) is not str
+            or len(generation_digest) != 64
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        return {
+            "mode": "worker",
+            "delegation_id": environment[DELEGATION_ID_ENV],
+            "parent_run_id": environment[DELEGATION_PARENT_RUN_ENV],
+            "delegation_operation_id": environment[DELEGATION_OPERATION_ENV],
+            "purpose": environment[DELEGATION_PURPOSE_ENV],
+            "worker_id": environment[DELEGATION_WORKER_ENV],
+            "parent_lease_epoch": environment[DELEGATION_PARENT_EPOCH_ENV],
+            "authority_generation_digest": generation_digest,
+            "binding_digest": binding_digest,
+        }
+
+
+def require_wallet_operation_continuation(
+    permit: Any,
+    operation: str,
+    blocking_operation_id: str,
+    blocking_intent_id: str,
+) -> tuple[WalletIdentityBinding, Any]:
+    """Revalidate one held permit while allowing only its own durable blocker."""
+
+    safe_operation = _safe_operation(operation)
+    blocker = _exact_text(blocking_operation_id, "blocking_operation_id")
+    intent = _exact_text(blocking_intent_id, "blocking_intent_id")
+    if (
+        type(permit) is not WalletMutationPermit
+        or type(permit.permit) is not str
+        or not permit.permit
+        or type(permit.wallet_identity_binding) is not WalletIdentityBinding
+        or permit.wallet_adapter_authority is None
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+    if permit.mode == "runtime":
+        runtime = permit.runtime_authority
+        authority = permit.authority_generation
+        if (
+            type(runtime) is not MutationGate
+            or type(authority) is not _OwnerIdentityAuthority
+            or current_runtime() is not runtime
+            or _registered_owner_identity_authority(runtime) is not authority
+            or authority.binding is not permit.wallet_identity_binding
+            or authority.wallet_adapter_authority is not permit.wallet_adapter_authority
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        return runtime.require_operation_continuation(
+            permit.permit,
+            safe_operation,
+            blocker,
+            intent,
+        )
+    if permit.mode != "worker" or permit.runtime_authority is not None:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+    with _worker_authority_lock:
+        generation = _worker_authority_generation
+        binding = _worker_wallet_identity_binding
+        registered = (
+            _worker_wallet_adapter_authorities.get(id(binding))
+            if binding is not None
+            else None
+        )
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+        valid = (
+            generation is not None
+            and generation is permit.authority_generation
+            and binding is permit.wallet_identity_binding
+            and type(registered) is tuple
+            and len(registered) == 2
+            and registered[0] is binding
+            and registered[1] is permit.wallet_adapter_authority
+            and _worker_active_wallet_mutations.get(permit.permit)
+            is permit.authority_generation
+            and environment is not None
+            and environment[DELEGATION_OPERATION_ENV] == blocker
+        )
+    if not valid:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+    result = _validate_worker_environment(
+        environment,
+        allowed_blocking_operation_id=blocker,
+        allowed_blocking_intent_id=intent,
+    )
+    if result.get("allowed") is not True:
+        reason = (
+            "WORKER_PARENT_LEASE_INVALID"
+            if result.get("reason") in {"parent_lease_invalid", "parent_gate_blocked"}
+            else "WORKER_DELEGATION_INVALID"
+        )
+        raise MutationBlocked(reason, safe_operation)
+    with _worker_authority_lock:
+        if (
+            generation is not _worker_authority_generation
+            or binding is not _worker_wallet_identity_binding
+            or _worker_active_wallet_mutations.get(permit.permit)
+            is not permit.authority_generation
+            or _worker_authority_environment != environment
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+    return permit.wallet_identity_binding, permit.wallet_adapter_authority
+
+
+def require_fresh_wallet_operation_continuation(
+    permit: Any,
+    snapshot: Any,
+    operation: str,
+    blocking_operation_id: str,
+    blocking_intent_id: str,
+) -> tuple[WalletIdentityBinding, Any, dict[str, Any]]:
+    """Validate a fresh identity under one exact scoped continuation."""
+
+    global _worker_identity_last_observed_at_utc
+    safe_operation = _safe_operation(operation)
+    blocker = _exact_text(blocking_operation_id, "blocking_operation_id")
+    intent = _exact_text(blocking_intent_id, "blocking_intent_id")
+    if type(permit) is not WalletMutationPermit:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+    if permit.mode == "runtime":
+        runtime = permit.runtime_authority
+        authority = permit.authority_generation
+        if (
+            type(runtime) is not MutationGate
+            or type(authority) is not _OwnerIdentityAuthority
+            or current_runtime() is not runtime
+            or _registered_owner_identity_authority(runtime) is not authority
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        return runtime.require_fresh_operation_continuation(
+            permit.permit,
+            snapshot,
+            safe_operation,
+            blocker,
+            intent,
+        )
+    binding, adapter = require_wallet_operation_continuation(
+        permit,
+        safe_operation,
+        blocker,
+        intent,
+    )
+    with _worker_authority_lock:
+        last_observed = _worker_identity_last_observed_at_utc
+        generation = _worker_authority_generation
+        environment = (
+            dict(_worker_authority_environment)
+            if _worker_authority_environment is not None
+            else None
+        )
+    decision = validate_wallet_identity(
+        binding,
+        snapshot,
+        last_observed_at_utc=last_observed,
+    )
+    if decision.get("allowed") is not True:
+        raise MutationBlocked(decision.get("reason"), safe_operation)
+    require_wallet_operation_continuation(
+        permit,
+        f"{safe_operation}:dispatch",
+        blocker,
+        intent,
+    )
+    with _worker_authority_lock:
+        if (
+            generation is not _worker_authority_generation
+            or environment != _worker_authority_environment
+            or _worker_active_wallet_mutations.get(permit.permit)
+            is not permit.authority_generation
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        _worker_identity_last_observed_at_utc = str(decision["observed_at_utc"])
+    return binding, adapter, decision
 
 
 def exit_wallet_mutation(permit: Any) -> bool:
@@ -2377,8 +2766,10 @@ __all__ = [
     "pid_liveness",
     "release_resolved",
     "require_allowed",
+    "require_fresh_wallet_operation_continuation",
     "require_fresh_wallet_identity",
     "require_wallet_mutation_permit_authority",
+    "require_wallet_operation_continuation",
     "require_worker_allowed_from_environment",
     "shutdown_runtime",
     "status",
@@ -2388,6 +2779,7 @@ __all__ = [
     "wallet_fingerprint_hash",
     "wallet_identity_binding_digest",
     "wallet_identity_binding_payload",
+    "wallet_mutation_permit_journal_authority",
     "worker_identity_lease_binding",
     "worker_wallet_adapter_authority",
 ]

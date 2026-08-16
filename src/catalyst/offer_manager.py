@@ -16,10 +16,13 @@ Thread-safe via `_lock`. All mutating operations should be called while holding
 the lock, and any coin reservation crosses through shared state guarded here.
 """
 
+import hashlib
 import json
 import os
 import time
 import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
@@ -47,6 +50,46 @@ from wallet import (
     get_wallet_type,
     get_owned_coins_detailed,
 )
+import database
+import mutation_gate
+import offer_registry
+import wallet
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalOfferCreationIntent:
+    intent_id: str
+    operation_id: str
+    offer_items: tuple[tuple[str, int], ...]
+    offered_amount_atomic: str
+    requested_amount_atomic: str
+    selected_coin_id: str
+    asset_id: str
+    side: str
+    tier: str
+    purpose: str
+    slot_key: str
+    generation: int
+    authority_run_id: Optional[str]
+    parent_intent_id: Optional[str]
+    offer_size_uniqueness_json: str
+    expiry_seconds: int
+    expiry_offset: int
+    stagger_seconds: int
+    offer_max_time: int
+    min_coin_hint: Optional[int]
+    max_coin_hint: Optional[int]
+    canonical_intent_sha256: str
+
+    def offer_dict(self) -> dict[str, int]:
+        return dict(self.offer_items)
+
+    def offer_size_uniqueness(self) -> dict[str, Any]:
+        return json.loads(self.offer_size_uniqueness_json)
+
+
+class _OfferCreationClaimLost(Exception):
+    """Another exact slot or selected-coin claim committed first."""
 
 
 def _wallet_batch_results(result, item_ids) -> dict:
@@ -198,6 +241,11 @@ class OfferManager:
         # not re-select a coin that is still pending on-chain confirmation.
         # Cleared at the start of every cycle via clear_cycle_coins().
         self._cycle_used_coin_ids: set = set()
+
+        # Test-only crash boundary hook. Production leaves this unset; the
+        # immutable intent argument lets tests simulate process loss without
+        # weakening or branching the durable state machine.
+        self._offer_creation_crash_hook = None
 
         # ----- Fix F: Slot suspension for coin exhaustion self-heal -----
         # When a specific slot fails to get a unique coin 3 consecutive times,
@@ -1388,6 +1436,998 @@ class OfferManager:
     # Offer Creation
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _canonical_creation_json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _canonical_selected_coin_id(value: Any) -> str:
+        if type(value) is not str:
+            raise ValueError("selected coin ID must be canonical text")
+        normalized = value.strip().lower()
+        if normalized.startswith("0x"):
+            normalized = normalized[2:]
+        if (
+            len(normalized) != 64
+            or not normalized.isascii()
+            or any(character not in "0123456789abcdef" for character in normalized)
+        ):
+            raise ValueError("selected coin ID must be exactly 32-byte hex")
+        return normalized
+
+    def _build_canonical_creation_intent(
+        self,
+        *,
+        offer_dict: dict,
+        selected_coin_id: str,
+        preferred_tier: Optional[str],
+        creation_context: Optional[dict],
+        expiry_seconds: int,
+        expiry_offset: int,
+        stagger_seconds: int,
+        offer_max_time: int,
+        min_coin_hint: Optional[int],
+        max_coin_hint: Optional[int],
+    ) -> _CanonicalOfferCreationIntent:
+        if type(offer_dict) is not dict or not offer_dict:
+            raise ValueError("offer_dict must be a non-empty exact object")
+        items = []
+        negative = []
+        positive = []
+        for raw_wallet_id, raw_amount in offer_dict.items():
+            if type(raw_wallet_id) is int and raw_wallet_id > 0:
+                wallet_id = str(raw_wallet_id)
+            elif (
+                type(raw_wallet_id) is str
+                and raw_wallet_id.isascii()
+                and raw_wallet_id.isdigit()
+                and raw_wallet_id == str(int(raw_wallet_id))
+                and int(raw_wallet_id) > 0
+            ):
+                wallet_id = raw_wallet_id
+            else:
+                raise ValueError("wallet IDs must be canonical positive integers")
+            if type(raw_amount) is not int or raw_amount == 0:
+                raise ValueError("offer amounts must be exact non-zero integers")
+            item = (wallet_id, raw_amount)
+            items.append(item)
+            (negative if raw_amount < 0 else positive).append(item)
+        if len(negative) != 1 or len(positive) != 1:
+            raise ValueError("offer intent requires exactly one spend and one request")
+        if len({wallet_id for wallet_id, _amount in items}) != len(items):
+            raise ValueError("wallet IDs must be unique after canonicalization")
+        items.sort(key=lambda item: int(item[0]))
+        coin_id = self._canonical_selected_coin_id(selected_coin_id)
+        for label, value in (
+            ("expiry_seconds", expiry_seconds),
+            ("expiry_offset", expiry_offset),
+            ("stagger_seconds", stagger_seconds),
+            ("offer_max_time", offer_max_time),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{label} must be an exact non-negative integer")
+        for label, value in (
+            ("min_coin_hint", min_coin_hint),
+            ("max_coin_hint", max_coin_hint),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{label} must be an exact non-negative integer")
+        context = {} if creation_context is None else creation_context
+        if type(context) is not dict:
+            raise ValueError("creation_context must be an exact object")
+        generation = context.get("generation", 0)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("creation generation must be a non-negative integer")
+        authority_run_id = context.get("_authority_run_id")
+        if authority_run_id is not None and (
+            type(authority_run_id) is not str
+            or not authority_run_id
+            or authority_run_id != authority_run_id.strip()
+        ):
+            raise ValueError("creation authority run ID must be canonical text")
+        inferred_side = (
+            "buy"
+            if int(negative[0][0]) == int(getattr(cfg, "WALLET_ID_XCH", 1))
+            else "sell"
+        )
+        side = context.get("side", inferred_side)
+        if type(side) is not str or side not in {"buy", "sell"}:
+            raise ValueError("creation side must be buy or sell")
+        tier = context.get("tier", preferred_tier or "unclassified")
+        purpose = context.get("purpose", "normal_lifecycle")
+        asset_id = context.get("asset_id", getattr(cfg, "CAT_ASSET_ID", None))
+        parent_intent_id = context.get("parent_intent_id")
+        for label, value in (
+            ("tier", tier),
+            ("purpose", purpose),
+            ("asset_id", asset_id),
+        ):
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError(f"creation {label} must be canonical text")
+        if parent_intent_id is not None and (
+            type(parent_intent_id) is not str
+            or not parent_intent_id
+            or parent_intent_id != parent_intent_id.strip()
+        ):
+            raise ValueError("parent_intent_id must be canonical text")
+        uniqueness = context.get(
+            "offer_size_uniqueness",
+            {
+                "requested_amount_atomic": str(positive[0][1]),
+                "offer_items_sha256": hashlib.sha256(
+                    self._canonical_creation_json(items).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        if type(uniqueness) is not dict:
+            raise ValueError("offer_size_uniqueness must be an exact object")
+        uniqueness_json = self._canonical_creation_json(uniqueness)
+        if len(uniqueness_json.encode("utf-8")) > 4096:
+            raise ValueError("offer_size_uniqueness exceeds 4096 UTF-8 bytes")
+        provisional_slot = context.get("slot_key")
+        if provisional_slot is None:
+            provisional_slot = (
+                "offer:"
+                + hashlib.sha256(
+                    self._canonical_creation_json(
+                        {
+                            "offer_items": items,
+                            "selected_coin_id": coin_id,
+                            "side": side,
+                            "tier": tier,
+                            "purpose": purpose,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+        if (
+            type(provisional_slot) is not str
+            or not provisional_slot
+            or provisional_slot != provisional_slot.strip()
+        ):
+            raise ValueError("creation slot_key must be canonical text")
+        identity_payload = {
+            "schema_version": 1,
+            "offer_items": items,
+            "selected_coin_id": coin_id,
+            "asset_id": asset_id,
+            "side": side,
+            "tier": tier,
+            "purpose": purpose,
+            "slot_key": provisional_slot,
+            "generation": generation,
+            "authority_run_id": authority_run_id,
+            "parent_intent_id": parent_intent_id,
+            "offer_size_uniqueness": json.loads(uniqueness_json),
+            "wallet_effect": {
+                "validate_only": False,
+                "expiry_seconds": expiry_seconds,
+                "expiry_offset": expiry_offset,
+                "stagger_seconds": stagger_seconds,
+                "min_coin_hint": min_coin_hint,
+                "max_coin_hint": max_coin_hint,
+            },
+        }
+        digest = hashlib.sha256(
+            self._canonical_creation_json(identity_payload).encode("utf-8")
+        ).hexdigest()
+        return _CanonicalOfferCreationIntent(
+            intent_id=digest,
+            operation_id=f"create:{digest}",
+            offer_items=tuple(items),
+            offered_amount_atomic=str(abs(negative[0][1])),
+            requested_amount_atomic=str(positive[0][1]),
+            selected_coin_id=coin_id,
+            asset_id=asset_id,
+            side=side,
+            tier=tier,
+            purpose=purpose,
+            slot_key=provisional_slot,
+            generation=generation,
+            authority_run_id=authority_run_id,
+            parent_intent_id=parent_intent_id,
+            offer_size_uniqueness_json=uniqueness_json,
+            expiry_seconds=expiry_seconds,
+            expiry_offset=expiry_offset,
+            stagger_seconds=stagger_seconds,
+            offer_max_time=offer_max_time,
+            min_coin_hint=min_coin_hint,
+            max_coin_hint=max_coin_hint,
+            canonical_intent_sha256=digest,
+        )
+
+    @staticmethod
+    def _resolve_creation_context_generation(creation_context: Any) -> Any:
+        if (
+            type(creation_context) is not dict
+            or "select_next_generation" not in creation_context
+        ):
+            return creation_context
+        if creation_context["select_next_generation"] is not True:
+            raise ValueError("select_next_generation must be exact true")
+        if "generation" in creation_context or "_authority_run_id" in creation_context:
+            raise ValueError("durable generation selection cannot be overridden")
+        slot_key = creation_context.get("slot_key")
+        if type(slot_key) is not str or not slot_key or slot_key != slot_key.strip():
+            raise ValueError(
+                "durable generation selection requires a canonical slot_key"
+            )
+        selection = database.select_offer_creation_generation(slot_key=slot_key)
+        if type(selection) is not dict:
+            raise ValueError("durable generation selection is malformed")
+        generation = selection.get("generation")
+        run_id = selection.get("run_id")
+        if type(generation) is not int or generation < 0:
+            raise ValueError("durable generation selection is malformed")
+        if type(run_id) is not str or not run_id or run_id != run_id.strip():
+            raise ValueError("durable generation authority is malformed")
+        resolved = dict(creation_context)
+        del resolved["select_next_generation"]
+        resolved["generation"] = generation
+        resolved["_authority_run_id"] = run_id
+        return resolved
+
+    def _offer_creation_crash_boundary(
+        self,
+        phase: str,
+        intent: _CanonicalOfferCreationIntent,
+    ) -> None:
+        hook = self._offer_creation_crash_hook
+        if hook is not None:
+            hook(phase, intent)
+
+    @staticmethod
+    def _existing_creation_result(
+        intent: _CanonicalOfferCreationIntent,
+        existing: dict,
+    ) -> dict:
+        state = str(existing.get("lifecycle_state") or "")
+        if state == "created":
+            trade_id = str(existing.get("sage_trade_id") or "")
+            offer_max_time = OfferManager._persisted_creation_offer_max_time(intent)
+            if offer_max_time is None:
+                OfferManager._trip_creation_latch(
+                    intent,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    wallet_fingerprint_hash=str(existing["wallet_fingerprint_hash"]),
+                    network=str(existing["network"]),
+                )
+                return OfferManager._creation_reconciliation_result(intent)
+            return {
+                "success": True,
+                "trade_id": trade_id,
+                "trade_record": {"trade_id": trade_id},
+                "locked_coin_id": intent.selected_coin_id,
+                "offer_max_time": offer_max_time,
+                "_catalyst_effect_attempted": False,
+                "_catalyst_idempotent_replay": True,
+                "_catalyst_intent_id": intent.intent_id,
+            }
+        if state in {"prepared", "submitted_unconfirmed", "creation_unknown"}:
+            OfferManager._trip_creation_latch(
+                intent,
+                reason_code="UNRESOLVED_OPERATIONS",
+                wallet_fingerprint_hash=str(existing["wallet_fingerprint_hash"]),
+                network=str(existing["network"]),
+            )
+            return OfferManager._creation_reconciliation_result(intent)
+        return {
+            "success": False,
+            "error": "Offer creation intent is already terminal",
+            "reason": "OFFER_CREATION_ALREADY_FINALIZED",
+            "_catalyst_effect_attempted": False,
+            "_catalyst_intent_id": intent.intent_id,
+        }
+
+    @staticmethod
+    def _persisted_creation_offer_max_time(
+        intent: _CanonicalOfferCreationIntent,
+    ) -> Optional[int]:
+        try:
+            events = database.get_offer_operation_events(intent.operation_id)
+        except Exception:
+            return None
+        for event in events:
+            if type(event) is not dict or event.get("phase") != "PREPARED":
+                continue
+            try:
+                canonical_event = database.validate_offer_operation_event(event)
+                evidence = json.loads(canonical_event["evidence_json"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                canonical_event["event_id"] != f"{intent.operation_id}:prepared"
+                or canonical_event["operation_id"] != intent.operation_id
+                or canonical_event["intent_id"] != intent.intent_id
+                or canonical_event["operation_type"] != "CREATE"
+                or canonical_event["attempt"] != 1
+                or canonical_event["phase"] != "PREPARED"
+                or canonical_event["outcome"] != "PREPARED"
+                or canonical_event["transaction_id"] is not None
+                or canonical_event["spend_identity"] is not None
+                or canonical_event["reason_code"] != "INTENT_PREPARED"
+                or canonical_event["blocks_mutation"] != 1
+                or canonical_event["request_timestamp"] != canonical_event["created_at"]
+                or type(evidence) is not dict
+                or set(evidence)
+                != {
+                    "canonical_intent_sha256",
+                    "continuation_journal_sha256",
+                    "offer_items",
+                    "wallet_effect",
+                    "offer_size_uniqueness",
+                    "selected_coin_ids",
+                }
+                or evidence["canonical_intent_sha256"] != intent.canonical_intent_sha256
+                or evidence["offer_items"]
+                != [list(item) for item in intent.offer_items]
+                or evidence["offer_size_uniqueness"] != intent.offer_size_uniqueness()
+                or evidence["selected_coin_ids"] != [intent.selected_coin_id]
+            ):
+                return None
+            continuation_digest = evidence["continuation_journal_sha256"]
+            if (
+                type(continuation_digest) is not str
+                or len(continuation_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in continuation_digest
+                )
+            ):
+                return None
+            wallet_effect = evidence["wallet_effect"]
+            if type(wallet_effect) is not dict or set(wallet_effect) != {
+                "validate_only",
+                "expiry_seconds",
+                "expiry_offset",
+                "stagger_seconds",
+                "offer_max_time",
+                "min_coin_hint",
+                "max_coin_hint",
+            }:
+                return None
+            expected_effect = {
+                "validate_only": False,
+                "expiry_seconds": intent.expiry_seconds,
+                "expiry_offset": intent.expiry_offset,
+                "stagger_seconds": intent.stagger_seconds,
+                "min_coin_hint": intent.min_coin_hint,
+                "max_coin_hint": intent.max_coin_hint,
+            }
+            if any(
+                wallet_effect[key] != value for key, value in expected_effect.items()
+            ):
+                return None
+            offer_max_time = wallet_effect["offer_max_time"]
+            if type(offer_max_time) is not int or offer_max_time < 0:
+                return None
+            return offer_max_time
+        return None
+
+    @staticmethod
+    def _creation_reconciliation_result(
+        intent: _CanonicalOfferCreationIntent,
+    ) -> dict:
+        return {
+            "success": False,
+            "error": "Offer creation requires reconciliation",
+            "reason": "OFFER_CREATION_RECONCILIATION_REQUIRED",
+            "_catalyst_effect_attempted": False,
+            "_catalyst_intent_id": intent.intent_id,
+        }
+
+    @staticmethod
+    def _trip_creation_latch(
+        intent: _CanonicalOfferCreationIntent,
+        *,
+        reason_code: str,
+        wallet_fingerprint_hash: str,
+        network: str,
+    ) -> bool:
+        try:
+            database.trip_runtime_safety_latch(
+                reason_code=reason_code,
+                reason="Offer creation outcome requires reconciliation",
+                blocking_operation_ids=[intent.operation_id],
+                wallet_fingerprint_hash=wallet_fingerprint_hash,
+                network=network,
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _verified_continuation_journal(
+        journal: Any,
+        intent: _CanonicalOfferCreationIntent,
+    ) -> tuple[dict, str, str, str]:
+        if type(journal) is not dict or set(journal) != {
+            "snapshot",
+            "snapshot_sha256",
+        }:
+            raise ValueError("offer creation authority journal is malformed")
+        snapshot = journal["snapshot"]
+        if type(snapshot) is not dict or set(snapshot) != {
+            "schema_version",
+            "operation_id",
+            "intent_id",
+            "binding",
+            "binding_digest",
+            "observation",
+            "observation_digest",
+            "authority",
+        }:
+            raise ValueError("offer creation authority journal is malformed")
+        if (
+            type(snapshot["schema_version"]) is not int
+            or snapshot["schema_version"] != 1
+        ):
+            raise ValueError("offer creation authority schema is unsupported")
+        encoded = OfferManager._canonical_creation_json(snapshot)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        if (
+            type(journal["snapshot_sha256"]) is not str
+            or journal["snapshot_sha256"] != digest
+        ):
+            raise ValueError("offer creation authority journal digest mismatch")
+        if (
+            snapshot.get("operation_id") != intent.operation_id
+            or snapshot.get("intent_id") != intent.intent_id
+        ):
+            raise ValueError("offer creation authority journal scope mismatch")
+        binding_payload = snapshot.get("binding")
+        if type(binding_payload) is not dict:
+            raise ValueError("offer creation authority binding is missing")
+        try:
+            binding = mutation_gate.WalletIdentityBinding(**binding_payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("offer creation authority binding is malformed") from exc
+        if binding_payload != mutation_gate.wallet_identity_binding_payload(binding):
+            raise ValueError("offer creation authority binding is not canonical")
+        binding_digest = mutation_gate.wallet_identity_binding_digest(binding)
+        if snapshot.get("binding_digest") != binding_digest:
+            raise ValueError("offer creation authority binding digest mismatch")
+        if binding.backend != "sage":
+            raise ValueError("offer creation authority is not the Sage backend")
+        observation = snapshot.get("observation")
+        if type(observation) is not dict or set(observation) != {
+            "backend",
+            "name",
+            "fingerprint",
+            "network_id",
+            "kind",
+            "has_secrets",
+            "observed_at_utc",
+        }:
+            raise ValueError("offer creation observation is missing")
+        observed_at = observation["observed_at_utc"]
+        if (
+            type(observation["backend"]) is not str
+            or type(observation["name"]) is not str
+            or type(observation["fingerprint"]) is not int
+            or type(observation["network_id"]) is not str
+            or type(observation["kind"]) is not str
+            or observation["has_secrets"] is not True
+            or type(observed_at) is not str
+        ):
+            raise ValueError("offer creation observation is malformed")
+        expected_observation_identity = {
+            "backend": binding.backend,
+            "name": binding.name,
+            "fingerprint": binding.fingerprint,
+            "network_id": binding.network_id,
+            "kind": binding.kind,
+            "has_secrets": binding.has_secrets,
+        }
+        if {
+            key: observation[key] for key in expected_observation_identity
+        } != expected_observation_identity:
+            raise ValueError("offer creation observation does not match binding")
+        try:
+            parsed_observed_at = datetime.fromisoformat(
+                observed_at[:-1] + "+00:00" if observed_at.endswith("Z") else ""
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "offer creation observation timestamp is malformed"
+            ) from exc
+        canonical_observed_at = (
+            parsed_observed_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        if observed_at != canonical_observed_at:
+            raise ValueError("offer creation observation timestamp is not canonical")
+        identity_decision = mutation_gate.validate_wallet_identity(
+            binding,
+            {"success": True, **observation},
+            now=parsed_observed_at,
+        )
+        if identity_decision != {
+            "allowed": True,
+            "reason": "identity_verified",
+            "observed_at_utc": observed_at,
+        }:
+            raise ValueError("offer creation observation is not exact identity proof")
+        observation_digest = hashlib.sha256(
+            OfferManager._canonical_creation_json(observation).encode("utf-8")
+        ).hexdigest()
+        if (
+            type(snapshot.get("observation_digest")) is not str
+            or snapshot["observation_digest"] != observation_digest
+        ):
+            raise ValueError("offer creation observation digest mismatch")
+        authority = snapshot.get("authority")
+        if type(authority) is not dict:
+            raise ValueError("offer creation authority proof is missing")
+        runtime_authority_keys = {
+            "mode",
+            "owner_run_id",
+            "owner_pid",
+            "owner_host",
+            "lease_version",
+            "lease_epoch",
+            "authority_generation_digest",
+            "binding_digest",
+        }
+        worker_authority_keys = {
+            "mode",
+            "delegation_id",
+            "parent_run_id",
+            "delegation_operation_id",
+            "purpose",
+            "worker_id",
+            "parent_lease_epoch",
+            "authority_generation_digest",
+            "binding_digest",
+        }
+        mode = authority.get("mode")
+        expected_authority_keys = (
+            runtime_authority_keys
+            if mode == "runtime"
+            else worker_authority_keys
+            if mode == "worker"
+            else set()
+        )
+        if set(authority) != expected_authority_keys:
+            raise ValueError("offer creation authority proof is incomplete")
+        if authority["binding_digest"] != binding_digest:
+            raise ValueError("offer creation authority proof binding mismatch")
+        generation_digest = authority.get("authority_generation_digest")
+        if (
+            type(generation_digest) is not str
+            or len(generation_digest) != 64
+            or any(
+                character not in "0123456789abcdef" for character in generation_digest
+            )
+        ):
+            raise ValueError("offer creation authority generation is malformed")
+        if mode == "runtime":
+            run_id = authority["owner_run_id"]
+            epoch = authority["lease_epoch"]
+            if (
+                type(authority["owner_pid"]) is not int
+                or authority["owner_pid"] <= 0
+                or type(authority["lease_version"]) is not int
+                or authority["lease_version"] <= 0
+                or type(authority["owner_host"]) is not str
+                or not authority["owner_host"]
+            ):
+                raise ValueError("offer creation runtime authority is malformed")
+        elif mode == "worker":
+            run_id = authority["parent_run_id"]
+            epoch = authority["parent_lease_epoch"]
+            if authority["delegation_operation_id"] != intent.operation_id:
+                raise ValueError("worker delegation is bound to another operation")
+            for key in ("delegation_id", "purpose", "worker_id"):
+                if type(authority[key]) is not str or not authority[key]:
+                    raise ValueError("offer creation worker authority is malformed")
+        else:
+            raise ValueError("offer creation authority mode is malformed")
+        if type(run_id) is not str or not run_id or type(epoch) is not str or not epoch:
+            raise ValueError("offer creation authority ownership is malformed")
+        if intent.authority_run_id is not None and run_id != intent.authority_run_id:
+            raise ValueError("offer creation generation authority run mismatch")
+        return (
+            journal,
+            run_id,
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint),
+            binding.network_id,
+        )
+
+    @staticmethod
+    def _bounded_lock_verification(value: Any) -> dict[str, Any]:
+        source = value if type(value) is dict else {}
+        locked = source.get("locked_coin_ids")
+        if type(locked) is not list:
+            locked = []
+        canonical_locked = set()
+        for coin_id in locked[:32]:
+            if type(coin_id) is not str:
+                continue
+            normalized = coin_id.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if len(normalized) != 64 or any(
+                character not in "0123456789abcdef" for character in normalized
+            ):
+                continue
+            canonical_locked.add("0x" + normalized)
+        return {
+            "verified": source.get("verified") is True,
+            "locked_coin_ids": sorted(canonical_locked),
+            "selected_present": source.get("selected_present") is True,
+        }
+
+    @staticmethod
+    def _authorize_prepared_creation(
+        intent: _CanonicalOfferCreationIntent,
+        wallet_hash: str,
+        network: str,
+    ) -> dict[str, Any]:
+        records = tuple(
+            offer_registry.offer_record_from_row(row)
+            for row in database.get_offer_intents_for_registry()
+        )
+        decision = offer_registry.authorize_mutation(
+            offer_registry.RegistrySnapshot(records=records),
+            offer_registry.MutationRequest(
+                kind=offer_registry.MutationKind.CREATE,
+                reference=offer_registry.OfferReference(intent_id=intent.intent_id),
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                selected_coin_ids=(intent.selected_coin_id,),
+            ),
+        )
+        return {
+            "allowed": decision.allowed is True,
+            "code": decision.code.value,
+        }
+
+    def _create_offer_from_journal(
+        self,
+        *,
+        intent: _CanonicalOfferCreationIntent,
+        spend_wallet_id: int,
+    ) -> dict:
+        existing = database.get_offer_intent(intent.intent_id)
+        if existing is not None:
+            return self._existing_creation_result(intent, existing)
+        continuation = None
+        journal = None
+        prepared = False
+        wallet_call_started = False
+        wallet_hash = ""
+        network = ""
+        try:
+            continuation = wallet.begin_offer_creation_continuation(
+                operation_id=intent.operation_id,
+                intent_id=intent.intent_id,
+                ttl_seconds=60,
+            )
+            journal = wallet.offer_creation_continuation_journal(continuation)
+            journal, run_id, wallet_hash, network = self._verified_continuation_journal(
+                journal,
+                intent,
+            )
+            prepared_at = datetime.now(timezone.utc).isoformat()
+            prepared_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": journal["snapshot_sha256"],
+                "offer_items": list(intent.offer_items),
+                "wallet_effect": {
+                    "validate_only": False,
+                    "expiry_seconds": intent.expiry_seconds,
+                    "expiry_offset": intent.expiry_offset,
+                    "stagger_seconds": intent.stagger_seconds,
+                    "offer_max_time": intent.offer_max_time,
+                    "min_coin_hint": intent.min_coin_hint,
+                    "max_coin_hint": intent.max_coin_hint,
+                },
+                "offer_size_uniqueness": intent.offer_size_uniqueness(),
+                "selected_coin_ids": [intent.selected_coin_id],
+            }
+            self._offer_creation_crash_boundary("before_intent_commit", intent)
+            try:
+                database.prepare_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:prepared",
+                    run_id=run_id,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    asset_id=intent.asset_id,
+                    side=intent.side,
+                    tier=intent.tier,
+                    purpose=intent.purpose,
+                    slot_key=intent.slot_key,
+                    generation=intent.generation,
+                    parent_intent_id=intent.parent_intent_id,
+                    offered_amount_atomic=intent.offered_amount_atomic,
+                    requested_amount_atomic=intent.requested_amount_atomic,
+                    selected_coin_ids_json=[intent.selected_coin_id],
+                    wallet_identity_json=journal,
+                    evidence_json=prepared_evidence,
+                    prepared_at=prepared_at,
+                    reserve_selected_coins=True,
+                    require_new_intent=True,
+                )
+            except Exception as exc:
+                message = str(exc)
+                if (
+                    "offer intent already exists" in message
+                    or "selected coin is not free" in message
+                    or "UNIQUE constraint failed: offer_intents.run_id" in message
+                ):
+                    raise _OfferCreationClaimLost from exc
+                raise
+            prepared = True
+            self._offer_creation_crash_boundary("after_intent_commit", intent)
+            registry_authorization = self._authorize_prepared_creation(
+                intent,
+                wallet_hash,
+                network,
+            )
+            if registry_authorization["allowed"] is not True:
+                denied_at = datetime.now(timezone.utc).isoformat()
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:registry-denied",
+                    lifecycle_state="creation_failed",
+                    outcome="FAILED",
+                    wallet_identity_json=journal,
+                    evidence_json={
+                        "canonical_intent_sha256": intent.canonical_intent_sha256,
+                        "continuation_journal_sha256": journal["snapshot_sha256"],
+                        "effect_attempted": False,
+                        "registry_authorization": registry_authorization,
+                    },
+                    reason_code=f"REGISTRY_{registry_authorization['code']}",
+                    finalized_at=denied_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                return {
+                    "success": False,
+                    "error": "Offer creation denied by registry policy",
+                    "reason": "OFFER_CREATION_REGISTRY_DENIED",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            self._offer_creation_crash_boundary("before_wallet_call", intent)
+            wallet_call_started = True
+            result = wallet.create_offer(
+                intent.offer_dict(),
+                validate_only=False,
+                max_time=intent.offer_max_time,
+                min_coin_amount=intent.min_coin_hint,
+                max_coin_amount=intent.max_coin_hint,
+                coin_ids=[intent.selected_coin_id],
+                _creation_continuation=continuation,
+                _creation_operation_id=intent.operation_id,
+                _creation_intent_id=intent.intent_id,
+            )
+            continuation = None
+            self._offer_creation_crash_boundary("after_wallet_response", intent)
+            effect_attempted = (
+                type(result) is dict
+                and result.get("_catalyst_effect_attempted") is True
+            )
+            success = type(result) is dict and result.get("success") is True
+            trade_record_value = result.get("trade_record") if success else None
+            trade_record = (
+                trade_record_value if type(trade_record_value) is dict else {}
+            )
+            direct_trade_id = result.get("trade_id") if success else None
+            nested_trade_id = trade_record.get("trade_id") if success else None
+            trade_id = (
+                direct_trade_id
+                if type(direct_trade_id) is str and direct_trade_id
+                else (
+                    nested_trade_id
+                    if type(nested_trade_id) is str and nested_trade_id
+                    else ""
+                )
+            )
+            offer_value = result.get("offer") if success else None
+            offer_text = offer_value if type(offer_value) is str and offer_value else ""
+            result_reason = result.get("reason") if type(result) is dict else None
+            safe_result_reason = (
+                result_reason[:128]
+                if type(result_reason) is str and result_reason
+                else "MALFORMED_RESULT"
+            )
+            finalized_at = datetime.now(timezone.utc).isoformat()
+            base_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": journal["snapshot_sha256"],
+                "effect_attempted": effect_attempted,
+                "offer_size_uniqueness": intent.offer_size_uniqueness(),
+                "registry_authorization": registry_authorization,
+                "wallet_result": {
+                    "success": success,
+                    "trade_id_present": bool(trade_id),
+                    "offer_text_present": bool(offer_text),
+                    "reason": safe_result_reason,
+                },
+            }
+            if success and effect_attempted and trade_id and offer_text:
+                verification = self._bounded_lock_verification(
+                    self._verify_sage_offer_locked_inputs(
+                        spend_wallet_id,
+                        trade_id,
+                        intent.selected_coin_id,
+                    )
+                )
+                offer_hash = hashlib.sha256(offer_text.encode("utf-8")).hexdigest()
+                evidence = dict(base_evidence)
+                evidence.update(
+                    {
+                        "locked_input_verification": verification,
+                        "offer_text_sha256": offer_hash,
+                        "sage_trade_id": trade_id,
+                    }
+                )
+                self._offer_creation_crash_boundary("before_trade_id_commit", intent)
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:confirmed",
+                    lifecycle_state="created",
+                    outcome="CONFIRMED",
+                    sage_trade_id=trade_id,
+                    offer_text_sha256=offer_hash,
+                    wallet_identity_json=journal,
+                    evidence_json=evidence,
+                    finalized_at=finalized_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                self._offer_creation_crash_boundary("after_trade_id_commit", intent)
+                enriched = dict(result)
+                enriched["locked_coin_id"] = intent.selected_coin_id
+                enriched["offer_max_time"] = intent.offer_max_time
+                enriched["_catalyst_intent_id"] = intent.intent_id
+                enriched["_catalyst_locked_input_verification"] = verification
+                return enriched
+            if (
+                type(result) is dict
+                and result.get("_catalyst_effect_attempted") is False
+            ):
+                evidence = dict(base_evidence)
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:failed",
+                    lifecycle_state="creation_failed",
+                    outcome="FAILED",
+                    wallet_identity_json=journal,
+                    evidence_json=evidence,
+                    reason_code=(
+                        safe_result_reason
+                        if safe_result_reason != "MALFORMED_RESULT"
+                        else "CREATE_REJECTED"
+                    ),
+                    finalized_at=finalized_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                failed = dict(result)
+                failed["_catalyst_intent_id"] = intent.intent_id
+                return failed
+            database.finalize_offer_intent(
+                intent_id=intent.intent_id,
+                operation_id=intent.operation_id,
+                event_id=f"{intent.operation_id}:finalized:unknown",
+                lifecycle_state="creation_unknown",
+                outcome="UNKNOWN",
+                wallet_identity_json=journal,
+                evidence_json=base_evidence,
+                reason_code="CREATE_RESPONSE_AMBIGUOUS",
+                finalized_at=finalized_at,
+                finalize_selected_coin_reservations=True,
+            )
+            return self._existing_creation_result(
+                intent,
+                database.get_offer_intent(intent.intent_id),
+            )
+        except _OfferCreationClaimLost:
+            raise
+        except Exception:
+            current = None
+            try:
+                current = database.get_offer_intent(intent.intent_id)
+            except Exception:
+                pass
+            if not prepared:
+                if current is None:
+                    raise
+                self._trip_creation_latch(
+                    intent,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+                return self._creation_reconciliation_result(intent)
+            if current is not None and current.get("lifecycle_state") == "created":
+                return self._existing_creation_result(intent, current)
+            exception_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": (
+                    journal.get("snapshot_sha256")
+                    if type(journal) is dict
+                    and type(journal.get("snapshot_sha256")) is str
+                    else ""
+                ),
+                "effect_attempted": wallet_call_started,
+                "failure_stage": (
+                    "post_wallet_call" if wallet_call_started else "pre_wallet_call"
+                ),
+            }
+            finalized = False
+            try:
+                if current is not None and current.get("lifecycle_state") == "prepared":
+                    database.finalize_offer_intent(
+                        intent_id=intent.intent_id,
+                        operation_id=intent.operation_id,
+                        event_id=(
+                            f"{intent.operation_id}:finalized:exception-unknown"
+                            if wallet_call_started
+                            else f"{intent.operation_id}:finalized:pre-effect-exception"
+                        ),
+                        lifecycle_state=(
+                            "creation_unknown"
+                            if wallet_call_started
+                            else "creation_failed"
+                        ),
+                        outcome="UNKNOWN" if wallet_call_started else "FAILED",
+                        wallet_identity_json=journal,
+                        evidence_json=exception_evidence,
+                        reason_code=(
+                            "CREATE_POST_EFFECT_EXCEPTION"
+                            if wallet_call_started
+                            else "CREATE_PRE_EFFECT_EXCEPTION"
+                        ),
+                        finalized_at=datetime.now(timezone.utc).isoformat(),
+                        finalize_selected_coin_reservations=True,
+                    )
+                    finalized = True
+                elif current is not None and current.get("lifecycle_state") in {
+                    "creation_unknown",
+                    "submitted_unconfirmed",
+                }:
+                    wallet_call_started = True
+                    finalized = True
+            except Exception:
+                finalized = False
+            if not wallet_call_started and finalized:
+                return {
+                    "success": False,
+                    "error": "Offer creation failed before wallet effect",
+                    "reason": "OFFER_CREATION_PRE_EFFECT_FAILED",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            self._trip_creation_latch(
+                intent,
+                reason_code="UNRESOLVED_OPERATIONS",
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return self._creation_reconciliation_result(intent)
+        finally:
+            if continuation is not None:
+                try:
+                    wallet.close_offer_creation_continuation(continuation)
+                except Exception:
+                    # Cleanup is best-effort and must never replace the stable
+                    # durable result (or the original pre-prepare exception).
+                    pass
+
     def create_offer_with_retry(
         self,
         offer_dict: dict,
@@ -1399,6 +2439,7 @@ class OfferManager:
         selected_coin_id: str = None,
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
+        creation_context: dict = None,
     ) -> Optional[Dict]:
         """Create a Chia offer with automatic retry on transient errors.
 
@@ -1476,6 +2517,7 @@ class OfferManager:
                 selected_coin_id=selected_coin_id,
                 preferred_tier=preferred_tier,
                 strict_preferred_tier=strict_preferred_tier,
+                creation_context=creation_context,
             )
         finally:
             if _reservation_id:
@@ -1497,6 +2539,7 @@ class OfferManager:
         selected_coin_id: str = None,
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
+        creation_context: dict = None,
     ) -> Optional[Dict]:
         """Internal implementation — called by create_offer_with_retry after
         the reservation lease is acquired.  See create_offer_with_retry for
@@ -1506,6 +2549,7 @@ class OfferManager:
         # handles the phantom fill risk from expired offers.
         # expiry_secs parameter allows override (e.g., shorter for sniper).
         _expiry = expiry_secs if expiry_secs is not None else cfg.OFFER_EXPIRY_SECS
+        stagger = 0
         if _expiry and _expiry > 0:
             # Stagger expiry across offers to avoid mass-expiry cascades
             stagger = expiry_offset * cfg.OFFER_STAGGER_SECS if expiry_offset else 0
@@ -1528,8 +2572,20 @@ class OfferManager:
                     spend_amount = abs(int(amt))
                     spend_wallet_id = int(wid)
         # Hint: use coins between 80% and 200% of the spend amount
-        min_coin_hint = int(spend_amount * 0.8) if spend_amount > 0 else None
-        max_coin_hint = int(spend_amount * 2.0) if spend_amount > 0 else None
+        min_coin_hint = (spend_amount * 8) // 10 if spend_amount > 0 else None
+        max_coin_hint = spend_amount * 2 if spend_amount > 0 else None
+
+        try:
+            authoritative_backend = wallet.get_wallet_backend_authority()
+        except Exception:
+            authoritative_backend = None
+        if authoritative_backend not in {"sage", "chia"}:
+            return {
+                "success": False,
+                "error": "Wallet backend authority unavailable",
+                "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                "_catalyst_effect_attempted": False,
+            }
 
         # --- V3 Coin Selection Mode ---
         # When coin_ids_enabled=True, we pre-select a specific coin and pass it
@@ -1565,7 +2621,11 @@ class OfferManager:
                     f"Using caller-selected coin: {selected_coin_id[:16]}... "
                     f"for {spend_amount} mojos",
                 )
-            elif coin_ids_enabled and spend_wallet_id is not None and spend_amount > 0:
+            elif (
+                (coin_ids_enabled or authoritative_backend == "sage")
+                and spend_wallet_id is not None
+                and spend_amount > 0
+            ):
                 selected_coin_id = self._select_coin_for_offer(
                     spend_wallet_id,
                     spend_amount,
@@ -1601,8 +2661,78 @@ class OfferManager:
                         "Coin selection returned None — falling back to polling mode",
                     )
 
+        if (
+            not use_coin_ids_mode
+            and spend_wallet_id is not None
+            and authoritative_backend == "sage"
+        ):
+            return {
+                "success": False,
+                "error": "no_exact_selected_coin",
+                "reason": "OFFER_CREATION_EXACT_COIN_REQUIRED",
+                "_catalyst_effect_attempted": False,
+            }
+
         # Track which coin was claimed for inflight cleanup
         _inflight_claimed = selected_coin_id if use_coin_ids_mode else None
+
+        if use_coin_ids_mode and selected_coin_id and authoritative_backend == "sage":
+            try:
+                try:
+                    resolved_creation_context = (
+                        self._resolve_creation_context_generation(creation_context)
+                    )
+                except (ValueError, mutation_gate.MutationBlocked):
+                    raise
+                except Exception:
+                    return {
+                        "success": False,
+                        "error": "Durable offer generation unavailable",
+                        "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                        "_catalyst_effect_attempted": False,
+                    }
+                intent = self._build_canonical_creation_intent(
+                    offer_dict=offer_dict,
+                    selected_coin_id=selected_coin_id,
+                    preferred_tier=preferred_tier,
+                    creation_context=resolved_creation_context,
+                    expiry_seconds=_expiry,
+                    expiry_offset=expiry_offset,
+                    stagger_seconds=stagger,
+                    offer_max_time=offer_max_time,
+                    min_coin_hint=min_coin_hint,
+                    max_coin_hint=max_coin_hint,
+                )
+                return self._create_offer_from_journal(
+                    intent=intent,
+                    spend_wallet_id=spend_wallet_id,
+                )
+            except _OfferCreationClaimLost:
+                return {
+                    "success": False,
+                    "error": "Offer creation claim lost",
+                    "reason": "OFFER_CREATION_RACE_LOST",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            except mutation_gate.MutationBlocked:
+                return {
+                    "success": False,
+                    "error": "Offer creation authority denied",
+                    "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                    "_catalyst_effect_attempted": False,
+                }
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": str(exc),
+                    "reason": "OFFER_CREATION_INTENT_INVALID",
+                    "_catalyst_effect_attempted": False,
+                }
+            finally:
+                if _inflight_claimed:
+                    with self._lock:
+                        self._inflight_coin_ids.discard(_inflight_claimed)
 
         # --- Before snapshot (V2 polling mode only) ---
         # Only needed when NOT using coin_ids mode.
@@ -2609,6 +3739,24 @@ class OfferManager:
                 coin_ids_enabled=coin_ids_enabled,
                 selected_coin_id=spec.get("coin_id"),
                 preferred_tier=spec["tier"],
+                creation_context={
+                    "slot_key": f"ladder:{asset_id}:{side}:{spec['slot']}",
+                    "select_next_generation": True,
+                    "asset_id": asset_id,
+                    "side": side,
+                    "tier": spec["tier"],
+                    "purpose": "normal_lifecycle",
+                    "offer_size_uniqueness": {
+                        "slot": spec["slot"],
+                        "requested_amount_atomic": str(
+                            next(
+                                int(amount)
+                                for amount in spec["offer_dict"].values()
+                                if int(amount) > 0
+                            )
+                        ),
+                    },
+                },
             )
             if res and res.get("success"):
                 locked_coin_id = res.get("locked_coin_id")

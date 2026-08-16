@@ -6971,6 +6971,45 @@ _JOURNAL_COMPARE_COLUMNS = (
 )
 
 
+def validate_offer_operation_event(event: Any) -> Dict[str, Any]:
+    """Return one exact canonical journal row or fail closed.
+
+    This reuses the write-path validator so readers cannot trust parseable
+    evidence whose digest or other canonical event fields were altered.
+    """
+
+    if type(event) is not dict or set(event) != {
+        "sequence",
+        *_JOURNAL_COMPARE_COLUMNS,
+    }:
+        raise ValueError("offer operation event fields are invalid")
+    sequence = _exact_integer(event["sequence"], "sequence", minimum=1)
+    blocks_mutation = event["blocks_mutation"]
+    if type(blocks_mutation) is not int or blocks_mutation not in {0, 1}:
+        raise ValueError("blocks_mutation must be an exact SQLite boolean")
+    canonical = _journal_values(
+        event_id=event["event_id"],
+        operation_id=event["operation_id"],
+        intent_id=event["intent_id"],
+        operation_type=event["operation_type"],
+        attempt=event["attempt"],
+        phase=event["phase"],
+        outcome=event["outcome"],
+        request_timestamp=event["request_timestamp"],
+        wallet_identity_json=event["wallet_identity_json"],
+        transaction_id=event["transaction_id"],
+        spend_identity=event["spend_identity"],
+        evidence_json=event["evidence_json"],
+        evidence_sha256=event["evidence_sha256"],
+        reason_code=event["reason_code"],
+        blocks_mutation=bool(blocks_mutation),
+        created_at=event["created_at"],
+    )
+    if any(event[column] != canonical[column] for column in _JOURNAL_COMPARE_COLUMNS):
+        raise ValueError("offer operation event is not canonical")
+    return {"sequence": sequence, **canonical}
+
+
 def _insert_offer_operation_event(
     conn: sqlite3.Connection, values: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -7082,9 +7121,15 @@ def prepare_offer_intent(
     wallet_identity_json: Any = None,
     evidence_json: Any = None,
     prepared_at: Any = None,
+    reserve_selected_coins: bool = False,
+    require_new_intent: bool = False,
 ) -> Dict[str, Any]:
     """Atomically persist a creation intent and its PREPARED journal event."""
 
+    if type(reserve_selected_coins) is not bool:
+        raise TypeError("reserve_selected_coins must be an exact bool")
+    if type(require_new_intent) is not bool:
+        raise TypeError("require_new_intent must be an exact bool")
     safe_side = _required_stability_text(side, "side").lower()
     if safe_side not in {"buy", "sell"}:
         raise ValueError("side must be buy or sell")
@@ -7164,6 +7209,8 @@ def prepare_offer_intent(
         blocks_mutation=True,
         created_at=prepared,
     )
+    reservation_identity = f"intent:{immutable['intent_id']}"
+    registry_coin_ids = [norm_coin_id(coin_id) for coin_id in normalized_coin_ids]
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -7171,6 +7218,7 @@ def prepare_offer_intent(
             "SELECT * FROM offer_intents WHERE intent_id=?",
             (immutable["intent_id"],),
         ).fetchone()
+        existing_state = None
         if existing is None:
             conn.execute(
                 """
@@ -7194,9 +7242,49 @@ def prepare_offer_intent(
             )
         else:
             existing_dict = dict(existing)
+            existing_state = str(existing_dict["lifecycle_state"])
             if any(existing_dict[key] != value for key, value in immutable.items()):
                 raise ValueError("intent_id already exists with different intent data")
+            if require_new_intent:
+                raise ValueError("offer intent already exists")
         _insert_offer_operation_event(conn, journal)
+        if reserve_selected_coins and existing_state in {None, "prepared"}:
+            placeholders = ",".join("?" for _ in registry_coin_ids)
+            rows = conn.execute(
+                f"SELECT coin_id, status, trade_id FROM coins "
+                f"WHERE coin_id IN ({placeholders})",
+                registry_coin_ids,
+            ).fetchall()
+            by_coin_id = {str(row["coin_id"]): dict(row) for row in rows}
+            if set(by_coin_id) != set(registry_coin_ids):
+                raise ValueError(
+                    "selected coin does not exist in the durable coin registry"
+                )
+            unavailable = [
+                coin_id
+                for coin_id in registry_coin_ids
+                if not (
+                    (
+                        by_coin_id[coin_id]["status"] == "free"
+                        and by_coin_id[coin_id]["trade_id"] is None
+                    )
+                    or (
+                        by_coin_id[coin_id]["status"] == "locked"
+                        and by_coin_id[coin_id]["trade_id"] == reservation_identity
+                    )
+                )
+            ]
+            if unavailable:
+                raise ValueError("selected coin is not free for this creation intent")
+            conn.execute(
+                f"""
+                UPDATE coins
+                SET status='locked', trade_id=?, last_seen=?
+                WHERE coin_id IN ({placeholders})
+                  AND status='free' AND trade_id IS NULL
+                """,
+                (reservation_identity, prepared, *registry_coin_ids),
+            )
         conn.commit()
         row = conn.execute(
             "SELECT * FROM offer_intents WHERE intent_id=?",
@@ -7208,6 +7296,59 @@ def prepare_offer_intent(
         raise
     finally:
         conn.close()
+
+
+def get_offer_intent_coin_reservations(intent_id: str) -> List[Dict[str, Any]]:
+    """Return exact durable selected-coin reservation state for one intent."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    intent = get_offer_intent(safe_intent_id)
+    if intent is None:
+        return []
+    try:
+        selected = json.loads(str(intent["selected_coin_ids_json"]))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("offer intent selected coin identity is corrupt") from exc
+    if type(selected) is not list or not selected:
+        raise RuntimeError("offer intent selected coin identity is corrupt")
+    coin_ids = [
+        _required_stability_text(value, "selected coin id") for value in selected
+    ]
+    registry_coin_ids = [norm_coin_id(coin_id) for coin_id in coin_ids]
+    placeholders = ",".join("?" for _ in registry_coin_ids)
+    rows = (
+        get_connection()
+        .execute(
+            f"SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN ({placeholders})",
+            registry_coin_ids,
+        )
+        .fetchall()
+    )
+    by_coin_id = {str(row["coin_id"]): dict(row) for row in rows}
+    if set(by_coin_id) != set(registry_coin_ids):
+        raise RuntimeError("offer intent selected coin reservation is missing")
+    reservation_identity = f"intent:{safe_intent_id}"
+    result = []
+    for coin_id, registry_coin_id in zip(coin_ids, registry_coin_ids):
+        row = by_coin_id[registry_coin_id]
+        if row["status"] == "locked" and row["trade_id"] == reservation_identity:
+            state = "reserved"
+            trade_id = None
+        elif row["status"] == "locked" and row["trade_id"]:
+            state = "bound"
+            trade_id = str(row["trade_id"])
+        else:
+            state = "released"
+            trade_id = None
+        result.append(
+            {
+                "coin_id": coin_id,
+                "reservation_identity": reservation_identity,
+                "status": state,
+                "trade_id": trade_id,
+            }
+        )
+    return result
 
 
 def finalize_offer_intent(
@@ -7231,9 +7372,12 @@ def finalize_offer_intent(
     blocks_mutation: bool = False,
     expected_row_version: Optional[int] = None,
     finalized_at: Any = None,
+    finalize_selected_coin_reservations: bool = False,
 ) -> Dict[str, Any]:
     """Atomically finalize intent identity/state and append its outcome event."""
 
+    if type(finalize_selected_coin_reservations) is not bool:
+        raise TypeError("finalize_selected_coin_reservations must be an exact bool")
     safe_intent_id = _required_stability_text(intent_id, "intent_id")
     state = _required_stability_text(lifecycle_state, "lifecycle_state").lower()
     safe_outcome = _required_stability_text(outcome, "outcome").upper()
@@ -7375,6 +7519,74 @@ def finalize_offer_intent(
         )
         if cursor.rowcount != 1:
             raise ValueError("offer intent row_version compare-and-set failed")
+        if finalize_selected_coin_reservations:
+            try:
+                selected_coin_ids = json.loads(
+                    str(current_dict["selected_coin_ids_json"])
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "offer intent selected coin identity is corrupt"
+                ) from exc
+            if type(selected_coin_ids) is not list or not selected_coin_ids:
+                raise RuntimeError("offer intent selected coin identity is corrupt")
+            registry_coin_ids = [
+                norm_coin_id(_required_stability_text(value, "selected coin id"))
+                for value in selected_coin_ids
+            ]
+            placeholders = ",".join("?" for _ in registry_coin_ids)
+            reservation_identity = f"intent:{safe_intent_id}"
+            reservation_rows = conn.execute(
+                f"SELECT coin_id, status, trade_id FROM coins "
+                f"WHERE coin_id IN ({placeholders})",
+                registry_coin_ids,
+            ).fetchall()
+            reservations = {
+                str(reservation["coin_id"]): dict(reservation)
+                for reservation in reservation_rows
+            }
+            if set(reservations) != set(registry_coin_ids):
+                raise RuntimeError("offer intent selected coin reservation is missing")
+            if is_confirmed:
+                if any(
+                    reservations[coin_id]["status"] != "locked"
+                    or reservations[coin_id]["trade_id"] != reservation_identity
+                    for coin_id in registry_coin_ids
+                ):
+                    raise RuntimeError(
+                        "offer intent selected coin reservation is not held"
+                    )
+                conn.execute(
+                    f"""
+                    UPDATE coins SET trade_id=?, last_seen=?
+                    WHERE coin_id IN ({placeholders})
+                      AND status='locked' AND trade_id=?
+                    """,
+                    (trade_id, final_time, *registry_coin_ids, reservation_identity),
+                )
+            elif state == "creation_failed":
+                if any(
+                    reservations[coin_id]["status"] != "locked"
+                    or reservations[coin_id]["trade_id"] != reservation_identity
+                    for coin_id in registry_coin_ids
+                ):
+                    raise RuntimeError(
+                        "offer intent selected coin reservation is not held"
+                    )
+                conn.execute(
+                    f"""
+                    UPDATE coins SET status='free', trade_id=NULL, last_seen=?
+                    WHERE coin_id IN ({placeholders})
+                      AND status='locked' AND trade_id=?
+                    """,
+                    (final_time, *registry_coin_ids, reservation_identity),
+                )
+            elif any(
+                reservations[coin_id]["status"] != "locked"
+                or reservations[coin_id]["trade_id"] != reservation_identity
+                for coin_id in registry_coin_ids
+            ):
+                raise RuntimeError("offer intent selected coin reservation is not held")
         _insert_offer_operation_event(conn, journal)
         conn.commit()
         row = conn.execute(
@@ -7395,6 +7607,99 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+def get_offer_intents_for_registry() -> List[Dict[str, Any]]:
+    """Return every durable intent row for one immutable Task 4 snapshot."""
+
+    rows = (
+        get_connection()
+        .execute("SELECT * FROM offer_intents ORDER BY prepared_at, intent_id")
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
+def select_offer_creation_generation(*, slot_key: str) -> Dict[str, Any]:
+    """Select the durable generation owned by the current runtime lease.
+
+    Selection is serialized with offer-intent prepares.  It deliberately does
+    not reserve the generation: concurrent callers receive the same candidate
+    and the active-slot unique index chooses the single prepare winner.
+    """
+
+    safe_slot_key = _required_stability_text(slot_key, "slot_key")
+    active_states = {
+        "prepared",
+        "submitted_unconfirmed",
+        "creation_unknown",
+        "created",
+    }
+    terminal_states = {
+        "creation_failed",
+        "rejected",
+        "cancelled",
+        "filled",
+        "expired",
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if lease_row is None:
+            raise RuntimeError("runtime mutation lease singleton is missing")
+        lease = dict(lease_row)
+        if (
+            lease["active"] != 1
+            or not lease["owner_run_id"]
+            or not lease["expires_at"]
+            or lease["expires_at"] <= locked_at
+        ):
+            raise ValueError("active runtime mutation lease is required")
+        run_id = str(lease["owner_run_id"])
+        rows = conn.execute(
+            """
+            SELECT intent_id, generation, lifecycle_state
+            FROM offer_intents
+            WHERE run_id=? AND slot_key=?
+            ORDER BY generation DESC, prepared_at DESC, intent_id DESC
+            """,
+            (run_id, safe_slot_key),
+        ).fetchall()
+        active = [row for row in rows if row["lifecycle_state"] in active_states]
+        unknown_states = {
+            str(row["lifecycle_state"])
+            for row in rows
+            if row["lifecycle_state"] not in active_states | terminal_states
+        }
+        if unknown_states:
+            raise RuntimeError("offer intent generation state is not recognized")
+        if active:
+            selected = active[0]
+            result = {
+                "run_id": run_id,
+                "generation": int(selected["generation"]),
+                "active_intent_id": str(selected["intent_id"]),
+                "active_lifecycle_state": str(selected["lifecycle_state"]),
+            }
+        else:
+            generation = int(rows[0]["generation"]) + 1 if rows else 0
+            result = {
+                "run_id": run_id,
+                "generation": generation,
+                "active_intent_id": None,
+                "active_lifecycle_state": None,
+            }
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_offer_intent_by_trade_id(sage_trade_id: str) -> Optional[Dict[str, Any]]:

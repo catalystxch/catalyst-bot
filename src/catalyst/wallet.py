@@ -17,8 +17,12 @@ application restart. The file intentionally contains no network or business
 logic of its own beyond the shim.
 """
 
-import os
+import hashlib
 import inspect
+import json
+import os
+import threading
+import time
 from dotenv import load_dotenv
 from config import cfg
 import mutation_gate
@@ -208,12 +212,19 @@ else:
 
 
 _WALLET_ADAPTER_AUTHORITY = _wallet_adapter
+_WALLET_BACKEND_AUTHORITY = "chia" if WALLET_TYPE == "chia" else "sage"
 
 
 def get_wallet_adapter_authority():
     """Return the exact adapter object selected for runtime acquisition."""
 
     return _wallet_adapter
+
+
+def get_wallet_backend_authority() -> str:
+    """Return the immutable backend selected with the adapter at import."""
+
+    return _WALLET_BACKEND_AUTHORITY
 
 
 def get_wallet_type() -> str:
@@ -285,6 +296,326 @@ def _blocked_mutation(reason: str) -> dict:
         "error": _IDENTITY_BLOCK_ERROR,
         "reason": str(reason or "MUTATION_GATE_SAFETY_STOP"),
     }
+
+
+def _blocked_offer_creation_continuation(
+    reason: str = "OFFER_CREATION_CONTINUATION_INVALID",
+    *,
+    effect_attempted: bool = False,
+) -> dict:
+    result = _blocked_mutation(reason)
+    result["_catalyst_effect_attempted"] = effect_attempted
+    return result
+
+
+class _OfferCreationContinuation:
+    """Opaque process-local capability with no serializable token material."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<offer-creation-continuation opaque>"
+
+    def __reduce__(self):
+        raise TypeError("offer creation continuations cannot be serialized")
+
+
+class _OfferCreationContinuationState:
+    __slots__ = (
+        "adapter",
+        "binding",
+        "creator_thread_id",
+        "deadline",
+        "intent_id",
+        "journal",
+        "operation_id",
+        "permit",
+    )
+
+    def __init__(
+        self,
+        *,
+        adapter,
+        binding,
+        creator_thread_id,
+        deadline,
+        intent_id,
+        journal,
+        operation_id,
+        permit,
+    ):
+        self.adapter = adapter
+        self.binding = binding
+        self.creator_thread_id = creator_thread_id
+        self.deadline = deadline
+        self.intent_id = intent_id
+        self.journal = journal
+        self.operation_id = operation_id
+        self.permit = permit
+
+
+_offer_creation_continuation_lock = threading.RLock()
+_offer_creation_continuations: dict[
+    _OfferCreationContinuation, _OfferCreationContinuationState
+] = {}
+
+
+def _exact_continuation_text(value, name: str) -> str:
+    if type(value) is not str or not value or len(value) > 256:
+        raise ValueError(f"{name} must be non-empty canonical text")
+    if value != value.strip() or any(ord(character) < 0x20 for character in value):
+        raise ValueError(f"{name} must be non-empty canonical text")
+    return value
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_identity_observation(snapshot: dict, decision: dict) -> dict:
+    return {
+        "backend": snapshot["backend"],
+        "name": snapshot["name"],
+        "fingerprint": snapshot["fingerprint"],
+        "network_id": snapshot["network_id"],
+        "kind": snapshot["kind"],
+        "has_secrets": snapshot["has_secrets"],
+        "observed_at_utc": decision["observed_at_utc"],
+    }
+
+
+def begin_offer_creation_continuation(
+    *,
+    operation_id: str,
+    intent_id: str,
+    ttl_seconds: int = 30,
+):
+    """Enter offer authority before PREPARED and return an opaque one-shot handle."""
+
+    operation = _exact_continuation_text(operation_id, "operation_id")
+    intent = _exact_continuation_text(intent_id, "intent_id")
+    if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 60:
+        raise ValueError("ttl_seconds must be an exact integer from 1 to 60")
+    wallet_operation = "wallet:create_offer"
+    permit = None
+    try:
+        permit = mutation_gate.enter_wallet_mutation(wallet_operation)
+        binding, adapter = mutation_gate.require_wallet_mutation_permit_authority(
+            permit,
+            f"{wallet_operation}:continuation:acquire",
+        )
+        if binding.backend != WALLET_TYPE or adapter is not _wallet_adapter:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID",
+                wallet_operation,
+            )
+        authority = mutation_gate.wallet_mutation_permit_journal_authority(
+            permit,
+            f"{wallet_operation}:continuation:journal",
+        )
+        snapshot = _identity_from_adapter(adapter)
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit,
+            f"{wallet_operation}:continuation:identity",
+        )
+        decision = mutation_gate.require_fresh_wallet_identity(
+            binding,
+            snapshot,
+            f"{wallet_operation}:continuation",
+        )
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit,
+            f"{wallet_operation}:continuation:dispatch",
+        )
+        binding_payload = mutation_gate.wallet_identity_binding_payload(binding)
+        binding_digest = mutation_gate.wallet_identity_binding_digest(binding)
+        if authority.get("binding_digest", binding_digest) != binding_digest:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID",
+                wallet_operation,
+            )
+        observation = _canonical_identity_observation(snapshot, decision)
+        observation_digest = hashlib.sha256(
+            _canonical_json(observation).encode("utf-8")
+        ).hexdigest()
+        journal_snapshot = {
+            "schema_version": 1,
+            "operation_id": operation,
+            "intent_id": intent,
+            "binding": binding_payload,
+            "binding_digest": binding_digest,
+            "observation": observation,
+            "observation_digest": observation_digest,
+            "authority": authority,
+        }
+        journal = {
+            "snapshot": journal_snapshot,
+            "snapshot_sha256": hashlib.sha256(
+                _canonical_json(journal_snapshot).encode("utf-8")
+            ).hexdigest(),
+        }
+        continuation = _OfferCreationContinuation()
+        state = _OfferCreationContinuationState(
+            adapter=adapter,
+            binding=binding,
+            creator_thread_id=threading.get_ident(),
+            deadline=time.monotonic() + ttl_seconds,
+            intent_id=intent,
+            journal=journal,
+            operation_id=operation,
+            permit=permit,
+        )
+        with _offer_creation_continuation_lock:
+            _offer_creation_continuations[continuation] = state
+        permit = None
+        return continuation
+    finally:
+        if permit is not None:
+            try:
+                mutation_gate.exit_wallet_mutation(permit)
+            except BaseException:
+                pass
+
+
+def offer_creation_continuation_journal(continuation) -> dict:
+    """Return a detached canonical snapshot; never expose the held permit."""
+
+    with _offer_creation_continuation_lock:
+        state = _offer_creation_continuations.get(continuation)
+        if state is None or threading.get_ident() != state.creator_thread_id:
+            raise ValueError("offer creation continuation is invalid")
+        return json.loads(_canonical_json(state.journal))
+
+
+def close_offer_creation_continuation(continuation) -> bool:
+    """Close an unused continuation and release its lifecycle permit exactly once."""
+
+    with _offer_creation_continuation_lock:
+        state = _offer_creation_continuations.pop(continuation, None)
+    if state is None:
+        return False
+    try:
+        return mutation_gate.exit_wallet_mutation(state.permit) is True
+    except BaseException:
+        return False
+
+
+def _run_offer_creation_continuation(
+    continuation,
+    operation_id,
+    intent_id,
+    *args,
+    **kwargs,
+):
+    wallet_operation = "wallet:create_offer"
+    with _offer_creation_continuation_lock:
+        state = _offer_creation_continuations.pop(continuation, None)
+    if state is None:
+        return _blocked_offer_creation_continuation()
+    effect_attempted = False
+    try:
+        try:
+            operation = _exact_continuation_text(operation_id, "operation_id")
+            intent = _exact_continuation_text(intent_id, "intent_id")
+        except (TypeError, ValueError):
+            return _blocked_offer_creation_continuation()
+        if (
+            threading.get_ident() != state.creator_thread_id
+            or time.monotonic() > state.deadline
+            or operation != state.operation_id
+            or intent != state.intent_id
+        ):
+            return _blocked_offer_creation_continuation()
+        snapshot = _identity_from_adapter(state.adapter)
+        binding, adapter, _decision = (
+            mutation_gate.require_fresh_wallet_operation_continuation(
+                state.permit,
+                snapshot,
+                wallet_operation,
+                operation,
+                intent,
+            )
+        )
+        if (
+            type(binding) is not mutation_gate.WalletIdentityBinding
+            or mutation_gate.wallet_identity_binding_digest(binding)
+            != mutation_gate.wallet_identity_binding_digest(state.binding)
+            or adapter is not state.adapter
+            or binding.backend != WALLET_TYPE
+            or adapter is not _wallet_adapter
+        ):
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID",
+                wallet_operation,
+            )
+
+        def identity_recheck(step: str) -> None:
+            safe_step = (
+                step if type(step) is str and step and len(step) <= 64 else "effect"
+            )
+            fresh_snapshot = _identity_from_adapter(adapter)
+            checked_binding, checked_adapter, _step_decision = (
+                mutation_gate.require_fresh_wallet_operation_continuation(
+                    state.permit,
+                    fresh_snapshot,
+                    f"{wallet_operation}:{safe_step}:identity",
+                    operation,
+                    intent,
+                )
+            )
+            if (
+                mutation_gate.wallet_identity_binding_digest(checked_binding)
+                != mutation_gate.wallet_identity_binding_digest(binding)
+                or checked_adapter is not adapter
+            ):
+                raise mutation_gate.MutationBlocked(
+                    "WALLET_IDENTITY_BINDING_INVALID",
+                    f"{wallet_operation}:{safe_step}",
+                )
+
+        kwargs["_identity_recheck"] = identity_recheck
+        callback = getattr(adapter, "create_offer")
+        effect_attempted = True
+        result = callback(*args, **kwargs)
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            return _blocked_offer_creation_continuation(
+                "WALLET_BACKEND_UNSUPPORTED",
+                effect_attempted=True,
+            )
+        if type(result) is not dict:
+            return _blocked_offer_creation_continuation(
+                "WALLET_MUTATION_FAILED",
+                effect_attempted=True,
+            )
+        result = dict(result)
+        result["_catalyst_effect_attempted"] = True
+        return result
+    except mutation_gate.MutationBlocked as exc:
+        return _blocked_offer_creation_continuation(
+            exc.reason_code,
+            effect_attempted=effect_attempted,
+        )
+    except Exception:
+        return _blocked_offer_creation_continuation(
+            "WALLET_MUTATION_FAILED",
+            effect_attempted=effect_attempted,
+        )
+    finally:
+        try:
+            mutation_gate.exit_wallet_mutation(state.permit)
+        except BaseException:
+            pass
 
 
 def _require_bound_target_fingerprint(
@@ -365,9 +696,9 @@ def wallet_mutation_count(result) -> int:
     return result if type(result) is int and result >= 0 else 0
 
 
-def _expected_identity_authority() -> (
-    tuple[mutation_gate.WalletIdentityBinding, object]
-):
+def _expected_identity_authority() -> tuple[
+    mutation_gate.WalletIdentityBinding, object
+]:
     """Return the frozen binding and adapter selected at authority acquisition."""
 
     candidate_adapter = _wallet_adapter
@@ -731,6 +1062,9 @@ def create_offer(
     max_coin_amount: int = None,
     coin_ids: list = None,
     fee_mojos: int = 0,
+    _creation_continuation=None,
+    _creation_operation_id: str = None,
+    _creation_intent_id: str = None,
 ):
     if validate_only is _ADAPTER_DEFAULT:
         validate_only = WALLET_TYPE == "chia"
@@ -748,6 +1082,21 @@ def create_offer(
         kwargs["fee_mojos"] = fee_mojos
     elif fee_mojos:
         return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    continuation_arguments = (
+        _creation_continuation,
+        _creation_operation_id,
+        _creation_intent_id,
+    )
+    if any(value is not None for value in continuation_arguments):
+        if not all(value is not None for value in continuation_arguments):
+            return _blocked_offer_creation_continuation()
+        return _run_offer_creation_continuation(
+            _creation_continuation,
+            _creation_operation_id,
+            _creation_intent_id,
+            offer_dict,
+            **kwargs,
+        )
     return _run_wallet_mutation("create_offer", offer_dict, **kwargs)
 
 
