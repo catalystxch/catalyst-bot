@@ -2389,6 +2389,23 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
             if type(stored_command) is dict
             else None
         )
+        if type(stored_command) is dict and type(materialization) is not dict:
+            intent = database.get_offer_intent_by_trade_id(trade_id)
+            if type(intent) is dict:
+                database.trip_runtime_safety_latch(
+                    reason_code="BOOST_COMMAND_MISSING_MATERIALIZATION",
+                    reason=(
+                        "A legacy Boost command has no immutable pre-effect state; "
+                        "capturing current manager state would rebind its meaning"
+                    ),
+                    blocking_operation_ids=[f"boost-fill:{int(fill['fill_id'])}"],
+                    wallet_fingerprint_hash=intent["wallet_fingerprint_hash"],
+                    network=intent["network"],
+                    tripped_at=fill["filled_at"],
+                )
+            raise RuntimeError(
+                "legacy Boost command is missing immutable materialization"
+            )
         if type(materialization) is not dict:
             materialization = manager.capture_authoritative_boost_fill_materialization(
                 int(fill["fill_id"]), trade_id, str(fill["side"])
@@ -2403,13 +2420,21 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
             claim_token=claim_token,
             claim_generation=claim_generation,
         )
+        durable_effect = database.materialize_authoritative_boost_fill_effect(
+            int(fill["fill_id"]),
+            trade_id,
+            str(fill["side"]),
+            claim_token=claim_token,
+            claim_generation=claim_generation,
+        )
         effect_state = manager.notify_authoritative_boost_fill(
             int(fill["fill_id"]),
             trade_id,
             str(fill["side"]),
             command["materialization"],
+            durable_effect=durable_effect,
         )
-        if type(effect_state) is not dict:
+        if type(effect_state) is not dict or effect_state != durable_effect:
             raise RuntimeError("BoostManager returned no exact authoritative effect")
         try:
             return database.complete_authoritative_boost_fill_command(

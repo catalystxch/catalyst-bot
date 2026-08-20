@@ -293,9 +293,9 @@ class BoostManager:
         self._authoritative_boost_fill_ids: set[int] = set()
         self._authoritative_boost_effects: dict[int, dict] = {}
         try:
-            from database import get_applied_authoritative_boost_commands
+            from database import get_materialized_authoritative_boost_commands
 
-            for command in get_applied_authoritative_boost_commands():
+            for command in get_materialized_authoritative_boost_commands():
                 fill_id = command["fill_id"]
                 effect = command["effect"]
                 side = effect["side"]
@@ -1183,6 +1183,7 @@ class BoostManager:
         trade_id: str,
         side: str,
         materialization: dict,
+        durable_effect: Optional[dict] = None,
     ) -> dict | bool:
         """Apply one fill-keyed command and return its exact materialized state."""
 
@@ -1196,28 +1197,42 @@ class BoostManager:
         ):
             return False
         try:
-            from database import _canonical_authoritative_boost_materialization
+            from database import (
+                _boost_effect_from_materialization,
+                _canonical_authoritative_boost_effect,
+                _canonical_authoritative_boost_materialization,
+            )
 
             materialization, _encoded, _digest = (
                 _canonical_authoritative_boost_materialization(
                     materialization, fill_id, trade_id, side
                 )
             )
+            expected_effect, _effect_json = _boost_effect_from_materialization(
+                materialization, side
+            )
+            if durable_effect is None:
+                effect = expected_effect
+            else:
+                effect, _effect_json = _canonical_authoritative_boost_effect(
+                    durable_effect, side
+                )
+                if effect != expected_effect:
+                    return False
         except Exception:
             return False
         with self._lock:
             if fill_id in self._authoritative_boost_fill_ids:
-                return dict(self._authoritative_boost_effects[fill_id])
+                existing = self._authoritative_boost_effects[fill_id]
+                return dict(existing) if existing == effect else False
             if side == "buy":
                 self._buy_probe_tid_history.add(materialization["probe_trade_id"])
                 self._buy_offset_bps = materialization["offset_bps"]
                 self._buy_last_safe_offset_bps = materialization["last_safe_offset_bps"]
-                if materialization["settled_before"]:
-                    self._buy_settled = True
-                    self._buy_floor_bps = materialization["floor_bps"]
-                else:
-                    self._buy_settled = False
-                    self._on_inverted_arb("buy")
+                self._buy_settled = True
+                self._buy_floor_bps = materialization["floor_bps"]
+                if self._buy_probe_tid == trade_id:
+                    self._buy_probe_tid = ""
                 offset_bps = self._buy_offset_bps
                 floor_bps = self._buy_floor_bps
                 last_safe_offset_bps = self._buy_last_safe_offset_bps
@@ -1227,12 +1242,10 @@ class BoostManager:
                 self._sell_last_safe_offset_bps = materialization[
                     "last_safe_offset_bps"
                 ]
-                if materialization["settled_before"]:
-                    self._sell_settled = True
-                    self._sell_floor_bps = materialization["floor_bps"]
-                else:
-                    self._sell_settled = False
-                    self._on_inverted_arb("sell")
+                self._sell_settled = True
+                self._sell_floor_bps = materialization["floor_bps"]
+                if self._sell_probe_tid == trade_id:
+                    self._sell_probe_tid = ""
                 offset_bps = self._sell_offset_bps
                 floor_bps = self._sell_floor_bps
                 last_safe_offset_bps = self._sell_last_safe_offset_bps
@@ -1242,16 +1255,8 @@ class BoostManager:
                 or last_safe_offset_bps != materialization["last_safe_offset_bps"]
             ):
                 return False
-            effect = {
-                "schema_version": 1,
-                "side": side,
-                "settled": True,
-                "offset_bps": offset_bps,
-                "floor_bps": floor_bps,
-                "last_safe_offset_bps": last_safe_offset_bps,
-            }
             self._authoritative_boost_fill_ids.add(fill_id)
-            self._authoritative_boost_effects[fill_id] = effect
+            self._authoritative_boost_effects[fill_id] = dict(effect)
             return dict(effect)
 
     def _on_inverted_arb(self, side: str):

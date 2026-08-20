@@ -179,7 +179,7 @@ class TestUpdateOfferStatus(_TempDB):
         result = _db.update_offer_status("nonexistent", "cancelled")
         self.assertTrue(result)
 
-    def test_not_submitted_marks_offer_terminal_and_frees_locked_coin(self):
+    def test_not_submitted_is_diagnostic_and_preserves_locked_open_offer(self):
         _db.upsert_coin(
             "0xnot-submitted", "cat", 123456, designation="tier_spare", tier="inner"
         )
@@ -206,11 +206,11 @@ class TestUpdateOfferStatus(_TempDB):
             )
             .fetchone()
         )
-        self.assertTrue(result)
-        self.assertEqual(offer["status"], "expired")
-        self.assertEqual(offer["lifecycle_state"], "not_submitted")
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
+        self.assertFalse(result)
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "t-not-submitted")
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

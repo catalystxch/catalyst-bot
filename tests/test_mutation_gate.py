@@ -1143,8 +1143,9 @@ def test_owner_wallet_effect_cannot_cross_runtime_generation_aba(
 
     adapter = SimpleNamespace(
         get_wallet_identity=identity_snapshot,
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     binding = mutation_gate.WalletIdentityBinding(
         backend="sage",
@@ -1253,8 +1254,9 @@ def test_owner_wallet_effect_cannot_cross_same_runtime_reacquire_generation(
 
     adapter = SimpleNamespace(
         get_wallet_identity=identity_snapshot,
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     binding = mutation_gate.WalletIdentityBinding(
         backend="sage",
@@ -1315,8 +1317,9 @@ def test_owner_shutdown_cannot_replace_runtime_after_final_wallet_check(
     lifecycle = {}
     adapter = SimpleNamespace(
         get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     runtime, binding = _wallet_owner(clock, adapter, run_id="final-check-owner")
     assert runtime.acquire()["acquired"] is True
@@ -1386,8 +1389,9 @@ def test_owner_release_and_reacquire_refuse_after_final_wallet_check(
     lifecycle = {}
     adapter = SimpleNamespace(
         get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     runtime, binding = _wallet_owner(clock, adapter, run_id="final-check-reacquire")
     assert runtime.acquire()["acquired"] is True
@@ -1497,8 +1501,9 @@ def test_worker_wallet_effect_cannot_cross_install_generation_aba(
 
     adapter = SimpleNamespace(
         get_wallet_identity=identity_snapshot,
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     mutation_gate.install_worker_authority_environment(
         environment,
@@ -1552,8 +1557,9 @@ def test_worker_clear_and_reinstall_refuse_after_final_wallet_check(
     lifecycle = {}
     adapter = SimpleNamespace(
         get_wallet_identity=lambda: _wallet_snapshot(clock, binding),
-        create_offer=lambda *args, **kwargs: effects.append("effect")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("effect") or {"success": True}
+        ),
     )
     mutation_gate.install_worker_authority_environment(
         environment,
@@ -3751,6 +3757,132 @@ def test_gui_shutdown_stops_bot_before_cancelling_wallet_offers(monkeypatch):
     captured["target"]()
 
     assert order.index("stop") < order.index("cancel") < order.index("central")
+
+
+def test_gui_shutdown_wallet_absence_never_terminalizes_submitted_cancel(monkeypatch):
+    import api_server
+    from blueprints import bot as bot_blueprint
+
+    captured = {}
+    status_updates = []
+
+    class DeferredThread:
+        def __init__(self, target, **_kwargs):
+            captured["target"] = target
+
+        def start(self):
+            return None
+
+    class OfferManager:
+        def cancel_all(self):
+            return {"shutdown-trade": {"success": True}}
+
+        def sync_from_wallet(self):
+            return [], [], {}
+
+    fake_bot = SimpleNamespace(
+        offer_manager=OfferManager(),
+        coin_manager=SimpleNamespace(_prep_running=False),
+        runtime_monitor=SimpleNamespace(stop=lambda: None),
+        splash_node=SimpleNamespace(is_running=lambda: False),
+        stop=lambda wait=True: None,
+    )
+    monkeypatch.setattr(api_server, "bot", fake_bot)
+    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
+    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
+    monkeypatch.setattr(
+        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
+    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
+    monkeypatch.setattr(
+        api_server,
+        "quiesce_and_release_mutation_runtime",
+        lambda **_kwargs: {"released": True},
+    )
+    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
+    monkeypatch.setattr(
+        database,
+        "update_offer_status",
+        lambda trade_id, status: status_updates.append((trade_id, status)),
+    )
+    monkeypatch.setattr(
+        database,
+        "get_connection",
+        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
+    )
+
+    with api_server.app.test_request_context(
+        "/api/shutdown", method="POST", json={"cancel_offers": True}
+    ):
+        response = bot_blueprint.api_shutdown()
+    assert response.get_json()["success"] is True
+
+    captured["target"]()
+
+    assert status_updates == []
+
+
+def test_gui_shutdown_cancel_failure_still_releases_permit_and_quiesces(monkeypatch):
+    import api_server
+    from blueprints import bot as bot_blueprint
+
+    captured = {}
+    order = []
+
+    class DeferredThread:
+        def __init__(self, target, **_kwargs):
+            captured["target"] = target
+
+        def start(self):
+            return None
+
+    class OfferManager:
+        def cancel_all(self):
+            raise RuntimeError("cancel unavailable")
+
+    fake_bot = SimpleNamespace(
+        offer_manager=OfferManager(),
+        coin_manager=SimpleNamespace(_prep_running=False),
+        runtime_monitor=SimpleNamespace(stop=lambda: None),
+        splash_node=SimpleNamespace(is_running=lambda: False),
+        stop=lambda wait=True: None,
+    )
+    monkeypatch.setattr(api_server, "bot", fake_bot)
+    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
+    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
+    monkeypatch.setattr(
+        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "exit_mutation",
+        lambda permit: order.append(("exit", permit)) or True,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "quiesce_and_release_mutation_runtime",
+        lambda **_kwargs: order.append(("quiesce", None)) or {"released": True},
+    )
+    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
+    monkeypatch.setattr(
+        database,
+        "get_connection",
+        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
+    )
+
+    with api_server.app.test_request_context(
+        "/api/shutdown", method="POST", json={"cancel_offers": True}
+    ):
+        response = bot_blueprint.api_shutdown()
+    assert response.get_json()["success"] is True
+
+    captured["target"]()
+
+    assert order == [("exit", "permit"), ("quiesce", None)]
 
 
 def test_inflight_mutation_quiescence_blocks_new_work_and_lease_release(

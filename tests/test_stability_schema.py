@@ -522,6 +522,83 @@ def test_stability_migration_rejects_malformed_boost_materialization_table(
         database.init_database()
 
 
+def test_boost_log_and_sweep_safety_materializations_are_schema_guarded(
+    isolated_database,
+):
+    database.init_database()
+    conn = database.get_connection()
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?, ?)",
+            (
+                "offer_fill_boost_log_sinks",
+                "offer_fill_sweep_safety_state",
+                "offer_fill_sweep_migration_audit",
+            ),
+        ).fetchall()
+    }
+    triggers = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN "
+            "(?, ?, ?, ?, ?, ?)",
+            (
+                "offer_fill_boost_log_sinks_no_update",
+                "offer_fill_boost_log_sinks_no_delete",
+                "offer_fill_sweep_safety_state_guarded_update",
+                "offer_fill_sweep_safety_state_no_delete",
+                "offer_fill_sweep_migration_audit_no_update",
+                "offer_fill_sweep_migration_audit_no_delete",
+            ),
+        ).fetchall()
+    }
+
+    assert tables == {
+        "offer_fill_boost_log_sinks",
+        "offer_fill_sweep_safety_state",
+        "offer_fill_sweep_migration_audit",
+    }
+    assert triggers == {
+        "offer_fill_boost_log_sinks_no_update",
+        "offer_fill_boost_log_sinks_no_delete",
+        "offer_fill_sweep_safety_state_guarded_update",
+        "offer_fill_sweep_safety_state_no_delete",
+        "offer_fill_sweep_migration_audit_no_update",
+        "offer_fill_sweep_migration_audit_no_delete",
+    }
+
+
+def test_repeated_migration_does_not_rescan_append_only_effect_history(
+    isolated_database,
+    monkeypatch,
+):
+    database.init_database()
+    database.close_connection()
+    statements = []
+    real_connect = database.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(database.sqlite3, "connect", traced_connect)
+
+    database._migrate_stability_schema()
+
+    normalized = [" ".join(statement.lower().split()) for statement in statements]
+    assert not any(
+        "from offer_fill_sweep_events as event left join" in statement
+        for statement in normalized
+    )
+    assert not any(
+        "from offer_fill_boost_effects as effect join" in statement
+        and "left join offer_fill_boost_log_sinks" in statement
+        for statement in normalized
+    )
+
+
 def test_sweep_active_queues_have_indexed_bounded_query_plans(isolated_database):
     database.init_database()
     conn = database.get_connection()
@@ -584,17 +661,33 @@ def test_sweep_active_queues_have_indexed_bounded_query_plans(isolated_database)
             "ORDER BY queue.finalized_at, queue.fill_id LIMIT 256"
         ).fetchall()
     )
+    safety_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT safety.side, safety.event_id, safety.expires_at, "
+            "       safety.effect_at, effect.effect_json, effect.effect_sha256, "
+            "       event.spent_block_index, event.sweep_group_id, event.event_json "
+            "FROM offer_fill_sweep_safety_state AS safety "
+            "JOIN offer_fill_sweep_downstream_effects AS effect "
+            "  ON effect.event_id=safety.event_id "
+            "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+            "ORDER BY safety.side LIMIT 3"
+        ).fetchall()
+    )
 
     assert "idx_offer_fill_sweep_registration_queue_active" in registration_plan
     assert "idx_offer_fill_sweep_delivery_pending" in pending_plan
     assert "idx_offer_fill_sweep_delivery_claim" in expired_plan
     assert "idx_offer_fill_sweep_delivery_completed" in completed_plan
     assert "idx_offer_fill_sweep_registration_queue_finalized" in finalized_plan
+    assert "sqlite_autoindex_offer_fill_sweep_safety_state_1" in safety_plan
     assert "USE TEMP B-TREE" not in registration_plan
     assert "USE TEMP B-TREE" not in pending_plan
     assert "USE TEMP B-TREE" not in expired_plan
     assert "USE TEMP B-TREE" not in completed_plan
     assert "USE TEMP B-TREE" not in finalized_plan
+    assert "USE TEMP B-TREE" not in safety_plan
 
 
 def test_sweep_auxiliary_queue_deletes_are_guarded_by_completed_state(

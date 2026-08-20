@@ -34,7 +34,6 @@ from database import (
     log_event,
     get_stats,
     get_offer,
-    update_offer_status,
 )
 
 try:
@@ -1643,16 +1642,13 @@ class BotLoop:
         wallet_sync_fresh: bool,
         now_ts: Optional[float] = None,
     ) -> Dict[str, set]:
-        """Expire DB-only offers once a fresh wallet view proves they never landed."""
+        """Park DB-only offers; wallet absence is diagnostic, never terminal proof."""
         retired = {"buy": set(), "sell": set()}
         if not wallet_sync_fresh:
             return retired
         now = float(now_ts if now_ts is not None else time.time())
         grace = max(
             15.0, float(getattr(cfg, "DB_ONLY_OFFER_CONFIRM_GRACE_SECS", 90) or 90)
-        )
-        retry_backoff = max(
-            0.0, float(getattr(cfg, "DB_ONLY_OFFER_RETRY_BACKOFF_SECS", 300) or 300)
         )
         side_rows = {
             "buy": (list(db_buy_offers or []), set(wallet_buy_ids or set())),
@@ -1668,33 +1664,18 @@ class BotLoop:
                 age_secs = self._offer_age_seconds(offer, now)
                 if age_secs < grace:
                     continue
-                if not update_offer_status(tid, "not_submitted"):
-                    continue
-                retired[side].add(tid)
-                try:
-                    self.offer_manager._recently_created.pop(tid, None)
-                    self.offer_manager._offer_details_cache.pop(tid, None)
-                except Exception:
-                    pass
                 log_event(
-                    "info",
-                    "db_only_offer_not_submitted",
+                    "warning",
+                    "db_only_offer_unproven",
                     f"{side} offer {tid[:16]}... was still absent from a fresh "
-                    f"wallet view after {age_secs:.0f}s; retiring DB row and "
-                    "freeing its locked coin",
+                    f"wallet view after {age_secs:.0f}s; preserving the open DB "
+                    "row and locked coin until authoritative reconciliation",
                     data={
                         "side": side,
                         "trade_id": tid,
                         "age_secs": round(age_secs, 1),
                         "grace_secs": round(grace, 1),
                     },
-                )
-            if retired[side] and retry_backoff > 0:
-                current_until = float(
-                    self._adaptive_target_backoff_until.get(side, 0.0) or 0.0
-                )
-                self._adaptive_target_backoff_until[side] = max(
-                    current_until, now + retry_backoff
                 )
         return retired
 
@@ -4495,6 +4476,10 @@ class BotLoop:
         # Database already initialised at app startup (api_server.py).
         # Just reload config to pick up any .env changes from GUI.
         cfg.reload()
+        # Runtime reset clears process-local Sweep protection and the dynamic
+        # buffer.  Rebuild both from the bounded durable safety materialization
+        # before any readiness gate can allow trading to continue.
+        self._restore_authoritative_sweep_downstream_effects()
         self.runtime_monitor.reset_session()
         self._recovery_state.update(
             {
@@ -7754,20 +7739,46 @@ class BotLoop:
                 age_seconds=effect_age_seconds,
             )
 
-    def _restore_authoritative_sweep_downstream_effects(self) -> None:
+    def _restore_authoritative_sweep_downstream_effects(self) -> bool:
         """Rebuild bounded protection/buffer state from immutable effects."""
 
         try:
-            from database import get_authoritative_sweep_downstream_effects
+            from database import (
+                get_authoritative_sweep_downstream_effects,
+                get_authoritative_sweep_safety_state,
+            )
+        except ImportError:
+            # Narrow compatibility contexts can provide a deliberately partial
+            # database double. Production database.py always exposes both APIs.
+            return False
 
+        try:
             effects = get_authoritative_sweep_downstream_effects(limit=20)
-        except Exception:
-            return
-        for effect in effects:
-            try:
+            safety_state = get_authoritative_sweep_safety_state()
+            for effect in effects:
                 self._apply_authoritative_sweep_downstream_effect(effect)
+            for state in safety_state:
+                side = state["side"]
+                expiry = self._sweep_timestamp_epoch(state["expires_at"])
+                self._sweep_protection[side] = max(
+                    float(self._sweep_protection.get(side, 0.0)), expiry
+                )
+            return True
+        except Exception as exc:
+            # Missing or corrupt restart evidence must pause both sides.  An
+            # infinite process-local guard is intentionally conservative; a
+            # successful subsequent start/reset can rebuild exact state.
+            self._sweep_protection = {"buy": float("inf"), "sell": float("inf")}
+            try:
+                log_event(
+                    "error",
+                    "authoritative_sweep_restore_failed",
+                    "Sweep safety restoration failed; both offer sides remain paused",
+                    data={"error": str(exc)[:160]},
+                )
             except Exception:
-                continue
+                pass
+            return False
 
     def _process_authoritative_sweep_events(self) -> int:
         """Claim, durably materialize, apply and positively ack Sweep events."""

@@ -727,7 +727,7 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
         self.assertEqual(targets["sell"], 4)
 
-    def test_wallet_missing_db_offers_are_retired_after_confirmation_grace(self):
+    def test_wallet_missing_db_offers_are_parked_after_confirmation_grace(self):
         loop = bot_loop.BotLoop()
         now_ts = 1000.0
         old_created = datetime.fromtimestamp(now_ts - 180, timezone.utc).isoformat()
@@ -741,12 +741,7 @@ class ProbeAnchorTests(unittest.TestCase):
             "fresh-sell": {"side": "sell"},
         }
 
-        with (
-            patch.object(
-                bot_loop, "update_offer_status", return_value=True
-            ) as update_mock,
-            patch.object(bot_loop, "log_event") as log_event_mock,
-        ):
+        with patch.object(bot_loop, "log_event") as log_event_mock:
             result = loop._retire_wallet_missing_db_offers(
                 db_buy_offers=[],
                 db_sell_offers=[
@@ -772,19 +767,18 @@ class ProbeAnchorTests(unittest.TestCase):
                 now_ts=now_ts,
             )
 
-        update_mock.assert_called_once_with("old-sell", "not_submitted")
-        self.assertEqual(result["sell"], {"old-sell"})
+        self.assertEqual(result["sell"], set())
         self.assertEqual(result["buy"], set())
-        self.assertNotIn("old-sell", loop.offer_manager._recently_created)
+        self.assertIn("old-sell", loop.offer_manager._recently_created)
         self.assertIn("fresh-sell", loop.offer_manager._recently_created)
-        self.assertGreater(loop._adaptive_target_backoff_until["sell"], now_ts)
-        not_submitted_events = [
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
+        parked_events = [
             call
             for call in log_event_mock.call_args_list
-            if call.args[1] == "db_only_offer_not_submitted"
+            if call.args[1] == "db_only_offer_unproven"
         ]
-        self.assertEqual(len(not_submitted_events), 1)
-        self.assertEqual(not_submitted_events[0].args[0], "info")
+        self.assertEqual(len(parked_events), 1)
+        self.assertEqual(parked_events[0].args[0], "warning")
 
     def test_orphan_offer_cleanup_relocks_without_absence_terminalization(self):
         loop = bot_loop.BotLoop()

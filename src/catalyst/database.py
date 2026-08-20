@@ -849,6 +849,26 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_boost_effects is append-only');
 END;
 
+-- User-visible Boost arb logging is part of the same fill-keyed durable effect.
+-- The sink identity prevents a crash/replay from emitting the event twice.
+CREATE TABLE IF NOT EXISTS offer_fill_boost_log_sinks (
+    fill_id                     INTEGER PRIMARY KEY,
+    event_log_id                INTEGER NOT NULL UNIQUE,
+    created_at                  TEXT NOT NULL,
+    FOREIGN KEY(fill_id) REFERENCES offer_fill_boost_effects(fill_id),
+    FOREIGN KEY(event_log_id) REFERENCES events(id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_log_sinks_no_update
+BEFORE UPDATE ON offer_fill_boost_log_sinks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_log_sinks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_log_sinks_no_delete
+BEFORE DELETE ON offer_fill_boost_log_sinks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_log_sinks is append-only');
+END;
+
 -- Sweep registration itself is the durable effect. A recreated coordinator
 -- reconstructs its process cache from these immutable fill-keyed rows.
 CREATE TABLE IF NOT EXISTS offer_fill_sweep_registrations (
@@ -1040,6 +1060,30 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_sweep_downstream_effects is append-only');
 END;
 
+-- Exactly one strongest durable protection per side keeps restart safety
+-- independent of the size of append-only Sweep history.
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_safety_state (
+    side                        TEXT PRIMARY KEY CHECK(side IN ('buy', 'sell')),
+    event_id                    TEXT NOT NULL,
+    expires_at                  TEXT NOT NULL,
+    effect_at                   TEXT NOT NULL,
+    updated_at                  TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_downstream_effects(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_safety_state_guarded_update
+BEFORE UPDATE ON offer_fill_sweep_safety_state
+WHEN OLD.side <> NEW.side
+  OR NEW.expires_at <= OLD.expires_at
+  OR NEW.effect_at < OLD.effect_at
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_safety_state transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_safety_state_no_delete
+BEFORE DELETE ON offer_fill_sweep_safety_state
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_safety_state cannot be deleted');
+END;
+
 CREATE TABLE IF NOT EXISTS offer_fill_sweep_log_sinks (
     event_id                    TEXT PRIMARY KEY,
     event_log_id                INTEGER NOT NULL UNIQUE,
@@ -1074,6 +1118,24 @@ CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_delivery_acks_no_delete
 BEFORE DELETE ON offer_fill_sweep_delivery_acks
 BEGIN
     SELECT RAISE(ABORT, 'offer_fill_sweep_delivery_acks is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_migration_audit (
+    event_id                    TEXT PRIMARY KEY,
+    reason_code                 TEXT NOT NULL,
+    prior_receipt_at            TEXT NOT NULL,
+    audited_at                  TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_migration_audit_no_update
+BEFORE UPDATE ON offer_fill_sweep_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_migration_audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_migration_audit_no_delete
+BEFORE DELETE ON offer_fill_sweep_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_migration_audit is append-only');
 END;
 
 CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_downstream_effects_recent
@@ -1365,6 +1427,11 @@ _STABILITY_REQUIRED_COLUMNS = {
         "effect_json",
         "applied_at",
     },
+    "offer_fill_boost_log_sinks": {
+        "fill_id",
+        "event_log_id",
+        "created_at",
+    },
     "offer_fill_sweep_registrations": {
         "fill_id",
         "trade_id",
@@ -1409,6 +1476,13 @@ _STABILITY_REQUIRED_COLUMNS = {
         "effect_sha256",
         "applied_at",
     },
+    "offer_fill_sweep_safety_state": {
+        "side",
+        "event_id",
+        "expires_at",
+        "effect_at",
+        "updated_at",
+    },
     "offer_fill_sweep_log_sinks": {
         "event_id",
         "event_log_id",
@@ -1419,6 +1493,12 @@ _STABILITY_REQUIRED_COLUMNS = {
         "claim_generation",
         "claim_token",
         "consumed_at",
+    },
+    "offer_fill_sweep_migration_audit": {
+        "event_id",
+        "reason_code",
+        "prior_receipt_at",
+        "audited_at",
     },
     "offer_fill_hook_migration_audit": {
         "audit_id",
@@ -1992,11 +2072,117 @@ def _normalize_existing_stability_timestamps(conn: sqlite3.Connection) -> None:
             )
 
 
+def _upsert_authoritative_sweep_safety_state(
+    conn: sqlite3.Connection, effect: Dict[str, Any]
+) -> None:
+    """Materialize the strongest immutable Sweep protection for each side."""
+
+    for protected in effect["protected_sides"]:
+        conn.execute(
+            """
+            INSERT INTO offer_fill_sweep_safety_state (
+                side, event_id, expires_at, effect_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(side) DO UPDATE SET
+                event_id=excluded.event_id,
+                expires_at=excluded.expires_at,
+                effect_at=excluded.effect_at,
+                updated_at=excluded.updated_at
+            WHERE excluded.expires_at > offer_fill_sweep_safety_state.expires_at
+            """,
+            (
+                protected["side"],
+                effect["event_id"],
+                protected["expires_at"],
+                effect["effect_at"],
+                effect["effect_at"],
+            ),
+        )
+
+
+def _backfill_authoritative_sweep_safety_state(
+    conn: sqlite3.Connection, *, safety_state_was_missing: bool
+) -> None:
+    """Bound a one-time upgrade from immutable effects into the two-row summary."""
+
+    if not safety_state_was_missing:
+        return
+    rows = conn.execute(
+        "SELECT effect.event_id, effect.effect_json, effect.effect_sha256, "
+        "       event.spent_block_index, event.sweep_group_id, event.event_json "
+        "FROM offer_fill_sweep_downstream_effects AS effect "
+        "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+        "ORDER BY effect.applied_at, effect.event_id LIMIT ?",
+        (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+        raise RuntimeError("legacy sweep effects exceed safety backfill hard limit")
+    for row in rows:
+        event = _canonical_authoritative_sweep_event_row(row)
+        try:
+            decoded = json.loads(str(row["effect_json"]))
+            effect, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                decoded, event
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored sweep downstream effect is invalid") from exc
+        if encoded != str(row["effect_json"]) or digest != str(row["effect_sha256"]):
+            raise RuntimeError("stored sweep downstream effect is invalid")
+        _upsert_authoritative_sweep_safety_state(conn, effect)
+
+
+def _backfill_authoritative_boost_log_sinks(
+    conn: sqlite3.Connection, *, log_sink_was_missing: bool
+) -> None:
+    """Bounded upgrade of prior exact Boost effects to fill-keyed log sinks."""
+
+    if not log_sink_was_missing:
+        return
+    rows = conn.execute(
+        "SELECT effect.fill_id, effect.trade_id, effect.side, effect.effect_json, "
+        "       effect.applied_at "
+        "FROM offer_fill_boost_effects AS effect "
+        "JOIN offer_fill_boost_command_materializations AS materialization "
+        "  ON materialization.fill_id=effect.fill_id "
+        "LEFT JOIN offer_fill_boost_log_sinks AS sink ON sink.fill_id=effect.fill_id "
+        "WHERE sink.fill_id IS NULL ORDER BY effect.fill_id LIMIT ?",
+        (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+        raise RuntimeError("legacy Boost effects exceed log backfill hard limit")
+    for row in rows:
+        fill_id = int(row["fill_id"])
+        trade_id = str(row["trade_id"])
+        side = str(row["side"])
+        _command, materialization = _load_authoritative_boost_materialization(
+            conn, fill_id, trade_id, side
+        )
+        try:
+            decoded = json.loads(str(row["effect_json"]))
+            effect, encoded = _canonical_authoritative_boost_effect(decoded, side)
+            expected, _expected_encoded = _boost_effect_from_materialization(
+                materialization, side
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored authoritative Boost effect is invalid") from exc
+        if encoded != str(row["effect_json"]) or effect != expected:
+            raise RuntimeError("stored authoritative Boost effect is invalid")
+        _ensure_authoritative_boost_log_sink(
+            conn,
+            fill_id,
+            trade_id,
+            side,
+            effect,
+            str(row["applied_at"]),
+        )
+
+
 def _backfill_authoritative_sweep_active_queues(
     conn: sqlite3.Connection,
     *,
     registration_queue_was_missing: bool,
     delivery_queue_was_missing: bool,
+    legacy_delivery_audit_was_missing: bool,
 ) -> None:
     """One-time upgrade from append-only history into bounded active queues."""
 
@@ -2018,28 +2204,76 @@ def _backfill_authoritative_sweep_active_queues(
             "VALUES (?, 'active', ?, NULL, NULL)",
             [(int(row[0]), str(row[1])) for row in active_rows],
         )
-    if delivery_queue_was_missing:
-        pending_events = conn.execute(
-            "SELECT event.event_id, event.finalized_at "
-            "FROM offer_fill_sweep_events AS event "
-            "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
-            "  ON receipt.event_id=event.event_id "
-            "WHERE receipt.event_id IS NULL "
-            "ORDER BY event.event_id LIMIT ?",
-            (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS + 1,),
-        ).fetchall()
-        if len(pending_events) > _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS:
-            raise RuntimeError("legacy active sweep delivery events exceed hard limit")
-        conn.executemany(
+    if not (delivery_queue_was_missing or legacy_delivery_audit_was_missing):
+        return
+    # A historical receipt predating the fenced downstream protocol proves
+    # nothing about BotLoop protection/buffer/log effects.  Positive delivery
+    # acknowledgement is the sole terminal criterion for auxiliary queue work.
+    pending_events = conn.execute(
+        "SELECT event.event_id, event.finalized_at, receipt.consumed_at, "
+        "       queue.state AS queue_state "
+        "FROM offer_fill_sweep_events AS event "
+        "LEFT JOIN offer_fill_sweep_delivery_acks AS ack "
+        "  ON ack.event_id=event.event_id "
+        "LEFT JOIN offer_fill_sweep_delivery_queue AS queue "
+        "  ON queue.event_id=event.event_id "
+        "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
+        "  ON receipt.event_id=event.event_id "
+        "WHERE ack.event_id IS NULL "
+        "  AND (queue.event_id IS NULL OR queue.state='completed') "
+        "ORDER BY event.event_id LIMIT ?",
+        (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS + 1,),
+    ).fetchall()
+    if len(pending_events) > _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS:
+        raise RuntimeError("legacy active sweep delivery events exceed hard limit")
+    active_rows = conn.execute(
+        "SELECT queue.event_id, receipt.consumed_at "
+        "FROM offer_fill_sweep_delivery_queue AS queue "
+        "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
+        "  ON receipt.event_id=queue.event_id "
+        "LEFT JOIN offer_fill_sweep_delivery_acks AS ack "
+        "  ON ack.event_id=queue.event_id "
+        "WHERE queue.state IN ('pending', 'running') AND ack.event_id IS NULL "
+        "ORDER BY queue.event_id LIMIT ?",
+        (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS + 1,),
+    ).fetchall()
+    if (
+        len(active_rows) > _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS
+        or len(active_rows) + len(pending_events)
+        > _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS
+    ):
+        raise RuntimeError("legacy active sweep delivery events exceed hard limit")
+    audited_at = _stability_wall_clock()
+    for row in active_rows:
+        if row["consumed_at"] is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO offer_fill_sweep_migration_audit "
+                "(event_id, reason_code, prior_receipt_at, audited_at) "
+                "VALUES (?, 'LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK', ?, ?)",
+                (str(row["event_id"]), str(row["consumed_at"]), audited_at),
+            )
+    for row in pending_events:
+        event_id = str(row["event_id"])
+        if row["queue_state"] == "completed":
+            conn.execute(
+                "DELETE FROM offer_fill_sweep_delivery_queue "
+                "WHERE event_id=? AND state='completed'",
+                (event_id,),
+            )
+        conn.execute(
             "INSERT INTO offer_fill_sweep_delivery_queue "
             "(event_id, state, generation, claim_token, claimed_at, "
             " completed_at, queued_at) "
             "VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
-            [
-                (str(row["event_id"]), str(row["finalized_at"]))
-                for row in pending_events
-            ],
+            (event_id, str(row["finalized_at"])),
         )
+        if row["consumed_at"] is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO offer_fill_sweep_migration_audit "
+                "(event_id, reason_code, prior_receipt_at, audited_at) "
+                "VALUES (?, 'LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK', ?, ?)",
+                (event_id, str(row["consumed_at"]), audited_at),
+            )
 
 
 def _migrate_stability_schema() -> None:
@@ -2064,6 +2298,27 @@ def _migrate_stability_schema() -> None:
             ).fetchone()
             is None
         )
+        safety_state_was_missing = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='offer_fill_sweep_safety_state'"
+            ).fetchone()
+            is None
+        )
+        legacy_delivery_audit_was_missing = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='offer_fill_sweep_migration_audit'"
+            ).fetchone()
+            is None
+        )
+        boost_log_sink_was_missing = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='offer_fill_boost_log_sinks'"
+            ).fetchone()
+            is None
+        )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _upgrade_offer_fill_boost_command_guard(conn)
         _validate_stability_schema(conn)
@@ -2072,6 +2327,13 @@ def _migrate_stability_schema() -> None:
             conn,
             registration_queue_was_missing=registration_queue_was_missing,
             delivery_queue_was_missing=delivery_queue_was_missing,
+            legacy_delivery_audit_was_missing=legacy_delivery_audit_was_missing,
+        )
+        _backfill_authoritative_sweep_safety_state(
+            conn, safety_state_was_missing=safety_state_was_missing
+        )
+        _backfill_authoritative_boost_log_sinks(
+            conn, log_sink_was_missing=boost_log_sink_was_missing
         )
         _audit_legacy_boost_command_materializations(conn)
         _audit_legacy_offer_fill_hook_receipts(conn)
@@ -3324,8 +3586,21 @@ def update_offer_status(trade_id: str, status: str) -> bool:
     """
     import time as _time
 
+    if status == "not_submitted":
+        # A wallet listing can be stale, paginated, or locally incomplete.
+        # Task 9 terminalization owns all absence/expiry decisions; retaining
+        # the row also keeps every Task 4 selected-coin reservation locked.
+        log_event(
+            "warning",
+            "offer_not_submitted_unproven",
+            f"Preserved open offer {str(trade_id)[:16]}... because wallet "
+            "absence is not authoritative terminal proof",
+            data={"trade_id": str(trade_id)},
+        )
+        return False
+
     lifecycle_state = status
-    coarse_status = "expired" if status == "not_submitted" else status
+    coarse_status = status
     for _attempt in range(3):
         try:
             conn = get_connection()
@@ -3348,9 +3623,6 @@ def update_offer_status(trade_id: str, status: str) -> bool:
             # Derive lifecycle_state from coarse status.
             # Callers can also set lifecycle_state directly via
             # update_offer_lifecycle_state() for finer-grained tracking.
-            # not_submitted is stored as status=expired to preserve the
-            # legacy CHECK constraint while keeping the precise lifecycle.
-
             if coarse_status == "filled":
                 conn.execute(
                     "UPDATE offers SET status=?, lifecycle_state=?, filled_at=?, cancelled_at=NULL WHERE trade_id=?",
@@ -6291,6 +6563,12 @@ def _audit_legacy_boost_command_materializations(
             "'BOOST_COMMAND_MISSING_MATERIALIZATION', ?, ?)",
             (int(row["fill_id"]), str(row["state"]), audited_at),
         )
+        conn.execute(
+            "UPDATE offer_fill_hook_outbox "
+            "SET last_error_code='BOOST_COMMAND_MISSING_MATERIALIZATION' "
+            "WHERE fill_id=? AND hook_name='boost_notification'",
+            (int(row["fill_id"]),),
+        )
 
 
 def _ensure_authoritative_fill_hook_outbox(
@@ -7130,6 +7408,15 @@ def register_authoritative_boost_fill_command(
             "SELECT * FROM offer_fill_boost_commands WHERE fill_id=?",
             (safe_fill_id,),
         ).fetchone()
+        stored_materialization = conn.execute(
+            "SELECT trade_id, side, materialization_json, materialization_sha256 "
+            "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing is not None and stored_materialization is None:
+            raise RuntimeError(
+                "legacy Boost command is missing immutable materialization"
+            )
         if existing is None:
             conn.execute(
                 """
@@ -7147,11 +7434,6 @@ def register_authoritative_boost_fill_command(
             ):
                 raise ValueError("Boost command replay differs")
             state = str(existing["state"])
-        stored_materialization = conn.execute(
-            "SELECT trade_id, side, materialization_json, materialization_sha256 "
-            "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
-            (safe_fill_id,),
-        ).fetchone()
         if stored_materialization is None:
             conn.execute(
                 "INSERT INTO offer_fill_boost_command_materializations "
@@ -7228,6 +7510,201 @@ def _canonical_authoritative_boost_effect(
     )
 
 
+def _load_authoritative_boost_materialization(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    trade_id: str,
+    side: str,
+) -> tuple[sqlite3.Row, Dict[str, Any]]:
+    command = conn.execute(
+        "SELECT * FROM offer_fill_boost_commands WHERE fill_id=?", (fill_id,)
+    ).fetchone()
+    if command is None:
+        raise ValueError("Boost command is not durably registered")
+    if str(command["trade_id"]) != trade_id or str(command["side"]) != side:
+        raise ValueError("Boost command differs from its durable fill")
+    stored = conn.execute(
+        "SELECT materialization_json, materialization_sha256 "
+        "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
+        (fill_id,),
+    ).fetchone()
+    if stored is None:
+        raise ValueError("Boost command has no durable materialization")
+    try:
+        decoded = json.loads(str(stored["materialization_json"]))
+        materialization, encoded, digest = (
+            _canonical_authoritative_boost_materialization(
+                decoded, fill_id, trade_id, side
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Boost command materialization is invalid") from exc
+    if encoded != str(stored["materialization_json"]) or digest != str(
+        stored["materialization_sha256"]
+    ):
+        raise ValueError("Boost command materialization is invalid")
+    return command, materialization
+
+
+def _boost_effect_from_materialization(
+    materialization: Dict[str, Any], side: str
+) -> tuple[Dict[str, Any], str]:
+    return _canonical_authoritative_boost_effect(
+        {
+            "schema_version": 1,
+            "side": side,
+            "settled": True,
+            "offset_bps": materialization["offset_bps"],
+            "floor_bps": materialization["floor_bps"],
+            "last_safe_offset_bps": materialization["last_safe_offset_bps"],
+        },
+        side,
+    )
+
+
+def _authoritative_boost_log_values(
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    effect: Dict[str, Any],
+) -> tuple[str, str, str]:
+    event_type = f"gap_closer_{side}_arbed"
+    message = (
+        f"{side.upper()} side arbed at {effect['offset_bps']} bps; "
+        f"authoritative fill {trade_id[:16]}... proved the floor"
+    )
+    data = _canonical_json_text(
+        {
+            "schema_version": 1,
+            "fill_id": fill_id,
+            "trade_id": trade_id,
+            "side": side,
+            "offset_bps": effect["offset_bps"],
+            "floor_bps": effect["floor_bps"],
+            "last_safe_offset_bps": effect["last_safe_offset_bps"],
+        },
+        "authoritative Boost event log data",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    return event_type, message, data
+
+
+def _ensure_authoritative_boost_log_sink(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    effect: Dict[str, Any],
+    when: str,
+) -> None:
+    event_type, message, data = _authoritative_boost_log_values(
+        fill_id, trade_id, side, effect
+    )
+    existing = conn.execute(
+        "SELECT sink.event_log_id, event.event_type, event.severity, "
+        "       event.message, event.data "
+        "FROM offer_fill_boost_log_sinks AS sink "
+        "JOIN events AS event ON event.id=sink.event_log_id "
+        "WHERE sink.fill_id=?",
+        (fill_id,),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing["event_type"]) != event_type
+            or str(existing["severity"]) != "info"
+            or str(existing["message"]) != message
+            or str(existing["data"]) != data
+        ):
+            raise RuntimeError("stored authoritative Boost log sink is invalid")
+        return
+    event_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(events)").fetchall()
+    }
+    if "event_category" in event_columns:
+        cursor = conn.execute(
+            "INSERT INTO events "
+            "(timestamp, event_type, severity, message, data, event_category) "
+            "VALUES (?, ?, 'info', ?, ?, 'boost')",
+            (when, event_type, message, data),
+        )
+    else:
+        cursor = conn.execute(
+            "INSERT INTO events (timestamp, event_type, severity, message, data) "
+            "VALUES (?, ?, 'info', ?, ?)",
+            (when, event_type, message, data),
+        )
+    conn.execute(
+        "INSERT INTO offer_fill_boost_log_sinks "
+        "(fill_id, event_log_id, created_at) VALUES (?, ?, ?)",
+        (fill_id, int(cursor.lastrowid), when),
+    )
+
+
+def materialize_authoritative_boost_fill_effect(
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    *,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    """Commit the immutable Boost state and once-only log before process apply."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    safe_side = _required_stability_text(side, "side").lower()
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "boost_notification",
+            safe_token,
+            safe_generation,
+        )
+        _command, materialization = _load_authoritative_boost_materialization(
+            conn, safe_fill_id, safe_trade_id, safe_side
+        )
+        effect, encoded_effect = _boost_effect_from_materialization(
+            materialization, safe_side
+        )
+        existing = conn.execute(
+            "SELECT trade_id, side, effect_json FROM offer_fill_boost_effects "
+            "WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO offer_fill_boost_effects "
+                "(fill_id, trade_id, side, effect_json, applied_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (safe_fill_id, safe_trade_id, safe_side, encoded_effect, when),
+            )
+        elif (
+            str(existing["trade_id"]) != safe_trade_id
+            or str(existing["side"]) != safe_side
+            or str(existing["effect_json"]) != encoded_effect
+        ):
+            raise ValueError("Boost effect replay differs")
+        _ensure_authoritative_boost_log_sink(
+            conn, safe_fill_id, safe_trade_id, safe_side, effect, when
+        )
+        conn.commit()
+        return effect
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def complete_authoritative_boost_fill_command(
     fill_id: int,
     trade_id: str,
@@ -7261,49 +7738,40 @@ def complete_authoritative_boost_fill_command(
             safe_token,
             safe_generation,
         )
-        command = conn.execute(
-            "SELECT * FROM offer_fill_boost_commands WHERE fill_id=?",
-            (safe_fill_id,),
-        ).fetchone()
-        if command is None:
-            raise ValueError("Boost command is not durably registered")
+        command, materialization = _load_authoritative_boost_materialization(
+            conn, safe_fill_id, safe_trade_id, safe_side
+        )
         if (
-            str(command["trade_id"]) != safe_trade_id
-            or str(command["side"]) != safe_side
-        ):
-            raise ValueError("Boost command completion differs")
-        stored_materialization = conn.execute(
-            "SELECT materialization_json, materialization_sha256 "
-            "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
-            (safe_fill_id,),
-        ).fetchone()
-        if stored_materialization is None:
-            raise ValueError("Boost command has no durable materialization")
-        try:
-            decoded_materialization = json.loads(
-                str(stored_materialization["materialization_json"])
-            )
-            materialization, encoded_materialization, materialization_digest = (
-                _canonical_authoritative_boost_materialization(
-                    decoded_materialization,
-                    safe_fill_id,
-                    safe_trade_id,
-                    safe_side,
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Boost command materialization is invalid") from exc
-        if (
-            encoded_materialization
-            != str(stored_materialization["materialization_json"])
-            or materialization_digest
-            != str(stored_materialization["materialization_sha256"])
-            or _effect["offset_bps"] != materialization["offset_bps"]
+            _effect["offset_bps"] != materialization["offset_bps"]
             or _effect["floor_bps"] != materialization["floor_bps"]
             or _effect["last_safe_offset_bps"]
             != materialization["last_safe_offset_bps"]
         ):
             raise ValueError("Boost effect differs from command materialization")
+        existing_effect = conn.execute(
+            "SELECT trade_id, side, effect_json FROM offer_fill_boost_effects "
+            "WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing_effect is None:
+            raise ValueError("Boost effect is not durably materialized")
+        if (
+            str(existing_effect["trade_id"]) != safe_trade_id
+            or str(existing_effect["side"]) != safe_side
+            or str(existing_effect["effect_json"]) != encoded_effect
+        ):
+            raise ValueError("Boost effect replay differs")
+        if (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+                (safe_fill_id,),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("Boost log is not durably materialized")
+        _ensure_authoritative_boost_log_sink(
+            conn, safe_fill_id, safe_trade_id, safe_side, _effect, when
+        )
         newly_applied = str(command["state"]) == "registered"
         if newly_applied:
             cursor = conn.execute(
@@ -7319,26 +7787,6 @@ def complete_authoritative_boost_fill_command(
                 raise RuntimeError("Boost command transition compare-and-set failed")
         elif str(command["state"]) != "applied":
             raise ValueError("Boost command state is invalid")
-        existing_effect = conn.execute(
-            "SELECT trade_id, side, effect_json FROM offer_fill_boost_effects "
-            "WHERE fill_id=?",
-            (safe_fill_id,),
-        ).fetchone()
-        if existing_effect is None:
-            conn.execute(
-                """
-                INSERT INTO offer_fill_boost_effects (
-                    fill_id, trade_id, side, effect_json, applied_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (safe_fill_id, safe_trade_id, safe_side, encoded_effect, when),
-            )
-        elif (
-            str(existing_effect["trade_id"]) != safe_trade_id
-            or str(existing_effect["side"]) != safe_side
-            or str(existing_effect["effect_json"]) != encoded_effect
-        ):
-            raise ValueError("Boost effect replay differs")
         _sink_ack, _sink_applied = _insert_offer_fill_hook_sink_ack(
             conn,
             safe_fill_id,
@@ -7416,6 +7864,72 @@ def get_applied_authoritative_boost_commands() -> List[Dict[str, Any]]:
                 "fill_id": int(row["fill_id"]),
                 "trade_id": str(row["trade_id"]),
                 "side": safe_side,
+                "effect": payload,
+                "applied_at": str(row["applied_at"]),
+            }
+        )
+    return commands
+
+
+def get_materialized_authoritative_boost_commands() -> List[Dict[str, Any]]:
+    """Return every verified durable effect, including pre-process recovery work."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT effect.fill_id, effect.trade_id, effect.side, "
+            "       effect.effect_json, effect.applied_at, "
+            "       command.trade_id AS command_trade_id, "
+            "       command.side AS command_side, command.state, "
+            "       materialization.materialization_json, "
+            "       materialization.materialization_sha256 "
+            "FROM offer_fill_boost_effects AS effect "
+            "JOIN offer_fill_boost_commands AS command "
+            "  ON command.fill_id=effect.fill_id "
+            "JOIN offer_fill_boost_command_materializations AS materialization "
+            "  ON materialization.fill_id=effect.fill_id "
+            "JOIN offer_fill_boost_log_sinks AS sink ON sink.fill_id=effect.fill_id "
+            "ORDER BY effect.applied_at, effect.fill_id"
+        )
+        .fetchall()
+    )
+    commands: List[Dict[str, Any]] = []
+    for row in rows:
+        fill_id = int(row["fill_id"])
+        trade_id = str(row["trade_id"])
+        safe_side = _required_stability_text(row["side"], "side").lower()
+        try:
+            effect = json.loads(str(row["effect_json"]))
+            payload, encoded_effect = _canonical_authoritative_boost_effect(
+                effect, safe_side
+            )
+            decoded_materialization = json.loads(str(row["materialization_json"]))
+            materialization, encoded_materialization, digest = (
+                _canonical_authoritative_boost_materialization(
+                    decoded_materialization, fill_id, trade_id, safe_side
+                )
+            )
+            expected_effect, _expected_encoded = _boost_effect_from_materialization(
+                materialization, safe_side
+            )
+            if (
+                trade_id != str(row["command_trade_id"])
+                or safe_side != str(row["command_side"])
+                or encoded_effect != str(row["effect_json"])
+                or payload != expected_effect
+                or encoded_materialization != str(row["materialization_json"])
+                or digest != str(row["materialization_sha256"])
+                or str(row["state"]) not in {"registered", "applied"}
+            ):
+                raise ValueError("Boost materialized effect differs from its command")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored authoritative Boost effect is invalid") from exc
+        commands.append(
+            {
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "side": safe_side,
+                "state": str(row["state"]),
                 "effect": payload,
                 "applied_at": str(row["applied_at"]),
             }
@@ -7818,17 +8332,21 @@ def finalize_authoritative_sweep_registrations(
             "FROM offer_fill_sweep_events WHERE event_id=?",
             (event_id,),
         ).fetchone()
-        delivery_exists = conn.execute(
-            "SELECT 1 FROM offer_fill_sweep_delivery_queue WHERE event_id=?",
+        delivery = conn.execute(
+            "SELECT state FROM offer_fill_sweep_delivery_queue WHERE event_id=?",
             (event_id,),
         ).fetchone()
-        receipt_exists = conn.execute(
-            "SELECT 1 FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+        receipt = conn.execute(
+            "SELECT consumed_at FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        delivery_ack = conn.execute(
+            "SELECT 1 FROM offer_fill_sweep_delivery_acks WHERE event_id=?",
             (event_id,),
         ).fetchone()
         if (
-            delivery_exists is None
-            and receipt_exists is None
+            delivery_ack is None
+            and (delivery is None or str(delivery["state"]) == "completed")
             and _authoritative_sweep_delivery_at_capacity(conn)
         ):
             raise ValueError("authoritative sweep delivery active limit reached")
@@ -7868,14 +8386,29 @@ def finalize_authoritative_sweep_registrations(
                     )
             elif str(existing["event_id"]) != event_id:
                 raise ValueError("sweep finalization replay differs")
-        if receipt_exists is None:
-            conn.execute(
-                "INSERT OR IGNORE INTO offer_fill_sweep_delivery_queue "
-                "(event_id, state, generation, claim_token, claimed_at, "
-                " completed_at, queued_at) "
-                "VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
-                (event_id, when),
-            )
+        if delivery_ack is None:
+            if receipt is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO offer_fill_sweep_migration_audit "
+                    "(event_id, reason_code, prior_receipt_at, audited_at) "
+                    "VALUES (?, 'LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK', ?, ?)",
+                    (event_id, str(receipt["consumed_at"]), when),
+                )
+            if delivery is not None and str(delivery["state"]) == "completed":
+                conn.execute(
+                    "DELETE FROM offer_fill_sweep_delivery_queue "
+                    "WHERE event_id=? AND state='completed'",
+                    (event_id,),
+                )
+                delivery = None
+            if delivery is None:
+                conn.execute(
+                    "INSERT INTO offer_fill_sweep_delivery_queue "
+                    "(event_id, state, generation, claim_token, claimed_at, "
+                    " completed_at, queued_at) "
+                    "VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
+                    (event_id, when),
+                )
         conn.commit()
         return {"event_id": event_id, **payload}
     except Exception:
@@ -8381,6 +8914,7 @@ def materialize_authoritative_sweep_downstream_effect(
                 is None
             ):
                 raise RuntimeError("stored sweep downstream effect is invalid")
+        _upsert_authoritative_sweep_safety_state(conn, effect)
         conn.commit()
         return effect
     except Exception:
@@ -8424,6 +8958,60 @@ def get_authoritative_sweep_downstream_effects(limit: int = 20) -> List[Dict[str
     return effects
 
 
+def get_authoritative_sweep_safety_state() -> List[Dict[str, Any]]:
+    """Read and verify the bounded per-side restart safety materialization."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT safety.side, safety.event_id, safety.expires_at, "
+            "       safety.effect_at, effect.effect_json, effect.effect_sha256, "
+            "       event.spent_block_index, event.sweep_group_id, event.event_json "
+            "FROM offer_fill_sweep_safety_state AS safety "
+            "JOIN offer_fill_sweep_downstream_effects AS effect "
+            "  ON effect.event_id=safety.event_id "
+            "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+            "ORDER BY safety.side LIMIT 3"
+        )
+        .fetchall()
+    )
+    if len(rows) > 2:
+        raise RuntimeError("authoritative sweep safety state exceeds two sides")
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        event = _canonical_authoritative_sweep_event_row(row)
+        try:
+            decoded = json.loads(str(row["effect_json"]))
+            effect, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                decoded, event
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored sweep safety state is invalid") from exc
+        side = str(row["side"])
+        matching = [
+            protected
+            for protected in effect["protected_sides"]
+            if protected["side"] == side
+        ]
+        if (
+            encoded != str(row["effect_json"])
+            or digest != str(row["effect_sha256"])
+            or len(matching) != 1
+            or matching[0]["expires_at"] != str(row["expires_at"])
+            or effect["effect_at"] != str(row["effect_at"])
+        ):
+            raise RuntimeError("stored sweep safety state is invalid")
+        result.append(
+            {
+                "side": side,
+                "event_id": str(row["event_id"]),
+                "expires_at": str(row["expires_at"]),
+                "effect_at": str(row["effect_at"]),
+            }
+        )
+    return result
+
+
 def consume_authoritative_sweep_event(
     event_id: Any,
     claim_token: Any,
@@ -8464,8 +9052,22 @@ def consume_authoritative_sweep_event(
             is None
         ):
             raise ValueError("sweep downstream effect is not durably materialized")
+        prior_receipt = conn.execute(
+            "SELECT consumed_at FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if prior_receipt is not None and (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_sweep_migration_audit "
+                "WHERE event_id=? "
+                "AND reason_code='LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK'",
+                (safe_event_id,),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("sweep event receipt lacks a migration audit")
         conn.execute(
-            "INSERT INTO offer_fill_sweep_event_receipts "
+            "INSERT OR IGNORE INTO offer_fill_sweep_event_receipts "
             "(event_id, consumed_at) VALUES (?, ?)",
             (safe_event_id, when),
         )

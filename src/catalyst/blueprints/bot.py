@@ -481,6 +481,7 @@ def api_shutdown():
         # 2. Cancel all offers if requested
         if perform_cancel and bot and bot.offer_manager:
             print("   Cancelling all offers...", flush=True)
+            cancelled = 0
             try:
                 result = bot.offer_manager.cancel_all()
                 cancelled = sum(1 for r in result.values() if r and r.get("success"))
@@ -488,52 +489,16 @@ def api_shutdown():
             except Exception as e:
                 print(f"   ⚠️ Cancel failed: {e}", flush=True)
 
-            # Cancel TXs submitted to mempool take a few seconds to leave the
-            # wallet's open-offer view. cancel_all keeps DB status as "open"
-            # for those (so a racing fill isn't misclassified) — but if we
-            # exit immediately the DB stays stale, and the next startup
-            # shows offers that no longer exist on-chain. Poll briefly until
-            # the wallet confirms they're gone, then write through to the DB
-            # so the next session boots with a clean book.
-            try:
-                import time as _t
-                from database import get_open_offers, update_offer_status
-
-                submitted_tids = [
-                    tid for tid, r in (result or {}).items() if r and r.get("success")
-                ]
-                deadline = _t.time() + 30
-                final_open: list = []
-                while _t.time() < deadline:
-                    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
-                    final_open = open_buys + open_sells
-                    if not final_open:
-                        break
-                    _t.sleep(2)
-
-                # Anything in our submitted set that's no longer in the wallet
-                # has cleared on-chain — mark it cancelled in the DB.
-                still_open_tids = {o.get("trade_id") for o in final_open}
-                cleared = [tid for tid in submitted_tids if tid not in still_open_tids]
-                for tid in cleared:
-                    try:
-                        update_offer_status(tid, "cancelled")
-                    except Exception:
-                        pass
-                if cleared:
-                    print(
-                        f"   ✅ {len(cleared)} cancellation(s) confirmed; "
-                        f"DB marked cancelled",
-                        flush=True,
-                    )
-                if final_open:
-                    print(
-                        f"   ⚠️ {len(final_open)} offer(s) still pending after "
-                        f"30s — next startup reconcile will catch them",
-                        flush=True,
-                    )
-            except Exception as e:
-                print(f"   ⚠️ Cancel settle wait failed: {e}", flush=True)
+            # A wallet row disappearing after a submitted cancellation is not
+            # authoritative terminal evidence: it could also be a partial RPC
+            # response or a racing fill.  Keep the durable offer and coin lock
+            # intact until reconciliation proves the terminal outcome.
+            if cancelled:
+                print(
+                    f"   ⏳ {cancelled} cancellation request(s) submitted; "
+                    "authoritative terminal reconciliation remains pending",
+                    flush=True,
+                )
 
         if cancel_permit is not None:
             api_server.mutation_gate.exit_mutation(cancel_permit)

@@ -4207,6 +4207,338 @@ def test_migration_audits_registered_boost_command_without_materialization(
     )
 
 
+def test_legacy_boost_command_without_materialization_is_blocked_not_recaptured(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO offer_fill_boost_commands "
+        "(fill_id, trade_id, side, state, registered_at, applied_at) "
+        "VALUES (?, ?, 'buy', 'registered', ?, NULL)",
+        (fill["fill_id"], TRADE, AFTER),
+    )
+    conn.commit()
+    database.close_connection()
+    database._migrate_stability_schema()
+
+    manager = BoostManager()
+    manager._buy_offset_bps = 999
+    manager._buy_last_safe_offset_bps = 888
+    manager._buy_probe_tid = TRADE
+    manager._buy_probe_tid_history.add(TRADE)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
+    )
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    callback = reconciliation._post_fill_hook_callbacks(fill)["boost_notification"]
+
+    with pytest.raises(RuntimeError, match="missing immutable materialization"):
+        _invoke_claimed_hook(callback, fill, claim)
+
+    conn = database.get_connection()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_command_materializations "
+            "WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_effects WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='gap_closer_buy_arbed'"
+        ).fetchone()[0]
+        == 0
+    )
+    audit = conn.execute(
+        "SELECT reason_code, prior_state FROM offer_fill_hook_migration_audit "
+        "WHERE fill_id=? AND hook_name='boost_notification'",
+        (fill["fill_id"],),
+    ).fetchone()
+    assert tuple(audit) == (
+        "BOOST_COMMAND_MISSING_MATERIALIZATION",
+        "registered",
+    )
+    assert manager._buy_offset_bps == 999
+    assert manager._buy_settled is False
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+def test_boost_effect_and_log_are_durable_before_process_apply_and_replay_once(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    first = BoostManager()
+    first._buy_offset_bps = 137
+    first._buy_last_safe_offset_bps = 121
+    first._buy_probe_tid = TRADE
+    first._buy_probe_tid_history.add(TRADE)
+    observations = []
+
+    def crash_before_process_apply(*_args, **_kwargs):
+        conn = database.get_connection()
+        observations.append(
+            (
+                conn.execute(
+                    "SELECT COUNT(*) FROM offer_fill_boost_effects WHERE fill_id=?",
+                    (fill["fill_id"],),
+                ).fetchone()[0],
+                conn.execute(
+                    "SELECT COUNT(*) FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+                    (fill["fill_id"],),
+                ).fetchone()[0],
+            )
+        )
+        raise SystemExit("crash before process Boost apply")
+
+    first.notify_authoritative_boost_fill = crash_before_process_apply
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=first)),
+    )
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    callback = reconciliation._post_fill_hook_callbacks(fill)["boost_notification"]
+
+    with pytest.raises(SystemExit, match="before process Boost apply"):
+        _invoke_claimed_hook(callback, fill, claim)
+
+    assert observations == [(1, 1)]
+    recreated = BoostManager()
+    assert recreated._buy_settled is True
+    assert recreated._buy_offset_bps == 137
+    assert recreated._buy_floor_bps == 137
+    assert recreated._buy_last_safe_offset_bps == 121
+
+    clock["now"] = "2026-08-20T12:10:31.000000Z"
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=recreated)),
+    )
+    recovered = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    acknowledgement = _invoke_claimed_hook(
+        reconciliation._post_fill_hook_callbacks(fill)["boost_notification"],
+        fill,
+        recovered,
+    )
+
+    assert acknowledgement["disposition"] == "applied"
+    conn = database.get_connection()
+    assert (
+        conn.execute(
+            "SELECT state FROM offer_fill_boost_commands WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == "applied"
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_effects WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='gap_closer_buy_arbed'"
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_boost_crash_after_process_apply_replays_without_duplicate_log(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    manager = BoostManager()
+    manager._buy_offset_bps = 137
+    manager._buy_last_safe_offset_bps = 121
+    manager._buy_probe_tid = TRADE
+    manager._buy_probe_tid_history.add(TRADE)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
+    )
+    real_complete = database.complete_authoritative_boost_fill_command
+    monkeypatch.setattr(
+        database,
+        "complete_authoritative_boost_fill_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            SystemExit("crash after process Boost apply")
+        ),
+    )
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+
+    with pytest.raises(SystemExit, match="after process Boost apply"):
+        _invoke_claimed_hook(
+            reconciliation._post_fill_hook_callbacks(fill)["boost_notification"],
+            fill,
+            claim,
+        )
+
+    monkeypatch.setattr(
+        database, "complete_authoritative_boost_fill_command", real_complete
+    )
+    recreated = BoostManager()
+    assert recreated._buy_settled is True
+    assert recreated._buy_floor_bps == 137
+    clock["now"] = "2026-08-20T12:10:31.000000Z"
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=recreated)),
+    )
+    recovered = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    acknowledgement = _invoke_claimed_hook(
+        reconciliation._post_fill_hook_callbacks(fill)["boost_notification"],
+        fill,
+        recovered,
+    )
+
+    assert acknowledgement["disposition"] == "applied"
+    conn = database.get_connection()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_effects WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='gap_closer_buy_arbed'"
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_migration_backfills_prior_boost_effect_log_sink(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    database.register_authoritative_boost_fill_command(
+        fill["fill_id"],
+        TRADE,
+        "buy",
+        materialization=_boost_materialization(fill["fill_id"]),
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    database.materialize_authoritative_boost_fill_effect(
+        fill["fill_id"],
+        TRADE,
+        "buy",
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    conn = database.get_connection()
+    event_log_id = conn.execute(
+        "SELECT event_log_id FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+        (fill["fill_id"],),
+    ).fetchone()[0]
+    conn.execute("DROP TABLE offer_fill_boost_log_sinks")
+    conn.execute("DELETE FROM events WHERE id=?", (event_log_id,))
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_boost_log_sinks WHERE fill_id=?",
+            (fill["fill_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='gap_closer_buy_arbed'"
+        ).fetchone()[0]
+        == 1
+    )
+    recreated = BoostManager()
+    assert recreated._buy_settled is True
+    assert recreated._buy_offset_bps == 137
+    assert recreated._buy_floor_bps == 137
+    assert recreated._buy_last_safe_offset_bps == 121
+
+
+def test_migration_backfills_prior_sweep_effect_safety_summary(
+    isolated_database,
+    monkeypatch,
+):
+    clock = {"now": "2099-08-20T12:00:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    effect = _insert_materialized_sweep_effect(
+        index=88,
+        classification="arb_sweep_buy",
+        side="buy",
+        finalized_at=clock["now"],
+    )
+    conn = database.get_connection()
+    conn.execute("DROP TABLE offer_fill_sweep_safety_state")
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    assert database.get_authoritative_sweep_safety_state() == [
+        {
+            "side": "sell",
+            "event_id": effect["event_id"],
+            "expires_at": effect["protected_sides"][0]["expires_at"],
+            "effect_at": effect["effect_at"],
+        }
+    ]
+
+
 def test_recreated_production_sweep_coordinator_reconstructs_durable_registration(
     isolated_database,
     monkeypatch,
@@ -4310,6 +4642,171 @@ def _finalize_test_authoritative_sweep(monkeypatch, *, block_index: int = 42) ->
         block_index,
         f"sweep_{block_index}",
     )
+
+
+def _insert_materialized_sweep_effect(
+    *,
+    index: int,
+    classification: str,
+    side: str,
+    finalized_at: str,
+) -> dict:
+    block_index = 10_000 + index
+    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
+        block_index,
+        f"sweep_restore_{block_index}",
+        [
+            {
+                "fill_id": 20_000 + index,
+                "trade_id": f"{30_000 + index:064x}",
+                "classification": classification,
+                "spent_block_index": block_index,
+                "taker_puzzle_hash": None,
+                "side": side,
+            }
+        ],
+    )
+    assert payload["spent_block_index"] == block_index
+    token = f"{40_000 + index:064x}"
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_events "
+        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (event_id, block_index, payload["sweep_group_id"], encoded, finalized_at),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_delivery_queue "
+        "(event_id, state, generation, claim_token, claimed_at, completed_at, queued_at) "
+        "VALUES (?, 'running', 1, ?, ?, NULL, ?)",
+        (event_id, token, finalized_at, finalized_at),
+    )
+    conn.commit()
+    return database.materialize_authoritative_sweep_downstream_effect(
+        event_id,
+        token,
+        1,
+        known_protection_seconds=90,
+        unknown_protection_seconds=30,
+    )
+
+
+def test_sweep_restore_preserves_both_sides_beyond_recent_effect_window(
+    isolated_database,
+    monkeypatch,
+):
+    import dynamic_amm_buffer
+    import wallet_sage
+
+    clock = {"now": "2099-08-20T12:00:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    epoch = datetime.fromisoformat(clock["now"].replace("Z", "+00:00")).timestamp()
+    monkeypatch.setattr(bot_loop.time, "time", lambda: epoch)
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda endpoint, *_args, **_kwargs: (
+            {"fingerprint": 123, "name": "test"}
+            if endpoint == "get_key"
+            else {"success": True}
+        ),
+    )
+    dynamic_amm_buffer.reset_buffer()
+
+    oldest_sell_protection = _insert_materialized_sweep_effect(
+        index=0,
+        classification="arb_sweep_buy",
+        side="buy",
+        finalized_at=clock["now"],
+    )
+    for index in range(1, 22):
+        clock["now"] = f"2099-08-20T12:00:{index:02d}.000000Z"
+        _insert_materialized_sweep_effect(
+            index=index,
+            classification="arb_sweep_sell",
+            side="sell",
+            finalized_at=clock["now"],
+        )
+
+    dynamic_amm_buffer.reset_buffer()
+    recreated = bot_loop.BotLoop()
+
+    expected_sell = recreated._sweep_timestamp_epoch(
+        oldest_sell_protection["protected_sides"][0]["expires_at"]
+    )
+    assert recreated._sweep_protection["sell"] == expected_sell
+    assert recreated._sweep_protection["buy"] > expected_sell
+    assert len(recreated._recent_sweep_events) <= 20
+    assert dynamic_amm_buffer.get_state()["sweep_count_in_window"] <= 20
+
+
+def test_normal_bot_start_restores_sweep_safety_after_runtime_reset(
+    isolated_database,
+    monkeypatch,
+):
+    import dynamic_amm_buffer
+    import wallet_sage
+    from config import cfg
+
+    clock = {"now": "2099-08-20T12:00:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    epoch = datetime.fromisoformat(clock["now"].replace("Z", "+00:00")).timestamp()
+    monkeypatch.setattr(bot_loop.time, "time", lambda: epoch)
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda endpoint, *_args, **_kwargs: (
+            {"fingerprint": 123, "name": "test"}
+            if endpoint == "get_key"
+            else {"success": True}
+        ),
+    )
+    effect = _insert_materialized_sweep_effect(
+        index=1,
+        classification="arb_sweep_sell",
+        side="sell",
+        finalized_at=clock["now"],
+    )
+    dynamic_amm_buffer.reset_buffer()
+    loop = bot_loop.BotLoop()
+    expected_expiry = loop._sweep_timestamp_epoch(
+        effect["protected_sides"][0]["expires_at"]
+    )
+    assert loop._sweep_protection["buy"] == expected_expiry
+
+    failed_check = SimpleNamespace(status="fail", name="test stop", message="stop")
+    preflight = SimpleNamespace(
+        can_start=False,
+        summary="test stop after reset",
+        duration_ms=0,
+        checks=[failed_check],
+        to_dict=lambda: {"can_start": False},
+    )
+    monkeypatch.setattr(cfg, "reload", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "doctor",
+        SimpleNamespace(run_preflight=lambda **_kwargs: preflight),
+    )
+
+    assert loop.start() is False
+    assert loop._sweep_protection["buy"] == expected_expiry
+    assert dynamic_amm_buffer.get_state()["sweep_count_in_window"] == 1
+
+
+def test_sweep_restore_failure_is_conservative(monkeypatch):
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._sweep_protection = {}
+    loop._recent_sweep_events = []
+    monkeypatch.setattr(
+        database,
+        "get_authoritative_sweep_downstream_effects",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("corrupt safety state")),
+    )
+
+    loop._restore_authoritative_sweep_downstream_effects()
+
+    assert loop._sweep_protection == {"buy": float("inf"), "sell": float("inf")}
 
 
 def test_concurrent_sweep_coordinators_have_one_fenced_delivery_owner(
@@ -4836,6 +5333,251 @@ def test_legacy_sweep_delivery_backfill_preflights_hard_cap(
 
     with pytest.raises(RuntimeError, match="delivery events exceed hard limit"):
         database._migrate_stability_schema()
+
+
+def test_legacy_sweep_receipt_without_effect_or_ack_is_requeued_and_applied_once(
+    isolated_database,
+    monkeypatch,
+):
+    import sweep_coordinator
+
+    block_index = 142
+    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
+        block_index,
+        "legacy_sweep_142",
+        [
+            {
+                "fill_id": 42_000,
+                "trade_id": "4" * 64,
+                "classification": "arb_sweep_sell",
+                "spent_block_index": block_index,
+                "taker_puzzle_hash": None,
+                "side": "sell",
+            }
+        ],
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_events "
+        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_event_receipts (event_id, consumed_at) "
+        "VALUES (?, ?)",
+        (event_id, AFTER),
+    )
+    conn.execute("DROP TABLE offer_fill_sweep_migration_audit")
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    queued = conn.execute(
+        "SELECT state, generation FROM offer_fill_sweep_delivery_queue "
+        "WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    assert tuple(queued) == ("pending", 0)
+    audit = conn.execute(
+        "SELECT reason_code FROM offer_fill_sweep_migration_audit WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    assert tuple(audit) == ("LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK",)
+
+    delivery = sweep_coordinator.SweepCoordinator(window_secs=0).drain_sweep_events()
+    assert len(delivery) == 1
+    effect = database.materialize_authoritative_sweep_downstream_effect(
+        event_id,
+        delivery[0].claim_token,
+        delivery[0].claim_generation,
+        known_protection_seconds=90,
+        unknown_protection_seconds=30,
+    )
+    assert effect["event_id"] == event_id
+    assert database.consume_authoritative_sweep_event(
+        event_id, delivery[0].claim_token, delivery[0].claim_generation
+    )
+    assert not database.consume_authoritative_sweep_event(
+        event_id, delivery[0].claim_token, delivery[0].claim_generation
+    )
+    assert sweep_coordinator.SweepCoordinator(window_secs=0).drain_sweep_events() == []
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+            (event_id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_sweep_downstream_effects WHERE event_id=?",
+            (event_id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_sweep_delivery_acks WHERE event_id=?",
+            (event_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_legacy_sweep_receipt_on_pending_queue_is_audited_and_acknowledged(
+    isolated_database,
+):
+    import sweep_coordinator
+
+    block_index = 143
+    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
+        block_index,
+        "legacy_sweep_pending_143",
+        [
+            {
+                "fill_id": 42_001,
+                "trade_id": "5" * 64,
+                "classification": "arb_sweep_buy",
+                "spent_block_index": block_index,
+                "taker_puzzle_hash": None,
+                "side": "buy",
+            }
+        ],
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_events "
+        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_event_receipts (event_id, consumed_at) "
+        "VALUES (?, ?)",
+        (event_id, AFTER),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_delivery_queue "
+        "(event_id, state, generation, claim_token, claimed_at, completed_at, "
+        " queued_at) VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
+        (event_id, AFTER),
+    )
+    conn.execute("DROP TABLE offer_fill_sweep_migration_audit")
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    delivery = sweep_coordinator.SweepCoordinator(window_secs=0).drain_sweep_events()
+    assert len(delivery) == 1
+    database.materialize_authoritative_sweep_downstream_effect(
+        event_id,
+        delivery[0].claim_token,
+        delivery[0].claim_generation,
+        known_protection_seconds=90,
+        unknown_protection_seconds=30,
+    )
+    assert database.consume_authoritative_sweep_event(
+        event_id, delivery[0].claim_token, delivery[0].claim_generation
+    )
+    audit = (
+        database.get_connection()
+        .execute(
+            "SELECT reason_code FROM offer_fill_sweep_migration_audit WHERE event_id=?",
+            (event_id,),
+        )
+        .fetchone()
+    )
+    assert tuple(audit) == ("LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK",)
+
+
+def test_legacy_sweep_receipt_cannot_suppress_finalization_replay_delivery(
+    isolated_database,
+    monkeypatch,
+):
+    import sweep_coordinator
+
+    block_index = 42
+    first_fill = _commit_fill_without_draining_hooks(monkeypatch)
+    second_fill = _insert_authoritative_test_fill(OTHER_TRADE, block_height=block_index)
+    fill_ids = [first_fill["fill_id"], second_fill["fill_id"]]
+    for fill in (first_fill, second_fill):
+        claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+        database.register_authoritative_sweep_fill(
+            fill["fill_id"],
+            {
+                "trade_id": fill["trade_id"],
+                "classification": "unknown",
+                "spent_block_index": block_index,
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+                "side": "buy",
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+
+    conn = database.get_connection()
+    event_fills = database._load_authoritative_sweep_event_fills(
+        conn, fill_ids, block_index
+    )
+    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
+        block_index, "legacy_finalize_42", event_fills
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_events "
+        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
+    )
+    for fill_id in fill_ids:
+        conn.execute(
+            "INSERT INTO offer_fill_sweep_finalizations "
+            "(fill_id, event_id, finalized_at) VALUES (?, ?, ?)",
+            (fill_id, event_id, AFTER),
+        )
+        conn.execute(
+            "UPDATE offer_fill_sweep_registration_queue "
+            "SET state='finalized', finalized_at=?, event_id=? "
+            "WHERE fill_id=? AND state='active'",
+            (AFTER, event_id, fill_id),
+        )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_event_receipts (event_id, consumed_at) "
+        "VALUES (?, ?)",
+        (event_id, AFTER),
+    )
+    conn.commit()
+
+    replay = database.finalize_authoritative_sweep_registrations(
+        fill_ids, block_index, "legacy_finalize_42"
+    )
+
+    assert replay["event_id"] == event_id
+    delivery = sweep_coordinator.SweepCoordinator(window_secs=0).drain_sweep_events()
+    assert len(delivery) == 1
+    database.materialize_authoritative_sweep_downstream_effect(
+        event_id,
+        delivery[0].claim_token,
+        delivery[0].claim_generation,
+        known_protection_seconds=90,
+        unknown_protection_seconds=30,
+    )
+    assert database.consume_authoritative_sweep_event(
+        event_id, delivery[0].claim_token, delivery[0].claim_generation
+    )
+    audit = (
+        database.get_connection()
+        .execute(
+            "SELECT reason_code FROM offer_fill_sweep_migration_audit WHERE event_id=?",
+            (event_id,),
+        )
+        .fetchone()
+    )
+    assert tuple(audit) == ("LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK",)
 
 
 def test_recreated_production_sweep_coordinator_requires_explicit_durable_ack(
@@ -7225,6 +7967,72 @@ def test_unlinked_coin_repair_never_terminalizes_from_wallet_absence(monkeypatch
 
     fake_database.update_offer_status.assert_not_called()
     fake_database.lock_coin.assert_called_once_with(database.norm_coin_id(COIN), TRADE)
+
+
+def test_repeated_wallet_absence_cannot_retire_created_intent_or_release_coin(
+    isolated_database,
+):
+    """A fresh-but-incomplete wallet book is never terminal proof."""
+
+    intent = _persist_created_offer()
+    row = dict(database.get_offer(TRADE))
+    row["created_at"] = AT
+    loop = object.__new__(bot_loop.BotLoop)
+    loop.offer_manager = SimpleNamespace(
+        _recently_created={TRADE: 1.0},
+        _offer_details_cache={TRADE: {"side": "buy"}},
+    )
+    loop._adaptive_target_backoff_until = {"buy": 0.0, "sell": 0.0}
+
+    for now_ts in (2_000_000_000.0, 2_000_000_300.0, 2_000_003_600.0):
+        retired = loop._retire_wallet_missing_db_offers(
+            db_buy_offers=[row],
+            db_sell_offers=[],
+            wallet_buy_ids=set(),
+            wallet_sell_ids=set(),
+            wallet_sync_fresh=True,
+            now_ts=now_ts,
+        )
+        assert retired == {"buy": set(), "sell": set()}
+        assert database.get_offer(TRADE)["status"] == "open"
+        assert database.get_offer(TRADE)["lifecycle_state"] == "open"
+        assert database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == (
+            "created"
+        )
+        assert database.get_coin_state(COIN)["status"] == "locked"
+        assert database.get_coin_state(COIN)["trade_id"] == TRADE
+
+    # The legacy status spelling is diagnostic only and cannot bypass the
+    # authoritative reconciliation transaction even when called directly.
+    assert database.update_offer_status(TRADE, "not_submitted") is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+
+    with pytest.raises(ValueError, match="selected coin is not free"):
+        database.prepare_offer_intent(
+            intent_id="intent-task9-second",
+            operation_id="create:intent-task9-second",
+            event_id="create:intent-task9-second:prepared",
+            run_id="run-task9",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            side="buy",
+            tier="inner",
+            purpose="normal_lifecycle",
+            slot_key="slot:intent-task9-second",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[COIN],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"intent": "second"},
+            prepared_at=AFTER,
+            reserve_selected_coins=True,
+        )
 
 
 def test_legacy_terminal_bypasses_are_not_callable_from_runtime_orchestration():
