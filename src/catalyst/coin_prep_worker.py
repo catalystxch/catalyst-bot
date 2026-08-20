@@ -1630,16 +1630,10 @@ class CoinPrepWorker:
         self.log("\n   DB: Final designation sweep...")
 
         try:
-            from database import get_connection
+            from database import mark_unreserved_free_coins_gone_for_preparation
 
-            gc = get_connection()
-            gone_result = gc.execute(
-                "UPDATE coins SET status='gone' WHERE status='free'"
-            )
-            gc.commit()
-            self.log(
-                f"   DB: reset {gone_result.rowcount} coins to 'gone' before re-scan"
-            )
+            gone_count = mark_unreserved_free_coins_gone_for_preparation()
+            self.log(f"   DB: reset {gone_count} coins to 'gone' before re-scan")
         except Exception as ge:
             self.log(f"   DB: pre-sweep reset failed: {ge}")
 
@@ -7471,14 +7465,11 @@ class CoinPrepWorker:
             # only the coins that actually exist after prep, keeping the DB clean.
             if self._db_ready:
                 try:
-                    from database import get_connection
-
-                    conn = get_connection()
-                    result = conn.execute(
-                        "UPDATE coins SET status='gone' WHERE status='free'"
+                    from database import (
+                        mark_unreserved_free_coins_gone_for_preparation,
                     )
-                    conn.commit()
-                    stale_count = result.rowcount
+
+                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
                     if stale_count > 0:
                         self.log(
                             f"   DB: marked {stale_count} stale coins as 'gone' (fresh start)"

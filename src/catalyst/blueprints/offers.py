@@ -332,14 +332,9 @@ def api_cancel_all():
             api_server.events.emit(
                 "offers_cancelled", {"count": cancelled, "reason": "manual_cancel_all"}
             )
-            # Reset gap closer state if active (cancel_all includes gap-closer offers)
-            if bot.boost_manager._boost_active:
-                bot.boost_manager._boost_active = False
-                bot.boost_manager._active_boost_ids.clear()
-                bot.boost_manager._boost_mid_price = Decimal("0")
-                bot.boost_manager._gap_spread_bps = 0
-                bot.boost_manager._convergence_factor = Decimal("1.0")
-                api_server.events.emit("boost", {"active": False})
+            # Cancel submission is not terminal proof.  Boost protection stays
+            # materialized until its normal reconciliation/prune path observes
+            # an authoritative Task 9 terminal journal.
         except Exception as e:
             _set_cancel_all_state(
                 running=False,
@@ -360,10 +355,7 @@ def api_cancel_all():
         # and the GUI can poll /api/offers/cancel_all/status for live progress
         # instead of hanging for 2-3 minutes with no feedback.
         try:
-            from wallet import (
-                get_all_offers,
-                is_offer_time_expired,
-            )
+            from wallet import get_all_offers
 
             all_offers = get_all_offers(include_completed=False, end=500)
             if not all_offers:
@@ -409,10 +401,9 @@ def api_cancel_all():
                     isinstance(raw_status, int) and raw_status <= 1
                 )
                 if is_open:
-                    if not is_offer_time_expired(o):
-                        tid = o.get("trade_id", "") or o.get("offer_id", "")
-                        if tid:
-                            open_ids.append(tid)
+                    tid = o.get("trade_id", "") or o.get("offer_id", "")
+                    if tid:
+                        open_ids.append(tid)
 
             if not open_ids:
                 if bot and getattr(bot, "offer_manager", None):
@@ -1385,30 +1376,16 @@ def api_purge_fills():
     slog("GUI_ACTION", ">>> BUTTON: Purge Fill Records")
 
     try:
-        from database import get_connection, log_event
+        from database import guarded_reset_authoritative_state, log_event
 
-        conn = get_connection()
-
-        # Count before purge
-        fill_count = conn.execute("SELECT COUNT(*) as cnt FROM fills").fetchone()["cnt"]
-        rt_count = (
-            conn.execute("SELECT COUNT(*) as cnt FROM round_trips").fetchone()["cnt"]
-            if conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-            ).fetchone()
-            else 0
+        reset = guarded_reset_authoritative_state(
+            clear_fills=True,
+            clear_round_trips=True,
         )
-
-        # Purge fills
-        conn.execute("DELETE FROM fills")
-        conn.commit()
-
-        # Purge round_trips if table exists
-        if conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-        ).fetchone():
-            conn.execute("DELETE FROM round_trips")
-            conn.commit()
+        if not reset["success"]:
+            return jsonify(reset), 409
+        fill_count = int(reset["fills_cleared"])
+        rt_count = int(reset["round_trips_cleared"])
 
         log_event(
             "info",
@@ -1568,6 +1545,8 @@ def api_pnl_reset():
             preserve_history=False,
             reason="pnl_reset_stats",
         )
+        if not summary["success"]:
+            return jsonify(api_server._serialize_dict(summary)), 409
         return jsonify(
             {
                 "success": True,
@@ -1619,31 +1598,13 @@ def api_reset_offer_history():
                 }
             ), 400
 
-        conn = get_connection()
-        try:
-            # Count before delete for the summary.
-            before = conn.execute(
-                "SELECT COUNT(*) AS n FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            ).fetchone()
-            n_before = int((before["n"] if before else 0) or 0)
+        from database import guarded_reset_authoritative_state
 
-            cur = conn.execute(
-                "DELETE FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            )
-            deleted = int(cur.rowcount or 0)
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
+        reset = guarded_reset_authoritative_state(clear_terminal_offers=True)
+        if not reset["success"]:
+            return jsonify(reset), 409
+        deleted = int(reset["offers_deleted"])
+        n_before = deleted
 
         log_event(
             "info",
@@ -1707,24 +1668,16 @@ def api_reset_full():
             preserve_history=False,
             reason="full_reset",
         )
+        if not summary["success"]:
+            return jsonify(api_server._serialize_dict(summary)), 409
 
         # Step 2: delete terminal-state offer rows.
-        conn = get_connection()
-        offers_deleted = 0
-        try:
-            cur = conn.execute(
-                "DELETE FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            )
-            offers_deleted = int(cur.rowcount or 0)
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        from database import guarded_reset_authoritative_state
+
+        offer_reset = guarded_reset_authoritative_state(clear_terminal_offers=True)
+        if not offer_reset["success"]:
+            return jsonify(offer_reset), 409
+        offers_deleted = int(offer_reset["offers_deleted"])
 
         # Step 3: reset in-memory counters on bot components. The bot is
         # not running at this point (gate above), so we reset whatever

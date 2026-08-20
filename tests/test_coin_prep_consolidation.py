@@ -48,6 +48,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_wallet.cancel_offer = lambda *args, **kwargs: {"success": True}
         fake_wallet.cancel_offers_batch = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_wallet_sync_status = lambda *args, **kwargs: {"synced": True}
+        fake_wallet.get_wallet_adapter_authority = lambda: None
 
         def _spendable_coins(wallet_id):
             adapter = sys.modules.get("wallet_sage")
@@ -79,6 +80,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_database.designate_reserve = lambda *args, **kwargs: True
         fake_database.get_reserve_coins = lambda *args, **kwargs: []
         fake_database.mark_coins_gone = lambda *args, **kwargs: True
+        fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 
         fake_dotenv = types.ModuleType("dotenv")

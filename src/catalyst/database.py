@@ -630,11 +630,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_offer_text_sha256
 CREATE INDEX IF NOT EXISTS idx_offer_intents_state
     ON offer_intents(lifecycle_state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_offer_intents_slot_generation
-    ON offer_intents(run_id, slot_key, generation);
+    ON offer_intents(slot_key, generation, run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_active_slot_generation
-    ON offer_intents(run_id, slot_key, generation)
+    ON offer_intents(slot_key)
     WHERE slot_key IS NOT NULL AND lifecycle_state IN (
-        'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created'
+        'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created',
+        'unknown', 'conflicted'
     );
 CREATE INDEX IF NOT EXISTS idx_offer_intents_parent
     ON offer_intents(parent_intent_id);
@@ -1268,6 +1269,26 @@ INSERT OR IGNORE INTO runtime_mutation_lease (
     singleton_id, lease_version, active, updated_at
 ) VALUES (1, 0, 0, datetime('now'));
 
+-- Append-only completion markers keep expensive legacy scans out of every
+-- startup.  A version is bound to one exact policy digest; a contradictory
+-- marker is a fatal schema-integrity error, never permission to skip work.
+CREATE TABLE IF NOT EXISTS stability_migration_watermarks (
+    migration_key               TEXT PRIMARY KEY,
+    schema_version              INTEGER NOT NULL CHECK(schema_version > 0),
+    policy_sha256               TEXT NOT NULL CHECK(length(policy_sha256) = 64),
+    completed_at                TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS stability_migration_watermarks_no_update
+BEFORE UPDATE ON stability_migration_watermarks
+BEGIN
+    SELECT RAISE(ABORT, 'stability_migration_watermarks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS stability_migration_watermarks_no_delete
+BEFORE DELETE ON stability_migration_watermarks
+BEGIN
+    SELECT RAISE(ABORT, 'stability_migration_watermarks is append-only');
+END;
+
 -- Narrow, expiring child-worker authority tied to one parent run/operation.
 CREATE TABLE IF NOT EXISTS runtime_worker_delegations (
     delegation_id               TEXT PRIMARY KEY,
@@ -1556,6 +1577,12 @@ _STABILITY_REQUIRED_COLUMNS = {
         "released_at",
         "updated_at",
     },
+    "stability_migration_watermarks": {
+        "migration_key",
+        "schema_version",
+        "policy_sha256",
+        "completed_at",
+    },
     "runtime_worker_delegations": {
         "delegation_id",
         "delegation_token_hash",
@@ -1621,16 +1648,16 @@ _STABILITY_INDEXES = {
         "offer_intents",
         False,
         False,
-        ("run_id", "slot_key", "generation"),
+        ("slot_key", "generation", "run_id"),
         None,
     ),
     "uniq_offer_intents_active_slot_generation": (
         "offer_intents",
         True,
         True,
-        ("run_id", "slot_key", "generation"),
+        ("slot_key",),
         "slot_keyisnotnullandlifecycle_statein('prepared','submitted_unconfirmed',"
-        "'creation_unknown','created')",
+        "'creation_unknown','created','unknown','conflicted')",
     ),
     "idx_offer_intents_parent": (
         "offer_intents",
@@ -1790,6 +1817,41 @@ BEGIN
 END
 """
 
+_LEGACY_OFFER_INTENT_SLOT_INDEX_SQL = """
+CREATE INDEX idx_offer_intents_slot_generation
+ON offer_intents(run_id, slot_key, generation)
+"""
+
+_OFFER_INTENT_SLOT_INDEX_SQL = """
+CREATE INDEX idx_offer_intents_slot_generation
+ON offer_intents(slot_key, generation, run_id)
+"""
+
+_LEGACY_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
+CREATE UNIQUE INDEX uniq_offer_intents_active_slot_generation
+ON offer_intents(run_id, slot_key, generation)
+WHERE slot_key IS NOT NULL AND lifecycle_state IN (
+    'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created'
+)
+"""
+
+_PREVIOUS_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
+CREATE UNIQUE INDEX uniq_offer_intents_active_slot_generation
+ON offer_intents(slot_key)
+WHERE slot_key IS NOT NULL AND lifecycle_state IN (
+    'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created'
+)
+"""
+
+_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
+CREATE UNIQUE INDEX uniq_offer_intents_active_slot_generation
+ON offer_intents(slot_key)
+WHERE slot_key IS NOT NULL AND lifecycle_state IN (
+    'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created',
+    'unknown', 'conflicted'
+)
+"""
+
 
 def _upgrade_offer_fill_boost_command_guard(conn: sqlite3.Connection) -> None:
     """Upgrade only the exact round-4 trigger; malformed variants stay fatal."""
@@ -1805,6 +1867,39 @@ def _upgrade_offer_fill_boost_command_guard(conn: sqlite3.Connection) -> None:
         return
     conn.execute("DROP TRIGGER offer_fill_boost_commands_guarded_update")
     conn.execute(_OFFER_FILL_BOOST_COMMAND_GUARD_SQL)
+
+
+def _upgrade_offer_intent_slot_indexes(conn: sqlite3.Connection) -> None:
+    """Upgrade only exact prior Task 9 indexes to global slot authority."""
+
+    upgrades = (
+        (
+            "idx_offer_intents_slot_generation",
+            (_LEGACY_OFFER_INTENT_SLOT_INDEX_SQL,),
+            _OFFER_INTENT_SLOT_INDEX_SQL,
+        ),
+        (
+            "uniq_offer_intents_active_slot_generation",
+            (
+                _LEGACY_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
+                _PREVIOUS_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
+            ),
+            _OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
+        ),
+    )
+    for name, legacy_sql_variants, replacement_sql in upgrades:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            continue
+        if _normalized_schema_sql(row[0]) not in {
+            _normalized_schema_sql(sql) for sql in legacy_sql_variants
+        }:
+            continue
+        conn.execute(f'DROP INDEX "{name}"')
+        conn.execute(replacement_sql)
 
 
 def _index_key_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
@@ -2276,6 +2371,31 @@ def _backfill_authoritative_sweep_active_queues(
             )
 
 
+_STABILITY_BACKFILL_MIGRATION_KEY = "task9-authoritative-backfills"
+_STABILITY_BACKFILL_SCHEMA_VERSION = 1
+_STABILITY_BACKFILL_POLICY_SHA256 = hashlib.sha256(
+    b"task9-authoritative-backfills:v1:sweep-boost-hook-proof"
+).hexdigest()
+
+
+def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 "
+        "FROM stability_migration_watermarks WHERE migration_key=?",
+        (_STABILITY_BACKFILL_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        type(row["schema_version"]) is not int
+        or row["schema_version"] != _STABILITY_BACKFILL_SCHEMA_VERSION
+        or type(row["policy_sha256"]) is not str
+        or row["policy_sha256"] != _STABILITY_BACKFILL_POLICY_SHA256
+    ):
+        raise RuntimeError("stability migration watermark contradicts schema policy")
+    return True
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -2284,60 +2404,63 @@ def _migrate_stability_schema() -> None:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
+        existing_tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        missing_stability_tables = set(_STABILITY_REQUIRED_COLUMNS) - existing_tables
         registration_queue_was_missing = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='offer_fill_sweep_registration_queue'"
-            ).fetchone()
-            is None
+            "offer_fill_sweep_registration_queue" in missing_stability_tables
         )
         delivery_queue_was_missing = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='offer_fill_sweep_delivery_queue'"
-            ).fetchone()
-            is None
+            "offer_fill_sweep_delivery_queue" in missing_stability_tables
         )
         safety_state_was_missing = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='offer_fill_sweep_safety_state'"
-            ).fetchone()
-            is None
+            "offer_fill_sweep_safety_state" in missing_stability_tables
         )
         legacy_delivery_audit_was_missing = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='offer_fill_sweep_migration_audit'"
-            ).fetchone()
-            is None
+            "offer_fill_sweep_migration_audit" in missing_stability_tables
         )
         boost_log_sink_was_missing = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='offer_fill_boost_log_sinks'"
-            ).fetchone()
-            is None
+            "offer_fill_boost_log_sinks" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _upgrade_offer_fill_boost_command_guard(conn)
+        _upgrade_offer_intent_slot_indexes(conn)
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
-        _backfill_authoritative_sweep_active_queues(
-            conn,
-            registration_queue_was_missing=registration_queue_was_missing,
-            delivery_queue_was_missing=delivery_queue_was_missing,
-            legacy_delivery_audit_was_missing=legacy_delivery_audit_was_missing,
-        )
-        _backfill_authoritative_sweep_safety_state(
-            conn, safety_state_was_missing=safety_state_was_missing
-        )
-        _backfill_authoritative_boost_log_sinks(
-            conn, log_sink_was_missing=boost_log_sink_was_missing
-        )
-        _audit_legacy_boost_command_materializations(conn)
-        _audit_legacy_offer_fill_hook_receipts(conn)
-        _backfill_authoritative_fill_hook_outbox(conn)
+        backfills_completed = _stability_backfills_completed(conn)
+        if backfills_completed and missing_stability_tables:
+            raise RuntimeError("stability migration watermark contradicts schema")
+        if not backfills_completed:
+            _backfill_authoritative_sweep_active_queues(
+                conn,
+                registration_queue_was_missing=registration_queue_was_missing,
+                delivery_queue_was_missing=delivery_queue_was_missing,
+                legacy_delivery_audit_was_missing=legacy_delivery_audit_was_missing,
+            )
+            _backfill_authoritative_sweep_safety_state(
+                conn, safety_state_was_missing=safety_state_was_missing
+            )
+            _backfill_authoritative_boost_log_sinks(
+                conn, log_sink_was_missing=boost_log_sink_was_missing
+            )
+            _audit_legacy_boost_command_materializations(conn)
+            _audit_legacy_offer_fill_hook_receipts(conn)
+            _backfill_authoritative_fill_hook_outbox(conn)
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _STABILITY_BACKFILL_MIGRATION_KEY,
+                    _STABILITY_BACKFILL_SCHEMA_VERSION,
+                    _STABILITY_BACKFILL_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -2557,15 +2680,6 @@ def _init_database_impl():
             "db_migration",
             "Added 'verification_status' column to fills table (existing rows marked legacy)",
         )
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        _audit_legacy_offer_fill_hook_receipts(conn)
-        _backfill_authoritative_fill_hook_outbox(conn)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
 
     # Migration: clear bad round-trip matches where sizes don't match.
     # FIFO matching was pairing 0.2 XCH sniper buys with 0.9+ XCH tiered sells.
@@ -3576,13 +3690,12 @@ def update_offer_coin_id(trade_id: str, coin_id: str) -> bool:
 
 
 def update_offer_status(trade_id: str, status: str) -> bool:
-    """Update an offer's status (e.g., 'filled', 'cancelled', 'expired').
+    """Apply a legacy status update without crossing Task 9's proof boundary.
 
-    Also sets the appropriate timestamp (filled_at or cancelled_at).
-    Also updates the coins table:
-      - filled → coin is destroyed on-chain → mark_coin_spent()
-      - cancelled → secure cancel destroys coin → mark_coin_spent()
-      - expired → coin unlocked (no on-chain tx) → free_coin()
+    Every durable offer row is protected from terminal changes here, including
+    unregistered legacy rows. Terminal offer and coin state may change only in
+    ``commit_offer_reconciliation``. Nonterminal presentation updates remain
+    available for legacy callers.
     """
     import time as _time
 
@@ -3601,14 +3714,30 @@ def update_offer_status(trade_id: str, status: str) -> bool:
 
     lifecycle_state = status
     coarse_status = status
+    terminal_statuses = {"filled", "cancelled", "expired"}
     for _attempt in range(3):
+        conn = _stability_connection()
         try:
-            conn = get_connection()
+            conn.execute("BEGIN IMMEDIATE")
             now = _now()
             row = conn.execute(
-                "SELECT status, filled_at, cancelled_at FROM offers WHERE trade_id=?",
+                "SELECT status, filled_at, cancelled_at, coin_id "
+                "FROM offers WHERE trade_id=?",
                 (trade_id,),
             ).fetchone()
+
+            if coarse_status in terminal_statuses and (
+                _offer_terminal_mutation_is_protected(conn, trade_id)
+            ):
+                conn.rollback()
+                log_event(
+                    "warning",
+                    "legacy_offer_terminality_blocked",
+                    f"Preserved offer {str(trade_id)[:16]}... because no "
+                    "authoritative reconciliation proof was committed",
+                    data={"trade_id": str(trade_id), "requested_status": status},
+                )
+                return False
 
             # A real fill must win over any later cancel/expiry bookkeeping.
             # This avoids sniper-cleanup or cancel-retry races downgrading a
@@ -3618,6 +3747,7 @@ def update_offer_status(trade_id: str, status: str) -> bool:
                 and coarse_status in ("cancelled", "expired")
                 and (row["status"] == "filled" or row["filled_at"])
             ):
+                conn.commit()
                 return True
 
             # Derive lifecycle_state from coarse status.
@@ -3639,34 +3769,34 @@ def update_offer_status(trade_id: str, status: str) -> bool:
                     (coarse_status, lifecycle_state, trade_id),
                 )
 
+            if coarse_status in {"filled", "cancelled"}:
+                conn.execute(
+                    "UPDATE coins SET status='spent', last_seen=?, "
+                    "designation='unknown', assigned_tier='none' "
+                    "WHERE trade_id=? AND status='locked'",
+                    (now, trade_id),
+                )
+                if row and row["coin_id"]:
+                    conn.execute(
+                        "UPDATE coins SET status='spent', last_seen=?, "
+                        "designation='unknown', assigned_tier='none' "
+                        "WHERE coin_id=? AND status='locked'",
+                        (now, row["coin_id"]),
+                    )
+            elif coarse_status == "expired":
+                conn.execute(
+                    "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
+                    "WHERE trade_id=? AND status='locked'",
+                    (now, trade_id),
+                )
+                if row and row["coin_id"]:
+                    conn.execute(
+                        "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
+                        "WHERE coin_id=? AND status='locked'",
+                        (now, row["coin_id"]),
+                    )
+
             conn.commit()
-
-            # ---- Update coin status based on what happened to the offer ----
-            # Sage can lock multiple source coins for one offer, so we must
-            # update every currently locked coin tied to this trade_id.
-            coin_ids = get_locked_coin_ids_for_trade(trade_id)
-
-            # Backward-compatibility fallback: very old rows may only have the
-            # primary offers.coin_id recorded.
-            if not coin_ids:
-                row = conn.execute(
-                    "SELECT coin_id FROM offers WHERE trade_id=?", (trade_id,)
-                ).fetchone()
-                coin_id = row["coin_id"] if row else None
-                if coin_id:
-                    coin_ids = [coin_id]
-
-            for coin_id in coin_ids:
-                if coarse_status == "filled":
-                    mark_coin_spent(coin_id)
-                elif coarse_status == "cancelled":
-                    # Secure cancel destroys the old coin and creates a new one.
-                    # The new coin will be auto-discovered on next snapshot.
-                    mark_coin_spent(coin_id)
-                elif coarse_status == "expired":
-                    # Expired/not-submitted offers unlock the coin; no on-chain tx.
-                    free_coin(coin_id)
-
             return True
         except sqlite3.OperationalError as e:
             if "locked" in str(e) and _attempt < 2:
@@ -3684,7 +3814,9 @@ def update_offer_status(trade_id: str, status: str) -> bool:
             except Exception:
                 pass
             log_event("error", "db_error", f"Failed to update offer {trade_id}: {e}")
-        return False
+            return False
+        finally:
+            conn.close()
     return False  # all retries exhausted
 
 
@@ -3735,8 +3867,25 @@ def update_offer_lifecycle_state(trade_id: str, lifecycle_state: str) -> bool:
             else "open"
         )
 
+    conn = None
     try:
-        conn = get_connection()
+        conn = _stability_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        legacy_terminal_lifecycle = lifecycle_state in {
+            "filled",
+            "cancelled",
+            "expired",
+            "not_submitted",
+            "phantom_rejected",
+            "creation_failed",
+            "terminal",
+            "user_cancelled",
+        }
+        if (
+            coarse in {"filled", "cancelled", "expired"} or legacy_terminal_lifecycle
+        ) and (_offer_terminal_mutation_is_protected(conn, trade_id)):
+            conn.rollback()
+            return False
         conn.execute(
             "UPDATE offers SET lifecycle_state=?, status=? WHERE trade_id=?",
             (lifecycle_state, coarse, trade_id),
@@ -3749,6 +3898,12 @@ def update_offer_lifecycle_state(trade_id: str, lifecycle_state: str) -> bool:
         except Exception:
             pass
         return False
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 
 # F21 (2026-04-08): lifecycle state machine observability counters.
@@ -3780,6 +3935,144 @@ def reset_lifecycle_observability_stats() -> None:
     with _lifecycle_counter_lock:
         _lifecycle_noop_counter.clear()
         _lifecycle_invalid_signal_counter.clear()
+
+
+def guarded_reset_authoritative_state(
+    *,
+    clear_fills: bool = False,
+    clear_round_trips: bool = False,
+    clear_coins: bool = False,
+    cancel_open_offers: bool = False,
+    clear_terminal_offers: bool = False,
+    clear_price_history: bool = False,
+    clear_inventory: bool = False,
+) -> Dict[str, Any]:
+    """Perform only reset work that cannot erase reconciliation evidence.
+
+    Fills and Task 4 rows are durable accounting/proof state.  If a requested
+    reset would touch them, their offers, or their reservations, the complete
+    transaction is refused with one stable conflict result.  Empty/legacy-only
+    housekeeping remains compatible and append-only tables are never deleted.
+    """
+
+    options = {
+        "clear_fills": clear_fills,
+        "clear_round_trips": clear_round_trips,
+        "clear_coins": clear_coins,
+        "cancel_open_offers": cancel_open_offers,
+        "clear_terminal_offers": clear_terminal_offers,
+        "clear_price_history": clear_price_history,
+        "clear_inventory": clear_inventory,
+    }
+    if any(type(value) is not bool for value in options.values()):
+        raise TypeError("reset options must be exact bool values")
+    # Reset routes can be the first database-backed action in a fresh process.
+    # Materialize the schema before the guarded read transaction so an empty
+    # installation follows the compatible no-op reset path instead of raising.
+    init_database()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        def count(sql: str, params: tuple[Any, ...] = ()) -> int:
+            return int(conn.execute(sql, params).fetchone()[0])
+
+        fill_count = count("SELECT COUNT(*) FROM fills")
+        intent_count = count("SELECT COUNT(*) FROM offer_intents")
+        journal_count = count("SELECT COUNT(*) FROM offer_operation_journal")
+        open_offer_count = count("SELECT COUNT(*) FROM offers WHERE status='open'")
+        protected_coin_count = count(
+            "SELECT COUNT(*) FROM coins WHERE status='locked' OR trade_id IS NOT NULL"
+        )
+        terminal_offer_count = count(
+            "SELECT COUNT(*) FROM offers "
+            "WHERE status IN ('cancelled', 'filled', 'expired') "
+            "OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
+            "'phantom_rejected', 'user_cancelled')"
+        )
+
+        conflicts = []
+        if clear_fills and (
+            fill_count
+            or intent_count
+            or journal_count
+            or open_offer_count
+            or protected_coin_count
+        ):
+            conflicts.append("authoritative_session_state")
+        if clear_coins and (
+            intent_count or journal_count or open_offer_count or protected_coin_count
+        ):
+            conflicts.append("coin_reservations")
+        if cancel_open_offers and open_offer_count:
+            conflicts.append("open_offers")
+        if clear_terminal_offers and (intent_count or journal_count or fill_count):
+            conflicts.append("offer_proof_history")
+        if conflicts:
+            conn.rollback()
+            return {
+                "success": False,
+                "error": "authoritative_state_conflict",
+                "conflicts": sorted(set(conflicts)),
+                "fills_cleared": 0,
+                "round_trips_cleared": 0,
+                "coins_cleared": 0,
+                "open_offers_cancelled": 0,
+                "offers_deleted": 0,
+                "price_history_cleared": False,
+                "inventory_cleared": False,
+            }
+
+        summary: Dict[str, Any] = {
+            "success": True,
+            "fills_cleared": 0,
+            "round_trips_cleared": 0,
+            "coins_cleared": 0,
+            "open_offers_cancelled": 0,
+            "offers_deleted": 0,
+            "price_history_cleared": False,
+            "inventory_cleared": False,
+        }
+        # A positive fill count is refused above.  Keeping the statement out
+        # entirely ensures no future FK topology can turn reset into data loss.
+        if (
+            clear_round_trips
+            and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='round_trips'"
+            ).fetchone()
+        ):
+            cursor = conn.execute("DELETE FROM round_trips")
+            summary["round_trips_cleared"] = int(cursor.rowcount or 0)
+        if clear_coins:
+            summary["coins_cleared"] = count("SELECT COUNT(*) FROM coins")
+            conn.execute("DELETE FROM coins")
+        if clear_terminal_offers and terminal_offer_count:
+            cursor = conn.execute(
+                "DELETE FROM offers "
+                "WHERE status IN ('cancelled', 'filled', 'expired') "
+                "OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
+                "'phantom_rejected', 'user_cancelled')"
+            )
+            summary["offers_deleted"] = int(cursor.rowcount or 0)
+        if clear_price_history:
+            conn.execute("DELETE FROM price_history")
+            summary["price_history_cleared"] = True
+        if (
+            clear_inventory
+            and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='inventory_snapshots'"
+            ).fetchone()
+        ):
+            conn.execute("DELETE FROM inventory_snapshots")
+            summary["inventory_cleared"] = True
+        conn.commit()
+        return summary
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def transition_offer(trade_id: str, signal: str):
@@ -3824,7 +4117,8 @@ def transition_offer(trade_id: str, signal: str):
             return None
         transition = apply_signal(current_state, sig)
         if transition.new_state != current_state:
-            update_offer_lifecycle_state(trade_id, str(transition.new_state))
+            if not update_offer_lifecycle_state(trade_id, str(transition.new_state)):
+                return None
         else:
             # F21: count noop transitions (state didn't change despite a
             # valid signal). Key by "state→signal" so we can spot which
@@ -3870,7 +4164,11 @@ def batch_cancel_stale_offers(stale_trade_ids: list) -> int:
 
     Returns the number of offers successfully cancelled.
     """
-    if not stale_trade_ids:
+    if type(stale_trade_ids) is not list or not stale_trade_ids:
+        return 0
+    if len(stale_trade_ids) > 4096 or any(
+        type(trade_id) is not str or not trade_id for trade_id in stale_trade_ids
+    ):
         return 0
 
     try:
@@ -3886,6 +4184,7 @@ def batch_cancel_stale_offers(stale_trade_ids: list) -> int:
     # can get stuck behind cascading uncommitted transactions from
     # Flask GUI polling threads.
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")  # 30s — startup can afford to wait
     try:
@@ -3897,24 +4196,32 @@ def batch_cancel_stale_offers(stale_trade_ids: list) -> int:
 
     try:
         now = _now()
-        # Safe: f-string only interpolates the count of ? placeholders, never user values.
-        # All actual values are passed as parameterised arguments — no SQL injection risk.
-        placeholders = ",".join("?" * len(stale_trade_ids))
         # BEGIN IMMEDIATE acquires write lock upfront with busy_timeout retry
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
+        safe_trade_ids = [
+            trade_id
+            for trade_id in stale_trade_ids
+            if not _offer_terminal_mutation_is_protected(conn, trade_id)
+        ]
+        if not safe_trade_ids:
+            conn.execute("COMMIT")
+            return 0
+        # Safe: f-string only interpolates the count of ? placeholders; all
+        # identities remain parameterized values.
+        placeholders = ",".join("?" * len(safe_trade_ids))
+        cursor = conn.execute(
             f"UPDATE offers SET status='cancelled', lifecycle_state='cancelled', cancelled_at=? "
             f"WHERE trade_id IN ({placeholders})",
-            [now] + list(stale_trade_ids),
+            [now] + safe_trade_ids,
         )
         # Free/spend coins that were locked by these offers
         conn.execute(
             f"UPDATE coins SET status='spent', last_seen=? "
             f"WHERE trade_id IN ({placeholders}) AND status='locked'",
-            [now] + list(stale_trade_ids),
+            [now] + safe_trade_ids,
         )
         conn.execute("COMMIT")
-        return len(stale_trade_ids)
+        return int(cursor.rowcount)
     except sqlite3.OperationalError as e:
         try:
             conn.execute("ROLLBACK")
@@ -4019,27 +4326,17 @@ def get_offers_for_repost(cat_asset_id: str = None) -> List[Dict]:
 def get_open_offers(
     side: str = None,
     cat_asset_id: str = None,
-    include_pending_cancel: bool = False,
-    include_mempool_observed: bool = False,
-    include_elapsed: bool = False,
+    include_pending_cancel: bool = True,
+    include_mempool_observed: bool = True,
+    include_elapsed: bool = True,
 ) -> List[Dict]:
-    """Get all open offers, optionally filtered by side and/or CAT pair.
+    """Get the safety-facing set of every nonterminal legacy offer.
 
-    By default, excludes offers whose lifecycle_state is 'cancel_requested'
-    (cancel RPC sent, awaiting on-chain confirmation). These offers still
-    have status='open' in the DB but the bot has already asked Sage to
-    cancel them — for cap counting, requote selection, dashboard display,
-    and trim decisions they are effectively gone.
-
-    Pass include_pending_cancel=True only when you specifically need to
-    examine pending-cancel offers (e.g. the bot_health verifier loop that
-    re-checks them against Dexie/Sage).
-    Pass include_mempool_observed=True only when investigating parked
-    fill-verification rows; they are protected in DB but hidden from normal
-    active-book views by default.
-    Pass include_elapsed=True for startup reconciliation only. Normal live-book
-    views hide locally elapsed offers without mutating the row so offline fills
-    can still be recovered before an explicit expiry pass marks them terminal.
+    Pending cancellation, provisional fill observation, and local clock expiry
+    are not authoritative terminal evidence.  They therefore remain visible by
+    default to every capacity, replenishment, housekeeping, and coin-safety
+    caller.  The opt-out flags are projection-only compatibility controls and
+    must never be used to drive a terminal transition or reservation release.
 
     Returns list of dicts with all offer fields.
     """
@@ -4153,11 +4450,11 @@ def _elapsed_open_offer_ids(
 
 
 def expire_elapsed_open_offers(cat_asset_id: str = None, now: datetime = None) -> int:
-    """Retire actionable open offers whose local expires_at has elapsed.
+    """Attempt legacy expiry without treating local time as terminal proof.
 
-    This is explicit wallet-independent cleanup for paths that have already
-    reconciled terminal wallet state. Ordinary live-book reads hide elapsed
-    offers non-mutatingly so startup can still recover offline fills first.
+    Existing offer rows are protected by ``update_offer_status`` and remain
+    open. The return value therefore counts only mutations that the central
+    authority boundary allowed; ordinary elapsed offers produce zero.
     """
     now_dt = now or datetime.now(timezone.utc)
     if now_dt.tzinfo is None:
@@ -4217,9 +4514,11 @@ def expire_open_offers_by_time(
     include_pending_cancel: bool = False,
     include_mempool_observed: bool = False,
 ) -> List[str]:
-    """Mark locally elapsed open offers expired and free their locked coins.
+    """Attempt the legacy local-expiry sweep without bypassing Task 9.
 
-    Compatibility API for offer manager callers that need the retired IDs.
+    Compatibility callers receive only IDs whose terminal transition was
+    accepted by the central database guard. A local clock alone cannot add an
+    ID or release its coin.
     """
     try:
         now_dt = datetime.fromtimestamp(
@@ -4625,16 +4924,29 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
         coin_id: The coin that got locked
         trade_id: The offer that locked it
     """
+    conn = None
     try:
-        conn = get_connection()
+        normalized = norm_coin_id(coin_id)
+        conn = _stability_connection()
+        conn.execute("BEGIN IMMEDIATE")
         # Get coin details before locking (for logging)
         row = conn.execute(
-            "SELECT wallet_type, amount_mojos, designation, assigned_tier FROM coins WHERE coin_id=?",
-            (coin_id,),
+            "SELECT wallet_type, amount_mojos, designation, assigned_tier, "
+            "status, trade_id FROM coins WHERE coin_id=?",
+            (normalized,),
         ).fetchone()
-        conn.execute(
-            "UPDATE coins SET status='locked', trade_id=?, last_seen=? WHERE coin_id=?",
-            (trade_id, _now(), coin_id),
+        if row is None:
+            conn.rollback()
+            return False
+        if _coin_terminal_mutation_is_protected(conn, normalized):
+            idempotent = row["status"] == "locked" and row["trade_id"] == trade_id
+            conn.rollback()
+            return idempotent
+        cursor = conn.execute(
+            "UPDATE coins SET status='locked', trade_id=?, last_seen=? "
+            "WHERE coin_id=? AND ((status='free' AND trade_id IS NULL) "
+            "OR (status='locked' AND trade_id=?))",
+            (trade_id, _now(), normalized, trade_id),
         )
         conn.commit()
         # Log the lock event with full details + structured data
@@ -4647,10 +4959,10 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
             log_event(
                 "debug",
                 "coin_locked",
-                f"{wt} coin {coin_id[:16]}... LOCKED by offer {trade_id[:12]}..."
+                f"{wt} coin {normalized[:16]}... LOCKED by offer {trade_id[:12]}..."
                 f" ({amt_str} | {row['designation']}/{row['assigned_tier']})",
                 data={
-                    "coin_id": coin_id,
+                    "coin_id": normalized,
                     "trade_id": trade_id,
                     "amount_mojos": row["amount_mojos"],
                     "wallet_type": row["wallet_type"],
@@ -4658,7 +4970,7 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
                     "assigned_tier": row["assigned_tier"],
                 },
             )
-        return True
+        return cursor.rowcount == 1
     except Exception as e:
         try:
             conn.rollback()
@@ -4666,27 +4978,37 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
             pass
         log_event("error", "db_error", f"Failed to lock coin {coin_id[:16]}...: {e}")
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def free_coin(coin_id: str) -> bool:
     """Mark a coin as free (available for new offers).
 
-    Called when an offer expires — the coin is unlocked but
-    not destroyed (no on-chain transaction for expiry).
+    The central guard rejects coins selected by a nonterminal Task 4 intent or
+    attributed to an open offer. Authoritative terminal reconciliation owns
+    those releases; this helper remains only for unreserved legacy debris.
 
     Args:
         coin_id: The coin to mark as free
     """
+    conn = None
     try:
-        conn = get_connection()
+        normalized = norm_coin_id(coin_id)
+        conn = _stability_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        if _coin_terminal_mutation_is_protected(conn, normalized):
+            conn.rollback()
+            return False
         # Get coin details before freeing (for logging)
         row = conn.execute(
             "SELECT wallet_type, amount_mojos, trade_id, designation, assigned_tier FROM coins WHERE coin_id=?",
-            (coin_id,),
+            (normalized,),
         ).fetchone()
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE coins SET status='free', trade_id=NULL, last_seen=? WHERE coin_id=?",
-            (_now(), coin_id),
+            (_now(), normalized),
         )
         conn.commit()
         # Log the free event with full details + structured data
@@ -4700,11 +5022,11 @@ def free_coin(coin_id: str) -> bool:
             log_event(
                 "debug",
                 "coin_freed",
-                f"{wt} coin {coin_id[:16]}... FREED ({amt_str})"
+                f"{wt} coin {normalized[:16]}... FREED ({amt_str})"
                 f" — was locked by {old_tid[:12] if old_tid != 'none' else 'none'}..."
                 f" | {row['designation']}/{row['assigned_tier']}",
                 data={
-                    "coin_id": coin_id,
+                    "coin_id": normalized,
                     "amount_mojos": row["amount_mojos"],
                     "wallet_type": row["wallet_type"],
                     "old_trade_id": row["trade_id"],
@@ -4712,7 +5034,7 @@ def free_coin(coin_id: str) -> bool:
                     "assigned_tier": row["assigned_tier"],
                 },
             )
-        return True
+        return cursor.rowcount == 1
     except Exception as e:
         try:
             conn.rollback()
@@ -4720,6 +5042,9 @@ def free_coin(coin_id: str) -> bool:
             pass
         log_event("error", "db_error", f"Failed to free coin {coin_id[:16]}...: {e}")
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def mark_coin_spent(coin_id: str) -> bool:
@@ -4734,18 +5059,24 @@ def mark_coin_spent(coin_id: str) -> bool:
     """
     if not coin_id:
         return False
+    conn = None
     try:
-        conn = get_connection()
+        normalized = norm_coin_id(coin_id)
+        conn = _stability_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        if _coin_terminal_mutation_is_protected(conn, normalized):
+            conn.rollback()
+            return False
         # Get coin details before marking spent (for logging)
         row = conn.execute(
             "SELECT wallet_type, amount_mojos, trade_id, designation, assigned_tier FROM coins WHERE coin_id=?",
-            (coin_id,),
+            (normalized,),
         ).fetchone()
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE coins SET status='spent', last_seen=?,
                designation='unknown', assigned_tier='none'
                WHERE coin_id=?""",
-            (_now(), coin_id),
+            (_now(), normalized),
         )
         conn.commit()
         # Log the spent event with full details + structured data
@@ -4759,11 +5090,11 @@ def mark_coin_spent(coin_id: str) -> bool:
             log_event(
                 "debug",
                 "coin_spent",
-                f"{wt} coin {coin_id[:16]}... SPENT/DESTROYED ({amt_str})"
+                f"{wt} coin {normalized[:16]}... SPENT/DESTROYED ({amt_str})"
                 f" — was {row['designation']}/{row['assigned_tier']}"
                 f" | offer {tid[:12] if tid != 'none' else 'none'}...",
                 data={
-                    "coin_id": coin_id,
+                    "coin_id": normalized,
                     "amount_mojos": row["amount_mojos"],
                     "wallet_type": row["wallet_type"],
                     "trade_id": row["trade_id"],
@@ -4771,7 +5102,7 @@ def mark_coin_spent(coin_id: str) -> bool:
                     "assigned_tier": row["assigned_tier"],
                 },
             )
-        return True
+        return cursor.rowcount == 1
     except Exception as e:
         try:
             conn.rollback()
@@ -4781,6 +5112,9 @@ def mark_coin_spent(coin_id: str) -> bool:
             "error", "db_error", f"Failed to mark coin spent {coin_id[:16]}...: {e}"
         )
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def mark_coins_gone(coin_ids: List[str]) -> int:
@@ -4829,8 +5163,7 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
             f"""UPDATE coins SET status='gone', last_seen=?,
                 designation='unknown', assigned_tier='none'
                 WHERE coin_id IN ({safe_placeholders}) AND status='free'
-                  AND trade_id IS NULL
-                  AND {_nonterminal_registry_coin_absent_sql("coins.coin_id")}""",
+                  AND trade_id IS NULL""",
             [now] + safe_coin_list,
         )
         count = cursor.rowcount
@@ -4887,13 +5220,18 @@ def get_free_coins(wallet_type: str) -> List[Dict]:
         "ORDER BY amount_mojos DESC",
         [wallet_type],
     ).fetchall()
-    return [dict(row) for row in rows]
+    protected = _nonterminal_registry_coin_ids(conn)
+    return [
+        dict(row)
+        for row in rows
+        if norm_coin_id(row["coin_id"]) not in protected and row["trade_id"] is None
+    ]
 
 
 def get_smallest_free_tier_spare(wallet_type: str) -> Optional[Dict]:
     """Return the smallest free tier-spare coin for a wallet type."""
     conn = get_connection()
-    row = conn.execute(
+    rows = conn.execute(
         """
         SELECT coin_id, amount_mojos, assigned_tier
         FROM coins
@@ -4901,10 +5239,18 @@ def get_smallest_free_tier_spare(wallet_type: str) -> Optional[Dict]:
           AND designation='tier_spare'
           AND wallet_type=?
         ORDER BY amount_mojos ASC, coin_id ASC
-        LIMIT 1
         """,
         (wallet_type,),
-    ).fetchone()
+    ).fetchall()
+    protected = _nonterminal_registry_coin_ids(conn)
+    row = next(
+        (
+            candidate
+            for candidate in rows
+            if norm_coin_id(candidate["coin_id"]) not in protected
+        ),
+        None,
+    )
     if not row:
         return None
     return {
@@ -5138,47 +5484,109 @@ def get_orphan_coin_locks() -> List[Dict[str, Any]]:
 _TERMINAL_INTENT_RESERVATION_STATES = frozenset(
     {"terminal", "creation_failed", "rejected", "cancelled", "filled", "expired"}
 )
+_MAX_NONTERMINAL_INTENT_RESERVATIONS = 4096
 
 
 def _nonterminal_registry_coin_ids(conn: sqlite3.Connection) -> set[str]:
     """Return every coin selected by an intent that has not terminalized."""
 
-    rows = conn.execute(
-        "SELECT lifecycle_state, selected_coin_ids_json FROM offer_intents"
-    ).fetchall()
+    return _nonterminal_registry_coin_ids_excluding(conn, exclude_intent_id=None)
+
+
+def _nonterminal_registry_coin_ids_excluding(
+    conn: sqlite3.Connection, *, exclude_intent_id: Optional[str]
+) -> set[str]:
+    """Return nonterminal selections, optionally excluding one idempotent owner."""
+
+    terminal_states = sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+    placeholders = ",".join("?" for _ in terminal_states)
+    query = (
+        "SELECT intent_id, lifecycle_state, selected_coin_ids_json "
+        f"FROM offer_intents WHERE lifecycle_state NOT IN ({placeholders})"
+    )
+    params: list[Any] = list(terminal_states)
+    if exclude_intent_id is not None:
+        query += " AND intent_id<>?"
+        params.append(exclude_intent_id)
+    query += " ORDER BY intent_id LIMIT ?"
+    params.append(_MAX_NONTERMINAL_INTENT_RESERVATIONS + 1)
+    rows = conn.execute(query, tuple(params)).fetchall()
+    if len(rows) > _MAX_NONTERMINAL_INTENT_RESERVATIONS:
+        raise RuntimeError("nonterminal intent reservation limit exceeded")
     protected: set[str] = set()
     for row in rows:
-        if str(row["lifecycle_state"]) in _TERMINAL_INTENT_RESERVATION_STATES:
-            continue
+        raw_selected = row["selected_coin_ids_json"]
+        if type(raw_selected) is not str:
+            raise RuntimeError("nonterminal intent coin reservation is corrupt")
+        if len(raw_selected) > _MAX_STABILITY_JSON_INPUT_CHARS:
+            raise RuntimeError("selected coin JSON exceeds hard limit")
         try:
-            selected = json.loads(row["selected_coin_ids_json"])
+            selected = json.loads(raw_selected)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 "nonterminal intent coin reservation is corrupt"
             ) from exc
-        if type(selected) is not list or not selected:
+        if (
+            type(selected) is not list
+            or not selected
+            or len(selected) > _MAX_STABILITY_JSON_CONTAINER_ITEMS
+        ):
             raise RuntimeError("nonterminal intent coin reservation is corrupt")
         for coin_id in selected:
             protected.add(norm_coin_id(_required_stability_text(coin_id, "coin_id")))
     return protected
 
 
-def _nonterminal_registry_coin_absent_sql(coin_expression: str) -> str:
-    """Return a correlated SQL guard for legacy coin-state writers."""
+_MAX_PREPARATION_FREE_COIN_CLEANUP = 4096
 
-    if coin_expression not in {"coins.coin_id", "coin_id"}:
-        raise ValueError("unsupported registry coin SQL expression")
-    terminal_states = ", ".join(
-        f"'{state}'" for state in sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+
+def mark_unreserved_free_coins_gone_for_preparation() -> int:
+    """Park only a bounded snapshot of free coins outside Task 4 reservations."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT coin_id FROM coins WHERE status='free' ORDER BY coin_id LIMIT ?",
+            (_MAX_PREPARATION_FREE_COIN_CLEANUP + 1,),
+        )
+        .fetchall()
     )
-    return f"""NOT EXISTS (
-        SELECT 1
-          FROM offer_intents AS registry_intent,
-               json_each(registry_intent.selected_coin_ids_json) AS selected_coin
-         WHERE registry_intent.lifecycle_state NOT IN ({terminal_states})
-           AND lower(replace(CAST(selected_coin.value AS TEXT), '0x', ''))
-             = lower(replace(CAST({coin_expression} AS TEXT), '0x', ''))
-    )"""
+    if len(rows) > _MAX_PREPARATION_FREE_COIN_CLEANUP:
+        raise RuntimeError("free coin preparation cleanup limit exceeded")
+    return mark_coins_gone([str(row["coin_id"]) for row in rows])
+
+
+def _offer_terminal_mutation_is_protected(
+    conn: sqlite3.Connection, trade_id: str
+) -> bool:
+    """Reserve every durable offer row for the reconciliation transaction.
+
+    Legacy mutation APIs may still operate on identities that have no offer
+    row (for historical accounting compatibility), but no existing offer may
+    cross or rewrite a terminal boundary outside commit_offer_reconciliation.
+    """
+
+    offer = conn.execute(
+        "SELECT 1 FROM offers WHERE trade_id=? LIMIT 1", (trade_id,)
+    ).fetchone()
+    return offer is not None
+
+
+def _coin_terminal_mutation_is_protected(
+    conn: sqlite3.Connection, coin_id: str
+) -> bool:
+    normalized = norm_coin_id(coin_id)
+    if normalized in _nonterminal_registry_coin_ids(conn):
+        return True
+    row = conn.execute(
+        "SELECT trade_id FROM coins WHERE coin_id=?", (normalized,)
+    ).fetchone()
+    if row is None or not row["trade_id"]:
+        return False
+    offer = conn.execute(
+        "SELECT status FROM offers WHERE trade_id=?", (row["trade_id"],)
+    ).fetchone()
+    return bool(offer is not None and offer["status"] == "open")
 
 
 def is_coin_reconciliation_protected(coin_id: str) -> bool:
@@ -5206,11 +5614,13 @@ def free_unreserved_locked_coin_for_reconciliation(coin_id: str) -> bool:
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if normalized in _nonterminal_registry_coin_ids(conn):
+            conn.rollback()
+            return False
         cursor = conn.execute(
-            f"""UPDATE coins
+            """UPDATE coins
                    SET status='free', trade_id=NULL, last_seen=?
-                 WHERE coin_id=? AND status='locked' AND trade_id IS NULL
-                   AND {_nonterminal_registry_coin_absent_sql("coins.coin_id")}""",
+                 WHERE coin_id=? AND status='locked' AND trade_id IS NULL""",
             (_now(), normalized),
         )
         conn.commit()
@@ -5240,7 +5650,6 @@ def reconcile_wallet_locked_coin_links(
         conn.execute("BEGIN IMMEDIATE")
         registry_protected = _nonterminal_registry_coin_ids(conn)
         now = _now()
-        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
         for coin_id, trade_id in exact_links:
             row = conn.execute(
                 "SELECT status, trade_id FROM coins WHERE coin_id=?", (coin_id,)
@@ -5253,17 +5662,15 @@ def reconcile_wallet_locked_coin_links(
                 continue
             if row["status"] == "locked":
                 cursor = conn.execute(
-                    f"""UPDATE coins SET trade_id=?, last_seen=?
-                        WHERE coin_id=? AND status='locked' AND trade_id IS NULL
-                          AND {registry_absent}""",
+                    """UPDATE coins SET trade_id=?, last_seen=?
+                        WHERE coin_id=? AND status='locked' AND trade_id IS NULL""",
                     (trade_id, now, coin_id),
                 )
                 stats["linked"] += cursor.rowcount
             else:
                 cursor = conn.execute(
-                    f"""UPDATE coins SET status='locked', trade_id=?, last_seen=?
-                        WHERE coin_id=? AND trade_id IS NULL
-                          AND {registry_absent}""",
+                    """UPDATE coins SET status='locked', trade_id=?, last_seen=?
+                        WHERE coin_id=? AND trade_id IS NULL""",
                     (trade_id, now, coin_id),
                 )
                 stats["locked"] += cursor.rowcount
@@ -5353,7 +5760,6 @@ def reconcile_coins_with_wallet(
         db_ids = set(db_coins.keys())
         wallet_all_ids = set(wallet_owned.keys())
         registry_protected = _nonterminal_registry_coin_ids(conn)
-        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
 
         # 1. STALE: in DB as free/locked but not in wallet → mark gone
         #    Only mark active coins as gone (already gone/spent stay as-is)
@@ -5367,9 +5773,9 @@ def reconcile_coins_with_wallet(
                 stats["protected"] += 1
                 continue
             cursor = conn.execute(
-                f"""UPDATE coins SET status='gone', last_seen=?
+                """UPDATE coins SET status='gone', last_seen=?
                     WHERE coin_id=? AND status IN ('free', 'locked')
-                      AND trade_id IS NULL AND {registry_absent}""",
+                      AND trade_id IS NULL""",
                 (now, raw_id),
             )
             if cursor.rowcount == 0:
@@ -5394,6 +5800,9 @@ def reconcile_coins_with_wallet(
             store_id = nid if nid.startswith("0x") else "0x" + nid
 
             if nid not in db_ids:
+                if nid in registry_protected:
+                    stats["protected"] += 1
+                    continue
                 # Truly new coin — never seen before
                 # Auto-classify by amount so it immediately gets a useful
                 # tier designation instead of staying 'unknown' until next
@@ -5410,7 +5819,7 @@ def reconcile_coins_with_wallet(
                     pass
 
                 cursor = conn.execute(
-                    f"""INSERT INTO coins
+                    """INSERT INTO coins
                        (coin_id, wallet_type, amount_mojos, tier, status,
                         first_seen, last_seen, designation, assigned_tier)
                        VALUES (?, ?, ?, 'unknown', ?, ?, ?, ?, ?)
@@ -5419,7 +5828,7 @@ def reconcile_coins_with_wallet(
                            amount_mojos = ?,
                            last_seen = ?,
                            wallet_type = ?
-                       WHERE coins.trade_id IS NULL AND {registry_absent}""",
+                       WHERE coins.trade_id IS NULL""",
                     (
                         store_id,
                         wallet_type,
@@ -5463,11 +5872,11 @@ def reconcile_coins_with_wallet(
                         continue
                     # Reappearing coin! Reset to active status
                     cursor = conn.execute(
-                        f"""UPDATE coins SET status=?, amount_mojos=?,
+                        """UPDATE coins SET status=?, amount_mojos=?,
                            last_seen=?, designation='unknown',
                            assigned_tier='none', trade_id=NULL
                            WHERE coin_id=? AND status IN ('gone', 'spent')
-                             AND trade_id IS NULL AND {registry_absent}""",
+                             AND trade_id IS NULL""",
                         (target_status, amt, now, raw_id),
                     )
                     if cursor.rowcount == 0:
@@ -5493,9 +5902,8 @@ def reconcile_coins_with_wallet(
                         stats["protected"] += 1
                         continue
                     cursor = conn.execute(
-                        f"""UPDATE coins SET status='locked', last_seen=?
-                            WHERE coin_id=? AND status='free' AND trade_id IS NULL
-                              AND {registry_absent}""",
+                        """UPDATE coins SET status='locked', last_seen=?
+                            WHERE coin_id=? AND status='free' AND trade_id IS NULL""",
                         (now, raw_id),
                     )
                     if cursor.rowcount:
@@ -5514,9 +5922,9 @@ def reconcile_coins_with_wallet(
                         stats["already_ok"] += 1
                     else:
                         cur = conn.execute(
-                            f"""UPDATE coins SET status='free', trade_id=NULL,
+                            """UPDATE coins SET status='free', trade_id=NULL,
                                last_seen=? WHERE coin_id=? AND status='locked'
-                               AND trade_id IS NULL AND {registry_absent}""",
+                               AND trade_id IS NULL""",
                             (now, raw_id),
                         )
                         if cur.rowcount > 0:
@@ -5935,7 +6343,6 @@ def cleanup_orphaned_locked_coins(
         conn.execute("BEGIN IMMEDIATE")
         now = _now()
         registry_protected = _nonterminal_registry_coin_ids(conn)
-        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
 
         # Get all locked coins
         rows = conn.execute(
@@ -5964,9 +6371,8 @@ def cleanup_orphaned_locked_coins(
 
             # No trade_id and no registry owner: legacy failed-creation debris.
             cursor = conn.execute(
-                f"""UPDATE coins SET status='free', trade_id=NULL, last_seen=?
-                    WHERE coin_id=? AND status='locked' AND trade_id IS NULL
-                      AND {registry_absent}""",
+                """UPDATE coins SET status='free', trade_id=NULL, last_seen=?
+                    WHERE coin_id=? AND status='locked' AND trade_id IS NULL""",
                 (now, cid),
             )
             if cursor.rowcount == 0:
@@ -9492,8 +9898,47 @@ def record_fill(
 
     Returns the fill_id of the new record, or -1 on error.
     """
+    conn = None
+    started_transaction = False
+    nested_savepoint = False
+
+    def finish_transaction() -> None:
+        nonlocal nested_savepoint
+        if started_transaction:
+            conn.commit()
+        elif nested_savepoint:
+            conn.execute("RELEASE SAVEPOINT catalyst_record_fill")
+            nested_savepoint = False
+
+    def abort_transaction() -> None:
+        nonlocal nested_savepoint
+        if conn is None:
+            return
+        if started_transaction:
+            conn.rollback()
+        elif nested_savepoint:
+            conn.execute("ROLLBACK TO SAVEPOINT catalyst_record_fill")
+            conn.execute("RELEASE SAVEPOINT catalyst_record_fill")
+            nested_savepoint = False
+
     try:
         conn = get_connection()
+        started_transaction = not conn.in_transaction
+        if started_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute("SAVEPOINT catalyst_record_fill")
+            nested_savepoint = True
+        if _offer_terminal_mutation_is_protected(conn, trade_id):
+            abort_transaction()
+            if started_transaction:
+                log_event(
+                    "warning",
+                    "legacy_fill_record_blocked",
+                    f"Rejected unproven fill mutation for {str(trade_id)[:16]}...",
+                    data={"trade_id": str(trade_id)},
+                )
+            return -1
         existing = conn.execute(
             """SELECT fill_id, side, price_xch, size_xch, size_cat FROM fills
                WHERE trade_id=?
@@ -9509,9 +9954,9 @@ def record_fill(
                     "filled_at=? WHERE trade_id=? AND status='open'",
                     (_now(), trade_id),
                 )
-                conn.commit()
+                finish_transaction()
             except Exception:
-                pass
+                abort_transaction()
             # Warn if key parameters differ from what was recorded
             try:
                 existing_side = existing["side"]
@@ -9519,13 +9964,14 @@ def record_fill(
                 if existing_side != side or abs(existing_price - price_xch) > Decimal(
                     "0.00000001"
                 ):
-                    log_event(
-                        "warning",
-                        "record_fill_mismatch",
-                        f"Fill {trade_id[:16]}... already recorded but parameters differ: "
-                        f"stored side={existing_side} price={existing_price} "
-                        f"vs incoming side={side} price={price_xch}",
-                    )
+                    if started_transaction:
+                        log_event(
+                            "warning",
+                            "record_fill_mismatch",
+                            f"Fill {trade_id[:16]}... already recorded but parameters differ: "
+                            f"stored side={existing_side} price={existing_price} "
+                            f"vs incoming side={side} price={price_xch}",
+                        )
             except Exception:
                 pass
             return int(existing["fill_id"])
@@ -9554,23 +10000,24 @@ def record_fill(
             "filled_at=?, cancelled_at=NULL WHERE trade_id=?",
             (now, trade_id),
         )
-        conn.commit()
+        finish_transaction()
 
         # Coin status update is secondary (ok if separate — coin state
         # is recovered at next reconciliation if this fails)
-        try:
-            coin_ids = get_locked_coin_ids_for_trade(trade_id)
-            if not coin_ids:
-                row = conn.execute(
-                    "SELECT coin_id FROM offers WHERE trade_id=?", (trade_id,)
-                ).fetchone()
-                coin_id = row["coin_id"] if row else None
-                if coin_id:
-                    coin_ids = [coin_id]
-            for cid in coin_ids:
-                mark_coin_spent(cid)
-        except Exception:
-            pass
+        if started_transaction:
+            try:
+                coin_ids = get_locked_coin_ids_for_trade(trade_id)
+                if not coin_ids:
+                    row = conn.execute(
+                        "SELECT coin_id FROM offers WHERE trade_id=?", (trade_id,)
+                    ).fetchone()
+                    coin_id = row["coin_id"] if row else None
+                    if coin_id:
+                        coin_ids = [coin_id]
+                for cid in coin_ids:
+                    mark_coin_spent(cid)
+            except Exception:
+                pass
 
         return cursor.lastrowid
     except sqlite3.IntegrityError as ie:
@@ -9588,7 +10035,7 @@ def record_fill(
         # at the module level — when we ever lose a fill from PnL we
         # want a loud, fail-loud, fail-fast operator-visible signal).
         try:
-            conn.rollback()
+            abort_transaction()
         except Exception:
             pass
         for attempt, delay in enumerate((0, 0.05, 0.10, 0.20)):
@@ -9604,48 +10051,51 @@ def record_fill(
                     (trade_id,),
                 ).fetchone()
                 if row:
-                    log_event(
-                        "info",
-                        "record_fill_race",
-                        f"UNIQUE constraint caught race for {trade_id[:16]}... "
-                        f"— returning existing fill_id {row['fill_id']}"
-                        + (f" (after {attempt} retries)" if attempt else ""),
-                    )
+                    if started_transaction:
+                        log_event(
+                            "info",
+                            "record_fill_race",
+                            f"UNIQUE constraint caught race for {trade_id[:16]}... "
+                            f"— returning existing fill_id {row['fill_id']}"
+                            + (f" (after {attempt} retries)" if attempt else ""),
+                        )
                     return int(row["fill_id"])
             except Exception:
                 pass
         # All retries failed — this is a SILENT FILL LOSS condition.
         # Escalate via the per-hour rate alert in addition to the error log.
-        log_event(
-            "error",
-            "fill_record_failed_critical",
-            f"CRITICAL: failed to record fill for {trade_id} after "
-            f"IntegrityError + 4 SELECT retries. Fill is silently lost "
-            f"from PnL math. Original error: {ie}",
-            data={
-                "trade_id": trade_id,
-                "side": side,
-                "price_xch": str(price_xch),
-                "size_xch": str(size_xch),
-            },
-        )
+        if started_transaction:
+            log_event(
+                "error",
+                "fill_record_failed_critical",
+                f"CRITICAL: failed to record fill for {trade_id} after "
+                f"IntegrityError + 4 SELECT retries. Fill is silently lost "
+                f"from PnL math. Original error: {ie}",
+                data={
+                    "trade_id": trade_id,
+                    "side": side,
+                    "price_xch": str(price_xch),
+                    "size_xch": str(size_xch),
+                },
+            )
         return -1
     except Exception as e:
         try:
-            conn.rollback()
+            abort_transaction()
         except Exception:
             pass
-        log_event(
-            "error",
-            "fill_record_failed_critical",
-            f"CRITICAL: failed to record fill for {trade_id}: {e}",
-            data={
-                "trade_id": trade_id,
-                "side": side,
-                "price_xch": str(price_xch),
-                "size_xch": str(size_xch),
-            },
-        )
+        if started_transaction:
+            log_event(
+                "error",
+                "fill_record_failed_critical",
+                f"CRITICAL: failed to record fill for {trade_id}: {e}",
+                data={
+                    "trade_id": trade_id,
+                    "side": side,
+                    "price_xch": str(price_xch),
+                    "size_xch": str(size_xch),
+                },
+            )
         return -1
 
 
@@ -12918,6 +13368,14 @@ def prepare_offer_intent(
             if require_new_intent:
                 raise ValueError("offer intent already exists")
         _insert_offer_operation_event(conn, journal)
+        protected_elsewhere = _nonterminal_registry_coin_ids_excluding(
+            conn, exclude_intent_id=immutable["intent_id"]
+        )
+        if protected_elsewhere.intersection(registry_coin_ids):
+            raise ValueError(
+                "selected coin is not free; it is reserved by another "
+                "nonterminal offer intent"
+            )
         if reserve_selected_coins and existing_state in {None, "prepared"}:
             placeholders = ",".join("?" for _ in registry_coin_ids)
             rows = conn.execute(
@@ -14479,8 +14937,11 @@ def select_offer_creation_generation(*, slot_key: str) -> Dict[str, Any]:
         "submitted_unconfirmed",
         "creation_unknown",
         "created",
+        "unknown",
+        "conflicted",
     }
     terminal_states = {
+        "terminal",
         "creation_failed",
         "rejected",
         "cancelled",
@@ -14505,25 +14966,43 @@ def select_offer_creation_generation(*, slot_key: str) -> Dict[str, Any]:
         ):
             raise ValueError("active runtime mutation lease is required")
         run_id = str(lease["owner_run_id"])
-        rows = conn.execute(
-            """
+        active_values = sorted(active_states)
+        active_placeholders = ",".join("?" for _ in active_values)
+        active_rows = conn.execute(
+            f"""
             SELECT intent_id, generation, lifecycle_state
             FROM offer_intents
-            WHERE run_id=? AND slot_key=?
+            WHERE slot_key=? AND lifecycle_state IN ({active_placeholders})
             ORDER BY generation DESC, prepared_at DESC, intent_id DESC
+            LIMIT 2
             """,
-            (run_id, safe_slot_key),
+            (safe_slot_key, *active_values),
         ).fetchall()
-        active = [row for row in rows if row["lifecycle_state"] in active_states]
-        unknown_states = {
-            str(row["lifecycle_state"])
-            for row in rows
-            if row["lifecycle_state"] not in active_states | terminal_states
-        }
-        if unknown_states:
+        if len(active_rows) > 1:
+            raise RuntimeError("offer intent slot has multiple active owners")
+        known_values = sorted(active_states | terminal_states)
+        known_placeholders = ",".join("?" for _ in known_values)
+        unknown_state = conn.execute(
+            f"""
+            SELECT lifecycle_state FROM offer_intents
+            WHERE slot_key=? AND lifecycle_state NOT IN ({known_placeholders})
+            LIMIT 1
+            """,
+            (safe_slot_key, *known_values),
+        ).fetchone()
+        if unknown_state is not None:
             raise RuntimeError("offer intent generation state is not recognized")
-        if active:
-            selected = active[0]
+        latest = conn.execute(
+            """
+            SELECT generation FROM offer_intents
+            WHERE slot_key=?
+            ORDER BY generation DESC, prepared_at DESC, intent_id DESC
+            LIMIT 1
+            """,
+            (safe_slot_key,),
+        ).fetchone()
+        if active_rows:
+            selected = active_rows[0]
             result = {
                 "run_id": run_id,
                 "generation": int(selected["generation"]),
@@ -14531,7 +15010,7 @@ def select_offer_creation_generation(*, slot_key: str) -> Dict[str, Any]:
                 "active_lifecycle_state": str(selected["lifecycle_state"]),
             }
         else:
-            generation = int(rows[0]["generation"]) + 1 if rows else 0
+            generation = int(latest["generation"]) + 1 if latest is not None else 0
             result = {
                 "run_id": run_id,
                 "generation": generation,

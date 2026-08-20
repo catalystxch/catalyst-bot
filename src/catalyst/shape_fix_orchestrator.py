@@ -451,10 +451,7 @@ class ShapeFixOrchestrator:
         self._emit(flow)
 
     def _stage_waiting_for_confirmation(self, flow: FlowState) -> None:
-        """Poll the open-offer book until ``flow.trade_ids`` no longer
-        appear. The bot's normal wallet_sync path updates the DB from
-        Sage each cycle, so once the cancels confirm on-chain they'll
-        disappear from the DB within one poll.
+        """Wait for exact durable cancellation proof for every cohort member.
 
         Timeout = :attr:`CONFIRMATION_TIMEOUT_S` (default 3 min).
         """
@@ -468,8 +465,7 @@ class ShapeFixOrchestrator:
         last_emit_at = 0.0
 
         try:
-            from database import get_open_offers
-            from config import cfg
+            from database import get_authoritative_terminal_record
         except Exception as e:
             flow.halt_reason = HaltReason.INTERNAL_ERROR
             flow.stage = Stage.HALTED
@@ -489,9 +485,16 @@ class ShapeFixOrchestrator:
                 return
 
             try:
-                rows = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID) or []
-                open_tids = {str(r.get("trade_id") or "") for r in rows}
-                still_open = len(target_tids & open_tids)
+                still_open = sum(
+                    1
+                    for trade_id in target_tids
+                    if (
+                        (get_authoritative_terminal_record(trade_id) or {}).get(
+                            "terminal_state"
+                        )
+                        != "cancelled"
+                    )
+                )
             except Exception:
                 # Transient DB hiccup — try again next poll
                 still_open = last_still_open

@@ -7869,6 +7869,37 @@ class BotLoop:
             )
         self._recent_sweep_events = self._recent_sweep_events[-20:]
 
+    def _retire_authoritative_sniper_ids(self, trade_ids) -> set[str]:
+        """Drop in-memory protection only after exact Task 9 terminal proof."""
+
+        from database import get_authoritative_terminal_record
+
+        confirmed: set[str] = set()
+        for trade_id in dict.fromkeys(trade_ids):
+            if type(trade_id) is not str or not trade_id:
+                continue
+            try:
+                record = get_authoritative_terminal_record(trade_id)
+            except Exception:
+                continue
+            if (
+                type(record) is dict
+                and record.get("sage_trade_id") == trade_id
+                and record.get("terminal_state") in {"cancelled", "filled", "expired"}
+            ):
+                confirmed.add(trade_id)
+        if not confirmed:
+            return set()
+        with self.sniper._snipe_lock:
+            self.sniper._active_snipe_ids = [
+                trade_id
+                for trade_id in self.sniper._active_snipe_ids
+                if trade_id not in confirmed
+            ]
+            for trade_id in confirmed:
+                self.sniper._active_snipe_sides.pop(trade_id, None)
+        return confirmed
+
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
         self._cycle_started_running = bool(self._running)
@@ -8460,11 +8491,7 @@ class BotLoop:
                         reason="sniper_orphan_sweep",
                         skip_confirmation=True,
                     )
-                    with self.sniper._snipe_lock:
-                        for _tid in _orphan_snipes:
-                            if _tid in self.sniper._active_snipe_ids:
-                                self.sniper._active_snipe_ids.remove(_tid)
-                            self.sniper._active_snipe_sides.pop(_tid, None)
+                    self._retire_authoritative_sniper_ids(_orphan_snipes)
                 except Exception as _sweep_err:
                     log_event(
                         "error",
@@ -9049,14 +9076,12 @@ class BotLoop:
             # skip_confirmation=True: probe retirement is fire-and-forget.
             # The main ladder builds immediately after; waiting 60-90s for
             # coins to return from the probe cancel blocks the whole cycle.
-            cancel_result = self.offer_manager.cancel_offers(
+            self.offer_manager.cancel_offers(
                 live_probe_ids,
                 reason=reason,
                 skip_confirmation=True,
             )
-            cancelled = {
-                tid for tid, res in cancel_result.items() if res and res.get("success")
-            }
+            cancelled = self._retire_authoritative_sniper_ids(live_probe_ids)
             failed = [tid for tid in live_probe_ids if tid not in cancelled]
 
             if cancelled:
@@ -9065,14 +9090,6 @@ class BotLoop:
                 self._set_state(
                     open_buys=len(current_buy_ids), open_sells=len(current_sell_ids)
                 )
-                with self.sniper._snipe_lock:
-                    self.sniper._active_snipe_ids = [
-                        tid
-                        for tid in self.sniper._active_snipe_ids
-                        if tid not in cancelled
-                    ]
-                    for tid in cancelled:
-                        self.sniper._active_snipe_sides.pop(tid, None)
                 for tid in cancelled:
                     if probe.get("buy_tid") == tid:
                         self._clear_probe_side("buy", tid)
@@ -9580,13 +9597,7 @@ class BotLoop:
                                 reason="probe_orphan_cleanup",
                                 skip_confirmation=True,
                             )
-                            # Also prune from sniper's tracking so the cap
-                            # doesn't stay inflated.
-                            with self.sniper._snipe_lock:
-                                for _tid in _orphan_tids:
-                                    if _tid in self.sniper._active_snipe_ids:
-                                        self.sniper._active_snipe_ids.remove(_tid)
-                                    self.sniper._active_snipe_sides.pop(_tid, None)
+                            self._retire_authoritative_sniper_ids(_orphan_tids)
                         except Exception as _orphan_err:
                             log_event(
                                 "error",
@@ -9914,18 +9925,14 @@ class BotLoop:
             try:
                 # skip_confirmation=True: sniper cleanup is routine maintenance;
                 # blocking 60-90s for coins freezes the cycle unnecessarily.
-                result = self.offer_manager.cancel_offers(
+                self.offer_manager.cancel_offers(
                     snipe_ids_to_cancel, reason="sniper_cleanup", skip_confirmation=True
                 )
-                cancelled_ids = [
-                    tid
-                    for tid, res in (result or {}).items()
-                    if res and res.get("success")
-                ]
+                cancelled_ids = sorted(
+                    self._retire_authoritative_sniper_ids(snipe_ids_to_cancel)
+                )
                 failed_ids = [
-                    tid
-                    for tid, res in (result or {}).items()
-                    if not (res and res.get("success"))
+                    tid for tid in snipe_ids_to_cancel if tid not in cancelled_ids
                 ]
                 cancelled = len(cancelled_ids)
                 log_event(
@@ -9947,8 +9954,7 @@ class BotLoop:
                             self._clear_probe_side("sell", tid)
                     self.coin_manager.snapshot_coins("sniper_cleanup")
                     self._emit_coin_update("sniper_cleanup")
-                # Keep failed sniper IDs tracked until retry or wallet sync removes them.
-                self.sniper._active_snipe_ids = failed_ids
+                # Pending IDs remain protected until reconciliation proves terminal.
             except Exception as e:
                 log_event(
                     "warning",

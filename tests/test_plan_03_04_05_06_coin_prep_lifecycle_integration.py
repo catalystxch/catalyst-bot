@@ -15,10 +15,10 @@ with real SQLite DB and mocked subprocess/threading:
     - Re-trigger after reset sets running=True again
     - Error state is cleared on re-trigger
 
-  03-06: coin-prep full reset (fresh-start path)
-    - full_reset=True in trigger body → fills cleared from DB (0 rows)
-    - full_reset=False (default) → fills preserved
-    - full_reset=True also clears round_trips
+  03-06: guarded coin-prep full reset (fresh-start path)
+    - full_reset=True succeeds only when no authoritative fill state exists
+    - fills make the reset return a stable conflict without mutation
+    - full_reset=False (default) preserves history
 
 Threading is mocked to prevent the do_prep() thread from actually launching.
 Uses the TempDB pattern for real SQLite isolation.
@@ -313,32 +313,36 @@ class TestCoinPrepRetry(_TempDB):
 
 
 # ---------------------------------------------------------------------------
-# 03-06: coin-prep full reset path — full_reset=True clears fills
+# 03-06: coin-prep full reset path — authoritative fills deny mutation
 # ---------------------------------------------------------------------------
 
 
 @unittest.skipIf(_SKIP is not None, f"modules unavailable: {_SKIP}")
 class TestCoinPrepFullReset(_TempDB):
-    """full_reset=True must clear fills from DB (unlike the default path)."""
+    """A full reset must not erase durable fill/proof history."""
 
     def test_full_reset_trigger_returns_success(self):
         resp = self._trigger(full_reset=True)
         self.assertTrue(resp.get_json().get("success"))
 
-    def test_full_reset_clears_fills(self):
-        """Triggering with full_reset=True deletes all fills from DB."""
+    def test_full_reset_with_fill_returns_conflict_without_mutation(self):
         self._seed_fill()
         self.assertEqual(self._fill_count(), 1)
-        self._trigger(full_reset=True)
-        self.assertEqual(self._fill_count(), 0)
+        resp = self._trigger(full_reset=True)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("error"), "authoritative_state_conflict")
+        self.assertEqual(self._fill_count(), 1)
 
-    def test_full_reset_with_multiple_fills(self):
-        """All fill rows are removed on full_reset=True, not just one."""
+    def test_full_reset_with_multiple_fills_preserves_every_row(self):
         self._seed_fill(trade_id=_TRADE_ID_A)
         self._seed_fill(trade_id=_TRADE_ID_B)
         self.assertEqual(self._fill_count(), 2)
-        self._trigger(full_reset=True)
-        self.assertEqual(self._fill_count(), 0)
+        resp = self._trigger(full_reset=True)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("conflicts"), ["authoritative_session_state"]
+        )
+        self.assertEqual(self._fill_count(), 2)
 
     def test_default_trigger_does_not_clear_fills(self):
         """full_reset=False (default) must NOT clear fills."""

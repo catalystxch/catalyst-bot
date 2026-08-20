@@ -644,12 +644,10 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
     ("adapter_name", "caller_name", "callee_name"),
     [
         ("wallet_sage", "split_coins_bulk", "split_coins_rpc"),
-        ("wallet_sage", "cleanup_expired_offers", "cancel_offer"),
         ("wallet_sage", "cancel_offers_batch", "cancel_offer"),
         ("wallet_sage", "delete_offers_batch", "delete_offer"),
         ("wallet_chia", "split_coins_bulk", "split_coins_rpc"),
         ("wallet_chia", "split_coins_bulk", "send_transaction"),
-        ("wallet_chia", "cleanup_expired_offers", "cancel_offer"),
         ("wallet_chia", "cancel_offers_batch", "cancel_offer"),
     ],
 )
@@ -676,6 +674,24 @@ def test_nested_mutating_adapter_calls_forward_identity_recheck(
         )
         for call in calls
     )
+
+
+@pytest.mark.parametrize("adapter_name", ["wallet_sage", "wallet_chia"])
+def test_expired_cleanup_is_read_only_without_identity_bound_cancel(
+    adapter_name, monkeypatch
+):
+    adapter = __import__(adapter_name)
+    logs = []
+    monkeypatch.setattr(adapter, "get_all_offers", lambda **_kwargs: [{"trade": "x"}])
+    monkeypatch.setattr(adapter, "is_offer_time_expired", lambda _offer: True)
+    monkeypatch.setattr(
+        adapter,
+        "cancel_offer",
+        lambda *_args, **_kwargs: pytest.fail("local expiry must not cancel an offer"),
+    )
+
+    assert adapter.cleanup_expired_offers(log_fn=lambda *args: logs.append(args)) == 0
+    assert logs
 
 
 def test_sage_split_bulk_rechecks_after_nested_signing_read(monkeypatch):
@@ -1104,18 +1120,43 @@ def test_adapter_identity_rechecks_are_never_inside_broad_exception_catches():
             for item in caught
         )
 
+    def reraises_mutation_block(handler):
+        return (
+            isinstance(handler.type, ast.Attribute)
+            and isinstance(handler.type.value, ast.Name)
+            and handler.type.value.id == "mutation_gate"
+            and handler.type.attr == "MutationBlocked"
+            and len(handler.body) == 1
+            and isinstance(handler.body[0], ast.Raise)
+            and handler.body[0].exc is None
+        )
+
     for filename in ("wallet_sage.py", "wallet_chia.py"):
         tree = ast.parse((root / filename).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Try) or not any(
-                catches_broad_exception(handler) for handler in node.handlers
-            ):
+            if not isinstance(node, ast.Try):
                 continue
+            broad_indexes = [
+                index
+                for index, handler in enumerate(node.handlers)
+                if catches_broad_exception(handler)
+            ]
+            if not broad_indexes:
+                continue
+            mutation_block_indexes = [
+                index
+                for index, handler in enumerate(node.handlers)
+                if reraises_mutation_block(handler)
+            ]
+            safely_fenced = mutation_block_indexes and (
+                min(mutation_block_indexes) < min(broad_indexes)
+            )
             for statement in node.body:
                 for descendant in ast.walk(statement):
                     if (
                         isinstance(descendant, ast.Name)
                         and descendant.id == "_identity_recheck"
+                        and not safely_fenced
                     ):
                         violations.append((filename, descendant.lineno))
 

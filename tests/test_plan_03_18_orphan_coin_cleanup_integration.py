@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,6 +31,7 @@ except ModuleNotFoundError as exc:
     _SKIP_DB = str(exc)
 
 try:
+    import bot_health as _bot_health
     from bot_health import check_orphan_locks
 
     _SKIP_BH = None
@@ -45,6 +47,10 @@ except ModuleNotFoundError as exc:
 
 class _TempDB(unittest.TestCase):
     def setUp(self):
+        self._wallet_locks_patch = patch.object(
+            _bot_health, "_wallet_confirmed_locked_coin_ids", return_value=set()
+        )
+        self._wallet_locks_patch.start()
         # Re-register the cached database module — other tests may pop it from
         # sys.modules in tearDown (e.g. coin_manager_* tests), causing lazy
         # `from database import` calls inside check_orphan_locks to re-import a
@@ -70,6 +76,7 @@ class _TempDB(unittest.TestCase):
         _db.init_database()
 
     def tearDown(self):
+        self._wallet_locks_patch.stop()
         if hasattr(_db._local, "conn") and _db._local.conn:
             try:
                 _db._local.conn.close()

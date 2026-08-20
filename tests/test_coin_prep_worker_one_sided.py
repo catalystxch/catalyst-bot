@@ -34,6 +34,7 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
         "send_cat_multi",
         "split_coins_rpc",
         "sage_topup_split",
+        "get_pending_transactions",
     ):
         setattr(fake_wallet, name, getattr(fake_wallet_sage, name))
 

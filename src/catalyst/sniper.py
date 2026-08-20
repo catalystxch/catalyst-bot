@@ -533,18 +533,24 @@ class Sniper:
     # -------------------------------------------------------------------
 
     def prune_active_snipes(self, open_trade_ids: set):
-        """Remove sniper IDs that are no longer open (filled or cancelled).
+        """Remove only sniper IDs with exact durable terminal proof."""
+        import database
 
-        Call this each cycle with the set of currently open trade IDs.
-        Keeps the active snipe count accurate so the cap works properly.
-        """
         with self._snipe_lock:
             before = len(self._active_snipe_ids)
-            removed_ids = [
-                tid for tid in self._active_snipe_ids if tid not in open_trade_ids
-            ]
+            removed_ids = []
+            for tid in self._active_snipe_ids:
+                if tid in open_trade_ids:
+                    continue
+                try:
+                    terminal = database.get_authoritative_terminal_record(tid)
+                except Exception:
+                    terminal = None
+                if terminal is not None:
+                    removed_ids.append(tid)
+            removed = set(removed_ids)
             self._active_snipe_ids = [
-                tid for tid in self._active_snipe_ids if tid in open_trade_ids
+                tid for tid in self._active_snipe_ids if tid not in removed
             ]
             # Also clean up the per-side tracking dict
             for tid in removed_ids:

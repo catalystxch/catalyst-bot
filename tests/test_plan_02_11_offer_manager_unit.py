@@ -445,7 +445,7 @@ class TestCleanupExpiredDbOffers(_OM):
             pass
         super().tearDown()
 
-    def test_cleanup_expired_db_offers_skips_pending_cancel_rows(self):
+    def test_cleanup_expired_db_offers_preserves_rows_without_authoritative_proof(self):
         now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
         past = (now - timedelta(seconds=1)).isoformat()
         future = (now + timedelta(hours=1)).isoformat()
@@ -495,8 +495,8 @@ class TestCleanupExpiredDbOffers(_OM):
         with patch.object(_db_mod.time, "time", return_value=now.timestamp()):
             expired = self._manager.cleanup_expired_db_offers()
 
-        self.assertEqual(expired, ["plain-expired"])
-        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "expired")
+        self.assertEqual(expired, [])
+        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "open")
         self.assertEqual(_db_mod.get_offer("pending-cancel-expired")["status"], "open")
         self.assertEqual(
             _db_mod.get_offer("pending-cancel-expired")["lifecycle_state"],
@@ -510,7 +510,7 @@ class TestCleanupExpiredDbOffers(_OM):
                 include_pending_cancel=True,
             )
         }
-        self.assertNotIn("plain-expired", open_with_pending)
+        self.assertIn("plain-expired", open_with_pending)
         self.assertIn("pending-cancel-expired", open_with_pending)
         self.assertIn("pending-cancel-future", open_with_pending)
         plain_coin = (
@@ -521,8 +521,8 @@ class TestCleanupExpiredDbOffers(_OM):
             )
             .fetchone()
         )
-        self.assertEqual(plain_coin["status"], "free")
-        self.assertIsNone(plain_coin["trade_id"])
+        self.assertEqual(plain_coin["status"], "locked")
+        self.assertEqual(plain_coin["trade_id"], "plain-expired")
         pending_coin = (
             _db_mod.get_connection()
             .execute(

@@ -28,6 +28,8 @@ def api_session_fresh_start():
             cancel_open_offers=False,
             reason="session_fresh_start",
         )
+        if not payload["success"]:
+            return jsonify(api_server._serialize_dict(payload)), 409
         # Persist the choice so check-resume returns can_resume=False on the
         # next page load, even though the old live offers are still in Sage.
         # Cleared automatically when the bot starts a new run.

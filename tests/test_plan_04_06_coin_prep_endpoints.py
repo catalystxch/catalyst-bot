@@ -353,6 +353,7 @@ class TestCoinPrepVerify(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCoinPrepTrigger(_FlaskBase):
     _FAKE_SUMMARY = {
+        "success": True,
         "fills_cleared": 0,
         "round_trips_cleared": 0,
         "price_history_cleared": False,

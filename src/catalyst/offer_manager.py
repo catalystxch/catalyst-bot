@@ -1208,13 +1208,8 @@ class OfferManager:
         replenishment toward inner/outer tiers.
 
         Args:
-            live_offer_ids: Set of trade_ids currently confirmed open in the
-                wallet (from this loop's sync_from_wallet call).  When provided,
-                DB offers whose trade_id is NOT in this set are treated as
-                already-expired and their tier slot is counted as empty.  This
-                fixes a 1-cycle reconciliation lag where expired offers still
-                show as 'open' in the DB when replenishment runs, causing new
-                offers to land in the wrong tier position.
+            live_offer_ids: Diagnostic wallet snapshot retained for API
+                compatibility. Wallet omission never opens a durable slot.
         """
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
 
@@ -1234,13 +1229,6 @@ class OfferManager:
             tier = (offer.get("tier") or "mid").lower()
             if tier not in live_counts:
                 continue
-            # If we have live wallet IDs, only count offers that are still
-            # confirmed open in the wallet.  Offers in DB but gone from the
-            # wallet have expired/been filled and their slot is available.
-            if live_offer_ids is not None:
-                trade_id = offer.get("trade_id") or ""
-                if trade_id and trade_id not in live_offer_ids:
-                    continue  # expired — don't count, the slot is free
             live_counts[tier] += 1
 
         planned_slots: List[int] = []
@@ -2226,6 +2214,7 @@ class OfferManager:
                     "offer intent already exists" in message
                     or "selected coin is not free" in message
                     or "UNIQUE constraint failed: offer_intents.run_id" in message
+                    or "UNIQUE constraint failed: offer_intents.slot_key" in message
                 ):
                     raise _OfferCreationClaimLost from exc
                 raise
@@ -4429,12 +4418,8 @@ class OfferManager:
         # ── Gather open offers to replace ──
         all_open = get_open_offers(side=side, cat_asset_id=cfg.CAT_ASSET_ID)
         open_offers = [o for o in all_open if o.get("tier") not in ("boost", "sniper")]
-        # Filter against live wallet snapshot — avoid targeting offers that
-        # already filled/expired this cycle (DB lags 1 cycle behind wallet).
-        if live_offer_ids is not None:
-            open_offers = [
-                o for o in open_offers if o.get("trade_id") in live_offer_ids
-            ]
+        # Wallet omission is diagnostic only.  Durable nonterminal rows remain
+        # capacity-owning until Task 9 commits exact terminal proof.
         # Sort most-at-risk first so cancels prioritise the stale-est offers.
         open_offers = self._sort_open_offers_for_requote(
             open_offers, side, mid_price=current_price
@@ -4598,29 +4583,16 @@ class OfferManager:
                 if c.get("designation", "") in _TRADING_DESIGS
                 and c.get("assigned_tier", "none") not in _SKIP_TIERS
             )
-        except Exception:
-            # Fallback to raw RPC count if DB query fails
-            try:
-                wallet_id = cfg.CAT_WALLET_ID if side == "sell" else cfg.WALLET_ID_XCH
-                _resp = get_exact_spendable_coins_rpc(wallet_id)
-                if _resp:
-                    _coins = _resp.get(
-                        "confirmed_records",
-                        _resp.get("coin_records", _resp.get("records", [])),
-                    )
-                    spare_count = len(_coins) if _coins else 0
-                    if get_wallet_type() != "sage":
-                        try:
-                            _open = len(
-                                get_open_offers(
-                                    side=side, cat_asset_id=cfg.CAT_ASSET_ID
-                                )
-                            )
-                            spare_count = max(0, spare_count - _open)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        except Exception as exc:
+            # The durable free-pool query is the reservation authority.  A
+            # wallet count cannot safely replace it because it omits Task 4
+            # selections and could create over a protected offer.
+            log_event(
+                "warning",
+                "requote_spare_query_blocked",
+                f"Requote {side}: durable spare query failed closed: {exc}",
+            )
+            spare_count = 0
 
         log_event(
             "info",
@@ -6492,19 +6464,20 @@ class OfferManager:
     # -------------------------------------------------------------------
 
     def cleanup_expired(self) -> int:
-        """Find and cancel expired offers.
+        """Observe locally expired offers without inferring terminality.
 
-        The Chia wallet doesn't auto-expire offers — they stay "open" forever.
-        We must check valid_times.max_time manually and cancel stale ones.
+        Adapter and database compatibility helpers are both fail-closed. They
+        may report diagnostics, but Task 9 owns cancellation/expiry proof and
+        the associated reservation mutation.
         """
         count = cleanup_expired_offers()
         return _wallet_mutation_count(count) + len(self.cleanup_expired_db_offers())
 
     def cleanup_expired_db_offers(self) -> List[str]:
-        """Retire DB-open offers whose local expires_at has elapsed.
+        """Run the guarded legacy expiry probe for observability.
 
-        Pending-cancel rows deliberately stay open until Dexie/Spacescan
-        verification resolves them as cancelled, expired, or filled.
+        All durable offer rows remain open until authoritative Task 9 proof;
+        local time and pending-cancel observations cannot retire them.
         """
         try:
             from database import expire_open_offers_by_time

@@ -3,6 +3,8 @@ import tempfile
 import unittest
 import importlib
 import sys
+import hashlib
+import json
 from decimal import Decimal
 
 
@@ -15,6 +17,108 @@ def _load_real_database_module():
 
 
 database = _load_real_database_module()
+
+
+_TEST_WALLET = "f" * 64
+_TEST_NETWORK = "mainnet"
+_TEST_PREPARED_AT = "2026-01-01T00:00:00+00:00"
+_TEST_FILLED_AT = "2026-03-28T00:00:00+00:00"
+_TEST_RECONCILED_AT = "2026-12-31T00:00:00+00:00"
+
+
+def _authoritatively_terminalize_offer(
+    trade_id,
+    *,
+    classification="FILLED_PROVEN",
+    selected_coin_ids=None,
+    filled_at=_TEST_FILLED_AT,
+):
+    """Build exact Task 4 state and cross Task 9's sole terminal boundary."""
+
+    offer = database.get_offer(trade_id)
+    if offer is None:
+        raise AssertionError(f"missing offer fixture: {trade_id}")
+    identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
+    intent_id = f"verified-fill-test:{identity}"
+    selected = list(
+        selected_coin_ids
+        or [hashlib.sha256(f"selected:{trade_id}".encode("utf-8")).hexdigest()]
+    )
+    for coin_id in selected:
+        database.upsert_coin(
+            coin_id,
+            "xch" if offer["side"] == "buy" else "cat",
+            1,
+            tier=offer.get("tier") or "unknown",
+        )
+    wallet_identity = {
+        "wallet_fingerprint_hash": _TEST_WALLET,
+        "network": _TEST_NETWORK,
+    }
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id="verified-fill-test-run",
+        wallet_fingerprint_hash=_TEST_WALLET,
+        network=_TEST_NETWORK,
+        asset_id=offer["cat_asset_id"],
+        side=offer["side"],
+        tier=offer.get("tier") or "unknown",
+        purpose="verified_fill_test",
+        slot_key=f"verified-fill-test-slot:{identity}",
+        generation=0,
+        offered_amount_atomic="1",
+        requested_amount_atomic="1",
+        selected_coin_ids_json=selected,
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "authoritative intent"},
+        prepared_at=_TEST_PREPARED_AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=hashlib.sha256(
+            f"offer:{trade_id}".encode("utf-8")
+        ).hexdigest(),
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "authoritative creation"},
+        finalized_at=_TEST_PREPARED_AT,
+        finalize_selected_coin_reservations=True,
+    )
+    evidence = {"fixture": "authoritative terminal proof", "trade_id": trade_id}
+    evidence_json = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    terminal = {}
+    if classification == "FILLED_PROVEN":
+        terminal = {
+            "transaction_id": hashlib.sha256(
+                f"transaction:{trade_id}".encode("utf-8")
+            ).hexdigest(),
+            "block_height": 42,
+            "receive_coin_id": hashlib.sha256(
+                f"receive:{trade_id}".encode("utf-8")
+            ).hexdigest(),
+            "receive_amount_mojos": 1,
+            "filled_at": filled_at,
+        }
+    return database.commit_offer_reconciliation(
+        intent_id=intent_id,
+        operation_id=f"reconcile:{intent_id}",
+        classification=classification,
+        reason_code="TEST_AUTHORITATIVE_PROOF",
+        wallet_identity_json=wallet_identity,
+        evidence_json=evidence,
+        evidence_sha256=hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+        reconciled_at=_TEST_RECONCILED_AT,
+        **terminal,
+    )
 
 
 class DatabaseVerifiedFillsTests(unittest.TestCase):
@@ -137,15 +241,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             coin_id=coin_id,
         )
-        database.record_fill(
-            trade_id="trade-new",
-            side="sell",
-            price_xch=Decimal("0.001"),
-            size_xch=Decimal("0.1"),
-            size_cat=Decimal("100"),
-            cat_asset_id=asset_id,
-            tier="inner",
-        )
+        _authoritatively_terminalize_offer("trade-new")
 
         summary = database.get_offer_coin_usage_summary(coin_id, asset_id)
 
@@ -169,15 +265,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            database.record_fill(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-            )
+            _authoritatively_terminalize_offer(trade_id)
 
         stats = database.get_stats(asset_id)
 
@@ -205,16 +293,12 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            database.record_fill(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-                verification_status=status,
+            result = _authoritatively_terminalize_offer(trade_id)
+            database.get_connection().execute(
+                "UPDATE fills SET verification_status=? WHERE fill_id=?",
+                (status, result["fill_id"]),
             )
+            database.get_connection().commit()
 
         stats = database.get_stats(asset_id)
 
@@ -239,15 +323,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            database.record_fill(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-            )
+            _authoritatively_terminalize_offer(trade_id)
 
         unmatched = database.get_unmatched_fills(asset_id, "sell")
 
@@ -257,9 +333,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
     def test_fill_and_expiry_update_all_locked_coins_for_trade(self):
         conn = database.get_connection()
         asset_id = "asset-test"
+        coin_a = hashlib.sha256(b"trade-multi-a").hexdigest()
+        coin_b = hashlib.sha256(b"trade-multi-b").hexdigest()
 
-        database.upsert_coin("0xcoin-a", "xch", 2200000000000)
-        database.upsert_coin("0xcoin-b", "xch", 220000000000)
         database.add_offer(
             trade_id="trade-multi",
             side="buy",
@@ -268,19 +344,10 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("22000"),
             cat_asset_id=asset_id,
             tier="inner",
-            coin_id="0xcoin-a",
+            coin_id=coin_a,
         )
-        database.lock_coin("0xcoin-a", "trade-multi")
-        database.lock_coin("0xcoin-b", "trade-multi")
-
-        database.record_fill(
-            trade_id="trade-multi",
-            side="buy",
-            price_xch=Decimal("0.1"),
-            size_xch=Decimal("2.2"),
-            size_cat=Decimal("22000"),
-            cat_asset_id=asset_id,
-            tier="inner",
+        _authoritatively_terminalize_offer(
+            "trade-multi", selected_coin_ids=[coin_a, coin_b]
         )
 
         rows = conn.execute(
@@ -297,14 +364,16 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 )
                 for row in rows
             ],
-            [
-                ("0xcoin-a", "spent", "unknown", "none"),
-                ("0xcoin-b", "spent", "unknown", "none"),
-            ],
+            sorted(
+                [
+                    (database.norm_coin_id(coin_a), "spent", "unknown", "none"),
+                    (database.norm_coin_id(coin_b), "spent", "unknown", "none"),
+                ]
+            ),
         )
 
-        database.upsert_coin("0xcoin-c", "cat", 10473000)
-        database.upsert_coin("0xcoin-d", "cat", 2095000)
+        coin_c = hashlib.sha256(b"trade-expire-c").hexdigest()
+        coin_d = hashlib.sha256(b"trade-expire-d").hexdigest()
         database.add_offer(
             trade_id="trade-expire",
             side="sell",
@@ -313,21 +382,26 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("8446"),
             cat_asset_id=asset_id,
             tier="mid",
-            coin_id="0xcoin-c",
+            coin_id=coin_c,
         )
-        database.lock_coin("0xcoin-c", "trade-expire")
-        database.lock_coin("0xcoin-d", "trade-expire")
-        database.update_offer_status("trade-expire", "expired")
+        _authoritatively_terminalize_offer(
+            "trade-expire",
+            classification="EXPIRED_PROVEN",
+            selected_coin_ids=[coin_c, coin_d],
+        )
 
         rows = conn.execute(
-            "SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN ('0xcoin-c', '0xcoin-d') ORDER BY coin_id"
+            "SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN (?, ?) ORDER BY coin_id",
+            (database.norm_coin_id(coin_c), database.norm_coin_id(coin_d)),
         ).fetchall()
         self.assertEqual(
             [(row["coin_id"], row["status"], row["trade_id"]) for row in rows],
-            [
-                ("0xcoin-c", "free", None),
-                ("0xcoin-d", "free", None),
-            ],
+            sorted(
+                [
+                    (database.norm_coin_id(coin_c), "free", None),
+                    (database.norm_coin_id(coin_d), "free", None),
+                ]
+            ),
         )
 
     def test_stats_net_position_honors_fresh_run_cutoff(self):
@@ -364,7 +438,6 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         conn = database.get_connection()
         asset_id = "asset-test"
 
-        database.upsert_coin("0xcoin-upgrade", "xch", 240000000000)
         database.add_offer(
             trade_id="trade-upgrade",
             side="sell",
@@ -375,10 +448,13 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="extreme",
             coin_id="0xcoin-upgrade",
         )
-        database.lock_coin("0xcoin-upgrade", "trade-upgrade")
+        conn.execute(
+            "UPDATE offers SET cancelled_at=? WHERE trade_id=?",
+            ("2026-02-01T00:00:00+00:00", "trade-upgrade"),
+        )
+        conn.commit()
 
-        self.assertTrue(database.update_offer_status("trade-upgrade", "cancelled"))
-        self.assertTrue(database.update_offer_status("trade-upgrade", "filled"))
+        _authoritatively_terminalize_offer("trade-upgrade")
 
         row = conn.execute(
             "SELECT status, filled_at, cancelled_at FROM offers WHERE trade_id=?",
@@ -390,6 +466,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
     def test_backfill_verified_fills_from_filled_offers_repairs_stats(self):
         asset_id = "asset-test"
+        conn = database.get_connection()
 
         database.add_offer(
             trade_id="trade-backfill",
@@ -401,7 +478,12 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="outer",
             coin_id="0xcoin-backfill",
         )
-        self.assertTrue(database.update_offer_status("trade-backfill", "filled"))
+        conn.execute(
+            "UPDATE offers SET status='filled', lifecycle_state='filled', filled_at=? "
+            "WHERE trade_id=?",
+            ("2026-03-27T20:00:00+00:00", "trade-backfill"),
+        )
+        conn.commit()
 
         stats_before = database.get_stats(asset_id)
         self.assertEqual(stats_before["total_fills"], 0)
@@ -434,8 +516,10 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="mid",
             coin_id="0xcoin-upgrade-verified",
         )
-        self.assertTrue(
-            database.update_offer_status("trade-upgrade-verified", "filled")
+        conn.execute(
+            "UPDATE offers SET status='filled', lifecycle_state='filled', filled_at=? "
+            "WHERE trade_id=?",
+            ("2026-03-27T20:00:00+00:00", "trade-upgrade-verified"),
         )
 
         conn.execute(

@@ -1168,6 +1168,9 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             setattr, coin_manager.cfg, "BUY_LADDER_REVERSED", original_reversed
         )
         coin_manager.cfg.BUY_LADDER_REVERSED = False
+        update_counts_patcher = patch.object(manager, "update_coin_counts")
+        update_counts_patcher.start()
+        self.addCleanup(update_counts_patcher.stop)
 
         with (
             patch.dict(sys.modules, {"wallet": fake_wallet}),
@@ -1334,6 +1337,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(manager, "get_trading_pace", return_value="normal")
             )
+            stack.enter_context(patch.object(manager, "update_coin_counts"))
             stack.enter_context(
                 patch.object(
                     manager,
@@ -1420,6 +1424,9 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             setattr, coin_manager.cfg, "BUY_LADDER_REVERSED", original_reversed
         )
         coin_manager.cfg.BUY_LADDER_REVERSED = False
+        update_counts_patcher = patch.object(manager, "update_coin_counts")
+        update_counts_patcher.start()
+        self.addCleanup(update_counts_patcher.stop)
 
         with (
             patch.dict(sys.modules, {"wallet": fake_wallet}),

@@ -26,6 +26,7 @@ STABILITY_TABLES = {
     "runtime_mutation_lease",
     "runtime_worker_delegations",
     "publication_outbox",
+    "stability_migration_watermarks",
 }
 
 AT = "2026-08-15T12:00:00.000000Z"
@@ -164,6 +165,7 @@ def _prepare_intent(
     requested_amount_atomic: str = "340282366920938463463374607431768211457",
     selected_coin_ids_json=None,
     generation=7,
+    slot_key="asset-a:buy:inner",
 ):
     return database.prepare_offer_intent(
         intent_id=intent_id,
@@ -176,7 +178,7 @@ def _prepare_intent(
         side="buy",
         tier="inner",
         purpose="ladder",
-        slot_key="asset-a:buy:inner",
+        slot_key=slot_key,
         generation=generation,
         parent_intent_id=None,
         offered_amount_atomic=offered_amount_atomic,
@@ -368,6 +370,28 @@ def test_stability_migration_rejects_wrong_unique_partial_index(isolated_databas
         database.init_database()
 
 
+def test_stability_migration_upgrades_previous_global_active_slot_index(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP INDEX uniq_offer_intents_active_slot_generation")
+        conn.execute(database._PREVIOUS_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL)
+    database._db_initialized_path = ""
+
+    database.init_database()
+
+    with sqlite3.connect(isolated_database) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='uniq_offer_intents_active_slot_generation'"
+        ).fetchone()
+    normalized = "".join(str(row[0]).lower().split())
+    assert "'unknown'" in normalized
+    assert "'conflicted'" in normalized
+
+
 def test_stability_migration_rejects_wrong_append_only_trigger(isolated_database):
     database.init_database()
     database.close_connection()
@@ -393,12 +417,6 @@ def test_stability_migration_upgrades_exact_legacy_boost_identity_trigger(
     with sqlite3.connect(isolated_database) as conn:
         conn.execute("DROP TRIGGER offer_fill_boost_commands_guarded_update")
         conn.executescript(database._LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL)
-        for trigger in (
-            "offer_fill_boost_effects_no_update",
-            "offer_fill_boost_effects_no_delete",
-        ):
-            conn.execute(f"DROP TRIGGER {trigger}")
-        conn.execute("DROP TABLE offer_fill_boost_effects")
     database._db_initialized_path = ""
 
     database.init_database()
@@ -1332,11 +1350,16 @@ def test_invalid_stored_safety_timestamp_fails_closed_and_rolls_back_migration(
 
 def test_schema_has_exact_identity_uniqueness_and_singletons(isolated_database):
     database.init_database()
-    _prepare_intent("intent-a")
+    _prepare_intent("intent-a", slot_key="identity-slot-a")
     _finalize_intent(
         "intent-a", trade_id=_sha("shared-trade"), offer_hash=_sha("offer-a")
     )
-    _prepare_intent("intent-b", generation=8)
+    _prepare_intent(
+        "intent-b",
+        generation=8,
+        slot_key="identity-slot-b",
+        selected_coin_ids_json=[_sha("identity-coin-b")],
+    )
 
     with pytest.raises(sqlite3.IntegrityError):
         _finalize_intent(
@@ -1348,7 +1371,12 @@ def test_schema_has_exact_identity_uniqueness_and_singletons(isolated_database):
     assert database.get_offer_intent("intent-b")["lifecycle_state"] == "prepared"
     assert len(database.get_offer_operation_events("create:intent-b")) == 1
 
-    _prepare_intent("intent-c", generation=9)
+    _prepare_intent(
+        "intent-c",
+        generation=9,
+        slot_key="identity-slot-c",
+        selected_coin_ids_json=[_sha("identity-coin-c")],
+    )
     with pytest.raises(sqlite3.IntegrityError):
         _finalize_intent(
             "intent-c",
@@ -2081,7 +2109,7 @@ def test_active_lifecycle_states_hold_one_database_enforced_slot_generation(
     assert database.get_offer_intent("intent-active-b") is None
 
 
-def test_terminal_creation_failure_releases_slot_but_generation_is_exact(
+def test_terminal_failure_releases_slot_until_replacement_becomes_active(
     isolated_database,
 ):
     database.init_database()
@@ -2096,10 +2124,11 @@ def test_terminal_creation_failure_releases_slot_but_generation_is_exact(
     )
 
     replacement = _prepare_intent("intent-failed-b")
-    later_generation = _prepare_intent("intent-next-generation", generation=8)
+    with pytest.raises(sqlite3.IntegrityError):
+        _prepare_intent("intent-next-generation", generation=8)
 
     assert replacement["lifecycle_state"] == "prepared"
-    assert later_generation["generation"] == 8
+    assert database.get_offer_intent("intent-next-generation") is None
 
 
 def test_racing_prepares_cannot_claim_same_active_slot_generation(

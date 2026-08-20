@@ -78,21 +78,33 @@ class TestPruneActiveSnipes(unittest.TestCase):
         s.prune_active_snipes({"tid1", "tid2"})
         self.assertEqual(sorted(s._active_snipe_ids), ["tid1", "tid2"])
 
-    def test_some_closed(self):
+    def test_wallet_absence_does_not_prune_some(self):
         s = self._make_sniper(["tid1", "tid2", "tid3"])
         s.prune_active_snipes({"tid1"})
-        self.assertEqual(s._active_snipe_ids, ["tid1"])
+        self.assertEqual(s._active_snipe_ids, ["tid1", "tid2", "tid3"])
 
-    def test_all_closed(self):
+    def test_wallet_absence_does_not_prune_all(self):
         s = self._make_sniper(["tid1", "tid2"])
         s.prune_active_snipes(set())
-        self.assertEqual(s._active_snipe_ids, [])
+        self.assertEqual(s._active_snipe_ids, ["tid1", "tid2"])
 
-    def test_side_tracking_pruned_too(self):
+    def test_wallet_absence_preserves_side_tracking(self):
         s = self._make_sniper(["tid1", "tid2"], {"tid1": "buy", "tid2": "sell"})
         s.prune_active_snipes({"tid1"})
         self.assertIn("tid1", s._active_snipe_sides)
-        self.assertNotIn("tid2", s._active_snipe_sides)
+        self.assertIn("tid2", s._active_snipe_sides)
+
+    def test_authoritative_terminal_proof_prunes_id_and_side(self):
+        s = self._make_sniper(["tid1", "tid2"], {"tid1": "buy", "tid2": "sell"})
+        with patch(
+            "database.get_authoritative_terminal_record",
+            side_effect=lambda trade_id: (
+                {"trade_id": trade_id} if trade_id == "tid2" else None
+            ),
+        ):
+            s.prune_active_snipes({"tid1"})
+        self.assertEqual(s._active_snipe_ids, ["tid1"])
+        self.assertEqual(s._active_snipe_sides, {"tid1": "buy"})
 
 
 # ---------------------------------------------------------------------------

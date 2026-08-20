@@ -309,30 +309,30 @@ class TestSniperPruneCycle(_TempDB):
                     sniper._active_snipe_sides[tid] = side
         return sniper
 
-    def test_prune_removes_closed_offer(self):
+    def test_wallet_absence_preserves_offer_without_terminal_proof(self):
         sniper = self._make_sniper_with_active(["tid-a", "tid-b"])
-        # tid-a closed (not in open set), tid-b still open
+        # Wallet omission is not authoritative terminal proof.
         sniper.prune_active_snipes({"tid-b"})
-        self.assertNotIn("tid-a", sniper._active_snipe_ids)
+        self.assertIn("tid-a", sniper._active_snipe_ids)
         self.assertIn("tid-b", sniper._active_snipe_ids)
 
-    def test_prune_clears_side_mapping(self):
+    def test_wallet_absence_preserves_side_mapping(self):
         sniper = self._make_sniper_with_active(["tid-fill"])
         sniper.prune_active_snipes(set())
-        self.assertNotIn("tid-fill", sniper._active_snipe_sides)
+        self.assertIn("tid-fill", sniper._active_snipe_sides)
 
-    def test_prune_empty_open_set_removes_all(self):
+    def test_empty_wallet_open_set_preserves_all_without_terminal_proof(self):
         sniper = self._make_sniper_with_active(["t1", "t2", "t3"])
         sniper.prune_active_snipes(set())
-        self.assertEqual(sniper._active_snipe_ids, [])
-        self.assertEqual(sniper._active_snipe_sides, {})
+        self.assertEqual(sniper._active_snipe_ids, ["t1", "t2", "t3"])
+        self.assertEqual(set(sniper._active_snipe_sides), {"t1", "t2", "t3"})
 
     def test_prune_noop_when_all_still_open(self):
         sniper = self._make_sniper_with_active(["t1", "t2"])
         sniper.prune_active_snipes({"t1", "t2", "t3"})
         self.assertEqual(len(sniper._active_snipe_ids), 2)
 
-    def test_after_prune_new_snipe_can_be_created(self):
+    def test_absence_does_not_free_snipe_capacity(self):
         fake_cfg = _fake_cfg()
         om = _fake_offer_manager()
         om.create_offer_with_retry.return_value = {
@@ -348,15 +348,15 @@ class TestSniperPruneCycle(_TempDB):
             sniper._active_snipe_ids.extend(["old-buy", "old-sell"])
             sniper._active_snipe_sides["old-buy"] = "buy"
             sniper._active_snipe_sides["old-sell"] = "sell"
-        # Prune both → cap freed
+        # Wallet omission alone cannot free the safety-accounted capacity.
         sniper.prune_active_snipes(set())
-        # Now try_snipe should be able to create new snipes
         with patch.object(_sniper_mod, "cfg", fake_cfg):
             results = sniper.try_snipe(
                 bid_price=Decimal("0.001"),
                 ask_price=Decimal("0.0011"),
             )
-        self.assertGreater(len(results), 0)
+        self.assertEqual(results, [])
+        om.create_offer_with_retry.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

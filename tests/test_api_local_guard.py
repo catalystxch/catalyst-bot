@@ -300,7 +300,13 @@ class TestApiLocalGuard(unittest.TestCase):
             "sage_version": "0.12.9",
             "sage_min_required_version": "0.12.10",
         }
-        with patch("chia_node.trigger_start", return_value=blocked):
+        with (
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
+            patch("chia_node.trigger_start", return_value=blocked),
+        ):
             resp = self.client.post(
                 "/api/sage/start-with-fingerprint",
                 json={"fingerprint": "1234567890"},

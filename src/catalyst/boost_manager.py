@@ -182,6 +182,22 @@ def _typed_replacement_cancel_outcomes(
     return outcomes
 
 
+def _has_authoritative_terminal_proof(trade_id: str) -> bool:
+    """Require the Task 9 proof journal in addition to Task 2 cancellation."""
+
+    try:
+        from database import get_authoritative_terminal_record
+
+        record = get_authoritative_terminal_record(trade_id)
+    except Exception:
+        return False
+    return bool(
+        type(record) is dict
+        and record.get("sage_trade_id") == trade_id
+        and record.get("terminal_state") in {"cancelled", "filled", "expired"}
+    )
+
+
 class BoostManager:
     """Adaptive gap-closing offers to improve Dexie ranking position.
 
@@ -356,10 +372,10 @@ class BoostManager:
 
         Returns dict with results and any warnings.
         """
-        if self._boost_active and self._active_boost_ids:
+        if self._active_boost_ids:
             return {
                 "success": False,
-                "error": "Close the Gap already active",
+                "error": "Close the Gap already has protected offers",
                 "active_count": len(self._active_boost_ids),
             }
 
@@ -611,6 +627,11 @@ class BoostManager:
             expected_identities,
             expected_authorities,
         )
+        for trade_id in trade_ids:
+            if outcomes.get(trade_id) == CANCEL_CONFIRMED and not (
+                _has_authoritative_terminal_proof(trade_id)
+            ):
+                outcomes[trade_id] = CANCEL_UNKNOWN
         for trade_id, outcome in outcomes.items():
             if outcome == CANCEL_FAILED:
                 # A proved no-effect failure leaves the old offer active.
@@ -632,35 +653,50 @@ class BoostManager:
             if not self._boost_active and not self._active_boost_ids:
                 return {"success": True, "message": "Close the Gap already inactive"}
 
-            cancelled = 0
-            failed = 0
-
             # Snapshot IDs under the lock so the network cancel runs on a
             # stable list (we release the lock for the cancel RPC below to
             # avoid holding it across a wallet call).
             to_cancel = list(self._active_boost_ids)
             offer_mgr = self._offer_manager
 
+        outcomes = {}
         if to_cancel and offer_mgr:
-            for tid in to_cancel:
-                offer_mgr._bot_cancelled_ids.add(tid)
-            result = offer_mgr.cancel_offers(
+            outcomes = self._request_replacement_cancels(
                 to_cancel,
                 reason="gap_closer_deactivate",
                 skip_confirmation=True,
             )
-            # cancel_offers returns {trade_id: {"success": bool, ...}, ...}
-            # — NOT {"cancelled": N, "failed": N}. Count by iterating values.
-            if isinstance(result, dict):
-                for _tid, _res in result.items():
-                    if isinstance(_res, dict) and _res.get("success"):
-                        cancelled += 1
-                    else:
-                        failed += 1
+        confirmed_ids = {
+            trade_id
+            for trade_id in to_cancel
+            if outcomes.get(trade_id) == CANCEL_CONFIRMED
+        }
+        cancelled = len(confirmed_ids)
+        failed = sum(outcomes.get(trade_id) == CANCEL_FAILED for trade_id in to_cancel)
+        pending = len(to_cancel) - cancelled - failed
 
         with self._lock:
+            self._active_boost_ids = [
+                trade_id
+                for trade_id in self._active_boost_ids
+                if trade_id not in confirmed_ids
+            ]
+            if self._active_boost_ids:
+                self._boost_active = True
+                log_event(
+                    "warning",
+                    "gap_closer_deactivate_pending",
+                    "Close the Gap cancellation remains pending authoritative "
+                    f"reconciliation for {len(self._active_boost_ids)} offer(s)",
+                )
+                return {
+                    "success": False,
+                    "cancelled": cancelled,
+                    "pending": len(self._active_boost_ids),
+                    "failed": failed,
+                }
+
             self._boost_active = False
-            self._active_boost_ids.clear()
             self._boost_mid_price = Decimal("0")
             self._gap_spread_bps = 0
             self._start_spread_bps = 0
@@ -703,6 +739,7 @@ class BoostManager:
         return {
             "success": True,
             "cancelled": cancelled,
+            "pending": pending,
             "failed": failed,
         }
 
@@ -1856,58 +1893,41 @@ class BoostManager:
     # -------------------------------------------------------------------
 
     def prune_active_boosts(self, open_trade_ids: set):
-        """Remove gap-closer IDs no longer open (filled or cancelled).
+        """Prune only offers carrying exact Task 9 terminal proof."""
+        import database
 
-        Also detects arb fills: if an offer disappeared but was NOT
-        bot-cancelled, it was arbed. This triggers spread widening.
-        """
         with self._lock:
             before = len(self._active_boost_ids)
-
-            bot_cancelled = set()
-            if self._offer_manager:
-                bot_cancelled = self._offer_manager._bot_cancelled_ids
-
             now = time.time()
+            terminal_ids = set()
             # Iterate over a snapshot so _on_inverted_arb() cannot mutate the
             # list out from under us.
             for tid in list(self._active_boost_ids):
-                if tid not in open_trade_ids and tid not in bot_cancelled:
-                    # Before declaring arb, check if this offer simply expired.
-                    expiry_time = self._boost_id_expiry.get(tid, 0)
-                    if expiry_time > 0 and now >= (expiry_time - 5):
-                        log_event(
-                            "debug",
-                            "gap_closer_offer_expired",
-                            f"Gap closer offer {tid[:16]}… expired naturally (not arbed)",
-                        )
-                    else:
-                        # Inverted-mode arb detection: identify which side the
-                        # missing trade_id belongs to. Check both the CURRENT
-                        # probe TID and the per-side HISTORY set (a fill can
-                        # arrive late, after the bot rotated to a new probe
-                        # whose TID we now hold as the "current" one). The
-                        # history catches that race.
-                        if (
-                            tid == self._buy_probe_tid
-                            or tid in self._buy_probe_tid_history
-                        ):
-                            self._on_inverted_arb("buy")
-                        elif (
-                            tid == self._sell_probe_tid
-                            or tid in self._sell_probe_tid_history
-                        ):
-                            self._on_inverted_arb("sell")
-                        else:
-                            self._arb_count += 1
-                            log_event(
-                                "warning",
-                                "gap_closer_arb_unknown_side",
-                                f"Probe {tid[:16]}… arbed but didn't match any tracked probe TID",
-                            )
+                if tid in open_trade_ids:
+                    continue
+                try:
+                    terminal = database.get_authoritative_terminal_record(tid)
+                except Exception:
+                    terminal = None
+                if terminal is None:
+                    continue
+                terminal_ids.add(tid)
+                if terminal.get("terminal_state") != "filled":
+                    continue
+                if tid == self._buy_probe_tid or tid in self._buy_probe_tid_history:
+                    self._on_inverted_arb("buy")
+                elif tid == self._sell_probe_tid or tid in self._sell_probe_tid_history:
+                    self._on_inverted_arb("sell")
+                else:
+                    self._arb_count += 1
+                    log_event(
+                        "warning",
+                        "gap_closer_arb_unknown_side",
+                        f"Probe {tid[:16]}… filled but did not match a tracked side",
+                    )
 
             self._active_boost_ids = [
-                tid for tid in self._active_boost_ids if tid in open_trade_ids
+                tid for tid in self._active_boost_ids if tid not in terminal_ids
             ]
             # Clean up stale expiry entries older than 5 minutes
             self._boost_id_expiry = {

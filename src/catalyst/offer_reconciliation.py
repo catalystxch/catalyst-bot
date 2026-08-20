@@ -2392,17 +2392,30 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
         if type(stored_command) is dict and type(materialization) is not dict:
             intent = database.get_offer_intent_by_trade_id(trade_id)
             if type(intent) is dict:
-                database.trip_runtime_safety_latch(
-                    reason_code="BOOST_COMMAND_MISSING_MATERIALIZATION",
-                    reason=(
-                        "A legacy Boost command has no immutable pre-effect state; "
-                        "capturing current manager state would rebind its meaning"
-                    ),
-                    blocking_operation_ids=[f"boost-fill:{int(fill['fill_id'])}"],
-                    wallet_fingerprint_hash=intent["wallet_fingerprint_hash"],
-                    network=intent["network"],
-                    tripped_at=fill["filled_at"],
+                wallet_binding = intent["wallet_fingerprint_hash"]
+                network_binding = intent["network"]
+            else:
+                latch = database.get_runtime_safety_latch()
+                lease = database.get_runtime_mutation_lease()
+                wallet_binding = (
+                    latch.get("wallet_fingerprint_hash")
+                    or lease.get("wallet_fingerprint_hash")
+                    or hashlib.sha256(b"legacy-boost-unbound-wallet").hexdigest()
                 )
+                network_binding = (
+                    latch.get("network") or lease.get("network") or "legacy-unbound"
+                )
+            database.trip_runtime_safety_latch(
+                reason_code="BOOST_COMMAND_MISSING_MATERIALIZATION",
+                reason=(
+                    "A legacy Boost command has no immutable pre-effect state; "
+                    "capturing current manager state would rebind its meaning"
+                ),
+                blocking_operation_ids=[f"boost-fill:{int(fill['fill_id'])}"],
+                wallet_fingerprint_hash=wallet_binding,
+                network=network_binding,
+                tripped_at=fill["filled_at"],
+            )
             raise RuntimeError(
                 "legacy Boost command is missing immutable materialization"
             )

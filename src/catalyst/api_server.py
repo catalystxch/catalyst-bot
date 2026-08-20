@@ -2716,29 +2716,27 @@ def _reset_fresh_run_session(
 ) -> Dict:
     """Reset session-facing bot state.
 
-    Two modes controlled by ``preserve_history``:
+    Two request modes are retained for client compatibility:
 
     * ``preserve_history=False`` (default / legacy / "Start Fresh"):
-        Clears fills, round-trips, position baseline, and runtime stats
-        in addition to anything the caller opted into via the other flags.
-        Equivalent to "wipe everything and start over" — used when the
-        operator explicitly picks Start Fresh or when switching CATs.
+        Requests the broad legacy reset. The database guard refuses the
+        operation without mutation whenever authoritative fills, protected
+        offers, intents, or reservations exist; proof and fill history are
+        never deleted. Empty legacy state remains reset-compatible.
 
     * ``preserve_history=True`` (coin-prep re-run):
         Keeps the fills / round-trips tables and the position baseline.
-        Coin prep can still opt into ``clear_coins`` and
-        ``cancel_open_offers`` because those records refer to coin IDs
-        that are about to be destroyed by the re-split — but the user's
-        trading history survives the re-prep. This is the 2026-04-19
-        default for the Prepare Coins flow; users who actually want a
-        full wipe can pick the explicit Start Fresh button.
+        Coin prep can still request coin and offer cleanup, but the same
+        authority guard preserves every protected row and lock. This is the
+        default Prepare Coins flow.
     """
     global _run_history_cutoff, _session_start_time
 
-    from database import _sqlite_ts
+    from database import _sqlite_ts, guarded_reset_authoritative_state
 
     reset_at = _sqlite_ts(datetime.now(timezone.utc))
     summary = {
+        "success": True,
         "reset_at": reset_at,
         "preserve_history": bool(preserve_history),
         "fills_cleared": 0,
@@ -2749,66 +2747,19 @@ def _reset_fresh_run_session(
         "inventory_cleared": False,
     }
 
-    conn = get_connection()
-    try:
-        has_round_trips = bool(
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-            ).fetchone()
-        )
-
-        if not preserve_history:
-            # Only count rows we're actually going to delete.
-            summary["fills_cleared"] = int(
-                (conn.execute("SELECT COUNT(*) as cnt FROM fills").fetchone()["cnt"])
-                or 0
-            )
-            if has_round_trips:
-                summary["round_trips_cleared"] = int(
-                    (
-                        conn.execute(
-                            "SELECT COUNT(*) as cnt FROM round_trips"
-                        ).fetchone()["cnt"]
-                    )
-                    or 0
-                )
-
-        if clear_coins:
-            summary["coins_cleared"] = int(
-                (conn.execute("SELECT COUNT(*) as cnt FROM coins").fetchone()["cnt"])
-                or 0
-            )
-
-        if not preserve_history:
-            conn.execute("DELETE FROM fills")
-            if has_round_trips:
-                conn.execute("DELETE FROM round_trips")
-        if clear_coins:
-            conn.execute("DELETE FROM coins")
-        if cancel_open_offers:
-            cursor = conn.execute(
-                "UPDATE offers SET status='cancelled' WHERE status='open'"
-            )
-            summary["open_offers_cancelled"] = int(cursor.rowcount or 0)
-        if clear_price_history:
-            try:
-                conn.execute("DELETE FROM price_history")
-                summary["price_history_cleared"] = True
-            except Exception:
-                summary["price_history_cleared"] = False
-        if clear_inventory:
-            try:
-                conn.execute("DELETE FROM inventory_snapshots")
-                summary["inventory_cleared"] = True
-            except Exception:
-                summary["inventory_cleared"] = False
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
+    db_summary = guarded_reset_authoritative_state(
+        clear_fills=not preserve_history,
+        clear_round_trips=not preserve_history,
+        clear_coins=clear_coins,
+        cancel_open_offers=cancel_open_offers,
+        clear_price_history=clear_price_history,
+        clear_inventory=clear_inventory,
+    )
+    summary.update(db_summary)
+    if not summary["success"]:
+        summary["reset_at"] = reset_at
+        summary["preserve_history"] = bool(preserve_history)
+        return summary
 
     if not preserve_history:
         # Advance the run-history cutoff so dashboard queries (/api/logs,

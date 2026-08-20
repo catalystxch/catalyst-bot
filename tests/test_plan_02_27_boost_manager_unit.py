@@ -492,13 +492,13 @@ class TestReplacementCancellationBoundary(unittest.TestCase):
     def test_offer_manager_metadata_envelope_preserves_all_typed_outcomes(self):
         trade_id = "1" * 64
         intent_id = "a" * 64
-        expected = (
-            CANCEL_CONFIRMED,
-            CANCEL_FAILED,
-            CANCEL_SUBMITTED_UNCONFIRMED,
-            CANCEL_UNKNOWN,
-        )
-        for outcome in expected:
+        expected = {
+            CANCEL_CONFIRMED: CANCEL_UNKNOWN,
+            CANCEL_FAILED: CANCEL_FAILED,
+            CANCEL_SUBMITTED_UNCONFIRMED: CANCEL_SUBMITTED_UNCONFIRMED,
+            CANCEL_UNKNOWN: CANCEL_UNKNOWN,
+        }
+        for outcome, expected_outcome in expected.items():
             with self.subTest(outcome=outcome):
                 envelope = _offer_manager_cancel_envelope(
                     outcome,
@@ -518,7 +518,7 @@ class TestReplacementCancellationBoundary(unittest.TestCase):
                     [trade_id], reason="metadata-envelope-test"
                 )
 
-                self.assertEqual(outcomes, {trade_id: outcome})
+                self.assertEqual(outcomes, {trade_id: expected_outcome})
                 if outcome == CANCEL_FAILED:
                     self.assertNotIn(trade_id, offer_manager._bot_cancelled_ids)
                 else:
@@ -632,6 +632,9 @@ class TestReplacementCancellationBoundary(unittest.TestCase):
             patch.object(_bm_mod.time, "time", return_value=1000),
             patch.object(_bm_mod.time, "sleep"),
             patch.object(manager, "_create_single_offer", return_value=new_offer),
+            patch.object(
+                _bm_mod, "_has_authoritative_terminal_proof", return_value=True
+            ),
             patch.object(_bm_mod, "log_event"),
         ):
             acted = manager.step_tighter(Decimal("0"))
@@ -1006,6 +1009,11 @@ class TestReplacementCancellationBoundary(unittest.TestCase):
         with (
             patch.object(_bm_mod, "cfg", config),
             patch.object(manager, "_find_stale_offers", return_value=stale),
+            patch.object(
+                _bm_mod,
+                "_has_authoritative_terminal_proof",
+                side_effect=lambda trade_id: trade_id == confirmed_trade_id,
+            ),
             patch.object(_bm_mod, "log_event"),
         ):
             result = manager.cascade_main_book(Decimal("0.0001"), stale, [])
@@ -1120,6 +1128,9 @@ class TestInvertedCascadeBroadcast(unittest.TestCase):
         with (
             patch.object(_bm_mod, "cfg", fake_cfg),
             patch("database.get_open_offers", side_effect=get_open_offers),
+            patch.object(
+                _bm_mod, "_has_authoritative_terminal_proof", return_value=True
+            ),
             patch.object(_bm_mod, "log_event"),
         ):
             mgr._cascade_after_inverted_floor()

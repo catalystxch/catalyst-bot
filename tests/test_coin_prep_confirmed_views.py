@@ -43,6 +43,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         fake_wallet.cancel_offer = lambda *args, **kwargs: {"success": True}
         fake_wallet.cancel_offers_batch = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_wallet_sync_status = lambda *args, **kwargs: {"synced": True}
+        fake_wallet.get_wallet_adapter_authority = lambda: None
+        fake_wallet.get_spendable_coin_count = lambda wallet_id: sys.modules[
+            "wallet_sage"
+        ].get_spendable_coin_count(wallet_id)
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_spendable_coins_rpc = lambda wallet_id: {
@@ -67,6 +71,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         fake_database.designate_reserve = lambda *args, **kwargs: True
         fake_database.get_reserve_coins = lambda *args, **kwargs: []
         fake_database.mark_coins_gone = lambda *args, **kwargs: True
+        fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 
         fake_wallet_sage = types.ModuleType("wallet_sage")

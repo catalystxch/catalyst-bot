@@ -155,6 +155,9 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
     """Status endpoint must surface worker crash state without hiding it."""
 
     def setUp(self):
+        import database
+
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
@@ -174,7 +177,10 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
         api_server._coin_prep_state["error"] = None
 
     def _get_status(self, bot=None):
-        with patch.object(api_server, "bot", bot):
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("wallet.get_spendable_coin_count", return_value=0),
+        ):
             return self.client.get(
                 "/api/coin-prep/status",
                 environ_base=_LOOPBACK,
@@ -253,6 +259,9 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
     """After a crash, the trigger endpoint must reset state cleanly."""
 
     def setUp(self):
+        import database
+
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN

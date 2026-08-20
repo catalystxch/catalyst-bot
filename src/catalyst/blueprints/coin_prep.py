@@ -1376,8 +1376,10 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
-        # Historical flag: full_reset=True means "Start Fresh" — wipes fills /
-        # round-trips / position baseline alongside the coin-shape reset.
+        # Historical flag: full_reset=True means "Start Fresh" and requests
+        # the broad legacy reset. The authoritative-state guard refuses it
+        # without mutation when fills, protected offers, intents, or locks
+        # exist; proof and fill history are never deleted.
         # Default False (2026-04-19) so a routine re-prep keeps the user's
         # trading history. 2026-04-21: superseded by the granular flags
         # below (reset_pnl / reset_offer_history / reset_counters) driven by
@@ -1459,12 +1461,11 @@ def _api_coin_prep_trigger_locked():
         # trips, position baseline, and market-intel stats all survive so
         # a routine re-prep doesn't destroy the user's trading record.
         #
-        # Under full_reset=True the call mirrors the pre-2026-04-19
-        # behaviour — fills and round-trips are deleted too. That path is
-        # opt-in, triggered from the GUI's "Start Fresh" button in the
-        # pre-prep confirm modal or the PnL tab's Reset Stats action.
+        # Under full_reset=True the caller requests the broad legacy reset.
+        # It remains opt-in, but authoritative or protected state produces a
+        # stable conflict instead of deleting fills, proofs, offers, or locks.
         try:
-            api_server._reset_fresh_run_session(
+            reset_summary = api_server._reset_fresh_run_session(
                 clear_coins=True,
                 clear_price_history=_prep_reset_pnl,
                 clear_inventory=True,
@@ -1476,12 +1477,15 @@ def _api_coin_prep_trigger_locked():
                     else "coin_prep_reprep_cleanup"
                 ),
             )
+            if not reset_summary["success"]:
+                return jsonify(reset_summary), 409
         except Exception as _clean_err:
             log_event(
                 "warning",
                 "fresh_start_cleanup_failed",
                 f"DB cleanup before coin prep failed: {_clean_err}",
             )
+            raise
 
         # Optional: delete terminal-state offer rows. Same SQL as the
         # standalone /api/reset/offer-history endpoint — live offers are
@@ -1490,30 +1494,26 @@ def _api_coin_prep_trigger_locked():
         # otherwise bloat the history view.
         if _prep_reset_offers:
             try:
-                conn = get_connection()
-                cur = conn.execute(
-                    "DELETE FROM offers "
-                    "WHERE status IN ('cancelled', 'filled', 'expired') "
-                    "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                    "                          'phantom_rejected', 'user_cancelled')"
+                from database import guarded_reset_authoritative_state
+
+                history_reset = guarded_reset_authoritative_state(
+                    clear_terminal_offers=True
                 )
-                deleted = int(cur.rowcount or 0)
-                conn.commit()
+                if not history_reset["success"]:
+                    return jsonify(history_reset), 409
+                deleted = int(history_reset["offers_deleted"])
                 log_event(
                     "info",
                     "coin_prep_offer_history_cleared",
                     f"Pre-prep: cleared {deleted} terminal-state offer rows",
                 )
             except Exception as _hist_err:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 log_event(
                     "warning",
                     "coin_prep_offer_history_failed",
                     f"Pre-prep offer-history clear failed: {_hist_err}",
                 )
+                raise
 
         # Optional: reset in-memory runtime counters (sniper / fill-tracker /
         # watchdog streaks / risk-manager position). Mirrors the counters

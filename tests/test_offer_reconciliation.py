@@ -83,6 +83,12 @@ def _clock_at(value: str = AT):
     return lambda: instant
 
 
+def _simulate_pre_watermark_stability_schema(conn) -> None:
+    """Model a database created before one-time Task 9 backfill completion."""
+
+    conn.execute("DROP TABLE stability_migration_watermarks")
+
+
 @pytest.fixture(autouse=True)
 def _socket_guard(monkeypatch):
     attempts: list[str] = []
@@ -4187,6 +4193,7 @@ def test_migration_audits_registered_boost_command_without_materialization(
         "VALUES (?, ?, 'buy', 'registered', ?, NULL)",
         (fill["fill_id"], TRADE, AFTER),
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -4222,6 +4229,7 @@ def test_legacy_boost_command_without_materialization_is_blocked_not_recaptured(
         "VALUES (?, ?, 'buy', 'registered', ?, NULL)",
         (fill["fill_id"], TRADE, AFTER),
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
     database._migrate_stability_schema()
@@ -4484,6 +4492,7 @@ def test_migration_backfills_prior_boost_effect_log_sink(
     ).fetchone()[0]
     conn.execute("DROP TABLE offer_fill_boost_log_sinks")
     conn.execute("DELETE FROM events WHERE id=?", (event_log_id,))
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -4524,6 +4533,7 @@ def test_migration_backfills_prior_sweep_effect_safety_summary(
     )
     conn = database.get_connection()
     conn.execute("DROP TABLE offer_fill_sweep_safety_state")
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5327,6 +5337,7 @@ def test_legacy_sweep_delivery_backfill_preflights_hard_cap(
         rows,
     )
     conn.execute("DROP TABLE offer_fill_sweep_delivery_queue")
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
     monkeypatch.setattr(database, "_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS", 1)
@@ -5369,6 +5380,7 @@ def test_legacy_sweep_receipt_without_effect_or_ack_is_requeued_and_applied_once
         (event_id, AFTER),
     )
     conn.execute("DROP TABLE offer_fill_sweep_migration_audit")
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5466,6 +5478,7 @@ def test_legacy_sweep_receipt_on_pending_queue_is_audited_and_acknowledged(
         (event_id, AFTER),
     )
     conn.execute("DROP TABLE offer_fill_sweep_migration_audit")
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5670,6 +5683,7 @@ def test_migration_reopens_unproven_legacy_boost_and_sweep_receipts(
             "WHERE fill_id=? AND hook_name=?",
             (AFTER, fill["fill_id"], hook_name),
         )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5711,6 +5725,7 @@ def test_migration_reopens_event_and_classification_receipts_without_sink_effect
             "WHERE fill_id=? AND hook_name=?",
             (AFTER, fill["fill_id"], hook_name),
         )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5832,6 +5847,7 @@ def test_migration_reopens_false_noop_ack_for_actual_boost_fill(
         "WHERE fill_id=? AND hook_name='boost_notification'",
         (AFTER, fill["fill_id"]),
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5883,6 +5899,7 @@ def test_migration_audits_unproven_receipt_when_outbox_was_missing(
         "WHERE fill_id=? AND hook_name='sweep_registration'",
         (fill["fill_id"],),
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -5983,6 +6000,7 @@ def test_schema_migration_backfills_outbox_for_existing_authoritative_fill(
     conn.execute(
         "DELETE FROM offer_fill_hook_outbox WHERE fill_id=?", (fill["fill_id"],)
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 
@@ -6011,6 +6029,7 @@ def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
     conn.execute(
         "DELETE FROM offer_fill_hook_outbox WHERE fill_id=?", (committed["fill_id"],)
     )
+    _simulate_pre_watermark_stability_schema(conn)
     conn.commit()
     database.close_connection()
 

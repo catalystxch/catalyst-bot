@@ -225,7 +225,7 @@ def api_boost_deactivate():
         return jsonify({"error": "Bot not initialised"}), 500
 
     result = bot.boost_manager.deactivate()
-    api_server.events.emit("boost", {"active": False})
+    api_server.events.emit("boost", bot.boost_manager.get_state())
     return jsonify(result)
 
 
