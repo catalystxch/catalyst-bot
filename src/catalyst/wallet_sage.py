@@ -5183,11 +5183,13 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
                 "created_height": c.get("created_height"),
                 "transaction_id": c.get("transaction_id"),
             }
+            asset_present = "asset_id" in c
             asset_value = c.get("asset_id")
-            if "asset_id" not in c and isinstance(c.get("asset"), dict):
+            if not asset_present and isinstance(c.get("asset"), dict):
+                asset_present = "asset_id" in c["asset"]
                 asset_value = c["asset"].get("asset_id")
-            if asset_value is not None:
-                record["asset_id"] = asset_value
+            if asset_present:
+                record["asset_id"] = "xch" if asset_value is None else asset_value
             owned_value = c.get("owned")
             if "owned" not in c:
                 owned_value = c.get("is_owned")

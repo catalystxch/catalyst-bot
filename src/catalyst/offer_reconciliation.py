@@ -73,6 +73,14 @@ _SENSITIVE_KEYS = frozenset(
         "signature",
     }
 )
+_MAX_CANONICAL_DEPTH = 64
+_MAX_CANONICAL_CONTAINER_ITEMS = 4096
+_MAX_CANONICAL_NODES = 100_000
+_MAX_CANONICAL_TEXT_BYTES = 8 * 1024 * 1024
+
+
+class _EvidenceEncodingError(ValueError):
+    """Raised when hostile evidence cannot be encoded exactly within bounds."""
 
 
 def _unknown(reason: str, **details: Any) -> dict[str, Any]:
@@ -172,24 +180,67 @@ def _status(value: Any) -> int | str | None:
     return None
 
 
-def _redact_json(value: Any, *, depth: int = 0) -> Any:
+def _redact_json(
+    value: Any,
+    *,
+    depth: int = 0,
+    state: dict[str, Any] | None = None,
+) -> Any:
+    if state is None:
+        state = {"nodes": 0, "text_bytes": 0, "active_containers": set()}
+    state["nodes"] += 1
+    if state["nodes"] > _MAX_CANONICAL_NODES:
+        raise _EvidenceEncodingError("evidence node cap exceeded")
+    if depth > _MAX_CANONICAL_DEPTH:
+        raise _EvidenceEncodingError("evidence depth cap exceeded")
     if type(value) is dict:
+        if len(value) > _MAX_CANONICAL_CONTAINER_ITEMS:
+            raise _EvidenceEncodingError("evidence object cap exceeded")
+        if any(type(key) is not str for key in value):
+            raise _EvidenceEncodingError("evidence object key is not text")
+        container_id = id(value)
+        if container_id in state["active_containers"]:
+            raise _EvidenceEncodingError("cyclic evidence container")
+        state["active_containers"].add(container_id)
         result: dict[str, Any] = {}
-        for key in sorted(value):
-            if type(key) is not str:
-                continue
-            if key.strip().lower() in _SENSITIVE_KEYS:
-                continue
-            result[key] = _redact_json(value[key], depth=depth + 1)
-        return result
+        try:
+            for key in sorted(value):
+                if key.strip().lower() in _SENSITIVE_KEYS:
+                    continue
+                result[key] = _redact_json(value[key], depth=depth + 1, state=state)
+            return result
+        finally:
+            state["active_containers"].remove(container_id)
     if type(value) is list:
-        return [_redact_json(item, depth=depth + 1) for item in value]
-    if type(value) in {str, int, bool} or value is None:
-        if type(value) is str and len(value) > 4096:
-            tail_digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        if len(value) > _MAX_CANONICAL_CONTAINER_ITEMS:
+            raise _EvidenceEncodingError("evidence list cap exceeded")
+        container_id = id(value)
+        if container_id in state["active_containers"]:
+            raise _EvidenceEncodingError("cyclic evidence container")
+        state["active_containers"].add(container_id)
+        try:
+            return [_redact_json(item, depth=depth + 1, state=state) for item in value]
+        finally:
+            state["active_containers"].remove(container_id)
+    if type(value) is str:
+        try:
+            encoded_text = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _EvidenceEncodingError("evidence text is not valid UTF-8") from exc
+        state["text_bytes"] += len(encoded_text)
+        if state["text_bytes"] > _MAX_CANONICAL_TEXT_BYTES:
+            raise _EvidenceEncodingError("evidence text cap exceeded")
+        if len(value) > 4096:
+            tail_digest = hashlib.sha256(encoded_text).hexdigest()
             return value[:256] + f"<redacted-long-text-sha256:{tail_digest}>"
         return value
-    return f"<{type(value).__name__}>"
+    if type(value) is int:
+        if value.bit_length() > 4096:
+            raise _EvidenceEncodingError("evidence integer cap exceeded")
+        return value
+    if type(value) is bool or value is None:
+        return value
+    raise _EvidenceEncodingError("evidence contains unsupported scalar")
 
 
 def canonical_evidence_and_digest(
@@ -202,7 +253,7 @@ def canonical_evidence_and_digest(
     redacted = _redact_json(evidence)
     full_encoded = json.dumps(
         redacted,
-        ensure_ascii=False,
+        ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -228,7 +279,7 @@ def canonical_evidence_and_digest(
         subset = exact_subset(redacted, list_limit=list_limit)
         subset_encoded = json.dumps(
             subset,
-            ensure_ascii=False,
+            ensure_ascii=True,
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -337,6 +388,39 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
     if age > _MAX_EVIDENCE_AGE_SECONDS or age < -30:
         return "EVIDENCE_STALE"
     effective_times: list[datetime] = []
+    identity = evidence.get("wallet_identity")
+    if (
+        type(identity) is not dict
+        or identity.get("complete") is not True
+        or type(identity.get("provenance")) is not str
+        or not identity["provenance"]
+    ):
+        return "WALLET_IDENTITY_INCOMPLETE"
+    if (
+        not _is_canonical_utc_text(identity.get("observed_at"))
+        or not _is_canonical_utc_text(identity.get("source_observed_at"))
+        or type(identity.get("source_observed_at_all")) is not list
+        or not identity["source_observed_at_all"]
+        or type(identity.get("read_observed_at")) is not list
+        or not identity["read_observed_at"]
+    ):
+        return "EVIDENCE_TIMESTAMP_INVALID"
+    for timestamp in [
+        identity["observed_at"],
+        *identity["source_observed_at_all"],
+        *identity["read_observed_at"],
+    ]:
+        if not _is_canonical_utc_text(timestamp):
+            return "EVIDENCE_TIMESTAMP_INVALID"
+        parsed = _parse_utc(timestamp)
+        if parsed is None:
+            return "EVIDENCE_TIMESTAMP_INVALID"
+        timestamp_age = (top_observed - parsed).total_seconds()
+        if timestamp_age < -30 or timestamp_age > _MAX_EVIDENCE_AGE_SECONDS:
+            return "EVIDENCE_STALE"
+    effective_times.extend(
+        _parse_utc(timestamp) for timestamp in identity["source_observed_at_all"]
+    )
     for name, reason in (
         ("offer_history", "OFFER_HISTORY_INCOMPLETE"),
         ("transaction_history", "TRANSACTION_HISTORY_INCOMPLETE"),
@@ -460,7 +544,7 @@ def _offer_summary_matches(intent: dict[str, Any], offer: Any) -> bool:
 
 
 def _asset(value: Any) -> str:
-    if value in (None, "", "xch", 1, "1"):
+    if value == "xch":
         return "xch"
     return _hex_id(value)
 
@@ -666,6 +750,14 @@ def _basic_cancel_members(
             member.get("request_timestamp")
         ):
             return None
+        if (
+            not _hex_id(member.get("asset_id"))
+            or member.get("side") not in {"buy", "sell"}
+            or not _atomic_text(member.get("offered_amount_atomic"))
+            or not _atomic_text(member.get("requested_amount_atomic"))
+            or not _hex_id(member.get("offer_text_sha256"))
+        ):
+            return None
         selected = tuple(
             sorted(_hex_id(value) for value in member["selected_coin_ids"])
         )
@@ -742,6 +834,13 @@ def _validated_cancel_context(context: Any) -> dict[str, Any] | None:
                     _hex_id(value) for value in member["selected_coin_ids"]
                 ),
                 "request_timestamp": member["request_timestamp"],
+                "asset_id": _hex_id(member["asset_id"]),
+                "side": member["side"],
+                "offered_amount_atomic": _atomic_text(member["offered_amount_atomic"]),
+                "requested_amount_atomic": _atomic_text(
+                    member["requested_amount_atomic"]
+                ),
+                "offer_text_sha256": _hex_id(member["offer_text_sha256"]),
                 "transaction_id": (
                     _hex_id(member["transaction_id"])
                     if member.get("transaction_id") is not None
@@ -799,12 +898,12 @@ def _cancel_proof(
     ):
         return None
     expected_offer_inputs: set[str] = set()
-    member_trade_ids: set[str] = set()
+    expected_trade_by_coin: dict[str, str] = {}
     for member in members:
         trade_id = _hex_id(member["trade_id"])
         selected = {_hex_id(value) for value in member["selected_coin_ids"]}
         expected_offer_inputs.update(selected)
-        member_trade_ids.add(trade_id)
+        expected_trade_by_coin.update({coin_id: trade_id for coin_id in selected})
         matching = [
             row
             for row in offers
@@ -812,12 +911,27 @@ def _cancel_proof(
         ]
         if len(matching) != 1:
             return None
+        if (
+            trade_id != intent["sage_trade_id"]
+            and _status(matching[0].get("status")) not in _CANCELLED_STATUSES
+        ):
+            return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
+        member_intent = {
+            "sage_trade_id": trade_id,
+            "side": member["side"],
+            "asset_id": member["asset_id"],
+            "offered_amount": int(member["offered_amount_atomic"]),
+            "requested_amount": int(member["requested_amount_atomic"]),
+            "selected_coin_ids": tuple(sorted(selected)),
+        }
+        if not _offer_summary_matches(member_intent, matching[0]):
+            return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
         observed_selected = matching[0].get("selected_coin_ids")
-        if observed_selected is not None and (
+        if (
             type(observed_selected) is not list
             or {_hex_id(value) for value in observed_selected} != selected
         ):
-            return None
+            return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
         if _hex_id(matching[0].get("transaction_id")) != _hex_id(tx["transaction_id"]):
             return None
     if expected_offer_inputs & set(auxiliary):
@@ -831,6 +945,14 @@ def _cancel_proof(
         expected_offer_inputs | set(auxiliary)
     ):
         return None
+    for member in members:
+        selected = {_hex_id(value) for value in member["selected_coin_ids"]}
+        offered_asset = "xch" if member["side"] == "buy" else member["asset_id"]
+        member_flows = [spent_by_id[coin_id] for coin_id in selected]
+        if any(flow[1] != offered_asset for flow in member_flows) or sum(
+            flow[2] for flow in member_flows
+        ) != int(member["offered_amount_atomic"]):
+            return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
     for coin_id, flow in spent_by_id.items():
         record = coins.get(coin_id)
         if record is None or not _coin_matches_flow(record, flow, tx, spent=True):
@@ -838,10 +960,9 @@ def _cancel_proof(
         offer_id = _norm_id(record.get("offer_id"))
         if (
             coin_id in expected_offer_inputs
-            and offer_id
-            and offer_id not in member_trade_ids
+            and offer_id != expected_trade_by_coin[coin_id]
         ):
-            return None
+            return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
         if coin_id in auxiliary and (flow[1] != "xch" or offer_id):
             return None
     available = {flow[0]: flow for flow in created if flow}
@@ -935,6 +1056,32 @@ def _cancel_proof(
     }
 
 
+def _selected_inputs_are_exactly_owned_and_linked(
+    intent: dict[str, Any], coins: dict[str, dict[str, Any]]
+) -> bool:
+    offered_asset = "xch" if intent["side"] == "buy" else intent["asset_id"]
+    selected_total = 0
+    for coin_id in intent["selected_coin_ids"]:
+        record = coins.get(coin_id)
+        offer_link = _norm_id(record.get("offer_id")) if record else ""
+        amount = _positive_int(record.get("amount")) if record else None
+        if (
+            record is None
+            or record.get("owned") is not True
+            or record.get("spent_height") not in (None, 0)
+            or _asset(record.get("asset_id")) != offered_asset
+            or amount is None
+            or offer_link
+            not in {
+                intent["sage_trade_id"],
+                _norm_id(intent["offer_text_sha256"]),
+            }
+        ):
+            return False
+        selected_total += amount
+    return selected_total == intent["offered_amount"]
+
+
 def classify_terminal_evidence(
     intent: Any,
     evidence: Any,
@@ -1016,6 +1163,8 @@ def classify_terminal_evidence(
         tx_time = _parse_utc(tx.get("timestamp"))
         if tx_time is not None and tx_time < exact_intent["offer_created_at"]:
             return _unknown("FILL_PREDATES_OFFER")
+        if tx_time is not None and tx_time > observed_now:
+            return _unknown("TRANSACTION_TIME_OUTSIDE_EVIDENCE_WINDOW")
     fill = _fill_proof(exact_intent, offer, tx, coins) if tx is not None else None
     cancel = (
         _cancel_proof(exact_intent, offer_rows, tx, coins, cancel_context)
@@ -1054,28 +1203,7 @@ def classify_terminal_evidence(
     if status in _CANCELLED_STATUSES:
         return _unknown("CANCEL_PROOF_INCOMPLETE")
     if status in _EXPIRED_STATUSES:
-        offered_asset = (
-            "xch" if exact_intent["side"] == "buy" else exact_intent["asset_id"]
-        )
-        selected_total = 0
-        for coin_id in exact_intent["selected_coin_ids"]:
-            record = coins.get(coin_id)
-            offer_link = _norm_id(record.get("offer_id")) if record else ""
-            if (
-                record is None
-                or record.get("owned") is not True
-                or record.get("spent_height") not in (None, 0)
-                or _asset(record.get("asset_id")) != offered_asset
-                or _positive_int(record.get("amount")) is None
-                or offer_link
-                not in {
-                    exact_intent["sage_trade_id"],
-                    _norm_id(exact_intent["offer_text_sha256"]),
-                }
-            ):
-                return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
-            selected_total += record["amount"]
-        if selected_total != exact_intent["offered_amount"]:
+        if not _selected_inputs_are_exactly_owned_and_linked(exact_intent, coins):
             return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
         return {
             "classification": EXPIRED_PROVEN,
@@ -1083,14 +1211,8 @@ def classify_terminal_evidence(
             "input_coins_owned_unlocked": True,
         }
     if status in _ACTIVE_STATUSES:
-        for coin_id in exact_intent["selected_coin_ids"]:
-            record = coins.get(coin_id)
-            if (
-                record is None
-                or record.get("owned") is not True
-                or record.get("spent_height") not in (None, 0)
-            ):
-                return _unknown("ACTIVE_INPUT_STATE_UNPROVEN")
+        if not _selected_inputs_are_exactly_owned_and_linked(exact_intent, coins):
+            return _unknown("ACTIVE_INPUT_STATE_UNPROVEN")
         return {
             "classification": ACTIVE_PROVEN,
             "reason_code": "AUTHORITATIVE_ACTIVE_PROOF",
@@ -1251,15 +1373,18 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
     if type(entry) is not dict:
         return None
     coin_id = _hex_id(entry.get("coin_id") or entry.get("name") or entry.get("id"))
+    asset_present = "asset_id" in entry
     asset_value = entry.get("asset_id")
-    if "asset_id" not in entry and type(entry.get("asset")) is dict:
+    if not asset_present and type(entry.get("asset")) is dict:
+        asset_present = "asset_id" in entry["asset"]
         asset_value = entry["asset"].get("asset_id")
-    asset_id = _asset(asset_value)
+    asset_id = "xch" if asset_present and asset_value is None else _asset(asset_value)
     raw_amount = entry.get("amount")
     amount_text = _atomic_text(raw_amount)
     address_kind = entry.get("address_kind")
     if (
         not coin_id
+        or not asset_present
         or not asset_id
         or not amount_text
         or address_kind not in {None, "own", "offer"}
@@ -1629,6 +1754,7 @@ def load_authoritative_evidence(
                 and type(identity.get("observed_at_utc")) is str
                 else []
             ),
+            "read_observed_at": [identity_read_at],
             "provenance": "wallet.get_wallet_identity",
             "complete": identity_valid,
             "read_error": identity_error,
@@ -1773,6 +1899,8 @@ def _incomplete_loader_evidence(
         "wallet_identity": {
             "observed_at": observed_at,
             "source_observed_at": None,
+            "source_observed_at_all": [],
+            "read_observed_at": [observed_at],
             "provenance": "wallet.get_wallet_identity",
             "complete": False,
             "read_error": "collection_exception",
@@ -1806,12 +1934,11 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
     classification_box: dict[str, Any] = {}
 
     def offer_filled_event(_row: dict[str, Any]) -> None:
-        persisted = database.log_event(
-            "info",
-            "offer_filled",
+        database.log_authoritative_offer_filled_once(
+            int(fill["fill_id"]),
             f"{str(fill['side']).upper()} offer {trade_id[:16]}... "
             "filled from authoritative on-chain proof",
-            data={
+            {
                 "fill_id": fill["fill_id"],
                 "trade_id": trade_id,
                 "side": fill["side"],
@@ -1819,9 +1946,8 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
                 "filled_at": fill["filled_at"],
                 "spent_block_index": fill.get("spent_block_index"),
             },
+            created_at=fill["filled_at"],
         )
-        if persisted is not True:
-            raise RuntimeError("offer_filled event was not persisted")
 
     def boost_notification(_row: dict[str, Any]) -> None:
         if str(fill.get("tier") or "").lower() != "boost":
@@ -1870,25 +1996,71 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
 
     import database
 
-    completed = set(database.get_offer_fill_hook_receipts(int(fill["fill_id"])))
     results: dict[str, str] = {}
     for hook_name, callback in _post_fill_hook_callbacks(fill).items():
-        if hook_name in completed:
-            results[hook_name] = "already_completed"
-            continue
         try:
-            callback(fill)
-            database.complete_offer_fill_hook(
-                int(fill["fill_id"]), hook_name, completed_at=completed_at
+            claim = database.claim_offer_fill_hook(
+                int(fill["fill_id"]), hook_name, claimed_at=completed_at
             )
         except Exception:
             results[hook_name] = "failed"
-            database.log_event(
-                "warning",
-                "authoritative_fill_hook_failed",
-                f"Post-fill hook {hook_name} failed for fill {fill['fill_id']}",
-                data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+            try:
+                database.log_event(
+                    "warning",
+                    "authoritative_fill_hook_claim_failed",
+                    f"Post-fill hook {hook_name} could not be claimed for fill "
+                    f"{fill['fill_id']}",
+                    data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+                )
+            except Exception:
+                pass
+            continue
+        if claim["status"] != "claimed":
+            results[hook_name] = claim["status"]
+            continue
+        claim_token = claim["claim_token"]
+        try:
+            callback(fill)
+        except Exception:
+            results[hook_name] = "failed"
+            database.fail_offer_fill_hook(
+                int(fill["fill_id"]),
+                hook_name,
+                claim_token,
+                error_code="CALLBACK_FAILED",
             )
+            try:
+                database.log_event(
+                    "warning",
+                    "authoritative_fill_hook_failed",
+                    f"Post-fill hook {hook_name} failed for fill {fill['fill_id']}",
+                    data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            database.complete_offer_fill_hook(
+                int(fill["fill_id"]),
+                hook_name,
+                claim_token,
+                completed_at=completed_at,
+            )
+        except Exception:
+            # The callback crossed its effect boundary.  A receipt failure is
+            # therefore uncertain and must retain the running claim: resetting
+            # it to pending would let replay duplicate the external effect.
+            results[hook_name] = "in_progress"
+            try:
+                database.log_event(
+                    "warning",
+                    "authoritative_fill_hook_receipt_uncertain",
+                    f"Post-fill hook {hook_name} receipt is uncertain for fill "
+                    f"{fill['fill_id']}",
+                    data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+                )
+            except Exception:
+                pass
         else:
             results[hook_name] = "completed"
     return results
@@ -1962,33 +2134,117 @@ def reconcile_offer(
         if exact_cancel_context is None:
             raise RuntimeError("proven cancellation lost its validated Task 8 context")
         durable_proof["cancel_context"] = exact_cancel_context
-    durable_json, evidence_sha256 = canonical_evidence_and_digest(durable_proof)
-    committed = database.commit_offer_reconciliation(
-        intent_id=intent["intent_id"],
-        operation_id=operation_id,
-        classification=result["classification"],
-        reason_code=result["reason_code"],
-        wallet_identity_json={
-            "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
-            "network": intent["network"],
-        },
-        evidence_json=durable_json,
-        evidence_sha256=evidence_sha256,
-        transaction_id=result.get("transaction_id"),
-        spend_identity=result.get("spend_identity"),
-        block_height=result.get("block_height"),
-        receive_coin_id=result.get("receive_coin_id"),
-        receive_amount_mojos=result.get("receive_amount_mojos"),
-        filled_at=result.get("filled_at"),
-        fee_mojos=result.get("fee_mojos", 0),
-        coin_rebindings=result.get("coin_rebindings", []),
-        cancel_context_json=(
-            exact_cancel_context
-            if result["classification"] == CANCELLED_PROVEN
-            else None
-        ),
-        reconciled_at=observed_at,
-    )
+    try:
+        durable_json, evidence_sha256 = canonical_evidence_and_digest(durable_proof)
+    except Exception:
+        encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
+        fallback_destination, fallback_evidence = _registry_evidence(
+            intent, encoding_result, observed_at
+        )
+        fallback_decision = authorize_transition(
+            RegistrySnapshot(records),
+            OfferReference(
+                intent_id=intent["intent_id"],
+                sage_trade_id=intent["sage_trade_id"],
+                offer_text_sha256=intent["offer_text_sha256"],
+            ),
+            fallback_destination,
+            intent["wallet_fingerprint_hash"],
+            intent["network"],
+            evidence=fallback_evidence,
+        )
+        if not fallback_decision.allowed:
+            _trip_denial_latch(
+                intent,
+                operation_id,
+                fallback_decision.code.value,
+                fallback_decision.reason,
+                observed_at,
+            )
+            return {
+                **encoding_result,
+                "applied": False,
+                "authorization_code": fallback_decision.code.value,
+            }
+        minimal_proof = {
+            "classification": encoding_result,
+            "evidence": {"encoding_failed": True, "redacted": True},
+        }
+        durable_json = json.dumps(
+            minimal_proof,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
+        committed = database.commit_offer_reconciliation(
+            intent_id=intent["intent_id"],
+            operation_id=operation_id,
+            classification=UNKNOWN,
+            reason_code=encoding_result["reason_code"],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
+                "network": intent["network"],
+            },
+            evidence_json=durable_json,
+            evidence_sha256=evidence_sha256,
+            transaction_id=None,
+            spend_identity=None,
+            block_height=None,
+            receive_coin_id=None,
+            receive_amount_mojos=None,
+            filled_at=None,
+            fee_mojos=0,
+            coin_rebindings=[],
+            cancel_context_json=None,
+            reconciled_at=observed_at,
+        )
+        return {
+            **encoding_result,
+            "applied": False,
+            "authorization_code": fallback_decision.code.value,
+            "evidence_sha256": evidence_sha256,
+            "event": committed["event"],
+            "idempotent": committed["idempotent"],
+        }
+    try:
+        committed = database.commit_offer_reconciliation(
+            intent_id=intent["intent_id"],
+            operation_id=operation_id,
+            classification=result["classification"],
+            reason_code=result["reason_code"],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
+                "network": intent["network"],
+            },
+            evidence_json=durable_json,
+            evidence_sha256=evidence_sha256,
+            transaction_id=result.get("transaction_id"),
+            spend_identity=result.get("spend_identity"),
+            block_height=result.get("block_height"),
+            receive_coin_id=result.get("receive_coin_id"),
+            receive_amount_mojos=result.get("receive_amount_mojos"),
+            filled_at=result.get("filled_at"),
+            fee_mojos=result.get("fee_mojos", 0),
+            coin_rebindings=result.get("coin_rebindings", []),
+            cancel_context_json=(
+                exact_cancel_context
+                if result["classification"] == CANCELLED_PROVEN
+                else None
+            ),
+            reconciled_at=observed_at,
+        )
+    except ValueError as exc:
+        if result["classification"] == CANCELLED_PROVEN and "Task 8" in str(exc):
+            _trip_denial_latch(
+                intent,
+                operation_id,
+                "TASK8_BINDING_CONFLICT",
+                "authoritative cancellation proof conflicts with durable Task 8 state",
+                observed_at,
+            )
+        raise
     response = {
         **result,
         "applied": result["classification"]
