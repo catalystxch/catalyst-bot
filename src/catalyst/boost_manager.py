@@ -286,16 +286,31 @@ class BoostManager:
         # one of our probes (and thus an arb, not just a stale cancel).
         self._buy_probe_tid_history: set = set()
         self._sell_probe_tid_history: set = set()
-        # Fill-keyed durable commands let a recreated manager distinguish a
-        # replay from a new Boost effect. Database startup can be unavailable
-        # in narrow unit contexts, so an empty cache remains retry-safe.
+        # Fill-keyed durable effects let a recreated manager materialize the
+        # exact settled side and proven floor, as well as distinguish a replay
+        # from a new Boost effect. Database startup can be unavailable in
+        # narrow unit contexts, so an empty cache remains retry-safe.
         self._authoritative_boost_fill_ids: set[int] = set()
+        self._authoritative_boost_effects: dict[int, dict] = {}
         try:
-            from database import get_applied_authoritative_boost_fill_ids
+            from database import get_applied_authoritative_boost_commands
 
-            self._authoritative_boost_fill_ids.update(
-                get_applied_authoritative_boost_fill_ids()
-            )
+            for command in get_applied_authoritative_boost_commands():
+                fill_id = command["fill_id"]
+                effect = command["effect"]
+                side = effect["side"]
+                self._authoritative_boost_fill_ids.add(fill_id)
+                self._authoritative_boost_effects[fill_id] = dict(effect)
+                if side == "buy":
+                    self._buy_settled = True
+                    self._buy_offset_bps = effect["offset_bps"]
+                    self._buy_floor_bps = effect["floor_bps"]
+                    self._buy_last_safe_offset_bps = effect["last_safe_offset_bps"]
+                else:
+                    self._sell_settled = True
+                    self._sell_offset_bps = effect["offset_bps"]
+                    self._sell_floor_bps = effect["floor_bps"]
+                    self._sell_last_safe_offset_bps = effect["last_safe_offset_bps"]
         except Exception:
             pass
         # Alternation flag — only push one side per cycle to avoid
@@ -1104,19 +1119,21 @@ class BoostManager:
 
     def notify_authoritative_boost_fill(
         self, fill_id: int, trade_id: str, side: str
-    ) -> bool:
-        """Apply one fill-keyed durable command exactly once per process state."""
+    ) -> dict | bool:
+        """Apply one fill-keyed command and return its exact materialized state."""
 
         if (
             type(fill_id) is not int
             or fill_id <= 0
-            or not trade_id
+            or type(trade_id) is not str
+            or not trade_id.strip()
+            or type(side) is not str
             or side not in {"buy", "sell"}
         ):
             return False
         with self._lock:
             if fill_id in self._authoritative_boost_fill_ids:
-                return True
+                return dict(self._authoritative_boost_effects[fill_id])
             applied = self.notify_boost_fill(trade_id)
             if applied is not True:
                 settled = self._buy_settled if side == "buy" else self._sell_settled
@@ -1125,8 +1142,25 @@ class BoostManager:
                 applied = self._buy_settled if side == "buy" else self._sell_settled
             if applied is not True:
                 return False
+            if side == "buy":
+                offset_bps = self._buy_offset_bps
+                floor_bps = self._buy_floor_bps
+                last_safe_offset_bps = self._buy_last_safe_offset_bps
+            else:
+                offset_bps = self._sell_offset_bps
+                floor_bps = self._sell_floor_bps
+                last_safe_offset_bps = self._sell_last_safe_offset_bps
+            effect = {
+                "schema_version": 1,
+                "side": side,
+                "settled": True,
+                "offset_bps": offset_bps,
+                "floor_bps": floor_bps,
+                "last_safe_offset_bps": last_safe_offset_bps,
+            }
             self._authoritative_boost_fill_ids.add(fill_id)
-            return True
+            self._authoritative_boost_effects[fill_id] = effect
+            return dict(effect)
 
     def _on_inverted_arb(self, side: str):
         """Called from prune_active_boosts when a probe vanishes pre-expiry.

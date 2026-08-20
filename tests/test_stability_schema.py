@@ -385,6 +385,83 @@ def test_stability_migration_rejects_wrong_append_only_trigger(isolated_database
         database.init_database()
 
 
+def test_stability_migration_upgrades_exact_legacy_boost_identity_trigger(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TRIGGER offer_fill_boost_commands_guarded_update")
+        conn.executescript(database._LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL)
+        for trigger in (
+            "offer_fill_boost_effects_no_update",
+            "offer_fill_boost_effects_no_delete",
+        ):
+            conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute("DROP TABLE offer_fill_boost_effects")
+    database._db_initialized_path = ""
+
+    database.init_database()
+
+    with sqlite3.connect(isolated_database) as conn:
+        trigger_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='offer_fill_boost_commands_guarded_update'"
+        ).fetchone()[0]
+        effect_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='offer_fill_boost_effects'"
+        ).fetchone()
+    assert "OLD.fill_id <> NEW.fill_id" in trigger_sql
+    assert effect_table == (1,)
+
+
+def test_stability_migration_rejects_malformed_boost_identity_trigger(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    malformed = database._LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL.replace(
+        "OLD.side <> NEW.side", "OLD.side = NEW.side"
+    )
+    assert malformed != database._LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TRIGGER offer_fill_boost_commands_guarded_update")
+        conn.executescript(malformed)
+    database._db_initialized_path = ""
+
+    with pytest.raises(RuntimeError, match="offer_fill_boost_commands_guarded_update"):
+        database.init_database()
+
+
+def test_stability_migration_rejects_malformed_boost_effect_table(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TRIGGER offer_fill_boost_effects_no_update")
+        conn.execute("DROP TRIGGER offer_fill_boost_effects_no_delete")
+        conn.execute("DROP TABLE offer_fill_boost_effects")
+        conn.execute(
+            """
+            CREATE TABLE offer_fill_boost_effects (
+                fill_id INTEGER PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                effect_json TEXT NOT NULL
+            )
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(
+        RuntimeError,
+        match="offer_fill_boost_effects.*missing required columns.*applied_at",
+    ):
+        database.init_database()
+
+
 def test_unique_table_key_validator_rejects_partial_and_created_indexes():
     conn = sqlite3.connect(":memory:")
     try:
@@ -546,8 +623,7 @@ def test_unicode_trigger_name_and_quoted_case_variant_owner_cannot_bypass_valida
             """
         )
         stored = conn.execute(
-            "SELECT name, tbl_name FROM sqlite_master "
-            "WHERE type='trigger' AND name=?",
+            "SELECT name, tbl_name FROM sqlite_master WHERE type='trigger' AND name=?",
             (trigger_name,),
         ).fetchone()
     assert stored == (trigger_name, "OfFeR_InTeNtS")

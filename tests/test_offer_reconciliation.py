@@ -1583,6 +1583,94 @@ def test_sage_coin_adapter_normalizes_explicit_native_asset_without_inventing_mi
     assert "asset_id" not in records["0x" + OTHER_COIN]
 
 
+@pytest.mark.parametrize(
+    ("raw_amount", "offered"),
+    [(1000.9, "1000"), (True, "1")],
+    ids=["fractional-float", "boolean"],
+)
+def test_malformed_sage_coin_amount_is_unknown_end_to_end_without_terminal_mutation(
+    isolated_database,
+    monkeypatch,
+    raw_amount,
+    offered,
+):
+    import wallet_sage
+
+    _persist_created_offer(offered=offered)
+    offered_int = int(offered)
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda *_args, **_kwargs: {
+            "coins": [
+                {
+                    "coin_id": COIN,
+                    "amount": raw_amount,
+                    "asset_id": None,
+                    "owned": True,
+                    "offer_id": TRADE,
+                    "spent_height": 42,
+                    "created_height": 1,
+                    "transaction_id": TX,
+                },
+                {
+                    "coin_id": RECEIVE,
+                    "amount": "2000",
+                    "asset_id": ASSET,
+                    "owned": True,
+                    "spent_height": None,
+                    "created_height": 42,
+                    "transaction_id": TX,
+                },
+            ]
+        },
+    )
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {
+            "offers": [_offer(offered=offered_int)],
+            "total": 1,
+        },
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [
+                _transaction(
+                    spent=[
+                        {
+                            "coin_id": COIN,
+                            "asset_id": "xch",
+                            "amount": offered_int,
+                            "address_kind": "offer",
+                        }
+                    ]
+                )
+            ],
+            "total": 1,
+        },
+        get_coins_by_ids=wallet_sage.get_coins_by_ids,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(offered=offered),
+        wallet_facade=facade,
+        clock=_clock_at(AT),
+    )
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
+    assert _journal_for("intent-task9")[-1]["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 def test_loader_normalizes_sage_transaction_fields_without_inventing_proof():
     offer = _offer()
     offer.pop("selected_coin_ids")
@@ -1941,6 +2029,432 @@ def test_classifier_caps_each_hostile_evidence_source(source_name):
     assert result["reason_code"] == "EVIDENCE_SOURCE_LIMIT_EXCEEDED"
 
 
+def test_coin_map_checks_cap_before_traversing_members(monkeypatch):
+    records = {
+        f"{index:064x}": {"coin_id": f"{index:064x}"}
+        for index in range(reconciliation._MAX_COIN_RECORDS)
+    }
+    assert len(reconciliation._coin_map({"records": records})) == 4096
+    records[f"{reconciliation._MAX_COIN_RECORDS:064x}"] = {
+        "coin_id": f"{reconciliation._MAX_COIN_RECORDS:064x}"
+    }
+    traversed = []
+
+    def forbidden_member_traversal(value):
+        traversed.append(value)
+        raise AssertionError("oversized coin map was traversed")
+
+    monkeypatch.setattr(reconciliation, "_hex_id", forbidden_member_traversal)
+
+    assert reconciliation._coin_map({"records": records}) is None
+    assert traversed == []
+
+
+def test_transaction_row_cap_is_exact_and_precedes_member_shape_checks():
+    at_cap = [{} for _index in range(reconciliation._MAX_HISTORY_RECORDS)]
+    assert reconciliation._transaction_rows({"records": at_cap}) is at_cap
+
+    over_cap = [*at_cap, {}]
+    assert reconciliation._transaction_rows({"records": over_cap}) is None
+
+
+def test_offer_page_cap_precedes_hostile_row_traversal():
+    rows = [
+        _offer(status=1, trade_id=f"{index:064x}", transaction_id="")
+        for index in range(reconciliation._MAX_HISTORY_RECORDS)
+    ]
+    rows.append(HostileDict())
+
+    source = load_sage_offer_history(
+        get_all_offers=lambda **_kwargs: rows,
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=reconciliation._MAX_HISTORY_RECORDS,
+        max_pages=1,
+        max_records=reconciliation._MAX_HISTORY_RECORDS,
+    )
+
+    assert source["complete"] is False
+    assert source["read_error"] == "source_limit_exceeded"
+    assert source["records"] == []
+
+
+def test_transaction_page_cap_precedes_hostile_row_traversal():
+    rows = [
+        _transaction(transaction_id=f"{index:064x}")
+        for index in range(reconciliation._MAX_HISTORY_RECORDS)
+    ]
+    rows.append(HostileDict())
+
+    source = reconciliation._load_transactions(
+        lambda **_kwargs: {
+            "success": True,
+            "transactions": rows,
+            "total": len(rows),
+        },
+        wallet_ids=(1,),
+        clock=_clock_at(),
+        page_size=reconciliation._MAX_HISTORY_RECORDS,
+        max_pages=1,
+        max_records=reconciliation._MAX_HISTORY_RECORDS,
+    )
+
+    assert source["complete"] is False
+    assert source["read_error"] == "source_limit_exceeded"
+    assert source["records"] == []
+
+
+def test_transaction_flow_cap_precedes_normalization(monkeypatch):
+    at_cap_calls = []
+
+    def observe_at_cap(entry):
+        at_cap_calls.append(entry)
+        return None
+
+    monkeypatch.setattr(reconciliation, "_normalized_transaction_flow", observe_at_cap)
+    normalized = reconciliation._normalized_transaction_row(
+        {
+            "spent": [{} for _index in range(reconciliation._MAX_TRANSACTION_FLOWS)],
+            "created": [],
+        }
+    )
+    assert len(normalized["spent"]) == reconciliation._MAX_TRANSACTION_FLOWS
+    assert len(at_cap_calls) == reconciliation._MAX_TRANSACTION_FLOWS
+
+    def forbidden_flow_normalization(_entry):
+        raise AssertionError("oversized transaction flow was traversed")
+
+    monkeypatch.setattr(
+        reconciliation, "_normalized_transaction_flow", forbidden_flow_normalization
+    )
+    with pytest.raises(ValueError, match="source limit"):
+        reconciliation._normalized_transaction_row(
+            {
+                "spent": [
+                    {} for _index in range(reconciliation._MAX_TRANSACTION_FLOWS + 1)
+                ],
+                "created": [],
+            }
+        )
+
+
+def test_loader_absolute_page_bounds_are_validated_before_wallet_reads():
+    calls = []
+
+    with pytest.raises(ValueError, match="hard limits"):
+        load_sage_offer_history(
+            get_all_offers=lambda **kwargs: calls.append(kwargs) or [],
+            include_completed=True,
+            clock=_clock_at(),
+            page_size=1,
+            max_pages=reconciliation._MAX_HISTORY_PAGES + 1,
+            max_records=10,
+        )
+
+    assert calls == []
+
+
+def test_huge_remote_total_cannot_extend_absolute_page_count():
+    calls = []
+
+    def endless_history(**kwargs):
+        calls.append(kwargs)
+        return {
+            "offers": [
+                _offer(
+                    status=1,
+                    trade_id=f"{kwargs['start'] + 1:064x}",
+                    transaction_id="",
+                )
+            ],
+            "total": 10**100,
+        }
+
+    source = load_sage_offer_history(
+        get_all_offers=endless_history,
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=1,
+        max_pages=reconciliation._MAX_HISTORY_PAGES,
+        max_records=reconciliation._MAX_HISTORY_RECORDS,
+    )
+
+    assert len(calls) == reconciliation._MAX_HISTORY_PAGES
+    assert source["pagination"]["pages_read"] == reconciliation._MAX_HISTORY_PAGES
+    assert source["complete"] is False
+
+
+def test_selected_coin_cap_precedes_sort_and_normalization(monkeypatch):
+    intent = reconciliation._exact_intent(_intent())
+    offer = _offer(
+        selected_coin_ids=[
+            f"{index + 100:064x}"
+            for index in range(reconciliation._MAX_SELECTED_COINS + 1)
+        ]
+    )
+    original_hex_id = reconciliation._hex_id
+    selected_traversal = []
+
+    def reject_selected(value):
+        if value == TRADE:
+            return original_hex_id(value)
+        selected_traversal.append(value)
+        raise AssertionError("oversized selected-coin list was traversed")
+
+    monkeypatch.setattr(reconciliation, "_hex_id", reject_selected)
+
+    assert reconciliation._offer_summary_matches(intent, offer) is False
+    assert selected_traversal == []
+
+
+def test_selected_coin_exact_cap_is_accepted():
+    selected = tuple(
+        f"{index + 100:064x}" for index in range(reconciliation._MAX_SELECTED_COINS)
+    )
+    intent = reconciliation._exact_intent(_intent(coin_ids=selected))
+    offer = _offer(selected_coin_ids=list(selected))
+
+    assert reconciliation._offer_summary_matches(intent, offer) is True
+
+
+def test_full_loader_flow_cap_is_incomplete_unknown_and_latched(isolated_database):
+    _persist_created_offer()
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": f"{index + 100:064x}",
+                "asset_id": "xch",
+                "amount": 1,
+                "address_kind": "offer",
+            }
+            for index in range(reconciliation._MAX_TRANSACTION_FLOWS + 1)
+        ]
+    )
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {"offers": [_offer()], "total": 1},
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [transaction],
+            "total": 1,
+        },
+        get_coins_by_ids=lambda _coin_ids: {
+            COIN: _coin(COIN, asset_id="xch", amount=1000)
+        },
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at()
+    )
+    classified = _classify(evidence)
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert evidence["transaction_history"]["read_error"] == "source_limit_exceeded"
+    assert evidence["transaction_history"]["records"] == []
+    assert classified == {
+        "classification": UNKNOWN,
+        "reason_code": "TRANSACTION_HISTORY_INCOMPLETE",
+    }
+    assert result["classification"] == UNKNOWN
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+@pytest.mark.parametrize(
+    ("count", "expected_error", "expected_records"),
+    [(4096, None, 4096), (4097, "source_limit_exceeded", 0)],
+)
+def test_raw_coin_response_cap_is_exact_before_record_copying(
+    count,
+    expected_error,
+    expected_records,
+):
+    coin_records = {
+        COIN: _coin(COIN, asset_id="xch", amount=1000),
+        **{
+            f"{index + 100:064x}": _coin(
+                f"{index + 100:064x}", asset_id="xch", amount=1
+            )
+            for index in range(count - 1)
+        },
+    }
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {
+            "offers": [_offer(status=1, transaction_id="")],
+            "total": 1,
+        },
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda _coin_ids: coin_records,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at()
+    )
+
+    assert evidence["coin_records"]["read_error"] == expected_error
+    assert len(evidence["coin_records"]["records"]) == expected_records
+    assert evidence["coin_records"]["complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("field_count", "expected_error", "expected_complete"),
+    [(64, None, True), (65, "source_limit_exceeded", False)],
+)
+def test_raw_coin_record_field_cap_precedes_copying(
+    field_count,
+    expected_error,
+    expected_complete,
+):
+    record = _coin(COIN, asset_id="xch", amount=1000)
+    record.update(
+        {f"provider_field_{index}": index for index in range(field_count - len(record))}
+    )
+    assert len(record) == field_count
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {
+            "offers": [_offer(status=1, transaction_id="")],
+            "total": 1,
+        },
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda _coin_ids: {COIN: record},
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at()
+    )
+
+    assert evidence["coin_records"]["read_error"] == expected_error
+    assert evidence["coin_records"]["complete"] is expected_complete
+    assert len(evidence["coin_records"]["records"]) == int(expected_complete)
+
+
+def test_loader_rejects_hostile_coin_mapping_subclass_without_iteration():
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {
+            "offers": [_offer(status=1, transaction_id="")],
+            "total": 1,
+        },
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda _coin_ids: _HostileMapping(),
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at()
+    )
+
+    assert evidence["coin_records"]["read_error"] == "reader_malformed"
+    assert evidence["coin_records"]["records"] == {}
+    assert evidence["coin_records"]["complete"] is False
+
+
+class HostileTuple(tuple):
+    def __iter__(self):
+        raise AssertionError("hostile wallet id tuple iteration invoked")
+
+
+@pytest.mark.parametrize(
+    "wallet_ids",
+    [HostileTuple((1,)), tuple(range(1, reconciliation._MAX_WALLET_IDS + 2))],
+)
+def test_loader_rejects_hostile_or_over_cap_wallet_ids_before_reads(wallet_ids):
+    calls = []
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: calls.append("identity"),
+        get_all_offers=lambda **_kwargs: calls.append("offers"),
+        get_transactions_list=lambda **_kwargs: calls.append("transactions"),
+        get_coins_by_ids=lambda _coin_ids: calls.append("coins"),
+    )
+
+    with pytest.raises(ValueError, match="bounds"):
+        load_authoritative_evidence(
+            _intent(), wallet_facade=facade, clock=_clock_at(), wallet_ids=wallet_ids
+        )
+
+    assert calls == []
+
+
+def test_over_cap_coin_evidence_is_unknown_latched_without_terminal_mutation(
+    isolated_database,
+):
+    _persist_created_offer()
+    evidence = _evidence()
+    for index in range(reconciliation._MAX_COIN_RECORDS + 1):
+        coin_id = f"{index + 100:064x}"
+        evidence["coin_records"]["records"][coin_id] = _coin(
+            coin_id, asset_id="xch", amount=1
+        )
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+class HostileList(list):
+    def __iter__(self):
+        raise AssertionError("hostile list iteration invoked")
+
+
+@pytest.mark.parametrize(
+    "result",
+    [HostileList(), {"offers": HostileList()}],
+)
+def test_offer_loader_rejects_sequence_subclasses_without_iteration(result):
+    source = load_sage_offer_history(
+        get_all_offers=lambda **_kwargs: result,
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=1,
+        max_pages=1,
+        max_records=1,
+    )
+
+    assert source["complete"] is False
+    assert source["read_error"] == "reader_malformed"
+    assert source["records"] == []
+
+
 class HostileDict(dict):
     def get(self, *_args, **_kwargs):
         raise AssertionError("hostile dict method invoked")
@@ -2041,11 +2555,11 @@ def test_terminal_journal_accepts_bounded_full_proof_digest_and_rejects_tail_cha
         reconcile_offer("intent-task9", evidence=changed, now=AFTER)
 
 
-def _persist_created_offer(*, coin_id: str = COIN) -> dict:
+def _persist_created_offer(*, coin_id: str = COIN, offered: str = "1000") -> dict:
     assert database.upsert_coin(
         coin_id,
         "xch",
-        1000,
+        int(offered),
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
@@ -2063,7 +2577,7 @@ def _persist_created_offer(*, coin_id: str = COIN) -> dict:
         purpose="normal_lifecycle",
         slot_key="slot:intent-task9",
         generation=0,
-        offered_amount_atomic="1000",
+        offered_amount_atomic=offered,
         requested_amount_atomic="2000",
         selected_coin_ids_json=[coin_id],
         wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
@@ -2088,7 +2602,7 @@ def _persist_created_offer(*, coin_id: str = COIN) -> dict:
         TRADE,
         "buy",
         price_xch=database.Decimal("0.0000005"),
-        size_xch=database.Decimal("0.000000001"),
+        size_xch=database.Decimal(offered) / database.Decimal("1000000000000"),
         size_cat=database.Decimal("2"),
         cat_asset_id=ASSET,
         tier="inner",
@@ -2699,6 +3213,31 @@ def _commit_fill_without_draining_hooks(monkeypatch) -> dict:
     return fill
 
 
+def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) -> dict:
+    fill_id = database.record_fill(
+        trade_id,
+        "buy",
+        price_xch=database.Decimal("0.0000005"),
+        size_xch=database.Decimal("0.000000001"),
+        size_cat=database.Decimal("2"),
+        cat_asset_id=ASSET,
+        tier="inner",
+        verification_status="verified_authoritative",
+        filled_at=AFTER,
+    )
+    assert fill_id > 0
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE fills SET spent_block_index=?, spent_block_height=? WHERE fill_id=?",
+        (block_height, block_height, fill_id),
+    )
+    database._ensure_authoritative_fill_hook_outbox(conn, fill_id)
+    conn.commit()
+    fill = database.get_fill_by_id(fill_id)
+    assert fill is not None
+    return fill
+
+
 def _record_claimed_test_sink_ack(fill_id, hook_name, detail, claim):
     if hook_name == "offer_filled_event":
         return database.log_authoritative_offer_filled_once(
@@ -3015,6 +3554,65 @@ def test_callback_construction_failure_is_contained_after_proof_commit(
     ]
 
 
+def test_production_classification_and_sweep_preserve_authoritative_block_42(
+    isolated_database,
+    monkeypatch,
+):
+    import sweep_coordinator
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    assert fill["spent_block_index"] == 42
+    sweep_coordinator.reset_coordinator()
+    callbacks = reconciliation._post_fill_hook_callbacks(fill)
+
+    classification_claim = database.claim_offer_fill_hook(
+        fill["fill_id"], "fill_classification"
+    )
+    classification_ack = _invoke_claimed_hook(
+        callbacks["fill_classification"], fill, classification_claim
+    )
+    assert database.validate_offer_fill_hook_sink_ack(
+        fill["fill_id"],
+        "fill_classification",
+        classification_ack,
+        claim_token=classification_claim["claim_token"],
+        claim_generation=classification_claim["claim_generation"],
+    )
+    assert database.complete_offer_fill_hook(
+        fill["fill_id"],
+        "fill_classification",
+        classification_claim["claim_token"],
+        claim_generation=classification_claim["claim_generation"],
+    )
+
+    sweep_claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+    sweep_ack = _invoke_claimed_hook(callbacks["sweep_registration"], fill, sweep_claim)
+    assert database.validate_offer_fill_hook_sink_ack(
+        fill["fill_id"],
+        "sweep_registration",
+        sweep_ack,
+        claim_token=sweep_claim["claim_token"],
+        claim_generation=sweep_claim["claim_generation"],
+    )
+
+    stored_fill = database.get_fill_by_id(fill["fill_id"])
+    registrations = database.get_authoritative_sweep_registrations()
+    coordinator = sweep_coordinator.get_coordinator()
+    assert stored_fill["spent_block_index"] == 42
+    assert registrations == [
+        {
+            "fill_id": fill["fill_id"],
+            "trade_id": TRADE,
+            "classification": "unknown",
+            "spent_block_index": 42,
+            "taker_puzzle_hash": None,
+            "sweep_group_id": None,
+            "side": "buy",
+        }
+    ]
+    assert coordinator.get_pending_summary()["pending_fill_count"] == 1
+
+
 def test_recreated_production_boost_manager_uses_durable_fill_command(
     isolated_database,
     monkeypatch,
@@ -3073,6 +3671,69 @@ def test_recreated_production_boost_manager_uses_durable_fill_command(
     assert "boost_notification" in database.get_offer_fill_hook_receipts(
         fill["fill_id"]
     )
+
+
+def test_recreated_production_boost_manager_materializes_settlement_and_floor(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    first_manager = BoostManager()
+    first_manager._buy_offset_bps = 137
+    first_manager._buy_last_safe_offset_bps = 121
+    first_manager._buy_probe_tid_history.add(TRADE)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=first_manager)),
+    )
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    callback = reconciliation._post_fill_hook_callbacks(fill)["boost_notification"]
+
+    acknowledgement = _invoke_claimed_hook(callback, fill, claim)
+    assert acknowledgement["disposition"] == "applied"
+    assert first_manager._buy_settled is True
+    assert first_manager._buy_floor_bps == 137
+
+    recreated_manager = BoostManager()
+
+    assert recreated_manager._buy_settled is True
+    assert recreated_manager._buy_floor_bps == 137
+    assert recreated_manager._buy_offset_bps == 137
+    assert recreated_manager._buy_last_safe_offset_bps == 121
+
+
+def test_boost_command_primary_identity_cannot_rebind_during_apply_transition(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    other_fill = _insert_authoritative_test_fill(OTHER_TRADE)
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    database.register_authoritative_boost_fill_command(
+        fill["fill_id"],
+        TRADE,
+        "buy",
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    conn = database.get_connection()
+
+    with pytest.raises(Exception, match="transition is invalid"):
+        conn.execute(
+            "UPDATE offer_fill_boost_commands "
+            "SET fill_id=?, state='applied', applied_at=? WHERE fill_id=?",
+            (other_fill["fill_id"], AFTER, fill["fill_id"]),
+        )
+
+    conn.rollback()
+    stored = conn.execute(
+        "SELECT fill_id, trade_id, state FROM offer_fill_boost_commands"
+    ).fetchall()
+    assert [tuple(row) for row in stored] == [(fill["fill_id"], TRADE, "registered")]
 
 
 def test_recreated_boost_manager_consumes_registered_command_after_crash(
@@ -3146,6 +3807,49 @@ def test_recreated_production_sweep_coordinator_reconstructs_durable_registratio
     assert recreated.get_pending_summary()["pending_fill_count"] == 1
 
 
+def test_recreated_production_sweep_coordinator_recovers_event_once_then_consumes(
+    isolated_database,
+    monkeypatch,
+):
+    import sweep_coordinator
+    from config import cfg
+
+    first_fill = _commit_fill_without_draining_hooks(monkeypatch)
+    second_fill = _insert_authoritative_test_fill(OTHER_TRADE)
+    monkeypatch.setattr(cfg, "SWEEP_MIN_FILLS", 2)
+    for fill in (first_fill, second_fill):
+        claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+        database.register_authoritative_sweep_fill(
+            fill["fill_id"],
+            {
+                "trade_id": fill["trade_id"],
+                "classification": "unknown",
+                "spent_block_index": 42,
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+                "side": "buy",
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+
+    before_crash = sweep_coordinator.SweepCoordinator(window_secs=0)
+    assert before_crash.get_pending_summary()["pending_fill_count"] == 2
+    before_crash.tick()
+
+    recreated = sweep_coordinator.SweepCoordinator(window_secs=0)
+    recreated.tick()
+    recovered_events = recreated.drain_sweep_events()
+    assert len(recovered_events) == 1
+    assert recovered_events[0].spent_block_index == 42
+    assert set(recovered_events[0].trade_ids) == {TRADE, OTHER_TRADE}
+
+    recreated_again = sweep_coordinator.SweepCoordinator(window_secs=0)
+    recreated_again.tick()
+    assert recreated_again.get_pending_summary()["pending_fill_count"] == 0
+    assert recreated_again.drain_sweep_events() == []
+
+
 def test_migration_reopens_unproven_legacy_boost_and_sweep_receipts(
     isolated_database,
     monkeypatch,
@@ -3202,6 +3906,110 @@ def test_migration_reopens_unproven_legacy_boost_and_sweep_receipts(
         ("boost_notification", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
         ("sweep_registration", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
     ]
+
+
+def test_migration_reopens_event_and_classification_receipts_without_sink_effect(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    hooks = ("offer_filled_event", "fill_classification")
+    conn = database.get_connection()
+    for hook_name in hooks:
+        conn.execute(
+            "INSERT INTO offer_fill_hook_receipts (fill_id, hook_name, completed_at) "
+            "VALUES (?, ?, ?)",
+            (fill["fill_id"], hook_name, AFTER),
+        )
+        conn.execute(
+            "UPDATE offer_fill_hook_outbox SET state='completed', completed_at=? "
+            "WHERE fill_id=? AND hook_name=?",
+            (AFTER, fill["fill_id"], hook_name),
+        )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    reopened = conn.execute(
+        "SELECT hook_name, state, last_error_code FROM offer_fill_hook_outbox "
+        "WHERE fill_id=? AND hook_name IN ('offer_filled_event', 'fill_classification') "
+        "ORDER BY hook_name",
+        (fill["fill_id"],),
+    ).fetchall()
+    audits = conn.execute(
+        "SELECT hook_name, reason_code, prior_state "
+        "FROM offer_fill_hook_migration_audit WHERE fill_id=? "
+        "AND hook_name IN ('offer_filled_event', 'fill_classification') "
+        "ORDER BY hook_name",
+        (fill["fill_id"],),
+    ).fetchall()
+    assert [tuple(row) for row in reopened] == [
+        ("fill_classification", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
+        ("offer_filled_event", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
+    ]
+    assert [tuple(row) for row in audits] == [
+        (
+            "fill_classification",
+            "LEGACY_RECEIPT_REQUIRES_REPLAY",
+            "completed",
+        ),
+        (
+            "offer_filled_event",
+            "LEGACY_RECEIPT_REQUIRES_REPLAY",
+            "completed",
+        ),
+    ]
+
+
+def test_migration_preserves_classification_receipt_after_durable_sweep_enrichment(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    callbacks = reconciliation._post_fill_hook_callbacks(fill)
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "fill_classification")
+    acknowledgement = _invoke_claimed_hook(
+        callbacks["fill_classification"], fill, claim
+    )
+    assert database.validate_offer_fill_hook_sink_ack(
+        fill["fill_id"],
+        "fill_classification",
+        acknowledgement,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    assert database.complete_offer_fill_hook(
+        fill["fill_id"],
+        "fill_classification",
+        claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE fills SET fill_classification='dexie_combined', "
+        "sweep_group_id='sweep_42' WHERE fill_id=?",
+        (fill["fill_id"],),
+    )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    outbox = conn.execute(
+        "SELECT state, last_error_code FROM offer_fill_hook_outbox "
+        "WHERE fill_id=? AND hook_name='fill_classification'",
+        (fill["fill_id"],),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT 1 FROM offer_fill_hook_migration_audit "
+        "WHERE fill_id=? AND hook_name='fill_classification'",
+        (fill["fill_id"],),
+    ).fetchone()
+    assert tuple(outbox) == ("completed", None)
+    assert audit is None
 
 
 def test_migration_reopens_false_noop_ack_for_actual_boost_fill(
@@ -3529,7 +4337,13 @@ def test_production_boost_sink_retries_unavailable_manager_from_durable_command(
         notified.append(trade_id)
         return True
 
-    manager = SimpleNamespace(notify_boost_fill=notify)
+    manager = SimpleNamespace(
+        notify_boost_fill=notify,
+        _buy_settled=True,
+        _buy_offset_bps=0,
+        _buy_floor_bps=0,
+        _buy_last_safe_offset_bps=0,
+    )
     monkeypatch.setitem(
         sys.modules,
         "api_server",
@@ -4982,6 +5796,107 @@ def test_wallet_reader_exception_persists_unknown_and_named_latch(
     assert json.loads(latch["blocking_operation_ids_json"]) == [
         "reconcile:intent-task9"
     ]
+
+
+class _HostileEvidenceAbort(BaseException):
+    pass
+
+
+class _RaisingTruthValue:
+    def __bool__(self):
+        raise _HostileEvidenceAbort("truthiness must never escape evidence handling")
+
+
+class _HostileMapping(dict):
+    def items(self):
+        raise _HostileEvidenceAbort("mapping subclass must never be traversed")
+
+
+def test_hostile_coin_identity_truthiness_totalizes_to_minimal_unknown_and_latch(
+    isolated_database,
+):
+    _persist_created_offer()
+    evidence = _evidence()
+    evidence["coin_records"]["records"][COIN]["coin_id"] = _RaisingTruthValue()
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EVIDENCE_ENCODING_FAILED"
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
+    durable = json.loads(_journal_for("intent-task9")[-1]["evidence_json"])
+    assert durable == {
+        "classification": {
+            "classification": UNKNOWN,
+            "reason_code": "EVIDENCE_ENCODING_FAILED",
+        },
+        "evidence": {"encoding_failed": True, "redacted": True},
+    }
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+def test_loader_contains_baseexception_from_hostile_coin_record_before_db_boundary(
+    isolated_database,
+):
+    _persist_created_offer()
+    hostile_record = _coin(COIN, asset_id="xch", amount=1000)
+    hostile_record["coin_id"] = _RaisingTruthValue()
+    facade = SimpleNamespace(
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_all_offers=lambda **_kwargs: {"offers": [_offer()], "total": 1},
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [_transaction()],
+            "total": 1,
+        },
+        get_coins_by_ids=lambda _coin_ids: {
+            COIN: hostile_record,
+            RECEIVE: _coin(
+                RECEIVE,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    result = reconcile_offer("intent-task9", wallet_facade=facade, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
+    assert _journal_for("intent-task9")[-1]["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+def test_hostile_mapping_subclass_is_rejected_without_traversal_or_escape(
+    isolated_database,
+):
+    _persist_created_offer()
+    evidence = _evidence()
+    evidence["coin_records"]["records"] = _HostileMapping(
+        evidence["coin_records"]["records"]
+    )
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EVIDENCE_ENCODING_FAILED"
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
 def _hostile_excessive_depth() -> dict:

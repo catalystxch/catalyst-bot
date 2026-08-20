@@ -785,7 +785,8 @@ CREATE TABLE IF NOT EXISTS offer_fill_boost_commands (
 );
 CREATE TRIGGER IF NOT EXISTS offer_fill_boost_commands_guarded_update
 BEFORE UPDATE ON offer_fill_boost_commands
-WHEN OLD.trade_id <> NEW.trade_id
+WHEN OLD.fill_id <> NEW.fill_id
+  OR OLD.trade_id <> NEW.trade_id
   OR OLD.side <> NEW.side
   OR OLD.registered_at <> NEW.registered_at
   OR OLD.state <> 'registered'
@@ -799,6 +800,29 @@ CREATE TRIGGER IF NOT EXISTS offer_fill_boost_commands_no_delete
 BEFORE DELETE ON offer_fill_boost_commands
 BEGIN
     SELECT RAISE(ABORT, 'offer_fill_boost_commands cannot be deleted');
+END;
+
+-- Exact post-effect state is append-only and separate from command delivery.
+-- A recreated BoostManager materializes its settled side and proven floor from
+-- this payload instead of treating the applied fill id as the effect itself.
+CREATE TABLE IF NOT EXISTS offer_fill_boost_effects (
+    fill_id                     INTEGER PRIMARY KEY,
+    trade_id                    TEXT NOT NULL,
+    side                        TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    effect_json                 TEXT NOT NULL,
+    applied_at                  TEXT NOT NULL,
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id),
+    FOREIGN KEY(fill_id) REFERENCES offer_fill_boost_commands(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_effects_no_update
+BEFORE UPDATE ON offer_fill_boost_effects
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_effects is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_effects_no_delete
+BEFORE DELETE ON offer_fill_boost_effects
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_effects is append-only');
 END;
 
 -- Sweep registration itself is the durable effect. A recreated coordinator
@@ -819,6 +843,63 @@ CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_registrations_no_delete
 BEFORE DELETE ON offer_fill_sweep_registrations
 BEGIN
     SELECT RAISE(ABORT, 'offer_fill_sweep_registrations is append-only');
+END;
+
+-- Sweep lifecycle is append-only: finalization prevents registrations from
+-- returning to the active restore set, while an event receipt prevents a
+-- finalized downstream event from being emitted again after restart.
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_events (
+    event_id                    TEXT PRIMARY KEY,
+    spent_block_index           INTEGER NOT NULL CHECK(spent_block_index > 0),
+    sweep_group_id              TEXT NOT NULL UNIQUE,
+    event_json                  TEXT NOT NULL,
+    finalized_at               TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_events_no_update
+BEFORE UPDATE ON offer_fill_sweep_events
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_events_no_delete
+BEFORE DELETE ON offer_fill_sweep_events
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_events is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_finalizations (
+    fill_id                     INTEGER PRIMARY KEY,
+    event_id                    TEXT,
+    finalized_at               TEXT NOT NULL,
+    FOREIGN KEY(fill_id) REFERENCES offer_fill_sweep_registrations(fill_id),
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_finalizations_event
+    ON offer_fill_sweep_finalizations(event_id, fill_id);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_finalizations_no_update
+BEFORE UPDATE ON offer_fill_sweep_finalizations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_finalizations is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_finalizations_no_delete
+BEFORE DELETE ON offer_fill_sweep_finalizations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_finalizations is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_event_receipts (
+    event_id                    TEXT PRIMARY KEY,
+    consumed_at                TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_event_receipts_no_update
+BEFORE UPDATE ON offer_fill_sweep_event_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_event_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_event_receipts_no_delete
+BEFORE DELETE ON offer_fill_sweep_event_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_event_receipts is append-only');
 END;
 
 CREATE TABLE IF NOT EXISTS offer_fill_hook_migration_audit (
@@ -1092,11 +1173,34 @@ _STABILITY_REQUIRED_COLUMNS = {
         "registered_at",
         "applied_at",
     },
+    "offer_fill_boost_effects": {
+        "fill_id",
+        "trade_id",
+        "side",
+        "effect_json",
+        "applied_at",
+    },
     "offer_fill_sweep_registrations": {
         "fill_id",
         "trade_id",
         "classification_json",
         "registered_at",
+    },
+    "offer_fill_sweep_events": {
+        "event_id",
+        "spent_block_index",
+        "sweep_group_id",
+        "event_json",
+        "finalized_at",
+    },
+    "offer_fill_sweep_finalizations": {
+        "fill_id",
+        "event_id",
+        "finalized_at",
+    },
+    "offer_fill_sweep_event_receipts": {
+        "event_id",
+        "consumed_at",
     },
     "offer_fill_hook_migration_audit": {
         "audit_id",
@@ -1258,6 +1362,13 @@ _STABILITY_INDEXES = {
         ("blocks_mutation", "operation_id", "sequence"),
         None,
     ),
+    "idx_offer_fill_sweep_finalizations_event": (
+        "offer_fill_sweep_finalizations",
+        False,
+        False,
+        ("event_id", "fill_id"),
+        None,
+    ),
     "uniq_worker_delegation_active_scope": (
         "runtime_worker_delegations",
         True,
@@ -1306,6 +1417,54 @@ def _normalized_schema_sql(sql: Optional[str]) -> str:
         for character in sql.lower()
         if not character.isspace() and character not in {'"', "`"}
     ).rstrip(";")
+
+
+_LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL = """
+CREATE TRIGGER offer_fill_boost_commands_guarded_update
+BEFORE UPDATE ON offer_fill_boost_commands
+WHEN OLD.trade_id <> NEW.trade_id
+  OR OLD.side <> NEW.side
+  OR OLD.registered_at <> NEW.registered_at
+  OR OLD.state <> 'registered'
+  OR NEW.state <> 'applied'
+  OR OLD.applied_at IS NOT NULL
+  OR NEW.applied_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_commands transition is invalid');
+END
+"""
+
+_OFFER_FILL_BOOST_COMMAND_GUARD_SQL = """
+CREATE TRIGGER offer_fill_boost_commands_guarded_update
+BEFORE UPDATE ON offer_fill_boost_commands
+WHEN OLD.fill_id <> NEW.fill_id
+  OR OLD.trade_id <> NEW.trade_id
+  OR OLD.side <> NEW.side
+  OR OLD.registered_at <> NEW.registered_at
+  OR OLD.state <> 'registered'
+  OR NEW.state <> 'applied'
+  OR OLD.applied_at IS NOT NULL
+  OR NEW.applied_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_commands transition is invalid');
+END
+"""
+
+
+def _upgrade_offer_fill_boost_command_guard(conn: sqlite3.Connection) -> None:
+    """Upgrade only the exact round-4 trigger; malformed variants stay fatal."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='offer_fill_boost_commands_guarded_update'"
+    ).fetchone()
+    if row is None:
+        return
+    actual = _normalized_schema_sql(row[0])
+    if actual != _normalized_schema_sql(_LEGACY_OFFER_FILL_BOOST_COMMAND_GUARD_SQL):
+        return
+    conn.execute("DROP TRIGGER offer_fill_boost_commands_guarded_update")
+    conn.execute(_OFFER_FILL_BOOST_COMMAND_GUARD_SQL)
 
 
 def _index_key_columns(conn: sqlite3.Connection, index_name: str) -> tuple[str, ...]:
@@ -1582,6 +1741,7 @@ def _migrate_stability_schema() -> None:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        _upgrade_offer_fill_boost_command_guard(conn)
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
         _audit_legacy_offer_fill_hook_receipts(conn)
@@ -5557,18 +5717,158 @@ _AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS = 30
 def _offer_fill_hook_receipt_has_durable_effect(
     conn: sqlite3.Connection, fill_id: int, hook_name: str
 ) -> bool:
-    if hook_name in {"offer_filled_event", "fill_classification"}:
-        return True
-    if hook_name == "boost_notification":
+    if hook_name == "offer_filled_event":
+        effect = conn.execute(
+            """
+            SELECT sink.event_id, events.event_type, events.data,
+                   ack.acknowledgement_json
+              FROM offer_fill_event_sinks AS sink
+              JOIN events ON events.id=sink.event_id
+              JOIN offer_fill_hook_sink_acks AS ack
+                ON ack.fill_id=sink.fill_id
+               AND ack.hook_name='offer_filled_event'
+             WHERE sink.fill_id=?
+            """,
+            (fill_id,),
+        ).fetchone()
+        if effect is None or str(effect["event_type"]) != "offer_filled":
+            return False
+        try:
+            event_data = json.loads(str(effect["data"]))
+            acknowledgement = json.loads(str(effect["acknowledgement_json"]))
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            type(event_data) is dict
+            and event_data.get("fill_id") == fill_id
+            and type(acknowledgement) is dict
+            and acknowledgement.get("schema_version") == 1
+            and acknowledgement.get("fill_id") == fill_id
+            and acknowledgement.get("hook_name") == "offer_filled_event"
+            and acknowledgement.get("durable") is True
+            and acknowledgement.get("detail") == {"event_id": int(effect["event_id"])}
+        )
+    if hook_name == "fill_classification":
+        effect = conn.execute(
+            """
+            SELECT fills.fill_classification, fills.spent_block_index,
+                   fills.taker_puzzle_hash, fills.sweep_group_id,
+                   ack.acknowledgement_json
+              FROM fills
+              JOIN offer_fill_hook_sink_acks AS ack
+                ON ack.fill_id=fills.fill_id
+               AND ack.hook_name='fill_classification'
+             WHERE fills.fill_id=?
+            """,
+            (fill_id,),
+        ).fetchone()
+        if effect is None:
+            return False
+        try:
+            acknowledgement = json.loads(str(effect["acknowledgement_json"]))
+        except (TypeError, ValueError):
+            return False
         if (
-            conn.execute(
-                "SELECT 1 FROM offer_fill_boost_commands "
-                "WHERE fill_id=? AND state='applied'",
-                (fill_id,),
-            ).fetchone()
-            is not None
+            type(acknowledgement) is not dict
+            or acknowledgement.get("schema_version") != 1
+            or acknowledgement.get("fill_id") != fill_id
+            or acknowledgement.get("hook_name") != "fill_classification"
+            or acknowledgement.get("durable") is not True
         ):
-            return True
+            return False
+        detail = acknowledgement.get("detail")
+        if type(detail) is not dict or set(detail) != {
+            "classification",
+            "spent_block_index",
+            "taker_puzzle_hash",
+            "sweep_group_id",
+        }:
+            return False
+        acknowledged_classification = detail["classification"]
+        acknowledged_block = detail["spent_block_index"]
+        acknowledged_taker = detail["taker_puzzle_hash"]
+        acknowledged_group = detail["sweep_group_id"]
+        if (
+            type(acknowledged_classification) is not str
+            or not acknowledged_classification.strip()
+            or (
+                acknowledged_block is not None
+                and (type(acknowledged_block) is not int or acknowledged_block < 0)
+            )
+            or (
+                acknowledged_taker is not None
+                and (
+                    type(acknowledged_taker) is not str
+                    or not acknowledged_taker.strip()
+                )
+            )
+            or (
+                acknowledged_group is not None
+                and (
+                    type(acknowledged_group) is not str
+                    or not acknowledged_group.strip()
+                )
+            )
+        ):
+            return False
+        stored_classification = str(effect["fill_classification"])
+        stored_block = effect["spent_block_index"]
+        stored_group = effect["sweep_group_id"]
+        classification_matches = stored_classification == acknowledged_classification
+        if (
+            acknowledged_classification == "unknown"
+            and stored_classification == "dexie_combined"
+        ):
+            classification_matches = True
+        block_matches = acknowledged_block == stored_block
+        if (
+            acknowledged_block is None
+            and type(stored_block) is int
+            and stored_block > 0
+        ):
+            block_matches = True
+        group_matches = acknowledged_group == stored_group
+        if (
+            acknowledged_group is None
+            and type(stored_block) is int
+            and stored_block > 0
+            and stored_group == f"sweep_{stored_block}"
+        ):
+            group_matches = True
+        return bool(
+            classification_matches
+            and block_matches
+            and effect["taker_puzzle_hash"] == acknowledged_taker
+            and group_matches
+        )
+    if hook_name == "boost_notification":
+        effect = conn.execute(
+            """
+            SELECT command.trade_id AS command_trade_id,
+                   command.side AS command_side,
+                   effect.trade_id AS effect_trade_id,
+                   effect.side AS effect_side,
+                   effect.effect_json
+              FROM offer_fill_boost_commands AS command
+              JOIN offer_fill_boost_effects AS effect
+                ON effect.fill_id=command.fill_id
+             WHERE command.fill_id=? AND command.state='applied'
+            """,
+            (fill_id,),
+        ).fetchone()
+        if effect is not None:
+            try:
+                side = _required_stability_text(
+                    effect["command_side"], "stored Boost command side"
+                ).lower()
+                payload = json.loads(str(effect["effect_json"]))
+                _canonical_authoritative_boost_effect(payload, side)
+                return bool(
+                    str(effect["command_trade_id"]) == str(effect["effect_trade_id"])
+                    and side == str(effect["effect_side"])
+                )
+            except (TypeError, ValueError):
+                return False
         acknowledgement = conn.execute(
             "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
             "WHERE fill_id=? AND hook_name='boost_notification'",
@@ -5607,10 +5907,10 @@ def _offer_fill_hook_receipt_has_durable_effect(
 
 
 def _audit_legacy_offer_fill_hook_receipts(conn: sqlite3.Connection) -> None:
-    """Reopen pre-effect Boost/Sweep receipts lacking durable source state."""
+    """Reopen every legacy receipt lacking its sink-specific durable effect."""
 
     audited_at = _stability_wall_clock()
-    for hook_name in ("boost_notification", "sweep_registration"):
+    for hook_name in _AUTHORITATIVE_FILL_HOOKS:
         rows = conn.execute(
             "SELECT fill_id, state FROM offer_fill_hook_outbox "
             "WHERE hook_name=? AND state='completed'",
@@ -6149,7 +6449,8 @@ def store_authoritative_fill_classification_ack(
             """
             UPDATE fills
                SET fill_classification=?, taker_puzzle_hash=?,
-                   spent_block_index=?, sweep_group_id=?
+                   spent_block_index=COALESCE(?, spent_block_index),
+                   sweep_group_id=?
              WHERE fill_id=?
             """,
             (
@@ -6399,10 +6700,48 @@ def register_authoritative_boost_fill_command(
         conn.close()
 
 
+def _canonical_authoritative_boost_effect(
+    effect_state: Dict[str, Any], side: str
+) -> tuple[Dict[str, Any], str]:
+    if (
+        type(effect_state) is not dict
+        or len(effect_state) != 6
+        or set(effect_state)
+        != {
+            "schema_version",
+            "side",
+            "settled",
+            "offset_bps",
+            "floor_bps",
+            "last_safe_offset_bps",
+        }
+    ):
+        raise ValueError("Boost effect state has an invalid schema")
+    if (
+        effect_state.get("schema_version") != 1
+        or type(effect_state.get("schema_version")) is not int
+        or effect_state.get("side") != side
+        or effect_state.get("settled") is not True
+    ):
+        raise ValueError("Boost effect state does not match its command")
+    for field in ("offset_bps", "floor_bps", "last_safe_offset_bps"):
+        _exact_integer(effect_state.get(field), field, minimum=0)
+    if effect_state["floor_bps"] != effect_state["offset_bps"]:
+        raise ValueError("Boost effect floor must match its settled offset")
+    payload = dict(effect_state)
+    return payload, _canonical_json_text(
+        payload,
+        "authoritative Boost effect",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+
+
 def complete_authoritative_boost_fill_command(
     fill_id: int,
     trade_id: str,
     side: str,
+    effect_state: Dict[str, Any],
     *,
     claim_token: str,
     claim_generation: int,
@@ -6416,6 +6755,9 @@ def complete_authoritative_boost_fill_command(
     safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_side not in {"buy", "sell"}:
         raise ValueError("side must be buy or sell")
+    _effect, encoded_effect = _canonical_authoritative_boost_effect(
+        effect_state, safe_side
+    )
     when = _stability_wall_clock()
     detail = {"trade_id": safe_trade_id, "applicable": True}
     conn = _stability_connection()
@@ -6454,6 +6796,26 @@ def complete_authoritative_boost_fill_command(
                 raise RuntimeError("Boost command transition compare-and-set failed")
         elif str(command["state"]) != "applied":
             raise ValueError("Boost command state is invalid")
+        existing_effect = conn.execute(
+            "SELECT trade_id, side, effect_json FROM offer_fill_boost_effects "
+            "WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing_effect is None:
+            conn.execute(
+                """
+                INSERT INTO offer_fill_boost_effects (
+                    fill_id, trade_id, side, effect_json, applied_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (safe_fill_id, safe_trade_id, safe_side, encoded_effect, when),
+            )
+        elif (
+            str(existing_effect["trade_id"]) != safe_trade_id
+            or str(existing_effect["side"]) != safe_side
+            or str(existing_effect["effect_json"]) != encoded_effect
+        ):
+            raise ValueError("Boost effect replay differs")
         _sink_ack, _sink_applied = _insert_offer_fill_hook_sink_ack(
             conn,
             safe_fill_id,
@@ -6485,10 +6847,57 @@ def get_applied_authoritative_boost_fill_ids() -> set[int]:
 
     rows = (
         get_connection()
-        .execute("SELECT fill_id FROM offer_fill_boost_commands WHERE state='applied'")
+        .execute(
+            "SELECT effect.fill_id FROM offer_fill_boost_effects AS effect "
+            "JOIN offer_fill_boost_commands AS command "
+            "  ON command.fill_id=effect.fill_id "
+            "WHERE command.state='applied'"
+        )
         .fetchall()
     )
     return {int(row["fill_id"]) for row in rows}
+
+
+def get_applied_authoritative_boost_commands() -> List[Dict[str, Any]]:
+    """Return exact effect payloads for deterministic manager reconstruction."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT effect.fill_id, effect.trade_id, effect.side, "
+            "       effect.effect_json, effect.applied_at, "
+            "       command.trade_id AS command_trade_id, "
+            "       command.side AS command_side "
+            "FROM offer_fill_boost_effects AS effect "
+            "JOIN offer_fill_boost_commands AS command "
+            "  ON command.fill_id=effect.fill_id "
+            "WHERE command.state='applied' "
+            "ORDER BY effect.applied_at, effect.fill_id"
+        )
+        .fetchall()
+    )
+    commands: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            effect = json.loads(str(row["effect_json"]))
+            safe_side = _required_stability_text(row["side"], "side").lower()
+            payload, _encoded = _canonical_authoritative_boost_effect(effect, safe_side)
+            if str(row["trade_id"]) != str(row["command_trade_id"]) or safe_side != str(
+                row["command_side"]
+            ):
+                raise ValueError("Boost effect differs from its command")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored authoritative Boost effect is invalid") from exc
+        commands.append(
+            {
+                "fill_id": int(row["fill_id"]),
+                "trade_id": str(row["trade_id"]),
+                "side": safe_side,
+                "effect": payload,
+                "applied_at": str(row["applied_at"]),
+            }
+        )
+    return commands
 
 
 def _canonical_authoritative_sweep_classification(
@@ -6657,23 +7066,360 @@ def acknowledge_authoritative_sweep_registration(
 
 
 def get_authoritative_sweep_registrations() -> List[Dict[str, Any]]:
-    """Return immutable sweep sources for process-cache reconstruction."""
+    """Return the bounded set of immutable, not-yet-finalized sweep sources."""
 
     rows = (
         get_connection()
         .execute(
-            "SELECT fill_id, trade_id, classification_json "
-            "FROM offer_fill_sweep_registrations ORDER BY fill_id"
+            "SELECT registration.fill_id, registration.trade_id, "
+            "       registration.classification_json "
+            "FROM offer_fill_sweep_registrations AS registration "
+            "LEFT JOIN offer_fill_sweep_finalizations AS finalization "
+            "  ON finalization.fill_id=registration.fill_id "
+            "WHERE finalization.fill_id IS NULL "
+            "ORDER BY registration.fill_id LIMIT ?",
+            (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
         )
         .fetchall()
     )
+    if len(rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+        raise RuntimeError("authoritative sweep restore exceeds its hard limit")
     registrations: List[Dict[str, Any]] = []
     for row in rows:
-        payload = json.loads(str(row["classification_json"]))
-        if type(payload) is not dict or payload.get("trade_id") != row["trade_id"]:
-            raise ValueError("stored authoritative sweep registration is invalid")
+        try:
+            payload = json.loads(str(row["classification_json"]))
+            payload, encoded = _canonical_authoritative_sweep_classification(payload)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "stored authoritative sweep registration is invalid"
+            ) from exc
+        if payload["trade_id"] != row["trade_id"] or encoded != str(
+            row["classification_json"]
+        ):
+            raise RuntimeError("stored authoritative sweep registration is invalid")
         registrations.append({"fill_id": int(row["fill_id"]), **payload})
     return registrations
+
+
+_MAX_AUTHORITATIVE_SWEEP_RESTORE = 4096
+_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS = 200
+
+
+def _exact_sweep_fill_ids(fill_ids: Any) -> List[int]:
+    if type(fill_ids) is not list:
+        raise ValueError("sweep fill ids must be an exact list")
+    if not fill_ids or len(fill_ids) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+        raise ValueError("sweep fill ids exceed their hard limit")
+    safe = [_exact_integer(fill_id, "sweep fill id", minimum=1) for fill_id in fill_ids]
+    if len(set(safe)) != len(safe):
+        raise ValueError("sweep fill ids must be unique")
+    return sorted(safe)
+
+
+def _canonical_authoritative_sweep_event(
+    spent_block_index: Any,
+    sweep_group_id: Any,
+    fills: Any,
+) -> tuple[Dict[str, Any], str, str]:
+    safe_block = _exact_integer(spent_block_index, "sweep spent_block_index", minimum=1)
+    if type(sweep_group_id) is not str or not sweep_group_id.strip():
+        raise ValueError("sweep_group_id must be exact non-empty text")
+    if type(fills) is not list or not fills:
+        raise ValueError("sweep event fills must be an exact non-empty list")
+    if len(fills) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+        raise ValueError("sweep event fills exceed their hard limit")
+    safe_fills: List[Dict[str, Any]] = []
+    for fill in fills:
+        if (
+            type(fill) is not dict
+            or len(fill) != 6
+            or set(fill)
+            != {
+                "fill_id",
+                "trade_id",
+                "classification",
+                "spent_block_index",
+                "taker_puzzle_hash",
+                "side",
+            }
+        ):
+            raise ValueError("sweep event fill has an invalid schema")
+        fill_id = _exact_integer(fill["fill_id"], "sweep fill id", minimum=1)
+        trade_id = fill["trade_id"]
+        classification = fill["classification"]
+        if type(trade_id) is not str or not trade_id.strip():
+            raise ValueError("sweep trade_id must be exact non-empty text")
+        if type(classification) is not str or not classification.strip():
+            raise ValueError("sweep classification must be exact non-empty text")
+        fill_block = _exact_integer(
+            fill["spent_block_index"], "sweep fill spent_block_index", minimum=1
+        )
+        if fill_block != safe_block:
+            raise ValueError("sweep fill block differs from its event")
+        taker_puzzle_hash = fill["taker_puzzle_hash"]
+        if taker_puzzle_hash is not None and (
+            type(taker_puzzle_hash) is not str or not taker_puzzle_hash.strip()
+        ):
+            raise ValueError("sweep taker puzzle hash must be exact text")
+        side = fill["side"]
+        if side is not None and (type(side) is not str or side not in {"buy", "sell"}):
+            raise ValueError("sweep side must be buy or sell")
+        safe_fills.append(
+            {
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "classification": classification,
+                "spent_block_index": fill_block,
+                "taker_puzzle_hash": taker_puzzle_hash,
+                "side": side,
+            }
+        )
+    safe_fills.sort(key=lambda item: item["fill_id"])
+    if len({item["fill_id"] for item in safe_fills}) != len(safe_fills):
+        raise ValueError("sweep event fill ids must be unique")
+    payload = {
+        "schema_version": 1,
+        "sweep_group_id": sweep_group_id,
+        "spent_block_index": safe_block,
+        "fills": safe_fills,
+    }
+    encoded = _canonical_json_text(
+        payload,
+        "authoritative sweep event",
+        expected_type=dict,
+        max_bytes=16 * 1024 * 1024,
+    )
+    event_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return payload, encoded, event_id
+
+
+def _load_authoritative_sweep_event_fills(
+    conn: sqlite3.Connection, fill_ids: List[int], spent_block_index: int
+) -> List[Dict[str, Any]]:
+    placeholders = ",".join("?" for _fill_id in fill_ids)
+    rows = conn.execute(
+        f"""
+        SELECT registration.fill_id, registration.trade_id,
+               registration.classification_json,
+               fills.fill_classification, fills.spent_block_index,
+               fills.taker_puzzle_hash, fills.side
+          FROM offer_fill_sweep_registrations AS registration
+          JOIN fills ON fills.fill_id=registration.fill_id
+         WHERE registration.fill_id IN ({placeholders})
+         ORDER BY registration.fill_id
+        """,
+        tuple(fill_ids),
+    ).fetchall()
+    if len(rows) != len(fill_ids):
+        raise ValueError("sweep finalization is missing a durable registration")
+    event_fills: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            registration = json.loads(str(row["classification_json"]))
+            registration, encoded = _canonical_authoritative_sweep_classification(
+                registration
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "stored authoritative sweep registration is invalid"
+            ) from exc
+        if (
+            encoded != str(row["classification_json"])
+            or registration["trade_id"] != str(row["trade_id"])
+            or row["spent_block_index"] != spent_block_index
+            or registration["spent_block_index"] != spent_block_index
+        ):
+            raise ValueError("sweep registration differs from its durable fill")
+        event_fills.append(
+            {
+                "fill_id": int(row["fill_id"]),
+                "trade_id": str(row["trade_id"]),
+                "classification": str(row["fill_classification"]),
+                "spent_block_index": spent_block_index,
+                "taker_puzzle_hash": row["taker_puzzle_hash"],
+                "side": row["side"],
+            }
+        )
+    return event_fills
+
+
+def finalize_authoritative_sweep_registrations(
+    fill_ids: Any, spent_block_index: Any, sweep_group_id: Any
+) -> Dict[str, Any]:
+    """Atomically finalize sources and append one deterministic sweep event."""
+
+    safe_fill_ids = _exact_sweep_fill_ids(fill_ids)
+    safe_block = _exact_integer(spent_block_index, "sweep spent_block_index", minimum=1)
+    if type(sweep_group_id) is not str or not sweep_group_id.strip():
+        raise ValueError("sweep_group_id must be exact non-empty text")
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        event_fills = _load_authoritative_sweep_event_fills(
+            conn, safe_fill_ids, safe_block
+        )
+        payload, encoded, event_id = _canonical_authoritative_sweep_event(
+            safe_block, sweep_group_id, event_fills
+        )
+        existing_event = conn.execute(
+            "SELECT spent_block_index, sweep_group_id, event_json "
+            "FROM offer_fill_sweep_events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if existing_event is None:
+            conn.execute(
+                "INSERT INTO offer_fill_sweep_events "
+                "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event_id, safe_block, sweep_group_id, encoded, when),
+            )
+        elif (
+            existing_event["spent_block_index"] != safe_block
+            or str(existing_event["sweep_group_id"]) != sweep_group_id
+            or str(existing_event["event_json"]) != encoded
+        ):
+            raise ValueError("sweep event replay differs")
+        for fill_id in safe_fill_ids:
+            existing = conn.execute(
+                "SELECT event_id FROM offer_fill_sweep_finalizations WHERE fill_id=?",
+                (fill_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO offer_fill_sweep_finalizations "
+                    "(fill_id, event_id, finalized_at) VALUES (?, ?, ?)",
+                    (fill_id, event_id, when),
+                )
+            elif str(existing["event_id"]) != event_id:
+                raise ValueError("sweep finalization replay differs")
+        conn.commit()
+        return {"event_id": event_id, **payload}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def consume_authoritative_sweep_registrations(fill_ids: Any) -> bool:
+    """Durably finalize a non-sweep group so it cannot restore after restart."""
+
+    safe_fill_ids = _exact_sweep_fill_ids(fill_ids)
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _fill_id in safe_fill_ids)
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM offer_fill_sweep_registrations "
+            f"WHERE fill_id IN ({placeholders})",
+            tuple(safe_fill_ids),
+        ).fetchone()[0]
+        if count != len(safe_fill_ids):
+            raise ValueError("sweep consumption is missing a durable registration")
+        for fill_id in safe_fill_ids:
+            existing = conn.execute(
+                "SELECT event_id FROM offer_fill_sweep_finalizations WHERE fill_id=?",
+                (fill_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO offer_fill_sweep_finalizations "
+                    "(fill_id, event_id, finalized_at) VALUES (?, NULL, ?)",
+                    (fill_id, when),
+                )
+            elif existing["event_id"] is not None:
+                raise ValueError("sweep registration already belongs to an event")
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_pending_authoritative_sweep_events() -> List[Dict[str, Any]]:
+    """Return a bounded set of finalized events lacking durable consumption."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT event.event_id, event.spent_block_index, "
+            "       event.sweep_group_id, event.event_json "
+            "FROM offer_fill_sweep_events AS event "
+            "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
+            "  ON receipt.event_id=event.event_id "
+            "WHERE receipt.event_id IS NULL "
+            "ORDER BY event.finalized_at, event.event_id LIMIT ?",
+            (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS,),
+        )
+        .fetchall()
+    )
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            decoded = json.loads(str(row["event_json"]))
+            if type(decoded) is not dict or set(decoded) != {
+                "schema_version",
+                "sweep_group_id",
+                "spent_block_index",
+                "fills",
+            }:
+                raise ValueError("invalid schema")
+            if decoded.get("schema_version") != 1:
+                raise ValueError("invalid schema version")
+            payload, encoded, event_id = _canonical_authoritative_sweep_event(
+                decoded.get("spent_block_index"),
+                decoded.get("sweep_group_id"),
+                decoded.get("fills"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored authoritative sweep event is invalid") from exc
+        if (
+            encoded != str(row["event_json"])
+            or event_id != str(row["event_id"])
+            or payload["spent_block_index"] != row["spent_block_index"]
+            or payload["sweep_group_id"] != str(row["sweep_group_id"])
+        ):
+            raise RuntimeError("stored authoritative sweep event is invalid")
+        events.append({"event_id": event_id, **payload})
+    return events
+
+
+def consume_authoritative_sweep_event(event_id: Any) -> bool:
+    """Append the consumption identity for one emitted downstream event."""
+
+    if (
+        type(event_id) is not str
+        or len(event_id) != 64
+        or any(character not in "0123456789abcdef" for character in event_id)
+    ):
+        raise ValueError("sweep event id must be an exact SHA-256 digest")
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_sweep_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("authoritative sweep event does not exist")
+        conn.execute(
+            "INSERT OR IGNORE INTO offer_fill_sweep_event_receipts "
+            "(event_id, consumed_at) VALUES (?, ?)",
+            (event_id, when),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def claim_offer_fill_hook(

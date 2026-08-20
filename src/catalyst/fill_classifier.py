@@ -82,6 +82,13 @@ def classify_fill(
         FillClassification with the best available classification.
     """
     result = FillClassification(trade_id=trade_id)
+    # Task 9's authoritative reconciliation already proved this on-chain
+    # height.  Preserve it independently of optional third-party metadata so
+    # a missing Dexie detail cannot erase sweep grouping evidence.
+    if type(fill_detail) is dict:
+        authoritative_block = fill_detail.get("spent_block_index")
+        if type(authoritative_block) is int and authoritative_block > 0:
+            result.spent_block_index = authoritative_block
 
     # Pull known arb puzzle hashes from config (fail-open)
     known_arb_hashes: Set[str] = set()
@@ -100,9 +107,9 @@ def classify_fill(
     side = str(fill_detail.get("side") or "").lower()
 
     # --- Extract spent_block_index from Dexie detail ---
-    if dexie_detail:
+    if type(dexie_detail) is dict:
         raw_block = dexie_detail.get("spent_block_index")
-        if raw_block is not None:
+        if raw_block is not None and result.spent_block_index is None:
             try:
                 result.spent_block_index = int(raw_block)
             except (TypeError, ValueError):

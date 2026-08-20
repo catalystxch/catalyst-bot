@@ -4647,6 +4647,16 @@ def _is_open_status(status_val, offer_record=None) -> bool:
     return False
 
 
+def _normalize_offer_lock_id(offer_id: Any) -> Optional[str]:
+    """Return the canonical form used when comparing Sage offer lock ids."""
+    if type(offer_id) is not str:
+        return None
+    normalized = offer_id.strip().lower()
+    if normalized.startswith("0x"):
+        normalized = normalized[2:]
+    return normalized or None
+
+
 def classify_offers_from_list(offers_list: list, asset_id_mz: str):
     """Classify offers from a pre-fetched list.
 
@@ -5127,6 +5137,24 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
     return coin_map
 
 
+def _exact_positive_atomic_amount(value) -> Optional[int]:
+    """Return one exact positive mojo amount without coercive conversion."""
+
+    if type(value) is int:
+        return value if value > 0 else None
+    if (
+        type(value) is str
+        and value.isascii()
+        and value.isdigit()
+        and not value.startswith("0")
+    ):
+        return int(value)
+    return None
+
+
+_MAX_GET_COINS_BY_IDS = 4096
+
+
 def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
     """Get detailed status for specific coins by their IDs.
 
@@ -5140,18 +5168,25 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
     Returns dict: {normalized_coin_id: {amount, offer_id, spent_height, created_height}}
     Returns None on RPC failure.
     """
+    if type(coin_ids) is not list or len(coin_ids) > _MAX_GET_COINS_BY_IDS:
+        return None
     if not coin_ids:
         return {}
 
     # Normalize IDs for the request — Sage expects hex strings
     normalized = []
     for cid in coin_ids:
-        if isinstance(cid, str):
-            # Remove 0x prefix if present — Sage might want bare hex
-            clean = cid.lower()
-            if clean.startswith("0x"):
-                clean = clean[2:]
-            normalized.append(clean)
+        if type(cid) is not str:
+            return None
+        # Remove 0x prefix if present — Sage might want bare hex
+        clean = cid.lower()
+        if clean.startswith("0x"):
+            clean = clean[2:]
+        if len(clean) != 64 or re.fullmatch(r"[0-9a-f]{64}", clean) is None:
+            return None
+        normalized.append(clean)
+    if len(set(normalized)) != len(normalized):
+        return None
 
     result = rpc(
         "get_coins_by_ids",
@@ -5161,23 +5196,48 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
         timeout=15,
     )
 
-    if not result:
+    if type(result) is not dict:
         return None
 
-    coins = result.get("coins") or result.get("records") or result.get("data") or []
+    coins = None
+    for key in ("coins", "records", "data"):
+        if key in result and result[key] is not None:
+            coins = result[key]
+            break
+    if type(coins) is not list or len(coins) > _MAX_GET_COINS_BY_IDS:
+        return None
     coin_map = {}
     for c in coins:
-        cid = c.get("coin_id", "")
+        if type(c) is not dict:
+            return None
+        amount = _exact_positive_atomic_amount(c.get("amount"))
+        if amount is None:
+            return None
+        raw_cid = c.get("coin_id")
+        if type(raw_cid) is not str:
+            return None
+        clean_cid = raw_cid.lower()
+        if clean_cid.startswith("0x"):
+            clean_cid = clean_cid[2:]
+        if (
+            len(clean_cid) != 64
+            or re.fullmatch(r"[0-9a-f]{64}", clean_cid) is None
+            or clean_cid not in normalized
+        ):
+            return None
+        cid = "0x" + clean_cid
+        if cid in coin_map:
+            return None
         if cid:
-            if not cid.startswith("0x"):
-                cid = "0x" + cid.lower()
-            else:
-                cid = cid.lower()
-            offer_id = c.get("offer_id") or c.get("offer_hash") or None
-            if offer_id and isinstance(offer_id, str):
+            offer_id = c.get("offer_id")
+            if offer_id is None:
+                offer_id = c.get("offer_hash")
+            if type(offer_id) is str:
                 offer_id = offer_id.lower()
+            elif offer_id is not None:
+                return None
             record = {
-                "amount": int(c.get("amount", "0")),
+                "amount": amount,
                 "offer_id": offer_id,
                 "spent_height": c.get("spent_height"),
                 "created_height": c.get("created_height"),
@@ -5185,7 +5245,7 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
             }
             asset_present = "asset_id" in c
             asset_value = c.get("asset_id")
-            if not asset_present and isinstance(c.get("asset"), dict):
+            if not asset_present and type(c.get("asset")) is dict:
                 asset_present = "asset_id" in c["asset"]
                 asset_value = c["asset"].get("asset_id")
             if asset_present:
