@@ -719,6 +719,28 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_event_sinks is append-only');
 END;
 
+-- Every post-fill sink returns this exact durable acknowledgement before the
+-- outbox receipt may complete.  The acknowledgement binds the fill and sink,
+-- and remains independently auditable after delivery state is compacted.
+CREATE TABLE IF NOT EXISTS offer_fill_hook_sink_acks (
+    fill_id                     INTEGER NOT NULL,
+    hook_name                   TEXT NOT NULL,
+    acknowledgement_json       TEXT NOT NULL,
+    created_at                  TEXT NOT NULL,
+    PRIMARY KEY(fill_id, hook_name),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_sink_acks_no_update
+BEFORE UPDATE ON offer_fill_hook_sink_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_sink_acks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_sink_acks_no_delete
+BEFORE DELETE ON offer_fill_hook_sink_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_sink_acks is append-only');
+END;
+
 -- Append-only success receipts remain the stable reader interface.
 CREATE TABLE IF NOT EXISTS offer_fill_hook_receipts (
     fill_id                     INTEGER NOT NULL,
@@ -944,6 +966,12 @@ _STABILITY_REQUIRED_COLUMNS = {
     "offer_fill_event_sinks": {
         "fill_id",
         "event_id",
+        "created_at",
+    },
+    "offer_fill_hook_sink_acks": {
+        "fill_id",
+        "hook_name",
+        "acknowledgement_json",
         "created_at",
     },
     "offer_fill_hook_receipts": {
@@ -1418,11 +1446,13 @@ def _migrate_stability_schema() -> None:
 
     conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
     try:
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
+        _backfill_authoritative_fill_hook_outbox(conn)
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -1642,6 +1672,14 @@ def _init_database_impl():
             "db_migration",
             "Added 'verification_status' column to fills table (existing rows marked legacy)",
         )
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _backfill_authoritative_fill_hook_outbox(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
     # Migration: clear bad round-trip matches where sizes don't match.
     # FIFO matching was pairing 0.2 XCH sniper buys with 0.9+ XCH tiered sells.
@@ -3866,6 +3904,7 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         return 0
     try:
         conn = get_connection()
+        conn.execute("BEGIN IMMEDIATE")
         now = _now()
         coin_list = list(coin_ids)
         placeholders = ",".join("?" * len(coin_list))
@@ -3885,6 +3924,7 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
 
         safe_coin_list = [coin_id for coin_id, _details in gone_details]
         if not safe_coin_list:
+            conn.commit()
             return 0
         safe_placeholders = ",".join("?" * len(safe_coin_list))
 
@@ -3893,7 +3933,8 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
             f"""UPDATE coins SET status='gone', last_seen=?,
                 designation='unknown', assigned_tier='none'
                 WHERE coin_id IN ({safe_placeholders}) AND status='free'
-                  AND trade_id IS NULL""",
+                  AND trade_id IS NULL
+                  AND {_nonterminal_registry_coin_absent_sql("coins.coin_id")}""",
             [now] + safe_coin_list,
         )
         count = cursor.rowcount
@@ -4226,6 +4267,24 @@ def _nonterminal_registry_coin_ids(conn: sqlite3.Connection) -> set[str]:
     return protected
 
 
+def _nonterminal_registry_coin_absent_sql(coin_expression: str) -> str:
+    """Return a correlated SQL guard for legacy coin-state writers."""
+
+    if coin_expression not in {"coins.coin_id", "coin_id"}:
+        raise ValueError("unsupported registry coin SQL expression")
+    terminal_states = ", ".join(
+        f"'{state}'" for state in sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+    )
+    return f"""NOT EXISTS (
+        SELECT 1
+          FROM offer_intents AS registry_intent,
+               json_each(registry_intent.selected_coin_ids_json) AS selected_coin
+         WHERE registry_intent.lifecycle_state NOT IN ({terminal_states})
+           AND lower(replace(CAST(selected_coin.value AS TEXT), '0x', ''))
+             = lower(replace(CAST({coin_expression} AS TEXT), '0x', ''))
+    )"""
+
+
 def is_coin_reconciliation_protected(coin_id: str) -> bool:
     """Return whether legacy wallet reconciliation must preserve this coin."""
 
@@ -4255,33 +4314,42 @@ def reconcile_wallet_locked_coin_links(
         exact_links.append((normalized_coin, exact_trade))
     stats = {"linked": 0, "locked": 0, "protected": 0, "missing": 0}
     conn = get_connection()
-    registry_protected = _nonterminal_registry_coin_ids(conn)
-    now = _now()
-    for coin_id, trade_id in exact_links:
-        row = conn.execute(
-            "SELECT status, trade_id FROM coins WHERE coin_id=?", (coin_id,)
-        ).fetchone()
-        if row is None:
-            stats["missing"] += 1
-            continue
-        if row["trade_id"] or coin_id in registry_protected:
-            stats["protected"] += 1
-            continue
-        if row["status"] == "locked":
-            conn.execute(
-                "UPDATE coins SET trade_id=?, last_seen=? WHERE coin_id=?",
-                (trade_id, now, coin_id),
-            )
-            stats["linked"] += 1
-        else:
-            conn.execute(
-                "UPDATE coins SET status='locked', trade_id=?, last_seen=? "
-                "WHERE coin_id=?",
-                (trade_id, now, coin_id),
-            )
-            stats["locked"] += 1
-    conn.commit()
-    return stats
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        registry_protected = _nonterminal_registry_coin_ids(conn)
+        now = _now()
+        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
+        for coin_id, trade_id in exact_links:
+            row = conn.execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?", (coin_id,)
+            ).fetchone()
+            if row is None:
+                stats["missing"] += 1
+                continue
+            if row["trade_id"] or coin_id in registry_protected:
+                stats["protected"] += 1
+                continue
+            if row["status"] == "locked":
+                cursor = conn.execute(
+                    f"""UPDATE coins SET trade_id=?, last_seen=?
+                        WHERE coin_id=? AND status='locked' AND trade_id IS NULL
+                          AND {registry_absent}""",
+                    (trade_id, now, coin_id),
+                )
+                stats["linked"] += cursor.rowcount
+            else:
+                cursor = conn.execute(
+                    f"""UPDATE coins SET status='locked', trade_id=?, last_seen=?
+                        WHERE coin_id=? AND trade_id IS NULL
+                          AND {registry_absent}""",
+                    (trade_id, now, coin_id),
+                )
+                stats["locked"] += cursor.rowcount
+        conn.commit()
+        return stats
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def reconcile_coins_with_wallet(
@@ -4322,8 +4390,10 @@ def reconcile_coins_with_wallet(
     # but never persisting (DB unchanged after commit).
     deferred_logs = []
 
+    conn = None
     try:
         conn = get_connection()
+        conn.execute("BEGIN IMMEDIATE")
         now = _now()
 
         # Derive locked set.
@@ -4361,6 +4431,7 @@ def reconcile_coins_with_wallet(
         db_ids = set(db_coins.keys())
         wallet_all_ids = set(wallet_owned.keys())
         registry_protected = _nonterminal_registry_coin_ids(conn)
+        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
 
         # 1. STALE: in DB as free/locked but not in wallet → mark gone
         #    Only mark active coins as gone (already gone/spent stay as-is)
@@ -4373,11 +4444,16 @@ def reconcile_coins_with_wallet(
             if db_coins[nid]["trade_id"] or norm_coin_id(raw_id) in registry_protected:
                 stats["protected"] += 1
                 continue
-            conn.execute(
-                "UPDATE coins SET status='gone', last_seen=? WHERE coin_id=?",
+            cursor = conn.execute(
+                f"""UPDATE coins SET status='gone', last_seen=?
+                    WHERE coin_id=? AND status IN ('free', 'locked')
+                      AND trade_id IS NULL AND {registry_absent}""",
                 (now, raw_id),
             )
-            stats["marked_gone"] += 1
+            if cursor.rowcount == 0:
+                stats["protected"] += 1
+                continue
+            stats["marked_gone"] += cursor.rowcount
             amt = db_coins[nid]["amount"]
             deferred_logs.append(
                 (
@@ -4411,8 +4487,8 @@ def reconcile_coins_with_wallet(
                 except Exception:
                     pass
 
-                conn.execute(
-                    """INSERT INTO coins
+                cursor = conn.execute(
+                    f"""INSERT INTO coins
                        (coin_id, wallet_type, amount_mojos, tier, status,
                         first_seen, last_seen, designation, assigned_tier)
                        VALUES (?, ?, ?, 'unknown', ?, ?, ?, ?, ?)
@@ -4420,7 +4496,8 @@ def reconcile_coins_with_wallet(
                            status = ?,
                            amount_mojos = ?,
                            last_seen = ?,
-                           wallet_type = ?""",
+                           wallet_type = ?
+                       WHERE coins.trade_id IS NULL AND {registry_absent}""",
                     (
                         store_id,
                         wallet_type,
@@ -4436,7 +4513,10 @@ def reconcile_coins_with_wallet(
                         wallet_type,
                     ),
                 )
-                stats["added"] += 1
+                if cursor.rowcount == 0:
+                    stats["protected"] += 1
+                    continue
+                stats["added"] += cursor.rowcount
                 deferred_logs.append(
                     (
                         "debug",
@@ -4460,14 +4540,18 @@ def reconcile_coins_with_wallet(
                         stats["protected"] += 1
                         continue
                     # Reappearing coin! Reset to active status
-                    conn.execute(
-                        """UPDATE coins SET status=?, amount_mojos=?,
+                    cursor = conn.execute(
+                        f"""UPDATE coins SET status=?, amount_mojos=?,
                            last_seen=?, designation='unknown',
                            assigned_tier='none', trade_id=NULL
-                           WHERE coin_id=?""",
+                           WHERE coin_id=? AND status IN ('gone', 'spent')
+                             AND trade_id IS NULL AND {registry_absent}""",
                         (target_status, amt, now, raw_id),
                     )
-                    stats["reappeared"] += 1
+                    if cursor.rowcount == 0:
+                        stats["protected"] += 1
+                        continue
+                    stats["reappeared"] += cursor.rowcount
                     deferred_logs.append(
                         (
                             "debug",
@@ -4480,11 +4564,22 @@ def reconcile_coins_with_wallet(
 
                 elif is_locked and db_status == "free":
                     # Wallet says locked, DB says free → lock it
-                    conn.execute(
-                        "UPDATE coins SET status='locked', last_seen=? WHERE coin_id=?",
+                    if (
+                        db_coins[nid]["trade_id"]
+                        or norm_coin_id(raw_id) in registry_protected
+                    ):
+                        stats["protected"] += 1
+                        continue
+                    cursor = conn.execute(
+                        f"""UPDATE coins SET status='locked', last_seen=?
+                            WHERE coin_id=? AND status='free' AND trade_id IS NULL
+                              AND {registry_absent}""",
                         (now, raw_id),
                     )
-                    stats["locked"] += 1
+                    if cursor.rowcount:
+                        stats["locked"] += cursor.rowcount
+                    else:
+                        stats["protected"] += 1
 
                 elif not is_locked and db_status == "locked":
                     # Wallet says free, DB says locked → free it, but only if no active
@@ -4497,8 +4592,9 @@ def reconcile_coins_with_wallet(
                         stats["already_ok"] += 1
                     else:
                         cur = conn.execute(
-                            """UPDATE coins SET status='free', trade_id=NULL,
-                               last_seen=? WHERE coin_id=? AND trade_id IS NULL""",
+                            f"""UPDATE coins SET status='free', trade_id=NULL,
+                               last_seen=? WHERE coin_id=? AND status='locked'
+                               AND trade_id IS NULL AND {registry_absent}""",
                             (now, raw_id),
                         )
                         if cur.rowcount > 0:
@@ -4532,6 +4628,11 @@ def reconcile_coins_with_wallet(
             )
 
     except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         deferred_logs.append(
             (
                 "error",
@@ -4905,10 +5006,14 @@ def cleanup_orphaned_locked_coins(
     for _wc in wallet_confirmed_locked:
         _wcl_normalized.add(norm_coin_id(_wc))
 
+    deferred_freed_logs: list[tuple[str, str]] = []
+    conn = None
     try:
         conn = get_connection()
+        conn.execute("BEGIN IMMEDIATE")
         now = _now()
         registry_protected = _nonterminal_registry_coin_ids(conn)
+        registry_absent = _nonterminal_registry_coin_absent_sql("coins.coin_id")
 
         # Get all locked coins
         rows = conn.execute(
@@ -4936,44 +5041,53 @@ def cleanup_orphaned_locked_coins(
                 continue
 
             # No trade_id and no registry owner: legacy failed-creation debris.
-            conn.execute(
-                "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
-                "WHERE coin_id=?",
+            cursor = conn.execute(
+                f"""UPDATE coins SET status='free', trade_id=NULL, last_seen=?
+                    WHERE coin_id=? AND status='locked' AND trade_id IS NULL
+                      AND {registry_absent}""",
                 (now, cid),
             )
-            stats["freed_no_trade"] += 1
+            if cursor.rowcount == 0:
+                stats["protected_registry_or_trade"] += 1
+                continue
+            stats["freed_no_trade"] += cursor.rowcount
             if row["wallet_type"] == "xch":
                 amt_str = f"{row['amount_mojos'] / 1_000_000_000_000:.4f} XCH"
             else:
                 amt_str = f"{row['amount_mojos']} mojos"
-            log_event(
-                "info",
-                "orphan_freed",
-                f"{wt} coin {cid[:16]}... FREED — no trade_id (orphaned) "
-                f"({amt_str} | {row['designation']}/{row['assigned_tier']})",
+            deferred_freed_logs.append(
+                (
+                    "orphan_freed",
+                    f"{wt} coin {cid[:16]}... FREED — no trade_id (orphaned) "
+                    f"({amt_str} | {row['designation']}/{row['assigned_tier']})",
+                )
             )
 
         conn.commit()
         stats["total_freed"] = stats["freed_no_trade"] + stats["freed_stale_trade"]
 
-        if stats["total_freed"] > 0 or stats["skipped_wallet_locked"] > 0:
-            log_event(
-                "info",
-                "orphan_cleanup",
-                f"Freed {stats['total_freed']} orphaned locked coins "
-                f"({stats['freed_no_trade']} no trade_id, "
-                f"{stats['freed_stale_trade']} stale trade_id, "
-                f"{stats['skipped_wallet_locked']} protected by wallet, "
-                f"{stats['protected_registry_or_trade']} registry/trade protected)",
-            )
-
     except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         log_event(
             "error", "orphan_cleanup_error", f"Orphaned locked coin cleanup failed: {e}"
+        )
+        return stats
+
+    for event_type, message in deferred_freed_logs:
+        log_event("info", event_type, message)
+    if stats["total_freed"] > 0 or stats["skipped_wallet_locked"] > 0:
+        log_event(
+            "info",
+            "orphan_cleanup",
+            f"Freed {stats['total_freed']} orphaned locked coins "
+            f"({stats['freed_no_trade']} no trade_id, "
+            f"{stats['freed_stale_trade']} stale trade_id, "
+            f"{stats['skipped_wallet_locked']} protected by wallet, "
+            f"{stats['protected_registry_or_trade']} registry/trade protected)",
         )
 
     return stats
@@ -5280,6 +5394,71 @@ _AUTHORITATIVE_FILL_HOOKS = (
 _AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS = 30
 
 
+def _ensure_authoritative_fill_hook_outbox(
+    conn: sqlite3.Connection, fill_id: int
+) -> None:
+    """Ensure every authoritative fill has replayable post-commit work."""
+
+    receipts = {
+        str(row["hook_name"]): str(row["completed_at"])
+        for row in conn.execute(
+            "SELECT hook_name, completed_at FROM offer_fill_hook_receipts "
+            "WHERE fill_id=?",
+            (fill_id,),
+        ).fetchall()
+    }
+    for hook_name in _AUTHORITATIVE_FILL_HOOKS:
+        completed_at = receipts.get(hook_name)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO offer_fill_hook_outbox (
+                fill_id, hook_name, state, attempt, completed_at
+            ) VALUES (?, ?, ?, 0, ?)
+            """,
+            (
+                fill_id,
+                hook_name,
+                "completed" if completed_at is not None else "pending",
+                completed_at,
+            ),
+        )
+        if completed_at is not None:
+            conn.execute(
+                """
+                UPDATE offer_fill_hook_outbox
+                SET state='completed', claim_token=NULL, claimed_at=NULL,
+                    completed_at=?, last_error_code=NULL
+                WHERE fill_id=? AND hook_name=? AND state<>'completed'
+                """,
+                (completed_at, fill_id, hook_name),
+            )
+
+
+def _backfill_authoritative_fill_hook_outbox(conn: sqlite3.Connection) -> None:
+    fill_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(fills)").fetchall()
+    }
+    if "verification_status" not in fill_columns:
+        return
+    rows = conn.execute(
+        """
+        SELECT DISTINCT fills.fill_id
+          FROM fills
+          LEFT JOIN offer_intents
+            ON offer_intents.sage_trade_id=fills.trade_id
+          LEFT JOIN offer_operation_journal
+            ON offer_operation_journal.intent_id=offer_intents.intent_id
+           AND offer_operation_journal.operation_type='RECONCILE'
+           AND offer_operation_journal.phase='FINALIZED'
+           AND offer_operation_journal.outcome='FILLED_PROVEN'
+         WHERE fills.verification_status='verified_authoritative'
+            OR offer_operation_journal.sequence IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        _ensure_authoritative_fill_hook_outbox(conn, int(row[0]))
+
+
 def get_fill_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
     """Return the one durable fill for a trade identity, if it exists."""
 
@@ -5290,6 +5469,16 @@ def get_fill_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM fills WHERE trade_id=? ORDER BY fill_id DESC LIMIT 1",
             (safe_trade_id,),
         )
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def get_fill_by_id(fill_id: int) -> Optional[Dict[str, Any]]:
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    row = (
+        get_connection()
+        .execute("SELECT * FROM fills WHERE fill_id=?", (safe_fill_id,))
         .fetchone()
     )
     return dict(row) if row is not None else None
@@ -5311,13 +5500,225 @@ def get_offer_fill_hook_receipts(fill_id: int) -> List[str]:
     return [name for name in _AUTHORITATIVE_FILL_HOOKS if name in completed]
 
 
+def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
+    """Return fills with pending or abandoned post-fill work."""
+
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    if safe_limit > 512:
+        raise ValueError("limit exceeds the post-fill outbox bound")
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "post-fill outbox clock", require_timezone=True
+    )
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT fill_id, MIN(CASE WHEN state='pending' THEN 0 ELSE 1 END) AS priority
+          FROM offer_fill_hook_outbox
+         WHERE state='pending'
+            OR (state='running' AND claimed_at<=?)
+         GROUP BY fill_id
+         ORDER BY priority, fill_id
+         LIMIT ?
+        """,
+            (abandoned_before, safe_limit),
+        )
+        .fetchall()
+    )
+    return [int(row["fill_id"]) for row in rows]
+
+
+def _offer_fill_hook_acknowledgement(
+    fill_id: int, hook_name: str, detail: Dict[str, Any]
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "fill_id": fill_id,
+        "hook_name": hook_name,
+        "durable": True,
+        "detail": detail,
+    }
+
+
+def _insert_offer_fill_hook_sink_ack(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    hook_name: str,
+    detail: Dict[str, Any],
+    created_at: str,
+) -> Dict[str, Any]:
+    acknowledgement = _offer_fill_hook_acknowledgement(fill_id, hook_name, detail)
+    acknowledgement_json = _canonical_json_text(
+        acknowledgement,
+        "post-fill sink acknowledgement",
+        expected_type=dict,
+        max_bytes=16384,
+    )
+    existing = conn.execute(
+        "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
+        "WHERE fill_id=? AND hook_name=?",
+        (fill_id, hook_name),
+    ).fetchone()
+    if existing is not None:
+        if str(existing["acknowledgement_json"]) != acknowledgement_json:
+            raise ValueError("post-fill sink acknowledgement replay differs")
+        return acknowledgement
+    conn.execute(
+        """
+        INSERT INTO offer_fill_hook_sink_acks (
+            fill_id, hook_name, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (fill_id, hook_name, acknowledgement_json, created_at),
+    )
+    return acknowledgement
+
+
+def record_offer_fill_hook_sink_ack(
+    fill_id: int, hook_name: str, detail: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Persist and return one exact positive acknowledgement from a sink."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_hook = _required_stability_text(hook_name, "hook_name")
+    if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
+        raise ValueError("post-fill hook name is not registered")
+    if type(detail) is not dict:
+        raise ValueError("post-fill sink acknowledgement detail must be a dict")
+    safe_detail = json.loads(
+        _canonical_json_text(
+            detail,
+            "post-fill sink acknowledgement detail",
+            expected_type=dict,
+            max_bytes=8192,
+        )
+    )
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            conn.execute(
+                "SELECT 1 FROM fills WHERE fill_id=?", (safe_fill_id,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("post-fill sink acknowledgement references a missing fill")
+        acknowledgement = _insert_offer_fill_hook_sink_ack(
+            conn, safe_fill_id, safe_hook, safe_detail, when
+        )
+        conn.commit()
+        return acknowledgement
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def validate_offer_fill_hook_sink_ack(
+    fill_id: int, hook_name: str, acknowledgement: Dict[str, Any]
+) -> bool:
+    """Confirm an acknowledgement is the exact durable row for this sink."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_hook = _required_stability_text(hook_name, "hook_name")
+    if safe_hook not in _AUTHORITATIVE_FILL_HOOKS or type(acknowledgement) is not dict:
+        return False
+    try:
+        encoded = _canonical_json_text(
+            acknowledgement,
+            "post-fill sink acknowledgement",
+            expected_type=dict,
+            max_bytes=16384,
+        )
+    except (TypeError, ValueError):
+        return False
+    row = (
+        get_connection()
+        .execute(
+            "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
+            "WHERE fill_id=? AND hook_name=?",
+            (safe_fill_id, safe_hook),
+        )
+        .fetchone()
+    )
+    return row is not None and str(row["acknowledgement_json"]) == encoded
+
+
+def store_authoritative_fill_classification_ack(
+    fill_id: int, classification: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Store classification and its sink acknowledgement atomically."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    if type(classification) is not dict:
+        raise ValueError("authoritative fill classification must be a dict")
+    safe_classification = _required_stability_text(
+        classification.get("classification"), "fill classification"
+    )
+    safe_block = classification.get("spent_block_index")
+    if safe_block is not None:
+        safe_block = _exact_integer(safe_block, "spent_block_index", minimum=0)
+    safe_taker = classification.get("taker_puzzle_hash")
+    if safe_taker is not None:
+        safe_taker = _required_stability_text(safe_taker, "taker_puzzle_hash")
+    safe_group = classification.get("sweep_group_id")
+    if safe_group is not None:
+        safe_group = _required_stability_text(safe_group, "sweep_group_id")
+    detail = {
+        "classification": safe_classification,
+        "spent_block_index": safe_block,
+        "taker_puzzle_hash": safe_taker,
+        "sweep_group_id": safe_group,
+    }
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE fills
+               SET fill_classification=?, taker_puzzle_hash=?,
+                   spent_block_index=?, sweep_group_id=?
+             WHERE fill_id=?
+            """,
+            (
+                safe_classification,
+                safe_taker,
+                safe_block,
+                safe_group,
+                safe_fill_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("fill classification references a missing fill")
+        acknowledgement = _insert_offer_fill_hook_sink_ack(
+            conn,
+            safe_fill_id,
+            "fill_classification",
+            detail,
+            when,
+        )
+        conn.commit()
+        return acknowledgement
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def log_authoritative_offer_filled_once(
     fill_id: int,
     message: str,
     data: Dict[str, Any],
     *,
     created_at: Any,
-) -> bool:
+) -> Dict[str, Any]:
     """Persist the offer_filled event exactly once for one durable fill."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
@@ -5331,6 +5732,14 @@ def log_authoritative_offer_filled_once(
         max_bytes=65536,
     )
     when = _stability_timestamp_or_now(created_at, "created_at")
+    sink_time = _stability_wall_clock()
+    event_category = None
+    try:
+        from event_taxonomy import categorize_event
+
+        event_category = categorize_event("offer_filled")
+    except Exception:
+        pass
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -5339,8 +5748,15 @@ def log_authoritative_offer_filled_once(
             (safe_fill_id,),
         ).fetchone()
         if existing is not None:
+            acknowledgement = _insert_offer_fill_hook_sink_ack(
+                conn,
+                safe_fill_id,
+                "offer_filled_event",
+                {"event_id": int(existing["event_id"])},
+                sink_time,
+            )
             conn.commit()
-            return False
+            return acknowledgement
         if (
             conn.execute(
                 "SELECT 1 FROM fills WHERE fill_id=?", (safe_fill_id,)
@@ -5348,22 +5764,53 @@ def log_authoritative_offer_filled_once(
             is None
         ):
             raise ValueError("offer_filled event references a missing fill")
-        cursor = conn.execute(
-            """
-            INSERT INTO events (timestamp, event_type, severity, message, data)
-            VALUES (?, 'offer_filled', 'info', ?, ?)
-            """,
-            (when, safe_message, safe_data),
-        )
+        if event_category:
+            cursor = conn.execute(
+                """
+                INSERT INTO events (
+                    timestamp, event_type, severity, message, data, event_category
+                ) VALUES (?, 'offer_filled', 'info', ?, ?, ?)
+                """,
+                (when, safe_message, safe_data, event_category),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO events (timestamp, event_type, severity, message, data)
+                VALUES (?, 'offer_filled', 'info', ?, ?)
+                """,
+                (when, safe_message, safe_data),
+            )
+        event_id = int(cursor.lastrowid)
         conn.execute(
             """
             INSERT INTO offer_fill_event_sinks (fill_id, event_id, created_at)
             VALUES (?, ?, ?)
             """,
-            (safe_fill_id, int(cursor.lastrowid), when),
+            (safe_fill_id, event_id, when),
+        )
+        acknowledgement = _insert_offer_fill_hook_sink_ack(
+            conn,
+            safe_fill_id,
+            "offer_filled_event",
+            {"event_id": event_id},
+            sink_time,
         )
         conn.commit()
-        return True
+        if _sse_callback:
+            try:
+                payload = {
+                    "severity": "info",
+                    "event_type": "offer_filled",
+                    "message": safe_message,
+                    "timestamp": when,
+                    "data": data,
+                    **data,
+                }
+                _sse_callback("log", payload)
+            except Exception:
+                pass
+        return acknowledgement
     except Exception:
         conn.rollback()
         raise
@@ -5380,7 +5827,8 @@ def claim_offer_fill_hook(
     safe_hook = _required_stability_text(hook_name, "hook_name")
     if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
         raise ValueError("post-fill hook name is not registered")
-    when = _stability_timestamp_or_now(claimed_at, "claimed_at")
+    _ = claimed_at
+    when = _stability_wall_clock()
     token = hashlib.sha256(
         f"{safe_fill_id}:{safe_hook}:{time.time_ns()}:{threading.get_ident()}".encode(
             "ascii"
@@ -5398,7 +5846,11 @@ def claim_offer_fill_hook(
         item = dict(row)
         if item["state"] == "completed":
             conn.commit()
-            return {"status": "already_completed", "claim_token": None}
+            return {
+                "status": "already_completed",
+                "claim_token": None,
+                "claim_generation": int(item["attempt"]),
+            }
         if item["state"] == "running":
             claimed = _parse_iso_timestamp(
                 item["claimed_at"], "stored post-fill claim", require_timezone=True
@@ -5410,14 +5862,18 @@ def claim_offer_fill_hook(
                 requested - claimed
             ).total_seconds() < _AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS:
                 conn.commit()
-                return {"status": "in_progress", "claim_token": None}
+                return {
+                    "status": "in_progress",
+                    "claim_token": None,
+                    "claim_generation": int(item["attempt"]),
+                }
             cursor = conn.execute(
                 """
                 UPDATE offer_fill_hook_outbox
                 SET attempt=attempt+1, claim_token=?, claimed_at=?,
                     last_error_code='STALE_CLAIM_REDELIVERY'
                 WHERE fill_id=? AND hook_name=? AND state='running'
-                  AND claim_token=? AND claimed_at=?
+                  AND claim_token=? AND claimed_at=? AND attempt=?
                 """,
                 (
                     token,
@@ -5426,6 +5882,7 @@ def claim_offer_fill_hook(
                     safe_hook,
                     item["claim_token"],
                     item["claimed_at"],
+                    int(item["attempt"]),
                 ),
             )
             if cursor.rowcount != 1:
@@ -5434,6 +5891,7 @@ def claim_offer_fill_hook(
             return {
                 "status": "claimed",
                 "claim_token": token,
+                "claim_generation": int(item["attempt"]) + 1,
                 "redelivery": True,
             }
         cursor = conn.execute(
@@ -5448,7 +5906,47 @@ def claim_offer_fill_hook(
         if cursor.rowcount != 1:
             raise RuntimeError("post-fill hook claim compare-and-set failed")
         conn.commit()
-        return {"status": "claimed", "claim_token": token}
+        return {
+            "status": "claimed",
+            "claim_token": token,
+            "claim_generation": int(item["attempt"]) + 1,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def heartbeat_offer_fill_hook(
+    fill_id: int,
+    hook_name: str,
+    claim_token: str,
+    claim_generation: int,
+) -> bool:
+    """Extend one running delivery lease using its exact fence."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_hook = _required_stability_text(hook_name, "hook_name")
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
+        raise ValueError("post-fill hook name is not registered")
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE offer_fill_hook_outbox
+            SET claimed_at=?
+            WHERE fill_id=? AND hook_name=? AND state='running'
+              AND claim_token=? AND attempt=?
+            """,
+            (when, safe_fill_id, safe_hook, safe_token, safe_generation),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
     except Exception:
         conn.rollback()
         raise
@@ -5461,6 +5959,7 @@ def fail_offer_fill_hook(
     hook_name: str,
     claim_token: str,
     *,
+    claim_generation: int,
     error_code: str = "CALLBACK_FAILED",
 ) -> bool:
     """Return one explicitly failed claimed hook to retryable pending state."""
@@ -5468,6 +5967,7 @@ def fail_offer_fill_hook(
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_hook = _required_stability_text(hook_name, "hook_name")
     safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     safe_error = _required_stability_text(error_code, "error_code").upper()
     if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
         raise ValueError("post-fill hook name is not registered")
@@ -5480,8 +5980,9 @@ def fail_offer_fill_hook(
             SET state='pending', claim_token=NULL, claimed_at=NULL,
                 last_error_code=?
             WHERE fill_id=? AND hook_name=? AND state='running' AND claim_token=?
+              AND attempt=?
             """,
-            (safe_error, safe_fill_id, safe_hook, safe_token),
+            (safe_error, safe_fill_id, safe_hook, safe_token, safe_generation),
         )
         conn.commit()
         return cursor.rowcount == 1
@@ -5497,6 +5998,7 @@ def complete_offer_fill_hook(
     hook_name: str,
     claim_token: str,
     *,
+    claim_generation: int,
     completed_at: Any = None,
 ) -> bool:
     """Atomically complete one claimed hook and append its success receipt."""
@@ -5504,9 +6006,11 @@ def complete_offer_fill_hook(
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_hook = _required_stability_text(hook_name, "hook_name")
     safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
         raise ValueError("post-fill hook name is not registered")
-    when = _stability_timestamp_or_now(completed_at, "completed_at")
+    _ = completed_at
+    when = _stability_wall_clock()
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -5520,8 +6024,19 @@ def complete_offer_fill_hook(
         if item["state"] == "completed":
             conn.commit()
             return False
-        if item["state"] != "running" or item["claim_token"] != safe_token:
+        if (
+            item["state"] != "running"
+            or item["claim_token"] != safe_token
+            or int(item["attempt"]) != safe_generation
+        ):
             raise ValueError("post-fill hook completion claim is not exact")
+        acknowledgement = conn.execute(
+            "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
+            "WHERE fill_id=? AND hook_name=?",
+            (safe_fill_id, safe_hook),
+        ).fetchone()
+        if acknowledgement is None:
+            raise ValueError("post-fill hook lacks a durable sink acknowledgement")
         conn.execute(
             """
             INSERT INTO offer_fill_hook_receipts (fill_id, hook_name, completed_at)
@@ -5535,8 +6050,9 @@ def complete_offer_fill_hook(
             SET state='completed', completed_at=?, claim_token=NULL,
                 last_error_code=NULL
             WHERE fill_id=? AND hook_name=? AND state='running' AND claim_token=?
+              AND attempt=?
             """,
-            (when, safe_fill_id, safe_hook, safe_token),
+            (when, safe_fill_id, safe_hook, safe_token, safe_generation),
         )
         if cursor.rowcount != 1:
             raise RuntimeError("post-fill hook completion compare-and-set failed")
@@ -9387,6 +9903,7 @@ def _validate_reconciliation_cancel_context(
         "prepared_event_id",
         "selected_coin_ids",
         "request_timestamp",
+        "transaction_timestamp",
         "asset_id",
         "side",
         "offered_amount_atomic",
@@ -9428,6 +9945,9 @@ def _validate_reconciliation_cancel_context(
             raise ValueError("Task 8 selected coin identity is duplicated")
         request_timestamp = _stability_timestamp(
             member["request_timestamp"], "Task 8 request timestamp"
+        )
+        transaction_timestamp = _stability_timestamp(
+            member["transaction_timestamp"], "Task 8 transaction timestamp"
         )
         member_asset_id = _reconciliation_coin_identity(
             member["asset_id"], "Task 8 member asset_id"
@@ -9513,6 +10033,29 @@ def _validate_reconciliation_cancel_context(
             raise ValueError("Task 8 auxiliary coins lack durable attempt binding")
         if durable_auxiliary is not None and durable_auxiliary != auxiliary_bare:
             raise ValueError("Task 8 auxiliary coin claim is not exact")
+        effect_claim_row = conn.execute(
+            """
+            SELECT operation_id, attempt, prepared_event_id, claimed_at
+            FROM offer_cancel_effect_claims
+            WHERE operation_id=? AND attempt=?
+            """,
+            (prepared["operation_id"], prepared["attempt"]),
+        ).fetchone()
+        if effect_claim_row is None:
+            raise ValueError("Task 8 effect claim is missing")
+        try:
+            effect_claim = _validated_offer_cancel_effect_claim(dict(effect_claim_row))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Task 8 effect claim is invalid") from exc
+        if (
+            effect_claim["operation_id"] != prepared["operation_id"]
+            or effect_claim["attempt"] != prepared["attempt"]
+            or effect_claim["prepared_event_id"] != prepared["event_id"]
+            or not request_timestamp
+            <= effect_claim["claimed_at"]
+            <= transaction_timestamp
+        ):
+            raise ValueError("Task 8 effect claim binding or timing is invalid")
         latest_row = conn.execute(
             """
             SELECT * FROM offer_operation_journal
@@ -9995,6 +10538,7 @@ def commit_offer_reconciliation(
                 if fill_row is None or fill_row["filled_at"] != safe_filled_at:
                     raise ValueError("authoritative fill timestamp replay differs")
                 fill_id = int(fill_row["fill_id"])
+                _ensure_authoritative_fill_hook_outbox(conn, fill_id)
             conn.commit()
             return {"event": existing, "idempotent": True, "fill_id": fill_id}
         if intent["lifecycle_state"] == "terminal":
@@ -10219,15 +10763,7 @@ def commit_offer_reconciliation(
                         trade_id,
                     ),
                 )
-            for hook_name in _AUTHORITATIVE_FILL_HOOKS:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO offer_fill_hook_outbox (
-                        fill_id, hook_name, state, attempt
-                    ) VALUES (?, ?, 'pending', 0)
-                    """,
-                    (fill_id, hook_name),
-                )
+            _ensure_authoritative_fill_hook_outbox(conn, fill_id)
             conn.execute(
                 f"""
                 UPDATE coins

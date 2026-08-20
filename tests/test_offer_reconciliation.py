@@ -65,7 +65,11 @@ RECONCILED = "2026-08-20T12:00:10.000000Z"
 HOOK_RETRY = "2026-08-20T12:01:02.000000Z"
 MANIFEST_SHA256 = hashlib.sha256(
     json.dumps(
-        {"prior_lifecycle_state": "open", "trade_id": TRADE},
+        {
+            "effect_claim_protocol": "durable_cohort_claim_v1",
+            "prior_lifecycle_state": "open",
+            "trade_id": TRADE,
+        },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -270,6 +274,7 @@ def _evidence(
 ) -> dict:
     evidence = {
         "schema_version": 1,
+        "collection_started_at": observed_at,
         "observed_at": observed_at,
         "wallet_fingerprint_hash": WALLET,
         "network": NETWORK,
@@ -315,6 +320,57 @@ def _evidence(
     return evidence
 
 
+@pytest.mark.parametrize(
+    "skewed_clock",
+    [
+        "collection_started_at",
+        "collection_end",
+        "wallet_identity_observed",
+        "wallet_identity_read",
+        "source_read",
+        "evaluation",
+    ],
+)
+def test_every_collection_and_read_clock_participates_in_durable_source_skew(
+    isolated_database,
+    skewed_clock,
+):
+    _persist_created_offer()
+    evidence = _evidence()
+    earlier = "2026-08-20T11:58:59.000000Z"
+    later = "2026-08-20T12:01:03.000000Z"
+    evaluated_at = AFTER
+    if skewed_clock == "collection_started_at":
+        evidence["collection_started_at"] = earlier
+    elif skewed_clock == "collection_end":
+        evidence["observed_at"] = later
+        evaluated_at = later
+    elif skewed_clock == "wallet_identity_observed":
+        evidence["wallet_identity"]["observed_at"] = earlier
+    elif skewed_clock == "wallet_identity_read":
+        evidence["wallet_identity"]["read_observed_at"] = [earlier]
+    elif skewed_clock == "source_read":
+        evidence["transaction_history"]["read_observed_at"] = [earlier]
+    elif skewed_clock == "evaluation":
+        evaluated_at = later
+    else:  # pragma: no cover - exhaustive parametrization guard
+        raise AssertionError(skewed_clock)
+
+    result = reconcile_offer(
+        "intent-task9",
+        evidence=evidence,
+        now=evaluated_at,
+    )
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EVIDENCE_SOURCE_SKEW"
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert _journal_for("intent-task9")[-1]["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 def _cancel_context(
     *,
     members: list[dict] | None = None,
@@ -340,6 +396,7 @@ def _cancel_context(
         member.setdefault("offered_amount_atomic", "1000" if is_target else "2000")
         member.setdefault("requested_amount_atomic", "2000" if is_target else "1000")
         member.setdefault("offer_text_sha256", OFFER_HASH if is_target else "0" * 64)
+        member.setdefault("transaction_timestamp", AFTER)
         member.setdefault("member_id", f"cancel-member:{index}:" + "f" * 64)
         member.setdefault(
             "prepared_event_id",
@@ -476,6 +533,7 @@ def _same_value_cancel_evidence(*, with_lineage: bool) -> tuple[dict, dict, dict
                 "trade_id": TRADE,
                 "selected_coin_ids": [COIN, OTHER_COIN],
                 "request_timestamp": AT,
+                "transaction_timestamp": AFTER,
                 "transaction_id": TX,
                 "spend_identity": SPEND,
                 "offered_amount_atomic": "2000",
@@ -1996,8 +2054,10 @@ def _persist_prepared_offer_with_unlinked_reservation() -> dict:
     return database.get_offer_intent("intent-task9")
 
 
-def _persist_cancel_prepared() -> dict:
-    return database.prepare_offer_cancel(
+def _persist_cancel_prepared(
+    *, claim_effect: bool = True, claimed_at: str = AT
+) -> dict:
+    prepared = database.prepare_offer_cancel(
         operation_id=f"cancel:{TRADE}",
         event_id=PREPARED_EVENT_ID,
         trade_id=TRADE,
@@ -2007,9 +2067,20 @@ def _persist_cancel_prepared() -> dict:
             "wallet_fingerprint_hash": WALLET,
             "network": NETWORK,
         },
-        evidence_json={"trade_id": TRADE},
+        evidence_json={
+            "trade_id": TRADE,
+            "effect_claim_protocol": "durable_cohort_claim_v1",
+        },
         prepared_at=AT,
     )
+    if claim_effect:
+        assert database.claim_offer_cancel_effect(
+            operation_id=f"cancel:{TRADE}",
+            trade_id=TRADE,
+            attempt=1,
+            claimed_at=claimed_at,
+        )
+    return prepared
 
 
 def _persist_cancel_result(
@@ -2128,6 +2199,119 @@ def test_wallet_locked_link_audit_never_rebinds_registry_trade_lock(
     coin = database.get_coin_state(COIN)
     assert coin["status"] == "locked"
     assert coin["trade_id"] == TRADE
+
+
+@pytest.mark.parametrize(
+    "legacy_writer",
+    [
+        "mark_gone",
+        "wallet_locked_links",
+        "wallet_snapshot",
+        "orphan_cleanup",
+    ],
+)
+def test_task4_registry_write_cannot_cross_legacy_reconciliation_snapshot(
+    isolated_database,
+    monkeypatch,
+    legacy_writer,
+):
+    assert database.upsert_coin(
+        COIN,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+    )
+    if legacy_writer == "orphan_cleanup":
+        conn = database.get_connection()
+        conn.execute(
+            "UPDATE coins SET status='locked', trade_id=NULL WHERE coin_id=?",
+            (database.norm_coin_id(COIN),),
+        )
+        conn.commit()
+
+    registry_read = threading.Event()
+    release_legacy = threading.Event()
+    reservation_started = threading.Event()
+    reservation_done = threading.Event()
+    errors = []
+    original_registry_read = database._nonterminal_registry_coin_ids
+
+    def pause_after_registry_read(conn):
+        protected = original_registry_read(conn)
+        if threading.current_thread().name == "task9-legacy-race":
+            registry_read.set()
+            assert release_legacy.wait(timeout=5)
+        return protected
+
+    monkeypatch.setattr(
+        database, "_nonterminal_registry_coin_ids", pause_after_registry_read
+    )
+
+    def run_legacy():
+        try:
+            if legacy_writer == "mark_gone":
+                database.mark_coins_gone([database.norm_coin_id(COIN)])
+            elif legacy_writer == "wallet_locked_links":
+                database.reconcile_wallet_locked_coin_links({COIN: OTHER_TRADE})
+            elif legacy_writer == "wallet_snapshot":
+                database.reconcile_coins_with_wallet({}, {}, "xch")
+            elif legacy_writer == "orphan_cleanup":
+                database.cleanup_orphaned_locked_coins(set())
+            else:  # pragma: no cover - exhaustive parametrization guard
+                raise AssertionError(legacy_writer)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def run_task4_registry_write():
+        reservation_started.set()
+        try:
+            database.prepare_offer_intent(
+                intent_id="intent-task9-race",
+                operation_id="create:intent-task9-race",
+                event_id="create:intent-task9-race:prepared",
+                run_id="run-task9",
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+                asset_id=ASSET,
+                side="buy",
+                tier="inner",
+                purpose="normal_lifecycle",
+                slot_key="slot:intent-task9-race",
+                generation=0,
+                offered_amount_atomic="1000",
+                requested_amount_atomic="2000",
+                selected_coin_ids_json=[COIN],
+                wallet_identity_json={
+                    "wallet_fingerprint_hash": WALLET,
+                    "network": NETWORK,
+                },
+                evidence_json={"race": "task4_registry_owner"},
+                prepared_at=AT,
+                reserve_selected_coins=False,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            reservation_done.set()
+
+    legacy_thread = threading.Thread(target=run_legacy, name="task9-legacy-race")
+    legacy_thread.start()
+    assert registry_read.wait(timeout=5)
+    reservation_thread = threading.Thread(target=run_task4_registry_write)
+    reservation_thread.start()
+    assert reservation_started.wait(timeout=5)
+    completed_before_legacy_release = reservation_done.wait(timeout=0.5)
+    release_legacy.set()
+    legacy_thread.join(timeout=10)
+    reservation_thread.join(timeout=10)
+
+    assert completed_before_legacy_release is False
+    assert errors == []
+    assert not legacy_thread.is_alive()
+    assert not reservation_thread.is_alive()
+    assert database.get_offer_intent("intent-task9-race") is not None
 
 
 def test_periodic_amount_linker_cannot_consume_registry_owned_unlinked_coin(
@@ -2310,6 +2494,299 @@ def test_future_cancel_becomes_durable_unknown_without_resolving_task8(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
+def _commit_fill_without_draining_hooks(monkeypatch) -> dict:
+    _persist_created_offer()
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", lambda *_a, **_k: {})
+    committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    fill = database.get_fill_by_trade_id(TRADE)
+    assert fill is not None and fill["fill_id"] == committed["fill_id"]
+    return fill
+
+
+def test_hook_claim_uses_db_wall_clock_and_returns_fenced_generation(
+    isolated_database, monkeypatch
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: RECONCILED)
+
+    claim = database.claim_offer_fill_hook(
+        fill["fill_id"], "offer_filled_event", claimed_at=AT
+    )
+    stored = (
+        database.get_connection()
+        .execute(
+            "SELECT * FROM offer_fill_hook_outbox WHERE fill_id=? AND hook_name=?",
+            (fill["fill_id"], "offer_filled_event"),
+        )
+        .fetchone()
+    )
+
+    assert claim["status"] == "claimed"
+    assert claim["claim_generation"] == 1
+    assert stored["claimed_at"] == RECONCILED
+
+
+def test_running_hook_heartbeat_prevents_steal_and_abandoned_claim_is_recovered(
+    isolated_database, monkeypatch
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    first = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+
+    clock["now"] = "2026-08-20T12:10:20.000000Z"
+    assert database.heartbeat_offer_fill_hook(
+        fill["fill_id"],
+        "boost_notification",
+        first["claim_token"],
+        first["claim_generation"],
+    )
+    clock["now"] = "2026-08-20T12:10:40.000000Z"
+    assert (
+        database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")["status"]
+        == "in_progress"
+    )
+
+    clock["now"] = "2026-08-20T12:10:51.000000Z"
+    recovered = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    assert recovered["status"] == "claimed"
+    assert recovered["redelivery"] is True
+    assert recovered["claim_generation"] == first["claim_generation"] + 1
+    assert not database.fail_offer_fill_hook(
+        fill["fill_id"],
+        "boost_notification",
+        first["claim_token"],
+        claim_generation=first["claim_generation"],
+    )
+
+
+def test_hook_without_positive_durable_fill_ack_is_not_completed(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: {
+            name: (lambda _row: None) for name in database._AUTHORITATIVE_FILL_HOOKS
+        },
+    )
+
+    result = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+
+    assert result["classification"] == FILLED_PROVEN
+    assert result["applied"] is True
+    assert result["post_fill_hooks"] == {
+        name: "failed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer_fill_hook_receipts(result["fill_id"]) == []
+
+
+def test_hook_reset_failure_is_contained_and_reported_as_running_uncertainty(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: {
+            name: (lambda _row: (_ for _ in ()).throw(RuntimeError("sink failed")))
+            for name in database._AUTHORITATIVE_FILL_HOOKS
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "fail_offer_fill_hook",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("reset failed")),
+    )
+
+    result = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+
+    assert result["classification"] == FILLED_PROVEN
+    assert result["post_fill_hooks"] == {
+        name: "in_progress" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer(TRADE)["status"] == "filled"
+
+
+def test_exact_terminal_replay_restores_missing_fill_outbox_before_return(
+    isolated_database, monkeypatch
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    conn = database.get_connection()
+    conn.execute(
+        "DELETE FROM offer_fill_hook_outbox WHERE fill_id=?", (fill["fill_id"],)
+    )
+    conn.commit()
+
+    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    restored = conn.execute(
+        "SELECT hook_name, state FROM offer_fill_hook_outbox WHERE fill_id=? "
+        "ORDER BY hook_name",
+        (fill["fill_id"],),
+    ).fetchall()
+
+    assert replay["idempotent"] is True
+    assert [(row["hook_name"], row["state"]) for row in restored] == sorted(
+        (name, "pending") for name in database._AUTHORITATIVE_FILL_HOOKS
+    )
+
+
+def test_schema_migration_backfills_outbox_for_existing_authoritative_fill(
+    isolated_database, monkeypatch
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    conn = database.get_connection()
+    conn.execute(
+        "DELETE FROM offer_fill_hook_outbox WHERE fill_id=?", (fill["fill_id"],)
+    )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+    restored = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state FROM offer_fill_hook_outbox WHERE fill_id=? "
+            "ORDER BY hook_name",
+            (fill["fill_id"],),
+        )
+        .fetchall()
+    )
+
+    assert [(row["hook_name"], row["state"]) for row in restored] == sorted(
+        (name, "pending") for name in database._AUTHORITATIVE_FILL_HOOKS
+    )
+
+
+def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+
+    def callbacks(_fill):
+        return {
+            name: (
+                lambda row, hook=name: database.record_offer_fill_hook_sink_ack(
+                    row["fill_id"], hook, {"test_sink": hook}
+                )
+            )
+            for name in database._AUTHORITATIVE_FILL_HOOKS
+        }
+
+    monkeypatch.setattr(reconciliation, "_post_fill_hook_callbacks", callbacks)
+    committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    conn = database.get_connection()
+    conn.execute(
+        "DELETE FROM offer_fill_hook_outbox WHERE fill_id=?", (committed["fill_id"],)
+    )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+    restored = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state FROM offer_fill_hook_outbox WHERE fill_id=?",
+            (committed["fill_id"],),
+        )
+        .fetchall()
+    )
+
+    assert {(row["hook_name"], row["state"]) for row in restored} == {
+        (name, "completed") for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+
+
+def test_durable_pending_outbox_has_explicit_wallet_free_drain_contract(
+    isolated_database, monkeypatch
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+
+    drained = reconciliation.drain_offer_fill_hook_outbox()
+
+    assert drained[fill["fill_id"]] == {
+        name: "completed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer_fill_hook_receipts(fill["fill_id"]) == list(
+        database._AUTHORITATIVE_FILL_HOOKS
+    )
+
+
+def test_production_fill_sinks_return_exact_durable_fill_acknowledgements(
+    isolated_database, monkeypatch
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    manager = SimpleNamespace(notify_boost_fill=lambda _trade_id: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
+    )
+    coordinator = SimpleNamespace(process_fill=lambda _fill_id, _result: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "sweep_coordinator",
+        SimpleNamespace(get_coordinator=lambda: coordinator),
+    )
+    callbacks = reconciliation._post_fill_hook_callbacks(fill)
+
+    acknowledgements = {name: callback(fill) for name, callback in callbacks.items()}
+
+    assert set(acknowledgements) == set(database._AUTHORITATIVE_FILL_HOOKS)
+    for name, acknowledgement in acknowledgements.items():
+        assert acknowledgement["fill_id"] == fill["fill_id"]
+        assert acknowledgement["hook_name"] == name
+        assert acknowledgement["durable"] is True
+        assert database.validate_offer_fill_hook_sink_ack(
+            fill["fill_id"], name, acknowledgement
+        )
+
+
+def test_production_boost_sink_retries_unavailable_manager_from_durable_fill_ack(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    conn = database.get_connection()
+    conn.execute("UPDATE offers SET tier='boost' WHERE trade_id=?", (TRADE,))
+    conn.commit()
+    monkeypatch.setitem(
+        sys.modules, "api_server", SimpleNamespace(bot=SimpleNamespace())
+    )
+
+    first = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    boost_ack = conn.execute(
+        "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
+        "WHERE fill_id=? AND hook_name='boost_notification'",
+        (first["fill_id"],),
+    ).fetchone()
+
+    assert first["post_fill_hooks"]["boost_notification"] == "failed"
+    assert boost_ack is not None
+    assert "boost_notification" not in database.get_offer_fill_hook_receipts(
+        first["fill_id"]
+    )
+
+    notified = []
+    manager = SimpleNamespace(
+        notify_boost_fill=lambda trade_id: notified.append(trade_id)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
+    )
+    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+
+    assert replay["post_fill_hooks"]["boost_notification"] == "completed"
+    assert notified == [TRADE]
+    assert "boost_notification" in database.get_offer_fill_hook_receipts(
+        first["fill_id"]
+    )
+
+
 def test_post_fill_hooks_run_once_by_durable_fill_id_on_exact_replay(
     isolated_database, monkeypatch
 ):
@@ -2323,10 +2800,16 @@ def test_post_fill_hooks_run_once_by_durable_fill_id_on_exact_replay(
     )
 
     def callbacks(_fill):
-        return {
-            name: (lambda _row, hook=name: calls.append((hook, _row["fill_id"])))
-            for name in hook_names
-        }
+        def callback(name):
+            def run(row):
+                calls.append((name, row["fill_id"]))
+                return database.record_offer_fill_hook_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}
+                )
+
+            return run
+
+        return {name: callback(name) for name in hook_names}
 
     monkeypatch.setattr(
         reconciliation, "_post_fill_hook_callbacks", callbacks, raising=False
@@ -2362,6 +2845,9 @@ def test_post_fill_hook_failure_never_undoes_proof_and_retries_only_failure(
                 calls[name] += 1
                 if name == "fill_classification" and calls[name] == 1:
                     raise RuntimeError("classification hook failed")
+                return database.record_offer_fill_hook_sink_ack(
+                    _row["fill_id"], name, {"test_sink": name}
+                )
 
             return run
 
@@ -2408,6 +2894,9 @@ def test_post_fill_hook_claim_allows_one_effect_under_concurrent_replay(
                     effect_entered.set()
                     assert release_effect.wait(timeout=5)
                 calls[name] += 1
+                return database.record_offer_fill_hook_sink_ack(
+                    _row["fill_id"], name, {"test_sink": name}
+                )
 
             return run
 
@@ -2442,6 +2931,64 @@ def test_post_fill_hook_claim_allows_one_effect_under_concurrent_replay(
     assert database.get_offer_fill_hook_receipts(fill["fill_id"]) == list(calls)
 
 
+def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
+    isolated_database,
+    monkeypatch,
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    monkeypatch.setattr(database, "_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS", 0.09)
+    callback_started = threading.Event()
+    heartbeat_seen = threading.Event()
+    release_callback = threading.Event()
+    results = {}
+    errors = []
+    original_heartbeat = database.heartbeat_offer_fill_hook
+
+    def heartbeat(*args, **kwargs):
+        held = original_heartbeat(*args, **kwargs)
+        if held:
+            heartbeat_seen.set()
+        return held
+
+    def callback(row):
+        callback_started.set()
+        assert heartbeat_seen.wait(timeout=0.5)
+        assert release_callback.wait(timeout=2)
+        return database.record_offer_fill_hook_sink_ack(
+            row["fill_id"], "offer_filled_event", {"test_sink": "long_running"}
+        )
+
+    monkeypatch.setattr(database, "heartbeat_offer_fill_hook", heartbeat)
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: {"offer_filled_event": callback},
+    )
+
+    def run():
+        try:
+            results.update(
+                reconciliation._run_post_fill_hooks(fill, completed_at=AFTER)
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert callback_started.wait(timeout=2)
+    assert heartbeat_seen.wait(timeout=0.5)
+    live_claim = database.claim_offer_fill_hook(fill["fill_id"], "offer_filled_event")
+    release_callback.set()
+    worker.join(timeout=5)
+
+    assert live_claim["status"] == "in_progress"
+    assert not errors
+    assert not worker.is_alive()
+    assert results == {"offer_filled_event": "completed"}
+
+
 def test_post_fill_hook_crash_after_effect_before_receipt_never_duplicates(
     isolated_database,
     monkeypatch,
@@ -2450,6 +2997,8 @@ def test_post_fill_hook_crash_after_effect_before_receipt_never_duplicates(
     attempts = {name: 0 for name in database._AUTHORITATIVE_FILL_HOOKS}
     effects = {name: 0 for name in database._AUTHORITATIVE_FILL_HOOKS}
     applied = set()
+    hook_clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: hook_clock["now"])
 
     def callbacks(_fill):
         def callback(name):
@@ -2459,6 +3008,9 @@ def test_post_fill_hook_crash_after_effect_before_receipt_never_duplicates(
                 if effect_key not in applied:
                     applied.add(effect_key)
                     effects[name] += 1
+                return database.record_offer_fill_hook_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}
+                )
 
             return run
 
@@ -2483,8 +3035,9 @@ def test_post_fill_hook_crash_after_effect_before_receipt_never_duplicates(
     assert database.get_offer(TRADE)["status"] == "filled"
     assert effects["offer_filled_event"] == 1
     monkeypatch.setattr(database, "complete_offer_fill_hook", original_complete)
+    hook_clock["now"] = "2026-08-20T12:10:31.000000Z"
 
-    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=HOOK_RETRY)
+    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
 
     assert replay["post_fill_hooks"]["offer_filled_event"] == "completed"
     assert attempts["offer_filled_event"] == 2
@@ -2499,6 +3052,8 @@ def test_post_fill_receipt_exception_after_effect_stays_uncertain_without_duplic
     attempts = {name: 0 for name in database._AUTHORITATIVE_FILL_HOOKS}
     effects = {name: 0 for name in database._AUTHORITATIVE_FILL_HOOKS}
     applied = set()
+    hook_clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: hook_clock["now"])
 
     def callbacks(_fill):
         def callback(name):
@@ -2508,6 +3063,9 @@ def test_post_fill_receipt_exception_after_effect_stays_uncertain_without_duplic
                 if effect_key not in applied:
                     applied.add(effect_key)
                     effects[name] += 1
+                return database.record_offer_fill_hook_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}
+                )
 
             return run
 
@@ -2532,8 +3090,9 @@ def test_post_fill_receipt_exception_after_effect_stays_uncertain_without_duplic
     assert first["post_fill_hooks"]["offer_filled_event"] == "in_progress"
     assert effects["offer_filled_event"] == 1
     monkeypatch.setattr(database, "complete_offer_fill_hook", original_complete)
+    hook_clock["now"] = "2026-08-20T12:10:31.000000Z"
 
-    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=HOOK_RETRY)
+    replay = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
 
     assert replay["post_fill_hooks"]["offer_filled_event"] == "completed"
     assert attempts["offer_filled_event"] == 2
@@ -2632,6 +3191,17 @@ def test_default_post_fill_hooks_retry_unpersisted_event_and_unavailable_boost(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("offer_filled event was not persisted")
         ),
+    )
+    monkeypatch.setattr(
+        database,
+        "record_offer_fill_hook_sink_ack",
+        lambda fill_id, hook_name, _detail: {
+            "schema_version": 1,
+            "fill_id": fill_id,
+            "hook_name": hook_name,
+            "durable": True,
+            "detail": _detail,
+        },
     )
     monkeypatch.setitem(
         sys.modules, "api_server", SimpleNamespace(bot=SimpleNamespace())
@@ -2801,6 +3371,40 @@ def test_cancel_commit_rejects_unbound_task8_prepared_event_and_preserves_blocke
     assert latest["event_id"] == prepared["event_id"]
     assert latest["outcome"] == "PREPARED"
     assert latest["blocks_mutation"] == 1
+
+
+@pytest.mark.parametrize("claim_case", ["missing", "tampered", "after_transaction"])
+def test_cancel_commit_requires_exact_timely_task8_effect_claim_and_latches(
+    isolated_database,
+    claim_case,
+):
+    _persist_created_offer()
+    _persist_cancel_prepared(
+        claim_effect=claim_case != "missing",
+        claimed_at=RECONCILED if claim_case == "after_transaction" else AT,
+    )
+    if claim_case == "tampered":
+        conn = database.get_connection()
+        conn.execute("DROP TRIGGER offer_cancel_effect_claims_no_update")
+        conn.execute(
+            "UPDATE offer_cancel_effect_claims SET prepared_event_id=? "
+            "WHERE operation_id=? AND attempt=1",
+            (f"cancel:{TRADE}:attempt:2:prepared", f"cancel:{TRADE}"),
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="Task 8.*effect claim"):
+        reconcile_offer(
+            "intent-task9",
+            evidence=_simple_cancel_flow_evidence(status=3),
+            cancel_context=_cancel_context(),
+            now=RECONCILED,
+        )
+
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert _journal_for("intent-task9") == []
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
 def test_cancel_commit_rejects_tampered_single_attempt_claim_binding(
@@ -3030,6 +3634,13 @@ def _persist_grouped_cancel_case(
         member_requests_json=requests,
         prepared_at=AT,
     )
+    for member in manifest["members"]:
+        assert database.claim_offer_cancel_effect(
+            operation_id=member["operation_id"],
+            trade_id=member["trade_id"],
+            attempt=member["attempt"],
+            claimed_at=AT,
+        )
     selected_by_trade = {TRADE: [COIN], OTHER_TRADE: [OTHER_COIN]}
     context = {
         "cohort_id": manifest["cohort_id"],
@@ -3042,6 +3653,7 @@ def _persist_grouped_cancel_case(
                 "prepared_event_id": member["prepared_event_id"],
                 "selected_coin_ids": selected_by_trade[member["trade_id"]],
                 "request_timestamp": AT,
+                "transaction_timestamp": AFTER,
                 "transaction_id": TX,
                 "spend_identity": SPEND,
                 "asset_id": ASSET,
@@ -3613,6 +4225,36 @@ def _hostile_excessive_depth() -> dict:
         cursor["child"] = child
         cursor = child
     return root
+
+
+@pytest.mark.parametrize("source_name", ["offer_history", "transaction_history"])
+def test_deep_identity_bearing_history_row_totalizes_to_durable_unknown(
+    isolated_database,
+    source_name,
+):
+    _persist_created_offer()
+    evidence = _evidence()
+    deep = {}
+    cursor = deep
+    for _index in range(10_000):
+        child = {}
+        cursor["child"] = child
+        cursor = child
+    if source_name == "offer_history":
+        hostile_row = {"trade_id": OTHER_TRADE, "hostile": deep}
+    else:
+        hostile_row = {"transaction_id": OTHER_COIN, "hostile": deep}
+    evidence[source_name]["records"].append(hostile_row)
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EVIDENCE_ENCODING_FAILED"
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert _journal_for("intent-task9")[-1]["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
 @pytest.mark.parametrize(

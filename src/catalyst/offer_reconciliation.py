@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import threading
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
@@ -185,6 +186,7 @@ def _redact_json(
     *,
     depth: int = 0,
     state: dict[str, Any] | None = None,
+    redact_sensitive: bool = True,
 ) -> Any:
     if state is None:
         state = {"nodes": 0, "text_bytes": 0, "active_containers": set()}
@@ -205,9 +207,14 @@ def _redact_json(
         result: dict[str, Any] = {}
         try:
             for key in sorted(value):
-                if key.strip().lower() in _SENSITIVE_KEYS:
+                if redact_sensitive and key.strip().lower() in _SENSITIVE_KEYS:
                     continue
-                result[key] = _redact_json(value[key], depth=depth + 1, state=state)
+                result[key] = _redact_json(
+                    value[key],
+                    depth=depth + 1,
+                    state=state,
+                    redact_sensitive=redact_sensitive,
+                )
             return result
         finally:
             state["active_containers"].remove(container_id)
@@ -219,7 +226,15 @@ def _redact_json(
             raise _EvidenceEncodingError("cyclic evidence container")
         state["active_containers"].add(container_id)
         try:
-            return [_redact_json(item, depth=depth + 1, state=state) for item in value]
+            return [
+                _redact_json(
+                    item,
+                    depth=depth + 1,
+                    state=state,
+                    redact_sensitive=redact_sensitive,
+                )
+                for item in value
+            ]
         finally:
             state["active_containers"].remove(container_id)
     if type(value) is str:
@@ -230,7 +245,7 @@ def _redact_json(
         state["text_bytes"] += len(encoded_text)
         if state["text_bytes"] > _MAX_CANONICAL_TEXT_BYTES:
             raise _EvidenceEncodingError("evidence text cap exceeded")
-        if len(value) > 4096:
+        if redact_sensitive and len(value) > 4096:
             tail_digest = hashlib.sha256(encoded_text).hexdigest()
             return value[:256] + f"<redacted-long-text-sha256:{tail_digest}>"
         return value
@@ -384,10 +399,15 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
     top_observed = _parse_utc(evidence.get("observed_at"))
     if top_observed is None:
         return "EVIDENCE_TIMESTAMP_INVALID"
+    if not _is_canonical_utc_text(evidence.get("collection_started_at")):
+        return "EVIDENCE_TIMESTAMP_INVALID"
+    collection_started = _parse_utc(evidence["collection_started_at"])
+    if collection_started is None:
+        return "EVIDENCE_TIMESTAMP_INVALID"
     age = (now - top_observed).total_seconds()
     if age > _MAX_EVIDENCE_AGE_SECONDS or age < -30:
         return "EVIDENCE_STALE"
-    effective_times: list[datetime] = []
+    effective_times: list[datetime] = [collection_started, top_observed, now]
     identity = evidence.get("wallet_identity")
     if (
         type(identity) is not dict
@@ -419,7 +439,12 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
         if timestamp_age < -30 or timestamp_age > _MAX_EVIDENCE_AGE_SECONDS:
             return "EVIDENCE_STALE"
     effective_times.extend(
-        _parse_utc(timestamp) for timestamp in identity["source_observed_at_all"]
+        _parse_utc(timestamp)
+        for timestamp in [
+            identity["observed_at"],
+            *identity["source_observed_at_all"],
+            *identity["read_observed_at"],
+        ]
     )
     for name, reason in (
         ("offer_history", "OFFER_HISTORY_INCOMPLETE"),
@@ -436,6 +461,7 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
         observed = _parse_utc(source.get("observed_at"))
         if observed is None:
             return "EVIDENCE_TIMESTAMP_INVALID"
+        effective_times.append(observed)
         source_age = (top_observed - observed).total_seconds()
         if source_age < -30 or source_age > _MAX_EVIDENCE_AGE_SECONDS:
             return "EVIDENCE_STALE"
@@ -454,6 +480,7 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
             ):
                 return "EVIDENCE_STALE"
             effective = source_observed
+            effective_times.append(source_observed)
         all_source_times = source.get("source_observed_at_all")
         if all_source_times is not None:
             if type(all_source_times) is not list:
@@ -484,6 +511,7 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
             read_age = (top_observed - parsed_read).total_seconds()
             if read_age < -30 or read_age > _MAX_EVIDENCE_AGE_SECONDS:
                 return "EVIDENCE_STALE"
+            effective_times.append(parsed_read)
         pagination = source.get("pagination")
         if type(pagination) is not dict:
             return reason
@@ -750,6 +778,8 @@ def _basic_cancel_members(
             member.get("request_timestamp")
         ):
             return None
+        if not _is_canonical_utc_text(member.get("transaction_timestamp")):
+            return None
         if (
             not _hex_id(member.get("asset_id"))
             or member.get("side") not in {"buy", "sell"}
@@ -834,6 +864,7 @@ def _validated_cancel_context(context: Any) -> dict[str, Any] | None:
                     _hex_id(value) for value in member["selected_coin_ids"]
                 ),
                 "request_timestamp": member["request_timestamp"],
+                "transaction_timestamp": member["transaction_timestamp"],
                 "asset_id": _hex_id(member["asset_id"]),
                 "side": member["side"],
                 "offered_amount_atomic": _atomic_text(member["offered_amount_atomic"]),
@@ -890,6 +921,8 @@ def _cancel_proof(
         if member.get("spend_identity") is not None and member[
             "spend_identity"
         ] != tx.get("spend_identity"):
+            return None
+        if member["transaction_timestamp"] != tx["timestamp"]:
             return None
     tx_time = _parse_utc(tx["timestamp"])
     if tx_time is None or any(
@@ -1243,9 +1276,10 @@ def _dedupe_records(
             or (row.get("offer_id") if identity_key == "trade_id" else "")
         )
         if identity:
+            bounded_row = _redact_json(row, redact_sensitive=False)
             canonical = json.dumps(
-                row,
-                ensure_ascii=False,
+                bounded_row,
+                ensure_ascii=True,
                 allow_nan=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -1933,8 +1967,8 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
     }
     classification_box: dict[str, Any] = {}
 
-    def offer_filled_event(_row: dict[str, Any]) -> None:
-        database.log_authoritative_offer_filled_once(
+    def offer_filled_event(_row: dict[str, Any]) -> dict[str, Any]:
+        return database.log_authoritative_offer_filled_once(
             int(fill["fill_id"]),
             f"{str(fill['side']).upper()} offer {trade_id[:16]}... "
             "filled from authoritative on-chain proof",
@@ -1949,39 +1983,62 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
             created_at=fill["filled_at"],
         )
 
-    def boost_notification(_row: dict[str, Any]) -> None:
-        if str(fill.get("tier") or "").lower() != "boost":
-            return
+    def boost_notification(_row: dict[str, Any]) -> dict[str, Any]:
+        applicable = str(fill.get("tier") or "").lower() == "boost"
+        acknowledgement = database.record_offer_fill_hook_sink_ack(
+            int(fill["fill_id"]),
+            "boost_notification",
+            {"trade_id": trade_id, "applicable": applicable},
+        )
+        if not applicable:
+            return acknowledgement
         api_server = sys.modules.get("api_server")
         bot_ref = getattr(api_server, "bot", None) if api_server is not None else None
         manager = getattr(bot_ref, "boost_manager", None) if bot_ref else None
         if manager is None or not hasattr(manager, "notify_boost_fill"):
             raise RuntimeError("BoostManager is unavailable")
         manager.notify_boost_fill(trade_id)
+        return acknowledgement
 
     def classification():
         existing = classification_box.get("value")
         if existing is not None:
             return existing
-        from fill_classifier import classify_and_store_fill
+        from fill_classifier import classify_fill
 
-        result = classify_and_store_fill(
-            fill_id=int(fill["fill_id"]),
-            trade_id=trade_id,
-            fill_detail=fill_detail,
-            dexie_detail=None,
-        )
+        result = classify_fill(trade_id, fill_detail, None)
         result.side = fill["side"]
+        acknowledgement = database.store_authoritative_fill_classification_ack(
+            int(fill["fill_id"]),
+            {
+                "classification": result.classification,
+                "spent_block_index": result.spent_block_index,
+                "taker_puzzle_hash": result.taker_puzzle_hash,
+                "sweep_group_id": result.sweep_group_id,
+            },
+        )
         classification_box["value"] = result
+        classification_box["acknowledgement"] = acknowledgement
         return result
 
-    def fill_classification(_row: dict[str, Any]) -> None:
+    def fill_classification(_row: dict[str, Any]) -> dict[str, Any]:
         classification()
+        return classification_box["acknowledgement"]
 
-    def sweep_registration(_row: dict[str, Any]) -> None:
+    def sweep_registration(_row: dict[str, Any]) -> dict[str, Any]:
         from sweep_coordinator import get_coordinator
 
-        get_coordinator().process_fill(int(fill["fill_id"]), classification())
+        result = classification()
+        acknowledgement = database.record_offer_fill_hook_sink_ack(
+            int(fill["fill_id"]),
+            "sweep_registration",
+            {
+                "trade_id": trade_id,
+                "spent_block_index": result.spent_block_index,
+            },
+        )
+        get_coordinator().process_fill(int(fill["fill_id"]), result)
+        return acknowledgement
 
     return {
         "offer_filled_event": offer_filled_event,
@@ -1996,12 +2053,11 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
 
     import database
 
+    _ = completed_at
     results: dict[str, str] = {}
     for hook_name, callback in _post_fill_hook_callbacks(fill).items():
         try:
-            claim = database.claim_offer_fill_hook(
-                int(fill["fill_id"]), hook_name, claimed_at=completed_at
-            )
+            claim = database.claim_offer_fill_hook(int(fill["fill_id"]), hook_name)
         except Exception:
             results[hook_name] = "failed"
             try:
@@ -2019,16 +2075,55 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             results[hook_name] = claim["status"]
             continue
         claim_token = claim["claim_token"]
+        claim_generation = claim["claim_generation"]
+        heartbeat_stop = threading.Event()
+        heartbeat_uncertain = threading.Event()
+
+        def maintain_claim() -> None:
+            interval = max(0.01, database._AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS / 3)
+            while not heartbeat_stop.wait(interval):
+                try:
+                    held = database.heartbeat_offer_fill_hook(
+                        int(fill["fill_id"]),
+                        hook_name,
+                        claim_token,
+                        claim_generation,
+                    )
+                except Exception:
+                    heartbeat_uncertain.set()
+                    return
+                if not held:
+                    heartbeat_uncertain.set()
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=maintain_claim,
+            name=f"offer-fill-hook-{fill['fill_id']}-{hook_name}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
-            callback(fill)
+            acknowledgement = callback(fill)
+            if not database.validate_offer_fill_hook_sink_ack(
+                int(fill["fill_id"]), hook_name, acknowledgement
+            ):
+                raise RuntimeError(
+                    "post-fill sink did not return its durable fill acknowledgement"
+                )
+            if heartbeat_uncertain.is_set():
+                raise RuntimeError("post-fill hook claim heartbeat is uncertain")
         except Exception:
-            results[hook_name] = "failed"
-            database.fail_offer_fill_hook(
-                int(fill["fill_id"]),
-                hook_name,
-                claim_token,
-                error_code="CALLBACK_FAILED",
-            )
+            try:
+                reset = database.fail_offer_fill_hook(
+                    int(fill["fill_id"]),
+                    hook_name,
+                    claim_token,
+                    claim_generation=claim_generation,
+                    error_code="CALLBACK_FAILED",
+                )
+            except Exception:
+                reset = False
+            results[hook_name] = "failed" if reset else "in_progress"
             try:
                 database.log_event(
                     "warning",
@@ -2039,12 +2134,15 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             except Exception:
                 pass
             continue
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
         try:
             database.complete_offer_fill_hook(
                 int(fill["fill_id"]),
                 hook_name,
                 claim_token,
-                completed_at=completed_at,
+                claim_generation=claim_generation,
             )
         except Exception:
             # The callback crossed its effect boundary.  A receipt failure is
@@ -2064,6 +2162,22 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         else:
             results[hook_name] = "completed"
     return results
+
+
+def drain_offer_fill_hook_outbox(*, limit: int = 32) -> dict[int, dict[str, str]]:
+    """Drain pending or abandoned durable post-fill work without wallet reads."""
+
+    import database
+
+    drained: dict[int, dict[str, str]] = {}
+    for fill_id in database.get_offer_fill_hook_outbox_work(limit=limit):
+        fill = database.get_fill_by_id(fill_id)
+        if fill is None:
+            continue
+        drained[fill_id] = _run_post_fill_hooks(
+            fill, completed_at=str(fill["filled_at"])
+        )
+    return drained
 
 
 def reconcile_offer(
@@ -2277,6 +2391,7 @@ __all__ = [
     "UNKNOWN",
     "canonical_evidence_and_digest",
     "classify_terminal_evidence",
+    "drain_offer_fill_hook_outbox",
     "load_authoritative_evidence",
     "load_sage_offer_history",
     "reconcile_offer",
