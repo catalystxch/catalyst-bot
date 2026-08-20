@@ -464,7 +464,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         self.assertIsNotNone(row["filled_at"])
         self.assertIsNone(row["cancelled_at"])
 
-    def test_backfill_verified_fills_from_filled_offers_repairs_stats(self):
+    def test_backfill_parks_filled_offer_without_authoritative_proof(self):
         asset_id = "asset-test"
         conn = database.get_connection()
 
@@ -493,16 +493,22 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         self.assertTrue(repaired[0]["created"])
         self.assertEqual(repaired[0]["trade_id"], "trade-backfill")
         self.assertEqual(repaired[0]["tier"], "outer")
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
+        parked = database.get_fills(
+            cat_asset_id=asset_id, limit=10, include_legacy=True
+        )
         stats_after = database.get_stats(asset_id)
 
-        self.assertEqual(len(fills), 1)
-        self.assertEqual(fills[0]["trade_id"], "trade-backfill")
-        self.assertEqual(stats_after["total_fills"], 1)
-        self.assertEqual(stats_after["sell_fills"], 1)
+        self.assertEqual(fills, [])
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]["trade_id"], "trade-backfill")
+        self.assertEqual(parked[0]["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(stats_after["total_fills"], 0)
+        self.assertEqual(stats_after["sell_fills"], 0)
 
-    def test_backfill_promotes_legacy_fill_to_verified(self):
+    def test_backfill_parks_legacy_fill_without_authoritative_proof(self):
         conn = database.get_connection()
         asset_id = "asset-test"
 
@@ -543,14 +549,111 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
         repaired = database.backfill_verified_fills_from_offers(limit=10)
         self.assertEqual(len(repaired), 1)
-        self.assertTrue(repaired[0]["upgraded"])
+        self.assertFalse(repaired[0]["upgraded"])
         self.assertFalse(repaired[0]["created"])
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         row = conn.execute(
             "SELECT verification_status FROM fills WHERE trade_id=?",
             ("trade-upgrade-verified",),
         ).fetchone()
-        self.assertEqual(row["verification_status"], "verified")
+        self.assertEqual(row["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 0)
+
+    def test_backfill_promotes_only_exact_existing_authoritative_fill(self):
+        conn = database.get_connection()
+        asset_id = "asset-test"
+        trade_id = "trade-authoritative-backfill"
+
+        database.add_offer(
+            trade_id=trade_id,
+            side="buy",
+            price_xch=Decimal("0.11"),
+            size_xch=Decimal("1.2"),
+            size_cat=Decimal("10000"),
+            cat_asset_id=asset_id,
+            tier="mid",
+            coin_id="0xcoin-authoritative-backfill",
+        )
+        terminal = _authoritatively_terminalize_offer(trade_id)
+        fill_id = terminal["fill_id"]
+        conn.execute(
+            "UPDATE fills SET verification_status='legacy' WHERE fill_id=?",
+            (fill_id,),
+        )
+        conn.commit()
+
+        repaired = database.backfill_verified_fills_from_offers(limit=10)
+
+        self.assertEqual(
+            repaired,
+            [
+                {
+                    "fill_id": fill_id,
+                    "trade_id": trade_id,
+                    "side": "buy",
+                    "price_xch": "0.11",
+                    "size_xch": "1.2",
+                    "size_cat": "10000",
+                    "filled_at": "2026-03-28T00:00:00.000000Z",
+                    "cat_asset_id": asset_id,
+                    "tier": "mid",
+                    "verification_status": "verified_authoritative",
+                    "created": False,
+                    "upgraded": True,
+                }
+            ],
+        )
+        row = conn.execute(
+            "SELECT verification_status, spent_block_index, receive_coin_id, "
+            "receive_amount_mojos FROM fills WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone()
+        self.assertEqual(row["verification_status"], "verified_authoritative")
+        self.assertEqual(row["spent_block_index"], 42)
+        self.assertEqual(
+            row["receive_coin_id"],
+            database.norm_coin_id(
+                hashlib.sha256(f"receive:{trade_id}".encode("utf-8")).hexdigest()
+            ),
+        )
+        self.assertEqual(row["receive_amount_mojos"], 1)
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 1)
+
+    def test_backfill_parks_changed_authoritative_fill_identity(self):
+        conn = database.get_connection()
+        asset_id = "asset-test"
+        trade_id = "trade-changed-authoritative-backfill"
+
+        database.add_offer(
+            trade_id=trade_id,
+            side="sell",
+            price_xch=Decimal("0.125"),
+            size_xch=Decimal("0.6"),
+            size_cat=Decimal("4800"),
+            cat_asset_id=asset_id,
+            tier="outer",
+            coin_id="0xcoin-changed-authoritative-backfill",
+        )
+        terminal = _authoritatively_terminalize_offer(trade_id)
+        conn.execute(
+            "UPDATE fills SET verification_status='legacy', size_cat='9999' "
+            "WHERE fill_id=?",
+            (terminal["fill_id"],),
+        )
+        conn.commit()
+
+        repaired = database.backfill_verified_fills_from_offers(limit=10)
+
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
+        row = conn.execute(
+            "SELECT verification_status, size_cat FROM fills WHERE fill_id=?",
+            (terminal["fill_id"],),
+        ).fetchone()
+        self.assertEqual(row["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(row["size_cat"], "9999")
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 0)
 
     def test_backfill_and_stats_honor_fresh_run_cutoff(self):
         conn = database.get_connection()
@@ -601,13 +704,18 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         )
         self.assertEqual(len(repaired), 1)
         self.assertEqual(repaired[0]["trade_id"], "trade-new-filled")
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
-        self.assertEqual([f["trade_id"] for f in fills], ["trade-new-filled"])
+        self.assertEqual(fills, [])
+        parked = database.get_fills(
+            cat_asset_id=asset_id, limit=10, include_legacy=True
+        )
+        self.assertEqual([f["trade_id"] for f in parked], ["trade-new-filled"])
 
         stats = database.get_stats(asset_id, since="2026-03-28T22:07:28+00:00")
-        self.assertEqual(stats["total_fills"], 1)
-        self.assertEqual(stats["buy_fills"], 1)
+        self.assertEqual(stats["total_fills"], 0)
+        self.assertEqual(stats["buy_fills"], 0)
         self.assertEqual(stats["sell_fills"], 0)
 
 

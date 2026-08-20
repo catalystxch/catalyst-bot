@@ -20,6 +20,7 @@ import database
 STABILITY_TABLES = {
     "offer_intents",
     "offer_operation_journal",
+    "offer_reconciliation_coin_outcomes",
     "offer_cancel_cohort_manifests",
     "offer_cancel_effect_claims",
     "runtime_safety_latch",
@@ -254,6 +255,168 @@ def test_migrates_empty_database_idempotently_with_integrity_ok(isolated_databas
 
     assert STABILITY_TABLES <= _table_names(isolated_database)
     assert _integrity(isolated_database) == "ok"
+
+
+def test_authoritative_coin_outcomes_are_append_only_and_coin_indexed(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        tables = _table_names(isolated_database)
+        indexes = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='index' AND sql IS NOT NULL"
+            )
+        }
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='offer_reconciliation_coin_outcomes'"
+            )
+        }
+
+    assert "offer_reconciliation_coin_outcomes" in tables
+    assert "idx_offer_reconciliation_coin_outcomes_latest" in indexes
+    assert (
+        "(coin_id, outcome_sequence)"
+        in indexes["idx_offer_reconciliation_coin_outcomes_latest"]
+    )
+    assert triggers == {
+        "offer_reconciliation_coin_outcomes_no_update",
+        "offer_reconciliation_coin_outcomes_no_delete",
+    }
+
+
+def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
+    isolated_database,
+):
+    database.init_database()
+    intent_id = "migration-terminal-coin-outcome"
+    trade_id = _sha("migration-terminal-trade")
+    coin_id = _sha("migration-terminal-coin")
+    wallet_hash = _sha("migration-terminal-wallet")
+    asset_id = _sha("migration-terminal-asset")
+    wallet_identity = {
+        "wallet_fingerprint_hash": wallet_hash,
+        "network": "mainnet",
+    }
+    evidence = {"migration": "exact terminal coin outcome"}
+    evidence_text = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+
+    assert database.upsert_coin(
+        coin_id,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+    )
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id="migration-terminal-run",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        asset_id=asset_id,
+        side="buy",
+        tier="inner",
+        purpose="migration_test",
+        slot_key="migration-terminal-slot",
+        generation=0,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[coin_id],
+        wallet_identity_json=wallet_identity,
+        evidence_json={"migration": "prepared"},
+        prepared_at=AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=_sha("migration-terminal-offer"),
+        wallet_identity_json=wallet_identity,
+        evidence_json={"migration": "created"},
+        finalized_at=LATER,
+        finalize_selected_coin_reservations=True,
+    )
+    assert database.add_offer(
+        trade_id=trade_id,
+        side="buy",
+        price_xch=database.Decimal("0.0000005"),
+        size_xch=database.Decimal("0.000000001"),
+        size_cat=database.Decimal("2"),
+        cat_asset_id=asset_id,
+        tier="inner",
+        coin_id=database.norm_coin_id(coin_id),
+    )
+    result = database.commit_offer_reconciliation(
+        intent_id=intent_id,
+        operation_id=f"reconcile:{intent_id}",
+        classification="FILLED_PROVEN",
+        reason_code="MIGRATION_TEST_PROOF",
+        wallet_identity_json=wallet_identity,
+        evidence_json=evidence,
+        evidence_sha256=hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
+        transaction_id=_sha("migration-terminal-transaction"),
+        block_height=42,
+        receive_coin_id=_sha("migration-terminal-receive"),
+        receive_amount_mojos=2000,
+        filled_at="2026-08-15T12:01:30.000000Z",
+        reconciled_at="2026-08-15T12:02:00.000000Z",
+    )
+    terminal_event_id = result["event"]["event_id"]
+    database.close_connection()
+
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TABLE offer_reconciliation_coin_outcomes")
+        conn.commit()
+
+    _replay_migrations()
+
+    with sqlite3.connect(isolated_database) as conn:
+        row = conn.execute(
+            "SELECT coin_id, intent_id, trade_id, outcome, disposition, "
+            "terminal_event_id, evidence_sha256, recorded_at "
+            "FROM offer_reconciliation_coin_outcomes"
+        ).fetchone()
+        assert row == (
+            database.norm_coin_id(coin_id),
+            intent_id,
+            trade_id,
+            "FILLED_PROVEN",
+            "spent",
+            terminal_event_id,
+            hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
+            "2026-08-15T12:02:00.000000Z",
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(
+                "UPDATE offer_reconciliation_coin_outcomes SET disposition='spent'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM offer_reconciliation_coin_outcomes")
+
+    _replay_migrations()
+
+    with sqlite3.connect(isolated_database) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM offer_reconciliation_coin_outcomes"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_migrates_current_database_without_changing_existing_rows(isolated_database):

@@ -2932,6 +2932,32 @@ def _persist_prepared_offer_with_unlinked_reservation() -> dict:
     return database.get_offer_intent("intent-task9")
 
 
+def _prepare_replacement_with_coin(coin_id: str, suffix: str) -> dict:
+    intent_id = f"replacement:{suffix}"
+    return database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id=f"run:{suffix}",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="authoritative_coin_reuse_test",
+        slot_key=f"slot:{suffix}",
+        generation=0,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[coin_id],
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
+        evidence_json={"replacement": suffix},
+        prepared_at=RECONCILED,
+        reserve_selected_coins=True,
+        require_new_intent=True,
+    )
+
+
 def _persist_cancel_prepared(
     *, claim_effect: bool = True, claimed_at: str = AT
 ) -> dict:
@@ -3414,6 +3440,123 @@ def test_fill_commit_is_one_exact_terminal_event_fill_and_coin_transition(
     assert len(events) == 1
     assert events[0]["outcome"] == FILLED_PROVEN
     assert events[0]["evidence_sha256"] == applied["evidence_sha256"]
+
+
+def test_filled_selected_coin_stays_proof_bound_without_legacy_offer_projection(
+    isolated_database,
+):
+    _persist_created_offer()
+    applied = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    conn = database.get_connection()
+    conn.execute("DELETE FROM offers WHERE trade_id=?", (TRADE,))
+    conn.commit()
+    terminal_coin = database.get_coin_state(COIN)
+
+    assert applied["classification"] == FILLED_PROVEN
+    assert terminal_coin["status"] == "spent"
+    assert terminal_coin["trade_id"] == TRADE
+    assert database.update_offer_status(TRADE, "expired") is False
+    assert database.mark_coin_spent(COIN) is False
+    assert database.free_coin(COIN) is False
+    assert database.lock_coin(COIN, OTHER_TRADE) is False
+    assert database.upsert_coin(COIN, "xch", 9999, tier="outer") is False
+    assert database.get_coin_state(COIN) == terminal_coin
+    assert (
+        database.record_fill(
+            TRADE,
+            "sell",
+            database.Decimal("9"),
+            database.Decimal("9"),
+            database.Decimal("9"),
+            ASSET,
+        )
+        == -1
+    )
+
+    conn.execute(
+        "UPDATE coins SET status='free', trade_id=NULL WHERE coin_id=?",
+        (database.norm_coin_id(COIN),),
+    )
+    conn.commit()
+    for suffix in ("same-run", "new-run"):
+        with pytest.raises(ValueError, match="authoritative terminal coin outcome"):
+            _prepare_replacement_with_coin(COIN, suffix)
+    assert database.get_offer_intent("replacement:same-run") is None
+    assert database.get_offer_intent("replacement:new-run") is None
+
+
+@pytest.mark.parametrize(
+    "mutation_path",
+    [
+        "mark_gone",
+        "wallet_reconcile",
+        "wallet_lock_link",
+        "amount_link",
+        "orphan_cleanup",
+        "legacy_locked_release",
+    ],
+)
+def test_authoritative_spent_outcome_fences_every_legacy_coin_reconciler(
+    isolated_database,
+    mutation_path,
+):
+    _persist_created_offer()
+    reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    conn = database.get_connection()
+    status = "free" if mutation_path == "mark_gone" else "spent"
+    if mutation_path in {
+        "wallet_lock_link",
+        "amount_link",
+        "orphan_cleanup",
+        "legacy_locked_release",
+    }:
+        status = "locked"
+    conn.execute("DELETE FROM offers WHERE trade_id=?", (TRADE,))
+    conn.execute(
+        "UPDATE coins SET status=?, trade_id=NULL WHERE coin_id=?",
+        (status, database.norm_coin_id(COIN)),
+    )
+    conn.commit()
+    before = database.get_coin_state(COIN)
+
+    if mutation_path == "mark_gone":
+        result = database.mark_coins_gone([database.norm_coin_id(COIN)])
+        assert result == 0
+    elif mutation_path == "wallet_reconcile":
+        result = database.reconcile_coins_with_wallet(
+            {database.norm_coin_id(COIN): 1000},
+            {database.norm_coin_id(COIN): 1000},
+            "xch",
+        )
+        assert result["protected"] == 1
+        assert result["reappeared"] == 0
+    elif mutation_path == "wallet_lock_link":
+        result = database.reconcile_wallet_locked_coin_links({COIN: OTHER_TRADE})
+        assert result["protected"] == 1
+        assert result["linked"] == 0
+    elif mutation_path == "amount_link":
+        result = database.link_offers_to_locked_coins(
+            [
+                {
+                    "trade_id": OTHER_TRADE,
+                    "summary": {
+                        "offered": {"xch": 1000},
+                        "requested": {ASSET: 2000},
+                    },
+                }
+            ],
+            ASSET,
+        )
+        assert result["protected"] == 1
+        assert result["linked"] == 0
+    elif mutation_path == "orphan_cleanup":
+        result = database.cleanup_orphaned_locked_coins(set())
+        assert result["protected_registry_or_trade"] == 1
+        assert result["total_freed"] == 0
+    else:
+        assert database.free_unreserved_locked_coin_for_reconciliation(COIN) is False
+
+    assert database.get_coin_state(COIN) == before
 
 
 def test_fill_persists_chain_time_separately_from_reconciliation_time(
@@ -6669,6 +6812,71 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
     assert database.get_coin_state(RETURN)["amount_mojos"] == 1000
 
 
+def test_cancelled_selected_input_stays_spent_while_exact_return_is_reusable(
+    isolated_database,
+):
+    _persist_created_offer()
+    _persist_cancel_prepared()
+    evidence = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+    applied = reconcile_offer(
+        "intent-task9",
+        evidence=evidence,
+        cancel_context=_cancel_context(),
+        now=AFTER,
+    )
+    conn = database.get_connection()
+    conn.execute("DELETE FROM offers WHERE trade_id=?", (TRADE,))
+    conn.commit()
+
+    assert applied["classification"] == CANCELLED_PROVEN
+    assert database.update_offer_status(TRADE, "filled") is False
+    assert database.mark_coin_spent(COIN) is False
+    assert database.free_coin(COIN) is False
+    assert database.lock_coin(COIN, OTHER_TRADE) is False
+    conn.execute(
+        "UPDATE coins SET status='free', trade_id=NULL WHERE coin_id=?",
+        (database.norm_coin_id(COIN),),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="authoritative terminal coin outcome"):
+        _prepare_replacement_with_coin(COIN, "cancel-source")
+
+    replacement = _prepare_replacement_with_coin(RETURN, "cancel-return")
+    assert replacement["lifecycle_state"] == "prepared"
+    assert database.get_coin_state(RETURN)["status"] == "locked"
+
+
 def test_cancel_commit_binds_validated_task8_context_and_rejects_tampered_replay(
     isolated_database,
 ):
@@ -7485,6 +7693,50 @@ def test_exact_expiry_proof_persists_terminal_and_releases_selected_coin(
     assert database.get_authoritative_terminal_record(TRADE)["outcome"] == (
         EXPIRED_PROVEN
     )
+
+
+def test_expired_selected_coin_requires_exact_release_then_may_be_reserved_again(
+    isolated_database,
+):
+    _persist_created_offer()
+    evidence = _evidence(
+        offers=[_offer(status=5, transaction_id="")],
+        transactions=[],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                offer_id=TRADE,
+            )
+        },
+    )
+    applied = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+    conn = database.get_connection()
+    conn.execute("DELETE FROM offers WHERE trade_id=?", (TRADE,))
+    conn.commit()
+
+    assert applied["classification"] == EXPIRED_PROVEN
+    released = database.get_coin_state(COIN)
+    assert released["status"] == "free"
+    assert released["trade_id"] is None
+    assert database.update_offer_status(TRADE, "filled") is False
+    assert database.free_coin(COIN) is False
+    assert (
+        database.record_fill(
+            TRADE,
+            "buy",
+            database.Decimal("0.0000005"),
+            database.Decimal("0.000000001"),
+            database.Decimal("2"),
+            ASSET,
+        )
+        == -1
+    )
+
+    replacement = _prepare_replacement_with_coin(COIN, "expiry-release")
+    assert replacement["lifecycle_state"] == "prepared"
+    assert database.get_coin_state(COIN)["status"] == "locked"
 
 
 def test_exact_replay_is_idempotent_and_changed_proof_is_rejected(isolated_database):

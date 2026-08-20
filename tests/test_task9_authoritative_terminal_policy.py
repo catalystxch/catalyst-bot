@@ -132,6 +132,63 @@ def _seed_created_intent(
     return created
 
 
+def _seed_registry_only_intent(*, lifecycle_state: str) -> tuple[str, str, str]:
+    """Persist one Task 4 reservation without creating a legacy offer row."""
+
+    intent_id = f"intent-registry-only-{lifecycle_state}"
+    coin_id = hashlib.sha256(f"coin:{lifecycle_state}".encode()).hexdigest()
+    assert database.upsert_coin(coin_id, "xch", 1000, tier="inner")
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id="run-registry-only",
+        wallet_fingerprint_hash=WALLET,
+        network="mainnet",
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="authority_crash_recovery",
+        slot_key=f"slot:{intent_id}",
+        generation=0,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[coin_id],
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": "mainnet"},
+        evidence_json={"source": "registry-only-authority-test"},
+        prepared_at=AT,
+        reserve_selected_coins=True,
+    )
+    mutation_identity = f"intent:{intent_id}"
+    if lifecycle_state != "prepared":
+        outcome = {
+            "submitted_unconfirmed": "SUBMITTED_UNCONFIRMED",
+            "creation_unknown": "UNKNOWN",
+            "created": "CONFIRMED",
+        }[lifecycle_state]
+        is_created = lifecycle_state == "created"
+        database.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:finalized",
+            lifecycle_state=lifecycle_state,
+            outcome=outcome,
+            sage_trade_id=TRADE if is_created else None,
+            offer_text_sha256=OFFER_HASH if is_created else None,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": "mainnet",
+            },
+            evidence_json={"source": "registry-only-finalization-test"},
+            reason_code=None if is_created else f"{outcome}_TEST",
+            finalized_at=AFTER,
+            finalize_selected_coin_reservations=True,
+        )
+        if is_created:
+            mutation_identity = TRADE
+    return intent_id, coin_id, mutation_identity
+
+
 def _assert_created_offer_is_protected() -> None:
     offer = database.get_offer(TRADE)
     coin = database.get_coin_state(COIN)
@@ -219,6 +276,44 @@ def test_legacy_record_fill_cannot_terminalize_registered_open_offer(
     assert fill_id == -1
     assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
     _assert_created_offer_is_protected()
+
+
+@pytest.mark.parametrize(
+    "lifecycle_state",
+    ["prepared", "submitted_unconfirmed", "creation_unknown", "created"],
+)
+def test_registry_only_identity_fences_every_legacy_terminal_path(
+    isolated_database,
+    lifecycle_state,
+):
+    intent_id, coin_id, mutation_identity = _seed_registry_only_intent(
+        lifecycle_state=lifecycle_state
+    )
+    before_intent = database.get_offer_intent(intent_id)
+    before_coin = database.get_coin_state(coin_id)
+
+    assert database.update_offer_status(mutation_identity, "filled") is False
+    assert (
+        database.update_offer_lifecycle_state(mutation_identity, "user_cancelled")
+        is False
+    )
+    assert database.batch_cancel_stale_offers([mutation_identity]) == 0
+    assert (
+        database.record_fill(
+            mutation_identity,
+            "buy",
+            Decimal("0.001"),
+            Decimal("1"),
+            Decimal("1000"),
+            ASSET,
+        )
+        == -1
+    )
+
+    assert database.get_offer(mutation_identity) is None
+    assert database.get_offer_intent(intent_id) == before_intent
+    assert database.get_coin_state(coin_id) == before_coin
+    assert database.get_fills(cat_asset_id=ASSET, limit=10) == []
 
 
 def test_legacy_terminal_fsm_signal_reports_no_transition_without_proof(
