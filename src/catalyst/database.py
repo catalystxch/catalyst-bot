@@ -7204,6 +7204,22 @@ def _canonical_cancel_identifiers(
 _CANCEL_COHORT_MEMBER_LIMIT = 64
 
 
+def _canonical_offer_cancel_intent_id(value: Any, trade_id: str) -> str:
+    """Validate a fallback cancel target or a Task 7 creation-intent digest."""
+
+    if type(value) is not str:
+        raise ValueError("cancellation cohort intent identity is invalid")
+    if value == f"cancel-target:{trade_id}":
+        return value
+    if len(value) != 64 or value.lower() != value:
+        raise ValueError("cancellation cohort intent identity is invalid")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError("cancellation cohort intent identity is invalid") from exc
+    return value
+
+
 def canonical_offer_cancel_cohort_manifest(members: Any) -> Dict[str, Any]:
     """Build the one canonical ordered identity manifest for a cancel cohort."""
 
@@ -7230,9 +7246,7 @@ def canonical_offer_cancel_cohort_manifest(members: Any) -> Dict[str, Any]:
             attempt=raw_member["attempt"],
             phase="PREPARED",
         )
-        intent_id = _required_stability_text(raw_member["intent_id"], "intent_id")
-        if intent_id != f"cancel-target:{trade_id}":
-            raise ValueError("cancellation cohort intent identity is invalid")
+        intent_id = _canonical_offer_cancel_intent_id(raw_member["intent_id"], trade_id)
         canonical_members.append(
             {
                 "trade_id": trade_id,

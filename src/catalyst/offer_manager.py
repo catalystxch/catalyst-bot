@@ -104,6 +104,13 @@ class _CanonicalOfferCancelIntent:
     authority_run_id: Optional[str] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _OfferCancelResultProjection:
+    result: Optional[dict]
+    latch_binding: Optional[tuple[str, str]]
+    authoritative: bool
+
+
 class _OfferCreationClaimLost(Exception):
     """Another exact slot or selected-coin claim committed first."""
 
@@ -5311,12 +5318,14 @@ class OfferManager:
             wallet.close_offer_cancel_continuation(continuation)
 
     @staticmethod
-    def _existing_cancel_result(
+    def _read_existing_cancel_result(
         intent: _CanonicalOfferCancelIntent,
-    ) -> Optional[dict]:
+    ) -> _OfferCancelResultProjection:
+        """Read and validate a durable cancel result without mutating state."""
+
         rows = database.get_offer_operation_events(intent.operation_id)
         if not rows:
-            return None
+            return _OfferCancelResultProjection(None, None, False)
         wallet_hash = ""
         network = ""
         latest_attempt = 1
@@ -5489,15 +5498,14 @@ class OfferManager:
             ):
                 raise ValueError("cancellation prepared event is not exact")
             if len(events) == 1:
-                OfferManager._trip_cancel_latch(
-                    intent,
-                    wallet_fingerprint_hash=wallet_hash,
-                    network=network,
-                )
-                return OfferManager._cancel_reconciliation_result(
-                    intent,
-                    idempotent_replay=True,
-                    attempt=latest_attempt,
+                return _OfferCancelResultProjection(
+                    result=OfferManager._cancel_reconciliation_result(
+                        intent,
+                        idempotent_replay=True,
+                        attempt=latest_attempt,
+                    ),
+                    latch_binding=(wallet_hash, network),
+                    authoritative=False,
                 )
             finalized = events[1]
             final_evidence = json.loads(finalized["evidence_json"])
@@ -5554,30 +5562,89 @@ class OfferManager:
                 )
             ):
                 raise ValueError("cancellation final event is not exact")
-            if expected_blocks:
-                OfferManager._trip_cancel_latch(
-                    intent,
-                    wallet_fingerprint_hash=wallet_hash,
-                    network=network,
-                )
             result["_catalyst_effect_attempted"] = False
             result["_catalyst_idempotent_replay"] = True
             result["_catalyst_operation_id"] = intent.operation_id
             result["_catalyst_intent_id"] = intent.intent_id
             result["_catalyst_attempt"] = latest_attempt
-            return result
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            if wallet_hash and network:
-                OfferManager._trip_cancel_latch(
-                    intent,
-                    wallet_fingerprint_hash=wallet_hash,
-                    network=network,
-                )
-            return OfferManager._cancel_reconciliation_result(
-                intent,
-                idempotent_replay=True,
-                attempt=latest_attempt,
+            return _OfferCancelResultProjection(
+                result=result,
+                latch_binding=(wallet_hash, network) if expected_blocks else None,
+                authoritative=not bool(expected_blocks),
             )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return _OfferCancelResultProjection(
+                result=OfferManager._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=True,
+                    attempt=latest_attempt,
+                ),
+                latch_binding=(
+                    (wallet_hash, network) if wallet_hash and network else None
+                ),
+                authoritative=False,
+            )
+
+    @staticmethod
+    def _existing_cancel_result(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> Optional[dict]:
+        projection = OfferManager._read_existing_cancel_result(intent)
+        if projection.latch_binding is not None:
+            wallet_hash, network = projection.latch_binding
+            OfferManager._trip_cancel_latch(
+                intent,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+        return projection.result
+
+    def get_cancel_result_authority(self, trade_id: Any) -> Optional[dict]:
+        """Project the latest exact durable cancellation result for one trade."""
+
+        intent = self._canonical_cancel_intent(trade_id)
+        projection = self._read_existing_cancel_result(intent)
+        result = projection.result
+        if type(result) is not dict or not projection.authoritative:
+            return None
+        metadata_keys = frozenset(
+            {
+                "_catalyst_effect_attempted",
+                "_catalyst_idempotent_replay",
+                "_catalyst_operation_id",
+                "_catalyst_intent_id",
+                "_catalyst_attempt",
+            }
+        )
+        if not metadata_keys.issubset(result):
+            return None
+        typed_result = {
+            key: value for key, value in result.items() if key not in metadata_keys
+        }
+        try:
+            typed_result = validate_cancel_result(typed_result)
+        except (TypeError, ValueError):
+            return None
+        attempt = result["_catalyst_attempt"]
+        effect_attempted = result["_catalyst_effect_attempted"]
+        idempotent_replay = result["_catalyst_idempotent_replay"]
+        if (
+            type(effect_attempted) is not bool
+            or type(idempotent_replay) is not bool
+            or (effect_attempted and idempotent_replay)
+            or result["_catalyst_operation_id"] != intent.operation_id
+            or result["_catalyst_intent_id"] != intent.intent_id
+            or type(attempt) is not int
+            or attempt < 1
+        ):
+            return None
+        return {
+            "trade_id": intent.trade_id,
+            "operation_id": intent.operation_id,
+            "intent_id": intent.intent_id,
+            "attempt": attempt,
+            "outcome": typed_result["outcome"],
+        }
 
     def _cancel_one_from_journal(
         self,

@@ -39,6 +39,17 @@ from cancel_outcomes import (
 )
 
 
+_CANCEL_RESULT_METADATA_KEYS = frozenset(
+    {
+        "_catalyst_effect_attempted",
+        "_catalyst_idempotent_replay",
+        "_catalyst_operation_id",
+        "_catalyst_intent_id",
+        "_catalyst_attempt",
+    }
+)
+
+
 def _bps_to_pct(val):
     """Convert a BPS value to a formatted % string."""
     try:
@@ -50,16 +61,122 @@ def _bps_to_pct(val):
         return str(val)
 
 
-def _typed_replacement_cancel_outcomes(results, trade_ids):
+def _canonical_replacement_cancel_identity(offer_manager, trade_id):
+    """Read the exact cancellation identity the OfferManager will request."""
+
+    if type(trade_id) is not str or len(trade_id) != 64 or trade_id.lower() != trade_id:
+        raise ValueError("replacement cancellation trade identity is invalid")
+    try:
+        bytes.fromhex(trade_id)
+    except ValueError as exc:
+        raise ValueError("replacement cancellation trade identity is invalid") from exc
+    canonicalizer = getattr(offer_manager, "_canonical_cancel_intent", None)
+    if not callable(canonicalizer):
+        raise ValueError("replacement cancellation identity provider is unavailable")
+    identity = canonicalizer(trade_id)
+    operation_id = getattr(identity, "operation_id", None)
+    intent_id = getattr(identity, "intent_id", None)
+    if type(operation_id) is not str or operation_id != f"cancel:{trade_id}":
+        raise ValueError("replacement cancellation operation identity is invalid")
+    fallback_intent = f"cancel-target:{trade_id}"
+    if intent_id != fallback_intent:
+        if (
+            type(intent_id) is not str
+            or len(intent_id) != 64
+            or intent_id.lower() != intent_id
+        ):
+            raise ValueError("replacement cancellation intent identity is invalid")
+        try:
+            bytes.fromhex(intent_id)
+        except ValueError as exc:
+            raise ValueError(
+                "replacement cancellation intent identity is invalid"
+            ) from exc
+    return operation_id, intent_id
+
+
+def _validated_replacement_cancel_envelope(
+    value,
+    *,
+    expected_identity,
+    expected_authority,
+):
+    """Validate an exact Task 2 result with optional complete manager metadata."""
+
+    if type(value) is not dict:
+        raise ValueError("replacement cancellation result envelope is invalid")
+    metadata_keys = set(value) & _CANCEL_RESULT_METADATA_KEYS
+    if not metadata_keys:
+        typed_value = validate_cancel_result(value)
+        if typed_value["outcome"] == CANCEL_CONFIRMED:
+            raise ValueError("bare cancellation confirmation is not authoritative")
+        return typed_value
+    if (
+        metadata_keys != _CANCEL_RESULT_METADATA_KEYS
+        or expected_identity is None
+        or type(expected_authority) is not dict
+        or set(expected_authority)
+        != {"trade_id", "operation_id", "intent_id", "attempt", "outcome"}
+    ):
+        raise ValueError("replacement cancellation result envelope is invalid")
+    operation_id, intent_id = expected_identity
+    trade_id = operation_id.removeprefix("cancel:")
+    if (
+        type(expected_authority["trade_id"]) is not str
+        or expected_authority["trade_id"] != trade_id
+        or type(expected_authority["operation_id"]) is not str
+        or expected_authority["operation_id"] != operation_id
+        or type(expected_authority["intent_id"]) is not str
+        or expected_authority["intent_id"] != intent_id
+        or type(expected_authority["attempt"]) is not int
+        or expected_authority["attempt"] < 1
+        or type(expected_authority["outcome"]) is not str
+        or type(value["_catalyst_effect_attempted"]) is not bool
+        or type(value["_catalyst_idempotent_replay"]) is not bool
+        or (
+            value["_catalyst_effect_attempted"] is True
+            and value["_catalyst_idempotent_replay"] is True
+        )
+        or type(value["_catalyst_operation_id"]) is not str
+        or value["_catalyst_operation_id"] != operation_id
+        or type(value["_catalyst_intent_id"]) is not str
+        or value["_catalyst_intent_id"] != intent_id
+        or type(value["_catalyst_attempt"]) is not int
+        or value["_catalyst_attempt"] != expected_authority["attempt"]
+    ):
+        raise ValueError("replacement cancellation result metadata is invalid")
+    typed_value = {
+        key: item
+        for key, item in value.items()
+        if key not in _CANCEL_RESULT_METADATA_KEYS
+    }
+    typed_value = validate_cancel_result(typed_value)
+    if typed_value["outcome"] != expected_authority["outcome"]:
+        raise ValueError("replacement cancellation result authority is inconsistent")
+    return typed_value
+
+
+def _typed_replacement_cancel_outcomes(
+    results,
+    trade_ids,
+    expected_identities=None,
+    expected_authorities=None,
+):
     """Return exact Task 2 outcomes, treating missing/malformed data as unknown."""
     if type(results) is not dict:
         results = {}
+    if type(expected_identities) is not dict:
+        expected_identities = {}
+    if type(expected_authorities) is not dict:
+        expected_authorities = {}
     outcomes = {}
     for trade_id in trade_ids:
         try:
-            outcomes[trade_id] = validate_cancel_result(results.get(trade_id))[
-                "outcome"
-            ]
+            outcomes[trade_id] = _validated_replacement_cancel_envelope(
+                results.get(trade_id),
+                expected_identity=expected_identities.get(trade_id),
+                expected_authority=expected_authorities.get(trade_id),
+            )["outcome"]
         except (TypeError, ValueError):
             outcomes[trade_id] = CANCEL_UNKNOWN
     return outcomes
@@ -433,6 +550,14 @@ class BoostManager:
         trade_ids = list(dict.fromkeys(tid for tid in trade_ids if tid))
         if not trade_ids or not self._offer_manager:
             return {}
+        expected_identities = {}
+        for trade_id in trade_ids:
+            try:
+                expected_identities[trade_id] = _canonical_replacement_cancel_identity(
+                    self._offer_manager, trade_id
+                )
+            except (AttributeError, TypeError, ValueError):
+                expected_identities[trade_id] = None
         for trade_id in trade_ids:
             self._offer_manager._bot_cancelled_ids.add(trade_id)
         try:
@@ -443,7 +568,22 @@ class BoostManager:
             )
         except Exception:
             raw_results = {}
-        outcomes = _typed_replacement_cancel_outcomes(raw_results, trade_ids)
+        expected_authorities = {}
+        authority_reader = getattr(
+            self._offer_manager, "get_cancel_result_authority", None
+        )
+        if callable(authority_reader):
+            for trade_id in trade_ids:
+                try:
+                    expected_authorities[trade_id] = authority_reader(trade_id)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    expected_authorities[trade_id] = None
+        outcomes = _typed_replacement_cancel_outcomes(
+            raw_results,
+            trade_ids,
+            expected_identities,
+            expected_authorities,
+        )
         for trade_id, outcome in outcomes.items():
             if outcome == CANCEL_FAILED:
                 # A proved no-effect failure leaves the old offer active.
