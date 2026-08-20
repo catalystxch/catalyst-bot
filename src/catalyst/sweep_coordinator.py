@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Dict, List, Optional
@@ -54,6 +55,8 @@ class SweepEvent:
     spent_block_index: int
     fills: List[SweepEntry]
     event_id: Optional[str] = None
+    claim_token: Optional[str] = None
+    claim_generation: Optional[int] = None
     finalised_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -82,6 +85,8 @@ _DEFAULT_WINDOW_SECS: float = 15.0
 
 # Maximum number of sweep events to buffer before oldest are dropped.
 _MAX_BUFFERED_EVENTS: int = 200
+_MAX_ACTIVE_FILLS: int = 4096
+_MAX_RECENT_FILL_IDS: int = 4096
 
 
 class SweepCoordinator:
@@ -95,12 +100,13 @@ class SweepCoordinator:
         self._pending: Dict[int, List[SweepEntry]] = {}
         self._registered_fill_ids: set[int] = set()
         self._durable_fill_ids: set[int] = set()
+        self._recent_fill_ids: set[int] = set()
+        self._recent_fill_order: deque[int] = deque()
 
         # Finalised events waiting to be drained
         self._events: List[SweepEvent] = []
         self._event_ids: set[str] = set()
         self._restore_authoritative_registrations()
-        self._restore_authoritative_events()
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,12 +125,13 @@ class SweepCoordinator:
 
         Returns the sweep_group_id if the fill was grouped, else None.
         """
-        block_idx = classification.spent_block_index
-        if block_idx is None:
-            with self._lock:
-                self._registered_fill_ids.add(fill_id)
-            return None
+        group_id, _accepted = self._process_fill(fill_id, classification, durable=False)
+        return group_id
 
+    def _process_fill(self, fill_id: int, classification, *, durable: bool):
+        """Register one bounded process identity and report exact acceptance."""
+
+        block_idx = classification.spent_block_index
         entry = SweepEntry(
             fill_id=fill_id,
             trade_id=classification.trade_id,
@@ -135,9 +142,16 @@ class SweepCoordinator:
         )
 
         with self._lock:
-            if fill_id in self._registered_fill_ids:
-                return None
+            if fill_id in self._registered_fill_ids or fill_id in self._recent_fill_ids:
+                return None, False
+            if len(self._registered_fill_ids) >= _MAX_ACTIVE_FILLS:
+                return None, False
             self._registered_fill_ids.add(fill_id)
+            if durable:
+                self._durable_fill_ids.add(fill_id)
+            if block_idx is None:
+                self._remember_recent_fill_locked(fill_id)
+                return None, True
             if block_idx not in self._pending:
                 self._pending[block_idx] = []
             self._pending[block_idx].append(entry)
@@ -145,15 +159,17 @@ class SweepCoordinator:
             # If this block already has >1 fill, it's already a sweep group —
             # return the anticipated group id even before finalisation.
             if len(self._pending.get(block_idx, [])) > 1:
-                return f"sweep_{block_idx}"
+                return f"sweep_{block_idx}", True
 
-        return None
+        return None, True
 
     def has_registered_fill(self, fill_id: int) -> bool:
         """Return whether this cache consumed the fill-keyed durable source."""
 
         with self._lock:
-            return fill_id in self._registered_fill_ids
+            return (
+                fill_id in self._registered_fill_ids or fill_id in self._recent_fill_ids
+            )
 
     def process_authoritative_fill(
         self,
@@ -162,16 +178,11 @@ class SweepCoordinator:
     ) -> Optional[str]:
         """Register a fill whose immutable source is already in the database."""
 
-        with self._lock:
-            self._durable_fill_ids.add(fill_id)
-        group_id = self.process_fill(fill_id, classification)
-        if classification.spent_block_index is None:
+        group_id, accepted = self._process_fill(fill_id, classification, durable=True)
+        if accepted and classification.spent_block_index is None:
             from database import consume_authoritative_sweep_registrations
 
             consume_authoritative_sweep_registrations([fill_id])
-            with self._lock:
-                self._registered_fill_ids.discard(fill_id)
-                self._durable_fill_ids.discard(fill_id)
         return group_id
 
     def tick(self) -> None:
@@ -184,24 +195,24 @@ class SweepCoordinator:
             self._expire_pending_locked()
 
     def drain_sweep_events(self) -> List[SweepEvent]:
-        """Return events only after recording their durable consumption."""
+        """Return local events plus at most one fenced durable delivery claim."""
 
         with self._lock:
             drained: List[SweepEvent] = []
-            retained: List[SweepEvent] = []
             for event in self._events:
-                if event.event_id is not None:
-                    try:
-                        from database import consume_authoritative_sweep_event
-
-                        consume_authoritative_sweep_event(event.event_id)
-                    except Exception:
-                        retained.append(event)
-                        continue
+                if event.event_id is None:
+                    drained.append(event)
+                else:
                     self._event_ids.discard(event.event_id)
-                drained.append(event)
-            self._events = retained
-            self._restore_authoritative_events()
+            self._events = []
+            try:
+                from database import claim_authoritative_sweep_event
+
+                stored = claim_authoritative_sweep_event()
+            except Exception:
+                stored = None
+            if stored is not None:
+                drained.append(self._event_from_stored_delivery(stored))
             return drained
 
     def get_pending_summary(self) -> Dict:
@@ -216,6 +227,19 @@ class SweepCoordinator:
     # ------------------------------------------------------------------
     # Internal helpers (must be called with _lock held)
     # ------------------------------------------------------------------
+
+    def _remember_recent_fill_locked(self, fill_id: int) -> None:
+        """Move one identity out of active state into bounded dedup retention."""
+
+        self._registered_fill_ids.discard(fill_id)
+        self._durable_fill_ids.discard(fill_id)
+        if fill_id in self._recent_fill_ids:
+            return
+        if len(self._recent_fill_order) >= _MAX_RECENT_FILL_IDS:
+            evicted = self._recent_fill_order.popleft()
+            self._recent_fill_ids.discard(evicted)
+        self._recent_fill_order.append(fill_id)
+        self._recent_fill_ids.add(fill_id)
 
     def _restore_authoritative_registrations(self) -> None:
         """Reconstruct process-local grouping from immutable database rows."""
@@ -239,41 +263,29 @@ class SweepCoordinator:
                 int(registration["fill_id"]), classification
             )
 
-    def _restore_authoritative_events(self) -> None:
-        """Recreate finalized events that were not durably consumed."""
+    @staticmethod
+    def _event_from_stored_delivery(stored: dict) -> SweepEvent:
+        """Build one process object from a fenced immutable database claim."""
 
-        try:
-            from database import get_pending_authoritative_sweep_events
-
-            events = get_pending_authoritative_sweep_events()
-        except Exception:
-            return
-        for stored in events:
-            if len(self._events) >= _MAX_BUFFERED_EVENTS:
-                break
-            event_id = stored["event_id"]
-            if event_id in self._event_ids:
-                continue
-            fills = [
-                SweepEntry(
-                    fill_id=fill["fill_id"],
-                    trade_id=fill["trade_id"],
-                    classification=fill["classification"],
-                    spent_block_index=fill["spent_block_index"],
-                    taker_puzzle_hash=fill["taker_puzzle_hash"],
-                    side=fill["side"],
-                )
-                for fill in stored["fills"]
-            ]
-            self._events.append(
-                SweepEvent(
-                    sweep_group_id=stored["sweep_group_id"],
-                    spent_block_index=stored["spent_block_index"],
-                    fills=fills,
-                    event_id=event_id,
-                )
+        fills = [
+            SweepEntry(
+                fill_id=fill["fill_id"],
+                trade_id=fill["trade_id"],
+                classification=fill["classification"],
+                spent_block_index=fill["spent_block_index"],
+                taker_puzzle_hash=fill["taker_puzzle_hash"],
+                side=fill["side"],
             )
-            self._event_ids.add(event_id)
+            for fill in stored["fills"]
+        ]
+        return SweepEvent(
+            sweep_group_id=stored["sweep_group_id"],
+            spent_block_index=stored["spent_block_index"],
+            fills=fills,
+            event_id=stored["event_id"],
+            claim_token=stored["claim_token"],
+            claim_generation=stored["claim_generation"],
+        )
 
     def _expire_pending_locked(self) -> None:
         now = time.monotonic()
@@ -304,6 +316,12 @@ class SweepCoordinator:
         except Exception:
             _min_fills = 3
 
+        durable_count = sum(
+            entry.fill_id in self._durable_fill_ids for entry in entries
+        )
+        if durable_count not in {0, len(entries)}:
+            return False
+
         if len(entries) < _min_fills:
             # Not enough fills to be a sweep — leave classification as-is.
             if all(entry.fill_id in self._durable_fill_ids for entry in entries):
@@ -315,9 +333,8 @@ class SweepCoordinator:
                     )
                 except Exception:
                     return False
-                for entry in entries:
-                    self._registered_fill_ids.discard(entry.fill_id)
-                    self._durable_fill_ids.discard(entry.fill_id)
+            for entry in entries:
+                self._remember_recent_fill_locked(entry.fill_id)
             return True
 
         group_id = f"sweep_{block_idx}"
@@ -336,9 +353,8 @@ class SweepCoordinator:
                 event_id = stored["event_id"]
             except Exception:
                 return False
-            for entry in entries:
-                self._registered_fill_ids.discard(entry.fill_id)
-                self._durable_fill_ids.discard(entry.fill_id)
+        for entry in entries:
+            self._remember_recent_fill_locked(entry.fill_id)
 
         event = SweepEvent(
             sweep_group_id=group_id,

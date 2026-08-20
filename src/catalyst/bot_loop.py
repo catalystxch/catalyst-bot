@@ -612,6 +612,7 @@ class BotLoop:
         # to avoid immediately re-posting stale-priced offers into an arb window.
         self._sweep_protection: Dict[str, float] = {}
         self._recent_sweep_events: list = []
+        self._restore_authoritative_sweep_downstream_effects()
 
         # ---- Health monitor state (V1 parity) ----
         self._health_thread: Optional[threading.Thread] = None
@@ -7709,6 +7710,154 @@ class BotLoop:
     # One trading cycle
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _sweep_timestamp_epoch(value: str) -> float:
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(text).astimezone(timezone.utc).timestamp()
+
+    def _apply_authoritative_sweep_downstream_effect(self, effect: dict) -> None:
+        """Idempotently materialize one already-durable effect in this process."""
+
+        event_id = effect["event_id"]
+        for protected in effect["protected_sides"]:
+            side = protected["side"]
+            expiry = self._sweep_timestamp_epoch(protected["expires_at"])
+            self._sweep_protection[side] = max(
+                float(self._sweep_protection.get(side, 0.0)), expiry
+            )
+        existing_identities = {
+            (item.get("event_id"), item.get("side"))
+            for item in self._recent_sweep_events
+            if type(item) is dict
+        }
+        for recent in effect["recent_events"]:
+            identity = (event_id, recent["side"])
+            if identity in existing_identities:
+                continue
+            materialized = dict(recent)
+            materialized["timestamp"] = self._sweep_timestamp_epoch(recent["timestamp"])
+            self._recent_sweep_events.append(materialized)
+            existing_identities.add(identity)
+        self._recent_sweep_events = self._recent_sweep_events[-20:]
+
+        effect_epoch = self._sweep_timestamp_epoch(effect["effect_at"])
+        dynamic_window_seconds = max(
+            0.0, float(getattr(cfg, "DYNAMIC_BUFFER_WINDOW_MINS", 60)) * 60.0
+        )
+        effect_age_seconds = max(0.0, time.time() - effect_epoch)
+        if effect_age_seconds <= dynamic_window_seconds:
+            from dynamic_amm_buffer import record_sweep
+
+            record_sweep(
+                fill_count=effect["buffer_fill_count"],
+                event_id=event_id,
+                age_seconds=effect_age_seconds,
+            )
+
+    def _restore_authoritative_sweep_downstream_effects(self) -> None:
+        """Rebuild bounded protection/buffer state from immutable effects."""
+
+        try:
+            from database import get_authoritative_sweep_downstream_effects
+
+            effects = get_authoritative_sweep_downstream_effects(limit=20)
+        except Exception:
+            return
+        for effect in effects:
+            try:
+                self._apply_authoritative_sweep_downstream_effect(effect)
+            except Exception:
+                continue
+
+    def _process_authoritative_sweep_events(self) -> int:
+        """Claim, durably materialize, apply and positively ack Sweep events."""
+
+        from database import (
+            consume_authoritative_sweep_event,
+            materialize_authoritative_sweep_downstream_effect,
+        )
+        from sweep_coordinator import get_coordinator
+
+        coordinator = get_coordinator()
+        coordinator.tick()
+        applied_count = 0
+        for event in coordinator.drain_sweep_events():
+            if (
+                event.event_id is None
+                or event.claim_token is None
+                or event.claim_generation is None
+            ):
+                self._process_legacy_sweep_event(event)
+                applied_count += 1
+                continue
+            try:
+                effect = materialize_authoritative_sweep_downstream_effect(
+                    event.event_id,
+                    event.claim_token,
+                    event.claim_generation,
+                    known_protection_seconds=int(
+                        getattr(cfg, "SWEEP_PROTECTION_SECS", 90)
+                    ),
+                    unknown_protection_seconds=int(
+                        getattr(cfg, "SWEEP_PROTECTION_UNKNOWN_SECS", 30)
+                    ),
+                )
+                self._apply_authoritative_sweep_downstream_effect(effect)
+                if consume_authoritative_sweep_event(
+                    event.event_id,
+                    event.claim_token,
+                    event.claim_generation,
+                ):
+                    applied_count += 1
+            except Exception:
+                continue
+        try:
+            from database import compact_authoritative_sweep_auxiliary_state
+
+            compact_authoritative_sweep_auxiliary_state(limit=32)
+        except Exception:
+            pass
+        return applied_count
+
+    def _process_legacy_sweep_event(self, event) -> None:
+        """Preserve bounded behavior for non-authoritative in-process events."""
+
+        from dynamic_amm_buffer import record_sweep
+        from fill_classifier import FillType
+
+        record_sweep(fill_count=event.fill_count)
+        known = int(getattr(cfg, "SWEEP_PROTECTION_SECS", 90))
+        unknown = int(getattr(cfg, "SWEEP_PROTECTION_UNKNOWN_SECS", 30))
+        protected: Dict[str, float] = {}
+        counts = {"buy": 0, "sell": 0}
+        for entry in event.fills:
+            if entry.classification == FillType.ARB_SWEEP_BUY:
+                sides, seconds = ("sell",), known
+            elif entry.classification == FillType.ARB_SWEEP_SELL:
+                sides, seconds = ("buy",), known
+            elif entry.side in {"buy", "sell"}:
+                sides, seconds = (entry.side,), known
+            else:
+                sides, seconds = ("buy", "sell"), unknown
+            for side in sides:
+                protected[side] = max(protected.get(side, 0), time.time() + seconds)
+                counts[side] += 1
+        self._sweep_protection.update(protected)
+        now = time.time()
+        for side in sorted(protected):
+            self._recent_sweep_events.append(
+                {
+                    "side": side,
+                    "fill_count": counts[side],
+                    "side_fill_count": counts[side],
+                    "total_fill_count": event.fill_count,
+                    "sweep_group_id": event.sweep_group_id,
+                    "spent_block_index": event.spent_block_index,
+                    "timestamp": now,
+                }
+            )
+        self._recent_sweep_events = self._recent_sweep_events[-20:]
+
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
         self._cycle_started_running = bool(self._running)
@@ -7740,84 +7889,7 @@ class BotLoop:
 
         # ---- Step 0b: Tick sweep coordinator (expire pending groups) ----
         try:
-            from sweep_coordinator import get_coordinator as _get_sc
-            from dynamic_amm_buffer import record_sweep as _record_sweep
-            from fill_classifier import FillType as _FT
-
-            _sc = _get_sc()
-            _sc.tick()
-            for _sweep_evt in _sc.drain_sweep_events():
-                # Record sweep for dynamic buffer widening
-                _record_sweep(fill_count=_sweep_evt.fill_count)
-
-                # Determine which side(s) were swept to apply protection.
-                # Priority for direction:
-                #   1. ARB_SWEEP_BUY/SELL classification (taker wallet known)
-                #   2. entry.side (fill side stamped by fill_tracker — always available)
-                #   3. Fallback: protect both, but for a shorter window
-                _prot_secs_known = float(getattr(cfg, "SWEEP_PROTECTION_SECS", 90))
-                _prot_secs_unknown = float(
-                    getattr(cfg, "SWEEP_PROTECTION_UNKNOWN_SECS", 30)
-                )
-                _protected_sides: dict = {}  # side → expiry timestamp
-                _side_fill_counts = {"buy": 0, "sell": 0}
-
-                def _protect_sweep_side(_side: str, _secs: float) -> None:
-                    if _side not in ("buy", "sell"):
-                        return
-                    _protected_sides[_side] = time.time() + _secs
-                    _side_fill_counts[_side] += 1
-
-                for _entry in _sweep_evt.fills:
-                    if _entry.classification == _FT.ARB_SWEEP_BUY:
-                        # Arb bought from us → our SELL offers swept
-                        _protect_sweep_side("sell", _prot_secs_known)
-                    elif _entry.classification == _FT.ARB_SWEEP_SELL:
-                        # Arb sold to us → our BUY offers swept
-                        _protect_sweep_side("buy", _prot_secs_known)
-                    elif _entry.side in ("buy", "sell"):
-                        # Direction from fill side: the offer that got swept
-                        _protect_sweep_side(_entry.side, _prot_secs_known)
-                    else:
-                        # No direction data — protect both but only briefly
-                        for _s in ("buy", "sell"):
-                            _protect_sweep_side(_s, _prot_secs_unknown)
-                self._sweep_protection.update(_protected_sides)
-                _sweep_now = time.time()
-                for _side in _protected_sides.keys() or [""]:
-                    _side_fill_count = (
-                        _side_fill_counts.get(_side) or _sweep_evt.fill_count
-                    )
-                    self._recent_sweep_events.append(
-                        {
-                            "side": _side,
-                            "fill_count": _side_fill_count,
-                            "side_fill_count": _side_fill_count,
-                            "total_fill_count": _sweep_evt.fill_count,
-                            "sweep_group_id": _sweep_evt.sweep_group_id,
-                            "spent_block_index": _sweep_evt.spent_block_index,
-                            "timestamp": _sweep_now,
-                        }
-                    )
-                self._recent_sweep_events = self._recent_sweep_events[-20:]
-
-                _prot_summary = {
-                    s: round(e - time.time()) for s, e in _protected_sides.items()
-                }
-                log_event(
-                    "info",
-                    "sweep_detected",
-                    f"Sweep detected: {_sweep_evt.fill_count} fills in block "
-                    f"{_sweep_evt.spent_block_index} — group {_sweep_evt.sweep_group_id}"
-                    + (f" — protecting {_prot_summary}" if _protected_sides else ""),
-                    data={
-                        "sweep_group_id": _sweep_evt.sweep_group_id,
-                        "spent_block_index": _sweep_evt.spent_block_index,
-                        "fill_count": _sweep_evt.fill_count,
-                        "trade_ids": _sweep_evt.trade_ids,
-                        "protected_sides": _prot_summary,
-                    },
-                )
+            self._process_authoritative_sweep_events()
         except Exception:
             pass  # Sweep coordinator is additive — never block main cycle
 

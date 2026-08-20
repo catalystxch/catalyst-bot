@@ -462,6 +462,172 @@ def test_stability_migration_rejects_malformed_boost_effect_table(
         database.init_database()
 
 
+def test_boost_command_materialization_schema_is_immutable_and_audited(
+    isolated_database,
+):
+    database.init_database()
+    conn = database.get_connection()
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='offer_fill_boost_command_materializations'"
+    ).fetchone()
+    triggers = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name='offer_fill_boost_command_materializations'"
+        ).fetchall()
+    }
+
+    assert table is not None
+    columns = {
+        row[1]: (row[2], row[3])
+        for row in conn.execute(
+            "PRAGMA table_info(offer_fill_boost_command_materializations)"
+        ).fetchall()
+    }
+    assert columns["materialization_json"] == ("TEXT", 1)
+    assert columns["materialization_sha256"] == ("TEXT", 1)
+    assert triggers == {
+        "offer_fill_boost_command_materializations_no_update",
+        "offer_fill_boost_command_materializations_no_delete",
+    }
+
+
+def test_stability_migration_rejects_malformed_boost_materialization_table(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute("DROP TRIGGER offer_fill_boost_command_materializations_no_update")
+        conn.execute("DROP TRIGGER offer_fill_boost_command_materializations_no_delete")
+        conn.execute("DROP TABLE offer_fill_boost_command_materializations")
+        conn.execute(
+            """
+            CREATE TABLE offer_fill_boost_command_materializations (
+                fill_id INTEGER PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                materialization_json TEXT NOT NULL
+            )
+            """
+        )
+    database._db_initialized_path = ""
+
+    with pytest.raises(
+        RuntimeError,
+        match="offer_fill_boost_command_materializations.*missing required columns",
+    ):
+        database.init_database()
+
+
+def test_sweep_active_queues_have_indexed_bounded_query_plans(isolated_database):
+    database.init_database()
+    conn = database.get_connection()
+
+    registration_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT registration.fill_id, registration.trade_id, "
+            "       registration.classification_json "
+            "FROM offer_fill_sweep_registration_queue AS queue "
+            "JOIN offer_fill_sweep_registrations AS registration "
+            "  ON registration.fill_id=queue.fill_id "
+            "WHERE queue.state='active' "
+            "ORDER BY queue.fill_id LIMIT 4097"
+        ).fetchall()
+    )
+    pending_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT event.event_id, event.event_json "
+            "FROM offer_fill_sweep_delivery_queue AS queue "
+            "JOIN offer_fill_sweep_events AS event ON event.event_id=queue.event_id "
+            "WHERE queue.state='pending' "
+            "ORDER BY queue.queued_at, queue.event_id LIMIT 200"
+        ).fetchall()
+    )
+    expired_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT event_id FROM offer_fill_sweep_delivery_queue "
+            "WHERE state='running' AND claimed_at<=? "
+            "ORDER BY claimed_at, event_id LIMIT 1",
+            (AT,),
+        ).fetchall()
+    )
+    completed_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT queue.event_id "
+            "FROM offer_fill_sweep_delivery_queue AS queue "
+            "JOIN offer_fill_sweep_delivery_acks AS ack "
+            "  ON ack.event_id=queue.event_id "
+            "WHERE queue.state='completed' "
+            "ORDER BY queue.completed_at, queue.event_id LIMIT 256"
+        ).fetchall()
+    )
+    finalized_plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT queue.fill_id "
+            "FROM offer_fill_sweep_registration_queue AS queue "
+            "JOIN offer_fill_sweep_finalizations AS finalization "
+            "  ON finalization.fill_id=queue.fill_id "
+            "WHERE queue.state='finalized' "
+            "ORDER BY queue.finalized_at, queue.fill_id LIMIT 256"
+        ).fetchall()
+    )
+
+    assert "idx_offer_fill_sweep_registration_queue_active" in registration_plan
+    assert "idx_offer_fill_sweep_delivery_pending" in pending_plan
+    assert "idx_offer_fill_sweep_delivery_claim" in expired_plan
+    assert "idx_offer_fill_sweep_delivery_completed" in completed_plan
+    assert "idx_offer_fill_sweep_registration_queue_finalized" in finalized_plan
+    assert "USE TEMP B-TREE" not in registration_plan
+    assert "USE TEMP B-TREE" not in pending_plan
+    assert "USE TEMP B-TREE" not in expired_plan
+    assert "USE TEMP B-TREE" not in completed_plan
+    assert "USE TEMP B-TREE" not in finalized_plan
+
+
+def test_sweep_auxiliary_queue_deletes_are_guarded_by_completed_state(
+    isolated_database,
+):
+    database.init_database()
+    conn = database.get_connection()
+    triggers = {
+        row[0]: row[1]
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            "AND name IN (?, ?)",
+            (
+                "offer_fill_sweep_registration_queue_guarded_delete",
+                "offer_fill_sweep_delivery_queue_guarded_delete",
+            ),
+        ).fetchall()
+    }
+
+    assert set(triggers) == {
+        "offer_fill_sweep_registration_queue_guarded_delete",
+        "offer_fill_sweep_delivery_queue_guarded_delete",
+    }
+    assert (
+        "OLD.state <> 'finalized'"
+        in triggers["offer_fill_sweep_registration_queue_guarded_delete"]
+    )
+    assert (
+        "OLD.state <> 'completed'"
+        in triggers["offer_fill_sweep_delivery_queue_guarded_delete"]
+    )
+
+
 def test_unique_table_key_validator_rejects_partial_and_created_indexes():
     conn = sqlite3.connect(":memory:")
     try:
@@ -489,6 +655,48 @@ def test_unique_table_key_validator_rejects_partial_and_created_indexes():
         database._require_unique_key(conn, "sample", ("event_id",))
     finally:
         conn.close()
+
+
+class _CanonicalizationAbort(BaseException):
+    pass
+
+
+class _HostileCanonicalMapping(dict):
+    def items(self):
+        raise _CanonicalizationAbort("mapping traversal escaped preflight")
+
+
+class _HostileCanonicalKey(str):
+    def __lt__(self, _other):
+        raise _CanonicalizationAbort("key sort escaped preflight")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _HostileCanonicalMapping({"safe": 1}),
+        {_HostileCanonicalKey("hostile"): 1, "safe": 2},
+    ],
+)
+def test_database_canonical_json_rejects_container_subclasses_before_dump(payload):
+    with pytest.raises(ValueError, match="exact JSON containers"):
+        database._canonical_json_text(payload, "payload", expected_type=dict)
+
+
+def test_database_json_text_cap_precedes_parser_allocation(monkeypatch):
+    oversized_json_text = " " * (2 * 1024 * 1024 + 1)
+    calls = []
+
+    def forbidden_loads(_value):
+        calls.append(True)
+        raise AssertionError("oversized JSON text reached parser")
+
+    monkeypatch.setattr(database.json, "loads", forbidden_loads)
+
+    with pytest.raises(ValueError, match="input exceeds"):
+        database._canonical_json_text(oversized_json_text, "payload")
+
+    assert calls == []
 
 
 def test_stability_migration_rejects_check_text_hidden_in_comment(

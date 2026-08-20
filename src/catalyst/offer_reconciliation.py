@@ -66,6 +66,13 @@ _MAX_AUXILIARY_COINS = 256
 _MAX_COIN_RECORDS = 4096
 _MAX_PROVIDER_RECORD_FIELDS = 64
 _MAX_SOURCE_TIMESTAMPS = 4096
+_MAX_PROVIDER_SCALAR_CHARS = 4096
+_MAX_PROVIDER_CONTAINER_ITEMS = 4096
+_MAX_PROVIDER_DEPTH = 16
+_MAX_PROVIDER_NODES = 300_000
+_MAX_PROVIDER_TOTAL_TEXT_BYTES = 8 * 1024 * 1024
+_MAX_ATOMIC_DIGITS = 128
+_MAX_ATOMIC_BITS = 512
 _SENSITIVE_KEYS = frozenset(
     {
         "key",
@@ -101,8 +108,75 @@ def _conflict(reason: str = "TERMINAL_EVIDENCE_CONFLICT") -> dict[str, Any]:
     return {"classification": CONFLICT, "reason_code": reason}
 
 
+def _validate_provider_value_bounds(
+    value: Any,
+    *,
+    depth: int = 0,
+    state: dict[str, int] | None = None,
+) -> None:
+    """Preflight exact provider shapes before normalization or copying."""
+
+    if state is None:
+        state = {"nodes": 0, "text_bytes_upper": 0}
+    state["nodes"] += 1
+    if state["nodes"] > _MAX_PROVIDER_NODES or depth > _MAX_PROVIDER_DEPTH:
+        raise _SourceLimitError("provider structure exceeds source limit")
+    if type(value) is str:
+        if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
+            raise _SourceLimitError("provider text exceeds source limit")
+        state["text_bytes_upper"] += len(value) * 4
+        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+            raise _SourceLimitError("provider text exceeds source limit")
+        return
+    if type(value) is bytes:
+        if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
+            raise _SourceLimitError("provider bytes exceed source limit")
+        state["text_bytes_upper"] += len(value)
+        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+            raise _SourceLimitError("provider bytes exceed source limit")
+        return
+    if type(value) is int:
+        if value.bit_length() > 4096:
+            raise _SourceLimitError("provider integer exceeds source limit")
+        return
+    if type(value) is bool or value is None:
+        return
+    if type(value) is dict:
+        if len(value) > _MAX_PROVIDER_CONTAINER_ITEMS:
+            raise _SourceLimitError("provider object exceeds source limit")
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("provider object key must be exact text")
+            if len(key) > _MAX_PROVIDER_SCALAR_CHARS:
+                raise _SourceLimitError("provider object key exceeds source limit")
+            state["text_bytes_upper"] += len(key) * 4
+            if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+                raise _SourceLimitError("provider text exceeds source limit")
+            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+        return
+    if type(value) is list:
+        if len(value) > _MAX_PROVIDER_CONTAINER_ITEMS:
+            raise _SourceLimitError("provider list exceeds source limit")
+        for item in value:
+            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+        return
+    raise ValueError("provider value must use exact bounded JSON scalar types")
+
+
+def _provider_value_within_bounds(value: Any) -> bool:
+    try:
+        _validate_provider_value_bounds(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _require_provider_bounds(value: Any) -> None:
+    _validate_provider_value_bounds(value)
+
+
 def _norm_id(value: Any) -> str:
-    if type(value) is not str:
+    if type(value) is not str or len(value) > _MAX_PROVIDER_SCALAR_CHARS:
         return ""
     text = value.strip().lower()
     return text[2:] if text.startswith("0x") else text
@@ -130,18 +204,27 @@ def _positive_int(value: Any) -> int | None:
 
 def _atomic_text(value: Any) -> str:
     if type(value) is int:
+        if value <= 0 or value.bit_length() > _MAX_ATOMIC_BITS:
+            return ""
         text = str(value)
     elif type(value) is str:
+        if len(value) > _MAX_ATOMIC_DIGITS:
+            return ""
         text = value
     else:
         return ""
-    if not text or not text.isascii() or not text.isdigit() or int(text) <= 0:
+    if (
+        not text
+        or text[0] not in "123456789"
+        or not text.isascii()
+        or not text.isdigit()
+    ):
         return ""
     return text
 
 
 def _parse_utc(value: Any) -> datetime | None:
-    if type(value) is not str or not value.strip():
+    if type(value) is not str or len(value) > 128 or not value.strip():
         return None
     text = value.strip()
     try:
@@ -194,7 +277,7 @@ def _source_timestamp(value: Any) -> Any:
 def _status(value: Any) -> int | str | None:
     if type(value) is int:
         return value
-    if type(value) is str and value.strip():
+    if type(value) is str and len(value) <= 64 and value.strip():
         return value.strip().lower()
     return None
 
@@ -207,7 +290,13 @@ def _redact_json(
     redact_sensitive: bool = True,
 ) -> Any:
     if state is None:
-        state = {"nodes": 0, "text_bytes": 0, "active_containers": set()}
+        state = {
+            "nodes": 0,
+            "text_bytes": 0,
+            "text_bytes_upper": 0,
+            "scalar_bytes_upper": 0,
+            "active_containers": set(),
+        }
     state["nodes"] += 1
     if state["nodes"] > _MAX_CANONICAL_NODES:
         raise _EvidenceEncodingError("evidence node cap exceeded")
@@ -219,6 +308,12 @@ def _redact_json(
         if any(type(key) is not str for key in value):
             raise _EvidenceEncodingError("evidence object key is not text")
         for key in value:
+            if (
+                len(key) > _MAX_CANONICAL_TEXT_BYTES // 4
+                or state["text_bytes_upper"] + len(key) * 4 > _MAX_CANONICAL_TEXT_BYTES
+            ):
+                raise _EvidenceEncodingError("evidence text cap exceeded")
+            state["text_bytes_upper"] += len(key) * 4
             try:
                 encoded_key = key.encode("utf-8")
             except UnicodeEncodeError as exc:
@@ -266,6 +361,12 @@ def _redact_json(
         finally:
             state["active_containers"].remove(container_id)
     if type(value) is str:
+        if (
+            len(value) > _MAX_CANONICAL_TEXT_BYTES // 4
+            or state["text_bytes_upper"] + len(value) * 4 > _MAX_CANONICAL_TEXT_BYTES
+        ):
+            raise _EvidenceEncodingError("evidence text cap exceeded")
+        state["text_bytes_upper"] += len(value) * 4
         try:
             encoded_text = value.encode("utf-8")
         except UnicodeEncodeError as exc:
@@ -280,8 +381,17 @@ def _redact_json(
     if type(value) is int:
         if value.bit_length() > 4096:
             raise _EvidenceEncodingError("evidence integer cap exceeded")
+        state["scalar_bytes_upper"] += max(1, value.bit_length()) + 2
+        if (
+            state["text_bytes_upper"]
+            + state["scalar_bytes_upper"]
+            + state["nodes"] * 16
+            > _MAX_CANONICAL_TEXT_BYTES
+        ):
+            raise _EvidenceEncodingError("evidence canonical payload cap exceeded")
         return value
     if type(value) is bool or value is None:
+        state["scalar_bytes_upper"] += 5
         return value
     raise _EvidenceEncodingError("evidence contains unsupported scalar")
 
@@ -293,16 +403,35 @@ def canonical_evidence_and_digest(
 
     if type(max_bytes) is not int or max_bytes < 128:
         raise ValueError("max_bytes must be an integer of at least 128")
-    redacted = _redact_json(evidence)
+    preflight_state = {
+        "nodes": 0,
+        "text_bytes": 0,
+        "text_bytes_upper": 0,
+        "scalar_bytes_upper": 0,
+        "active_containers": set(),
+    }
+    redacted = _redact_json(evidence, state=preflight_state)
+    if (
+        preflight_state["text_bytes_upper"]
+        + preflight_state["scalar_bytes_upper"]
+        + preflight_state["nodes"] * 16
+        > _MAX_CANONICAL_TEXT_BYTES
+    ):
+        raise _EvidenceEncodingError("evidence canonical payload cap exceeded")
     full_encoded = json.dumps(
         redacted,
-        ensure_ascii=True,
+        ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    full_digest = hashlib.sha256(full_encoded.encode("utf-8")).hexdigest()
-    if len(full_encoded.encode("utf-8")) <= max_bytes:
+    if len(full_encoded) > _MAX_CANONICAL_TEXT_BYTES:
+        raise _EvidenceEncodingError("evidence canonical payload cap exceeded")
+    full_bytes = full_encoded.encode("utf-8")
+    if len(full_bytes) > _MAX_CANONICAL_TEXT_BYTES:
+        raise _EvidenceEncodingError("evidence canonical payload cap exceeded")
+    full_digest = hashlib.sha256(full_bytes).hexdigest()
+    if len(full_bytes) <= max_bytes:
         return full_encoded, full_digest
 
     def exact_subset(value: Any, *, list_limit: int) -> Any:
@@ -1339,6 +1468,8 @@ def _offer_list(
     if type(result) is list:
         rows = result
     elif type(result) is dict:
+        if len(result) > _MAX_PROVIDER_RECORD_FIELDS:
+            raise _SourceLimitError("offer response fields exceed source limit")
         rows = None
         for key in ("trades", "offers", "trade_records"):
             candidate = result.get(key)
@@ -1351,7 +1482,12 @@ def _offer_list(
         return None
     if len(rows) > min(record_cap, _MAX_HISTORY_RECORDS):
         raise _SourceLimitError("offer rows exceed source limit")
-    return rows if all(type(row) is dict for row in rows) else None
+    if any(type(row) is not dict for row in rows):
+        return None
+    if any(len(row) > _MAX_PROVIDER_RECORD_FIELDS for row in rows):
+        raise _SourceLimitError("offer record fields exceed source limit")
+    _require_provider_bounds(result)
+    return rows
 
 
 def _dedupe_records(records: Any, identity_key: str) -> list[dict[str, Any]]:
@@ -1436,17 +1572,20 @@ def load_sage_offer_history(
             read_error = "reader_exception"
             break
         read_times.append(_clock_utc(clock))
-        provided_timestamp = _source_timestamp(result)
-        if type(provided_timestamp) is str:
-            source_times.append(provided_timestamp)
         try:
             rows = _offer_list(result, record_cap=max_records - collected_count)
         except _SourceLimitError:
             read_error = "source_limit_exceeded"
             break
+        except (TypeError, ValueError):
+            read_error = "normalization_exception"
+            break
         if rows is None:
             read_error = "reader_malformed"
             break
+        provided_timestamp = _source_timestamp(result)
+        if type(provided_timestamp) is str:
+            source_times.append(provided_timestamp)
         pages.append(rows)
         collected_count += len(rows)
         page_authoritative_end = _authoritative_page_end(result, len(rows))
@@ -1515,6 +1654,9 @@ def load_sage_offer_history(
 def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
     if type(entry) is not dict:
         return None
+    if len(entry) > _MAX_PROVIDER_RECORD_FIELDS:
+        raise _SourceLimitError("transaction flow fields exceed source limit")
+    _require_provider_bounds(entry)
     coin_id = _hex_id(_first_present(entry, "coin_id", "name", "id"))
     asset_present = "asset_id" in entry
     asset_value = entry.get("asset_id")
@@ -1554,6 +1696,27 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
 
 
 def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
+    if type(row) is not dict:
+        raise ValueError("transaction row must be an exact object")
+    if len(row) > _MAX_PROVIDER_RECORD_FIELDS:
+        raise _SourceLimitError("transaction record fields exceed source limit")
+    raw_spent = row.get("spent")
+    if raw_spent is None:
+        raw_spent = row.get("removals")
+    raw_created = row.get("created")
+    if raw_created is None:
+        raw_created = row.get("additions")
+    if type(raw_spent) is list and len(raw_spent) > _MAX_TRANSACTION_FLOWS:
+        raise _SourceLimitError("transaction spent flow source limit exceeded")
+    if type(raw_created) is list and len(raw_created) > _MAX_TRANSACTION_FLOWS:
+        raise _SourceLimitError("transaction created flow source limit exceeded")
+    for flows in (raw_spent, raw_created):
+        if type(flows) is list and any(
+            type(entry) is dict and len(entry) > _MAX_PROVIDER_RECORD_FIELDS
+            for entry in flows
+        ):
+            raise _SourceLimitError("transaction flow fields exceed source limit")
+    _require_provider_bounds(row)
     transaction_id = _hex_id(_first_present(row, "transaction_id", "name", "tx_id"))
     spend_identity = _first_present(row, "spend_identity", "spend_bundle_id")
     if type(spend_identity) is not str or not spend_identity:
@@ -1577,16 +1740,6 @@ def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
             timestamp = None
     else:
         timestamp = None
-    raw_spent = row.get("spent")
-    if raw_spent is None:
-        raw_spent = row.get("removals")
-    raw_created = row.get("created")
-    if raw_created is None:
-        raw_created = row.get("additions")
-    if type(raw_spent) is list and len(raw_spent) > _MAX_TRANSACTION_FLOWS:
-        raise _SourceLimitError("transaction spent flow source limit exceeded")
-    if type(raw_created) is list and len(raw_created) > _MAX_TRANSACTION_FLOWS:
-        raise _SourceLimitError("transaction created flow source limit exceeded")
     spent = (
         [_normalized_transaction_flow(entry) for entry in raw_spent]
         if type(raw_spent) is list
@@ -1665,9 +1818,6 @@ def _load_transactions(
                 break
             pages_read += 1
             read_times.append(_clock_utc(clock))
-            provided_timestamp = _source_timestamp(result)
-            if type(provided_timestamp) is str:
-                source_times.append(provided_timestamp)
             if (
                 type(result) is not dict
                 or result.get("success") is not True
@@ -1687,6 +1837,25 @@ def _load_transactions(
                 read_error = "reader_malformed"
                 complete = False
                 break
+            if len(result) > _MAX_PROVIDER_RECORD_FIELDS or any(
+                len(row) > _MAX_PROVIDER_RECORD_FIELDS for row in rows
+            ):
+                read_error = "source_limit_exceeded"
+                complete = False
+                break
+            try:
+                _require_provider_bounds(result)
+            except _SourceLimitError:
+                read_error = "source_limit_exceeded"
+                complete = False
+                break
+            except BaseException:
+                read_error = "normalization_exception"
+                complete = False
+                break
+            provided_timestamp = _source_timestamp(result)
+            if type(provided_timestamp) is str:
+                source_times.append(provided_timestamp)
             try:
                 repeated_page = previous_rows is not None and rows == previous_rows
             except BaseException:
@@ -1800,7 +1969,14 @@ def load_authoritative_evidence(
     try:
         identity_reader = getattr(wallet_facade, "get_wallet_identity")
         identity = identity_reader()
+        if type(identity) is dict:
+            if len(identity) > _MAX_PROVIDER_RECORD_FIELDS:
+                raise _SourceLimitError("wallet identity fields exceed source limit")
+            _require_provider_bounds(identity)
         identity_error = None
+    except _SourceLimitError:
+        identity = None
+        identity_error = "source_limit_exceeded"
     except BaseException:
         identity = None
         identity_error = "reader_exception"
@@ -1901,7 +2077,7 @@ def load_authoritative_evidence(
         raw_coin_result = None
         coin_error = "reader_exception"
     coin_read_at = _clock_utc(clock)
-    coin_source_observed_at = _source_timestamp(raw_coin_result)
+    coin_source_observed_at = None
     if (
         type(raw_coin_result) is dict
         and raw_coin_result.get("success") is True
@@ -1917,11 +2093,17 @@ def load_authoritative_evidence(
         coin_error = "source_limit_exceeded"
     elif type(raw_coins) is dict:
         try:
+            if any(
+                type(raw_record) is dict
+                and len(raw_record) > _MAX_PROVIDER_RECORD_FIELDS
+                for raw_record in raw_coins.values()
+            ):
+                raise _SourceLimitError("coin record fields exceed source limit")
+            _require_provider_bounds(raw_coin_result)
+            coin_source_observed_at = _source_timestamp(raw_coin_result)
             for raw_id, raw_record in raw_coins.items():
                 if type(raw_record) is not dict:
                     continue
-                if len(raw_record) > _MAX_PROVIDER_RECORD_FIELDS:
-                    raise _SourceLimitError("coin record field source limit exceeded")
                 explicit_id = raw_record.get("coin_id")
                 if explicit_id is None:
                     candidate_id = raw_id
@@ -2190,37 +2372,43 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
                 claim_token=claim_token,
                 claim_generation=claim_generation,
             )
-        database.register_authoritative_boost_fill_command(
-            int(fill["fill_id"]),
-            trade_id,
-            str(fill["side"]),
-            claim_token=claim_token,
-            claim_generation=claim_generation,
-        )
         api_server = sys.modules.get("api_server")
         bot_ref = getattr(api_server, "bot", None) if api_server is not None else None
         manager = getattr(bot_ref, "boost_manager", None) if bot_ref else None
-        if manager is None or not hasattr(manager, "notify_boost_fill"):
+        if (
+            manager is None
+            or not hasattr(manager, "notify_authoritative_boost_fill")
+            or not hasattr(manager, "capture_authoritative_boost_fill_materialization")
+        ):
             raise RuntimeError("BoostManager is unavailable")
-        if hasattr(manager, "notify_authoritative_boost_fill"):
-            effect_state = manager.notify_authoritative_boost_fill(
+        stored_command = database.get_authoritative_boost_fill_command(
+            int(fill["fill_id"])
+        )
+        materialization = (
+            stored_command.get("materialization")
+            if type(stored_command) is dict
+            else None
+        )
+        if type(materialization) is not dict:
+            materialization = manager.capture_authoritative_boost_fill_materialization(
                 int(fill["fill_id"]), trade_id, str(fill["side"])
             )
-        else:
-            applied = manager.notify_boost_fill(trade_id)
-            if applied is not True:
-                raise RuntimeError("BoostManager rejected authoritative fill")
-            side_prefix = "_buy" if str(fill["side"]) == "buy" else "_sell"
-            effect_state = {
-                "schema_version": 1,
-                "side": str(fill["side"]),
-                "settled": getattr(manager, f"{side_prefix}_settled", None),
-                "offset_bps": getattr(manager, f"{side_prefix}_offset_bps", None),
-                "floor_bps": getattr(manager, f"{side_prefix}_floor_bps", None),
-                "last_safe_offset_bps": getattr(
-                    manager, f"{side_prefix}_last_safe_offset_bps", None
-                ),
-            }
+        if type(materialization) is not dict:
+            raise RuntimeError("BoostManager has no exact authoritative probe state")
+        command = database.register_authoritative_boost_fill_command(
+            int(fill["fill_id"]),
+            trade_id,
+            str(fill["side"]),
+            materialization=materialization,
+            claim_token=claim_token,
+            claim_generation=claim_generation,
+        )
+        effect_state = manager.notify_authoritative_boost_fill(
+            int(fill["fill_id"]),
+            trade_id,
+            str(fill["side"]),
+            command["materialization"],
+        )
         if type(effect_state) is not dict:
             raise RuntimeError("BoostManager returned no exact authoritative effect")
         try:

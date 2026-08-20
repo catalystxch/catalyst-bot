@@ -5137,13 +5137,88 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
     return coin_map
 
 
+_MAX_EXACT_ATOMIC_DIGITS = 128
+_MAX_EXACT_ATOMIC_BITS = 512
+_MAX_AUTHORITATIVE_PROVIDER_SCALAR_CHARS = 4096
+_MAX_AUTHORITATIVE_PROVIDER_FIELDS = 64
+_MAX_AUTHORITATIVE_PROVIDER_ITEMS = 4096
+_MAX_AUTHORITATIVE_PROVIDER_DEPTH = 16
+_MAX_AUTHORITATIVE_PROVIDER_NODES = 300_000
+_MAX_AUTHORITATIVE_PROVIDER_TEXT_BYTES = 8 * 1024 * 1024
+
+
+def _authoritative_provider_value_is_bounded(
+    value,
+    *,
+    depth: int = 0,
+    state: Optional[Dict[str, int]] = None,
+) -> bool:
+    """Preflight exact Sage response values before normalization discards fields."""
+
+    if state is None:
+        state = {"nodes": 0, "text_bytes_upper": 0}
+    state["nodes"] += 1
+    if (
+        state["nodes"] > _MAX_AUTHORITATIVE_PROVIDER_NODES
+        or depth > _MAX_AUTHORITATIVE_PROVIDER_DEPTH
+    ):
+        return False
+    if type(value) is str:
+        if len(value) > _MAX_AUTHORITATIVE_PROVIDER_SCALAR_CHARS:
+            return False
+        state["text_bytes_upper"] += len(value) * 4
+        return state["text_bytes_upper"] <= _MAX_AUTHORITATIVE_PROVIDER_TEXT_BYTES
+    if type(value) is bytes:
+        if len(value) > _MAX_AUTHORITATIVE_PROVIDER_SCALAR_CHARS:
+            return False
+        state["text_bytes_upper"] += len(value)
+        return state["text_bytes_upper"] <= _MAX_AUTHORITATIVE_PROVIDER_TEXT_BYTES
+    if type(value) is int:
+        return value.bit_length() <= 4096
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is bool or value is None:
+        return True
+    if type(value) is dict:
+        if len(value) > _MAX_AUTHORITATIVE_PROVIDER_ITEMS:
+            return False
+        for key, item in value.items():
+            if (
+                type(key) is not str
+                or len(key) > _MAX_AUTHORITATIVE_PROVIDER_SCALAR_CHARS
+            ):
+                return False
+            state["text_bytes_upper"] += len(key) * 4
+            if (
+                state["text_bytes_upper"] > _MAX_AUTHORITATIVE_PROVIDER_TEXT_BYTES
+                or not _authoritative_provider_value_is_bounded(
+                    item, depth=depth + 1, state=state
+                )
+            ):
+                return False
+        return True
+    if type(value) is list:
+        if len(value) > _MAX_AUTHORITATIVE_PROVIDER_ITEMS:
+            return False
+        return all(
+            _authoritative_provider_value_is_bounded(item, depth=depth + 1, state=state)
+            for item in value
+        )
+    return False
+
+
 def _exact_positive_atomic_amount(value) -> Optional[int]:
     """Return one exact positive mojo amount without coercive conversion."""
 
     if type(value) is int:
-        return value if value > 0 else None
+        return (
+            value
+            if value > 0 and value.bit_length() <= _MAX_EXACT_ATOMIC_BITS
+            else None
+        )
     if (
         type(value) is str
+        and len(value) <= _MAX_EXACT_ATOMIC_DIGITS
         and value.isascii()
         and value.isdigit()
         and not value.startswith("0")
@@ -5176,7 +5251,7 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
     # Normalize IDs for the request — Sage expects hex strings
     normalized = []
     for cid in coin_ids:
-        if type(cid) is not str:
+        if type(cid) is not str or len(cid) not in {64, 66}:
             return None
         # Remove 0x prefix if present — Sage might want bare hex
         clean = cid.lower()
@@ -5196,7 +5271,7 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
         timeout=15,
     )
 
-    if type(result) is not dict:
+    if type(result) is not dict or len(result) > _MAX_AUTHORITATIVE_PROVIDER_FIELDS:
         return None
 
     coins = None
@@ -5206,15 +5281,20 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
             break
     if type(coins) is not list or len(coins) > _MAX_GET_COINS_BY_IDS:
         return None
+    if any(
+        type(coin) is not dict or len(coin) > _MAX_AUTHORITATIVE_PROVIDER_FIELDS
+        for coin in coins
+    ):
+        return None
+    if not _authoritative_provider_value_is_bounded(result):
+        return None
     coin_map = {}
     for c in coins:
-        if type(c) is not dict:
-            return None
         amount = _exact_positive_atomic_amount(c.get("amount"))
         if amount is None:
             return None
         raw_cid = c.get("coin_id")
-        if type(raw_cid) is not str:
+        if type(raw_cid) is not str or len(raw_cid) not in {64, 66}:
             return None
         clean_cid = raw_cid.lower()
         if clean_cid.startswith("0x"):
@@ -5233,6 +5313,8 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
             if offer_id is None:
                 offer_id = c.get("offer_hash")
             if type(offer_id) is str:
+                if len(offer_id) > _MAX_AUTHORITATIVE_PROVIDER_SCALAR_CHARS:
+                    return None
                 offer_id = offer_id.lower()
             elif offer_id is not None:
                 return None

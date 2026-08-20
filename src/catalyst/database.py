@@ -19,6 +19,7 @@ All DB access in the codebase should route through this module; importing
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -802,6 +803,29 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_boost_commands cannot be deleted');
 END;
 
+-- Registration captures the exact manager state needed to materialize the
+-- command after a process crash.  Keeping this payload append-only and
+-- digest-bound prevents a replay from rebinding the command to new state.
+CREATE TABLE IF NOT EXISTS offer_fill_boost_command_materializations (
+    fill_id                     INTEGER PRIMARY KEY,
+    trade_id                    TEXT NOT NULL,
+    side                        TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    materialization_json        TEXT NOT NULL,
+    materialization_sha256      TEXT NOT NULL CHECK(length(materialization_sha256) = 64),
+    registered_at               TEXT NOT NULL,
+    FOREIGN KEY(fill_id) REFERENCES offer_fill_boost_commands(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_command_materializations_no_update
+BEFORE UPDATE ON offer_fill_boost_command_materializations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_command_materializations is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_command_materializations_no_delete
+BEFORE DELETE ON offer_fill_boost_command_materializations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_command_materializations is append-only');
+END;
+
 -- Exact post-effect state is append-only and separate from command delivery.
 -- A recreated BoostManager materializes its settled side and proven floor from
 -- this payload instead of treating the applied fill id as the effect itself.
@@ -886,6 +910,44 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_sweep_finalizations is append-only');
 END;
 
+-- Mutable, compactable queue state keeps active registration restoration off
+-- the append-only audit history.  Only active -> finalized is permitted.
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_registration_queue (
+    fill_id                     INTEGER PRIMARY KEY,
+    state                       TEXT NOT NULL CHECK(state IN ('active', 'finalized')),
+    registered_at               TEXT NOT NULL,
+    finalized_at                TEXT,
+    event_id                    TEXT,
+    CHECK(
+        (state = 'active' AND finalized_at IS NULL AND event_id IS NULL)
+        OR (state = 'finalized' AND finalized_at IS NOT NULL)
+    ),
+    FOREIGN KEY(fill_id) REFERENCES offer_fill_sweep_registrations(fill_id),
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_registration_queue_active
+    ON offer_fill_sweep_registration_queue(state, fill_id);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_registration_queue_finalized
+    ON offer_fill_sweep_registration_queue(state, finalized_at, fill_id);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_registration_queue_guarded_update
+BEFORE UPDATE ON offer_fill_sweep_registration_queue
+WHEN OLD.fill_id <> NEW.fill_id
+  OR OLD.registered_at <> NEW.registered_at
+  OR OLD.state <> 'active'
+  OR NEW.state <> 'finalized'
+  OR OLD.finalized_at IS NOT NULL
+  OR NEW.finalized_at IS NULL
+  OR OLD.event_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_registration_queue transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_registration_queue_guarded_delete
+BEFORE DELETE ON offer_fill_sweep_registration_queue
+WHEN OLD.state <> 'finalized'
+BEGIN
+    SELECT RAISE(ABORT, 'active sweep registration queue work cannot be deleted');
+END;
+
 CREATE TABLE IF NOT EXISTS offer_fill_sweep_event_receipts (
     event_id                    TEXT PRIMARY KEY,
     consumed_at                TEXT NOT NULL,
@@ -901,6 +963,121 @@ BEFORE DELETE ON offer_fill_sweep_event_receipts
 BEGIN
     SELECT RAISE(ABORT, 'offer_fill_sweep_event_receipts is append-only');
 END;
+
+-- Single-owner delivery state.  Generation and token fence every claim;
+-- completed rows may be compacted in bounded batches because immutable event,
+-- effect, log-sink and receipt rows remain as the durable audit trail.
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_delivery_queue (
+    event_id                    TEXT PRIMARY KEY,
+    state                       TEXT NOT NULL CHECK(state IN ('pending', 'running', 'completed')),
+    generation                  INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    claim_token                 TEXT,
+    claimed_at                  TEXT,
+    completed_at                TEXT,
+    queued_at                   TEXT NOT NULL,
+    CHECK(
+        (state = 'pending' AND generation = 0 AND claim_token IS NULL
+         AND claimed_at IS NULL AND completed_at IS NULL)
+        OR (state = 'running' AND generation > 0 AND claim_token IS NOT NULL
+            AND claimed_at IS NOT NULL AND completed_at IS NULL)
+        OR (state = 'completed' AND generation > 0 AND claim_token IS NOT NULL
+            AND claimed_at IS NOT NULL AND completed_at IS NOT NULL)
+    ),
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_delivery_pending
+    ON offer_fill_sweep_delivery_queue(state, queued_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_delivery_claim
+    ON offer_fill_sweep_delivery_queue(state, claimed_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_delivery_completed
+    ON offer_fill_sweep_delivery_queue(state, completed_at, event_id);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_delivery_queue_guarded_update
+BEFORE UPDATE ON offer_fill_sweep_delivery_queue
+WHEN OLD.event_id <> NEW.event_id
+  OR OLD.queued_at <> NEW.queued_at
+  OR NOT (
+      (OLD.state = 'pending' AND NEW.state = 'running'
+       AND NEW.generation = OLD.generation + 1
+       AND NEW.claim_token IS NOT NULL AND NEW.claimed_at IS NOT NULL
+       AND NEW.completed_at IS NULL)
+      OR
+      (OLD.state = 'running' AND NEW.state = 'running'
+       AND NEW.generation = OLD.generation + 1
+       AND NEW.claim_token IS NOT NULL AND NEW.claim_token <> OLD.claim_token
+       AND NEW.claimed_at IS NOT NULL AND NEW.completed_at IS NULL)
+      OR
+      (OLD.state = 'running' AND NEW.state = 'completed'
+       AND NEW.generation = OLD.generation
+       AND NEW.claim_token = OLD.claim_token
+       AND NEW.claimed_at = OLD.claimed_at
+       AND NEW.completed_at IS NOT NULL)
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_delivery_queue transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_delivery_queue_guarded_delete
+BEFORE DELETE ON offer_fill_sweep_delivery_queue
+WHEN OLD.state <> 'completed'
+BEGIN
+    SELECT RAISE(ABORT, 'pending sweep delivery queue work cannot be deleted');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_downstream_effects (
+    event_id                    TEXT PRIMARY KEY,
+    effect_json                 TEXT NOT NULL,
+    effect_sha256               TEXT NOT NULL CHECK(length(effect_sha256) = 64),
+    applied_at                  TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_downstream_effects_no_update
+BEFORE UPDATE ON offer_fill_sweep_downstream_effects
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_downstream_effects is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_downstream_effects_no_delete
+BEFORE DELETE ON offer_fill_sweep_downstream_effects
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_downstream_effects is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_log_sinks (
+    event_id                    TEXT PRIMARY KEY,
+    event_log_id                INTEGER NOT NULL UNIQUE,
+    created_at                  TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id),
+    FOREIGN KEY(event_log_id) REFERENCES events(id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_log_sinks_no_update
+BEFORE UPDATE ON offer_fill_sweep_log_sinks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_log_sinks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_log_sinks_no_delete
+BEFORE DELETE ON offer_fill_sweep_log_sinks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_log_sinks is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_delivery_acks (
+    event_id                    TEXT PRIMARY KEY,
+    claim_generation            INTEGER NOT NULL CHECK(claim_generation > 0),
+    claim_token                 TEXT NOT NULL,
+    consumed_at                 TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES offer_fill_sweep_events(event_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_delivery_acks_no_update
+BEFORE UPDATE ON offer_fill_sweep_delivery_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_delivery_acks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_delivery_acks_no_delete
+BEFORE DELETE ON offer_fill_sweep_delivery_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_delivery_acks is append-only');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_offer_fill_sweep_downstream_effects_recent
+    ON offer_fill_sweep_downstream_effects(applied_at DESC, event_id);
 
 CREATE TABLE IF NOT EXISTS offer_fill_hook_migration_audit (
     audit_id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1173,6 +1350,14 @@ _STABILITY_REQUIRED_COLUMNS = {
         "registered_at",
         "applied_at",
     },
+    "offer_fill_boost_command_materializations": {
+        "fill_id",
+        "trade_id",
+        "side",
+        "materialization_json",
+        "materialization_sha256",
+        "registered_at",
+    },
     "offer_fill_boost_effects": {
         "fill_id",
         "trade_id",
@@ -1198,8 +1383,41 @@ _STABILITY_REQUIRED_COLUMNS = {
         "event_id",
         "finalized_at",
     },
+    "offer_fill_sweep_registration_queue": {
+        "fill_id",
+        "state",
+        "registered_at",
+        "finalized_at",
+        "event_id",
+    },
     "offer_fill_sweep_event_receipts": {
         "event_id",
+        "consumed_at",
+    },
+    "offer_fill_sweep_delivery_queue": {
+        "event_id",
+        "state",
+        "generation",
+        "claim_token",
+        "claimed_at",
+        "completed_at",
+        "queued_at",
+    },
+    "offer_fill_sweep_downstream_effects": {
+        "event_id",
+        "effect_json",
+        "effect_sha256",
+        "applied_at",
+    },
+    "offer_fill_sweep_log_sinks": {
+        "event_id",
+        "event_log_id",
+        "created_at",
+    },
+    "offer_fill_sweep_delivery_acks": {
+        "event_id",
+        "claim_generation",
+        "claim_token",
         "consumed_at",
     },
     "offer_fill_hook_migration_audit": {
@@ -1367,6 +1585,48 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("event_id", "fill_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_registration_queue_active": (
+        "offer_fill_sweep_registration_queue",
+        False,
+        False,
+        ("state", "fill_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_registration_queue_finalized": (
+        "offer_fill_sweep_registration_queue",
+        False,
+        False,
+        ("state", "finalized_at", "fill_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_delivery_pending": (
+        "offer_fill_sweep_delivery_queue",
+        False,
+        False,
+        ("state", "queued_at", "event_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_delivery_claim": (
+        "offer_fill_sweep_delivery_queue",
+        False,
+        False,
+        ("state", "claimed_at", "event_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_delivery_completed": (
+        "offer_fill_sweep_delivery_queue",
+        False,
+        False,
+        ("state", "completed_at", "event_id"),
+        None,
+    ),
+    "idx_offer_fill_sweep_downstream_effects_recent": (
+        "offer_fill_sweep_downstream_effects",
+        False,
+        False,
+        ("applied_at", "event_id"),
         None,
     ),
     "uniq_worker_delegation_active_scope": (
@@ -1732,6 +1992,56 @@ def _normalize_existing_stability_timestamps(conn: sqlite3.Connection) -> None:
             )
 
 
+def _backfill_authoritative_sweep_active_queues(
+    conn: sqlite3.Connection,
+    *,
+    registration_queue_was_missing: bool,
+    delivery_queue_was_missing: bool,
+) -> None:
+    """One-time upgrade from append-only history into bounded active queues."""
+
+    if registration_queue_was_missing:
+        active_rows = conn.execute(
+            "SELECT registration.fill_id, registration.registered_at "
+            "FROM offer_fill_sweep_registrations AS registration "
+            "LEFT JOIN offer_fill_sweep_finalizations AS finalization "
+            "  ON finalization.fill_id=registration.fill_id "
+            "WHERE finalization.fill_id IS NULL "
+            "ORDER BY registration.fill_id LIMIT ?",
+            (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
+        ).fetchall()
+        if len(active_rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+            raise RuntimeError("legacy active sweep registrations exceed hard limit")
+        conn.executemany(
+            "INSERT INTO offer_fill_sweep_registration_queue "
+            "(fill_id, state, registered_at, finalized_at, event_id) "
+            "VALUES (?, 'active', ?, NULL, NULL)",
+            [(int(row[0]), str(row[1])) for row in active_rows],
+        )
+    if delivery_queue_was_missing:
+        pending_events = conn.execute(
+            "SELECT event.event_id, event.finalized_at "
+            "FROM offer_fill_sweep_events AS event "
+            "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
+            "  ON receipt.event_id=event.event_id "
+            "WHERE receipt.event_id IS NULL "
+            "ORDER BY event.event_id LIMIT ?",
+            (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS + 1,),
+        ).fetchall()
+        if len(pending_events) > _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS:
+            raise RuntimeError("legacy active sweep delivery events exceed hard limit")
+        conn.executemany(
+            "INSERT INTO offer_fill_sweep_delivery_queue "
+            "(event_id, state, generation, claim_token, claimed_at, "
+            " completed_at, queued_at) "
+            "VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
+            [
+                (str(row["event_id"]), str(row["finalized_at"]))
+                for row in pending_events
+            ],
+        )
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -1740,10 +2050,30 @@ def _migrate_stability_schema() -> None:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
+        registration_queue_was_missing = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='offer_fill_sweep_registration_queue'"
+            ).fetchone()
+            is None
+        )
+        delivery_queue_was_missing = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='offer_fill_sweep_delivery_queue'"
+            ).fetchone()
+            is None
+        )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _upgrade_offer_fill_boost_command_guard(conn)
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
+        _backfill_authoritative_sweep_active_queues(
+            conn,
+            registration_queue_was_missing=registration_queue_was_missing,
+            delivery_queue_was_missing=delivery_queue_was_missing,
+        )
+        _audit_legacy_boost_command_materializations(conn)
         _audit_legacy_offer_fill_hook_receipts(conn)
         _backfill_authoritative_fill_hook_outbox(conn)
         conn.commit()
@@ -5940,6 +6270,29 @@ def _audit_legacy_offer_fill_hook_receipts(conn: sqlite3.Connection) -> None:
             )
 
 
+def _audit_legacy_boost_command_materializations(
+    conn: sqlite3.Connection,
+) -> None:
+    """Record prior commands that cannot prove their pre-effect replay state."""
+
+    audited_at = _stability_wall_clock()
+    rows = conn.execute(
+        "SELECT command.fill_id, command.state "
+        "FROM offer_fill_boost_commands AS command "
+        "LEFT JOIN offer_fill_boost_command_materializations AS materialization "
+        "  ON materialization.fill_id=command.fill_id "
+        "WHERE materialization.fill_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO offer_fill_hook_migration_audit "
+            "(fill_id, hook_name, reason_code, prior_state, audited_at) "
+            "VALUES (?, 'boost_notification', "
+            "'BOOST_COMMAND_MISSING_MATERIALIZATION', ?, ?)",
+            (int(row["fill_id"]), str(row["state"]), audited_at),
+        )
+
+
 def _ensure_authoritative_fill_hook_outbox(
     conn: sqlite3.Connection, fill_id: int
 ) -> None:
@@ -6628,11 +6981,114 @@ def log_authoritative_offer_filled_once(
         conn.close()
 
 
+def _canonical_authoritative_boost_materialization(
+    materialization: Dict[str, Any],
+    fill_id: int,
+    trade_id: str,
+    side: str,
+) -> tuple[Dict[str, Any], str, str]:
+    """Validate the exact pre-effect state bound to one Boost command."""
+
+    expected_fields = {
+        "schema_version",
+        "fill_id",
+        "trade_id",
+        "side",
+        "probe_trade_id",
+        "probe_matched",
+        "settled_before",
+        "offset_bps",
+        "floor_bps",
+        "last_safe_offset_bps",
+    }
+    if type(materialization) is not dict or set(materialization) != expected_fields:
+        raise ValueError("Boost command materialization has an invalid schema")
+    if (
+        type(materialization["schema_version"]) is not int
+        or materialization["schema_version"] != 1
+        or type(materialization["fill_id"]) is not int
+        or materialization["fill_id"] != fill_id
+        or type(materialization["trade_id"]) is not str
+        or materialization["trade_id"] != trade_id
+        or type(materialization["side"]) is not str
+        or materialization["side"] != side
+        or type(materialization["probe_trade_id"]) is not str
+        or materialization["probe_trade_id"] != trade_id
+        or materialization["probe_matched"] is not True
+        or type(materialization["settled_before"]) is not bool
+    ):
+        raise ValueError("Boost command materialization differs from its command")
+    for field in ("offset_bps", "floor_bps", "last_safe_offset_bps"):
+        _exact_integer(materialization[field], field, minimum=0)
+    if (
+        materialization["floor_bps"] != materialization["offset_bps"]
+        or materialization["last_safe_offset_bps"] > materialization["offset_bps"]
+    ):
+        raise ValueError("Boost command materialization has invalid floor state")
+    payload = dict(materialization)
+    encoded = _canonical_json_text(
+        payload,
+        "authoritative Boost command materialization",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    return payload, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def get_authoritative_boost_fill_command(fill_id: int) -> Optional[Dict[str, Any]]:
+    """Read and verify one registered command and its immutable materialization."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    row = (
+        get_connection()
+        .execute(
+            "SELECT command.*, materialization.materialization_json, "
+            "       materialization.materialization_sha256 "
+            "FROM offer_fill_boost_commands AS command "
+            "LEFT JOIN offer_fill_boost_command_materializations AS materialization "
+            "  ON materialization.fill_id=command.fill_id "
+            "WHERE command.fill_id=?",
+            (safe_fill_id,),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    result = {
+        "fill_id": safe_fill_id,
+        "trade_id": str(row["trade_id"]),
+        "side": str(row["side"]),
+        "state": str(row["state"]),
+        "registered_at": str(row["registered_at"]),
+        "applied_at": row["applied_at"],
+        "materialization": None,
+    }
+    if row["materialization_json"] is None:
+        return result
+    try:
+        decoded = json.loads(str(row["materialization_json"]))
+        payload, encoded, digest = _canonical_authoritative_boost_materialization(
+            decoded,
+            safe_fill_id,
+            result["trade_id"],
+            result["side"],
+        )
+        if encoded != str(row["materialization_json"]) or digest != str(
+            row["materialization_sha256"]
+        ):
+            raise ValueError("Boost command materialization digest differs")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("stored Boost command materialization is invalid") from exc
+    result["materialization"] = payload
+    return result
+
+
 def register_authoritative_boost_fill_command(
     fill_id: int,
     trade_id: str,
     side: str,
     *,
+    materialization: Dict[str, Any],
     claim_token: str,
     claim_generation: int,
 ) -> Dict[str, Any]:
@@ -6645,6 +7101,11 @@ def register_authoritative_boost_fill_command(
     safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_side not in {"buy", "sell"}:
         raise ValueError("side must be buy or sell")
+    payload, encoded_materialization, materialization_digest = (
+        _canonical_authoritative_boost_materialization(
+            materialization, safe_fill_id, safe_trade_id, safe_side
+        )
+    )
     when = _stability_wall_clock()
     conn = _stability_connection()
     try:
@@ -6686,12 +7147,42 @@ def register_authoritative_boost_fill_command(
             ):
                 raise ValueError("Boost command replay differs")
             state = str(existing["state"])
+        stored_materialization = conn.execute(
+            "SELECT trade_id, side, materialization_json, materialization_sha256 "
+            "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if stored_materialization is None:
+            conn.execute(
+                "INSERT INTO offer_fill_boost_command_materializations "
+                "(fill_id, trade_id, side, materialization_json, "
+                " materialization_sha256, registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    safe_fill_id,
+                    safe_trade_id,
+                    safe_side,
+                    encoded_materialization,
+                    materialization_digest,
+                    str(existing["registered_at"]) if existing is not None else when,
+                ),
+            )
+        elif (
+            str(stored_materialization["trade_id"]) != safe_trade_id
+            or str(stored_materialization["side"]) != safe_side
+            or str(stored_materialization["materialization_json"])
+            != encoded_materialization
+            or str(stored_materialization["materialization_sha256"])
+            != materialization_digest
+        ):
+            raise ValueError("Boost command materialization replay differs")
         conn.commit()
         return {
             "fill_id": safe_fill_id,
             "trade_id": safe_trade_id,
             "side": safe_side,
             "state": state,
+            "materialization": payload,
         }
     except Exception:
         conn.rollback()
@@ -6781,6 +7272,38 @@ def complete_authoritative_boost_fill_command(
             or str(command["side"]) != safe_side
         ):
             raise ValueError("Boost command completion differs")
+        stored_materialization = conn.execute(
+            "SELECT materialization_json, materialization_sha256 "
+            "FROM offer_fill_boost_command_materializations WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if stored_materialization is None:
+            raise ValueError("Boost command has no durable materialization")
+        try:
+            decoded_materialization = json.loads(
+                str(stored_materialization["materialization_json"])
+            )
+            materialization, encoded_materialization, materialization_digest = (
+                _canonical_authoritative_boost_materialization(
+                    decoded_materialization,
+                    safe_fill_id,
+                    safe_trade_id,
+                    safe_side,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Boost command materialization is invalid") from exc
+        if (
+            encoded_materialization
+            != str(stored_materialization["materialization_json"])
+            or materialization_digest
+            != str(stored_materialization["materialization_sha256"])
+            or _effect["offset_bps"] != materialization["offset_bps"]
+            or _effect["floor_bps"] != materialization["floor_bps"]
+            or _effect["last_safe_offset_bps"]
+            != materialization["last_safe_offset_bps"]
+        ):
+            raise ValueError("Boost effect differs from command materialization")
         newly_applied = str(command["state"]) == "registered"
         if newly_applied:
             cursor = conn.execute(
@@ -6983,6 +7506,15 @@ def register_authoritative_sweep_fill(
             (safe_fill_id,),
         ).fetchone()
         if existing is None:
+            at_capacity = conn.execute(
+                "SELECT fill_id FROM offer_fill_sweep_registration_queue "
+                "WHERE state='active' ORDER BY fill_id LIMIT 1 OFFSET ?",
+                (_MAX_AUTHORITATIVE_SWEEP_RESTORE - 1,),
+            ).fetchone()
+            if at_capacity is not None:
+                raise ValueError(
+                    "authoritative sweep registration active limit reached"
+                )
             conn.execute(
                 """
                 INSERT INTO offer_fill_sweep_registrations (
@@ -6991,11 +7523,30 @@ def register_authoritative_sweep_fill(
                 """,
                 (safe_fill_id, payload["trade_id"], encoded, when),
             )
+            conn.execute(
+                "INSERT INTO offer_fill_sweep_registration_queue "
+                "(fill_id, state, registered_at, finalized_at, event_id) "
+                "VALUES (?, 'active', ?, NULL, NULL)",
+                (safe_fill_id, when),
+            )
         elif (
             str(existing["trade_id"]) != payload["trade_id"]
             or str(existing["classification_json"]) != encoded
         ):
             raise ValueError("sweep registration replay differs")
+        elif (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_sweep_finalizations WHERE fill_id=?",
+                (safe_fill_id,),
+            ).fetchone()
+            is None
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO offer_fill_sweep_registration_queue "
+                "(fill_id, state, registered_at, finalized_at, event_id) "
+                "VALUES (?, 'active', ?, NULL, NULL)",
+                (safe_fill_id, when),
+            )
         conn.commit()
         return {"fill_id": safe_fill_id, **payload}
     except Exception:
@@ -7073,11 +7624,11 @@ def get_authoritative_sweep_registrations() -> List[Dict[str, Any]]:
         .execute(
             "SELECT registration.fill_id, registration.trade_id, "
             "       registration.classification_json "
-            "FROM offer_fill_sweep_registrations AS registration "
-            "LEFT JOIN offer_fill_sweep_finalizations AS finalization "
-            "  ON finalization.fill_id=registration.fill_id "
-            "WHERE finalization.fill_id IS NULL "
-            "ORDER BY registration.fill_id LIMIT ?",
+            "FROM offer_fill_sweep_registration_queue AS queue "
+            "JOIN offer_fill_sweep_registrations AS registration "
+            "  ON registration.fill_id=queue.fill_id "
+            "WHERE queue.state='active' "
+            "ORDER BY queue.fill_id LIMIT ?",
             (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
         )
         .fetchall()
@@ -7267,6 +7818,20 @@ def finalize_authoritative_sweep_registrations(
             "FROM offer_fill_sweep_events WHERE event_id=?",
             (event_id,),
         ).fetchone()
+        delivery_exists = conn.execute(
+            "SELECT 1 FROM offer_fill_sweep_delivery_queue WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        receipt_exists = conn.execute(
+            "SELECT 1 FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if (
+            delivery_exists is None
+            and receipt_exists is None
+            and _authoritative_sweep_delivery_at_capacity(conn)
+        ):
+            raise ValueError("authoritative sweep delivery active limit reached")
         if existing_event is None:
             conn.execute(
                 "INSERT INTO offer_fill_sweep_events "
@@ -7291,8 +7856,26 @@ def finalize_authoritative_sweep_registrations(
                     "(fill_id, event_id, finalized_at) VALUES (?, ?, ?)",
                     (fill_id, event_id, when),
                 )
+                cursor = conn.execute(
+                    "UPDATE offer_fill_sweep_registration_queue "
+                    "SET state='finalized', finalized_at=?, event_id=? "
+                    "WHERE fill_id=? AND state='active'",
+                    (when, event_id, fill_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "sweep registration active queue transition failed"
+                    )
             elif str(existing["event_id"]) != event_id:
                 raise ValueError("sweep finalization replay differs")
+        if receipt_exists is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO offer_fill_sweep_delivery_queue "
+                "(event_id, state, generation, claim_token, claimed_at, "
+                " completed_at, queued_at) "
+                "VALUES (?, 'pending', 0, NULL, NULL, NULL, ?)",
+                (event_id, when),
+            )
         conn.commit()
         return {"event_id": event_id, **payload}
     except Exception:
@@ -7329,6 +7912,16 @@ def consume_authoritative_sweep_registrations(fill_ids: Any) -> bool:
                     "(fill_id, event_id, finalized_at) VALUES (?, NULL, ?)",
                     (fill_id, when),
                 )
+                cursor = conn.execute(
+                    "UPDATE offer_fill_sweep_registration_queue "
+                    "SET state='finalized', finalized_at=?, event_id=NULL "
+                    "WHERE fill_id=? AND state='active'",
+                    (when, fill_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "sweep registration active queue transition failed"
+                    )
             elif existing["event_id"] is not None:
                 raise ValueError("sweep registration already belongs to an event")
         conn.commit()
@@ -7340,81 +7933,616 @@ def consume_authoritative_sweep_registrations(fill_ids: Any) -> bool:
         conn.close()
 
 
-def get_pending_authoritative_sweep_events() -> List[Dict[str, Any]]:
-    """Return a bounded set of finalized events lacking durable consumption."""
+_AUTHORITATIVE_SWEEP_DELIVERY_LEASE_SECONDS = 30
 
-    rows = (
-        get_connection()
-        .execute(
-            "SELECT event.event_id, event.spent_block_index, "
-            "       event.sweep_group_id, event.event_json "
-            "FROM offer_fill_sweep_events AS event "
-            "LEFT JOIN offer_fill_sweep_event_receipts AS receipt "
-            "  ON receipt.event_id=event.event_id "
-            "WHERE receipt.event_id IS NULL "
-            "ORDER BY event.finalized_at, event.event_id LIMIT ?",
-            (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS,),
-        )
-        .fetchall()
+
+def _authoritative_sweep_delivery_at_capacity(conn: sqlite3.Connection) -> bool:
+    """Check the combined active queue using only bounded state-index reads."""
+
+    limit = _MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS
+    pending_count = len(
+        conn.execute(
+            "SELECT event_id FROM offer_fill_sweep_delivery_queue "
+            "WHERE state='pending' LIMIT ?",
+            (limit,),
+        ).fetchall()
     )
-    events: List[Dict[str, Any]] = []
-    for row in rows:
-        try:
-            decoded = json.loads(str(row["event_json"]))
-            if type(decoded) is not dict or set(decoded) != {
-                "schema_version",
-                "sweep_group_id",
-                "spent_block_index",
-                "fills",
-            }:
-                raise ValueError("invalid schema")
-            if decoded.get("schema_version") != 1:
-                raise ValueError("invalid schema version")
-            payload, encoded, event_id = _canonical_authoritative_sweep_event(
-                decoded.get("spent_block_index"),
-                decoded.get("sweep_group_id"),
-                decoded.get("fills"),
-            )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("stored authoritative sweep event is invalid") from exc
-        if (
-            encoded != str(row["event_json"])
-            or event_id != str(row["event_id"])
-            or payload["spent_block_index"] != row["spent_block_index"]
-            or payload["sweep_group_id"] != str(row["sweep_group_id"])
-        ):
-            raise RuntimeError("stored authoritative sweep event is invalid")
-        events.append({"event_id": event_id, **payload})
-    return events
+    if pending_count >= limit:
+        return True
+    remaining = limit - pending_count
+    running_count = len(
+        conn.execute(
+            "SELECT event_id FROM offer_fill_sweep_delivery_queue "
+            "WHERE state='running' LIMIT ?",
+            (remaining,),
+        ).fetchall()
+    )
+    return running_count >= remaining
 
 
-def consume_authoritative_sweep_event(event_id: Any) -> bool:
-    """Append the consumption identity for one emitted downstream event."""
-
+def _exact_sweep_event_id(event_id: Any) -> str:
     if (
         type(event_id) is not str
         or len(event_id) != 64
         or any(character not in "0123456789abcdef" for character in event_id)
     ):
         raise ValueError("sweep event id must be an exact SHA-256 digest")
+    return event_id
+
+
+def _canonical_authoritative_sweep_event_row(row: Any) -> Dict[str, Any]:
+    try:
+        decoded = json.loads(str(row["event_json"]))
+        if type(decoded) is not dict or set(decoded) != {
+            "schema_version",
+            "sweep_group_id",
+            "spent_block_index",
+            "fills",
+        }:
+            raise ValueError("invalid schema")
+        if (
+            type(decoded.get("schema_version")) is not int
+            or decoded.get("schema_version") != 1
+        ):
+            raise ValueError("invalid schema version")
+        payload, encoded, event_id = _canonical_authoritative_sweep_event(
+            decoded.get("spent_block_index"),
+            decoded.get("sweep_group_id"),
+            decoded.get("fills"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("stored authoritative sweep event is invalid") from exc
+    if (
+        encoded != str(row["event_json"])
+        or event_id != str(row["event_id"])
+        or payload["spent_block_index"] != row["spent_block_index"]
+        or payload["sweep_group_id"] != str(row["sweep_group_id"])
+    ):
+        raise RuntimeError("stored authoritative sweep event is invalid")
+    return {"event_id": event_id, **payload}
+
+
+def get_pending_authoritative_sweep_events() -> List[Dict[str, Any]]:
+    """Read only the bounded indexed pending delivery queue."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT event.event_id, event.spent_block_index, "
+            "       event.sweep_group_id, event.event_json "
+            "FROM offer_fill_sweep_delivery_queue AS queue "
+            "JOIN offer_fill_sweep_events AS event ON event.event_id=queue.event_id "
+            "WHERE queue.state='pending' "
+            "ORDER BY queue.queued_at, queue.event_id LIMIT ?",
+            (_MAX_PENDING_AUTHORITATIVE_SWEEP_EVENTS,),
+        )
+        .fetchall()
+    )
+    return [_canonical_authoritative_sweep_event_row(row) for row in rows]
+
+
+def _require_current_sweep_delivery_claim(
+    conn: sqlite3.Connection,
+    event_id: str,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM offer_fill_sweep_delivery_queue WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("sweep delivery claim is missing")
+    item = dict(row)
+    if (
+        item["state"] != "running"
+        or item["claim_token"] != claim_token
+        or int(item["generation"]) != claim_generation
+    ):
+        raise ValueError("sweep delivery claim is not the current owner")
+    return item
+
+
+def claim_authoritative_sweep_event() -> Optional[Dict[str, Any]]:
+    """Claim one pending or abandoned event with a monotonic generation fence."""
+
+    when = _stability_wall_clock()
+    now = _parse_iso_timestamp(when, "sweep delivery clock", require_timezone=True)
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_SWEEP_DELIVERY_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    token = hashlib.sha256(
+        f"sweep:{time.time_ns()}:{threading.get_ident()}".encode("ascii")
+    ).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        item = conn.execute(
+            "SELECT * FROM offer_fill_sweep_delivery_queue "
+            "WHERE state='running' AND claimed_at<=? "
+            "ORDER BY claimed_at, event_id LIMIT 1",
+            (abandoned_before,),
+        ).fetchone()
+        redelivery = item is not None
+        if item is None:
+            item = conn.execute(
+                "SELECT * FROM offer_fill_sweep_delivery_queue "
+                "WHERE state='pending' "
+                "ORDER BY queued_at, event_id LIMIT 1"
+            ).fetchone()
+        if item is None:
+            conn.commit()
+            return None
+        prior = dict(item)
+        next_generation = int(prior["generation"]) + 1
+        cursor = conn.execute(
+            "UPDATE offer_fill_sweep_delivery_queue "
+            "SET state='running', generation=?, claim_token=?, claimed_at=?, "
+            "    completed_at=NULL "
+            "WHERE event_id=? AND state=? AND generation=? "
+            "  AND ((claim_token IS NULL AND ? IS NULL) OR claim_token=?)",
+            (
+                next_generation,
+                token,
+                when,
+                prior["event_id"],
+                prior["state"],
+                int(prior["generation"]),
+                prior["claim_token"],
+                prior["claim_token"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("sweep delivery claim compare-and-set failed")
+        event_row = conn.execute(
+            "SELECT event_id, spent_block_index, sweep_group_id, event_json "
+            "FROM offer_fill_sweep_events WHERE event_id=?",
+            (prior["event_id"],),
+        ).fetchone()
+        if event_row is None:
+            raise RuntimeError("sweep delivery event is missing")
+        event = _canonical_authoritative_sweep_event_row(event_row)
+        conn.commit()
+        return {
+            **event,
+            "claim_token": token,
+            "claim_generation": next_generation,
+            "redelivery": redelivery,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _canonical_authoritative_sweep_downstream_effect(
+    effect: Any, event: Dict[str, Any]
+) -> tuple[Dict[str, Any], str, str]:
+    expected = {
+        "schema_version",
+        "event_id",
+        "sweep_group_id",
+        "spent_block_index",
+        "effect_at",
+        "total_fill_count",
+        "buffer_fill_count",
+        "protected_sides",
+        "recent_events",
+        "trade_ids",
+    }
+    if type(effect) is not dict or set(effect) != expected:
+        raise ValueError("sweep downstream effect has an invalid schema")
+    if (
+        type(effect["schema_version"]) is not int
+        or effect["schema_version"] != 1
+        or effect["event_id"] != event["event_id"]
+        or effect["sweep_group_id"] != event["sweep_group_id"]
+        or effect["spent_block_index"] != event["spent_block_index"]
+        or type(effect["effect_at"]) is not str
+        or _stability_timestamp(effect["effect_at"], "sweep effect timestamp")
+        != effect["effect_at"]
+        or type(effect["total_fill_count"]) is not int
+        or effect["total_fill_count"] != len(event["fills"])
+        or effect["buffer_fill_count"] != len(event["fills"])
+        or type(effect["trade_ids"]) is not list
+        or effect["trade_ids"] != [fill["trade_id"] for fill in event["fills"]]
+        or type(effect["protected_sides"]) is not list
+        or type(effect["recent_events"]) is not list
+        or len(effect["protected_sides"]) > 2
+        or len(effect["recent_events"]) != len(effect["protected_sides"])
+    ):
+        raise ValueError("sweep downstream effect differs from its event")
+    seen_sides: set[str] = set()
+    for index, protected in enumerate(effect["protected_sides"]):
+        if (
+            type(protected) is not dict
+            or set(protected) != {"side", "fill_count", "expires_at"}
+            or protected["side"] not in {"buy", "sell"}
+            or protected["side"] in seen_sides
+            or type(protected["fill_count"]) is not int
+            or protected["fill_count"] <= 0
+            or type(protected["expires_at"]) is not str
+            or _stability_timestamp(protected["expires_at"], "sweep protection expiry")
+            != protected["expires_at"]
+        ):
+            raise ValueError("sweep downstream protection is invalid")
+        seen_sides.add(protected["side"])
+        recent = effect["recent_events"][index]
+        if (
+            type(recent) is not dict
+            or set(recent)
+            != {
+                "event_id",
+                "side",
+                "fill_count",
+                "side_fill_count",
+                "total_fill_count",
+                "sweep_group_id",
+                "spent_block_index",
+                "timestamp",
+            }
+            or recent["event_id"] != event["event_id"]
+            or recent["side"] != protected["side"]
+            or recent["fill_count"] != protected["fill_count"]
+            or recent["side_fill_count"] != protected["fill_count"]
+            or recent["total_fill_count"] != len(event["fills"])
+            or recent["sweep_group_id"] != event["sweep_group_id"]
+            or recent["spent_block_index"] != event["spent_block_index"]
+            or recent["timestamp"] != effect["effect_at"]
+        ):
+            raise ValueError("sweep downstream recent event is invalid")
+    if [item["side"] for item in effect["protected_sides"]] != sorted(seen_sides):
+        raise ValueError("sweep downstream sides are not canonical")
+    encoded = _canonical_json_text(
+        effect,
+        "authoritative sweep downstream effect",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    payload = json.loads(encoded)
+    return payload, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_authoritative_sweep_downstream_effect(
+    event: Dict[str, Any],
+    when: str,
+    known_protection_seconds: int,
+    unknown_protection_seconds: int,
+) -> Dict[str, Any]:
+    base_time = _parse_iso_timestamp(when, "sweep effect clock", require_timezone=True)
+    side_counts = {"buy": 0, "sell": 0}
+    side_seconds: Dict[str, int] = {}
+    for fill in event["fills"]:
+        classification = fill["classification"]
+        if classification == "arb_sweep_buy":
+            sides = ("sell",)
+            seconds = known_protection_seconds
+        elif classification == "arb_sweep_sell":
+            sides = ("buy",)
+            seconds = known_protection_seconds
+        elif fill["side"] in {"buy", "sell"}:
+            sides = (fill["side"],)
+            seconds = known_protection_seconds
+        else:
+            sides = ("buy", "sell")
+            seconds = unknown_protection_seconds
+        for side in sides:
+            side_counts[side] += 1
+            side_seconds[side] = max(side_seconds.get(side, 0), seconds)
+    protected_sides = [
+        {
+            "side": side,
+            "fill_count": side_counts[side],
+            "expires_at": (base_time + timedelta(seconds=side_seconds[side])).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
+        }
+        for side in sorted(side_seconds)
+    ]
+    recent_events = [
+        {
+            "event_id": event["event_id"],
+            "side": item["side"],
+            "fill_count": item["fill_count"],
+            "side_fill_count": item["fill_count"],
+            "total_fill_count": len(event["fills"]),
+            "sweep_group_id": event["sweep_group_id"],
+            "spent_block_index": event["spent_block_index"],
+            "timestamp": when,
+        }
+        for item in protected_sides
+    ]
+    return {
+        "schema_version": 1,
+        "event_id": event["event_id"],
+        "sweep_group_id": event["sweep_group_id"],
+        "spent_block_index": event["spent_block_index"],
+        "effect_at": when,
+        "total_fill_count": len(event["fills"]),
+        "buffer_fill_count": len(event["fills"]),
+        "protected_sides": protected_sides,
+        "recent_events": recent_events,
+        "trade_ids": [fill["trade_id"] for fill in event["fills"]],
+    }
+
+
+def materialize_authoritative_sweep_downstream_effect(
+    event_id: Any,
+    claim_token: Any,
+    claim_generation: Any,
+    *,
+    known_protection_seconds: int,
+    unknown_protection_seconds: int,
+) -> Dict[str, Any]:
+    """Durably materialize every downstream effect before process delivery."""
+
+    safe_event_id = _exact_sweep_event_id(event_id)
+    safe_token = _required_stability_text(claim_token, "sweep claim_token")
+    safe_generation = _exact_integer(
+        claim_generation, "sweep claim_generation", minimum=1
+    )
+    safe_known = _exact_integer(
+        known_protection_seconds, "known protection seconds", minimum=0
+    )
+    safe_unknown = _exact_integer(
+        unknown_protection_seconds, "unknown protection seconds", minimum=0
+    )
+    if safe_known > 3600 or safe_unknown > 3600:
+        raise ValueError("sweep protection seconds exceed their hard limit")
     when = _stability_wall_clock()
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _require_current_sweep_delivery_claim(
+            conn, safe_event_id, safe_token, safe_generation
+        )
+        event_row = conn.execute(
+            "SELECT event_id, spent_block_index, sweep_group_id, event_json "
+            "FROM offer_fill_sweep_events WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if event_row is None:
+            raise ValueError("authoritative sweep event does not exist")
+        event = _canonical_authoritative_sweep_event_row(event_row)
+        existing = conn.execute(
+            "SELECT effect_json, effect_sha256 FROM "
+            "offer_fill_sweep_downstream_effects WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if existing is None:
+            effect = _build_authoritative_sweep_downstream_effect(
+                event, when, safe_known, safe_unknown
+            )
+            effect, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                effect, event
+            )
+            conn.execute(
+                "INSERT INTO offer_fill_sweep_downstream_effects "
+                "(event_id, effect_json, effect_sha256, applied_at) "
+                "VALUES (?, ?, ?, ?)",
+                (safe_event_id, encoded, digest, when),
+            )
+            log_data = _canonical_json_text(
+                {
+                    "event_id": safe_event_id,
+                    "sweep_group_id": event["sweep_group_id"],
+                    "spent_block_index": event["spent_block_index"],
+                    "fill_count": len(event["fills"]),
+                    "trade_ids": effect["trade_ids"],
+                    "protected_sides": effect["protected_sides"],
+                },
+                "authoritative sweep event log data",
+                expected_type=dict,
+                max_bytes=1024 * 1024,
+            )
+            message = (
+                f"Sweep detected: {len(event['fills'])} fills in block "
+                f"{event['spent_block_index']} — group {event['sweep_group_id']}"
+            )
+            event_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "event_category" in event_columns:
+                cursor = conn.execute(
+                    "INSERT INTO events "
+                    "(timestamp, event_type, severity, message, data, event_category) "
+                    "VALUES (?, 'sweep_detected', 'info', ?, ?, 'sweep')",
+                    (when, message, log_data),
+                )
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO events "
+                    "(timestamp, event_type, severity, message, data) "
+                    "VALUES (?, 'sweep_detected', 'info', ?, ?)",
+                    (when, message, log_data),
+                )
+            conn.execute(
+                "INSERT INTO offer_fill_sweep_log_sinks "
+                "(event_id, event_log_id, created_at) VALUES (?, ?, ?)",
+                (safe_event_id, int(cursor.lastrowid), when),
+            )
+        else:
+            try:
+                decoded = json.loads(str(existing["effect_json"]))
+                effect, encoded, digest = (
+                    _canonical_authoritative_sweep_downstream_effect(decoded, event)
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("stored sweep downstream effect is invalid") from exc
+            if (
+                encoded != str(existing["effect_json"])
+                or digest != str(existing["effect_sha256"])
+                or conn.execute(
+                    "SELECT 1 FROM offer_fill_sweep_log_sinks WHERE event_id=?",
+                    (safe_event_id,),
+                ).fetchone()
+                is None
+            ):
+                raise RuntimeError("stored sweep downstream effect is invalid")
+        conn.commit()
+        return effect
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_authoritative_sweep_downstream_effects(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return only the newest bounded durable process effects via an index."""
+
+    safe_limit = _exact_integer(limit, "sweep downstream effect limit", minimum=1)
+    if safe_limit > 20:
+        raise ValueError("sweep downstream effect limit exceeds 20")
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT effect.event_id, effect.effect_json, effect.effect_sha256, "
+            "       event.spent_block_index, event.sweep_group_id, event.event_json "
+            "FROM offer_fill_sweep_downstream_effects AS effect "
+            "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+            "ORDER BY effect.applied_at DESC, effect.event_id LIMIT ?",
+            (safe_limit,),
+        )
+        .fetchall()
+    )
+    effects: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        event = _canonical_authoritative_sweep_event_row(row)
+        try:
+            decoded = json.loads(str(row["effect_json"]))
+            payload, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                decoded, event
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("stored sweep downstream effect is invalid") from exc
+        if encoded != str(row["effect_json"]) or digest != str(row["effect_sha256"]):
+            raise RuntimeError("stored sweep downstream effect is invalid")
+        effects.append(payload)
+    return effects
+
+
+def consume_authoritative_sweep_event(
+    event_id: Any,
+    claim_token: Any,
+    claim_generation: Any,
+) -> bool:
+    """Acknowledge one exact owner only after its durable effect exists."""
+
+    safe_event_id = _exact_sweep_event_id(event_id)
+    safe_token = _required_stability_text(claim_token, "sweep claim_token")
+    safe_generation = _exact_integer(
+        claim_generation, "sweep claim_generation", minimum=1
+    )
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior_ack = conn.execute(
+            "SELECT claim_token, claim_generation FROM "
+            "offer_fill_sweep_delivery_acks WHERE event_id=?",
+            (safe_event_id,),
+        ).fetchone()
+        if prior_ack is not None:
+            if (
+                str(prior_ack["claim_token"]) != safe_token
+                or int(prior_ack["claim_generation"]) != safe_generation
+            ):
+                raise ValueError("sweep delivery claim is not the current owner")
+            conn.commit()
+            return False
+        _require_current_sweep_delivery_claim(
+            conn, safe_event_id, safe_token, safe_generation
+        )
         if (
             conn.execute(
-                "SELECT 1 FROM offer_fill_sweep_events WHERE event_id=?", (event_id,)
+                "SELECT 1 FROM offer_fill_sweep_downstream_effects WHERE event_id=?",
+                (safe_event_id,),
             ).fetchone()
             is None
         ):
-            raise ValueError("authoritative sweep event does not exist")
+            raise ValueError("sweep downstream effect is not durably materialized")
         conn.execute(
-            "INSERT OR IGNORE INTO offer_fill_sweep_event_receipts "
+            "INSERT INTO offer_fill_sweep_event_receipts "
             "(event_id, consumed_at) VALUES (?, ?)",
-            (event_id, when),
+            (safe_event_id, when),
         )
+        conn.execute(
+            "INSERT INTO offer_fill_sweep_delivery_acks "
+            "(event_id, claim_generation, claim_token, consumed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (safe_event_id, safe_generation, safe_token, when),
+        )
+        cursor = conn.execute(
+            "UPDATE offer_fill_sweep_delivery_queue SET state='completed', "
+            "completed_at=? WHERE event_id=? AND state='running' "
+            "AND claim_token=? AND generation=?",
+            (when, safe_event_id, safe_token, safe_generation),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("sweep delivery acknowledgement compare-and-set failed")
         conn.commit()
         return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def compact_authoritative_sweep_auxiliary_state(*, limit: int = 128) -> Dict[str, int]:
+    """Delete only proven-complete queue rows in two explicitly bounded batches."""
+
+    safe_limit = _exact_integer(limit, "sweep compaction limit", minimum=1)
+    if safe_limit > 256:
+        raise ValueError("sweep compaction limit exceeds 256")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        delivery_ids = [
+            str(row["event_id"])
+            for row in conn.execute(
+                "SELECT queue.event_id FROM offer_fill_sweep_delivery_queue AS queue "
+                "JOIN offer_fill_sweep_delivery_acks AS ack "
+                "  ON ack.event_id=queue.event_id "
+                "WHERE queue.state='completed' "
+                "ORDER BY queue.completed_at, queue.event_id LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        ]
+        if delivery_ids:
+            placeholders = ",".join("?" for _event_id in delivery_ids)
+            conn.execute(
+                f"DELETE FROM offer_fill_sweep_delivery_queue "
+                f"WHERE event_id IN ({placeholders}) AND state='completed'",
+                tuple(delivery_ids),
+            )
+        registration_ids = [
+            int(row["fill_id"])
+            for row in conn.execute(
+                "SELECT queue.fill_id "
+                "FROM offer_fill_sweep_registration_queue AS queue "
+                "JOIN offer_fill_sweep_finalizations AS finalization "
+                "  ON finalization.fill_id=queue.fill_id "
+                "WHERE queue.state='finalized' "
+                "ORDER BY queue.finalized_at, queue.fill_id LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        ]
+        if registration_ids:
+            placeholders = ",".join("?" for _fill_id in registration_ids)
+            conn.execute(
+                f"DELETE FROM offer_fill_sweep_registration_queue "
+                f"WHERE fill_id IN ({placeholders}) AND state='finalized'",
+                tuple(registration_ids),
+            )
+        conn.commit()
+        return {
+            "deliveries": len(delivery_ids),
+            "registrations": len(registration_ids),
+        }
     except Exception:
         conn.rollback()
         raise
@@ -9597,8 +10725,11 @@ def _stability_read_only_connection() -> sqlite3.Connection:
 
 
 def _required_stability_text(value: Any, label: str) -> str:
-    text = str(value) if value is not None else ""
-    text = text.strip()
+    if type(value) is not str:
+        raise ValueError(f"{label} must be exact text")
+    if len(value) > _MAX_STABILITY_TEXT_CHARS:
+        raise ValueError(f"{label} exceeds its text limit")
+    text = value.strip()
     if not text:
         raise ValueError(f"{label} is required")
     return text
@@ -9607,22 +10738,33 @@ def _required_stability_text(value: Any, label: str) -> str:
 def _optional_stability_text(value: Any) -> Optional[str]:
     if value is None:
         return None
-    text = str(value).strip()
+    if type(value) is not str:
+        raise ValueError("optional stability value must be exact text")
+    if len(value) > _MAX_STABILITY_TEXT_CHARS:
+        raise ValueError("optional stability value exceeds its text limit")
+    text = value.strip()
     return text or None
 
 
 def _atomic_amount_text(value: Any, label: str) -> str:
     """Validate an atomic integer without converting it through float/SQLite."""
 
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a positive atomic integer")
-    if isinstance(value, int):
+    if type(value) is int:
+        if value <= 0 or value.bit_length() > _MAX_STABILITY_ATOMIC_BITS:
+            raise ValueError(f"{label} must be a positive atomic integer")
         text = str(value)
-    elif isinstance(value, str):
+    elif type(value) is str:
+        if len(value) > _MAX_STABILITY_ATOMIC_DIGITS:
+            raise ValueError(f"{label} must be a positive atomic integer")
         text = value
     else:
         raise ValueError(f"{label} must be a positive atomic integer")
-    if not text or not text.isascii() or not text.isdigit() or int(text) <= 0:
+    if (
+        not text
+        or text[0] not in "123456789"
+        or not text.isascii()
+        or not text.isdigit()
+    ):
         raise ValueError(f"{label} must be a positive atomic integer")
     return text
 
@@ -9637,6 +10779,108 @@ def _exact_integer(value: Any, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+_MAX_STABILITY_TEXT_CHARS = 4096
+_MAX_STABILITY_ATOMIC_DIGITS = 128
+_MAX_STABILITY_ATOMIC_BITS = 512
+_MAX_STABILITY_JSON_INPUT_CHARS = 2 * 1024 * 1024
+_MAX_STABILITY_JSON_INPUT_BYTES = 8 * 1024 * 1024
+_MAX_STABILITY_JSON_SCALAR_CHARS = 1024 * 1024
+_MAX_STABILITY_JSON_CONTAINER_ITEMS = 4096
+_MAX_STABILITY_JSON_DEPTH = 64
+_MAX_STABILITY_JSON_NODES = 100_000
+_MAX_STABILITY_CANONICAL_BYTES = 16 * 1024 * 1024
+
+
+def _preflight_stability_json(
+    value: Any,
+    label: str,
+    *,
+    depth: int = 0,
+    state: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Bound exact JSON trees before key sorting, encoding, or copying."""
+
+    if state is None:
+        state = {
+            "nodes": 0,
+            "utf8_upper": 0,
+            "json_upper": 0,
+            "active": set(),
+        }
+    state["nodes"] += 1
+    if state["nodes"] > _MAX_STABILITY_JSON_NODES:
+        raise ValueError(f"{label} exceeds its JSON node limit")
+    if state["nodes"] * 16 > _MAX_STABILITY_CANONICAL_BYTES:
+        raise ValueError(f"{label} exceeds its canonical JSON limit")
+    if depth > _MAX_STABILITY_JSON_DEPTH:
+        raise ValueError(f"{label} exceeds its JSON depth limit")
+
+    def account_text(text: str) -> None:
+        if len(text) > _MAX_STABILITY_JSON_SCALAR_CHARS:
+            raise ValueError(f"{label} exceeds its JSON scalar limit")
+        state["utf8_upper"] += len(text) * 4
+        state["json_upper"] += len(text) * 6
+        if (
+            state["utf8_upper"] + state["nodes"] * 16 > _MAX_STABILITY_CANONICAL_BYTES
+            or state["json_upper"] + state["nodes"] * 16
+            > _MAX_STABILITY_CANONICAL_BYTES
+        ):
+            raise ValueError(f"{label} exceeds its canonical JSON limit")
+
+    if type(value) is dict:
+        if len(value) > _MAX_STABILITY_JSON_CONTAINER_ITEMS:
+            raise ValueError(f"{label} exceeds its JSON object limit")
+        container_id = id(value)
+        if container_id in state["active"]:
+            raise ValueError(f"{label} contains a cyclic JSON container")
+        state["active"].add(container_id)
+        try:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValueError(
+                        f"{label} requires exact JSON containers and text keys"
+                    )
+                account_text(key)
+                _preflight_stability_json(item, label, depth=depth + 1, state=state)
+        finally:
+            state["active"].remove(container_id)
+        return
+    if type(value) in {list, tuple}:
+        if len(value) > _MAX_STABILITY_JSON_CONTAINER_ITEMS:
+            raise ValueError(f"{label} exceeds its JSON sequence limit")
+        container_id = id(value)
+        if container_id in state["active"]:
+            raise ValueError(f"{label} contains a cyclic JSON container")
+        state["active"].add(container_id)
+        try:
+            for item in value:
+                _preflight_stability_json(item, label, depth=depth + 1, state=state)
+        finally:
+            state["active"].remove(container_id)
+        return
+    if type(value) is str:
+        account_text(value)
+        return
+    if type(value) is int:
+        if value.bit_length() > 4096:
+            raise ValueError(f"{label} exceeds its JSON integer limit")
+        state["json_upper"] += max(1, value.bit_length()) + 2
+        if state["json_upper"] + state["nodes"] * 16 > _MAX_STABILITY_CANONICAL_BYTES:
+            raise ValueError(f"{label} exceeds its canonical JSON limit")
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{label} contains a non-finite JSON number")
+        state["json_upper"] += 32
+        if state["json_upper"] + state["nodes"] * 16 > _MAX_STABILITY_CANONICAL_BYTES:
+            raise ValueError(f"{label} exceeds its canonical JSON limit")
+        return
+    if type(value) is bool or value is None:
+        state["json_upper"] += 5
+        return
+    raise ValueError(f"{label} requires exact JSON containers and scalars")
+
+
 def _canonical_json_text(
     value: Any,
     label: str,
@@ -9644,37 +10888,68 @@ def _canonical_json_text(
     expected_type: Optional[type] = None,
     default: Any = None,
     max_bytes: Optional[int] = None,
+    ensure_ascii: bool = False,
 ) -> str:
     """Validate and canonicalize JSON before a caller opens a transaction."""
 
+    if type(label) is not str or not label:
+        raise ValueError("canonical JSON label must be exact non-empty text")
+    if type(ensure_ascii) is not bool:
+        raise ValueError("ensure_ascii must be an exact bool")
+    effective_cap = _MAX_STABILITY_CANONICAL_BYTES if max_bytes is None else max_bytes
+    if (
+        type(effective_cap) is not int
+        or effective_cap <= 0
+        or effective_cap > _MAX_STABILITY_CANONICAL_BYTES
+    ):
+        raise ValueError("canonical JSON byte cap is invalid")
     if value is None:
         value = {} if default is None else default
-    if isinstance(value, str):
+    if type(value) is str:
+        if len(value) > _MAX_STABILITY_JSON_INPUT_CHARS:
+            raise ValueError(f"{label} input exceeds its JSON text limit")
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must contain valid JSON") from exc
+    elif type(value) is bytes:
+        if len(value) > _MAX_STABILITY_JSON_INPUT_BYTES:
+            raise ValueError(f"{label} input exceeds its JSON byte limit")
         try:
             parsed = json.loads(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{label} must contain valid JSON") from exc
     else:
         parsed = value
-    if expected_type is not None and not isinstance(parsed, expected_type):
+    _preflight_stability_json(parsed, label)
+    if expected_type is not None and type(parsed) is not expected_type:
         raise ValueError(f"{label} JSON must decode to {expected_type.__name__}")
     try:
         encoded = json.dumps(
             parsed,
-            ensure_ascii=False,
+            ensure_ascii=ensure_ascii,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} must contain valid JSON") from exc
-    if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
-        raise ValueError(f"{label} exceeds {max_bytes} UTF-8 bytes")
+    if len(encoded) > effective_cap:
+        raise ValueError(f"{label} exceeds {effective_cap} UTF-8 bytes")
+    encoded_bytes = encoded.encode("utf-8")
+    if len(encoded_bytes) > effective_cap:
+        raise ValueError(f"{label} exceeds {effective_cap} UTF-8 bytes")
     return encoded
 
 
 def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
-    parsed_evidence = json.loads(canonical_evidence)
+    safe_evidence = _canonical_json_text(
+        canonical_evidence,
+        "canonical evidence",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    parsed_evidence = json.loads(safe_evidence)
     if type(parsed_evidence) is dict and parsed_evidence.get("bounded") is True:
         if (
             set(parsed_evidence)
@@ -9688,12 +10963,11 @@ def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
             or parsed_evidence.get("redacted") is not True
         ):
             raise ValueError("bounded evidence envelope fields are invalid")
-        subset_text = json.dumps(
+        subset_text = _canonical_json_text(
             parsed_evidence["exact_subset"],
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
+            "bounded evidence exact subset",
+            max_bytes=65536,
+            ensure_ascii=True,
         )
         subset_digest = hashlib.sha256(subset_text.encode("utf-8")).hexdigest()
         if parsed_evidence.get("exact_subset_sha256") != subset_digest:
@@ -9706,7 +10980,7 @@ def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
         ):
             raise ValueError("bounded evidence full digest is invalid")
         return full_digest
-    return hashlib.sha256(canonical_evidence.encode("utf-8")).hexdigest()
+    return hashlib.sha256(safe_evidence.encode("utf-8")).hexdigest()
 
 
 def _journal_values(
@@ -9738,8 +11012,11 @@ def _journal_values(
         evidence_json, "evidence_json", default={}, max_bytes=65536
     )
     digest = _evidence_digest_from_canonical_json(evidence)
-    if evidence_sha256 is not None and str(evidence_sha256) != digest:
-        raise ValueError("evidence_sha256 does not match canonical evidence JSON")
+    if evidence_sha256 is not None:
+        supplied_digest = _required_stability_text(evidence_sha256, "evidence_sha256")
+        if supplied_digest != digest:
+            raise ValueError("evidence_sha256 does not match canonical evidence JSON")
+    safe_reason_code = _optional_stability_text(reason_code)
     return {
         "event_id": _required_stability_text(event_id, "event_id"),
         "operation_id": _required_stability_text(operation_id, "operation_id"),
@@ -9759,11 +11036,7 @@ def _journal_values(
         "spend_identity": _optional_stability_text(spend_identity),
         "evidence_json": evidence,
         "evidence_sha256": digest,
-        "reason_code": (
-            _required_stability_text(reason_code, "reason_code").upper()
-            if reason_code is not None and str(reason_code).strip()
-            else None
-        ),
+        "reason_code": safe_reason_code.upper() if safe_reason_code else None,
         "blocks_mutation": 1 if blocks_mutation else 0,
         "created_at": _stability_timestamp_or_now(
             created_at if created_at is not None else request_timestamp,

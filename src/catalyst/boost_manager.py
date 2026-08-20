@@ -1117,8 +1117,72 @@ class BoostManager:
                 return True
         return False
 
-    def notify_authoritative_boost_fill(
+    def capture_authoritative_boost_fill_materialization(
         self, fill_id: int, trade_id: str, side: str
+    ) -> dict | bool:
+        """Snapshot the exact side state before a durable fill command exists."""
+
+        if (
+            type(fill_id) is not int
+            or fill_id <= 0
+            or type(trade_id) is not str
+            or not trade_id
+            or type(side) is not str
+            or side not in {"buy", "sell"}
+        ):
+            return False
+        with self._lock:
+            if side == "buy":
+                probe_matched = (
+                    trade_id == self._buy_probe_tid
+                    or trade_id in self._buy_probe_tid_history
+                )
+                offset_bps = self._buy_offset_bps
+                current_floor_bps = self._buy_floor_bps
+                last_safe_offset_bps = self._buy_last_safe_offset_bps
+                settled_before = self._buy_settled
+            else:
+                probe_matched = (
+                    trade_id == self._sell_probe_tid
+                    or trade_id in self._sell_probe_tid_history
+                )
+                offset_bps = self._sell_offset_bps
+                current_floor_bps = self._sell_floor_bps
+                last_safe_offset_bps = self._sell_last_safe_offset_bps
+                settled_before = self._sell_settled
+            if (
+                not probe_matched
+                or type(offset_bps) is not int
+                or offset_bps < 0
+                or type(current_floor_bps) is not int
+                or current_floor_bps < 0
+                or type(last_safe_offset_bps) is not int
+                or last_safe_offset_bps < 0
+                or last_safe_offset_bps > offset_bps
+            ):
+                return False
+            floor_bps = current_floor_bps if settled_before else offset_bps
+            if floor_bps != offset_bps:
+                return False
+            return {
+                "schema_version": 1,
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "side": side,
+                "probe_trade_id": trade_id,
+                "probe_matched": True,
+                "settled_before": settled_before,
+                "offset_bps": offset_bps,
+                "floor_bps": floor_bps,
+                "last_safe_offset_bps": last_safe_offset_bps,
+            }
+
+    def notify_authoritative_boost_fill(
+        self,
+        fill_id: int,
+        trade_id: str,
+        side: str,
+        materialization: dict,
     ) -> dict | bool:
         """Apply one fill-keyed command and return its exact materialized state."""
 
@@ -1131,25 +1195,53 @@ class BoostManager:
             or side not in {"buy", "sell"}
         ):
             return False
+        try:
+            from database import _canonical_authoritative_boost_materialization
+
+            materialization, _encoded, _digest = (
+                _canonical_authoritative_boost_materialization(
+                    materialization, fill_id, trade_id, side
+                )
+            )
+        except Exception:
+            return False
         with self._lock:
             if fill_id in self._authoritative_boost_fill_ids:
                 return dict(self._authoritative_boost_effects[fill_id])
-            applied = self.notify_boost_fill(trade_id)
-            if applied is not True:
-                settled = self._buy_settled if side == "buy" else self._sell_settled
-                if not settled:
-                    self._on_inverted_arb(side)
-                applied = self._buy_settled if side == "buy" else self._sell_settled
-            if applied is not True:
-                return False
             if side == "buy":
+                self._buy_probe_tid_history.add(materialization["probe_trade_id"])
+                self._buy_offset_bps = materialization["offset_bps"]
+                self._buy_last_safe_offset_bps = materialization["last_safe_offset_bps"]
+                if materialization["settled_before"]:
+                    self._buy_settled = True
+                    self._buy_floor_bps = materialization["floor_bps"]
+                else:
+                    self._buy_settled = False
+                    self._on_inverted_arb("buy")
                 offset_bps = self._buy_offset_bps
                 floor_bps = self._buy_floor_bps
                 last_safe_offset_bps = self._buy_last_safe_offset_bps
             else:
+                self._sell_probe_tid_history.add(materialization["probe_trade_id"])
+                self._sell_offset_bps = materialization["offset_bps"]
+                self._sell_last_safe_offset_bps = materialization[
+                    "last_safe_offset_bps"
+                ]
+                if materialization["settled_before"]:
+                    self._sell_settled = True
+                    self._sell_floor_bps = materialization["floor_bps"]
+                else:
+                    self._sell_settled = False
+                    self._on_inverted_arb("sell")
                 offset_bps = self._sell_offset_bps
                 floor_bps = self._sell_floor_bps
                 last_safe_offset_bps = self._sell_last_safe_offset_bps
+            if (
+                offset_bps != materialization["offset_bps"]
+                or floor_bps != materialization["floor_bps"]
+                or last_safe_offset_bps != materialization["last_safe_offset_bps"]
+            ):
+                return False
             effect = {
                 "schema_version": 1,
                 "side": side,

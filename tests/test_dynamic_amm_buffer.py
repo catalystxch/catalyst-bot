@@ -119,6 +119,13 @@ class DynamicAMMBufferTests(unittest.TestCase):
         result = self.mod.get_buffer(30)
         self.assertEqual(result, Decimal("30.0"))
 
+    def test_durable_event_identity_dedupes_partial_redelivery(self):
+        event_id = "a" * 64
+
+        self.assertTrue(self.mod.record_sweep(fill_count=4, event_id=event_id))
+        self.assertFalse(self.mod.record_sweep(fill_count=4, event_id=event_id))
+        self.assertEqual(self.mod.get_state()["sweep_count_in_window"], 1)
+
     # ------------------------------------------------------------------
     # Rolling window expiry
     # ------------------------------------------------------------------
