@@ -4051,6 +4051,64 @@ def get_all_coins_state() -> Dict[str, Dict]:
         return {}
 
 
+def get_coin_state(coin_id: str) -> Optional[Dict[str, Any]]:
+    """Return one durable coin row, including spent/gone terminal states."""
+
+    normalized = norm_coin_id(_required_stability_text(coin_id, "coin_id"))
+    row = (
+        get_connection()
+        .execute("SELECT * FROM coins WHERE coin_id=?", (normalized,))
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def get_unlinked_open_offer_coins(*, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return open offers whose selected legacy coin lock needs re-linking."""
+
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT o.trade_id, o.coin_id, o.side
+            FROM offers AS o
+            LEFT JOIN coins AS c ON o.coin_id = c.coin_id
+            WHERE o.status='open' AND o.coin_id IS NOT NULL AND o.coin_id<>''
+              AND (c.status IS NULL OR c.status<>'locked')
+            ORDER BY o.created_at, o.trade_id
+            LIMIT ?
+            """,
+            (safe_limit,),
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
+def get_orphan_coin_locks() -> List[Dict[str, Any]]:
+    """Return locks whose trade no longer has a nonterminal legacy row."""
+
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT c.coin_id, c.wallet_type, c.amount_mojos, c.trade_id,
+                   c.assigned_tier, c.last_seen
+            FROM coins AS c
+            WHERE c.status='locked'
+              AND (c.trade_id IS NULL OR c.trade_id NOT IN (
+                    SELECT trade_id FROM offers
+                    WHERE status='open' AND trade_id IS NOT NULL
+                  ))
+            ORDER BY c.last_seen, c.coin_id
+            """
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
 def reconcile_coins_with_wallet(
     wallet_selectable: dict, wallet_owned: dict, wallet_type: str
 ) -> dict:
@@ -8632,6 +8690,752 @@ def finalize_offer_intent(
             "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
         ).fetchone()
         return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_RECONCILE_TERMINAL_OUTCOMES = frozenset(
+    {"FILLED_PROVEN", "CANCELLED_PROVEN", "EXPIRED_PROVEN"}
+)
+_RECONCILE_BLOCKING_OUTCOMES = frozenset({"UNKNOWN", "CONFLICT"})
+_RECONCILE_OBSERVATION_OUTCOMES = frozenset({"ACTIVE_PROVEN"})
+
+
+def get_authoritative_terminal_record(trade_id: str) -> Optional[Dict[str, Any]]:
+    """Return the exact proof-bound terminal journal identity for a trade."""
+
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    row = (
+        get_connection()
+        .execute(
+            """
+        SELECT j.*
+        FROM offer_operation_journal AS j
+        JOIN offer_intents AS i ON i.intent_id=j.intent_id
+        WHERE i.sage_trade_id=?
+          AND i.lifecycle_state='terminal'
+          AND j.operation_type='RECONCILE'
+          AND j.phase='FINALIZED'
+        ORDER BY j.sequence DESC
+        LIMIT 1
+        """,
+            (safe_trade_id,),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    event = validate_offer_operation_event(dict(row))
+    outcome = event["outcome"]
+    if outcome not in _RECONCILE_TERMINAL_OUTCOMES:
+        raise RuntimeError("terminal reconciliation journal outcome is invalid")
+    if event["operation_id"] != f"reconcile:{event['intent_id']}":
+        raise RuntimeError("terminal reconciliation journal identity is invalid")
+    return {
+        "attempt_no": event["attempt"],
+        "event_id": event["event_id"],
+        "evidence_sha256": event["evidence_sha256"],
+        "intent_id": event["intent_id"],
+        "operation_id": event["operation_id"],
+        "outcome": outcome,
+        "sage_trade_id": safe_trade_id,
+        "terminal_state": {
+            "FILLED_PROVEN": "filled",
+            "CANCELLED_PROVEN": "cancelled",
+            "EXPIRED_PROVEN": "expired",
+        }[outcome],
+    }
+
+
+def _reconciliation_coin_identity(value: Any, label: str) -> tuple[str, str]:
+    """Return one strict bare/registry coin identity pair."""
+
+    if type(value) is not str:
+        raise ValueError(f"{label} must be a 32-byte hex coin identity")
+    bare = value.strip().lower()
+    if bare.startswith("0x"):
+        bare = bare[2:]
+    if len(bare) != 64 or any(
+        character not in "0123456789abcdef" for character in bare
+    ):
+        raise ValueError(f"{label} must be a 32-byte hex coin identity")
+    return bare, norm_coin_id(bare)
+
+
+def _reconciliation_latch_update(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    reason_code: str,
+    reason: str,
+    reconciled_at: str,
+    blocking: bool,
+    additionally_resolved: Iterable[str] = (),
+) -> None:
+    """Trip or resolve only named reconciliation blockers in an open tx."""
+
+    row = conn.execute(
+        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("runtime safety latch singleton is missing")
+    latch = dict(row)
+    if latch["state"] == "tripped" and (
+        latch["wallet_fingerprint_hash"] != wallet_fingerprint_hash
+        or latch["network"] != network
+    ):
+        raise ValueError("runtime safety latch wallet binding mismatch")
+    blockers = (
+        set(json.loads(latch["blocking_operation_ids_json"]))
+        if latch["state"] == "tripped"
+        else set()
+    )
+    if blocking:
+        blockers.add(operation_id)
+        encoded = _canonical_json_text(
+            sorted(blockers),
+            "blocking_operation_ids_json",
+            expected_type=list,
+        )
+        generation = int(latch["generation"]) + (
+            1 if latch["state"] != "tripped" else 0
+        )
+        conn.execute(
+            """
+            UPDATE runtime_safety_latch
+            SET generation=?, state='tripped', reason_code=?, reason=?,
+                blocking_operation_ids_json=?, wallet_fingerprint_hash=?,
+                network=?, tripped_at=COALESCE(tripped_at, ?),
+                resolved_at=NULL, updated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                generation,
+                reason_code,
+                reason,
+                encoded,
+                wallet_fingerprint_hash,
+                network,
+                reconciled_at,
+                reconciled_at,
+            ),
+        )
+        return
+    blockers.difference_update({operation_id, *additionally_resolved})
+    encoded = _canonical_json_text(
+        sorted(blockers),
+        "blocking_operation_ids_json",
+        expected_type=list,
+    )
+    if blockers:
+        conn.execute(
+            """
+            UPDATE runtime_safety_latch
+            SET blocking_operation_ids_json=?, updated_at=?
+            WHERE singleton_id=1 AND state='tripped'
+            """,
+            (encoded, reconciled_at),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE runtime_safety_latch
+            SET state='resolved', reason_code=NULL, reason=NULL,
+                blocking_operation_ids_json='[]', resolved_at=?, updated_at=?
+            WHERE singleton_id=1 AND state='tripped'
+            """,
+            (reconciled_at, reconciled_at),
+        )
+
+
+def commit_offer_reconciliation(
+    *,
+    intent_id: str,
+    operation_id: str,
+    classification: str,
+    reason_code: str,
+    wallet_identity_json: Any,
+    evidence_json: Any,
+    evidence_sha256: str,
+    transaction_id: Optional[str] = None,
+    spend_identity: Optional[str] = None,
+    block_height: Optional[int] = None,
+    receive_coin_id: Optional[str] = None,
+    receive_amount_mojos: Optional[int] = None,
+    fee_mojos: int = 0,
+    coin_rebindings: Any = None,
+    reconciled_at: Any = None,
+) -> Dict[str, Any]:
+    """Commit one policy-authorized reconciliation in one short transaction.
+
+    This is Task 9's only terminal write boundary.  Its inputs are plain,
+    already-classified proof values; it never performs callbacks or wallet
+    reads.  Exact replay returns the original append-only event, while any
+    changed proof for an already-terminal operation is rejected.
+    """
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    safe_operation_id = _required_stability_text(operation_id, "operation_id")
+    if safe_operation_id != f"reconcile:{safe_intent_id}":
+        raise ValueError("canonical reconciliation operation_id is required")
+    if type(classification) is not str:
+        raise ValueError("classification must be exact text")
+    safe_classification = classification.strip().upper()
+    if safe_classification not in (
+        _RECONCILE_TERMINAL_OUTCOMES
+        | _RECONCILE_BLOCKING_OUTCOMES
+        | _RECONCILE_OBSERVATION_OUTCOMES
+    ):
+        raise ValueError("reconciliation classification is not committable")
+    blocking = safe_classification in _RECONCILE_BLOCKING_OUTCOMES
+    phase = {
+        "UNKNOWN": "UNKNOWN",
+        "CONFLICT": "CONFLICTED",
+        "ACTIVE_PROVEN": "OBSERVED",
+    }.get(safe_classification, "FINALIZED")
+    safe_reason = _required_stability_text(reason_code, "reason_code").upper()
+    when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
+    wallet_json = _canonical_json_text(
+        wallet_identity_json,
+        "wallet_identity_json",
+        expected_type=dict,
+    )
+    wallet_identity = json.loads(wallet_json)
+    wallet_hash = _required_stability_text(
+        wallet_identity.get("wallet_fingerprint_hash"),
+        "wallet_fingerprint_hash",
+    )
+    network = _required_stability_text(wallet_identity.get("network"), "network")
+    canonical_evidence = _canonical_json_text(
+        evidence_json,
+        "evidence_json",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    expected_digest = hashlib.sha256(canonical_evidence.encode("utf-8")).hexdigest()
+    if type(evidence_sha256) is not str or evidence_sha256 != expected_digest:
+        raise ValueError("evidence_sha256 does not match canonical evidence JSON")
+    safe_fee = _exact_integer(fee_mojos, "fee_mojos")
+    if safe_classification != "CANCELLED_PROVEN" and safe_fee != 0:
+        raise ValueError("only a proven cancellation may carry a fee value")
+    safe_transaction_id = _optional_stability_text(transaction_id)
+    safe_spend_identity = _optional_stability_text(spend_identity)
+    safe_height = (
+        _exact_integer(block_height, "block_height", minimum=1)
+        if block_height is not None
+        else None
+    )
+    safe_receive_coin_id = None
+    if receive_coin_id is not None:
+        safe_receive_coin_id = _reconciliation_coin_identity(
+            receive_coin_id, "receive_coin_id"
+        )[0]
+    safe_receive_amount = (
+        _exact_integer(receive_amount_mojos, "receive_amount_mojos", minimum=1)
+        if receive_amount_mojos is not None
+        else None
+    )
+    if safe_classification in {"FILLED_PROVEN", "CANCELLED_PROVEN"} and (
+        (safe_transaction_id is None and safe_spend_identity is None)
+        or safe_height is None
+    ):
+        raise ValueError("on-chain terminal proof identity is incomplete")
+    if safe_classification == "FILLED_PROVEN" and (
+        safe_receive_coin_id is None or safe_receive_amount is None
+    ):
+        raise ValueError("fill receipt proof is incomplete")
+    if safe_classification != "FILLED_PROVEN" and (
+        safe_receive_coin_id is not None or safe_receive_amount is not None
+    ):
+        raise ValueError("only a proven fill may carry receipt values")
+    raw_rebindings = [] if coin_rebindings is None else coin_rebindings
+    if type(raw_rebindings) is not list:
+        raise ValueError("coin_rebindings must be an exact list")
+    safe_rebindings = []
+    for raw in raw_rebindings:
+        if type(raw) is not dict or set(raw) != {
+            "input_coin_id",
+            "return_coin_id",
+            "asset_id",
+            "amount",
+        }:
+            raise ValueError("coin_rebinding fields are invalid")
+        input_bare, input_registry = _reconciliation_coin_identity(
+            raw["input_coin_id"], "input_coin_id"
+        )
+        return_bare, return_registry = _reconciliation_coin_identity(
+            raw["return_coin_id"], "return_coin_id"
+        )
+        asset_id = _required_stability_text(raw["asset_id"], "asset_id").lower()
+        if asset_id != "xch":
+            _reconciliation_coin_identity(asset_id, "asset_id")
+        amount = _exact_integer(raw["amount"], "return amount", minimum=1)
+        safe_rebindings.append(
+            {
+                "input_bare": input_bare,
+                "input_registry": input_registry,
+                "return_bare": return_bare,
+                "return_registry": return_registry,
+                "asset_id": asset_id,
+                "amount": amount,
+            }
+        )
+    if len({row["input_bare"] for row in safe_rebindings}) != len(
+        safe_rebindings
+    ) or len({row["return_bare"] for row in safe_rebindings}) != len(safe_rebindings):
+        raise ValueError("coin_rebindings contain duplicate identities")
+    if safe_classification == "CANCELLED_PROVEN" and not safe_rebindings:
+        raise ValueError("proven cancellation requires exact returned coins")
+    if safe_classification != "CANCELLED_PROVEN" and safe_rebindings:
+        raise ValueError("only proven cancellation may rebind returned coins")
+    event_id = f"{safe_operation_id}:attempt:1:{phase.lower()}"
+    journal = _journal_values(
+        event_id=event_id,
+        operation_id=safe_operation_id,
+        intent_id=safe_intent_id,
+        operation_type="RECONCILE",
+        attempt=1,
+        phase=phase,
+        outcome=safe_classification,
+        request_timestamp=when,
+        wallet_identity_json=wallet_json,
+        transaction_id=safe_transaction_id,
+        spend_identity=safe_spend_identity,
+        evidence_json=canonical_evidence,
+        evidence_sha256=expected_digest,
+        reason_code=safe_reason,
+        blocks_mutation=blocking,
+        created_at=when,
+    )
+
+    # Read and validate a Task 8 blocker before the write transaction.  The
+    # exact sequence is rechecked under BEGIN IMMEDIATE before appending its
+    # authoritative CANCEL_CONFIRMED resolution.
+    cancel_resolution = None
+    if safe_classification == "CANCELLED_PROVEN":
+        trade_hint = None
+        read_conn = get_connection()
+        intent_hint = read_conn.execute(
+            "SELECT sage_trade_id FROM offer_intents WHERE intent_id=?",
+            (safe_intent_id,),
+        ).fetchone()
+        if intent_hint is not None:
+            trade_hint = intent_hint["sage_trade_id"]
+        if trade_hint:
+            cancel_operation_id = f"cancel:{trade_hint}"
+            latest = read_conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+                """,
+                (cancel_operation_id,),
+            ).fetchone()
+            if latest is not None and int(latest["blocks_mutation"] or 0) == 1:
+                latest_event = validate_offer_operation_event(dict(latest))
+                if (
+                    latest_event["operation_type"] != "CANCEL"
+                    or latest_event["intent_id"] != safe_intent_id
+                ):
+                    raise ValueError("cancellation blocker identity is inconsistent")
+                cancel_resolution = {
+                    "observed_sequence": latest_event["sequence"],
+                    "operation_id": cancel_operation_id,
+                    "journal": _journal_values(
+                        event_id=(
+                            f"{cancel_operation_id}:attempt:"
+                            f"{latest_event['attempt']}:reconciled"
+                        ),
+                        operation_id=cancel_operation_id,
+                        intent_id=safe_intent_id,
+                        operation_type="CANCEL",
+                        attempt=latest_event["attempt"],
+                        phase="RECONCILED",
+                        outcome="CANCEL_CONFIRMED",
+                        request_timestamp=when,
+                        wallet_identity_json=wallet_json,
+                        transaction_id=safe_transaction_id,
+                        spend_identity=safe_spend_identity,
+                        evidence_json=canonical_evidence,
+                        evidence_sha256=expected_digest,
+                        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+                        blocks_mutation=False,
+                        created_at=when,
+                    ),
+                }
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if intent_row is None:
+            raise ValueError("intent_id does not exist")
+        intent = dict(intent_row)
+        if (
+            intent["wallet_fingerprint_hash"] != wallet_hash
+            or intent["network"] != network
+        ):
+            raise ValueError("reconciliation wallet binding mismatch")
+        existing_terminal = conn.execute(
+            """
+            SELECT * FROM offer_operation_journal
+            WHERE operation_id=? AND operation_type='RECONCILE'
+              AND phase='FINALIZED'
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (safe_operation_id,),
+        ).fetchone()
+        if existing_terminal is not None:
+            existing = validate_offer_operation_event(dict(existing_terminal))
+            if (
+                existing["outcome"] != safe_classification
+                or existing["evidence_sha256"] != expected_digest
+                or existing["transaction_id"] != safe_transaction_id
+                or existing["spend_identity"] != safe_spend_identity
+            ):
+                raise ValueError(
+                    "terminal offer was reconciled with different authoritative proof"
+                )
+            conn.commit()
+            return {"event": existing, "idempotent": True}
+        if intent["lifecycle_state"] == "terminal":
+            raise ValueError("terminal offer lacks its authoritative journal event")
+        try:
+            selected_bare = json.loads(intent["selected_coin_ids_json"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "offer intent selected coin identity is corrupt"
+            ) from exc
+        if type(selected_bare) is not list or not selected_bare:
+            raise RuntimeError("offer intent selected coin identity is corrupt")
+        selected = [
+            _reconciliation_coin_identity(value, "selected coin id")
+            for value in selected_bare
+        ]
+        selected_registry = [registry for _bare, registry in selected]
+        placeholders = ",".join("?" for _value in selected_registry)
+        coin_rows = conn.execute(
+            f"SELECT * FROM coins WHERE coin_id IN ({placeholders})",
+            selected_registry,
+        ).fetchall()
+        coins = {str(row["coin_id"]): dict(row) for row in coin_rows}
+        if set(coins) != set(selected_registry):
+            raise RuntimeError("offer intent selected coin reservation is missing")
+        trade_id = intent["sage_trade_id"]
+        if not trade_id:
+            raise ValueError("terminal reconciliation requires Sage trade identity")
+        if any(
+            coins[coin_id]["status"] != "locked"
+            or coins[coin_id]["trade_id"] != trade_id
+            for coin_id in selected_registry
+        ):
+            raise RuntimeError("offer intent selected coin lock is not held")
+        if safe_classification == "CANCELLED_PROVEN" and {
+            row["input_registry"] for row in safe_rebindings
+        } != set(selected_registry):
+            raise ValueError("cancellation return proof does not match selected coins")
+        existing_same_phase = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (journal["event_id"],),
+        ).fetchone()
+        if existing_same_phase is not None:
+            existing = validate_offer_operation_event(dict(existing_same_phase))
+            if any(
+                existing[column] != journal[column]
+                for column in _JOURNAL_COMPARE_COLUMNS
+            ):
+                raise ValueError(
+                    "reconciliation event has different authoritative proof"
+                )
+            conn.commit()
+            return {"event": existing, "idempotent": True}
+        event = _insert_offer_operation_event(conn, journal)
+        if blocking:
+            destination = (
+                "unknown" if safe_classification == "UNKNOWN" else "conflicted"
+            )
+            cursor = conn.execute(
+                """
+                UPDATE offer_intents
+                SET lifecycle_state=?, row_version=row_version+1, updated_at=?
+                WHERE intent_id=? AND lifecycle_state<>'terminal'
+                """,
+                (destination, when, safe_intent_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("offer intent state changed during reconciliation")
+            _reconciliation_latch_update(
+                conn,
+                operation_id=safe_operation_id,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                reason_code=safe_reason,
+                reason=f"authoritative reconciliation returned {safe_classification}",
+                reconciled_at=when,
+                blocking=True,
+            )
+            conn.commit()
+            return {"event": event, "idempotent": False}
+
+        if safe_classification == "ACTIVE_PROVEN":
+            legacy_row = conn.execute(
+                "SELECT status FROM offers WHERE trade_id=?", (trade_id,)
+            ).fetchone()
+            if legacy_row is not None and legacy_row["status"] != "open":
+                raise ValueError(
+                    "authoritative active proof conflicts with legacy terminal state"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE offer_intents
+                SET lifecycle_state=CASE
+                        WHEN lifecycle_state IN ('unknown', 'conflicted')
+                        THEN 'created' ELSE lifecycle_state END,
+                    row_version=row_version+1, updated_at=?
+                WHERE intent_id=? AND lifecycle_state<>'terminal'
+                """,
+                (when, safe_intent_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("offer intent state changed during reconciliation")
+            _reconciliation_latch_update(
+                conn,
+                operation_id=safe_operation_id,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                reason_code=safe_reason,
+                reason="authoritative active proof committed",
+                reconciled_at=when,
+                blocking=False,
+            )
+            conn.commit()
+            return {"event": event, "idempotent": False}
+
+        terminal_status = {
+            "FILLED_PROVEN": "filled",
+            "CANCELLED_PROVEN": "cancelled",
+            "EXPIRED_PROVEN": "expired",
+        }[safe_classification]
+        legacy_row = conn.execute(
+            "SELECT * FROM offers WHERE trade_id=?", (trade_id,)
+        ).fetchone()
+        legacy = dict(legacy_row) if legacy_row is not None else None
+        if legacy is not None and legacy["status"] != "open":
+            raise ValueError("authoritative proof conflicts with legacy terminal state")
+        cursor = conn.execute(
+            """
+            UPDATE offer_intents
+            SET lifecycle_state='terminal', terminal_at=?, updated_at=?,
+                row_version=row_version+1
+            WHERE intent_id=? AND lifecycle_state<>'terminal'
+            """,
+            (when, when, safe_intent_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(
+                "offer intent state changed during terminal reconciliation"
+            )
+        if legacy is not None:
+            conn.execute(
+                """
+                UPDATE offers
+                SET status=?, lifecycle_state=?,
+                    filled_at=CASE WHEN ?='filled' THEN ? ELSE NULL END,
+                    cancelled_at=CASE WHEN ?='cancelled' THEN ? ELSE NULL END
+                WHERE trade_id=? AND status='open'
+                """,
+                (
+                    terminal_status,
+                    terminal_status,
+                    terminal_status,
+                    when,
+                    terminal_status,
+                    when,
+                    trade_id,
+                ),
+            )
+        if safe_classification == "FILLED_PROVEN":
+            if legacy is None:
+                raise RuntimeError("authoritative fill requires its legacy offer row")
+            existing_fill = conn.execute(
+                "SELECT * FROM fills WHERE trade_id=?", (trade_id,)
+            ).fetchone()
+            if existing_fill is None:
+                conn.execute(
+                    """
+                    INSERT INTO fills (
+                        trade_id, side, price_xch, size_xch, size_cat,
+                        filled_at, cat_asset_id, tier, verification_status,
+                        fee_mojos_xch, spent_block_index, spent_block_height,
+                        receive_coin_id, receive_amount_mojos
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        legacy["side"],
+                        legacy["price_xch"],
+                        legacy["size_xch"],
+                        legacy["size_cat"],
+                        when,
+                        legacy["cat_asset_id"],
+                        legacy["tier"],
+                        "verified_authoritative",
+                        int(legacy.get("fee_mojos_xch") or 0),
+                        safe_height,
+                        safe_height,
+                        norm_coin_id(safe_receive_coin_id),
+                        safe_receive_amount,
+                    ),
+                )
+            else:
+                existing = dict(existing_fill)
+                if any(
+                    str(existing[key]) != str(legacy[key])
+                    for key in (
+                        "side",
+                        "price_xch",
+                        "size_xch",
+                        "size_cat",
+                        "cat_asset_id",
+                    )
+                ):
+                    raise ValueError("existing fill identity differs from offer")
+                conn.execute(
+                    """
+                    UPDATE fills
+                    SET verification_status='verified_authoritative',
+                        spent_block_index=?, spent_block_height=?,
+                        receive_coin_id=?, receive_amount_mojos=?
+                    WHERE trade_id=?
+                    """,
+                    (
+                        safe_height,
+                        safe_height,
+                        norm_coin_id(safe_receive_coin_id),
+                        safe_receive_amount,
+                        trade_id,
+                    ),
+                )
+            conn.execute(
+                f"""
+                UPDATE coins
+                SET status='spent', designation='unknown', assigned_tier='none',
+                    last_seen=?
+                WHERE coin_id IN ({placeholders}) AND status='locked'
+                  AND trade_id=?
+                """,
+                (when, *selected_registry, trade_id),
+            )
+        elif safe_classification == "CANCELLED_PROVEN":
+            for rebinding in safe_rebindings:
+                source = coins[rebinding["input_registry"]]
+                wallet_type = "xch" if rebinding["asset_id"] == "xch" else "cat"
+                if source["wallet_type"] != wallet_type:
+                    raise ValueError(
+                        "cancellation return asset differs from selected coin"
+                    )
+                returned = conn.execute(
+                    "SELECT * FROM coins WHERE coin_id=?",
+                    (rebinding["return_registry"],),
+                ).fetchone()
+                if returned is None:
+                    conn.execute(
+                        """
+                        INSERT INTO coins (
+                            coin_id, wallet_type, amount_mojos, tier, status,
+                            trade_id, first_seen, last_seen, designation,
+                            assigned_tier
+                        ) VALUES (?, ?, ?, ?, 'free', NULL, ?, ?, ?, ?)
+                        """,
+                        (
+                            rebinding["return_registry"],
+                            wallet_type,
+                            rebinding["amount"],
+                            source["tier"],
+                            when,
+                            when,
+                            source["designation"],
+                            source["assigned_tier"],
+                        ),
+                    )
+                else:
+                    returned_dict = dict(returned)
+                    if (
+                        returned_dict["wallet_type"] != wallet_type
+                        or int(returned_dict["amount_mojos"]) != rebinding["amount"]
+                        or returned_dict["status"] != "free"
+                        or returned_dict["trade_id"] is not None
+                    ):
+                        raise ValueError(
+                            "returned coin conflicts with durable coin state"
+                        )
+                    conn.execute(
+                        """
+                        UPDATE coins SET tier=?, designation=?, assigned_tier=?,
+                            last_seen=? WHERE coin_id=?
+                        """,
+                        (
+                            source["tier"],
+                            source["designation"],
+                            source["assigned_tier"],
+                            when,
+                            rebinding["return_registry"],
+                        ),
+                    )
+            conn.execute(
+                f"""
+                UPDATE coins
+                SET status='spent', designation='unknown', assigned_tier='none',
+                    last_seen=?
+                WHERE coin_id IN ({placeholders}) AND status='locked'
+                  AND trade_id=?
+                """,
+                (when, *selected_registry, trade_id),
+            )
+        else:
+            conn.execute(
+                f"""
+                UPDATE coins SET status='free', trade_id=NULL, last_seen=?
+                WHERE coin_id IN ({placeholders}) AND status='locked'
+                  AND trade_id=?
+                """,
+                (when, *selected_registry, trade_id),
+            )
+        resolved_operations = []
+        if cancel_resolution is not None:
+            latest = conn.execute(
+                """
+                SELECT sequence FROM offer_operation_journal
+                WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+                """,
+                (cancel_resolution["operation_id"],),
+            ).fetchone()
+            if (
+                latest is None
+                or int(latest["sequence"]) != cancel_resolution["observed_sequence"]
+            ):
+                raise ValueError("cancellation blocker changed during reconciliation")
+            _insert_offer_operation_event(conn, cancel_resolution["journal"])
+            resolved_operations.append(cancel_resolution["operation_id"])
+        _reconciliation_latch_update(
+            conn,
+            operation_id=safe_operation_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            reason_code=safe_reason,
+            reason="authoritative terminal proof committed",
+            reconciled_at=when,
+            blocking=False,
+            additionally_resolved=resolved_operations,
+        )
+        conn.commit()
+        return {"event": event, "idempotent": False}
     except Exception:
         conn.rollback()
         raise

@@ -35,7 +35,6 @@ from database import (
     get_stats,
     get_offer,
     update_offer_status,
-    backfill_verified_fills_from_offers,
 )
 
 try:
@@ -6872,346 +6871,41 @@ class BotLoop:
             except AttributeError:
                 pass  # set_baseline not yet available — harmless
 
-            # ---- Clean up stale database offers ----
-            # The database may have offers marked 'open' from a previous session
-            # that are no longer open in the wallet (cancelled, filled, expired).
-            # Mark them as cancelled so the GUI doesn't show phantom offers.
+            # ---- Diagnose stale database offers without inferring terminal state ----
+            # Wallet-open absence, local expiry, and a terminal-looking history row
+            # are observations only. Task 10 will coordinate startup reconciliation
+            # by calling the proof-bound Task 9 authority.
             wallet_open_ids = buy_ids | sell_ids
-            slog(
-                "STARTUP",
-                f"DB cleanup: wallet has {len(wallet_open_ids)} open offer IDs",
-            )
             try:
-                from database import get_open_offers, batch_cancel_stale_offers
+                from database import get_open_offers
 
                 db_open = get_open_offers(include_elapsed=True)
-                log_event(
-                    "info",
-                    "db_cleanup_start",
-                    f"DB has {len(db_open)} offers marked 'open', "
-                    f"wallet has {len(wallet_open_ids)} truly open",
-                )
-
-                # Collect stale trade_ids (in DB but not in wallet)
-                stale_ids = []
-                stale_db_map = {}
-                for db_offer in db_open:
-                    tid = db_offer.get("trade_id", "")
-                    if tid and tid not in wallet_open_ids:
-                        stale_ids.append(tid)
-                        stale_db_map[tid] = db_offer
-
+                stale_ids = [
+                    row.get("trade_id")
+                    for row in db_open
+                    if row.get("trade_id")
+                    and row.get("trade_id") not in wallet_open_ids
+                ]
                 if stale_ids:
-                    slog(
-                        "STARTUP",
-                        f"Found {len(stale_ids)} stale offers — checking status",
+                    log_event(
+                        "warning",
+                        "db_cleanup_authoritative_deferred",
+                        f"Deferred {len(stale_ids)} wallet-absent DB offers; "
+                        "rows and selected-coin locks remain intact pending "
+                        "authoritative terminal reconciliation",
+                        data={"trade_ids": stale_ids[:50]},
                     )
-                    # Check completed offers from wallet to distinguish fills from cancels.
-                    # Offers that filled while the bot was down must be marked "filled"
-                    # not "cancelled" — otherwise PnL is permanently wrong.
-                    fill_ids = set()
-                    expire_ids = set()
-                    pending_cancel_ids = set()
-                    deferred_stale_ids = set()
-                    try:
-                        from wallet_sage import get_all_offers as sage_get_all
-
-                        now_ts_cleanup = int(time.time())
-                        remaining_stale = set(stale_ids)
-                        completed_map: Dict[str, Dict] = {}
-                        # Previously this call capped at the first 500 Sage
-                        # completed offers; on a long live run, any stale
-                        # offer that drifted past that window was silently
-                        # classified as cancelled, erasing its P&L even
-                        # when it had actually filled. Paginate until we've
-                        # either resolved every stale_id or Sage returns an
-                        # empty page (authoritative end-of-history). Hard
-                        # cap at 40 pages / 20k offers so a pathological
-                        # Sage response can't stall startup forever.
-                        page_size = 500
-                        # Hard cap at 100 pages (50k completed offers).
-                        # Very busy wallets plus a long outage can in
-                        # theory exceed this; when we hit it we log
-                        # CRITICAL (persists to DB) so the operator sees
-                        # the mismatch and can reconcile P&L manually.
-                        max_pages = 100
-                        page = 0
-                        while page < max_pages:
-                            start_idx = page * page_size
-                            end_idx = start_idx + page_size
-                            try:
-                                page_offers = (
-                                    sage_get_all(
-                                        include_completed=True,
-                                        start=start_idx,
-                                        end=end_idx,
-                                    )
-                                    or []
-                                )
-                            except Exception as _page_err:
-                                log_event(
-                                    "warning",
-                                    "db_cleanup_page_failed",
-                                    f"Sage completed page {page} failed: {_page_err}",
-                                )
-                                break
-                            if not page_offers:
-                                break
-                            for o in page_offers:
-                                if not isinstance(o, dict):
-                                    continue
-                                tid = o.get("trade_id") or o.get("offer_id", "")
-                                if tid:
-                                    completed_map[tid] = o
-                                    remaining_stale.discard(tid)
-                            page += 1
-                            if not remaining_stale:
-                                break  # all stale_ids resolved, done paginating
-                        if page >= max_pages and remaining_stale:
-                            # Escalate to CRITICAL so the event persists
-                            # via the storage-layer remap (post-Cat6 fix)
-                            # and the operator sees it in post-startup
-                            # review — misclassifying offline fills as
-                            # cancelled understates P&L and can rebuild
-                            # inventory against the wrong baseline.
-                            log_event(
-                                "critical",
-                                "db_cleanup_page_cap_hit",
-                                f"Stale-offer pagination hit the "
-                                f"{max_pages * page_size}-offer safety cap "
-                                f"with {len(remaining_stale)} ids still "
-                                f"unchecked after startup. The remainder "
-                                f"will be treated as cancelled. MANUAL "
-                                f"P&L RECONCILIATION RECOMMENDED — some "
-                                f"of these may actually have filled while "
-                                f"the bot was offline.",
-                                data={
-                                    "unresolved_count": len(remaining_stale),
-                                    "scanned_offers": max_pages * page_size,
-                                    "action": "manual_reconcile_pnl",
-                                },
-                            )
-                        for tid in stale_ids:
-                            sage_offer = completed_map.get(tid)
-                            if sage_offer:
-                                status_val = sage_offer.get("status")
-                                status_text = (
-                                    str(status_val).upper()
-                                    if isinstance(status_val, str)
-                                    else ""
-                                )
-                                if status_val == 2 or status_text == "PENDING_CANCEL":
-                                    pending_cancel_ids.add(tid)
-                                    continue
-                                mapped = map_sage_terminal_offer_status(
-                                    status_val,
-                                    sage_offer=sage_offer,
-                                    local_offer=stale_db_map.get(tid, {}),
-                                    now_ts=now_ts_cleanup,
-                                )
-                                if mapped == "filled":
-                                    fill_ids.add(tid)
-                                elif mapped == "expired":
-                                    expire_ids.add(tid)
-                                elif mapped is None:
-                                    deferred_stale_ids.add(tid)
-                    except Exception as e:
-                        log_event(
-                            "warning",
-                            "db_cleanup_status_check_failed",
-                            f"Could not check completed offers at startup: {e}",
-                        )
-
-                    local_expire_ids = collect_locally_expired_stale_offer_ids(
-                        stale_ids,
-                        stale_db_map,
-                        already_resolved=(
-                            fill_ids
-                            | expire_ids
-                            | pending_cancel_ids
-                            | deferred_stale_ids
-                        ),
-                        now_ts=now_ts_cleanup,
-                    )
-                    if local_expire_ids:
-                        expire_ids.update(local_expire_ids)
-                        log_event(
-                            "info",
-                            "db_cleanup_local_expired",
-                            f"Classified {len(local_expire_ids)} stale DB offers "
-                            f"as expired from local offer max_time",
-                        )
-
-                    cancel_ids = [
-                        t
-                        for t in stale_ids
-                        if t not in fill_ids
-                        and t not in expire_ids
-                        and t not in pending_cancel_ids
-                        and t not in deferred_stale_ids
-                    ]
-
-                    if fill_ids:
-                        from database import update_offer_status
-
-                        for tid in fill_ids:
-                            update_offer_status(tid, "filled")
-                        log_event(
-                            "info",
-                            "db_cleanup_fills_recovered",
-                            f"Marked {len(fill_ids)} offers as filled "
-                            f"(filled while bot was offline)",
-                        )
-
-                    # Emit SSE fill events for offline fills + create fill rows
-                    # so PnL matching works correctly without waiting for the
-                    # housekeeping backfill cycle.
-                    if fill_ids:
-                        try:
-                            from database import backfill_verified_fills_from_offers
-
-                            _offline_fills = backfill_verified_fills_from_offers(
-                                limit=len(fill_ids) + 10
-                            )
-                            for _off_fill in _offline_fills or []:
-                                self._emit(
-                                    "fill",
-                                    {
-                                        "side": _off_fill.get("side", ""),
-                                        "price": str(
-                                            _off_fill.get("price_xch")
-                                            or _off_fill.get("price")
-                                            or ""
-                                        ),
-                                        "size_xch": str(
-                                            _off_fill.get("xch_amount") or ""
-                                        ),
-                                        "tier": _off_fill.get("tier", ""),
-                                        "offline": True,
-                                    },
-                                )
-                            if _offline_fills:
-                                log_event(
-                                    "info",
-                                    "offline_fill_sse_emitted",
-                                    f"Emitted SSE events for "
-                                    f"{len(_offline_fills)} offline fill(s)",
-                                )
-                        except Exception as _sse_err:
-                            log_event(
-                                "warning",
-                                "offline_fill_sse_failed",
-                                f"Offline fill SSE emit failed (non-critical): "
-                                f"{_sse_err}",
-                            )
-
-                    if expire_ids:
-                        from database import update_offer_status as _uos
-
-                        for tid in expire_ids:
-                            _uos(tid, "expired")
-                        log_event(
-                            "info",
-                            "db_cleanup_expired",
-                            f"Marked {len(expire_ids)} offers as expired",
-                        )
-
-                    if pending_cancel_ids:
-                        try:
-                            from database import (
-                                transition_offer as _to,
-                                mark_cancel_attempted as _mca,
-                            )
-                        except Exception:
-                            _to = None
-                            _mca = None
-                        for tid in pending_cancel_ids:
-                            if _to:
-                                try:
-                                    _to(tid, "cancel_sent")
-                                except Exception:
-                                    pass
-                            if _mca:
-                                try:
-                                    _mca(tid)
-                                except Exception:
-                                    pass
-                        log_event(
-                            "info",
-                            "db_cleanup_pending_cancel_deferred",
-                            f"Deferred {len(pending_cancel_ids)} stale offers still "
-                            f"PENDING_CANCEL in Sage; pending-cancel verifier will reconcile",
-                        )
-
-                    if deferred_stale_ids:
-                        log_event(
-                            "warning",
-                            "db_cleanup_stale_deferred",
-                            f"Deferred {len(deferred_stale_ids)} stale offers with "
-                            f"non-terminal Sage status; leaving open for next wallet sync",
-                        )
-
-                    cleaned = batch_cancel_stale_offers(cancel_ids) if cancel_ids else 0
-                    total_cleaned = cleaned + len(fill_ids) + len(expire_ids)
-                    total_deferred = len(pending_cancel_ids) + len(deferred_stale_ids)
-                    slog(
-                        "STARTUP",
-                        f"Cleanup result: {cleaned} cancelled, "
-                        f"{len(fill_ids)} filled, {len(expire_ids)} expired, "
-                        f"{total_deferred} deferred",
-                    )
-                    if total_cleaned == len(stale_ids):
-                        log_event(
-                            "info",
-                            "db_cleanup_done",
-                            f"Cleaned {total_cleaned} stale DB offers "
-                            f"({cleaned} cancelled, {len(fill_ids)} filled, "
-                            f"{len(expire_ids)} expired)",
-                        )
-                    elif total_deferred:
-                        log_event(
-                            "info",
-                            "db_cleanup_done",
-                            f"Cleaned {total_cleaned}/{len(stale_ids)} stale DB offers "
-                            f"({cleaned} cancelled, {len(fill_ids)} filled, "
-                            f"{len(expire_ids)} expired, {total_deferred} deferred)",
-                        )
-                    else:
-                        log_event(
-                            "info",
-                            "db_cleanup_done",
-                            f"Cleaned {total_cleaned}/{len(stale_ids)} stale DB offers "
-                            f"(some failed due to DB lock)",
-                        )
                 else:
-                    log_event("info", "db_cleanup_done", "No stale DB offers found")
+                    log_event(
+                        "info",
+                        "db_cleanup_done",
+                        "No wallet-absent DB offers found",
+                    )
             except Exception as e:
                 log_event(
-                    "warning", "db_cleanup_failed", f"DB offer cleanup failed: {e}"
-                )
-
-            locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
-            if locally_expired_ids:
-                self._mark_local_expiry_rebuild_needed(locally_expired_ids)
-                open_buys = [
-                    o for o in open_buys if o.get("trade_id") not in locally_expired_ids
-                ]
-                open_sells = [
-                    o
-                    for o in open_sells
-                    if o.get("trade_id") not in locally_expired_ids
-                ]
-                buy_ids = {
-                    o.get("trade_id", "") for o in open_buys if o.get("trade_id")
-                }
-                sell_ids = {
-                    o.get("trade_id", "") for o in open_sells if o.get("trade_id")
-                }
-                wallet_open_ids = buy_ids | sell_ids
-                log_event(
-                    "info",
-                    "startup_local_expired_filtered",
-                    f"Retired and filtered {len(locally_expired_ids)} locally expired open offer(s) after startup reconciliation",
+                    "warning",
+                    "db_cleanup_failed",
+                    f"DB offer diagnostic failed: {e}",
                 )
 
             recovered_startup_trade_ids = set()
@@ -7603,62 +7297,29 @@ class BotLoop:
                     f"Full reconcile + link failed: {e}",
                 )
 
-            # ---- Orphaned locked coin cleanup (V5 FIX) ----
-            # Free any locked coins whose offers no longer exist.
-            # This catches: coins locked by offers that were cancelled outside the
-            # bot, coins from failed offer creation, coins whose trade_ids are stale.
-            # V5: For Sage, build wallet_confirmed_locked set to prevent tug-of-war.
+            # ---- Orphan-looking locks are diagnostic until exact proof ----
             try:
-                from database import cleanup_orphaned_locked_coins
+                from database import get_orphan_coin_locks
 
-                # Build wallet_confirmed_locked for Sage
-                wallet_confirmed_locked = wallet_confirmed_locked or set()
-                try:
-                    from wallet import get_wallet_type
-
-                    if get_wallet_type() == "sage" and not wallet_confirmed_locked:
-                        from wallet_sage import get_owned_coins_detailed
-
-                        for _wid in [cfg.WALLET_ID_XCH, cfg.CAT_WALLET_ID]:
-                            _detail = get_owned_coins_detailed(_wid)
-                            if _detail:
-                                for _cid, _info in _detail.items():
-                                    if _info.get("offer_id"):
-                                        store_id = (
-                                            _cid
-                                            if _cid.startswith("0x")
-                                            else "0x" + _cid
-                                        )
-                                        wallet_confirmed_locked.add(store_id)
-                except Exception as e:
+                orphan_rows = get_orphan_coin_locks()
+                if orphan_rows:
                     log_event(
-                        "debug",
-                        "sage_locked_coin_fetch_failed",
-                        f"Sage locked coin set build failed (non-critical, proceeding without protection): {e}",
-                    )
-                orphan_stats = cleanup_orphaned_locked_coins(
-                    wallet_open_ids, wallet_confirmed_locked=wallet_confirmed_locked
-                )
-                if orphan_stats["total_freed"] > 0:
-                    log_event(
-                        "info",
-                        "startup_orphan_cleanup",
-                        f"Freed {orphan_stats['total_freed']} orphaned locked coins "
-                        f"({orphan_stats['freed_no_trade']} no trade_id, "
-                        f"{orphan_stats['freed_stale_trade']} stale trade_id, "
-                        f"{orphan_stats.get('skipped_wallet_locked', 0)} wallet-protected)",
+                        "warning",
+                        "startup_orphan_locks_deferred",
+                        f"Deferred {len(orphan_rows)} orphan-looking lock(s) to "
+                        "authoritative reconciliation; no coin was released",
                     )
                 else:
                     log_event(
                         "info",
-                        "startup_orphan_cleanup",
-                        "No orphaned locked coins found",
+                        "startup_orphan_lock_check",
+                        "No orphan-looking locked coins found",
                     )
             except Exception as e:
                 log_event(
                     "warning",
-                    "startup_orphan_cleanup_failed",
-                    f"Orphaned locked coin cleanup failed: {e}",
+                    "startup_orphan_lock_check_failed",
+                    f"Orphan lock diagnostic failed: {e}",
                 )
 
             # ---- Sniper recovery ----
@@ -8562,23 +8223,8 @@ class BotLoop:
         open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
         wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
-        locally_expired_ids = set(self.offer_manager.cleanup_expired_db_offers())
-        if locally_expired_ids:
-            self._mark_local_expiry_rebuild_needed(locally_expired_ids)
-            open_buys = [
-                o for o in open_buys if o.get("trade_id") not in locally_expired_ids
-            ]
-            open_sells = [
-                o for o in open_sells if o.get("trade_id") not in locally_expired_ids
-            ]
-            closed = list(closed or []) + [
-                {"trade_id": tid, "status": "expired"} for tid in locally_expired_ids
-            ]
-            log_event(
-                "info",
-                "wallet_open_expired_filtered",
-                f"Filtered {len(locally_expired_ids)} locally expired offer(s) out of the live wallet book",
-            )
+        # Local expiry is display/planning context only. The wallet book stays
+        # intact until authoritative reconciliation proves terminal state.
         self._last_live_offer_edges = self._get_live_offer_edges(open_buys, open_sells)
 
         current_buy_ids = {
@@ -12890,419 +12536,28 @@ class BotLoop:
         except Exception:
             pass
 
-        # ---- Coin sanity check + orphan cleanup ----
-        # Runs every housekeeping cycle (5 min). Catches:
-        # - Locked coins whose offers were cancelled outside the bot
-        # - Divergence between locked count and open offer count
+        # ---- Proof-safe coin/offer drift diagnostics ----
         try:
-            from database import (
-                coin_sanity_check,
-                cleanup_orphaned_locked_coins,
-                get_open_offers as _hk_get_open_offers,
-                batch_cancel_stale_offers as _hk_batch_cancel_stale_offers,
-                get_locked_coin_ids_for_trade as _hk_get_locked_coin_ids_for_trade,
-            )
+            from database import get_orphan_coin_locks
 
-            # Sanity check: locked vs offers
-            db_open = _hk_get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
-            sanity = coin_sanity_check(len(db_open))
-            wallet_open_ids = set(active_ids)
-
-            # If stale locked coins detected, clean them up
-            if sanity.get("stale_locked", 0) > 0 or sanity.get("warnings"):
-                # V5: Build wallet_confirmed_locked for Sage
-                _hk_wallet_locked = set()
-                try:
-                    from wallet import get_wallet_type as _hk_gwt
-
-                    if _hk_gwt() == "sage":
-                        from wallet_sage import get_owned_coins_detailed
-
-                        for _wid in [cfg.WALLET_ID_XCH, cfg.CAT_WALLET_ID]:
-                            _detail = get_owned_coins_detailed(_wid)
-                            if _detail:
-                                for _cid, _info in _detail.items():
-                                    if _info.get("offer_id"):
-                                        _sid = (
-                                            _cid
-                                            if _cid.startswith("0x")
-                                            else "0x" + _cid
-                                        )
-                                        _hk_wallet_locked.add(_sid)
-                except Exception:
-                    pass
-                orphan_stats = cleanup_orphaned_locked_coins(
-                    wallet_open_ids, wallet_confirmed_locked=_hk_wallet_locked
+            orphan_rows = get_orphan_coin_locks()
+            if orphan_rows:
+                log_event(
+                    "warning",
+                    "housekeeping_orphan_locks_deferred",
+                    f"Deferred {len(orphan_rows)} orphan-looking lock(s); "
+                    "wallet absence did not release coins or retire offers",
                 )
-                if orphan_stats["total_freed"] > 0:
-                    log_event(
-                        "info",
-                        "housekeeping_orphan_cleanup",
-                        f"Freed {orphan_stats['total_freed']} orphaned locked coins "
-                        f"during housekeeping",
-                    )
-
-            # If the DB still has offers marked open that are not in the
-            # wallet-open set and no longer have locked coins, retire those
-            # stale rows so the dashboard stays aligned during long runs.
-            stale_db_ids = []
-            recent_ids = {
-                tid
-                for tid, ts in self.offer_manager._recently_created.items()
-                if tid and (now - float(ts or 0)) < 45
-            }
-            for db_offer in db_open:
-                tid = db_offer.get("trade_id", "")
-                if not tid or tid in wallet_open_ids or tid in recent_ids:
-                    continue
-                # Time-based override: if offer has been in DB for >120s and
-                # is NOT in the wallet, mark it stale regardless of coin lock
-                # status. This catches offers that failed on-chain
-                # (MEMPOOL_CONFLICT) but were recorded in the DB.
-                offer_age_s = 0
-                try:
-                    _ca = db_offer.get("created_at", "")
-                    if _ca:
-                        from datetime import datetime as _dt_cls
-
-                        _created_ts = _dt_cls.strptime(
-                            _ca, "%Y-%m-%d %H:%M:%S"
-                        ).timestamp()
-                        offer_age_s = now - _created_ts
-                except Exception:
-                    pass
-                has_locked = bool(_hk_get_locked_coin_ids_for_trade(tid))
-                if has_locked and offer_age_s <= 120:
-                    continue
-                if has_locked and offer_age_s > 120:
-                    log_event(
-                        "info",
-                        "stale_offer_cleanup",
-                        f"Cleaned up stale DB offer {tid[:16]}... "
-                        f"(not in wallet after {int(offer_age_s)}s, had locked coins)",
-                    )
-                stale_db_ids.append(tid)
-
-            if stale_db_ids:
-                cleaned = _hk_batch_cancel_stale_offers(stale_db_ids)
-                if cleaned:
-                    log_event(
-                        "info",
-                        "housekeeping_offer_cleanup",
-                        f"Marked {cleaned}/{len(stale_db_ids)} stale DB offers cancelled "
-                        f"(not open in wallet and no locked coin remained)",
-                    )
         except Exception as hk_e:
             log_event(
                 "debug",
                 "housekeeping_sanity_failed",
-                f"Coin sanity check failed: {hk_e}",
+                f"Coin/offer drift diagnostic failed: {hk_e}",
             )
 
-        # ---- Sage offer cleanup (F47, 2026-04-09): CONSERVATIVE PURGE ----
-        #
-        # IMPORTANT HISTORY: an earlier version of this block (pre-F47)
-        # treated ANY status >= 2 as "terminal" and deleted it from Sage's
-        # local DB. That included status=4 (CONFIRMED == filled), which
-        # meant the bot was silently deleting records of every profitable
-        # trade before the operator could see them in Sage's UI. This
-        # masked a separate fill-rejection bug and made retroactive
-        # verification impossible. See the 2026-04-08 "9 phantom_rejected
-        # fills" incident for the full post-mortem.
-        #
-        # NEW POLICY (F47): only CANCELLED and EXPIRED offers are ever
-        # deleted, and only after THREE safety gates:
-        #
-        #   Gate A: Sage's reported status is explicitly 'cancelled',
-        #           'expired', or the Chia enum int 3 (CANCELLED).
-        #           COMPLETED/CONFIRMED/FILLED are NEVER touched — the
-        #           operator keeps those in Sage for bookkeeping.
-        #
-        #   Gate B: The offer has been in that terminal state for at
-        #           least 24 HOURS. This leaves a big observation window
-        #           so fill-detection, reconciliation, and manual audits
-        #           can all catch any surprises before the evidence
-        #           disappears.
-        #
-        #   Gate C: Our local DB has a matching row with the SAME
-        #           terminal status (cancelled/expired). If the local
-        #           record is missing, open, filled, or anything else
-        #           unexpected, we REFUSE to delete and log a warning —
-        #           the operator decides what to do.
-        #
-        # If any single offer fails its gate checks, we skip THAT offer
-        # but continue checking the rest. If Sage returns an offer we
-        # don't recognize at all, we log a 'sage_cleanup_anomaly' warning
-        # (which is visible in Recommendations) and leave it alone.
-        try:
-            from wallet import get_wallet_type
-
-            if get_wallet_type() == "sage":
-                from wallet import sage_delete_offer, wallet_mutation_succeeded
-
-                all_sage_offers = get_all_offers(
-                    include_completed=True, start=0, end=500
-                )
-                if all_sage_offers:
-                    # SAFE = only explicit cancellations and expirations.
-                    # 'FAILED' / 'PENDING_CANCEL' are intentionally excluded
-                    # because they represent transitional or error states
-                    # that might still convert to a fill.
-                    SAFE_TO_DELETE_STRINGS = {"CANCELLED", "CANCELED", "EXPIRED"}
-                    # Chia TradeStatus enum: 3 == CANCELLED.
-                    # Explicitly NOT including 4 (CONFIRMED), 5 (FAILED),
-                    # or 2 (PENDING_CANCEL).
-                    SAFE_TO_DELETE_INTS = {3}
-
-                    # Local-DB statuses that are allowed to match a
-                    # Sage-terminal offer. If the local DB shows
-                    # anything else, refuse to delete.
-                    LOCAL_SAFE_STATUSES = {"cancelled", "canceled", "expired"}
-
-                    # 24h age gate — a terminal offer must have been in
-                    # that state for at least this long before deletion.
-                    MIN_AGE_SECS = 24 * 3600
-
-                    to_delete = []
-                    anomalies = 0
-                    new_anomalies = 0  # only first-time occurrences
-                    now_ts = int(time.time())
-                    # Per-session set — each unique trade_id is only
-                    # warned about once.  Stored on self so it survives
-                    # across cycles for the lifetime of the bot session.
-                    if not hasattr(self, "_sage_anomaly_seen"):
-                        self._sage_anomaly_seen: set = set()
-
-                    for offer in all_sage_offers:
-                        status_val = offer.get("status")
-                        trade_id = offer.get("trade_id", "")
-                        if not trade_id:
-                            continue
-
-                        # ---- Gate A: is this status explicitly deletable? ----
-                        is_safe_status = False
-                        reason = None
-                        if isinstance(status_val, str):
-                            if status_val.upper() in SAFE_TO_DELETE_STRINGS:
-                                is_safe_status = True
-                                reason = status_val.upper()
-                        elif isinstance(status_val, int):
-                            if status_val in SAFE_TO_DELETE_INTS:
-                                is_safe_status = True
-                                reason = "CANCELLED_INT"
-
-                        # Time-expiry bypass: offers past their max_time
-                        # are effectively EXPIRED even if Sage still
-                        # reports them active. Must be >=24h past expiry.
-                        if not is_safe_status:
-                            valid_times = offer.get("valid_times") or {}
-                            max_time = (
-                                valid_times.get("max_time", 0)
-                                or offer.get("max_time", 0)
-                                or 0
-                            )
-                            if max_time and int(max_time) > 0:
-                                seconds_past_expiry = now_ts - int(max_time)
-                                if seconds_past_expiry >= MIN_AGE_SECS:
-                                    is_safe_status = True
-                                    reason = "EXPIRED_VALID_TIMES"
-
-                        if not is_safe_status:
-                            # Not cancelled, not expired — leave it alone.
-                            # This is the big departure from the old code:
-                            # filled/confirmed offers stay in Sage for the
-                            # operator to see.
-                            continue
-
-                        # ---- Gate B: is the offer at least 24h old? ----
-                        # Prefer the Sage-side creation timestamp; fall
-                        # back to our local DB timestamps.
-                        local_offer = get_offer(trade_id)
-                        age_secs = 0
-                        sage_ct = offer.get("creation_timestamp") or offer.get(
-                            "created_at_height"
-                        )
-                        if sage_ct:
-                            try:
-                                age_secs = now_ts - int(sage_ct)
-                            except Exception:
-                                pass
-                        if age_secs <= 0 and local_offer:
-                            try:
-                                from datetime import datetime as _dt
-
-                                created_raw = str(local_offer.get("created_at") or "")
-                                if created_raw:
-                                    _created = _dt.strptime(
-                                        created_raw[:19], "%Y-%m-%d %H:%M:%S"
-                                    )
-                                    age_secs = now_ts - int(_created.timestamp())
-                            except Exception:
-                                pass
-
-                        if age_secs < MIN_AGE_SECS:
-                            # Too young to delete — keep it visible in
-                            # Sage so the operator can audit.
-                            continue
-
-                        # ---- Gate C: does our local DB agree? ----
-                        if local_offer is None:
-                            anomalies += 1
-                            if trade_id not in self._sage_anomaly_seen:
-                                self._sage_anomaly_seen.add(trade_id)
-                                new_anomalies += 1
-                                # Per-offer detail at DEBUG — the summary below
-                                # handles operator visibility at WARNING level.
-                                # These fire ~40 times per cleanup run for
-                                # historical offers that pre-date the local DB,
-                                # generating thousands of WARNING lines per session.
-                                log_event(
-                                    "debug",
-                                    "sage_cleanup_anomaly",
-                                    f"Sage reports offer {trade_id[:16]}... as "
-                                    f"{reason} but no local DB record exists. "
-                                    f"Refusing to delete — check Recommendations.",
-                                )
-                            continue
-
-                        local_status = str(local_offer.get("status") or "").lower()
-                        if local_status not in LOCAL_SAFE_STATUSES:
-                            # Local says something else — open, filled,
-                            # pending, etc. Don't touch it.
-                            anomalies += 1
-                            if trade_id not in self._sage_anomaly_seen:
-                                self._sage_anomaly_seen.add(trade_id)
-                                new_anomalies += 1
-                                # Per-offer detail at DEBUG (see comment above).
-                                log_event(
-                                    "debug",
-                                    "sage_cleanup_anomaly",
-                                    f"Sage says {reason} for {trade_id[:16]}... "
-                                    f"but local DB shows '{local_status}'. "
-                                    f"Refusing to delete — manual review needed.",
-                                )
-                            continue
-
-                        # All three gates passed.
-                        to_delete.append(
-                            (
-                                trade_id,
-                                map_sage_terminal_offer_status(
-                                    status_val,
-                                    sage_offer=offer,
-                                    local_offer=local_offer,
-                                    now_ts=now_ts,
-                                ),
-                            )
-                        )
-
-                    if to_delete:
-                        deleted = 0
-                        status_updates = 0
-                        for tid, local_status in to_delete[:50]:  # Cap at 50 per cycle
-                            if wallet_mutation_succeeded(sage_delete_offer(tid)):
-                                deleted += 1
-                                if local_status:
-                                    try:
-                                        if update_offer_status(tid, local_status):
-                                            status_updates += 1
-                                    except Exception:
-                                        pass
-                            time.sleep(0.05)
-                        if deleted > 0:
-                            log_event(
-                                "info",
-                                "sage_offer_cleanup",
-                                f"Deleted {deleted}/{len(to_delete)} "
-                                f"safe-to-delete (cancelled/expired >24h, "
-                                f"DB-verified) offers from Sage",
-                            )
-                            if status_updates > 0:
-                                log_event(
-                                    "debug",
-                                    "sage_offer_cleanup_db",
-                                    f"Updated {status_updates} local offer "
-                                    f"statuses during Sage cleanup",
-                                )
-                    if anomalies > 0:
-                        # Only emit the summary when there are NEW (first-seen)
-                        # anomalies this cycle.  Known anomalies are silently
-                        # counted so the summary still shows the total, but
-                        # repeated cycles won't flood the log.
-                        repeated = anomalies - new_anomalies
-                        if new_anomalies > 0:
-                            log_event(
-                                "info",
-                                "sage_cleanup_anomalies_summary",
-                                _format_sage_cleanup_skip_summary(
-                                    anomalies,
-                                    new_anomalies,
-                                    repeated,
-                                ),
-                            )
-                        # else: all anomalies already seen — no summary spam
-
-                    repaired_fills = backfill_verified_fills_from_offers(
-                        limit=50,
-                        since=getattr(cfg, "RUN_HISTORY_CUTOFF", None),
-                    )
-                    if repaired_fills:
-                        log_event(
-                            "success",
-                            "sage_fill_backfill",
-                            f"Recovered {len(repaired_fills)} verified fill "
-                            f"record{'s' if len(repaired_fills) != 1 else ''} from "
-                            f"Sage-confirmed offer state",
-                        )
-                        for fill in repaired_fills[:10]:
-                            try:
-                                price = float(fill.get("price_xch"))
-                            except Exception:
-                                price = None
-                            try:
-                                size_xch = float(fill.get("size_xch"))
-                            except Exception:
-                                size_xch = None
-                            try:
-                                size_cat = float(fill.get("size_cat"))
-                            except Exception:
-                                size_cat = None
-                            side_label = str(fill.get("side") or "").upper()
-                            trade_preview = str(fill.get("trade_id") or "")[:16]
-                            size_part = (
-                                f" size {size_xch:.4f} XCH"
-                                if isinstance(size_xch, float)
-                                else ""
-                            )
-                            price_part = (
-                                f" at {price:.8f}" if isinstance(price, float) else ""
-                            )
-                            fill_msg = (
-                                f"Sage confirmed {side_label} fill for {trade_preview}..."
-                                f"{size_part}{price_part}"
-                                if side_label
-                                else f"Sage confirmed fill for {trade_preview}..."
-                                f"{size_part}{price_part}"
-                            )
-                            log_event(
-                                "info",
-                                "offer_filled",
-                                fill_msg,
-                                data={
-                                    "fill_id": fill.get("fill_id"),
-                                    "trade_id": fill.get("trade_id"),
-                                    "side": fill.get("side"),
-                                    "price": price,
-                                    "size_xch": size_xch,
-                                    "size_cat": size_cat,
-                                    "tier": fill.get("tier") or "unknown",
-                                    "verification_source": "sage_cleanup",
-                                },
-                            )
-        except Exception as sage_e:
-            log_event(
-                "debug", "sage_cleanup_failed", f"Sage offer cleanup failed: {sage_e}"
-            )
+        # Sage terminal history is authoritative evidence. Keep it intact here;
+        # Task 9 reconciliation is read-only at the wallet boundary, and Task 10
+        # will coordinate long-gap recovery before any later cleanup policy.
 
         log_event("debug", "housekeeping", "Periodic housekeeping completed")
 
@@ -14082,146 +13337,40 @@ class BotLoop:
                 pass
 
     def _repair_unlinked_offer_coins(self) -> None:
-        """F23: repair offer-coin links that didn't fully complete.
-
-        add_offer + lock_coin run as separate DB transactions in
-        offer_manager.create_ladder. If lock_coin fails (lock contention,
-        unique violation, etc.), the offer row has a coin_id but the
-        coin row doesn't have status='locked'. The fill detector still
-        works because it walks via offers.coin_id, but coin_manager
-        thinks the coin is free → may try to use it for another offer.
-
-        This sweep scans for offers where status='open' and the
-        referenced coin is NOT marked locked, and re-runs lock_coin.
-        """
-        try:
-            from database import get_connection, lock_coin, update_offer_status
-        except ImportError:
-            return
+        """Restore missing locks without inferring terminal state from absence."""
 
         try:
-            conn = get_connection()
-            rows = conn.execute(
-                """
-                SELECT o.trade_id, o.coin_id, o.side
-                FROM offers o
-                LEFT JOIN coins c ON o.coin_id = c.coin_id
-                WHERE o.status = 'open'
-                  AND o.coin_id IS NOT NULL
-                  AND o.coin_id != ''
-                  AND (c.status IS NULL OR c.status != 'locked')
-                LIMIT 50
-                """
-            ).fetchall()
-        except Exception as e:
+            from database import get_unlinked_open_offer_coins, lock_coin
+
+            rows = get_unlinked_open_offer_coins(limit=50)
+        except Exception as exc:
             log_event(
-                "debug", "offer_coin_repair_query_failed", f"Repair query failed: {e}"
+                "debug",
+                "offer_coin_repair_query_failed",
+                f"Repair query failed: {exc}",
             )
             return
-
-        if not rows:
-            return
-
-        # F62 (2026-04-09): before re-locking, check whether the wallet still
-        # knows about this offer. The old repair loop re-locked blindly, which
-        # created an infinite self-healing cycle whenever the wallet had
-        # dropped an offer but the DB still had it open: Pass 2 of the Sage
-        # reconciler would free the orphan lock on every cycle, then this
-        # repair would re-lock it, then Pass 2 would free it again. The two
-        # sniper offers at startup were stuck in this loop for ~45 minutes.
-        #
-        # Fix: snapshot the wallet's open trade_ids once up front. If an
-        # offer is in our DB but the wallet doesn't know about it, the offer
-        # is dead (cancelled/filled/expired and the wallet is the source of
-        # truth), so mark it cancelled in the DB instead of re-locking its
-        # coin. Otherwise, re-lock as before.
-        wallet_open_ids = None
-        try:
-            from wallet import get_all_offers
-
-            _open = get_all_offers(include_completed=False, start=0, end=500) or []
-            wallet_open_ids = {
-                (o.get("trade_id") or "").lower()
-                for o in _open
-                if o.get("trade_id")
-                and str(o.get("status", "")).lower()
-                not in ("cancelled", "canceled", "completed", "expired", "failed")
-            }
-        except Exception:
-            wallet_open_ids = None  # Unknown — fall back to old behaviour
-
         repaired = 0
-        orphan_closed = 0
-        orphan_closed_by_side = {"buy": 0, "sell": 0}
         for row in rows:
-            tid = row["trade_id"]
-            cid = row["coin_id"]
-            side = str(row["side"] or "").lower()
-            if not tid or not cid:
-                continue
-            # If we have a reliable wallet snapshot and the offer isn't there,
-            # it's a dead offer — close it instead of relocking.
-            if wallet_open_ids is not None and tid.lower() not in wallet_open_ids:
-                try:
-                    update_offer_status(tid, "cancelled")
-                    orphan_closed += 1
-                    if side in orphan_closed_by_side:
-                        orphan_closed_by_side[side] += 1
-                except Exception:
-                    pass
+            trade_id = row.get("trade_id")
+            coin_id = row.get("coin_id")
+            if not trade_id or not coin_id:
                 continue
             try:
-                if lock_coin(cid, tid):
+                if lock_coin(coin_id, trade_id):
                     repaired += 1
             except Exception:
-                pass
-
-        if repaired > 0:
+                continue
+        if repaired:
             log_event(
                 "info",
                 "offer_coin_link_repaired",
-                f"Repaired {repaired} offer-coin link(s) where the offer "
-                f"existed but the coin row wasn't marked locked. Indicates "
-                f"a previous lock_coin call failed silently.",
-            )
-        if orphan_closed > 0:
-            retry_backoff = max(
-                0.0,
-                float(getattr(cfg, "DB_ONLY_OFFER_RETRY_BACKOFF_SECS", 300) or 300),
-            )
-            if retry_backoff > 0:
-                now = time.time()
-                for side, count in orphan_closed_by_side.items():
-                    if count <= 0:
-                        continue
-                    current_until = float(
-                        self._adaptive_target_backoff_until.get(side, 0.0) or 0.0
-                    )
-                    self._adaptive_target_backoff_until[side] = max(
-                        current_until,
-                        now + retry_backoff,
-                    )
-            log_event(
-                "info",
-                "offer_coin_orphan_closed",
-                f"Closed {orphan_closed} DB offer(s) that no longer exist "
-                f"in the wallet — breaks the re-lock/free loop on dead "
-                f"sniper/ladder offers.",
-                data={
-                    "buy": orphan_closed_by_side["buy"],
-                    "sell": orphan_closed_by_side["sell"],
-                    "adaptive_backoff_secs": retry_backoff,
-                },
+                f"Re-locked {repaired} selected coin(s); wallet-open absence "
+                "was ignored pending authoritative terminal reconciliation.",
             )
 
     def _maybe_run_daily_reconcile(self) -> None:
-        """Run a deep DB↔wallet reconciliation once per 24 hours.
-
-        Backfills missing fills via the existing `backfill_verified_fills_from_offers`
-        helper, then logs a delta summary. Does NOT auto-correct anything
-        beyond what the existing backfill function already does (idempotent
-        record_fill calls for offers marked filled).
-        """
+        """Run read-only DB↔wallet drift diagnostics once per 24 hours."""
         now = time.time()
         last = float(getattr(self, "_last_daily_reconcile_at", 0) or 0)
         if last and (now - last) < 86400:  # 24 hours
@@ -14232,70 +13381,11 @@ class BotLoop:
         )
         self._last_daily_reconcile_at = now
 
-        try:
-            run_history_cutoff = getattr(cfg, "RUN_HISTORY_CUTOFF", None)
-            backfilled = backfill_verified_fills_from_offers(
-                limit=200,
-                since=run_history_cutoff,
-            )
-            backfilled = backfilled or []
-            # F48 (2026-04-09): distinguish between newly-inserted rows and
-            # existing rows whose verification_status was upgraded from
-            # 'legacy' to 'verified'. The old code lumped them together and
-            # logged "backfilled N missing fill rows" even when nothing new
-            # was inserted — misleading for the operator reviewing logs.
-            created_count = sum(1 for r in backfilled if r.get("created"))
-            upgraded_count = sum(1 for r in backfilled if r.get("upgraded"))
-            if created_count > 0:
-                log_event(
-                    "info",
-                    "daily_reconcile_backfilled",
-                    f"Daily reconcile: backfilled {created_count} fill records "
-                    f"for historical offers. PnL tracking is now up to date.",
-                )
-            if upgraded_count > 0:
-                log_event(
-                    "info",
-                    "daily_reconcile_upgraded",
-                    f"Daily reconcile upgraded verification_status on "
-                    f"{upgraded_count} legacy fill row(s) to 'verified'. "
-                    f"No new rows inserted.",
-                )
-            if created_count == 0 and upgraded_count == 0:
-                log_event(
-                    "info",
-                    "daily_reconcile_clean",
-                    "Daily reconcile: no missing fills found (PnL is in sync)",
-                )
-
-            # F62 (2026-04-09): if the backfill changed the all-time net
-            # position, the position-sanity baseline snapshot is now stale.
-            # The baseline was taken at session start when the fills table
-            # was still missing these rows, so it captured `baseline_net=0`.
-            # Leaving it stale makes `_check_position_sanity` fire every
-            # cycle with a phantom "wallet delta" equal to whatever the
-            # reconcile added. Reset it so the next housekeeping tick
-            # re-snaps against the fresh (correct) all-time position.
-            if created_count > 0 or upgraded_count > 0:
-                try:
-                    self.risk_manager.update_inventory()  # refresh net_position_cat
-                except Exception:
-                    pass
-                self._position_baseline_cat = None
-                self._position_baseline_net_cat = None
-                self._position_baseline_at = None
-                log_event(
-                    "info",
-                    "position_baseline_invalidated",
-                    "Position sanity baseline cleared after reconcile "
-                    "updated the fills table — will re-snap next tick.",
-                )
-        except Exception as _bf_err:
-            log_event(
-                "warning",
-                "daily_reconcile_backfill_failed",
-                f"Daily reconcile backfill step failed: {_bf_err}",
-            )
+        log_event(
+            "info",
+            "daily_reconcile_authoritative_deferred",
+            "Status-only fill backfill is disabled; exact terminal proof is required",
+        )
 
         # Sanity check: number of open offers in DB vs in wallet
         try:

@@ -786,16 +786,8 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(len(not_submitted_events), 1)
         self.assertEqual(not_submitted_events[0].args[0], "info")
 
-    def test_orphan_offer_cleanup_sets_adaptive_backoff_for_closed_side(self):
+    def test_orphan_offer_cleanup_relocks_without_absence_terminalization(self):
         loop = bot_loop.BotLoop()
-
-        class _Conn:
-            def execute(self, *args, **kwargs):
-                return self
-
-            def fetchall(self):
-                return [{"trade_id": "dead-sell", "coin_id": "0xcoin", "side": "sell"}]
-
         updates = []
 
         def _update_offer_status(trade_id, status):
@@ -805,9 +797,16 @@ class ProbeAnchorTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"database": fake_database, "wallet": fake_wallet}),
             patch.object(
-                fake_database, "get_connection", return_value=_Conn(), create=True
+                fake_database,
+                "get_unlinked_open_offer_coins",
+                return_value=[
+                    {"trade_id": "dead-sell", "coin_id": "0xcoin", "side": "sell"}
+                ],
+                create=True,
             ),
-            patch.object(fake_database, "lock_coin", return_value=True, create=True),
+            patch.object(
+                fake_database, "lock_coin", return_value=True, create=True
+            ) as lock_coin,
             patch.object(
                 fake_database, "update_offer_status", side_effect=_update_offer_status
             ),
@@ -817,8 +816,9 @@ class ProbeAnchorTests(unittest.TestCase):
         ):
             loop._repair_unlinked_offer_coins()
 
-        self.assertEqual(updates, [("dead-sell", "cancelled")])
-        self.assertGreaterEqual(loop._adaptive_target_backoff_until["sell"], 1300.0)
+        self.assertEqual(updates, [])
+        lock_coin.assert_called_once_with("0xcoin", "dead-sell")
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
         self.assertEqual(loop._adaptive_target_backoff_until["buy"], 0.0)
 
     def test_daily_reconcile_recent_db_only_offers_are_visibility_info(self):
@@ -840,9 +840,6 @@ class ProbeAnchorTests(unittest.TestCase):
 
         with (
             patch.dict(sys.modules, {"database": fake_database}),
-            patch.object(
-                bot_loop, "backfill_verified_fills_from_offers", return_value=[]
-            ),
             patch.object(fake_database, "get_open_offers", return_value=db_open),
             patch.object(bot_loop, "get_all_offers", return_value=wallet_open),
             patch.object(bot_loop.time, "time", return_value=now_ts),

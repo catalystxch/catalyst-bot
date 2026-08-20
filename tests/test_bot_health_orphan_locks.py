@@ -1,6 +1,4 @@
-"""Tests for bot_health.check_orphan_locks() — finds DB-locked coins
-whose trade_id points to no open offer and frees them.
-"""
+"""Tests for proof-safe diagnostics of DB-locked, orphan-looking coins."""
 
 import sys
 import types
@@ -93,11 +91,8 @@ def _orphan(coin_id, last_seen=None, trade_id=None, wt="cat"):
 class CheckOrphanLocksTests(_ModuleStubMixin, unittest.TestCase):
     def _patch_db(self, orphans):
         fake = types.ModuleType("database")
-        cur = MagicMock()
-        cur.fetchall.return_value = [orphans] if isinstance(orphans, dict) else orphans
-        conn = MagicMock()
-        conn.execute.return_value = cur
-        fake.get_connection = lambda: conn
+        rows = [orphans] if isinstance(orphans, dict) else orphans
+        fake.get_orphan_coin_locks = lambda: rows
         fake.free_coin = MagicMock(return_value=True)
         sys.modules["database"] = fake
         if "wallet" not in sys.modules:
@@ -124,14 +119,15 @@ class CheckOrphanLocksTests(_ModuleStubMixin, unittest.TestCase):
         self.assertEqual(c.status, "pass")
         self.assertEqual(c.anomaly_count, 0)
 
-    def test_old_orphan_is_freed(self):
+    def test_old_orphan_is_reported_without_release(self):
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         orphans = [_orphan("0xcoin1", last_seen=old, trade_id="dead_tid")]
         fake_db = self._patch_db(orphans)
         c = bot_health.check_orphan_locks(auto_repair=True)
-        self.assertEqual(c.repaired_count, 1)
-        fake_db.free_coin.assert_called_once_with("0xcoin1")
-        self.assertIn("freed_orphan_lock", c.repair_log[0])
+        self.assertEqual(c.status, "warn")
+        self.assertEqual(c.anomaly_count, 1)
+        self.assertEqual(c.repaired_count, 0)
+        fake_db.free_coin.assert_not_called()
 
     def test_recent_orphan_is_left_alone(self):
         # 30s ago — within the grace window (default 300s)
@@ -153,13 +149,14 @@ class CheckOrphanLocksTests(_ModuleStubMixin, unittest.TestCase):
         self.assertEqual(c.repaired_count, 0)
         fake_db.free_coin.assert_not_called()
 
-    def test_orphan_with_no_last_seen_treated_as_actionable(self):
-        """Coin without a last_seen timestamp can't be aged — but it's still
-        an orphan, so we treat it as actionable rather than skip forever."""
+    def test_orphan_with_no_last_seen_is_reported_without_release(self):
         orphans = [_orphan("0xcoin1", last_seen=None)]
         fake_db = self._patch_db(orphans)
         c = bot_health.check_orphan_locks(auto_repair=True)
-        self.assertEqual(c.repaired_count, 1)
+        self.assertEqual(c.status, "warn")
+        self.assertEqual(c.anomaly_count, 1)
+        self.assertEqual(c.repaired_count, 0)
+        fake_db.free_coin.assert_not_called()
 
     def test_wallet_confirmed_external_lock_is_not_freed(self):
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()

@@ -11,29 +11,20 @@ import bot_loop
 
 
 class BotLoopDailyReconcileTests(unittest.TestCase):
-    def test_daily_reconcile_scopes_backfill_to_fresh_run_cutoff(self):
-        cutoff = "2026-04-30 19:09:43"
+    def test_daily_reconcile_does_not_backfill_without_authoritative_proof(self):
         host = types.SimpleNamespace(_last_daily_reconcile_at=0)
-        calls = []
-
-        def fake_backfill(*args, **kwargs):
-            calls.append((args, kwargs))
-            return []
 
         with (
-            patch.object(bot_loop.cfg, "RUN_HISTORY_CUTOFF", cutoff, create=True),
             patch.object(bot_loop.cfg, "SPACESCAN_ENABLED", False),
-            patch.object(
-                bot_loop, "backfill_verified_fills_from_offers", fake_backfill
-            ),
             patch.object(bot_loop, "get_all_offers", return_value=[]),
             patch("database.get_open_offers", return_value=[]),
-            patch.object(bot_loop, "log_event"),
+            patch.object(bot_loop, "log_event") as log_event_mock,
         ):
             bot_loop.BotLoop._maybe_run_daily_reconcile(host)
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1].get("since"), cutoff)
+        events = [call.args[1] for call in log_event_mock.call_args_list]
+        self.assertIn("daily_reconcile_authoritative_deferred", events)
+        self.assertFalse(hasattr(bot_loop, "backfill_verified_fills_from_offers"))
 
     def test_state_recent_fills_scoped_to_fresh_run_cutoff(self):
         cutoff = "2026-04-30 19:09:43"

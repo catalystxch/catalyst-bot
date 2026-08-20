@@ -233,6 +233,29 @@ def get_wallet_type() -> str:
     return WALLET_TYPE
 
 
+def get_coins_by_ids(coin_ids: list) -> dict | None:
+    """Read exact owned/spent coin records through the selected adapter.
+
+    Sage provides the authoritative targeted endpoint.  Older Chia adapters do
+    not expose an equivalent complete spent-coin read, so they return ``None``
+    and reconciliation stays fail-closed instead of substituting a spendable
+    snapshot.  This function is read-only and never enters the mutation gate.
+    """
+
+    if type(coin_ids) is not list or any(
+        type(coin_id) is not str for coin_id in coin_ids
+    ):
+        return None
+    reader = getattr(_wallet_adapter, "get_coins_by_ids", None)
+    if not callable(reader):
+        return None
+    try:
+        result = reader(list(coin_ids))
+    except Exception:
+        return None
+    return result if type(result) is dict else None
+
+
 MUTATING_WALLET_EXPORTS = frozenset(
     {
         "cancel_offer",
@@ -805,9 +828,9 @@ def wallet_mutation_count(result) -> int:
     return result if type(result) is int and result >= 0 else 0
 
 
-def _expected_identity_authority() -> (
-    tuple[mutation_gate.WalletIdentityBinding, object]
-):
+def _expected_identity_authority() -> tuple[
+    mutation_gate.WalletIdentityBinding, object
+]:
     """Return the frozen binding and adapter selected at authority acquisition."""
 
     candidate_adapter = _wallet_adapter

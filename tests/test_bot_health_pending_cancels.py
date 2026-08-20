@@ -84,7 +84,7 @@ class _ModuleStubMixin:
     later test files (test_coin_manager_topup_fail_closed and friends
     that do real imports of those modules)."""
 
-    _STUBBED_NAMES = ("database", "wallet", "wallet_sage")
+    _STUBBED_NAMES = ("api_server", "database", "wallet", "wallet_sage")
 
     def setUp(self):
         self._saved_modules = {}
@@ -315,6 +315,7 @@ class RunRuntimeChecksTests(_ModuleStubMixin, unittest.TestCase):
         """Stub the full database surface used by every health check."""
         fake_db = types.ModuleType("database")
         fake_db.get_open_offers = lambda **kw: []
+        fake_db.get_orphan_coin_locks = lambda: []
         # check_orphan_locks + check_stale_dexie_posts call get_connection()
         # and execute SELECT statements; a default MagicMock returns a chain
         # that fetchall()s to []
@@ -331,6 +332,14 @@ class RunRuntimeChecksTests(_ModuleStubMixin, unittest.TestCase):
         fake_db.get_setting = MagicMock(return_value=None)
         fake_db.set_setting = MagicMock(return_value=True)
         sys.modules["database"] = fake_db
+        fake_api = types.ModuleType("api_server")
+        fake_api.bot = None
+        fake_api.events = None
+        sys.modules["api_server"] = fake_api
+        fake_wallet = types.ModuleType("wallet")
+        fake_wallet.get_wallet_type = lambda: "chia"
+        fake_wallet.get_wallet_balance = lambda _wallet_id: None
+        sys.modules["wallet"] = fake_wallet
         return fake_db
 
     def test_run_runtime_checks_throttles(self):

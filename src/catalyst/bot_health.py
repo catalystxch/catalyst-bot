@@ -195,14 +195,10 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
       D. Dexie returns nothing / unreachable → leave as pending, try again
          next cycle.
 
-    No cancellation repair or terminal write occurs in this check. The
-    existing verified-fill recovery remains independent of cancellation.
+    No cancellation or fill terminal write occurs in this check.  Dexie and
+    Spacescan observations are diagnostics for the Task 9 reconciler only.
     """
-    from database import (
-        get_open_offers,
-        update_offer_status,
-        transition_offer,
-    )
+    from database import get_open_offers
 
     pending = get_open_offers(include_pending_cancel=True)
     pending = [
@@ -251,13 +247,13 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
     repair_log = []
     repaired = 0
 
-    # --- C: suspected fills — attempt Spacescan-verified recovery ---
+    # --- C: suspected fills — collect diagnostics, never write terminal ---
     # A pending-cancel row with Dexie status COMPLETED means the offer
     # was filled BEFORE our cancel landed. fill_tracker may have missed
     # it because the trade_id no longer appears in a "disappeared" set
     # (it's out of the _previous_ids window by now). Run Spacescan
-    # directly; if it confirms a real fill, commit the DB status change
-    # and clear the bot-cancel marker so downstream flows reconcile.
+    # directly for operator context. A spent-looking coin is still not the
+    # exact offer/amount/receipt proof required by Task 9.
     if auto_repair and suspected_fills:
         try:
             from spacescan import verify_fill as _spacescan_verify
@@ -298,34 +294,18 @@ def check_pending_cancels(auto_repair: bool = True) -> HealthCheck:
                         break
 
             if verdict == "filled":
-                try:
-                    update_offer_status(tid, "filled")
-                    try:
-                        transition_offer(tid, "fill_verified")
-                    except Exception:
-                        pass
-                    msg = (
-                        f"recovered_fill tid={tid[:16]}... — Dexie COMPLETED + "
-                        f"Spacescan confirmed on-chain spend"
-                    )
-                    repair_log.append(msg)
-                    slog(
-                        "BOT_HEALTH",
-                        msg,
-                        level="info",
-                        data={
-                            "trade_id": tid,
-                            "dexie_id": off.get("dexie_id"),
-                            "source": "bot_health.suspected_fill_recovery",
-                        },
-                    )
-                    repaired += 1
-                except Exception as e:
-                    slog(
-                        "BOT_HEALTH",
-                        f"Failed to commit recovered fill for tid={tid[:16]}...: {e}",
-                        level="warn",
-                    )
+                slog(
+                    "BOT_HEALTH",
+                    f"Offer tid={tid[:16]}... has Dexie COMPLETED plus a "
+                    "Spacescan spent-coin observation; leaving it nonterminal "
+                    "for exact authoritative reconciliation.",
+                    level="warn",
+                    data={
+                        "trade_id": tid,
+                        "dexie_id": off.get("dexie_id"),
+                        "source": "bot_health.suspected_fill_observation",
+                    },
+                )
             else:
                 verdict_str = verdict if verdict is not None else "unavailable"
                 slog(
@@ -460,28 +440,13 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
       - Offer was filled and removed but coin lineage tracking lagged
       - trade_id points to a stale/never-existed offer (rare data corruption)
 
-    Repair: free the lock so the coin returns to its tier pool. This is
-    safe because:
-      - If a real offer DOES still hold the coin via Sage, the next
-        reconcile cycle will re-lock it (bot trusts wallet state).
-      - If the coin is genuinely free in Sage, freeing the DB lock is
-        the correct action.
+    This check is diagnostic only.  Absence from a local open-offer join and
+    an unlocked-looking wallet snapshot are not terminal proof, so Task 9
+    retains the lock until exact fill/cancel/expiry reconciliation.
     """
-    from database import get_connection, free_coin
+    from database import get_orphan_coin_locks
 
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT c.coin_id, c.wallet_type, c.amount_mojos, c.trade_id, "
-        "       c.assigned_tier, c.last_seen "
-        "FROM coins c "
-        "WHERE c.status = 'locked' "
-        "  AND (c.trade_id IS NULL "
-        "       OR c.trade_id NOT IN ("
-        "          SELECT trade_id FROM offers "
-        "          WHERE status = 'open' AND trade_id IS NOT NULL"
-        "       ))"
-    ).fetchall()
-    orphans = [dict(r) for r in rows]
+    orphans = get_orphan_coin_locks()
 
     if not orphans:
         return HealthCheck(
@@ -495,7 +460,8 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
     # Wallet-confirmed locks may belong to NFT/off-wallet offers; leave those alone.
     wallet_locked_ids = _wallet_confirmed_locked_coin_ids()
 
-    # Only act on old DB-only locks so we do not race in-flight reconcile updates.
+    # Age separates actionable diagnostics from in-flight noise; it does not
+    # grant release authority.
     now = time.time()
     actionable = []
     too_fresh = 0
@@ -512,25 +478,13 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
 
     repair_log = []
     repaired = 0
-    if auto_repair:
-        for o in actionable:
-            cid = o["coin_id"]
-            try:
-                if free_coin(cid):
-                    msg = (
-                        f"freed_orphan_lock coin={cid[:18]}... "
-                        f"wt={o['wallet_type']} amt={o['amount_mojos']:,} "
-                        f"prior_trade={(o.get('trade_id') or 'none')[:16]}"
-                    )
-                    repair_log.append(msg)
-                    slog("BOT_HEALTH", msg, level="info")
-                    repaired += 1
-            except Exception as e:
-                slog(
-                    "BOT_HEALTH",
-                    f"Failed to free orphan lock {cid[:18]}...: {e}",
-                    level="warn",
-                )
+    if auto_repair and actionable:
+        slog(
+            "BOT_HEALTH",
+            f"Deferred {len(actionable)} orphan-looking coin lock(s) to "
+            "authoritative terminal reconciliation",
+            level="warn",
+        )
 
     if not actionable and wallet_confirmed and not too_fresh:
         return HealthCheck(
@@ -559,8 +513,8 @@ def check_orphan_locks(auto_repair: bool = True) -> HealthCheck:
     return HealthCheck(
         name="orphan_locks",
         category="coins",
-        status="warn" if (actionable and not auto_repair) else "pass",
-        severity="warning" if (actionable and not auto_repair) else "info",
+        status="warn" if actionable else "pass",
+        severity="warning" if actionable else "info",
         message=(
             f"{len(actionable)} orphan locks ({too_fresh} too fresh, "
             f"{wallet_confirmed} wallet-confirmed)"
@@ -1126,11 +1080,11 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
 
     # ---- XCH advisory ----
     try:
-        from wallet_sage import get_wallet_balance as _sage_balance
+        from wallet import get_wallet_balance as _wallet_balance
         from wallet import get_wallet_type as _wt
 
         if _wt() == "sage":
-            raw = _sage_balance(int(getattr(cfg, "WALLET_ID_XCH", 1) or 1)) or {}
+            raw = _wallet_balance(int(getattr(cfg, "WALLET_ID_XCH", 1) or 1)) or {}
             wb = raw.get("wallet_balance") or {}
             spendable_mojos = int(wb.get("spendable_balance", 0) or 0)
         else:
@@ -1198,11 +1152,11 @@ def check_funds_advisory(auto_repair: bool = True) -> HealthCheck:
 
     # ---- CAT advisory ----
     try:
-        from wallet_sage import get_wallet_balance as _sage_balance
+        from wallet import get_wallet_balance as _wallet_balance
         from wallet import get_wallet_type as _wt
 
         if _wt() == "sage":
-            raw = _sage_balance(int(getattr(cfg, "CAT_WALLET_ID", 2) or 2)) or {}
+            raw = _wallet_balance(int(getattr(cfg, "CAT_WALLET_ID", 2) or 2)) or {}
             wb = raw.get("wallet_balance") or {}
             spendable_mojos = int(wb.get("spendable_balance", 0) or 0)
         else:
