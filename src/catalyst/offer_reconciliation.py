@@ -61,6 +61,7 @@ _MAX_TRANSACTION_FLOWS = 512
 _MAX_CANCEL_MEMBERS = 64
 _MAX_AUXILIARY_COINS = 256
 _MAX_COIN_RECORDS = 4096
+_MAX_SOURCE_TIMESTAMPS = 4096
 _SENSITIVE_KEYS = frozenset(
     {
         "key",
@@ -200,6 +201,16 @@ def _redact_json(
             raise _EvidenceEncodingError("evidence object cap exceeded")
         if any(type(key) is not str for key in value):
             raise _EvidenceEncodingError("evidence object key is not text")
+        for key in value:
+            try:
+                encoded_key = key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise _EvidenceEncodingError(
+                    "evidence object key is not valid UTF-8"
+                ) from exc
+            state["text_bytes"] += len(encoded_key)
+            if state["text_bytes"] > _MAX_CANONICAL_TEXT_BYTES:
+                raise _EvidenceEncodingError("evidence text cap exceeded")
         container_id = id(value)
         if container_id in state["active_containers"]:
             raise _EvidenceEncodingError("cyclic evidence container")
@@ -425,27 +436,32 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
         or not identity["read_observed_at"]
     ):
         return "EVIDENCE_TIMESTAMP_INVALID"
-    for timestamp in [
-        identity["observed_at"],
-        *identity["source_observed_at_all"],
-        *identity["read_observed_at"],
-    ]:
-        if not _is_canonical_utc_text(timestamp):
-            return "EVIDENCE_TIMESTAMP_INVALID"
-        parsed = _parse_utc(timestamp)
-        if parsed is None:
-            return "EVIDENCE_TIMESTAMP_INVALID"
-        timestamp_age = (top_observed - parsed).total_seconds()
-        if timestamp_age < -30 or timestamp_age > _MAX_EVIDENCE_AGE_SECONDS:
-            return "EVIDENCE_STALE"
-    effective_times.extend(
-        _parse_utc(timestamp)
-        for timestamp in [
-            identity["observed_at"],
-            *identity["source_observed_at_all"],
-            *identity["read_observed_at"],
-        ]
+    identity_source_times = identity["source_observed_at_all"]
+    identity_read_times = identity["read_observed_at"]
+    if (
+        len(identity_source_times) > _MAX_SOURCE_TIMESTAMPS
+        or len(identity_read_times) > _MAX_SOURCE_TIMESTAMPS
+    ):
+        return "EVIDENCE_SOURCE_LIMIT_EXCEEDED"
+    identity_singular_source = identity["source_observed_at"]
+    identity_times = (
+        (identity["observed_at"], identity_singular_source),
+        identity_source_times,
+        identity_read_times,
     )
+    for timestamps in identity_times:
+        for timestamp in timestamps:
+            if not _is_canonical_utc_text(timestamp):
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            parsed = _parse_utc(timestamp)
+            if parsed is None:
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            timestamp_age = (top_observed - parsed).total_seconds()
+            if timestamp_age < -30 or timestamp_age > _MAX_EVIDENCE_AGE_SECONDS:
+                return "EVIDENCE_STALE"
+            effective_times.append(parsed)
+    if identity_singular_source not in identity_source_times:
+        return "EVIDENCE_TIMESTAMP_INVALID"
     for name, reason in (
         ("offer_history", "OFFER_HISTORY_INCOMPLETE"),
         ("transaction_history", "TRANSACTION_HISTORY_INCOMPLETE"),
@@ -456,6 +472,17 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
             return reason
         if type(source.get("provenance")) is not str or not source["provenance"]:
             return reason
+        all_source_times = source.get("source_observed_at_all")
+        if all_source_times is not None:
+            if type(all_source_times) is not list:
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            if len(all_source_times) > _MAX_SOURCE_TIMESTAMPS:
+                return "EVIDENCE_SOURCE_LIMIT_EXCEEDED"
+        read_times = source.get("read_observed_at")
+        if type(read_times) is not list or not read_times:
+            return "EVIDENCE_TIMESTAMP_INVALID"
+        if len(read_times) > _MAX_SOURCE_TIMESTAMPS:
+            return "EVIDENCE_SOURCE_LIMIT_EXCEEDED"
         if not _is_canonical_utc_text(source.get("observed_at")):
             return "EVIDENCE_TIMESTAMP_INVALID"
         observed = _parse_utc(source.get("observed_at"))
@@ -481,9 +508,11 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
                 return "EVIDENCE_STALE"
             effective = source_observed
             effective_times.append(source_observed)
-        all_source_times = source.get("source_observed_at_all")
         if all_source_times is not None:
-            if type(all_source_times) is not list:
+            if (
+                source_observed_at is not None
+                and source_observed_at not in all_source_times
+            ):
                 return "EVIDENCE_TIMESTAMP_INVALID"
             if not all_source_times:
                 effective_times.append(effective)
@@ -499,9 +528,6 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
                 effective_times.append(parsed_source_time)
         else:
             effective_times.append(effective)
-        read_times = source.get("read_observed_at")
-        if type(read_times) is not list or not read_times:
-            return "EVIDENCE_TIMESTAMP_INVALID"
         for read_time in read_times:
             if not _is_canonical_utc_text(read_time):
                 return "EVIDENCE_TIMESTAMP_INVALID"
@@ -1946,7 +1972,11 @@ def _incomplete_loader_evidence(
     }
 
 
-def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict], Any]]:
+class _PostFillEffectUncertain(RuntimeError):
+    """A durable or process effect may exist but its acknowledgement is unsure."""
+
+
+def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., Any]]:
     """Build additive, replay-safe callbacks for one committed durable fill."""
 
     import database
@@ -1967,7 +1997,9 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
     }
     classification_box: dict[str, Any] = {}
 
-    def offer_filled_event(_row: dict[str, Any]) -> dict[str, Any]:
+    def offer_filled_event(
+        _row: dict[str, Any], *, claim_token: str, claim_generation: int
+    ) -> dict[str, Any]:
         return database.log_authoritative_offer_filled_once(
             int(fill["fill_id"]),
             f"{str(fill['side']).upper()} offer {trade_id[:16]}... "
@@ -1981,24 +2013,54 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
                 "spent_block_index": fill.get("spent_block_index"),
             },
             created_at=fill["filled_at"],
+            claim_token=claim_token,
+            claim_generation=claim_generation,
         )
 
-    def boost_notification(_row: dict[str, Any]) -> dict[str, Any]:
+    def boost_notification(
+        _row: dict[str, Any], *, claim_token: str, claim_generation: int
+    ) -> dict[str, Any]:
         applicable = str(fill.get("tier") or "").lower() == "boost"
-        acknowledgement = database.record_offer_fill_hook_sink_ack(
-            int(fill["fill_id"]),
-            "boost_notification",
-            {"trade_id": trade_id, "applicable": applicable},
-        )
         if not applicable:
-            return acknowledgement
+            return database.record_offer_fill_hook_sink_ack(
+                int(fill["fill_id"]),
+                "boost_notification",
+                {"trade_id": trade_id, "applicable": False},
+                claim_token=claim_token,
+                claim_generation=claim_generation,
+            )
+        database.register_authoritative_boost_fill_command(
+            int(fill["fill_id"]),
+            trade_id,
+            str(fill["side"]),
+            claim_token=claim_token,
+            claim_generation=claim_generation,
+        )
         api_server = sys.modules.get("api_server")
         bot_ref = getattr(api_server, "bot", None) if api_server is not None else None
         manager = getattr(bot_ref, "boost_manager", None) if bot_ref else None
         if manager is None or not hasattr(manager, "notify_boost_fill"):
             raise RuntimeError("BoostManager is unavailable")
-        manager.notify_boost_fill(trade_id)
-        return acknowledgement
+        if hasattr(manager, "notify_authoritative_boost_fill"):
+            applied = manager.notify_authoritative_boost_fill(
+                int(fill["fill_id"]), trade_id, str(fill["side"])
+            )
+        else:
+            applied = manager.notify_boost_fill(trade_id)
+        if applied is not True:
+            raise RuntimeError("BoostManager rejected authoritative fill")
+        try:
+            return database.complete_authoritative_boost_fill_command(
+                int(fill["fill_id"]),
+                trade_id,
+                str(fill["side"]),
+                claim_token=claim_token,
+                claim_generation=claim_generation,
+            )
+        except Exception as exc:
+            raise _PostFillEffectUncertain(
+                "Boost effect succeeded before durable acknowledgement"
+            ) from exc
 
     def classification():
         existing = classification_box.get("value")
@@ -2008,6 +2070,13 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
 
         result = classify_fill(trade_id, fill_detail, None)
         result.side = fill["side"]
+        classification_box["value"] = result
+        return result
+
+    def fill_classification(
+        _row: dict[str, Any], *, claim_token: str, claim_generation: int
+    ) -> dict[str, Any]:
+        result = classification()
         acknowledgement = database.store_authoritative_fill_classification_ack(
             int(fill["fill_id"]),
             {
@@ -2016,29 +2085,46 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict]
                 "taker_puzzle_hash": result.taker_puzzle_hash,
                 "sweep_group_id": result.sweep_group_id,
             },
+            claim_token=claim_token,
+            claim_generation=claim_generation,
         )
-        classification_box["value"] = result
-        classification_box["acknowledgement"] = acknowledgement
-        return result
+        return acknowledgement
 
-    def fill_classification(_row: dict[str, Any]) -> dict[str, Any]:
-        classification()
-        return classification_box["acknowledgement"]
-
-    def sweep_registration(_row: dict[str, Any]) -> dict[str, Any]:
-        from sweep_coordinator import get_coordinator
-
+    def sweep_registration(
+        _row: dict[str, Any], *, claim_token: str, claim_generation: int
+    ) -> dict[str, Any]:
         result = classification()
-        acknowledgement = database.record_offer_fill_hook_sink_ack(
+        database.register_authoritative_sweep_fill(
             int(fill["fill_id"]),
-            "sweep_registration",
             {
                 "trade_id": trade_id,
+                "classification": result.classification,
                 "spent_block_index": result.spent_block_index,
+                "taker_puzzle_hash": result.taker_puzzle_hash,
+                "sweep_group_id": result.sweep_group_id,
+                "side": fill["side"],
             },
+            claim_token=claim_token,
+            claim_generation=claim_generation,
         )
-        get_coordinator().process_fill(int(fill["fill_id"]), result)
-        return acknowledgement
+        try:
+            from sweep_coordinator import get_coordinator
+
+            coordinator = get_coordinator()
+            coordinator.process_fill(int(fill["fill_id"]), result)
+            if hasattr(coordinator, "has_registered_fill") and not (
+                coordinator.has_registered_fill(int(fill["fill_id"]))
+            ):
+                raise RuntimeError("SweepCoordinator rejected durable registration")
+            return database.acknowledge_authoritative_sweep_registration(
+                int(fill["fill_id"]),
+                claim_token=claim_token,
+                claim_generation=claim_generation,
+            )
+        except Exception as exc:
+            raise _PostFillEffectUncertain(
+                "sweep registration is durable but process delivery is uncertain"
+            ) from exc
 
     return {
         "offer_filled_event": offer_filled_event,
@@ -2055,7 +2141,28 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
 
     _ = completed_at
     results: dict[str, str] = {}
-    for hook_name, callback in _post_fill_hook_callbacks(fill).items():
+    try:
+        callbacks = _post_fill_hook_callbacks(fill)
+    except Exception:
+        try:
+            results = database.record_offer_fill_hook_construction_failure(
+                int(fill["fill_id"])
+            )
+        except Exception:
+            results = {
+                name: "in_progress" for name in database._AUTHORITATIVE_FILL_HOOKS
+            }
+        try:
+            database.log_event(
+                "warning",
+                "authoritative_fill_hook_construction_failed",
+                f"Post-fill callbacks could not be built for fill {fill['fill_id']}",
+                data={"fill_id": fill["fill_id"]},
+            )
+        except Exception:
+            pass
+        return results
+    for hook_name, callback in callbacks.items():
         try:
             claim = database.claim_offer_fill_hook(int(fill["fill_id"]), hook_name)
         except Exception:
@@ -2077,7 +2184,6 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         claim_token = claim["claim_token"]
         claim_generation = claim["claim_generation"]
         heartbeat_stop = threading.Event()
-        heartbeat_uncertain = threading.Event()
 
         def maintain_claim() -> None:
             interval = max(0.01, database._AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS / 3)
@@ -2090,10 +2196,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
                         claim_generation,
                     )
                 except Exception:
-                    heartbeat_uncertain.set()
                     return
                 if not held:
-                    heartbeat_uncertain.set()
                     return
 
         heartbeat_thread = threading.Thread(
@@ -2102,65 +2206,84 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             daemon=True,
         )
         heartbeat_thread.start()
+        effect_boundary = False
         try:
-            acknowledgement = callback(fill)
+            acknowledgement = callback(
+                fill,
+                claim_token=claim_token,
+                claim_generation=claim_generation,
+            )
             if not database.validate_offer_fill_hook_sink_ack(
-                int(fill["fill_id"]), hook_name, acknowledgement
+                int(fill["fill_id"]),
+                hook_name,
+                acknowledgement,
+                claim_token=claim_token,
+                claim_generation=claim_generation,
             ):
                 raise RuntimeError(
                     "post-fill sink did not return its durable fill acknowledgement"
                 )
-            if heartbeat_uncertain.is_set():
-                raise RuntimeError("post-fill hook claim heartbeat is uncertain")
-        except Exception:
+            effect_boundary = True
+        except Exception as exc:
+            effect_boundary = isinstance(exc, _PostFillEffectUncertain)
             try:
-                reset = database.fail_offer_fill_hook(
+                effect_boundary = (
+                    database.has_offer_fill_hook_delivery_ack(
+                        int(fill["fill_id"]),
+                        hook_name,
+                        claim_token,
+                        claim_generation,
+                    )
+                    or effect_boundary
+                )
+            except Exception:
+                pass
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+        if effect_boundary:
+            try:
+                completed = database.complete_offer_fill_hook(
                     int(fill["fill_id"]),
                     hook_name,
                     claim_token,
                     claim_generation=claim_generation,
-                    error_code="CALLBACK_FAILED",
                 )
             except Exception:
-                reset = False
-            results[hook_name] = "failed" if reset else "in_progress"
-            try:
-                database.log_event(
-                    "warning",
-                    "authoritative_fill_hook_failed",
-                    f"Post-fill hook {hook_name} failed for fill {fill['fill_id']}",
-                    data={"fill_id": fill["fill_id"], "hook_name": hook_name},
-                )
-            except Exception:
-                pass
+                results[hook_name] = "in_progress"
+                try:
+                    database.log_event(
+                        "warning",
+                        "authoritative_fill_hook_receipt_uncertain",
+                        f"Post-fill hook {hook_name} receipt is uncertain for fill "
+                        f"{fill['fill_id']}",
+                        data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+                    )
+                except Exception:
+                    pass
+            else:
+                results[hook_name] = "completed" if completed else "already_completed"
             continue
-        finally:
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1)
         try:
-            database.complete_offer_fill_hook(
+            reset = database.fail_offer_fill_hook(
                 int(fill["fill_id"]),
                 hook_name,
                 claim_token,
                 claim_generation=claim_generation,
+                error_code="CALLBACK_FAILED",
             )
         except Exception:
-            # The callback crossed its effect boundary.  A receipt failure is
-            # therefore uncertain and must retain the running claim: resetting
-            # it to pending would let replay duplicate the external effect.
-            results[hook_name] = "in_progress"
-            try:
-                database.log_event(
-                    "warning",
-                    "authoritative_fill_hook_receipt_uncertain",
-                    f"Post-fill hook {hook_name} receipt is uncertain for fill "
-                    f"{fill['fill_id']}",
-                    data={"fill_id": fill["fill_id"], "hook_name": hook_name},
-                )
-            except Exception:
-                pass
-        else:
-            results[hook_name] = "completed"
+            reset = False
+        results[hook_name] = "failed" if reset else "in_progress"
+        try:
+            database.log_event(
+                "warning",
+                "authoritative_fill_hook_failed",
+                f"Post-fill hook {hook_name} failed for fill {fill['fill_id']}",
+                data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+            )
+        except Exception:
+            pass
     return results
 
 

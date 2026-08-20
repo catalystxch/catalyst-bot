@@ -286,6 +286,18 @@ class BoostManager:
         # one of our probes (and thus an arb, not just a stale cancel).
         self._buy_probe_tid_history: set = set()
         self._sell_probe_tid_history: set = set()
+        # Fill-keyed durable commands let a recreated manager distinguish a
+        # replay from a new Boost effect. Database startup can be unavailable
+        # in narrow unit contexts, so an empty cache remains retry-safe.
+        self._authoritative_boost_fill_ids: set[int] = set()
+        try:
+            from database import get_applied_authoritative_boost_fill_ids
+
+            self._authoritative_boost_fill_ids.update(
+                get_applied_authoritative_boost_fill_ids()
+            )
+        except Exception:
+            pass
         # Alternation flag — only push one side per cycle to avoid
         # mempool conflicts caused by simultaneous cancel+create on
         # both sides at once (Sage/mempool stress test 2026-04-25).
@@ -1089,6 +1101,32 @@ class BoostManager:
                 self._on_inverted_arb("sell")
                 return True
         return False
+
+    def notify_authoritative_boost_fill(
+        self, fill_id: int, trade_id: str, side: str
+    ) -> bool:
+        """Apply one fill-keyed durable command exactly once per process state."""
+
+        if (
+            type(fill_id) is not int
+            or fill_id <= 0
+            or not trade_id
+            or side not in {"buy", "sell"}
+        ):
+            return False
+        with self._lock:
+            if fill_id in self._authoritative_boost_fill_ids:
+                return True
+            applied = self.notify_boost_fill(trade_id)
+            if applied is not True:
+                settled = self._buy_settled if side == "buy" else self._sell_settled
+                if not settled:
+                    self._on_inverted_arb(side)
+                applied = self._buy_settled if side == "buy" else self._sell_settled
+            if applied is not True:
+                return False
+            self._authoritative_boost_fill_ids.add(fill_id)
+            return True
 
     def _on_inverted_arb(self, side: str):
         """Called from prune_active_boosts when a probe vanishes pre-expiry.

@@ -3174,9 +3174,8 @@ class CoinManager:
             if not is_sage:
                 try:
                     from database import (
+                        free_unreserved_locked_coin_for_reconciliation,
                         get_locked_coins,
-                        free_coin,
-                        is_coin_reconciliation_protected,
                     )
 
                     xch_rpc = self._get_coins_fast(cfg.WALLET_ID_XCH)
@@ -3193,10 +3192,9 @@ class CoinManager:
                     reconciled = 0
                     for coin in db_locked:
                         cid = coin["coin_id"]
-                        if is_coin_reconciliation_protected(cid):
-                            continue
-                        if cid in wallet_spendable:
-                            free_coin(cid)
+                        if cid in wallet_spendable and (
+                            free_unreserved_locked_coin_for_reconciliation(cid)
+                        ):
                             reconciled += 1
                     if reconciled > 0:
                         log_event(

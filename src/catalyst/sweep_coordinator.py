@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 
@@ -95,6 +96,7 @@ class SweepCoordinator:
 
         # Finalised events waiting to be drained
         self._events: List[SweepEvent] = []
+        self._restore_authoritative_registrations()
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,6 +117,8 @@ class SweepCoordinator:
         """
         block_idx = classification.spent_block_index
         if block_idx is None:
+            with self._lock:
+                self._registered_fill_ids.add(fill_id)
             return None
 
         entry = SweepEntry(
@@ -140,6 +144,12 @@ class SweepCoordinator:
                 return f"sweep_{block_idx}"
 
         return None
+
+    def has_registered_fill(self, fill_id: int) -> bool:
+        """Return whether this cache consumed the fill-keyed durable source."""
+
+        with self._lock:
+            return fill_id in self._registered_fill_ids
 
     def tick(self) -> None:
         """Expire pending groups whose window has elapsed.
@@ -168,6 +178,26 @@ class SweepCoordinator:
     # ------------------------------------------------------------------
     # Internal helpers (must be called with _lock held)
     # ------------------------------------------------------------------
+
+    def _restore_authoritative_registrations(self) -> None:
+        """Reconstruct process-local grouping from immutable database rows."""
+
+        try:
+            from database import get_authoritative_sweep_registrations
+
+            registrations = get_authoritative_sweep_registrations()
+        except Exception:
+            return
+        for registration in registrations:
+            classification = SimpleNamespace(
+                trade_id=registration["trade_id"],
+                classification=registration["classification"],
+                spent_block_index=registration["spent_block_index"],
+                taker_puzzle_hash=registration["taker_puzzle_hash"],
+                sweep_group_id=registration["sweep_group_id"],
+                side=registration["side"],
+            )
+            self.process_fill(int(registration["fill_id"]), classification)
 
     def _expire_pending_locked(self) -> None:
         now = time.monotonic()

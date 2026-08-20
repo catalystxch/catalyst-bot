@@ -741,6 +741,107 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_hook_sink_acks is append-only');
 END;
 
+-- Delivery acknowledgements are separate from fill-keyed sink idempotency.
+-- A receipt may consume only the acknowledgement for its exact claim token
+-- and monotonic generation, so a stale worker can never complete a new owner.
+CREATE TABLE IF NOT EXISTS offer_fill_hook_delivery_acks (
+    fill_id                     INTEGER NOT NULL,
+    hook_name                   TEXT NOT NULL,
+    claim_generation            INTEGER NOT NULL CHECK(claim_generation > 0),
+    claim_token                 TEXT NOT NULL,
+    disposition                 TEXT NOT NULL
+        CHECK(disposition IN ('applied', 'already_applied')),
+    acknowledgement_json       TEXT NOT NULL,
+    created_at                  TEXT NOT NULL,
+    PRIMARY KEY(fill_id, hook_name, claim_generation),
+    UNIQUE(fill_id, hook_name, claim_token),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_delivery_acks_no_update
+BEFORE UPDATE ON offer_fill_hook_delivery_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_delivery_acks is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_delivery_acks_no_delete
+BEFORE DELETE ON offer_fill_hook_delivery_acks
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_delivery_acks is append-only');
+END;
+
+-- Boost's process effect is driven by this durable fill-keyed command.  The
+-- registered -> applied transition is one-way and immutable by identity.
+CREATE TABLE IF NOT EXISTS offer_fill_boost_commands (
+    fill_id                     INTEGER PRIMARY KEY,
+    trade_id                    TEXT NOT NULL,
+    side                        TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    state                       TEXT NOT NULL CHECK(state IN ('registered', 'applied')),
+    registered_at               TEXT NOT NULL,
+    applied_at                  TEXT,
+    CHECK(
+        (state = 'registered' AND applied_at IS NULL)
+        OR (state = 'applied' AND applied_at IS NOT NULL)
+    ),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_commands_guarded_update
+BEFORE UPDATE ON offer_fill_boost_commands
+WHEN OLD.trade_id <> NEW.trade_id
+  OR OLD.side <> NEW.side
+  OR OLD.registered_at <> NEW.registered_at
+  OR OLD.state <> 'registered'
+  OR NEW.state <> 'applied'
+  OR OLD.applied_at IS NOT NULL
+  OR NEW.applied_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_commands transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_boost_commands_no_delete
+BEFORE DELETE ON offer_fill_boost_commands
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_boost_commands cannot be deleted');
+END;
+
+-- Sweep registration itself is the durable effect. A recreated coordinator
+-- reconstructs its process cache from these immutable fill-keyed rows.
+CREATE TABLE IF NOT EXISTS offer_fill_sweep_registrations (
+    fill_id                     INTEGER PRIMARY KEY,
+    trade_id                    TEXT NOT NULL,
+    classification_json        TEXT NOT NULL,
+    registered_at               TEXT NOT NULL,
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_registrations_no_update
+BEFORE UPDATE ON offer_fill_sweep_registrations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_registrations is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_sweep_registrations_no_delete
+BEFORE DELETE ON offer_fill_sweep_registrations
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_sweep_registrations is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS offer_fill_hook_migration_audit (
+    audit_id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    fill_id                     INTEGER NOT NULL,
+    hook_name                   TEXT NOT NULL,
+    reason_code                 TEXT NOT NULL,
+    prior_state                 TEXT NOT NULL,
+    audited_at                  TEXT NOT NULL,
+    UNIQUE(fill_id, hook_name, reason_code),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_migration_audit_no_update
+BEFORE UPDATE ON offer_fill_hook_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_migration_audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_migration_audit_no_delete
+BEFORE DELETE ON offer_fill_hook_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_migration_audit is append-only');
+END;
+
 -- Append-only success receipts remain the stable reader interface.
 CREATE TABLE IF NOT EXISTS offer_fill_hook_receipts (
     fill_id                     INTEGER NOT NULL,
@@ -973,6 +1074,37 @@ _STABILITY_REQUIRED_COLUMNS = {
         "hook_name",
         "acknowledgement_json",
         "created_at",
+    },
+    "offer_fill_hook_delivery_acks": {
+        "fill_id",
+        "hook_name",
+        "claim_generation",
+        "claim_token",
+        "disposition",
+        "acknowledgement_json",
+        "created_at",
+    },
+    "offer_fill_boost_commands": {
+        "fill_id",
+        "trade_id",
+        "side",
+        "state",
+        "registered_at",
+        "applied_at",
+    },
+    "offer_fill_sweep_registrations": {
+        "fill_id",
+        "trade_id",
+        "classification_json",
+        "registered_at",
+    },
+    "offer_fill_hook_migration_audit": {
+        "audit_id",
+        "fill_id",
+        "hook_name",
+        "reason_code",
+        "prior_state",
+        "audited_at",
     },
     "offer_fill_hook_receipts": {
         "fill_id",
@@ -1452,6 +1584,7 @@ def _migrate_stability_schema() -> None:
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
+        _audit_legacy_offer_fill_hook_receipts(conn)
         _backfill_authoritative_fill_hook_outbox(conn)
         conn.commit()
     except Exception:
@@ -1675,6 +1808,7 @@ def _init_database_impl():
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _audit_legacy_offer_fill_hook_receipts(conn)
         _backfill_authoritative_fill_hook_outbox(conn)
         conn.commit()
     except Exception:
@@ -4298,6 +4432,32 @@ def is_coin_reconciliation_protected(coin_id: str) -> bool:
     return bool(row["trade_id"] or normalized in _nonterminal_registry_coin_ids(conn))
 
 
+def free_unreserved_locked_coin_for_reconciliation(coin_id: str) -> bool:
+    """Release only legacy locked debris with no current registry owner.
+
+    The status, trade attribution, and Task 4 registry reservation are checked
+    by the same UPDATE under BEGIN IMMEDIATE. Callers must not split this into
+    a protection read followed by :func:`free_coin`.
+    """
+
+    normalized = norm_coin_id(_required_stability_text(coin_id, "coin_id"))
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            f"""UPDATE coins
+                   SET status='free', trade_id=NULL, last_seen=?
+                 WHERE coin_id=? AND status='locked' AND trade_id IS NULL
+                   AND {_nonterminal_registry_coin_absent_sql("coins.coin_id")}""",
+            (_now(), normalized),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def reconcile_wallet_locked_coin_links(
     wallet_locked_to_trade: Dict[str, str],
 ) -> Dict[str, int]:
@@ -5394,6 +5554,92 @@ _AUTHORITATIVE_FILL_HOOKS = (
 _AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS = 30
 
 
+def _offer_fill_hook_receipt_has_durable_effect(
+    conn: sqlite3.Connection, fill_id: int, hook_name: str
+) -> bool:
+    if hook_name in {"offer_filled_event", "fill_classification"}:
+        return True
+    if hook_name == "boost_notification":
+        if (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_boost_commands "
+                "WHERE fill_id=? AND state='applied'",
+                (fill_id,),
+            ).fetchone()
+            is not None
+        ):
+            return True
+        acknowledgement = conn.execute(
+            "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
+            "WHERE fill_id=? AND hook_name='boost_notification'",
+            (fill_id,),
+        ).fetchone()
+        if acknowledgement is None:
+            return False
+        try:
+            payload = json.loads(str(acknowledgement["acknowledgement_json"]))
+            fill = conn.execute(
+                "SELECT trade_id, tier FROM fills WHERE fill_id=?", (fill_id,)
+            ).fetchone()
+            if fill is None:
+                return False
+            return (
+                type(payload) is dict
+                and payload.get("schema_version") == 1
+                and payload.get("fill_id") == fill_id
+                and payload.get("hook_name") == "boost_notification"
+                and payload.get("durable") is True
+                and payload.get("detail")
+                == {"trade_id": str(fill["trade_id"]), "applicable": False}
+                and str(fill["tier"]).lower() != "boost"
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+    if hook_name == "sweep_registration":
+        return (
+            conn.execute(
+                "SELECT 1 FROM offer_fill_sweep_registrations WHERE fill_id=?",
+                (fill_id,),
+            ).fetchone()
+            is not None
+        )
+    return False
+
+
+def _audit_legacy_offer_fill_hook_receipts(conn: sqlite3.Connection) -> None:
+    """Reopen pre-effect Boost/Sweep receipts lacking durable source state."""
+
+    audited_at = _stability_wall_clock()
+    for hook_name in ("boost_notification", "sweep_registration"):
+        rows = conn.execute(
+            "SELECT fill_id, state FROM offer_fill_hook_outbox "
+            "WHERE hook_name=? AND state='completed'",
+            (hook_name,),
+        ).fetchall()
+        for row in rows:
+            fill_id = int(row["fill_id"])
+            if _offer_fill_hook_receipt_has_durable_effect(conn, fill_id, hook_name):
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO offer_fill_hook_migration_audit (
+                    fill_id, hook_name, reason_code, prior_state, audited_at
+                ) VALUES (?, ?, 'LEGACY_RECEIPT_REQUIRES_REPLAY', ?, ?)
+                """,
+                (fill_id, hook_name, str(row["state"]), audited_at),
+            )
+            conn.execute(
+                """
+                UPDATE offer_fill_hook_outbox
+                   SET state='pending', claim_token=NULL, claimed_at=NULL,
+                       completed_at=NULL,
+                       last_error_code='LEGACY_RECEIPT_REQUIRES_REPLAY'
+                 WHERE fill_id=? AND hook_name=? AND state='completed'
+                """,
+                (fill_id, hook_name),
+            )
+
+
 def _ensure_authoritative_fill_hook_outbox(
     conn: sqlite3.Connection, fill_id: int
 ) -> None:
@@ -5408,18 +5654,46 @@ def _ensure_authoritative_fill_hook_outbox(
         ).fetchall()
     }
     for hook_name in _AUTHORITATIVE_FILL_HOOKS:
-        completed_at = receipts.get(hook_name)
+        receipt_at = receipts.get(hook_name)
+        completed_at = (
+            receipt_at
+            if receipt_at is not None
+            and _offer_fill_hook_receipt_has_durable_effect(conn, fill_id, hook_name)
+            else None
+        )
+        unsafe_receipt = receipt_at is not None and completed_at is None
+        if unsafe_receipt:
+            existing = conn.execute(
+                "SELECT state FROM offer_fill_hook_outbox "
+                "WHERE fill_id=? AND hook_name=?",
+                (fill_id, hook_name),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO offer_fill_hook_migration_audit (
+                    fill_id, hook_name, reason_code, prior_state, audited_at
+                ) VALUES (?, ?, 'LEGACY_RECEIPT_REQUIRES_REPLAY', ?, ?)
+                """,
+                (
+                    fill_id,
+                    hook_name,
+                    str(existing["state"]) if existing is not None else "missing",
+                    _stability_wall_clock(),
+                ),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO offer_fill_hook_outbox (
-                fill_id, hook_name, state, attempt, completed_at
-            ) VALUES (?, ?, ?, 0, ?)
+                fill_id, hook_name, state, attempt, completed_at,
+                last_error_code
+            ) VALUES (?, ?, ?, 0, ?, ?)
             """,
             (
                 fill_id,
                 hook_name,
                 "completed" if completed_at is not None else "pending",
                 completed_at,
+                "LEGACY_RECEIPT_REQUIRES_REPLAY" if unsafe_receipt else None,
             ),
         )
         if completed_at is not None:
@@ -5431,6 +5705,25 @@ def _ensure_authoritative_fill_hook_outbox(
                 WHERE fill_id=? AND hook_name=? AND state<>'completed'
                 """,
                 (completed_at, fill_id, hook_name),
+            )
+        elif unsafe_receipt:
+            conn.execute(
+                """
+                UPDATE offer_fill_hook_outbox
+                   SET state='pending', claim_token=NULL, claimed_at=NULL,
+                       completed_at=NULL,
+                       last_error_code='LEGACY_RECEIPT_REQUIRES_REPLAY'
+                 WHERE fill_id=? AND hook_name=? AND state='completed'
+                """,
+                (fill_id, hook_name),
+            )
+            conn.execute(
+                """
+                UPDATE offer_fill_hook_outbox
+                   SET last_error_code='LEGACY_RECEIPT_REQUIRES_REPLAY'
+                 WHERE fill_id=? AND hook_name=? AND state='pending'
+                """,
+                (fill_id, hook_name),
             )
 
 
@@ -5491,7 +5784,8 @@ def get_offer_fill_hook_receipts(fill_id: int) -> List[str]:
     rows = (
         get_connection()
         .execute(
-            "SELECT hook_name FROM offer_fill_hook_receipts WHERE fill_id=?",
+            "SELECT hook_name FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND state='completed'",
             (safe_fill_id,),
         )
         .fetchall()
@@ -5532,15 +5826,47 @@ def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
 
 
 def _offer_fill_hook_acknowledgement(
-    fill_id: int, hook_name: str, detail: Dict[str, Any]
+    fill_id: int,
+    hook_name: str,
+    detail: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
+    disposition: str,
 ) -> Dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "fill_id": fill_id,
         "hook_name": hook_name,
+        "claim_token": claim_token,
+        "claim_generation": claim_generation,
+        "disposition": disposition,
         "durable": True,
         "detail": detail,
     }
+
+
+def _require_current_offer_fill_hook_claim(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    hook_name: str,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM offer_fill_hook_outbox WHERE fill_id=? AND hook_name=?",
+        (fill_id, hook_name),
+    ).fetchone()
+    if row is None:
+        raise ValueError("post-fill hook outbox item is missing")
+    item = dict(row)
+    if (
+        item["state"] != "running"
+        or item["claim_token"] != claim_token
+        or int(item["attempt"]) != claim_generation
+    ):
+        raise ValueError("post-fill hook claim is not the current owner")
+    return item
 
 
 def _insert_offer_fill_hook_sink_ack(
@@ -5549,8 +5875,14 @@ def _insert_offer_fill_hook_sink_ack(
     hook_name: str,
     detail: Dict[str, Any],
     created_at: str,
-) -> Dict[str, Any]:
-    acknowledgement = _offer_fill_hook_acknowledgement(fill_id, hook_name, detail)
+) -> tuple[Dict[str, Any], bool]:
+    acknowledgement = {
+        "schema_version": 1,
+        "fill_id": fill_id,
+        "hook_name": hook_name,
+        "durable": True,
+        "detail": detail,
+    }
     acknowledgement_json = _canonical_json_text(
         acknowledgement,
         "post-fill sink acknowledgement",
@@ -5565,7 +5897,7 @@ def _insert_offer_fill_hook_sink_ack(
     if existing is not None:
         if str(existing["acknowledgement_json"]) != acknowledgement_json:
             raise ValueError("post-fill sink acknowledgement replay differs")
-        return acknowledgement
+        return acknowledgement, False
     conn.execute(
         """
         INSERT INTO offer_fill_hook_sink_acks (
@@ -5574,16 +5906,102 @@ def _insert_offer_fill_hook_sink_ack(
         """,
         (fill_id, hook_name, acknowledgement_json, created_at),
     )
+    return acknowledgement, True
+
+
+def _insert_offer_fill_hook_delivery_ack(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    hook_name: str,
+    detail: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
+    disposition: str,
+    created_at: str,
+) -> Dict[str, Any]:
+    if disposition not in {"applied", "already_applied"}:
+        raise ValueError("post-fill delivery disposition is invalid")
+    _require_current_offer_fill_hook_claim(
+        conn, fill_id, hook_name, claim_token, claim_generation
+    )
+    acknowledgement = _offer_fill_hook_acknowledgement(
+        fill_id,
+        hook_name,
+        detail,
+        claim_token=claim_token,
+        claim_generation=claim_generation,
+        disposition=disposition,
+    )
+    acknowledgement_json = _canonical_json_text(
+        acknowledgement,
+        "post-fill delivery acknowledgement",
+        expected_type=dict,
+        max_bytes=16384,
+    )
+    existing = conn.execute(
+        "SELECT claim_token, disposition, acknowledgement_json "
+        "FROM offer_fill_hook_delivery_acks "
+        "WHERE fill_id=? AND hook_name=? AND claim_generation=?",
+        (fill_id, hook_name, claim_generation),
+    ).fetchone()
+    if existing is not None:
+        existing_disposition = str(existing["disposition"])
+        existing_acknowledgement = _offer_fill_hook_acknowledgement(
+            fill_id,
+            hook_name,
+            detail,
+            claim_token=claim_token,
+            claim_generation=claim_generation,
+            disposition=existing_disposition,
+        )
+        existing_json = _canonical_json_text(
+            existing_acknowledgement,
+            "post-fill delivery acknowledgement",
+            expected_type=dict,
+            max_bytes=16384,
+        )
+        if (
+            str(existing["claim_token"]) != claim_token
+            or existing_disposition not in {"applied", "already_applied"}
+            or str(existing["acknowledgement_json"]) != existing_json
+        ):
+            raise ValueError("post-fill delivery acknowledgement replay differs")
+        return existing_acknowledgement
+    conn.execute(
+        """
+        INSERT INTO offer_fill_hook_delivery_acks (
+            fill_id, hook_name, claim_generation, claim_token,
+            disposition, acknowledgement_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fill_id,
+            hook_name,
+            claim_generation,
+            claim_token,
+            disposition,
+            acknowledgement_json,
+            created_at,
+        ),
+    )
     return acknowledgement
 
 
 def record_offer_fill_hook_sink_ack(
-    fill_id: int, hook_name: str, detail: Dict[str, Any]
+    fill_id: int,
+    hook_name: str,
+    detail: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
 ) -> Dict[str, Any]:
-    """Persist and return one exact positive acknowledgement from a sink."""
+    """Acknowledge the identity-checked non-applicable Boost no-op."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_hook = _required_stability_text(hook_name, "hook_name")
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
         raise ValueError("post-fill hook name is not registered")
     if type(detail) is not dict:
@@ -5596,19 +6014,37 @@ def record_offer_fill_hook_sink_ack(
             max_bytes=8192,
         )
     )
+    if safe_hook != "boost_notification" or safe_detail.get("applicable") is not False:
+        raise ValueError("post-fill sink requires its effect-specific durable boundary")
     when = _stability_wall_clock()
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        if (
-            conn.execute(
-                "SELECT 1 FROM fills WHERE fill_id=?", (safe_fill_id,)
-            ).fetchone()
-            is None
-        ):
+        fill = conn.execute(
+            "SELECT trade_id, tier FROM fills WHERE fill_id=?", (safe_fill_id,)
+        ).fetchone()
+        if fill is None:
             raise ValueError("post-fill sink acknowledgement references a missing fill")
-        acknowledgement = _insert_offer_fill_hook_sink_ack(
+        expected_detail = {
+            "trade_id": str(fill["trade_id"]),
+            "applicable": False,
+        }
+        if safe_detail != expected_detail or str(fill["tier"]).lower() == "boost":
+            raise ValueError(
+                "post-fill sink requires its effect-specific durable boundary"
+            )
+        _sink_ack, applied = _insert_offer_fill_hook_sink_ack(
             conn, safe_fill_id, safe_hook, safe_detail, when
+        )
+        acknowledgement = _insert_offer_fill_hook_delivery_ack(
+            conn,
+            safe_fill_id,
+            safe_hook,
+            safe_detail,
+            claim_token=safe_token,
+            claim_generation=safe_generation,
+            disposition="applied" if applied else "already_applied",
+            created_at=when,
         )
         conn.commit()
         return acknowledgement
@@ -5620,12 +6056,19 @@ def record_offer_fill_hook_sink_ack(
 
 
 def validate_offer_fill_hook_sink_ack(
-    fill_id: int, hook_name: str, acknowledgement: Dict[str, Any]
+    fill_id: int,
+    hook_name: str,
+    acknowledgement: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
 ) -> bool:
     """Confirm an acknowledgement is the exact durable row for this sink."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_hook = _required_stability_text(hook_name, "hook_name")
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_hook not in _AUTHORITATIVE_FILL_HOOKS or type(acknowledgement) is not dict:
         return False
     try:
@@ -5637,24 +6080,40 @@ def validate_offer_fill_hook_sink_ack(
         )
     except (TypeError, ValueError):
         return False
-    row = (
-        get_connection()
-        .execute(
-            "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
-            "WHERE fill_id=? AND hook_name=?",
-            (safe_fill_id, safe_hook),
-        )
-        .fetchone()
+    conn = get_connection()
+    owner = conn.execute(
+        "SELECT state, claim_token, attempt FROM offer_fill_hook_outbox "
+        "WHERE fill_id=? AND hook_name=?",
+        (safe_fill_id, safe_hook),
+    ).fetchone()
+    row = conn.execute(
+        "SELECT acknowledgement_json FROM offer_fill_hook_delivery_acks "
+        "WHERE fill_id=? AND hook_name=? AND claim_generation=? "
+        "AND claim_token=?",
+        (safe_fill_id, safe_hook, safe_generation, safe_token),
+    ).fetchone()
+    return bool(
+        owner is not None
+        and owner["state"] == "running"
+        and owner["claim_token"] == safe_token
+        and int(owner["attempt"]) == safe_generation
+        and row is not None
+        and str(row["acknowledgement_json"]) == encoded
     )
-    return row is not None and str(row["acknowledgement_json"]) == encoded
 
 
 def store_authoritative_fill_classification_ack(
-    fill_id: int, classification: Dict[str, Any]
+    fill_id: int,
+    classification: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
 ) -> Dict[str, Any]:
     """Store classification and its sink acknowledgement atomically."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if type(classification) is not dict:
         raise ValueError("authoritative fill classification must be a dict")
     safe_classification = _required_stability_text(
@@ -5679,6 +6138,13 @@ def store_authoritative_fill_classification_ack(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "fill_classification",
+            safe_token,
+            safe_generation,
+        )
         cursor = conn.execute(
             """
             UPDATE fills
@@ -5696,12 +6162,22 @@ def store_authoritative_fill_classification_ack(
         )
         if cursor.rowcount != 1:
             raise ValueError("fill classification references a missing fill")
-        acknowledgement = _insert_offer_fill_hook_sink_ack(
+        _sink_ack, applied = _insert_offer_fill_hook_sink_ack(
             conn,
             safe_fill_id,
             "fill_classification",
             detail,
             when,
+        )
+        acknowledgement = _insert_offer_fill_hook_delivery_ack(
+            conn,
+            safe_fill_id,
+            "fill_classification",
+            detail,
+            claim_token=safe_token,
+            claim_generation=safe_generation,
+            disposition="applied" if applied else "already_applied",
+            created_at=when,
         )
         conn.commit()
         return acknowledgement
@@ -5718,11 +6194,15 @@ def log_authoritative_offer_filled_once(
     data: Dict[str, Any],
     *,
     created_at: Any,
+    claim_token: str,
+    claim_generation: int,
 ) -> Dict[str, Any]:
     """Persist the offer_filled event exactly once for one durable fill."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_message = _required_stability_text(message, "message")
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if type(data) is not dict or data.get("fill_id") != safe_fill_id:
         raise ValueError("offer_filled event data must bind the exact fill_id")
     safe_data = _canonical_json_text(
@@ -5743,17 +6223,35 @@ def log_authoritative_offer_filled_once(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "offer_filled_event",
+            safe_token,
+            safe_generation,
+        )
         existing = conn.execute(
             "SELECT event_id FROM offer_fill_event_sinks WHERE fill_id=?",
             (safe_fill_id,),
         ).fetchone()
         if existing is not None:
-            acknowledgement = _insert_offer_fill_hook_sink_ack(
+            detail = {"event_id": int(existing["event_id"])}
+            _sink_ack, applied = _insert_offer_fill_hook_sink_ack(
                 conn,
                 safe_fill_id,
                 "offer_filled_event",
-                {"event_id": int(existing["event_id"])},
+                detail,
                 sink_time,
+            )
+            acknowledgement = _insert_offer_fill_hook_delivery_ack(
+                conn,
+                safe_fill_id,
+                "offer_filled_event",
+                detail,
+                claim_token=safe_token,
+                claim_generation=safe_generation,
+                disposition="applied" if applied else "already_applied",
+                created_at=sink_time,
             )
             conn.commit()
             return acknowledgement
@@ -5789,12 +6287,23 @@ def log_authoritative_offer_filled_once(
             """,
             (safe_fill_id, event_id, when),
         )
-        acknowledgement = _insert_offer_fill_hook_sink_ack(
+        detail = {"event_id": event_id}
+        _sink_ack, applied = _insert_offer_fill_hook_sink_ack(
             conn,
             safe_fill_id,
             "offer_filled_event",
-            {"event_id": event_id},
+            detail,
             sink_time,
+        )
+        acknowledgement = _insert_offer_fill_hook_delivery_ack(
+            conn,
+            safe_fill_id,
+            "offer_filled_event",
+            detail,
+            claim_token=safe_token,
+            claim_generation=safe_generation,
+            disposition="applied" if applied else "already_applied",
+            created_at=sink_time,
         )
         conn.commit()
         if _sse_callback:
@@ -5816,6 +6325,355 @@ def log_authoritative_offer_filled_once(
         raise
     finally:
         conn.close()
+
+
+def register_authoritative_boost_fill_command(
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    *,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    """Register one immutable Boost command under the current delivery fence."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    safe_side = _required_stability_text(side, "side").lower()
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "boost_notification",
+            safe_token,
+            safe_generation,
+        )
+        fill = conn.execute(
+            "SELECT trade_id, side FROM fills WHERE fill_id=?", (safe_fill_id,)
+        ).fetchone()
+        if (
+            fill is None
+            or str(fill["trade_id"]) != safe_trade_id
+            or str(fill["side"]).lower() != safe_side
+        ):
+            raise ValueError("Boost command does not match its durable fill")
+        existing = conn.execute(
+            "SELECT * FROM offer_fill_boost_commands WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO offer_fill_boost_commands (
+                    fill_id, trade_id, side, state, registered_at, applied_at
+                ) VALUES (?, ?, ?, 'registered', ?, NULL)
+                """,
+                (safe_fill_id, safe_trade_id, safe_side, when),
+            )
+            state = "registered"
+        else:
+            if (
+                str(existing["trade_id"]) != safe_trade_id
+                or str(existing["side"]) != safe_side
+            ):
+                raise ValueError("Boost command replay differs")
+            state = str(existing["state"])
+        conn.commit()
+        return {
+            "fill_id": safe_fill_id,
+            "trade_id": safe_trade_id,
+            "side": safe_side,
+            "state": state,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def complete_authoritative_boost_fill_command(
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    *,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    """Mark a positively applied Boost command and acknowledge this owner."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    safe_side = _required_stability_text(side, "side").lower()
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    when = _stability_wall_clock()
+    detail = {"trade_id": safe_trade_id, "applicable": True}
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "boost_notification",
+            safe_token,
+            safe_generation,
+        )
+        command = conn.execute(
+            "SELECT * FROM offer_fill_boost_commands WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if command is None:
+            raise ValueError("Boost command is not durably registered")
+        if (
+            str(command["trade_id"]) != safe_trade_id
+            or str(command["side"]) != safe_side
+        ):
+            raise ValueError("Boost command completion differs")
+        newly_applied = str(command["state"]) == "registered"
+        if newly_applied:
+            cursor = conn.execute(
+                """
+                UPDATE offer_fill_boost_commands
+                   SET state='applied', applied_at=?
+                 WHERE fill_id=? AND trade_id=? AND side=?
+                   AND state='registered' AND applied_at IS NULL
+                """,
+                (when, safe_fill_id, safe_trade_id, safe_side),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Boost command transition compare-and-set failed")
+        elif str(command["state"]) != "applied":
+            raise ValueError("Boost command state is invalid")
+        _sink_ack, _sink_applied = _insert_offer_fill_hook_sink_ack(
+            conn,
+            safe_fill_id,
+            "boost_notification",
+            detail,
+            when,
+        )
+        acknowledgement = _insert_offer_fill_hook_delivery_ack(
+            conn,
+            safe_fill_id,
+            "boost_notification",
+            detail,
+            claim_token=safe_token,
+            claim_generation=safe_generation,
+            disposition="applied" if newly_applied else "already_applied",
+            created_at=when,
+        )
+        conn.commit()
+        return acknowledgement
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_applied_authoritative_boost_fill_ids() -> set[int]:
+    """Return durable Boost command ids whose process effect was confirmed."""
+
+    rows = (
+        get_connection()
+        .execute("SELECT fill_id FROM offer_fill_boost_commands WHERE state='applied'")
+        .fetchall()
+    )
+    return {int(row["fill_id"]) for row in rows}
+
+
+def _canonical_authoritative_sweep_classification(
+    classification: Dict[str, Any],
+) -> tuple[Dict[str, Any], str]:
+    if type(classification) is not dict:
+        raise ValueError("authoritative sweep classification must be a dict")
+    trade_id = _required_stability_text(classification.get("trade_id"), "trade_id")
+    classification_name = _required_stability_text(
+        classification.get("classification"), "fill classification"
+    )
+    spent_block_index = classification.get("spent_block_index")
+    if spent_block_index is not None:
+        spent_block_index = _exact_integer(
+            spent_block_index, "spent_block_index", minimum=0
+        )
+    taker_puzzle_hash = classification.get("taker_puzzle_hash")
+    if taker_puzzle_hash is not None:
+        taker_puzzle_hash = _required_stability_text(
+            taker_puzzle_hash, "taker_puzzle_hash"
+        )
+    sweep_group_id = classification.get("sweep_group_id")
+    if sweep_group_id is not None:
+        sweep_group_id = _required_stability_text(sweep_group_id, "sweep_group_id")
+    side = classification.get("side")
+    if side is not None:
+        side = _required_stability_text(side, "side").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("side must be buy or sell")
+    payload = {
+        "trade_id": trade_id,
+        "classification": classification_name,
+        "spent_block_index": spent_block_index,
+        "taker_puzzle_hash": taker_puzzle_hash,
+        "sweep_group_id": sweep_group_id,
+        "side": side,
+    }
+    encoded = _canonical_json_text(
+        payload,
+        "authoritative sweep classification",
+        expected_type=dict,
+        max_bytes=16384,
+    )
+    return payload, encoded
+
+
+def register_authoritative_sweep_fill(
+    fill_id: int,
+    classification: Dict[str, Any],
+    *,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    """Append an immutable sweep registration under the current fence."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    payload, encoded = _canonical_authoritative_sweep_classification(classification)
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "sweep_registration",
+            safe_token,
+            safe_generation,
+        )
+        fill = conn.execute(
+            "SELECT trade_id, side FROM fills WHERE fill_id=?", (safe_fill_id,)
+        ).fetchone()
+        if (
+            fill is None
+            or str(fill["trade_id"]) != payload["trade_id"]
+            or str(fill["side"]).lower() != payload["side"]
+        ):
+            raise ValueError("sweep registration does not match its durable fill")
+        existing = conn.execute(
+            "SELECT trade_id, classification_json "
+            "FROM offer_fill_sweep_registrations WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO offer_fill_sweep_registrations (
+                    fill_id, trade_id, classification_json, registered_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (safe_fill_id, payload["trade_id"], encoded, when),
+            )
+        elif (
+            str(existing["trade_id"]) != payload["trade_id"]
+            or str(existing["classification_json"]) != encoded
+        ):
+            raise ValueError("sweep registration replay differs")
+        conn.commit()
+        return {"fill_id": safe_fill_id, **payload}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def acknowledge_authoritative_sweep_registration(
+    fill_id: int,
+    *,
+    claim_token: str,
+    claim_generation: int,
+) -> Dict[str, Any]:
+    """Acknowledge that the current coordinator accepted its durable source."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    when = _stability_wall_clock()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_current_offer_fill_hook_claim(
+            conn,
+            safe_fill_id,
+            "sweep_registration",
+            safe_token,
+            safe_generation,
+        )
+        registration = conn.execute(
+            "SELECT trade_id, classification_json "
+            "FROM offer_fill_sweep_registrations WHERE fill_id=?",
+            (safe_fill_id,),
+        ).fetchone()
+        if registration is None:
+            raise ValueError("sweep fill is not durably registered")
+        payload = json.loads(str(registration["classification_json"]))
+        detail = {
+            "trade_id": str(registration["trade_id"]),
+            "spent_block_index": payload.get("spent_block_index"),
+        }
+        _sink_ack, applied = _insert_offer_fill_hook_sink_ack(
+            conn,
+            safe_fill_id,
+            "sweep_registration",
+            detail,
+            when,
+        )
+        acknowledgement = _insert_offer_fill_hook_delivery_ack(
+            conn,
+            safe_fill_id,
+            "sweep_registration",
+            detail,
+            claim_token=safe_token,
+            claim_generation=safe_generation,
+            disposition="applied" if applied else "already_applied",
+            created_at=when,
+        )
+        conn.commit()
+        return acknowledgement
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_authoritative_sweep_registrations() -> List[Dict[str, Any]]:
+    """Return immutable sweep sources for process-cache reconstruction."""
+
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT fill_id, trade_id, classification_json "
+            "FROM offer_fill_sweep_registrations ORDER BY fill_id"
+        )
+        .fetchall()
+    )
+    registrations: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = json.loads(str(row["classification_json"]))
+        if type(payload) is not dict or payload.get("trade_id") != row["trade_id"]:
+            raise ValueError("stored authoritative sweep registration is invalid")
+        registrations.append({"fill_id": int(row["fill_id"]), **payload})
+    return registrations
 
 
 def claim_offer_fill_hook(
@@ -5993,6 +6851,78 @@ def fail_offer_fill_hook(
         conn.close()
 
 
+def has_offer_fill_hook_delivery_ack(
+    fill_id: int,
+    hook_name: str,
+    claim_token: str,
+    claim_generation: int,
+) -> bool:
+    """Report whether this exact delivery fence crossed a durable boundary."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_hook = _required_stability_text(hook_name, "hook_name")
+    safe_token = _required_stability_text(claim_token, "claim_token")
+    safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
+        raise ValueError("post-fill hook name is not registered")
+    row = (
+        get_connection()
+        .execute(
+            "SELECT 1 FROM offer_fill_hook_delivery_acks "
+            "WHERE fill_id=? AND hook_name=? AND claim_generation=? AND claim_token=?",
+            (safe_fill_id, safe_hook, safe_generation, safe_token),
+        )
+        .fetchone()
+    )
+    return row is not None
+
+
+def record_offer_fill_hook_construction_failure(
+    fill_id: int,
+    *,
+    error_code: str = "CALLBACK_CONSTRUCTION_FAILED",
+) -> Dict[str, str]:
+    """Contain callback construction errors without disturbing active owners."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_error = _required_stability_text(error_code, "error_code").upper()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            conn.execute(
+                "SELECT 1 FROM fills WHERE fill_id=?", (safe_fill_id,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("post-fill callback failure references a missing fill")
+        conn.execute(
+            """
+            UPDATE offer_fill_hook_outbox
+               SET last_error_code=?
+             WHERE fill_id=? AND state='pending'
+            """,
+            (safe_error, safe_fill_id),
+        )
+        rows = conn.execute(
+            "SELECT hook_name, state FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? ORDER BY hook_name",
+            (safe_fill_id,),
+        ).fetchall()
+        conn.commit()
+        states = {
+            "pending": "failed",
+            "running": "in_progress",
+            "completed": "already_completed",
+        }
+        return {str(row["hook_name"]): states[str(row["state"])] for row in rows}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def complete_offer_fill_hook(
     fill_id: int,
     hook_name: str,
@@ -6031,15 +6961,20 @@ def complete_offer_fill_hook(
         ):
             raise ValueError("post-fill hook completion claim is not exact")
         acknowledgement = conn.execute(
-            "SELECT acknowledgement_json FROM offer_fill_hook_sink_acks "
-            "WHERE fill_id=? AND hook_name=?",
-            (safe_fill_id, safe_hook),
+            "SELECT acknowledgement_json FROM offer_fill_hook_delivery_acks "
+            "WHERE fill_id=? AND hook_name=? AND claim_generation=? "
+            "AND claim_token=?",
+            (safe_fill_id, safe_hook, safe_generation, safe_token),
         ).fetchone()
         if acknowledgement is None:
-            raise ValueError("post-fill hook lacks a durable sink acknowledgement")
+            raise ValueError(
+                "post-fill hook lacks its current delivery acknowledgement"
+            )
         conn.execute(
             """
-            INSERT INTO offer_fill_hook_receipts (fill_id, hook_name, completed_at)
+            INSERT OR IGNORE INTO offer_fill_hook_receipts (
+                fill_id, hook_name, completed_at
+            )
             VALUES (?, ?, ?)
             """,
             (safe_fill_id, safe_hook, when),

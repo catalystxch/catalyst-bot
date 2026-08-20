@@ -955,6 +955,49 @@ def test_wallet_identity_source_is_required_in_freshness_and_skew_matrix(
     assert result["reason_code"] == reason
 
 
+@pytest.mark.parametrize(
+    ("singular_timestamp", "all_timestamps", "reason"),
+    [
+        (
+            "2026-08-20T11:54:00.000000Z",
+            [AFTER],
+            "EVIDENCE_STALE",
+        ),
+        (
+            "2026-08-20T12:01:00.000000Z",
+            [AFTER],
+            "EVIDENCE_STALE",
+        ),
+        (
+            "2026-08-20T12:00:01.000000Z",
+            [AFTER],
+            "EVIDENCE_TIMESTAMP_INVALID",
+        ),
+    ],
+    ids=["stale-singular", "future-singular", "singular-list-mismatch"],
+)
+def test_wallet_identity_singular_source_time_is_bound_to_freshness_and_provenance(
+    isolated_database,
+    singular_timestamp,
+    all_timestamps,
+    reason,
+):
+    _persist_created_offer()
+    evidence = _evidence(observed_at=AFTER)
+    evidence["wallet_identity"]["source_observed_at"] = singular_timestamp
+    evidence["wallet_identity"]["source_observed_at_all"] = all_timestamps
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == reason
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert _journal_for("intent-task9")[-1]["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 def test_missing_transaction_asset_never_defaults_to_native_xch():
     transaction = _transaction()
     transaction["spent"][0].pop("asset_id")
@@ -1830,6 +1873,39 @@ def test_classifier_caps_selected_coins_and_transaction_flows():
     assert transaction_result["classification"] == UNKNOWN
 
 
+@pytest.mark.parametrize(
+    ("source_name", "timestamp_field"),
+    [
+        ("wallet_identity", "source_observed_at_all"),
+        ("wallet_identity", "read_observed_at"),
+        ("offer_history", "source_observed_at_all"),
+        ("transaction_history", "read_observed_at"),
+    ],
+)
+def test_classifier_caps_timestamp_arrays_before_building_effective_clock_set(
+    isolated_database,
+    source_name,
+    timestamp_field,
+):
+    _persist_created_offer()
+    evidence = _evidence(observed_at=AFTER)
+    evidence[source_name][timestamp_field] = [AFTER] * 4097
+
+    classified = _classify(evidence)
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert classified["classification"] == UNKNOWN
+    assert classified["reason_code"] == "EVIDENCE_SOURCE_LIMIT_EXCEEDED"
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EVIDENCE_ENCODING_FAILED"
+    assert result["applied"] is False
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    event = _journal_for("intent-task9")[-1]
+    assert event["outcome"] == UNKNOWN
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 @pytest.mark.parametrize("source_name", ["offers", "transactions", "coins"])
 def test_classifier_caps_each_hostile_evidence_source(source_name):
     kwargs = {}
@@ -2201,6 +2277,126 @@ def test_wallet_locked_link_audit_never_rebinds_registry_trade_lock(
     assert coin["trade_id"] == TRADE
 
 
+def test_chia_reconcile_atomic_release_cannot_cross_new_task4_reservation(
+    isolated_database,
+    monkeypatch,
+):
+    from coin_manager import CoinManager
+    from config import cfg
+    import wallet
+
+    assert database.upsert_coin(
+        COIN,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE coins SET status='locked', trade_id=NULL WHERE coin_id=?",
+        (database.norm_coin_id(COIN),),
+    )
+    conn.commit()
+
+    reservation_created = False
+
+    def create_task4_reservation() -> None:
+        nonlocal reservation_created
+        if reservation_created:
+            return
+        reservation_created = True
+        database.prepare_offer_intent(
+            intent_id="intent-task9-chia-race",
+            operation_id="create:intent-task9-chia-race",
+            event_id="create:intent-task9-chia-race:prepared",
+            run_id="run-task9",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            side="buy",
+            tier="inner",
+            purpose="normal_lifecycle",
+            slot_key="slot:intent-task9-chia-race",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[COIN],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"race": "chia_atomic_release"},
+            prepared_at=AT,
+            reserve_selected_coins=False,
+        )
+
+    original_protection = database.is_coin_reconciliation_protected
+    old_release = database.free_coin
+    atomic_release = getattr(
+        database, "free_unreserved_locked_coin_for_reconciliation", None
+    )
+    calls = {"old": 0, "atomic": 0}
+
+    def observed_then_old_release(coin_id):
+        calls["old"] += 1
+        create_task4_reservation()
+        return old_release(coin_id)
+
+    def observed_then_atomic_release(coin_id):
+        calls["atomic"] += 1
+        create_task4_reservation()
+        assert atomic_release is not None
+        return atomic_release(coin_id)
+
+    # Against the old implementation, reservation is inserted after its
+    # protection observation and immediately before free_coin. Against the
+    # desired implementation, the same reservation is inserted immediately
+    # before the one atomic database primitive opens BEGIN IMMEDIATE.
+    def observe_unprotected_then_pause(coin_id):
+        protected = original_protection(coin_id)
+        assert protected is False
+        return protected
+
+    monkeypatch.setattr(
+        database, "is_coin_reconciliation_protected", observe_unprotected_then_pause
+    )
+    monkeypatch.setattr(database, "free_coin", observed_then_old_release)
+    monkeypatch.setattr(
+        database,
+        "free_unreserved_locked_coin_for_reconciliation",
+        observed_then_atomic_release,
+        raising=False,
+    )
+    monkeypatch.setattr(wallet, "get_wallet_type", lambda: "chia")
+    monkeypatch.setattr(wallet, "get_all_offers", lambda **_kwargs: [])
+
+    manager = CoinManager.__new__(CoinManager)
+    monkeypatch.setattr(
+        manager,
+        "_get_coins_fast",
+        lambda wallet_id: (
+            {
+                "success": True,
+                "confirmed_records": [{"name": COIN, "coin": {"amount": 1000}}],
+            }
+            if wallet_id == cfg.WALLET_ID_XCH
+            else {"success": True, "confirmed_records": []}
+        ),
+    )
+    monkeypatch.setattr(manager, "_ensure_reserve_exists", lambda *_args: None)
+
+    manager.reconcile_with_wallet()
+
+    assert reservation_created is True
+    assert database.get_offer_intent("intent-task9-chia-race") is not None
+    coin = database.get_coin_state(COIN)
+    assert coin["status"] == "locked"
+    assert coin["trade_id"] is None
+    assert calls == {"old": 0, "atomic": 1}
+
+
 @pytest.mark.parametrize(
     "legacy_writer",
     [
@@ -2503,6 +2699,72 @@ def _commit_fill_without_draining_hooks(monkeypatch) -> dict:
     return fill
 
 
+def _record_claimed_test_sink_ack(fill_id, hook_name, detail, claim):
+    if hook_name == "offer_filled_event":
+        return database.log_authoritative_offer_filled_once(
+            fill_id,
+            "claimed test offer-filled event",
+            {"fill_id": fill_id, "test_detail": detail},
+            created_at=AFTER,
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    if hook_name == "boost_notification" and detail.get("test_sink"):
+        detail = {"trade_id": TRADE, "applicable": False}
+    if hook_name == "fill_classification":
+        return database.store_authoritative_fill_classification_ack(
+            fill_id,
+            {
+                "classification": "unknown",
+                "spent_block_index": 42,
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    if hook_name == "sweep_registration" and detail.get("test_sink"):
+        database.register_authoritative_sweep_fill(
+            fill_id,
+            {
+                "trade_id": TRADE,
+                "classification": "unknown",
+                "spent_block_index": 42,
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+                "side": "buy",
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+        return database.acknowledge_authoritative_sweep_registration(
+            fill_id,
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    parameters = inspect.signature(database.record_offer_fill_hook_sink_ack).parameters
+    if "claim_token" in parameters:
+        return database.record_offer_fill_hook_sink_ack(
+            fill_id,
+            hook_name,
+            detail,
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    return database.record_offer_fill_hook_sink_ack(fill_id, hook_name, detail)
+
+
+def _invoke_claimed_hook(callback, fill, claim):
+    parameters = inspect.signature(callback).parameters
+    if "claim_token" in parameters:
+        return callback(
+            fill,
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    return callback(fill)
+
+
 def test_hook_claim_uses_db_wall_clock_and_returns_fenced_generation(
     isolated_database, monkeypatch
 ):
@@ -2524,6 +2786,82 @@ def test_hook_claim_uses_db_wall_clock_and_returns_fenced_generation(
     assert claim["status"] == "claimed"
     assert claim["claim_generation"] == 1
     assert stored["claimed_at"] == RECONCILED
+
+
+def test_stale_generation_sink_ack_cannot_complete_newer_outbox_owner(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    first = database.claim_offer_fill_hook(fill["fill_id"], "offer_filled_event")
+    _record_claimed_test_sink_ack(
+        fill["fill_id"],
+        "offer_filled_event",
+        {"test_sink": "first-generation"},
+        first,
+    )
+
+    clock["now"] = "2026-08-20T12:10:31.000000Z"
+    second = database.claim_offer_fill_hook(fill["fill_id"], "offer_filled_event")
+
+    with pytest.raises(ValueError, match="current delivery acknowledgement"):
+        database.complete_offer_fill_hook(
+            fill["fill_id"],
+            "offer_filled_event",
+            second["claim_token"],
+            claim_generation=second["claim_generation"],
+        )
+
+    stored = (
+        database.get_connection()
+        .execute(
+            "SELECT state, attempt, claim_token FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND hook_name='offer_filled_event'",
+            (fill["fill_id"],),
+        )
+        .fetchone()
+    )
+    assert stored["state"] == "running"
+    assert stored["attempt"] == second["claim_generation"]
+    assert stored["claim_token"] == second["claim_token"]
+    assert database.get_offer_fill_hook_receipts(fill["fill_id"]) == []
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "detail"),
+    [
+        ("offer_filled_event", {"event_id": 99}),
+        ("boost_notification", {"trade_id": TRADE, "applicable": True}),
+        ("fill_classification", {"classification": "unknown"}),
+        ("sweep_registration", {"trade_id": TRADE, "spent_block_index": 42}),
+    ],
+)
+def test_generic_sink_ack_cannot_bypass_effect_specific_durable_boundary(
+    isolated_database,
+    monkeypatch,
+    hook_name,
+    detail,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    claim = database.claim_offer_fill_hook(fill["fill_id"], hook_name)
+
+    with pytest.raises(ValueError, match="effect-specific durable boundary"):
+        database.record_offer_fill_hook_sink_ack(
+            fill["fill_id"],
+            hook_name,
+            detail,
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+
+    assert not database.has_offer_fill_hook_delivery_ack(
+        fill["fill_id"],
+        hook_name,
+        claim["claim_token"],
+        claim["claim_generation"],
+    )
 
 
 def test_running_hook_heartbeat_prevents_steal_and_abandoned_claim_is_recovered(
@@ -2558,6 +2896,418 @@ def test_running_hook_heartbeat_prevents_steal_and_abandoned_claim_is_recovered(
         first["claim_token"],
         claim_generation=first["claim_generation"],
     )
+
+
+def test_boost_false_result_is_retryable_failure_not_positive_acknowledgement(
+    isolated_database,
+    monkeypatch,
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    fill["tier"] = "boost"
+    manager = SimpleNamespace(notify_boost_fill=lambda _trade_id: False)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
+    )
+
+    result = reconciliation._run_post_fill_hooks(fill, completed_at=AFTER)
+
+    assert result["boost_notification"] == "failed"
+    row = (
+        database.get_connection()
+        .execute(
+            "SELECT state, last_error_code FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND hook_name='boost_notification'",
+            (fill["fill_id"],),
+        )
+        .fetchone()
+    )
+    assert tuple(row) == ("pending", "CALLBACK_FAILED")
+    assert "boost_notification" not in database.get_offer_fill_hook_receipts(
+        fill["fill_id"]
+    )
+
+
+def test_heartbeat_uncertainty_after_durable_effect_never_resets_pending(
+    isolated_database,
+    monkeypatch,
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    monkeypatch.setattr(database, "_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS", 0.03)
+    acknowledgement_written = threading.Event()
+    heartbeat_failed = threading.Event()
+
+    def uncertain_heartbeat(*_args, **_kwargs):
+        assert acknowledgement_written.wait(timeout=1)
+        heartbeat_failed.set()
+        return False
+
+    def callback(row, **claim):
+        acknowledgement = _record_claimed_test_sink_ack(
+            row["fill_id"],
+            "offer_filled_event",
+            {"test_sink": "effect-before-heartbeat-failure"},
+            claim,
+        )
+        acknowledgement_written.set()
+        assert heartbeat_failed.wait(timeout=1)
+        return acknowledgement
+
+    monkeypatch.setattr(database, "heartbeat_offer_fill_hook", uncertain_heartbeat)
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: {"offer_filled_event": callback},
+    )
+
+    result = reconciliation._run_post_fill_hooks(fill, completed_at=AFTER)
+
+    assert result["offer_filled_event"] == "completed"
+    row = (
+        database.get_connection()
+        .execute(
+            "SELECT state, last_error_code FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND hook_name='offer_filled_event'",
+            (fill["fill_id"],),
+        )
+        .fetchone()
+    )
+    assert tuple(row) == ("completed", None)
+
+
+def test_callback_construction_failure_is_contained_after_proof_commit(
+    isolated_database,
+    monkeypatch,
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: (_ for _ in ()).throw(RuntimeError("callback import failed")),
+    )
+
+    result = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+
+    assert result["classification"] == FILLED_PROVEN
+    assert result["applied"] is True
+    assert result["post_fill_hooks"] == {
+        name: "failed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state, last_error_code FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? ORDER BY hook_name",
+            (result["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert [
+        (row["hook_name"], row["state"], row["last_error_code"]) for row in rows
+    ] == [
+        (name, "pending", "CALLBACK_CONSTRUCTION_FAILED")
+        for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
+    ]
+
+
+def test_recreated_production_boost_manager_uses_durable_fill_command(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    first_manager = BoostManager()
+    first_manager._buy_probe_tid_history.add(TRADE)
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=first_manager)),
+    )
+    first_claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    first_callback = reconciliation._post_fill_hook_callbacks(fill)[
+        "boost_notification"
+    ]
+    _invoke_claimed_hook(first_callback, fill, first_claim)
+
+    clock["now"] = "2026-08-20T12:10:31.000000Z"
+    recreated_manager = BoostManager()
+    legacy_results = []
+    legacy_notify = recreated_manager.notify_boost_fill
+
+    def observe_legacy_notify(trade_id):
+        result = legacy_notify(trade_id)
+        legacy_results.append(result)
+        return result
+
+    recreated_manager.notify_boost_fill = observe_legacy_notify
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=recreated_manager)),
+    )
+    recovered_claim = database.claim_offer_fill_hook(
+        fill["fill_id"], "boost_notification"
+    )
+    recovered_callback = reconciliation._post_fill_hook_callbacks(fill)[
+        "boost_notification"
+    ]
+    acknowledgement = _invoke_claimed_hook(recovered_callback, fill, recovered_claim)
+    assert database.complete_offer_fill_hook(
+        fill["fill_id"],
+        "boost_notification",
+        recovered_claim["claim_token"],
+        claim_generation=recovered_claim["claim_generation"],
+    )
+
+    assert acknowledgement["detail"]["trade_id"] == TRADE
+    assert legacy_results == []
+    assert "boost_notification" in database.get_offer_fill_hook_receipts(
+        fill["fill_id"]
+    )
+
+
+def test_recreated_boost_manager_consumes_registered_command_after_crash(
+    isolated_database,
+    monkeypatch,
+):
+    from boost_manager import BoostManager
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill["tier"] = "boost"
+    clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
+    abandoned = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    database.register_authoritative_boost_fill_command(
+        fill["fill_id"],
+        TRADE,
+        "buy",
+        claim_token=abandoned["claim_token"],
+        claim_generation=abandoned["claim_generation"],
+    )
+
+    clock["now"] = "2026-08-20T12:10:31.000000Z"
+    recreated = BoostManager()
+    monkeypatch.setitem(
+        sys.modules,
+        "api_server",
+        SimpleNamespace(bot=SimpleNamespace(boost_manager=recreated)),
+    )
+    recovered = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    callback = reconciliation._post_fill_hook_callbacks(fill)["boost_notification"]
+
+    acknowledgement = _invoke_claimed_hook(callback, fill, recovered)
+
+    assert acknowledgement["disposition"] == "applied"
+    assert recreated._buy_settled is True
+
+
+def test_recreated_production_sweep_coordinator_reconstructs_durable_registration(
+    isolated_database,
+    monkeypatch,
+):
+    import fill_classifier
+    import sweep_coordinator
+
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    classification = SimpleNamespace(
+        trade_id=TRADE,
+        classification="unknown",
+        spent_block_index=42,
+        taker_puzzle_hash=None,
+        sweep_group_id=None,
+        side="buy",
+    )
+    monkeypatch.setattr(
+        fill_classifier, "classify_fill", lambda *_a, **_k: classification
+    )
+    sweep_coordinator.reset_coordinator()
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+    callback = reconciliation._post_fill_hook_callbacks(fill)["sweep_registration"]
+    _invoke_claimed_hook(callback, fill, claim)
+    assert database.complete_offer_fill_hook(
+        fill["fill_id"],
+        "sweep_registration",
+        claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+
+    sweep_coordinator.reset_coordinator()
+    recreated = sweep_coordinator.get_coordinator()
+
+    assert recreated.get_pending_summary()["pending_fill_count"] == 1
+
+
+def test_migration_reopens_unproven_legacy_boost_and_sweep_receipts(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    conn = database.get_connection()
+    for hook_name in ("boost_notification", "sweep_registration"):
+        acknowledgement = {
+            "schema_version": 1,
+            "fill_id": fill["fill_id"],
+            "hook_name": hook_name,
+            "durable": True,
+            "detail": {"legacy_pre_effect": True},
+        }
+        conn.execute(
+            "INSERT INTO offer_fill_hook_sink_acks "
+            "(fill_id, hook_name, acknowledgement_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                fill["fill_id"],
+                hook_name,
+                json.dumps(acknowledgement, sort_keys=True, separators=(",", ":")),
+                AFTER,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO offer_fill_hook_receipts (fill_id, hook_name, completed_at) "
+            "VALUES (?, ?, ?)",
+            (fill["fill_id"], hook_name, AFTER),
+        )
+        conn.execute(
+            "UPDATE offer_fill_hook_outbox SET state='completed', completed_at=? "
+            "WHERE fill_id=? AND hook_name=?",
+            (AFTER, fill["fill_id"], hook_name),
+        )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    reopened = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state, last_error_code FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND hook_name IN ('boost_notification', 'sweep_registration') "
+            "ORDER BY hook_name",
+            (fill["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert [
+        (row["hook_name"], row["state"], row["last_error_code"]) for row in reopened
+    ] == [
+        ("boost_notification", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
+        ("sweep_registration", "pending", "LEGACY_RECEIPT_REQUIRES_REPLAY"),
+    ]
+
+
+def test_migration_reopens_false_noop_ack_for_actual_boost_fill(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    acknowledgement = {
+        "schema_version": 1,
+        "fill_id": fill["fill_id"],
+        "hook_name": "boost_notification",
+        "durable": True,
+        "detail": {"trade_id": TRADE, "applicable": False},
+    }
+    conn = database.get_connection()
+    conn.execute("UPDATE fills SET tier='boost' WHERE fill_id=?", (fill["fill_id"],))
+    conn.execute(
+        "INSERT INTO offer_fill_hook_sink_acks "
+        "(fill_id, hook_name, acknowledgement_json, created_at) "
+        "VALUES (?, 'boost_notification', ?, ?)",
+        (
+            fill["fill_id"],
+            json.dumps(acknowledgement, sort_keys=True, separators=(",", ":")),
+            AFTER,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_hook_receipts "
+        "(fill_id, hook_name, completed_at) "
+        "VALUES (?, 'boost_notification', ?)",
+        (fill["fill_id"], AFTER),
+    )
+    conn.execute(
+        "UPDATE offer_fill_hook_outbox SET state='completed', completed_at=? "
+        "WHERE fill_id=? AND hook_name='boost_notification'",
+        (AFTER, fill["fill_id"]),
+    )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    row = (
+        database.get_connection()
+        .execute(
+            "SELECT state, last_error_code FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? AND hook_name='boost_notification'",
+            (fill["fill_id"],),
+        )
+        .fetchone()
+    )
+    assert tuple(row) == ("pending", "LEGACY_RECEIPT_REQUIRES_REPLAY")
+
+
+def test_migration_audits_unproven_receipt_when_outbox_was_missing(
+    isolated_database,
+    monkeypatch,
+):
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    acknowledgement = {
+        "schema_version": 1,
+        "fill_id": fill["fill_id"],
+        "hook_name": "sweep_registration",
+        "durable": True,
+        "detail": {"legacy_pre_effect": True},
+    }
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO offer_fill_hook_sink_acks "
+        "(fill_id, hook_name, acknowledgement_json, created_at) "
+        "VALUES (?, 'sweep_registration', ?, ?)",
+        (
+            fill["fill_id"],
+            json.dumps(acknowledgement, sort_keys=True, separators=(",", ":")),
+            AFTER,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_hook_receipts "
+        "(fill_id, hook_name, completed_at) "
+        "VALUES (?, 'sweep_registration', ?)",
+        (fill["fill_id"], AFTER),
+    )
+    conn.execute(
+        "DELETE FROM offer_fill_hook_outbox "
+        "WHERE fill_id=? AND hook_name='sweep_registration'",
+        (fill["fill_id"],),
+    )
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    outbox = conn.execute(
+        "SELECT state, last_error_code FROM offer_fill_hook_outbox "
+        "WHERE fill_id=? AND hook_name='sweep_registration'",
+        (fill["fill_id"],),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT reason_code, prior_state FROM offer_fill_hook_migration_audit "
+        "WHERE fill_id=? AND hook_name='sweep_registration'",
+        (fill["fill_id"],),
+    ).fetchone()
+    assert tuple(outbox) == ("pending", "LEGACY_RECEIPT_REQUIRES_REPLAY")
+    assert tuple(audit) == ("LEGACY_RECEIPT_REQUIRES_REPLAY", "missing")
 
 
 def test_hook_without_positive_durable_fill_ack_is_not_completed(
@@ -2663,18 +3413,6 @@ def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
     isolated_database, monkeypatch
 ):
     _persist_created_offer()
-
-    def callbacks(_fill):
-        return {
-            name: (
-                lambda row, hook=name: database.record_offer_fill_hook_sink_ack(
-                    row["fill_id"], hook, {"test_sink": hook}
-                )
-            )
-            for name in database._AUTHORITATIVE_FILL_HOOKS
-        }
-
-    monkeypatch.setattr(reconciliation, "_post_fill_hook_callbacks", callbacks)
     committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
     conn = database.get_connection()
     conn.execute(
@@ -2733,7 +3471,14 @@ def test_production_fill_sinks_return_exact_durable_fill_acknowledgements(
     )
     callbacks = reconciliation._post_fill_hook_callbacks(fill)
 
-    acknowledgements = {name: callback(fill) for name, callback in callbacks.items()}
+    claims = {
+        name: database.claim_offer_fill_hook(fill["fill_id"], name)
+        for name in callbacks
+    }
+    acknowledgements = {
+        name: _invoke_claimed_hook(callback, fill, claims[name])
+        for name, callback in callbacks.items()
+    }
 
     assert set(acknowledgements) == set(database._AUTHORITATIVE_FILL_HOOKS)
     for name, acknowledgement in acknowledgements.items():
@@ -2741,11 +3486,15 @@ def test_production_fill_sinks_return_exact_durable_fill_acknowledgements(
         assert acknowledgement["hook_name"] == name
         assert acknowledgement["durable"] is True
         assert database.validate_offer_fill_hook_sink_ack(
-            fill["fill_id"], name, acknowledgement
+            fill["fill_id"],
+            name,
+            acknowledgement,
+            claim_token=claims[name]["claim_token"],
+            claim_generation=claims[name]["claim_generation"],
         )
 
 
-def test_production_boost_sink_retries_unavailable_manager_from_durable_fill_ack(
+def test_production_boost_sink_retries_unavailable_manager_from_durable_command(
     isolated_database, monkeypatch
 ):
     _persist_created_offer()
@@ -2764,15 +3513,23 @@ def test_production_boost_sink_retries_unavailable_manager_from_durable_fill_ack
     ).fetchone()
 
     assert first["post_fill_hooks"]["boost_notification"] == "failed"
-    assert boost_ack is not None
+    assert boost_ack is None
+    command = conn.execute(
+        "SELECT trade_id, state FROM offer_fill_boost_commands WHERE fill_id=?",
+        (first["fill_id"],),
+    ).fetchone()
+    assert tuple(command) == (TRADE, "registered")
     assert "boost_notification" not in database.get_offer_fill_hook_receipts(
         first["fill_id"]
     )
 
     notified = []
-    manager = SimpleNamespace(
-        notify_boost_fill=lambda trade_id: notified.append(trade_id)
-    )
+
+    def notify(trade_id):
+        notified.append(trade_id)
+        return True
+
+    manager = SimpleNamespace(notify_boost_fill=notify)
     monkeypatch.setitem(
         sys.modules,
         "api_server",
@@ -2801,10 +3558,10 @@ def test_post_fill_hooks_run_once_by_durable_fill_id_on_exact_replay(
 
     def callbacks(_fill):
         def callback(name):
-            def run(row):
+            def run(row, **claim):
                 calls.append((name, row["fill_id"]))
-                return database.record_offer_fill_hook_sink_ack(
-                    row["fill_id"], name, {"test_sink": name}
+                return _record_claimed_test_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}, claim
                 )
 
             return run
@@ -2841,12 +3598,12 @@ def test_post_fill_hook_failure_never_undoes_proof_and_retries_only_failure(
 
     def callbacks(_fill):
         def callback(name):
-            def run(_row):
+            def run(_row, **claim):
                 calls[name] += 1
                 if name == "fill_classification" and calls[name] == 1:
                     raise RuntimeError("classification hook failed")
-                return database.record_offer_fill_hook_sink_ack(
-                    _row["fill_id"], name, {"test_sink": name}
+                return _record_claimed_test_sink_ack(
+                    _row["fill_id"], name, {"test_sink": name}, claim
                 )
 
             return run
@@ -2889,13 +3646,13 @@ def test_post_fill_hook_claim_allows_one_effect_under_concurrent_replay(
 
     def callbacks(_fill):
         def callback(name):
-            def run(_row):
+            def run(_row, **claim):
                 if name == "offer_filled_event":
                     effect_entered.set()
                     assert release_effect.wait(timeout=5)
                 calls[name] += 1
-                return database.record_offer_fill_hook_sink_ack(
-                    _row["fill_id"], name, {"test_sink": name}
+                return _record_claimed_test_sink_ack(
+                    _row["fill_id"], name, {"test_sink": name}, claim
                 )
 
             return run
@@ -2952,12 +3709,15 @@ def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
             heartbeat_seen.set()
         return held
 
-    def callback(row):
+    def callback(row, **claim):
         callback_started.set()
         assert heartbeat_seen.wait(timeout=0.5)
         assert release_callback.wait(timeout=2)
-        return database.record_offer_fill_hook_sink_ack(
-            row["fill_id"], "offer_filled_event", {"test_sink": "long_running"}
+        return _record_claimed_test_sink_ack(
+            row["fill_id"],
+            "offer_filled_event",
+            {"test_sink": "long_running"},
+            claim,
         )
 
     monkeypatch.setattr(database, "heartbeat_offer_fill_hook", heartbeat)
@@ -3002,14 +3762,14 @@ def test_post_fill_hook_crash_after_effect_before_receipt_never_duplicates(
 
     def callbacks(_fill):
         def callback(name):
-            def run(row):
+            def run(row, **claim):
                 attempts[name] += 1
                 effect_key = (name, row["fill_id"])
                 if effect_key not in applied:
                     applied.add(effect_key)
                     effects[name] += 1
-                return database.record_offer_fill_hook_sink_ack(
-                    row["fill_id"], name, {"test_sink": name}
+                return _record_claimed_test_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}, claim
                 )
 
             return run
@@ -3057,14 +3817,14 @@ def test_post_fill_receipt_exception_after_effect_stays_uncertain_without_duplic
 
     def callbacks(_fill):
         def callback(name):
-            def run(row):
+            def run(row, **claim):
                 attempts[name] += 1
                 effect_key = (name, row["fill_id"])
                 if effect_key not in applied:
                     applied.add(effect_key)
                     effects[name] += 1
-                return database.record_offer_fill_hook_sink_ack(
-                    row["fill_id"], name, {"test_sink": name}
+                return _record_claimed_test_sink_ack(
+                    row["fill_id"], name, {"test_sink": name}, claim
                 )
 
             return run
@@ -3117,8 +3877,9 @@ def test_default_offer_filled_event_sink_is_idempotent_by_durable_fill_id(
     assert fill["fill_id"] == committed["fill_id"]
 
     callback = original_callbacks(fill)["offer_filled_event"]
-    callback(fill)
-    callback(fill)
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "offer_filled_event")
+    _invoke_claimed_hook(callback, fill, claim)
+    _invoke_claimed_hook(callback, fill, claim)
 
     persisted = database.get_recent_events(limit=20, event_type="offer_filled")
     matching = [
@@ -3195,7 +3956,7 @@ def test_default_post_fill_hooks_retry_unpersisted_event_and_unavailable_boost(
     monkeypatch.setattr(
         database,
         "record_offer_fill_hook_sink_ack",
-        lambda fill_id, hook_name, _detail: {
+        lambda fill_id, hook_name, _detail, **_claim: {
             "schema_version": 1,
             "fill_id": fill_id,
             "hook_name": hook_name,
@@ -3203,16 +3964,22 @@ def test_default_post_fill_hooks_retry_unpersisted_event_and_unavailable_boost(
             "detail": _detail,
         },
     )
+    monkeypatch.setattr(
+        database,
+        "register_authoritative_boost_fill_command",
+        lambda *_args, **_kwargs: {"state": "registered"},
+    )
     monkeypatch.setitem(
         sys.modules, "api_server", SimpleNamespace(bot=SimpleNamespace())
     )
 
     callbacks = reconciliation._post_fill_hook_callbacks(fill)
+    claim = {"claim_token": "test-token", "claim_generation": 1}
 
     with pytest.raises(RuntimeError, match="offer_filled"):
-        callbacks["offer_filled_event"](fill)
+        _invoke_claimed_hook(callbacks["offer_filled_event"], fill, claim)
     with pytest.raises(RuntimeError, match="BoostManager"):
-        callbacks["boost_notification"](fill)
+        _invoke_claimed_hook(callbacks["boost_notification"], fill, claim)
 
 
 def test_sweep_registration_is_idempotent_by_durable_fill_id():
@@ -4227,6 +4994,10 @@ def _hostile_excessive_depth() -> dict:
     return root
 
 
+def _hostile_oversized_utf8_key() -> dict:
+    return {"e" * (reconciliation._MAX_CANONICAL_TEXT_BYTES + 1): None}
+
+
 @pytest.mark.parametrize("source_name", ["offer_history", "transaction_history"])
 def test_deep_identity_bearing_history_row_totalizes_to_durable_unknown(
     isolated_database,
@@ -4264,8 +5035,15 @@ def test_deep_identity_bearing_history_row_totalizes_to_durable_unknown(
         lambda: [float("nan"), float("inf"), float("-inf")],
         _hostile_excessive_depth,
         lambda: list(range(4097)),
+        _hostile_oversized_utf8_key,
     ],
-    ids=["mixed-keys", "nonfinite", "excessive-depth", "container-cap"],
+    ids=[
+        "mixed-keys",
+        "nonfinite",
+        "excessive-depth",
+        "container-cap",
+        "oversized-utf8-key",
+    ],
 )
 def test_hostile_proof_encoding_persists_minimal_unknown_and_named_latch(
     isolated_database,
