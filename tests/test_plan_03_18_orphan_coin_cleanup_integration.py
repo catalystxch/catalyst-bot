@@ -1,7 +1,7 @@
 """Slice 03-18 — orphan coin cleanup (integration test).
 
-Tests the full flow: coins locked in DB → offers cancelled/expired →
-cleanup_orphaned_locked_coins detects orphans → coins freed.
+Tests the proof-safe split: unattributed legacy locks may be reclaimed, while
+trade-attributed locks remain reserved until authoritative reconciliation.
 
 Uses real SQLite temp DB. Also tests check_orphan_locks from bot_health.py.
 """
@@ -136,15 +136,16 @@ class TestCleanupOrphanedLockedCoins(_TempDB):
         self.assertEqual(result["total_freed"], 1)
         self.assertEqual(self._coin_status("0xcoin1")["status"], "free")
 
-    def test_frees_coin_with_stale_trade_id(self):
-        # Coin locked with a trade_id that's no longer open
+    def test_preserves_coin_with_stale_looking_trade_id(self):
+        # Wallet/open-list absence is not terminal proof.
         self._add_coin("0xcoin2")
         self._lock_coin_to_offer("0xcoin2", "trade-gone")
         # open_trade_ids does NOT include "trade-gone"
         result = cleanup_orphaned_locked_coins({"trade-active"})
-        self.assertEqual(result["freed_stale_trade"], 1)
-        self.assertEqual(result["total_freed"], 1)
-        self.assertEqual(self._coin_status("0xcoin2")["status"], "free")
+        self.assertEqual(result["freed_stale_trade"], 0)
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 1)
+        self.assertEqual(self._coin_status("0xcoin2")["status"], "locked")
 
     def test_keeps_coin_with_active_trade_id(self):
         # Coin locked with a trade_id that IS still open
@@ -170,36 +171,39 @@ class TestCleanupOrphanedLockedCoins(_TempDB):
         self._add_coin("0xa1")
         self._add_coin("0xa2")
         self._add_coin("0xa3")
-        # a1: locked, stale trade_id → freed
+        # a1: locked, stale-looking trade_id → still proof-protected
         self._lock_coin_to_offer("0xa1", "stale-trade")
         # a2: locked, active trade_id → kept
         self._lock_coin_to_offer("0xa2", "active-trade")
         # a3: free → not affected
         result = cleanup_orphaned_locked_coins({"active-trade"})
-        self.assertEqual(result["total_freed"], 1)
-        self.assertEqual(self._coin_status("0xa1")["status"], "free")
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 2)
+        self.assertEqual(self._coin_status("0xa1")["status"], "locked")
         self.assertEqual(self._coin_status("0xa2")["status"], "locked")
         self.assertEqual(self._coin_status("0xa3")["status"], "free")
 
-    def test_stats_count_all_freed_coins(self):
+    def test_stats_count_all_trade_attributed_coins_as_protected(self):
         for i in range(5):
             self._add_coin(f"0xstale{i}")
             self._lock_coin_to_offer(f"0xstale{i}", f"stale-{i}")
         result = cleanup_orphaned_locked_coins(set())
-        self.assertEqual(result["freed_stale_trade"], 5)
-        self.assertEqual(result["total_freed"], 5)
+        self.assertEqual(result["freed_stale_trade"], 0)
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 5)
 
-    def test_freed_coins_become_available_in_free_pool(self):
+    def test_trade_attributed_coins_do_not_reenter_free_pool_without_proof(self):
         self._add_coin("0xfree1")
         self._lock_coin_to_offer("0xfree1", "stale-trade")
         # Before cleanup: locked coin not in free pool
         self.assertEqual(len(get_free_coins("xch")), 0)
         cleanup_orphaned_locked_coins(set())
-        # After cleanup: coin is back in free pool
+        # After cleanup: the reservation remains blocking.
         free = get_free_coins("xch")
-        self.assertEqual(len(free), 1)
+        self.assertEqual(len(free), 0)
+        self.assertEqual(self._coin_status("0xfree1")["status"], "locked")
 
-    def test_cat_coins_also_freed(self):
+    def test_cat_trade_attribution_is_also_preserved(self):
         upsert_coin(
             "0xcat1",
             "cat",
@@ -210,8 +214,9 @@ class TestCleanupOrphanedLockedCoins(_TempDB):
         )
         self._lock_coin_to_offer("0xcat1", "stale-cat-trade")
         result = cleanup_orphaned_locked_coins(set())
-        self.assertEqual(result["total_freed"], 1)
-        self.assertEqual(self._coin_status("0xcat1")["status"], "free")
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 1)
+        self.assertEqual(self._coin_status("0xcat1")["status"], "locked")
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +290,9 @@ class TestCheckOrphanLocks(_TempDB):
 
 @unittest.skipIf(_SKIP_DB is not None, f"database unavailable: {_SKIP_DB}")
 class TestOrphanCleanupCycle(_TempDB):
-    """End-to-end: offers cancelled → orphan detection → coins freed → available again."""
+    """End-to-end: open-list absence alone preserves trade reservations."""
 
-    def test_cancel_flow_frees_coins(self):
+    def test_cancel_appearance_without_proof_preserves_coins(self):
         from decimal import Decimal
 
         # Setup: add coin + open offer, lock coin to offer
@@ -309,13 +314,14 @@ class TestOrphanCleanupCycle(_TempDB):
         # Simulate offer cancelled (not in open_trade_ids anymore)
         open_ids = set()  # no open offers
         result = cleanup_orphaned_locked_coins(open_ids)
-        self.assertEqual(result["total_freed"], 1)
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 1)
 
-        # Coin should be free again
-        self.assertEqual(self._coin_status("0xcycle1")["status"], "free")
-        self.assertEqual(len(get_free_coins("xch")), 1)
+        # Coin remains reserved until Task 9 commits exact terminal proof.
+        self.assertEqual(self._coin_status("0xcycle1")["status"], "locked")
+        self.assertEqual(len(get_free_coins("xch")), 0)
 
-    def test_multiple_offers_partial_cancel(self):
+    def test_open_list_partial_absence_preserves_every_attributed_lock(self):
         from decimal import Decimal
 
         # 3 coins locked to 3 offers, 2 cancelled
@@ -333,12 +339,13 @@ class TestOrphanCleanupCycle(_TempDB):
 
         # Only t-2 still open
         result = cleanup_orphaned_locked_coins({"t-2"})
-        self.assertEqual(result["total_freed"], 2)
+        self.assertEqual(result["total_freed"], 0)
+        self.assertEqual(result["protected_registry_or_trade"], 3)
 
-        self.assertEqual(self._coin_status("0xcycle0")["status"], "free")
-        self.assertEqual(self._coin_status("0xcycle1")["status"], "free")
+        self.assertEqual(self._coin_status("0xcycle0")["status"], "locked")
+        self.assertEqual(self._coin_status("0xcycle1")["status"], "locked")
         self.assertEqual(self._coin_status("0xcycle2")["status"], "locked")
-        self.assertEqual(len(get_free_coins("xch")), 2)
+        self.assertEqual(len(get_free_coins("xch")), 0)
 
 
 if __name__ == "__main__":

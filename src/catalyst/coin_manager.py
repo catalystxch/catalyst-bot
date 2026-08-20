@@ -3028,31 +3028,14 @@ class CoinManager:
                     # locked each coin — no more unreliable amount-based matching.
                     # This replaces the old link_offers_to_locked_coins() approach.
                     #
-                    # V6 FIX (2026-04-08): Wallet-authoritative audit pass.
-                    # Always run the audit when offer_id_map is available — not
-                    # just when stats["locked"] > 0. The previous gating left
-                    # three drift conditions unfixed:
-                    #   (a) coins already locked from a prior cycle with NULL
-                    #       trade_id (no longer caught after the first cycle)
-                    #   (b) coins already locked with a STALE trade_id
-                    #       (offer was replaced; coin was reused under a
-                    #       different offer)
-                    #   (c) coins still flagged status='locked' in DB whose
-                    #       offer no longer exists in the wallet at all
-                    #       (orphan locks — happen when reconcile_coins_with
-                    #       _wallet's free-transition is blocked by a stale
-                    #       trade_id at line 1994).
-                    # The audit fixes (a)+(b)+(c) in one pass, with the wallet
-                    # as the single source of truth.
+                    # A wallet-observed lock may conservatively add a missing
+                    # reservation. Existing trade-attributed or registry-owned
+                    # reservations are never rebound here: only Task 9 terminal
+                    # proof may release or replace them.
                     if offer_id_map is not None:
                         try:
-                            from database import get_connection, _now
+                            from database import reconcile_wallet_locked_coin_links
 
-                            conn = get_connection()
-                            now = _now()
-                            audit_linked = 0  # NULL → trade_id set
-                            audit_relinked = 0  # stale trade_id overwritten
-                            audit_freed = 0  # orphan lock freed
                             # Get all open offers from wallet to map offer_hash → trade_id
                             if wallet_open_offers is None:
                                 from wallet import get_all_offers
@@ -3072,13 +3055,11 @@ class CoinManager:
                             # we only ever assign a trade_id we've actually
                             # seen as an open offer (defends against junk).
                             hash_to_trade = {}
-                            open_trade_ids = set()
                             if all_open:
                                 for o in all_open:
                                     tid = o.get("trade_id", "")
                                     if tid:
                                         hash_to_trade[tid.lower()] = tid
-                                        open_trade_ids.add(tid)
 
                             # ---- Build the wallet-authoritative locked map ----
                             # For every coin that Sage says is locked, derive
@@ -3090,109 +3071,17 @@ class CoinManager:
                                 if trade_id:
                                     wallet_locked_to_trade[store_id] = trade_id
 
-                            # ---- Pass 1: Reconcile each wallet-locked coin ----
-                            # The DB row should be (status='locked',
-                            # trade_id=canonical). Apply the minimum update.
-                            for (
-                                store_id,
-                                canonical_tid,
-                            ) in wallet_locked_to_trade.items():
-                                row = conn.execute(
-                                    "SELECT status, trade_id FROM coins "
-                                    "WHERE coin_id=?",
-                                    (store_id,),
-                                ).fetchone()
-                                if row is None:
-                                    # Coin not in DB yet — reconcile_coins_with_wallet
-                                    # should have inserted it above. If it's
-                                    # still missing, something is wrong with
-                                    # the upsert; skip silently here so we
-                                    # don't double-commit.
-                                    continue
-                                cur_status = row["status"]
-                                cur_tid = row["trade_id"] or ""
-                                if cur_status != "locked":
-                                    conn.execute(
-                                        "UPDATE coins SET status='locked', "
-                                        "trade_id=?, last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_relinked += 1
-                                elif not cur_tid:
-                                    conn.execute(
-                                        "UPDATE coins SET trade_id=?, "
-                                        "last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_linked += 1
-                                elif cur_tid != canonical_tid:
-                                    conn.execute(
-                                        "UPDATE coins SET trade_id=?, "
-                                        "last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_relinked += 1
-
-                            # ---- Pass 2: Free orphan locks ----
-                            # Any DB row that says status='locked' for THIS
-                            # wallet type but does NOT appear in the wallet's
-                            # locked map is a stale lock. Either the offer is
-                            # gone (cancelled/filled and confirmed on-chain)
-                            # or the trade_id was bogus to begin with.
-                            #
-                            # Guard: don't touch coins locked very recently
-                            # (last 60s). The offer_manager may have just
-                            # locked a coin in the gap between our wallet
-                            # snapshot and now — we don't want the audit to
-                            # race-clobber a fresh lock.
-                            stale_threshold_secs = 60
-                            db_locked_rows = conn.execute(
-                                "SELECT coin_id, trade_id, last_seen "
-                                "FROM coins "
-                                "WHERE wallet_type=? AND status='locked'",
-                                (wt,),
-                            ).fetchall()
-                            for row in db_locked_rows:
-                                cid_db = row["coin_id"]
-                                cid_norm = (
-                                    cid_db if cid_db.startswith("0x") else "0x" + cid_db
-                                ).lower()
-                                if cid_norm in wallet_locked_to_trade:
-                                    continue  # Wallet still locks it — fine
-                                # Wallet doesn't lock it. Is it freshly
-                                # locked by us in the last 60s?
-                                last_seen = row["last_seen"] or 0
-                                try:
-                                    age = now - int(last_seen)
-                                except Exception:
-                                    age = 999999
-                                if age < stale_threshold_secs:
-                                    continue  # Too fresh to touch
-                                # Also: if the row's trade_id is in our open
-                                # offers list, the wallet just hasn't reported
-                                # the lock yet (rare RPC race); leave it alone.
-                                cur_tid = row["trade_id"] or ""
-                                if cur_tid and cur_tid in open_trade_ids:
-                                    continue
-                                # Genuine orphan lock — free it.
-                                conn.execute(
-                                    "UPDATE coins SET status='free', "
-                                    "trade_id=NULL, last_seen=? "
-                                    "WHERE coin_id=?",
-                                    (now, cid_db),
-                                )
-                                audit_freed += 1
-
-                            conn.commit()
-
-                            if audit_linked or audit_relinked or audit_freed:
+                            audit = reconcile_wallet_locked_coin_links(
+                                wallet_locked_to_trade
+                            )
+                            if audit["linked"] or audit["locked"]:
                                 log_event(
                                     "info",
                                     "reconcile_audit",
                                     f"{wt.upper()} wallet audit: "
-                                    f"linked={audit_linked}, "
-                                    f"relinked={audit_relinked}, "
-                                    f"freed_orphans={audit_freed}",
+                                    f"linked={audit['linked']}, "
+                                    f"newly_locked={audit['locked']}, "
+                                    f"protected={audit['protected']}",
                                 )
                         except Exception as audit_e:
                             log_event(
@@ -3244,7 +3133,6 @@ class CoinManager:
                         get_free_coins,
                         get_locked_coins,
                         mark_coins_gone,
-                        mark_coin_spent,
                         free_coin,
                         upsert_coin,
                         get_open_offers,
@@ -3287,13 +3175,9 @@ class CoinManager:
                 try:
                     from database import (
                         get_locked_coins,
-                        get_open_offers,
                         free_coin,
-                        mark_coin_spent,
+                        is_coin_reconciliation_protected,
                     )
-
-                    open_offers_list = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
-                    open_trade_ids = {o["trade_id"] for o in open_offers_list}
 
                     xch_rpc = self._get_coins_fast(cfg.WALLET_ID_XCH)
                     cat_rpc = self._get_coins_fast(cfg.CAT_WALLET_ID)
@@ -3309,12 +3193,10 @@ class CoinManager:
                     reconciled = 0
                     for coin in db_locked:
                         cid = coin["coin_id"]
-                        linked_trade = coin.get("trade_id", "")
+                        if is_coin_reconciliation_protected(cid):
+                            continue
                         if cid in wallet_spendable:
                             free_coin(cid)
-                            reconciled += 1
-                        elif linked_trade and linked_trade not in open_trade_ids:
-                            mark_coin_spent(cid)
                             reconciled += 1
                     if reconciled > 0:
                         log_event(
@@ -3371,14 +3253,10 @@ class CoinManager:
                     f"Offer-to-coin linking failed: {link_e}",
                 )
 
-            # ---- Orphaned locked coin cleanup (V5 FIX) ----
-            # Free locked coins whose trade_id no longer matches an open offer.
-            #
-            # CRITICAL FIX: For Sage wallets, pass the set of coin IDs that
-            # the wallet confirms are offer-locked (have offer_id set).
-            # The cleanup function will NOT free these coins even if they
-            # lack a trade_id in our DB — the wallet is authoritative.
-            # This breaks the tug-of-war: reconcile locks → orphan frees → repeat.
+            # ---- Conservative legacy orphan cleanup ----
+            # Wallet absence does not release trade-attributed or registry-owned
+            # locks. The database helper may reclaim only genuinely unattributed
+            # legacy debris; wallet-confirmed locks remain an additional guard.
             try:
                 from database import cleanup_orphaned_locked_coins, get_open_offers
 

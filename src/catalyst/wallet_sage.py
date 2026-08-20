@@ -5176,13 +5176,24 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
             offer_id = c.get("offer_id") or c.get("offer_hash") or None
             if offer_id and isinstance(offer_id, str):
                 offer_id = offer_id.lower()
-            coin_map[cid] = {
+            record = {
                 "amount": int(c.get("amount", "0")),
                 "offer_id": offer_id,
                 "spent_height": c.get("spent_height"),
                 "created_height": c.get("created_height"),
                 "transaction_id": c.get("transaction_id"),
             }
+            asset_value = c.get("asset_id")
+            if "asset_id" not in c and isinstance(c.get("asset"), dict):
+                asset_value = c["asset"].get("asset_id")
+            if asset_value is not None:
+                record["asset_id"] = asset_value
+            owned_value = c.get("owned")
+            if "owned" not in c:
+                owned_value = c.get("is_owned")
+            if type(owned_value) is bool:
+                record["owned"] = owned_value
+            coin_map[cid] = record
     return coin_map
 
 

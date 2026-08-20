@@ -91,6 +91,7 @@ class SweepCoordinator:
 
         # block_index → list of SweepEntry
         self._pending: Dict[int, List[SweepEntry]] = {}
+        self._registered_fill_ids: set[int] = set()
 
         # Finalised events waiting to be drained
         self._events: List[SweepEvent] = []
@@ -126,6 +127,9 @@ class SweepCoordinator:
         )
 
         with self._lock:
+            if fill_id in self._registered_fill_ids:
+                return None
+            self._registered_fill_ids.add(fill_id)
             if block_idx not in self._pending:
                 self._pending[block_idx] = []
             self._pending[block_idx].append(entry)

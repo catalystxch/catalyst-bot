@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
@@ -52,6 +53,8 @@ _CANCELLED_STATUSES = frozenset({3, "cancelled", "canceled"})
 _EXPIRED_STATUSES = frozenset({5, "expired"})
 _TERMINAL_STATUSES = _FILLED_STATUSES | _CANCELLED_STATUSES | _EXPIRED_STATUSES
 _MAX_EVIDENCE_AGE_SECONDS = 300
+_MAX_SOURCE_SKEW_SECONDS = 60
+_MAX_HISTORY_RECORDS = 1000
 _MAX_SELECTED_COINS = 256
 _MAX_TRANSACTION_FLOWS = 512
 _MAX_CANCEL_MEMBERS = 64
@@ -147,6 +150,20 @@ def _is_canonical_utc_text(value: Any) -> bool:
         return False
 
 
+def _clock_utc(clock: Callable[[], Any] | None = None) -> str:
+    value = clock() if clock is not None else datetime.now(timezone.utc)
+    return _canonical_utc(value)
+
+
+def _source_timestamp(value: Any) -> Any:
+    if type(value) is not dict:
+        return None
+    for key in ("observed_at_utc", "source_observed_at", "observed_at"):
+        if key in value:
+            return value[key]
+    return None
+
+
 def _status(value: Any) -> int | str | None:
     if type(value) is int:
         return value
@@ -156,8 +173,6 @@ def _status(value: Any) -> int | str | None:
 
 
 def _redact_json(value: Any, *, depth: int = 0) -> Any:
-    if depth > 12:
-        return "<depth-limited>"
     if type(value) is dict:
         result: dict[str, Any] = {}
         for key in sorted(value):
@@ -168,10 +183,11 @@ def _redact_json(value: Any, *, depth: int = 0) -> Any:
             result[key] = _redact_json(value[key], depth=depth + 1)
         return result
     if type(value) is list:
-        return [_redact_json(item, depth=depth + 1) for item in value[:512]]
+        return [_redact_json(item, depth=depth + 1) for item in value]
     if type(value) in {str, int, bool} or value is None:
         if type(value) is str and len(value) > 4096:
-            return value[:256] + "<redacted-long-text>"
+            tail_digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            return value[:256] + f"<redacted-long-text-sha256:{tail_digest}>"
         return value
     return f"<{type(value).__name__}>"
 
@@ -184,23 +200,73 @@ def canonical_evidence_and_digest(
     if type(max_bytes) is not int or max_bytes < 128:
         raise ValueError("max_bytes must be an integer of at least 128")
     redacted = _redact_json(evidence)
-    encoded = json.dumps(
+    full_encoded = json.dumps(
         redacted,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    if len(encoded.encode("utf-8")) > max_bytes:
-        source_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        encoded = json.dumps(
-            {"bounded": True, "redacted": True, "source_sha256": source_digest},
+    full_digest = hashlib.sha256(full_encoded.encode("utf-8")).hexdigest()
+    if len(full_encoded.encode("utf-8")) <= max_bytes:
+        return full_encoded, full_digest
+
+    def exact_subset(value: Any, *, list_limit: int) -> Any:
+        if type(value) is dict:
+            return {
+                key: exact_subset(item, list_limit=list_limit)
+                for key, item in value.items()
+            }
+        if type(value) is list:
+            return [
+                exact_subset(item, list_limit=list_limit) for item in value[:list_limit]
+            ]
+        return value
+
+    encoded = ""
+    for list_limit in (8, 4, 2, 1, 0):
+        subset = exact_subset(redacted, list_limit=list_limit)
+        subset_encoded = json.dumps(
+            subset,
+            ensure_ascii=False,
+            allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
         )
+        envelope = {
+            "bounded": True,
+            "exact_subset": subset,
+            "exact_subset_sha256": hashlib.sha256(
+                subset_encoded.encode("utf-8")
+            ).hexdigest(),
+            "full_evidence_sha256": full_digest,
+            "redacted": True,
+        }
+        encoded = json.dumps(
+            envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded.encode("utf-8")) <= max_bytes:
+            return encoded, full_digest
+    subset = {}
+    subset_encoded = "{}"
+    encoded = json.dumps(
+        {
+            "bounded": True,
+            "exact_subset": subset,
+            "exact_subset_sha256": hashlib.sha256(
+                subset_encoded.encode("utf-8")
+            ).hexdigest(),
+            "full_evidence_sha256": full_digest,
+            "redacted": True,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     if len(encoded.encode("utf-8")) > max_bytes:
         raise ValueError("max_bytes is too small for bounded evidence")
-    return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return encoded, full_digest
 
 
 def _exact_intent(intent: Any) -> dict[str, Any] | None:
@@ -245,6 +311,11 @@ def _exact_intent(intent: Any) -> dict[str, Any] | None:
     coin_ids = tuple(_hex_id(value) for value in raw_coins)
     if any(not value for value in coin_ids) or coin_ids != tuple(sorted(set(coin_ids))):
         return None
+    offer_created_at = _parse_utc(
+        intent.get("confirmed_at") or intent.get("prepared_at")
+    )
+    if offer_created_at is None:
+        return None
     return {
         **intent,
         "asset_id": _hex_id(intent["asset_id"]),
@@ -252,6 +323,7 @@ def _exact_intent(intent: Any) -> dict[str, Any] | None:
         "selected_coin_ids": coin_ids,
         "offered_amount": int(intent["offered_amount_atomic"]),
         "requested_amount": int(intent["requested_amount_atomic"]),
+        "offer_created_at": offer_created_at,
     }
 
 
@@ -264,6 +336,7 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
     age = (now - top_observed).total_seconds()
     if age > _MAX_EVIDENCE_AGE_SECONDS or age < -30:
         return "EVIDENCE_STALE"
+    effective_times: list[datetime] = []
     for name, reason in (
         ("offer_history", "OFFER_HISTORY_INCOMPLETE"),
         ("transaction_history", "TRANSACTION_HISTORY_INCOMPLETE"),
@@ -275,10 +348,58 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
         if type(source.get("provenance")) is not str or not source["provenance"]:
             return reason
         if not _is_canonical_utc_text(source.get("observed_at")):
-            return reason
+            return "EVIDENCE_TIMESTAMP_INVALID"
         observed = _parse_utc(source.get("observed_at"))
-        if observed is None or observed != top_observed:
-            return reason
+        if observed is None:
+            return "EVIDENCE_TIMESTAMP_INVALID"
+        source_age = (top_observed - observed).total_seconds()
+        if source_age < -30 or source_age > _MAX_EVIDENCE_AGE_SECONDS:
+            return "EVIDENCE_STALE"
+        effective = observed
+        source_observed_at = source.get("source_observed_at")
+        if source_observed_at is not None:
+            if not _is_canonical_utc_text(source_observed_at):
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            source_observed = _parse_utc(source_observed_at)
+            if source_observed is None:
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            source_observed_age = (top_observed - source_observed).total_seconds()
+            if (
+                source_observed_age < -30
+                or source_observed_age > _MAX_EVIDENCE_AGE_SECONDS
+            ):
+                return "EVIDENCE_STALE"
+            effective = source_observed
+        all_source_times = source.get("source_observed_at_all")
+        if all_source_times is not None:
+            if type(all_source_times) is not list:
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            if not all_source_times:
+                effective_times.append(effective)
+            for source_time in all_source_times:
+                if not _is_canonical_utc_text(source_time):
+                    return "EVIDENCE_TIMESTAMP_INVALID"
+                parsed_source_time = _parse_utc(source_time)
+                if parsed_source_time is None:
+                    return "EVIDENCE_TIMESTAMP_INVALID"
+                page_age = (top_observed - parsed_source_time).total_seconds()
+                if page_age < -30 or page_age > _MAX_EVIDENCE_AGE_SECONDS:
+                    return "EVIDENCE_STALE"
+                effective_times.append(parsed_source_time)
+        else:
+            effective_times.append(effective)
+        read_times = source.get("read_observed_at")
+        if type(read_times) is not list or not read_times:
+            return "EVIDENCE_TIMESTAMP_INVALID"
+        for read_time in read_times:
+            if not _is_canonical_utc_text(read_time):
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            parsed_read = _parse_utc(read_time)
+            if parsed_read is None:
+                return "EVIDENCE_TIMESTAMP_INVALID"
+            read_age = (top_observed - parsed_read).total_seconds()
+            if read_age < -30 or read_age > _MAX_EVIDENCE_AGE_SECONDS:
+                return "EVIDENCE_STALE"
         pagination = source.get("pagination")
         if type(pagination) is not dict:
             return reason
@@ -290,9 +411,15 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
             return reason
         if (
             pagination.get("remote_bounds_honored") is not True
-            and pagination.get("stable_oversized_snapshot") is not True
+            and pagination.get("authoritative_end") is not True
         ):
             return reason
+    if (
+        effective_times
+        and (max(effective_times) - min(effective_times)).total_seconds()
+        > _MAX_SOURCE_SKEW_SECONDS
+    ):
+        return "EVIDENCE_SOURCE_SKEW"
     return None
 
 
@@ -338,7 +465,7 @@ def _asset(value: Any) -> str:
     return _hex_id(value)
 
 
-def _flow(entry: Any) -> tuple[str, str, int, str] | None:
+def _flow(entry: Any) -> tuple[str, str, int, str, str, str] | None:
     if type(entry) is not dict:
         return None
     coin_id = _hex_id(entry.get("coin_id") or entry.get("id"))
@@ -348,14 +475,33 @@ def _flow(entry: Any) -> tuple[str, str, int, str] | None:
     asset_id = _asset(asset_value)
     amount = _positive_int(entry.get("amount"))
     address_kind = entry.get("address_kind")
+    raw_parent = (
+        entry.get("parent_coin_id")
+        or entry.get("parent_id")
+        or entry.get("source_coin_id")
+    )
+    parent_coin_id = _hex_id(raw_parent) if raw_parent is not None else ""
+    raw_condition = entry.get("spend_condition_id")
+    spend_condition_id = (
+        raw_condition if type(raw_condition) is str and raw_condition.strip() else ""
+    )
     if (
         not coin_id
         or not asset_id
         or amount is None
         or address_kind not in {None, "own", "offer"}
+        or (raw_parent is not None and not parent_coin_id)
+        or (raw_condition is not None and not spend_condition_id)
     ):
         return None
-    return coin_id, asset_id, amount, address_kind
+    return (
+        coin_id,
+        asset_id,
+        amount,
+        address_kind,
+        parent_coin_id,
+        spend_condition_id,
+    )
 
 
 def _coin_map(source: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
@@ -420,12 +566,12 @@ def _exact_transaction(
 
 def _coin_matches_flow(
     record: dict[str, Any],
-    flow: tuple[str, str, int, str],
+    flow: tuple[str, str, int, str, str, str],
     tx: dict[str, Any],
     *,
     spent: bool,
 ) -> bool:
-    coin_id, asset_id, amount, _kind = flow
+    coin_id, asset_id, amount, _kind, _parent, _condition = flow
     height_key = "spent_height" if spent else "created_height"
     return bool(
         _hex_id(record.get("coin_id") or coin_id) == coin_id
@@ -485,12 +631,13 @@ def _fill_proof(
         "transaction_id": tx["transaction_id"],
         "spend_identity": tx.get("spend_identity"),
         "block_height": tx["confirmed_height"],
+        "filled_at": tx["timestamp"],
         "receive_coin_id": receipt[0],
         "receive_amount_mojos": receipt[2],
     }
 
 
-def _cancel_members(
+def _basic_cancel_members(
     context: Any,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...]] | None:
     if type(context) is not dict or type(context.get("members")) is not list:
@@ -542,6 +689,75 @@ def _cancel_members(
     return members, normalized_aux
 
 
+def _validated_cancel_context(context: Any) -> dict[str, Any] | None:
+    parsed = _basic_cancel_members(context)
+    if parsed is None or type(context) is not dict:
+        return None
+    cohort_id = context.get("cohort_id")
+    manifest_sha256 = _hex_id(context.get("manifest_sha256"))
+    if type(cohort_id) is not str or not cohort_id.strip() or not manifest_sha256:
+        return None
+    members, auxiliary = parsed
+    exact_members: list[dict[str, Any]] = []
+    seen_member_ids: set[str] = set()
+    seen_prepared_events: set[str] = set()
+    seen_trade_ids: set[str] = set()
+    for member in members:
+        intent_id = member.get("intent_id")
+        trade_id = _hex_id(member.get("trade_id"))
+        member_id = member.get("member_id")
+        prepared_event_id = member.get("prepared_event_id")
+        if (
+            type(intent_id) is not str
+            or not intent_id.strip()
+            or type(member_id) is not str
+            or not member_id.strip()
+            or type(prepared_event_id) is not str
+        ):
+            return None
+        prefix = f"cancel:{trade_id}:attempt:"
+        if not prepared_event_id.startswith(prefix) or not prepared_event_id.endswith(
+            ":prepared"
+        ):
+            return None
+        attempt_text = prepared_event_id[len(prefix) : -len(":prepared")]
+        if not attempt_text.isdigit() or int(attempt_text) < 1:
+            return None
+        if (
+            member_id in seen_member_ids
+            or prepared_event_id in seen_prepared_events
+            or trade_id in seen_trade_ids
+        ):
+            return None
+        seen_member_ids.add(member_id)
+        seen_prepared_events.add(prepared_event_id)
+        seen_trade_ids.add(trade_id)
+        exact_members.append(
+            {
+                "intent_id": intent_id,
+                "trade_id": trade_id,
+                "member_id": member_id,
+                "prepared_event_id": prepared_event_id,
+                "selected_coin_ids": sorted(
+                    _hex_id(value) for value in member["selected_coin_ids"]
+                ),
+                "request_timestamp": member["request_timestamp"],
+                "transaction_id": (
+                    _hex_id(member["transaction_id"])
+                    if member.get("transaction_id") is not None
+                    else None
+                ),
+                "spend_identity": member.get("spend_identity"),
+            }
+        )
+    return {
+        "cohort_id": cohort_id,
+        "manifest_sha256": manifest_sha256,
+        "members": exact_members,
+        "auxiliary_coin_ids": list(auxiliary),
+    }
+
+
 def _cancel_proof(
     intent: dict[str, Any],
     offers: list[dict[str, Any]],
@@ -549,10 +765,11 @@ def _cancel_proof(
     coins: dict[str, dict[str, Any]],
     context: Any,
 ) -> dict[str, Any] | None:
-    parsed = _cancel_members(context)
-    if parsed is None:
+    exact_context = _validated_cancel_context(context)
+    if exact_context is None:
         return None
-    members, auxiliary = parsed
+    members = exact_context["members"]
+    auxiliary = tuple(exact_context["auxiliary_coin_ids"])
     target_members = [
         member
         for member in members
@@ -593,10 +810,7 @@ def _cancel_proof(
             for row in offers
             if _hex_id(row.get("trade_id") or row.get("offer_id")) == trade_id
         ]
-        if (
-            len(matching) != 1
-            or _status(matching[0].get("status")) not in _CANCELLED_STATUSES
-        ):
+        if len(matching) != 1:
             return None
         observed_selected = matching[0].get("selected_coin_ids")
         if observed_selected is not None and (
@@ -634,7 +848,7 @@ def _cancel_proof(
     if len(available) != len(created):
         return None
     rebindings: list[dict[str, Any]] = []
-    unmatched_xch_inputs: list[tuple[str, tuple[str, str, int, str]]] = []
+    unmatched_xch_inputs: list[tuple[str, tuple[str, str, int, str, str, str]]] = []
     for input_id in sorted(expected_offer_inputs):
         input_flow = spent_by_id[input_id]
         candidates = sorted(
@@ -644,6 +858,16 @@ def _cancel_proof(
         )
         if candidates:
             return_id = candidates[0]
+            if len(candidates) > 1:
+                lineage_matches = [
+                    coin_id
+                    for coin_id in candidates
+                    if available[coin_id][4] == input_id
+                    or (input_flow[5] and available[coin_id][5] == input_flow[5])
+                ]
+                if len(lineage_matches) != 1:
+                    return {"_conflict_reason": "CANCEL_RETURN_LINEAGE_AMBIGUOUS"}
+                return_id = lineage_matches[0]
             available.pop(return_id)
             rebindings.append(
                 {
@@ -745,6 +969,19 @@ def classify_terminal_evidence(
     coins = _coin_map(evidence["coin_records"])
     if type(offer_rows) is not list or transactions is None or coins is None:
         return _unknown("EVIDENCE_SCHEMA_INVALID")
+    if (
+        len(offer_rows) > _MAX_HISTORY_RECORDS
+        or len(transactions) > _MAX_HISTORY_RECORDS
+        or len(coins) > _MAX_COIN_RECORDS
+    ):
+        return _unknown("EVIDENCE_SOURCE_LIMIT_EXCEEDED")
+    if any(type(row) is not dict for row in offer_rows):
+        return _unknown("EVIDENCE_SCHEMA_INVALID")
+    try:
+        offer_rows = _dedupe_records(offer_rows, "trade_id")
+        transactions = _dedupe_records(transactions, "transaction_id")
+    except (TypeError, ValueError):
+        return _unknown("EVIDENCE_SCHEMA_INVALID")
     matches = [
         row
         for row in offer_rows
@@ -761,17 +998,38 @@ def classify_terminal_evidence(
         return _unknown("OFFER_IDENTITY_OR_AMOUNT_MISMATCH")
     status = _status(offer.get("status"))
     transaction_id = offer.get("transaction_id")
+    target_transaction_id = _hex_id(transaction_id)
+    if target_transaction_id:
+        tx_matches = [
+            row
+            for row in transactions
+            if _hex_id(row.get("transaction_id")) == target_transaction_id
+        ]
+        if len(tx_matches) > 1:
+            return _conflict("DUPLICATE_TRANSACTION_IDENTITY")
     tx = (
         _exact_transaction(transactions, transaction_id)
         if type(transaction_id) is str and transaction_id
         else None
     )
+    if tx is not None:
+        tx_time = _parse_utc(tx.get("timestamp"))
+        if tx_time is not None and tx_time < exact_intent["offer_created_at"]:
+            return _unknown("FILL_PREDATES_OFFER")
     fill = _fill_proof(exact_intent, offer, tx, coins) if tx is not None else None
     cancel = (
         _cancel_proof(exact_intent, offer_rows, tx, coins, cancel_context)
         if tx is not None and cancel_context is not None
         else None
     )
+    if cancel is not None and cancel.get("_conflict_reason"):
+        return _conflict(cancel["_conflict_reason"])
+    if status in _FILLED_STATUSES and cancel is not None:
+        return _conflict()
+    if status in (_ACTIVE_STATUSES | _EXPIRED_STATUSES) and (
+        fill is not None or cancel is not None
+    ):
+        return _conflict()
     # A grouped cancellation can return another cohort member's asset in the
     # exact amount this member requested.  The complete request-bound return
     # flow disambiguates that apparent receipt; without it, fail as conflict.
@@ -796,15 +1054,29 @@ def classify_terminal_evidence(
     if status in _CANCELLED_STATUSES:
         return _unknown("CANCEL_PROOF_INCOMPLETE")
     if status in _EXPIRED_STATUSES:
+        offered_asset = (
+            "xch" if exact_intent["side"] == "buy" else exact_intent["asset_id"]
+        )
+        selected_total = 0
         for coin_id in exact_intent["selected_coin_ids"]:
             record = coins.get(coin_id)
+            offer_link = _norm_id(record.get("offer_id")) if record else ""
             if (
                 record is None
                 or record.get("owned") is not True
                 or record.get("spent_height") not in (None, 0)
+                or _asset(record.get("asset_id")) != offered_asset
                 or _positive_int(record.get("amount")) is None
+                or offer_link
+                not in {
+                    exact_intent["sage_trade_id"],
+                    _norm_id(exact_intent["offer_text_sha256"]),
+                }
             ):
                 return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
+            selected_total += record["amount"]
+        if selected_total != exact_intent["offered_amount"]:
+            return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
         return {
             "classification": EXPIRED_PROVEN,
             "reason_code": "AUTHORITATIVE_EXPIRY_PROOF",
@@ -840,7 +1112,8 @@ def _offer_list(result: Any) -> list[dict[str, Any]] | None:
 def _dedupe_records(
     records: Iterable[dict[str, Any]], identity_key: str
 ) -> list[dict[str, Any]]:
-    by_id: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    canonical_by_id: dict[str, set[str]] = {}
     anonymous: list[dict[str, Any]] = []
     for row in records:
         identity = _norm_id(
@@ -848,17 +1121,36 @@ def _dedupe_records(
             or (row.get("offer_id") if identity_key == "trade_id" else "")
         )
         if identity:
-            by_id.setdefault(identity, row)
+            canonical = json.dumps(
+                row,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            seen = canonical_by_id.setdefault(identity, set())
+            if canonical not in seen:
+                by_id.setdefault(identity, []).append(row)
+                seen.add(canonical)
         else:
             anonymous.append(row)
-    return [by_id[key] for key in sorted(by_id)] + anonymous
+    return [row for key in sorted(by_id) for row in by_id[key]] + anonymous
+
+
+def _authoritative_page_end(result: Any, row_count: int) -> bool:
+    if type(result) is not dict:
+        return False
+    total = result.get("total")
+    if type(total) is int and total >= 0 and total == row_count:
+        return True
+    return bool(result.get("end_of_history") is True or result.get("has_more") is False)
 
 
 def load_sage_offer_history(
     *,
     get_all_offers: Callable[..., Any],
     include_completed: bool,
-    observed_at: Any,
+    clock: Callable[[], Any] | None = None,
     page_size: int = 50,
     max_pages: int = 20,
     max_records: int = 1000,
@@ -870,38 +1162,61 @@ def load_sage_offer_history(
         for value in (page_size, max_pages, max_records)
     ):
         raise ValueError("offer history bounds and include_completed must be exact")
-    when = _canonical_utc(observed_at)
     pages: list[list[dict[str, Any]]] = []
+    read_times: list[str] = []
+    source_times: list[str] = []
+    read_error = None
     complete = False
     remote_bounds_honored = True
     stable_oversized = False
+    authoritative_end = False
     for page_index in range(max_pages):
         start = page_index * page_size
-        rows = _offer_list(
-            get_all_offers(
+        try:
+            result = get_all_offers(
                 include_completed=include_completed,
                 start=start,
                 end=start + page_size,
             )
-        )
+        except Exception:
+            read_times.append(_clock_utc(clock))
+            read_error = "reader_exception"
+            break
+        read_times.append(_clock_utc(clock))
+        provided_timestamp = _source_timestamp(result)
+        if type(provided_timestamp) is str:
+            source_times.append(provided_timestamp)
+        rows = _offer_list(result)
         if rows is None:
+            read_error = "reader_malformed"
             break
         pages.append(rows)
+        page_authoritative_end = _authoritative_page_end(result, len(rows))
         if page_index > 0 and rows == pages[0] and len(rows) >= page_size:
             remote_bounds_honored = False
             stable_oversized = len(rows) > page_size
-            complete = len(rows) <= max_records
+            authoritative_end = page_authoritative_end
+            complete = authoritative_end and len(rows) <= max_records
             pages = [pages[0]]
             break
         if len(rows) > page_size:
             remote_bounds_honored = False
+            if page_authoritative_end and len(rows) <= max_records:
+                authoritative_end = True
+                complete = True
+                break
             continue
         if len(rows) < page_size:
             complete = True
             break
         if sum(len(page) for page in pages) >= max_records:
             break
-    records = _dedupe_records((row for page in pages for row in page), "trade_id")
+    try:
+        records = _dedupe_records((row for page in pages for row in page), "trade_id")
+    except (TypeError, ValueError):
+        records = []
+        complete = False
+        read_error = "normalization_exception"
     if len(records) > max_records:
         records = records[:max_records]
         complete = False
@@ -912,9 +1227,13 @@ def load_sage_offer_history(
             if _status(row.get("status")) not in _TERMINAL_STATUSES
         ]
     return {
-        "observed_at": when,
+        "observed_at": read_times[-1] if read_times else _clock_utc(clock),
+        "source_observed_at": source_times[-1] if source_times else None,
+        "source_observed_at_all": source_times,
+        "read_observed_at": read_times or [_clock_utc(clock)],
         "provenance": "wallet.get_all_offers",
         "complete": complete,
+        "read_error": read_error,
         "records": records,
         "include_completed_normalized": True,
         "pagination": {
@@ -923,6 +1242,7 @@ def load_sage_offer_history(
             "remote_bounds_honored": remote_bounds_honored,
             "locally_normalized": True,
             "stable_oversized_snapshot": stable_oversized,
+            "authoritative_end": authoritative_end,
         },
     }
 
@@ -945,12 +1265,28 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
         or address_kind not in {None, "own", "offer"}
     ):
         return None
-    return {
+    normalized = {
         "coin_id": coin_id,
         "asset_id": asset_id,
         "amount": int(amount_text),
         "address_kind": address_kind,
     }
+    raw_parent = (
+        entry.get("parent_coin_id")
+        or entry.get("parent_id")
+        or entry.get("source_coin_id")
+    )
+    if raw_parent is not None:
+        parent_coin_id = _hex_id(raw_parent)
+        if not parent_coin_id:
+            return None
+        normalized["parent_coin_id"] = parent_coin_id
+    raw_condition = entry.get("spend_condition_id")
+    if raw_condition is not None:
+        if type(raw_condition) is not str or not raw_condition.strip():
+            return None
+        normalized["spend_condition_id"] = raw_condition
+    return normalized
 
 
 def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -1010,7 +1346,7 @@ def _load_transactions(
     reader: Callable[..., Any],
     *,
     wallet_ids: tuple[int, ...],
-    observed_at: str,
+    clock: Callable[[], Any] | None,
     page_size: int,
     max_pages: int,
     max_records: int,
@@ -1018,30 +1354,47 @@ def _load_transactions(
     records: list[dict[str, Any]] = []
     complete = True
     pages_read = 0
+    read_times: list[str] = []
+    source_times: list[str] = []
+    read_error = None
     remote_bounds_honored = True
     stable_oversized = False
+    authoritative_end = False
     for wallet_id in wallet_ids:
         wallet_complete = False
         previous_rows: list[dict[str, Any]] | None = None
         for page_index in range(max_pages):
             start = page_index * page_size
-            result = reader(
-                wallet_id=wallet_id,
-                start=start,
-                end=start + page_size,
-                sort_key="CONFIRMED_AT_HEIGHT",
-                reverse=True,
-            )
+            try:
+                result = reader(
+                    wallet_id=wallet_id,
+                    start=start,
+                    end=start + page_size,
+                    sort_key="CONFIRMED_AT_HEIGHT",
+                    reverse=True,
+                )
+            except Exception:
+                pages_read += 1
+                read_times.append(_clock_utc(clock))
+                read_error = "reader_exception"
+                complete = False
+                break
             pages_read += 1
+            read_times.append(_clock_utc(clock))
+            provided_timestamp = _source_timestamp(result)
+            if type(provided_timestamp) is str:
+                source_times.append(provided_timestamp)
             if (
                 type(result) is not dict
                 or result.get("success") is not True
                 or type(result.get("transactions")) is not list
             ):
+                read_error = "reader_malformed"
                 complete = False
                 break
             rows = result["transactions"]
             if any(type(row) is not dict for row in rows):
+                read_error = "reader_malformed"
                 complete = False
                 break
             if (
@@ -1053,7 +1406,12 @@ def _load_transactions(
                 complete = False
                 break
             previous_rows = rows
-            records.extend(_normalized_transaction_row(row) for row in rows)
+            try:
+                records.extend(_normalized_transaction_row(row) for row in rows)
+            except Exception:
+                read_error = "normalization_exception"
+                complete = False
+                break
             total = result.get("total")
             if len(rows) > page_size:
                 remote_bounds_honored = False
@@ -1063,6 +1421,7 @@ def _load_transactions(
                     and len(rows) <= max_records
                 ):
                     stable_oversized = True
+                    authoritative_end = True
                     wallet_complete = True
                 else:
                     complete = False
@@ -1079,11 +1438,20 @@ def _load_transactions(
         if len(records) >= max_records:
             complete = False
             break
-    records = _dedupe_records(records[:max_records], "transaction_id")
+    try:
+        records = _dedupe_records(records[:max_records], "transaction_id")
+    except (TypeError, ValueError):
+        records = []
+        complete = False
+        read_error = "normalization_exception"
     return {
-        "observed_at": observed_at,
+        "observed_at": read_times[-1] if read_times else _clock_utc(clock),
+        "source_observed_at": source_times[-1] if source_times else None,
+        "source_observed_at_all": source_times,
+        "read_observed_at": read_times or [_clock_utc(clock)],
         "provenance": "wallet.get_transactions_list",
         "complete": complete,
+        "read_error": read_error,
         "records": records,
         "pagination": {
             "pages_read": max(1, pages_read),
@@ -1091,6 +1459,7 @@ def _load_transactions(
             "remote_bounds_honored": remote_bounds_honored,
             "locally_normalized": True,
             "stable_oversized_snapshot": stable_oversized,
+            "authoritative_end": authoritative_end,
         },
     }
 
@@ -1099,7 +1468,7 @@ def load_authoritative_evidence(
     intent: Any,
     *,
     wallet_facade: Any = None,
-    observed_at: Any = None,
+    clock: Callable[[], Any] | None = None,
     wallet_ids: tuple[int, ...] = (1,),
     page_size: int = 50,
     max_pages: int = 20,
@@ -1112,17 +1481,22 @@ def load_authoritative_evidence(
         raise ValueError("intent is not an exact registered offer")
     if wallet_facade is None:
         import wallet as wallet_facade
-    when = _canonical_utc(
-        datetime.now(timezone.utc) if observed_at is None else observed_at
-    )
-    identity = wallet_facade.get_wallet_identity()
+    collection_started_at = _clock_utc(clock)
+    try:
+        identity_reader = getattr(wallet_facade, "get_wallet_identity")
+        identity = identity_reader()
+        identity_error = None
+    except Exception:
+        identity = None
+        identity_error = "reader_exception"
+    identity_read_at = _clock_utc(clock)
     identity_observed = (
         _parse_utc(identity.get("observed_at_utc"))
         if type(identity) is dict
         and _is_canonical_utc_text(identity.get("observed_at_utc"))
         else None
     )
-    evidence_observed = _parse_utc(when)
+    evidence_observed = _parse_utc(identity_read_at)
     identity_age = (
         (evidence_observed - identity_observed).total_seconds()
         if evidence_observed is not None and identity_observed is not None
@@ -1147,24 +1521,46 @@ def load_authoritative_evidence(
             f"fingerprint:{identity['fingerprint']}".encode("utf-8")
         ).hexdigest()
     network = identity.get("network_id") if identity_valid else None
+
+    try:
+        offer_reader = getattr(wallet_facade, "get_all_offers")
+    except Exception:
+        offer_reader = None
+
+    def unavailable_offer_reader(**_kwargs):
+        raise RuntimeError("offer reader unavailable")
+
     offers = load_sage_offer_history(
-        get_all_offers=wallet_facade.get_all_offers,
+        get_all_offers=(
+            offer_reader if callable(offer_reader) else unavailable_offer_reader
+        ),
         include_completed=True,
-        observed_at=when,
+        clock=clock,
         page_size=page_size,
         max_pages=max_pages,
         max_records=max_records,
     )
+    try:
+        transaction_reader = getattr(wallet_facade, "get_transactions_list")
+    except Exception:
+        transaction_reader = None
+
+    def unavailable_transaction_reader(**_kwargs):
+        raise RuntimeError("transaction reader unavailable")
+
     transactions = _load_transactions(
-        wallet_facade.get_transactions_list,
+        (
+            transaction_reader
+            if callable(transaction_reader)
+            else unavailable_transaction_reader
+        ),
         wallet_ids=wallet_ids,
-        observed_at=when,
+        clock=clock,
         page_size=page_size,
         max_pages=max_pages,
         max_records=max_records,
     )
     required_ids = set(exact_intent["selected_coin_ids"])
-    asset_by_coin: dict[str, str] = {}
     coin_cap_exceeded = False
     for tx in transactions["records"]:
         for entry in [*(tx.get("spent") or []), *(tx.get("created") or [])]:
@@ -1177,37 +1573,79 @@ def load_authoritative_evidence(
                     coin_cap_exceeded = True
                     continue
                 required_ids.add(flow[0])
-                asset_by_coin[flow[0]] = flow[1]
-    raw_coins = wallet_facade.get_coins_by_ids(sorted(required_ids))
+    try:
+        coin_reader = getattr(wallet_facade, "get_coins_by_ids")
+        raw_coin_result = coin_reader(sorted(required_ids))
+        coin_error = None
+    except Exception:
+        raw_coin_result = None
+        coin_error = "reader_exception"
+    coin_read_at = _clock_utc(clock)
+    coin_source_observed_at = _source_timestamp(raw_coin_result)
+    if (
+        type(raw_coin_result) is dict
+        and raw_coin_result.get("success") is True
+        and type(raw_coin_result.get("records")) is dict
+    ):
+        raw_coins = raw_coin_result["records"]
+    else:
+        raw_coins = raw_coin_result
     normalized_coins: dict[str, dict[str, Any]] = {}
     if type(raw_coins) is dict:
-        for raw_id, raw_record in raw_coins.items():
-            if type(raw_record) is not dict:
-                continue
-            coin_id = _hex_id(raw_record.get("coin_id") or raw_id)
-            if not coin_id:
-                continue
-            record = dict(raw_record)
-            record["coin_id"] = coin_id
-            record.setdefault("asset_id", asset_by_coin.get(coin_id))
-            record.setdefault("owned", True)
-            normalized_coins[coin_id] = record
+        try:
+            for raw_id, raw_record in raw_coins.items():
+                if type(raw_record) is not dict:
+                    continue
+                coin_id = _hex_id(raw_record.get("coin_id") or raw_id)
+                if not coin_id:
+                    continue
+                record = dict(raw_record)
+                record["coin_id"] = coin_id
+                normalized_coins[coin_id] = record
+        except Exception:
+            normalized_coins = {}
+            coin_error = "normalization_exception"
     coin_complete = bool(
         not coin_cap_exceeded
         and type(raw_coins) is dict
         and set(normalized_coins) == required_ids
+        and coin_error is None
     )
+    collected_at = _clock_utc(clock)
     return {
         "schema_version": 1,
-        "observed_at": when,
+        "collection_started_at": collection_started_at,
+        "observed_at": collected_at,
         "wallet_fingerprint_hash": _norm_id(wallet_hash),
         "network": network,
+        "wallet_identity": {
+            "observed_at": identity_read_at,
+            "source_observed_at": (
+                identity.get("observed_at_utc") if type(identity) is dict else None
+            ),
+            "source_observed_at_all": (
+                [identity["observed_at_utc"]]
+                if type(identity) is dict
+                and type(identity.get("observed_at_utc")) is str
+                else []
+            ),
+            "provenance": "wallet.get_wallet_identity",
+            "complete": identity_valid,
+            "read_error": identity_error,
+        },
         "offer_history": offers,
         "transaction_history": transactions,
         "coin_records": {
-            "observed_at": when,
+            "observed_at": coin_read_at,
+            "source_observed_at": (
+                coin_source_observed_at
+                if type(coin_source_observed_at) is str
+                else None
+            ),
+            "read_observed_at": [coin_read_at],
             "provenance": "wallet.get_coins_by_ids",
             "complete": coin_complete,
+            "read_error": coin_error,
             "records": normalized_coins,
             "pagination": {
                 "pages_read": 1,
@@ -1302,6 +1740,160 @@ def _trip_denial_latch(
     )
 
 
+def _incomplete_loader_evidence(
+    intent: dict[str, Any], observed_at: str
+) -> dict[str, Any]:
+    def failed_source(provenance: str) -> dict[str, Any]:
+        return {
+            "observed_at": observed_at,
+            "source_observed_at": None,
+            "read_observed_at": [observed_at],
+            "provenance": provenance,
+            "complete": False,
+            "read_error": "collection_exception",
+            "records": {},
+            "pagination": {
+                "pages_read": 1,
+                "page_size": 1,
+                "remote_bounds_honored": False,
+                "locally_normalized": True,
+            },
+        }
+
+    offers = failed_source("wallet.get_all_offers")
+    offers["records"] = []
+    transactions = failed_source("wallet.get_transactions_list")
+    transactions["records"] = []
+    return {
+        "schema_version": 1,
+        "collection_started_at": observed_at,
+        "observed_at": observed_at,
+        "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
+        "network": intent["network"],
+        "wallet_identity": {
+            "observed_at": observed_at,
+            "source_observed_at": None,
+            "provenance": "wallet.get_wallet_identity",
+            "complete": False,
+            "read_error": "collection_exception",
+        },
+        "offer_history": offers,
+        "transaction_history": transactions,
+        "coin_records": failed_source("wallet.get_coins_by_ids"),
+        "local_expired": False,
+    }
+
+
+def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[[dict], Any]]:
+    """Build additive, replay-safe callbacks for one committed durable fill."""
+
+    import database
+
+    trade_id = fill["trade_id"]
+    offer = database.get_offer(trade_id) or {}
+    fill_detail = {
+        "fill_id": fill["fill_id"],
+        "trade_id": trade_id,
+        "side": fill["side"],
+        "price": fill["price_xch"],
+        "size_xch": fill["size_xch"],
+        "size_cat": fill["size_cat"],
+        "tier": fill["tier"],
+        "coin_id": offer.get("coin_id") or "unknown",
+        "timestamp": fill["filled_at"],
+        "spent_block_index": fill.get("spent_block_index"),
+    }
+    classification_box: dict[str, Any] = {}
+
+    def offer_filled_event(_row: dict[str, Any]) -> None:
+        persisted = database.log_event(
+            "info",
+            "offer_filled",
+            f"{str(fill['side']).upper()} offer {trade_id[:16]}... "
+            "filled from authoritative on-chain proof",
+            data={
+                "fill_id": fill["fill_id"],
+                "trade_id": trade_id,
+                "side": fill["side"],
+                "tier": fill["tier"],
+                "filled_at": fill["filled_at"],
+                "spent_block_index": fill.get("spent_block_index"),
+            },
+        )
+        if persisted is not True:
+            raise RuntimeError("offer_filled event was not persisted")
+
+    def boost_notification(_row: dict[str, Any]) -> None:
+        if str(fill.get("tier") or "").lower() != "boost":
+            return
+        api_server = sys.modules.get("api_server")
+        bot_ref = getattr(api_server, "bot", None) if api_server is not None else None
+        manager = getattr(bot_ref, "boost_manager", None) if bot_ref else None
+        if manager is None or not hasattr(manager, "notify_boost_fill"):
+            raise RuntimeError("BoostManager is unavailable")
+        manager.notify_boost_fill(trade_id)
+
+    def classification():
+        existing = classification_box.get("value")
+        if existing is not None:
+            return existing
+        from fill_classifier import classify_and_store_fill
+
+        result = classify_and_store_fill(
+            fill_id=int(fill["fill_id"]),
+            trade_id=trade_id,
+            fill_detail=fill_detail,
+            dexie_detail=None,
+        )
+        result.side = fill["side"]
+        classification_box["value"] = result
+        return result
+
+    def fill_classification(_row: dict[str, Any]) -> None:
+        classification()
+
+    def sweep_registration(_row: dict[str, Any]) -> None:
+        from sweep_coordinator import get_coordinator
+
+        get_coordinator().process_fill(int(fill["fill_id"]), classification())
+
+    return {
+        "offer_filled_event": offer_filled_event,
+        "boost_notification": boost_notification,
+        "fill_classification": fill_classification,
+        "sweep_registration": sweep_registration,
+    }
+
+
+def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str, str]:
+    """Run post-commit hooks without allowing failures to undo proof."""
+
+    import database
+
+    completed = set(database.get_offer_fill_hook_receipts(int(fill["fill_id"])))
+    results: dict[str, str] = {}
+    for hook_name, callback in _post_fill_hook_callbacks(fill).items():
+        if hook_name in completed:
+            results[hook_name] = "already_completed"
+            continue
+        try:
+            callback(fill)
+            database.complete_offer_fill_hook(
+                int(fill["fill_id"]), hook_name, completed_at=completed_at
+            )
+        except Exception:
+            results[hook_name] = "failed"
+            database.log_event(
+                "warning",
+                "authoritative_fill_hook_failed",
+                f"Post-fill hook {hook_name} failed for fill {fill['fill_id']}",
+                data={"fill_id": fill["fill_id"], "hook_name": hook_name},
+            )
+        else:
+            results[hook_name] = "completed"
+    return results
+
+
 def reconcile_offer(
     intent_id: str,
     *,
@@ -1317,14 +1909,17 @@ def reconcile_offer(
     intent = database.get_offer_intent(intent_id)
     if intent is None:
         raise ValueError("intent_id does not exist")
-    observed_at = _canonical_utc(datetime.now(timezone.utc) if now is None else now)
-    collected = (
-        evidence
-        if evidence is not None
-        else load_authoritative_evidence(
-            intent, wallet_facade=wallet_facade, observed_at=observed_at
-        )
-    )
+    if evidence is None:
+        try:
+            collected = load_authoritative_evidence(intent, wallet_facade=wallet_facade)
+        except Exception:
+            observed_at = _clock_utc()
+            collected = _incomplete_loader_evidence(intent, observed_at)
+        else:
+            observed_at = _clock_utc()
+    else:
+        observed_at = _canonical_utc(datetime.now(timezone.utc) if now is None else now)
+        collected = evidence
     result = classify_terminal_evidence(
         intent,
         collected,
@@ -1361,9 +1956,13 @@ def reconcile_offer(
             "applied": False,
             "authorization_code": decision.code.value,
         }
-    durable_json, evidence_sha256 = canonical_evidence_and_digest(
-        {"classification": result, "evidence": collected}
-    )
+    durable_proof = {"classification": result, "evidence": collected}
+    exact_cancel_context = _validated_cancel_context(cancel_context)
+    if result["classification"] == CANCELLED_PROVEN:
+        if exact_cancel_context is None:
+            raise RuntimeError("proven cancellation lost its validated Task 8 context")
+        durable_proof["cancel_context"] = exact_cancel_context
+    durable_json, evidence_sha256 = canonical_evidence_and_digest(durable_proof)
     committed = database.commit_offer_reconciliation(
         intent_id=intent["intent_id"],
         operation_id=operation_id,
@@ -1380,11 +1979,17 @@ def reconcile_offer(
         block_height=result.get("block_height"),
         receive_coin_id=result.get("receive_coin_id"),
         receive_amount_mojos=result.get("receive_amount_mojos"),
+        filled_at=result.get("filled_at"),
         fee_mojos=result.get("fee_mojos", 0),
         coin_rebindings=result.get("coin_rebindings", []),
+        cancel_context_json=(
+            exact_cancel_context
+            if result["classification"] == CANCELLED_PROVEN
+            else None
+        ),
         reconciled_at=observed_at,
     )
-    return {
+    response = {
         **result,
         "applied": result["classification"]
         in {FILLED_PROVEN, CANCELLED_PROVEN, EXPIRED_PROVEN},
@@ -1393,6 +1998,18 @@ def reconcile_offer(
         "event": committed["event"],
         "idempotent": committed["idempotent"],
     }
+    if result["classification"] == FILLED_PROVEN:
+        fill_id = committed.get("fill_id")
+        fill = database.get_fill_by_trade_id(intent["sage_trade_id"])
+        if fill_id is None or fill is None or int(fill["fill_id"]) != int(fill_id):
+            raise RuntimeError(
+                "authoritative fill commit lost its durable fill identity"
+            )
+        response["fill_id"] = int(fill_id)
+        response["post_fill_hooks"] = _run_post_fill_hooks(
+            fill, completed_at=observed_at
+        )
+    return response
 
 
 __all__ = [

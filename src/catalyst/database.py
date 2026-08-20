@@ -678,6 +678,27 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
 END;
 
+-- Durable idempotency receipts for additive work that runs only after an
+-- authoritative fill transaction commits.  Callbacks never run while the
+-- database transaction that proves the fill is open.
+CREATE TABLE IF NOT EXISTS offer_fill_hook_receipts (
+    fill_id                     INTEGER NOT NULL,
+    hook_name                   TEXT NOT NULL,
+    completed_at                TEXT NOT NULL,
+    PRIMARY KEY(fill_id, hook_name),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_receipts_no_update
+BEFORE UPDATE ON offer_fill_hook_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_fill_hook_receipts_no_delete
+BEFORE DELETE ON offer_fill_hook_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'offer_fill_hook_receipts is append-only');
+END;
+
 -- One canonical durable description of every multi-member cancellation
 -- cohort.  The row and all referenced PREPARED journal events are inserted in
 -- the same transaction, so a stored manifest is always complete and
@@ -870,6 +891,11 @@ _STABILITY_REQUIRED_COLUMNS = {
         "reason_code",
         "blocks_mutation",
         "created_at",
+    },
+    "offer_fill_hook_receipts": {
+        "fill_id",
+        "hook_name",
+        "completed_at",
     },
     "offer_cancel_cohort_manifests": {
         "manifest_sequence",
@@ -3789,23 +3815,32 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         now = _now()
         coin_list = list(coin_ids)
         placeholders = ",".join("?" * len(coin_list))
+        registry_protected = _nonterminal_registry_coin_ids(conn)
 
-        # Batch SELECT for logging details
         gone_details = []
         rows = conn.execute(
-            f"SELECT coin_id, wallet_type, amount_mojos, designation, assigned_tier "
+            f"SELECT coin_id, wallet_type, amount_mojos, designation, "
+            f"assigned_tier, trade_id "
             f"FROM coins WHERE coin_id IN ({placeholders}) AND status='free'",
             coin_list,
         ).fetchall()
         for row in rows:
+            if row["trade_id"] or norm_coin_id(row["coin_id"]) in registry_protected:
+                continue
             gone_details.append((row["coin_id"], dict(row)))
+
+        safe_coin_list = [coin_id for coin_id, _details in gone_details]
+        if not safe_coin_list:
+            return 0
+        safe_placeholders = ",".join("?" * len(safe_coin_list))
 
         # Batch UPDATE
         cursor = conn.execute(
             f"""UPDATE coins SET status='gone', last_seen=?,
                 designation='unknown', assigned_tier='none'
-                WHERE coin_id IN ({placeholders}) AND status='free'""",
-            [now] + coin_list,
+                WHERE coin_id IN ({safe_placeholders}) AND status='free'
+                  AND trade_id IS NULL""",
+            [now] + safe_coin_list,
         )
         count = cursor.rowcount
         conn.commit()
@@ -4109,6 +4144,92 @@ def get_orphan_coin_locks() -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+_TERMINAL_INTENT_RESERVATION_STATES = frozenset(
+    {"terminal", "creation_failed", "rejected", "cancelled", "filled", "expired"}
+)
+
+
+def _nonterminal_registry_coin_ids(conn: sqlite3.Connection) -> set[str]:
+    """Return every coin selected by an intent that has not terminalized."""
+
+    rows = conn.execute(
+        "SELECT lifecycle_state, selected_coin_ids_json FROM offer_intents"
+    ).fetchall()
+    protected: set[str] = set()
+    for row in rows:
+        if str(row["lifecycle_state"]) in _TERMINAL_INTENT_RESERVATION_STATES:
+            continue
+        try:
+            selected = json.loads(row["selected_coin_ids_json"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "nonterminal intent coin reservation is corrupt"
+            ) from exc
+        if type(selected) is not list or not selected:
+            raise RuntimeError("nonterminal intent coin reservation is corrupt")
+        for coin_id in selected:
+            protected.add(norm_coin_id(_required_stability_text(coin_id, "coin_id")))
+    return protected
+
+
+def is_coin_reconciliation_protected(coin_id: str) -> bool:
+    """Return whether legacy wallet reconciliation must preserve this coin."""
+
+    normalized = norm_coin_id(_required_stability_text(coin_id, "coin_id"))
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT status, trade_id FROM coins WHERE coin_id=?", (normalized,)
+    ).fetchone()
+    if row is None:
+        return False
+    return bool(row["trade_id"] or normalized in _nonterminal_registry_coin_ids(conn))
+
+
+def reconcile_wallet_locked_coin_links(
+    wallet_locked_to_trade: Dict[str, str],
+) -> Dict[str, int]:
+    """Conservatively add wallet-observed locks without rebinding reservations."""
+
+    if type(wallet_locked_to_trade) is not dict or len(wallet_locked_to_trade) > 4096:
+        raise ValueError("wallet locked coin mapping is invalid")
+    exact_links: list[tuple[str, str]] = []
+    for coin_id, trade_id in wallet_locked_to_trade.items():
+        normalized_coin = norm_coin_id(
+            _required_stability_text(coin_id, "wallet locked coin_id")
+        )
+        exact_trade = _required_stability_text(trade_id, "wallet locked trade_id")
+        exact_links.append((normalized_coin, exact_trade))
+    stats = {"linked": 0, "locked": 0, "protected": 0, "missing": 0}
+    conn = get_connection()
+    registry_protected = _nonterminal_registry_coin_ids(conn)
+    now = _now()
+    for coin_id, trade_id in exact_links:
+        row = conn.execute(
+            "SELECT status, trade_id FROM coins WHERE coin_id=?", (coin_id,)
+        ).fetchone()
+        if row is None:
+            stats["missing"] += 1
+            continue
+        if row["trade_id"] or coin_id in registry_protected:
+            stats["protected"] += 1
+            continue
+        if row["status"] == "locked":
+            conn.execute(
+                "UPDATE coins SET trade_id=?, last_seen=? WHERE coin_id=?",
+                (trade_id, now, coin_id),
+            )
+            stats["linked"] += 1
+        else:
+            conn.execute(
+                "UPDATE coins SET status='locked', trade_id=?, last_seen=? "
+                "WHERE coin_id=?",
+                (trade_id, now, coin_id),
+            )
+            stats["locked"] += 1
+    conn.commit()
+    return stats
+
+
 def reconcile_coins_with_wallet(
     wallet_selectable: dict, wallet_owned: dict, wallet_type: str
 ) -> dict:
@@ -4136,6 +4257,7 @@ def reconcile_coins_with_wallet(
         "locked": 0,
         "already_ok": 0,
         "reappeared": 0,
+        "protected": 0,
     }
 
     # CRITICAL FIX: Collect log messages and emit AFTER commit.
@@ -4184,6 +4306,7 @@ def reconcile_coins_with_wallet(
 
         db_ids = set(db_coins.keys())
         wallet_all_ids = set(wallet_owned.keys())
+        registry_protected = _nonterminal_registry_coin_ids(conn)
 
         # 1. STALE: in DB as free/locked but not in wallet → mark gone
         #    Only mark active coins as gone (already gone/spent stay as-is)
@@ -4193,6 +4316,9 @@ def reconcile_coins_with_wallet(
             if db_status not in ("free", "locked"):
                 continue  # Already gone/spent — nothing to do
             raw_id = db_coins[nid]["raw_id"]
+            if db_coins[nid]["trade_id"] or norm_coin_id(raw_id) in registry_protected:
+                stats["protected"] += 1
+                continue
             conn.execute(
                 "UPDATE coins SET status='gone', last_seen=? WHERE coin_id=?",
                 (now, raw_id),
@@ -4304,17 +4430,21 @@ def reconcile_coins_with_wallet(
                     # Wallet says free, DB says locked → free it, but only if no active
                     # trade attribution. Guard: offer_manager may have locked this coin
                     # since we took our wallet snapshot (wallet data is 1 cycle stale).
-                    cur = conn.execute(
-                        """UPDATE coins SET status='free', trade_id=NULL,
-                           last_seen=? WHERE coin_id=? AND trade_id IS NULL""",
-                        (now, raw_id),
-                    )
-                    if cur.rowcount > 0:
-                        stats["freed"] += 1
-                    else:
-                        # trade_id is set → coin was just locked by offer_manager;
-                        # trust the offer attribution over the stale wallet snapshot.
+                    if (
+                        db_coins[nid]["trade_id"]
+                        or norm_coin_id(raw_id) in registry_protected
+                    ):
                         stats["already_ok"] += 1
+                    else:
+                        cur = conn.execute(
+                            """UPDATE coins SET status='free', trade_id=NULL,
+                               last_seen=? WHERE coin_id=? AND trade_id IS NULL""",
+                            (now, raw_id),
+                        )
+                        if cur.rowcount > 0:
+                            stats["freed"] += 1
+                        else:
+                            stats["already_ok"] += 1
 
                 else:
                     stats["already_ok"] += 1
@@ -4668,16 +4798,12 @@ def designate_reserve(coin_id: str, wallet_type: str, amount_mojos: int) -> bool
 def cleanup_orphaned_locked_coins(
     open_trade_ids: set, wallet_confirmed_locked: set = None
 ) -> dict:
-    """Free locked coins whose offers no longer exist.
+    """Free only genuinely unreserved legacy locks.
 
-    After a restart, DB may have coins marked 'locked' with trade_ids
-    that no longer correspond to any open offer in the wallet.
-    These 'orphaned' locked coins block topup and waste inventory.
-
-    Coins with a trade_id NOT in open_trade_ids → freed (if offer
-    was cancelled/expired, the coin is back in the wallet).
-    Coins with NO trade_id at all → freed (orphaned from a failed
-    offer creation that never completed).
+    Wallet/open-list absence is not terminal proof. Every trade-attributed
+    lock and every coin selected by a nonterminal registry intent therefore
+    remains reserved. Only unattributed locks outside the registry may be
+    reclaimed here as legacy failed-creation debris.
 
     V5 FIX: wallet_confirmed_locked parameter. If provided, coins in
     this set are NEVER freed regardless of trade_id status. The wallet
@@ -4686,7 +4812,8 @@ def cleanup_orphaned_locked_coins(
     coins locked → orphan cleanup frees them → reconcile locks again.
 
     Args:
-        open_trade_ids: Set of trade_ids for currently open wallet offers
+        open_trade_ids: Legacy observation retained for API compatibility;
+            absence from it never releases a trade-attributed lock.
         wallet_confirmed_locked: Set of coin_ids the wallet confirms are
             offer-locked (have offer_id/offer_hash set). These are protected.
 
@@ -4697,6 +4824,7 @@ def cleanup_orphaned_locked_coins(
         "freed_no_trade": 0,
         "freed_stale_trade": 0,
         "skipped_wallet_locked": 0,
+        "protected_registry_or_trade": 0,
         "total_freed": 0,
     }
     if wallet_confirmed_locked is None:
@@ -4710,6 +4838,7 @@ def cleanup_orphaned_locked_coins(
     try:
         conn = get_connection()
         now = _now()
+        registry_protected = _nonterminal_registry_coin_ids(conn)
 
         # Get all locked coins
         rows = conn.execute(
@@ -4729,43 +4858,30 @@ def cleanup_orphaned_locked_coins(
                 stats["skipped_wallet_locked"] += 1
                 continue
 
-            if not tid:
-                # No trade_id → orphaned locked coin (offer creation failed)
-                conn.execute(
-                    "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
-                    "WHERE coin_id=?",
-                    (now, cid),
-                )
-                stats["freed_no_trade"] += 1
-                if row["wallet_type"] == "xch":
-                    amt_str = f"{row['amount_mojos'] / 1_000_000_000_000:.4f} XCH"
-                else:
-                    amt_str = f"{row['amount_mojos']} mojos"
-                log_event(
-                    "info",
-                    "orphan_freed",
-                    f"{wt} coin {cid[:16]}... FREED — no trade_id (orphaned) "
-                    f"({amt_str} | {row['designation']}/{row['assigned_tier']})",
-                )
+            # Wallet absence and an orphan-looking join are observations, not
+            # terminal proof. Any trade attribution or nonterminal registry
+            # selection stays locked until commit_offer_reconciliation.
+            if tid or nid in registry_protected:
+                stats["protected_registry_or_trade"] += 1
+                continue
 
-            elif tid not in open_trade_ids:
-                # Has trade_id but offer no longer exists → stale lock
-                conn.execute(
-                    "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
-                    "WHERE coin_id=?",
-                    (now, cid),
-                )
-                stats["freed_stale_trade"] += 1
-                if row["wallet_type"] == "xch":
-                    amt_str = f"{row['amount_mojos'] / 1_000_000_000_000:.4f} XCH"
-                else:
-                    amt_str = f"{row['amount_mojos']} mojos"
-                log_event(
-                    "info",
-                    "orphan_freed",
-                    f"{wt} coin {cid[:16]}... FREED — offer {tid[:12]}... "
-                    f"no longer open ({amt_str})",
-                )
+            # No trade_id and no registry owner: legacy failed-creation debris.
+            conn.execute(
+                "UPDATE coins SET status='free', trade_id=NULL, last_seen=? "
+                "WHERE coin_id=?",
+                (now, cid),
+            )
+            stats["freed_no_trade"] += 1
+            if row["wallet_type"] == "xch":
+                amt_str = f"{row['amount_mojos'] / 1_000_000_000_000:.4f} XCH"
+            else:
+                amt_str = f"{row['amount_mojos']} mojos"
+            log_event(
+                "info",
+                "orphan_freed",
+                f"{wt} coin {cid[:16]}... FREED — no trade_id (orphaned) "
+                f"({amt_str} | {row['designation']}/{row['assigned_tier']})",
+            )
 
         conn.commit()
         stats["total_freed"] = stats["freed_no_trade"] + stats["freed_stale_trade"]
@@ -4777,7 +4893,8 @@ def cleanup_orphaned_locked_coins(
                 f"Freed {stats['total_freed']} orphaned locked coins "
                 f"({stats['freed_no_trade']} no trade_id, "
                 f"{stats['freed_stale_trade']} stale trade_id, "
-                f"{stats['skipped_wallet_locked']} protected by wallet)",
+                f"{stats['skipped_wallet_locked']} protected by wallet, "
+                f"{stats['protected_registry_or_trade']} registry/trade protected)",
             )
 
     except Exception as e:
@@ -5082,6 +5199,73 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
 # ---------------------------------------------------------------------------
 # Fills — record fills, match round-trips
 # ---------------------------------------------------------------------------
+
+
+_AUTHORITATIVE_FILL_HOOKS = (
+    "offer_filled_event",
+    "boost_notification",
+    "fill_classification",
+    "sweep_registration",
+)
+
+
+def get_fill_by_trade_id(trade_id: str) -> Optional[Dict[str, Any]]:
+    """Return the one durable fill for a trade identity, if it exists."""
+
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM fills WHERE trade_id=? ORDER BY fill_id DESC LIMIT 1",
+            (safe_trade_id,),
+        )
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def get_offer_fill_hook_receipts(fill_id: int) -> List[str]:
+    """Return completed post-fill hook names in canonical execution order."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT hook_name FROM offer_fill_hook_receipts WHERE fill_id=?",
+            (safe_fill_id,),
+        )
+        .fetchall()
+    )
+    completed = {str(row["hook_name"]) for row in rows}
+    return [name for name in _AUTHORITATIVE_FILL_HOOKS if name in completed]
+
+
+def complete_offer_fill_hook(
+    fill_id: int, hook_name: str, *, completed_at: Any = None
+) -> bool:
+    """Record one successfully completed additive hook exactly once."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    safe_hook = _required_stability_text(hook_name, "hook_name")
+    if safe_hook not in _AUTHORITATIVE_FILL_HOOKS:
+        raise ValueError("post-fill hook name is not registered")
+    when = _stability_timestamp_or_now(completed_at, "completed_at")
+    conn = get_connection()
+    if (
+        conn.execute("SELECT 1 FROM fills WHERE fill_id=?", (safe_fill_id,)).fetchone()
+        is None
+    ):
+        raise ValueError("post-fill hook references a missing fill")
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO offer_fill_hook_receipts (
+            fill_id, hook_name, completed_at
+        ) VALUES (?, ?, ?)
+        """,
+        (safe_fill_id, safe_hook, when),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def record_fill(
@@ -7011,6 +7195,42 @@ def _canonical_json_text(
     return encoded
 
 
+def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
+    parsed_evidence = json.loads(canonical_evidence)
+    if type(parsed_evidence) is dict and parsed_evidence.get("bounded") is True:
+        if (
+            set(parsed_evidence)
+            != {
+                "bounded",
+                "exact_subset",
+                "exact_subset_sha256",
+                "full_evidence_sha256",
+                "redacted",
+            }
+            or parsed_evidence.get("redacted") is not True
+        ):
+            raise ValueError("bounded evidence envelope fields are invalid")
+        subset_text = json.dumps(
+            parsed_evidence["exact_subset"],
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        subset_digest = hashlib.sha256(subset_text.encode("utf-8")).hexdigest()
+        if parsed_evidence.get("exact_subset_sha256") != subset_digest:
+            raise ValueError("bounded evidence exact subset digest is invalid")
+        full_digest = parsed_evidence.get("full_evidence_sha256")
+        if (
+            type(full_digest) is not str
+            or len(full_digest) != 64
+            or any(char not in "0123456789abcdef" for char in full_digest)
+        ):
+            raise ValueError("bounded evidence full digest is invalid")
+        return full_digest
+    return hashlib.sha256(canonical_evidence.encode("utf-8")).hexdigest()
+
+
 def _journal_values(
     *,
     event_id: str,
@@ -7039,7 +7259,7 @@ def _journal_values(
     evidence = _canonical_json_text(
         evidence_json, "evidence_json", default={}, max_bytes=65536
     )
-    digest = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+    digest = _evidence_digest_from_canonical_json(evidence)
     if evidence_sha256 is not None and str(evidence_sha256) != digest:
         raise ValueError("evidence_sha256 does not match canonical evidence JSON")
     return {
@@ -8853,6 +9073,192 @@ def _reconciliation_latch_update(
         )
 
 
+def _validate_reconciliation_cancel_context(
+    conn: sqlite3.Connection,
+    context: Any,
+    *,
+    intent_id: str,
+    trade_id: str,
+) -> Dict[str, Any]:
+    """Cross-bind classifier context to exact Task 8 PREPARED authority."""
+
+    if type(context) is not dict or set(context) != {
+        "cohort_id",
+        "manifest_sha256",
+        "members",
+        "auxiliary_coin_ids",
+    }:
+        raise ValueError("Task 8 cancellation context fields are invalid")
+    if (
+        type(context["cohort_id"]) is not str
+        or not context["cohort_id"].strip()
+        or type(context["manifest_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", context["manifest_sha256"]) is None
+        or type(context["members"]) is not list
+        or not context["members"]
+        or type(context["auxiliary_coin_ids"]) is not list
+    ):
+        raise ValueError("Task 8 cancellation context values are invalid")
+    member_keys = {
+        "intent_id",
+        "trade_id",
+        "member_id",
+        "prepared_event_id",
+        "selected_coin_ids",
+        "request_timestamp",
+        "transaction_id",
+        "spend_identity",
+    }
+    prepared_events: dict[str, Dict[str, Any]] = {}
+    exact_members: list[Dict[str, Any]] = []
+    for member in context["members"]:
+        if type(member) is not dict or set(member) != member_keys:
+            raise ValueError("Task 8 cancellation member fields are invalid")
+        member_trade = _required_stability_text(
+            member["trade_id"], "Task 8 member trade_id"
+        ).lower()
+        member_intent = _required_stability_text(
+            member["intent_id"], "Task 8 member intent_id"
+        )
+        member_id = _required_stability_text(member["member_id"], "Task 8 member_id")
+        prepared_event_id = _required_stability_text(
+            member["prepared_event_id"], "Task 8 prepared_event_id"
+        )
+        selected = member["selected_coin_ids"]
+        if type(selected) is not list or not selected:
+            raise ValueError("Task 8 selected coin identity is invalid")
+        selected_bare = sorted(
+            _reconciliation_coin_identity(value, "Task 8 selected coin")[0]
+            for value in selected
+        )
+        if len(selected_bare) != len(set(selected_bare)):
+            raise ValueError("Task 8 selected coin identity is duplicated")
+        request_timestamp = _stability_timestamp(
+            member["request_timestamp"], "Task 8 request timestamp"
+        )
+        prepared_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (prepared_event_id,),
+        ).fetchone()
+        if prepared_row is None:
+            raise ValueError("Task 8 PREPARED event is missing")
+        prepared = validate_offer_operation_event(dict(prepared_row))
+        if (
+            prepared["operation_id"] != f"cancel:{member_trade}"
+            or prepared["intent_id"] != member_intent
+            or prepared["operation_type"] != "CANCEL"
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or prepared["blocks_mutation"] != 1
+            or prepared["request_timestamp"] != request_timestamp
+        ):
+            raise ValueError("Task 8 PREPARED event binding is invalid")
+        durable_intent = conn.execute(
+            "SELECT intent_id, selected_coin_ids_json, sage_trade_id "
+            "FROM offer_intents WHERE sage_trade_id=?",
+            (member_trade,),
+        ).fetchone()
+        if durable_intent is None or member_intent not in {
+            durable_intent["intent_id"],
+            f"cancel-target:{member_trade}",
+        }:
+            raise ValueError("Task 8 member intent binding is invalid")
+        durable_selected = sorted(json.loads(durable_intent["selected_coin_ids_json"]))
+        if durable_selected != selected_bare:
+            raise ValueError("Task 8 member selected coins are not exact")
+        prepared_events[member_trade] = prepared
+        exact_members.append(
+            {
+                "intent_id": member_intent,
+                "trade_id": member_trade,
+                "member_id": member_id,
+                "prepared_event_id": prepared_event_id,
+            }
+        )
+    targets = [
+        member
+        for member in exact_members
+        if member["trade_id"] == trade_id
+        and member["intent_id"] in {intent_id, f"cancel-target:{trade_id}"}
+    ]
+    if len(targets) != 1:
+        raise ValueError("Task 8 target member binding is invalid")
+    manifest_row = conn.execute(
+        """
+        SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+               manifest_json, created_at
+        FROM offer_cancel_cohort_manifests WHERE cohort_id=?
+        """,
+        (context["cohort_id"],),
+    ).fetchone()
+    if manifest_row is None:
+        if len(exact_members) != 1:
+            raise ValueError("Task 8 cohort manifest is missing")
+        single_member = exact_members[0]
+        prepared = prepared_events[single_member["trade_id"]]
+        if context["manifest_sha256"] != prepared["evidence_sha256"]:
+            raise ValueError("Task 8 single-attempt claim digest is not exact")
+        prepared_evidence = json.loads(prepared["evidence_json"])
+        if (
+            type(prepared_evidence) is not dict
+            or (
+                "cohort_id" in prepared_evidence
+                and prepared_evidence["cohort_id"] != context["cohort_id"]
+            )
+            or (
+                "member_id" in prepared_evidence
+                and prepared_evidence["member_id"] != single_member["member_id"]
+            )
+        ):
+            raise ValueError("Task 8 single-attempt claim binding is invalid")
+    else:
+        manifest = _validated_offer_cancel_cohort_manifest_row(dict(manifest_row))
+        if manifest["manifest_sha256"] != context["manifest_sha256"]:
+            raise ValueError("Task 8 cohort manifest digest is not exact")
+        manifested = {
+            (
+                member["intent_id"],
+                member["trade_id"],
+                member["member_id"],
+                member["prepared_event_id"],
+            )
+            for member in manifest["members"]
+        }
+        contextual = {
+            (
+                member["intent_id"],
+                member["trade_id"],
+                member["member_id"],
+                member["prepared_event_id"],
+            )
+            for member in exact_members
+        }
+        if contextual != manifested:
+            raise ValueError("Task 8 cohort members are not manifest-bound")
+        for member in manifest["members"]:
+            validate_offer_cancel_cohort_prepared_event(
+                prepared_events[member["trade_id"]], manifest
+            )
+    target = targets[0]
+    latest_row = conn.execute(
+        """
+        SELECT * FROM offer_operation_journal
+        WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+        """,
+        (f"cancel:{trade_id}",),
+    ).fetchone()
+    if latest_row is None:
+        raise ValueError("Task 8 cancellation attempt is missing")
+    latest = validate_offer_operation_event(dict(latest_row))
+    prepared = prepared_events[trade_id]
+    if latest["attempt"] != prepared["attempt"] or latest["intent_id"] not in {
+        intent_id,
+        f"cancel-target:{trade_id}",
+    }:
+        raise ValueError("Task 8 cancellation attempt lineage is not exact")
+    return {"target": target, "latest": latest}
+
+
 def commit_offer_reconciliation(
     *,
     intent_id: str,
@@ -8867,8 +9273,10 @@ def commit_offer_reconciliation(
     block_height: Optional[int] = None,
     receive_coin_id: Optional[str] = None,
     receive_amount_mojos: Optional[int] = None,
+    filled_at: Optional[str] = None,
     fee_mojos: int = 0,
     coin_rebindings: Any = None,
+    cancel_context_json: Any = None,
     reconciled_at: Any = None,
 ) -> Dict[str, Any]:
     """Commit one policy-authorized reconciliation in one short transaction.
@@ -8917,7 +9325,7 @@ def commit_offer_reconciliation(
         expected_type=dict,
         max_bytes=65536,
     )
-    expected_digest = hashlib.sha256(canonical_evidence.encode("utf-8")).hexdigest()
+    expected_digest = _evidence_digest_from_canonical_json(canonical_evidence)
     if type(evidence_sha256) is not str or evidence_sha256 != expected_digest:
         raise ValueError("evidence_sha256 does not match canonical evidence JSON")
     safe_fee = _exact_integer(fee_mojos, "fee_mojos")
@@ -8940,17 +9348,26 @@ def commit_offer_reconciliation(
         if receive_amount_mojos is not None
         else None
     )
+    safe_filled_at = (
+        _stability_timestamp_or_now(filled_at, "filled_at")
+        if filled_at is not None
+        else None
+    )
     if safe_classification in {"FILLED_PROVEN", "CANCELLED_PROVEN"} and (
         (safe_transaction_id is None and safe_spend_identity is None)
         or safe_height is None
     ):
         raise ValueError("on-chain terminal proof identity is incomplete")
     if safe_classification == "FILLED_PROVEN" and (
-        safe_receive_coin_id is None or safe_receive_amount is None
+        safe_receive_coin_id is None
+        or safe_receive_amount is None
+        or safe_filled_at is None
     ):
         raise ValueError("fill receipt proof is incomplete")
     if safe_classification != "FILLED_PROVEN" and (
-        safe_receive_coin_id is not None or safe_receive_amount is not None
+        safe_receive_coin_id is not None
+        or safe_receive_amount is not None
+        or safe_filled_at is not None
     ):
         raise ValueError("only a proven fill may carry receipt values")
     raw_rebindings = [] if coin_rebindings is None else coin_rebindings
@@ -8993,6 +9410,19 @@ def commit_offer_reconciliation(
         raise ValueError("proven cancellation requires exact returned coins")
     if safe_classification != "CANCELLED_PROVEN" and safe_rebindings:
         raise ValueError("only proven cancellation may rebind returned coins")
+    safe_cancel_context = None
+    if cancel_context_json is not None:
+        cancel_context_text = _canonical_json_text(
+            cancel_context_json,
+            "cancel_context_json",
+            expected_type=dict,
+            max_bytes=262144,
+        )
+        safe_cancel_context = json.loads(cancel_context_text)
+    if safe_classification == "CANCELLED_PROVEN" and safe_cancel_context is None:
+        raise ValueError("proven cancellation requires exact Task 8 context")
+    if safe_classification != "CANCELLED_PROVEN" and safe_cancel_context is not None:
+        raise ValueError("only proven cancellation may carry Task 8 context")
     event_id = f"{safe_operation_id}:attempt:1:{phase.lower()}"
     journal = _journal_values(
         event_id=event_id,
@@ -9018,55 +9448,48 @@ def commit_offer_reconciliation(
     # authoritative CANCEL_CONFIRMED resolution.
     cancel_resolution = None
     if safe_classification == "CANCELLED_PROVEN":
-        trade_hint = None
         read_conn = get_connection()
         intent_hint = read_conn.execute(
             "SELECT sage_trade_id FROM offer_intents WHERE intent_id=?",
             (safe_intent_id,),
         ).fetchone()
-        if intent_hint is not None:
-            trade_hint = intent_hint["sage_trade_id"]
-        if trade_hint:
-            cancel_operation_id = f"cancel:{trade_hint}"
-            latest = read_conn.execute(
-                """
-                SELECT * FROM offer_operation_journal
-                WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
-                """,
-                (cancel_operation_id,),
-            ).fetchone()
-            if latest is not None and int(latest["blocks_mutation"] or 0) == 1:
-                latest_event = validate_offer_operation_event(dict(latest))
-                if (
-                    latest_event["operation_type"] != "CANCEL"
-                    or latest_event["intent_id"] != safe_intent_id
-                ):
-                    raise ValueError("cancellation blocker identity is inconsistent")
-                cancel_resolution = {
-                    "observed_sequence": latest_event["sequence"],
-                    "operation_id": cancel_operation_id,
-                    "journal": _journal_values(
-                        event_id=(
-                            f"{cancel_operation_id}:attempt:"
-                            f"{latest_event['attempt']}:reconciled"
-                        ),
-                        operation_id=cancel_operation_id,
-                        intent_id=safe_intent_id,
-                        operation_type="CANCEL",
-                        attempt=latest_event["attempt"],
-                        phase="RECONCILED",
-                        outcome="CANCEL_CONFIRMED",
-                        request_timestamp=when,
-                        wallet_identity_json=wallet_json,
-                        transaction_id=safe_transaction_id,
-                        spend_identity=safe_spend_identity,
-                        evidence_json=canonical_evidence,
-                        evidence_sha256=expected_digest,
-                        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
-                        blocks_mutation=False,
-                        created_at=when,
+        if intent_hint is None or not intent_hint["sage_trade_id"]:
+            raise ValueError("Task 8 cancellation target trade is missing")
+        trade_hint = str(intent_hint["sage_trade_id"])
+        task8 = _validate_reconciliation_cancel_context(
+            read_conn,
+            safe_cancel_context,
+            intent_id=safe_intent_id,
+            trade_id=trade_hint,
+        )
+        latest_event = task8["latest"]
+        cancel_operation_id = f"cancel:{trade_hint}"
+        if latest_event["blocks_mutation"] == 1:
+            cancel_resolution = {
+                "observed_sequence": latest_event["sequence"],
+                "operation_id": cancel_operation_id,
+                "journal": _journal_values(
+                    event_id=(
+                        f"{cancel_operation_id}:attempt:"
+                        f"{latest_event['attempt']}:reconciled"
                     ),
-                }
+                    operation_id=cancel_operation_id,
+                    intent_id=safe_intent_id,
+                    operation_type="CANCEL",
+                    attempt=latest_event["attempt"],
+                    phase="RECONCILED",
+                    outcome="CANCEL_CONFIRMED",
+                    request_timestamp=when,
+                    wallet_identity_json=wallet_json,
+                    transaction_id=safe_transaction_id,
+                    spend_identity=safe_spend_identity,
+                    evidence_json=canonical_evidence,
+                    evidence_sha256=expected_digest,
+                    reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+                    blocks_mutation=False,
+                    created_at=when,
+                ),
+            }
 
     conn = _stability_connection()
     try:
@@ -9082,6 +9505,22 @@ def commit_offer_reconciliation(
             or intent["network"] != network
         ):
             raise ValueError("reconciliation wallet binding mismatch")
+        if safe_filled_at is not None:
+            offer_created_at = _parse_iso_timestamp(
+                intent.get("confirmed_at") or intent.get("prepared_at"),
+                "offer creation timestamp",
+                require_timezone=True,
+            )
+            proven_fill_at = _parse_iso_timestamp(
+                safe_filled_at, "filled_at", require_timezone=True
+            )
+            reconciliation_time = _parse_iso_timestamp(
+                when, "reconciled_at", require_timezone=True
+            )
+            if not offer_created_at <= proven_fill_at <= reconciliation_time:
+                raise ValueError(
+                    "authoritative fill timestamp is outside offer lifetime"
+                )
         existing_terminal = conn.execute(
             """
             SELECT * FROM offer_operation_journal
@@ -9102,8 +9541,17 @@ def commit_offer_reconciliation(
                 raise ValueError(
                     "terminal offer was reconciled with different authoritative proof"
                 )
+            fill_id = None
+            if safe_classification == "FILLED_PROVEN":
+                fill_row = conn.execute(
+                    "SELECT fill_id, filled_at FROM fills WHERE trade_id=?",
+                    (intent["sage_trade_id"],),
+                ).fetchone()
+                if fill_row is None or fill_row["filled_at"] != safe_filled_at:
+                    raise ValueError("authoritative fill timestamp replay differs")
+                fill_id = int(fill_row["fill_id"])
             conn.commit()
-            return {"event": existing, "idempotent": True}
+            return {"event": existing, "idempotent": True, "fill_id": fill_id}
         if intent["lifecycle_state"] == "terminal":
             raise ValueError("terminal offer lacks its authoritative journal event")
         try:
@@ -9254,7 +9702,7 @@ def commit_offer_reconciliation(
                     terminal_status,
                     terminal_status,
                     terminal_status,
-                    when,
+                    safe_filled_at if terminal_status == "filled" else when,
                     terminal_status,
                     when,
                     trade_id,
@@ -9267,7 +9715,7 @@ def commit_offer_reconciliation(
                 "SELECT * FROM fills WHERE trade_id=?", (trade_id,)
             ).fetchone()
             if existing_fill is None:
-                conn.execute(
+                fill_cursor = conn.execute(
                     """
                     INSERT INTO fills (
                         trade_id, side, price_xch, size_xch, size_cat,
@@ -9282,7 +9730,7 @@ def commit_offer_reconciliation(
                         legacy["price_xch"],
                         legacy["size_xch"],
                         legacy["size_cat"],
-                        when,
+                        safe_filled_at,
                         legacy["cat_asset_id"],
                         legacy["tier"],
                         "verified_authoritative",
@@ -9293,6 +9741,7 @@ def commit_offer_reconciliation(
                         safe_receive_amount,
                     ),
                 )
+                fill_id = int(fill_cursor.lastrowid)
             else:
                 existing = dict(existing_fill)
                 if any(
@@ -9306,6 +9755,9 @@ def commit_offer_reconciliation(
                     )
                 ):
                     raise ValueError("existing fill identity differs from offer")
+                if existing["filled_at"] != safe_filled_at:
+                    raise ValueError("existing fill timestamp differs from proof")
+                fill_id = int(existing["fill_id"])
                 conn.execute(
                     """
                     UPDATE fills
@@ -9435,7 +9887,11 @@ def commit_offer_reconciliation(
             additionally_resolved=resolved_operations,
         )
         conn.commit()
-        return {"event": event, "idempotent": False}
+        return {
+            "event": event,
+            "idempotent": False,
+            "fill_id": fill_id if safe_classification == "FILLED_PROVEN" else None,
+        }
     except Exception:
         conn.rollback()
         raise
