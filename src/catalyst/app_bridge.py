@@ -1239,6 +1239,15 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def get_safety_status(self):
+        """Get redacted startup safety status without crossing HTTP."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/safety/status"):
+            resp = api_server.api_safety_status()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     def get_fingerprints(self):
         """List wallet fingerprints. Maps to GET /api/sage/fingerprints."""
         import api_server
@@ -1809,6 +1818,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_splash_receive",
     "get_splash_setup_progress",
     "get_splash_stats",
+    "get_safety_status",
     "get_startup_status",
     "get_stats",
     "get_status",

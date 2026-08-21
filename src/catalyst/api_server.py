@@ -1200,6 +1200,189 @@ bot: BotLoop = None
 _mutation_runtime = None
 _mutation_runtime_db_path = None
 _mutation_runtime_init_lock = threading.RLock()
+_stability_startup_status = {
+    "allowed": False,
+    "reason_code": "STARTUP_RECOVERY_NOT_RUN",
+    "source": "startup_recovery",
+    "failed_check": "not_started",
+    "checks": [],
+    "blocker_counts": {},
+    "source_ages_seconds": {},
+}
+
+_STABILITY_STARTUP_CHECKS = (
+    "lease",
+    "wallet_identity_freshness",
+    "unresolved_operations",
+    "reservations",
+    "publication_claims",
+    "authority_revalidation",
+)
+
+_STABILITY_BLOCKER_COUNT_KEYS = (
+    "operations",
+    "prepared_creations",
+    "submitted_cancels",
+    "contradictory_history",
+    "reservations",
+    "publication_claims",
+)
+
+_STABILITY_PUBLIC_SOURCES = frozenset(
+    {
+        "startup_recovery",
+        "durable_latch",
+        "durable_read",
+        "operation_journal",
+        "lease",
+        "process",
+    }
+)
+
+_STABILITY_CHECK_SOURCES = frozenset(
+    {"durable_snapshot", "configured_binding", "authorized_snapshot"}
+)
+
+
+def _bounded_stability_count(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        return 0
+    return min(value, 2_147_483_647)
+
+
+def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
+    if allowed:
+        return "NONE"
+    if reason_code in {"DATABASE_INTEGRITY_FAILED", "DURABLE_STATE_UNAVAILABLE"}:
+        return "RESTORE_DATABASE_BACKUP"
+    if reason_code == "LEASE_OWNED_BY_OTHER":
+        return "USE_ACTIVE_CATALYST_INSTANCE"
+    if reason_code in {"LEASE_EXPIRED", "LEASE_LOST", "STARTUP_AUTHORITY_CHANGED"}:
+        return "RESTART_CATALYST"
+    if reason_code.startswith("WALLET_IDENTITY_"):
+        return "VERIFY_WALLET_IDENTITY"
+    if reason_code == "RESERVATION_RECONCILIATION_REQUIRED":
+        return "RECONCILE_COIN_RESERVATIONS"
+    if reason_code == "PUBLICATION_CLAIM_RECOVERY_REQUIRED":
+        return "RETRY_PUBLICATION_RECOVERY"
+    if reason_code in {
+        "UNRESOLVED_OPERATIONS",
+        "RECONCILIATION_REQUIRED",
+        "CONTRADICTORY_HISTORY",
+    }:
+        return "RUN_AUTHORITATIVE_RECONCILIATION"
+    return "REVIEW_SAFETY_DIAGNOSTICS"
+
+
+def get_public_stability_status() -> dict:
+    """Return the stable, redacted Task 10 diagnostics contract."""
+
+    live = mutation_gate.status().to_dict()
+    startup = _stability_startup_status
+    if type(live) is not dict or type(startup) is not dict:
+        raise RuntimeError("malformed stability status")
+
+    startup_allowed = startup.get("allowed") is True
+    live_allowed = live.get("allowed") is True
+    allowed = startup_allowed and live_allowed
+    authority = live if startup_allowed else startup
+    reason_code = str(authority.get("reason_code") or "")[:64]
+    if not allowed and not reason_code:
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+    source = str(authority.get("source") or "durable_read")
+    if source not in _STABILITY_PUBLIC_SOURCES:
+        source = "durable_read"
+
+    raw_counts = startup.get("blocker_counts")
+    if type(raw_counts) is not dict:
+        raw_counts = {}
+    blocker_counts = {
+        key: _bounded_stability_count(raw_counts.get(key))
+        for key in _STABILITY_BLOCKER_COUNT_KEYS
+    }
+
+    checks = startup.get("checks")
+    if type(checks) is not list:
+        checks = []
+    source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
+    public_checks = []
+    for raw_check in checks[: len(_STABILITY_STARTUP_CHECKS)]:
+        if type(raw_check) is not dict:
+            continue
+        name = raw_check.get("name")
+        if name not in _STABILITY_STARTUP_CHECKS:
+            continue
+        age = raw_check.get("source_age_seconds")
+        age = _bounded_stability_count(age) if type(age) is int else None
+        source_ages[name] = age
+        check_reason = str(raw_check.get("reason_code") or "")[:64]
+        check_source = str(raw_check.get("source") or "durable_snapshot")
+        if check_source not in _STABILITY_CHECK_SOURCES:
+            check_source = "durable_snapshot"
+        public_checks.append(
+            {
+                "name": name,
+                "ok": raw_check.get("ok") is True,
+                "reason_code": check_reason,
+                "source_age_seconds": age,
+                "source": check_source,
+            }
+        )
+
+    wallet_hash, network = _configured_mutation_binding()
+    if type(wallet_hash) is not str or len(wallet_hash) < 12:
+        redacted_fingerprint = None
+    else:
+        redacted_fingerprint = f"sha256:{wallet_hash[:12]}…"
+    if type(network) is not str or not network or len(network) > 64:
+        network = "unknown"
+
+    raw_lease = live.get("lease")
+    if type(raw_lease) is not dict:
+        raw_lease = {}
+    lease_active = raw_lease.get("active") is True
+    owned_by_this_run = lease_active and raw_lease.get("owned_by_this_run") is True
+    lease_owner = (
+        "this_run" if owned_by_this_run else "other_run" if lease_active else None
+    )
+    lease = {
+        "active": lease_active,
+        "version": _bounded_stability_count(raw_lease.get("version")),
+        "expires_at": (
+            str(raw_lease.get("expires_at"))[:40]
+            if type(raw_lease.get("expires_at")) is str
+            else None
+        ),
+        "owned_by_this_run": owned_by_this_run,
+    }
+    failed_check = startup.get("failed_check")
+    if failed_check not in {*_STABILITY_STARTUP_CHECKS, "database_integrity", None}:
+        failed_check = "startup_recovery"
+
+    return {
+        "allowed": allowed,
+        "reason_code": reason_code,
+        "source": source,
+        "blocking_operation_count": max(
+            blocker_counts["operations"],
+            _bounded_stability_count(live.get("blocking_operation_count")),
+        ),
+        "blocker_counts": blocker_counts,
+        "identity": {
+            "wallet_fingerprint": redacted_fingerprint,
+            "network": network,
+            "lease_owner": lease_owner,
+        },
+        "lease": lease,
+        "source_ages_seconds": source_ages,
+        "recommended_action": _stability_recommended_action(
+            reason_code, allowed=allowed
+        ),
+        "recovery": {
+            "failed_check": failed_check,
+            "checks": public_checks,
+        },
+    }
 
 
 def _configured_mutation_binding() -> tuple[str, str]:
@@ -1312,26 +1495,490 @@ def _mutation_stop_handler(reason_code: str) -> None:
         )
 
 
+def _startup_source_age_seconds(value: Any) -> Optional[int]:
+    if type(value) is not str or not value.endswith("Z"):
+        return None
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            return None
+        age = (
+            datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
+        ).total_seconds()
+        if age < 0:
+            return None
+        return min(int(age), 2_147_483_647)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _startup_check_result(
+    ok: bool,
+    reason_code: str = "",
+    *,
+    source: str = "durable_snapshot",
+    source_age_seconds: Optional[int] = None,
+    blocker_counts: Optional[dict] = None,
+) -> dict:
+    safe_source = source if source in _STABILITY_CHECK_SOURCES else "durable_snapshot"
+    return {
+        "ok": ok is True,
+        "reason_code": str(reason_code or "")[:64],
+        "source": safe_source,
+        "source_age_seconds": (
+            source_age_seconds
+            if type(source_age_seconds) is int and source_age_seconds >= 0
+            else None
+        ),
+        "blocker_counts": dict(blocker_counts or {}),
+    }
+
+
+def _configured_startup_identity_authority(
+    binding: Any,
+    wallet_fingerprint_hash: Any,
+    network: Any,
+) -> Optional[dict[str, str]]:
+    """Validate the immutable config binding without importing a wallet adapter."""
+
+    try:
+        if type(binding) is not mutation_gate.WalletIdentityBinding:
+            return None
+        if type(wallet_fingerprint_hash) is not str:
+            return None
+        if type(network) is not str or not network.strip():
+            return None
+        if (
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+            != wallet_fingerprint_hash
+            or binding.network_id != network.strip().lower()
+        ):
+            return None
+        return {
+            "binding_digest": mutation_gate.wallet_identity_binding_digest(binding),
+            "wallet_fingerprint_hash": wallet_fingerprint_hash,
+            "network": binding.network_id,
+            "bound_at_utc": binding.bound_at_utc,
+        }
+    except Exception:
+        return None
+
+
+def _run_stability_startup_check(name: str, **context) -> dict:
+    """Run one allowlisted read-only Task 10 recovery check."""
+
+    if name not in _STABILITY_STARTUP_CHECKS:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+    state = context.get("state")
+    runtime = context.get("runtime")
+    binding = context.get("wallet_identity_binding")
+    if type(state) is not dict or runtime is None:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+
+    if name == "lease":
+        snapshot = database.get_stability_startup_recovery_snapshot()
+        state["initial_snapshot"] = snapshot
+        lease = snapshot.get("lease")
+        if type(lease) is not dict:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        heartbeat_age = _startup_source_age_seconds(lease.get("heartbeat_at"))
+        if lease.get("active") not in {0, 1, False, True}:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        if bool(lease.get("active")):
+            try:
+                expiry = datetime.fromisoformat(
+                    str(lease.get("expires_at") or "").replace("Z", "+00:00")
+                )
+                expired = (
+                    expiry.tzinfo is not None
+                    and expiry.utcoffset() is not None
+                    and expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+                )
+            except (TypeError, ValueError, OverflowError):
+                expired = False
+            if not expired:
+                return _startup_check_result(
+                    False,
+                    "LEASE_OWNED_BY_OTHER",
+                    source_age_seconds=heartbeat_age,
+                )
+            try:
+                prior_alive = runtime._pid_liveness(
+                    int(lease.get("owner_pid") or 0),
+                    str(lease.get("owner_host") or ""),
+                )
+            except Exception:
+                prior_alive = None
+            if prior_alive is not False:
+                return _startup_check_result(
+                    False,
+                    "LEASE_EXPIRED",
+                    source_age_seconds=heartbeat_age,
+                )
+        return _startup_check_result(True, source_age_seconds=heartbeat_age)
+
+    initial = state.get("initial_snapshot")
+    if type(initial) is not dict:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+
+    if name == "wallet_identity_freshness":
+        configured_authority = _configured_startup_identity_authority(
+            binding,
+            context.get("wallet_fingerprint_hash"),
+            context.get("network"),
+        )
+        if configured_authority is None:
+            return _startup_check_result(
+                False,
+                "WALLET_IDENTITY_BINDING_INVALID",
+                source="configured_binding",
+            )
+        state["configured_identity_authority"] = configured_authority
+        if "cached_wallet_identity_snapshot" not in context:
+            state["identity_source"] = "configured_binding"
+            return _startup_check_result(True, source="configured_binding")
+
+        identity = context.get("cached_wallet_identity_snapshot")
+        decision = mutation_gate.validate_wallet_identity(binding, identity)
+        if decision.get("allowed") is not True:
+            return _startup_check_result(
+                False,
+                str(decision.get("reason") or "WALLET_IDENTITY_MALFORMED"),
+                source="authorized_snapshot",
+                source_age_seconds=_startup_source_age_seconds(
+                    identity.get("observed_at_utc") if type(identity) is dict else None
+                ),
+            )
+        state["identity_source"] = "authorized_snapshot"
+        state["identity_observed_at_utc"] = str(decision["observed_at_utc"])
+        return _startup_check_result(
+            True,
+            source="authorized_snapshot",
+            source_age_seconds=_startup_source_age_seconds(decision["observed_at_utc"]),
+        )
+
+    counts = initial.get("blocker_counts")
+    if type(counts) is not dict:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+    if name == "unresolved_operations":
+        latch = initial.get("latch")
+        blockers = initial.get("blockers")
+        if type(latch) is not dict or type(blockers) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        if latch.get("state") != "resolved":
+            reason = str(latch.get("reason_code") or "RECONCILIATION_REQUIRED")
+            return _startup_check_result(False, reason, blocker_counts=counts)
+        if blockers:
+            return _startup_check_result(
+                False,
+                "UNRESOLVED_OPERATIONS",
+                source_age_seconds=_startup_source_age_seconds(
+                    initial.get("source_timestamps", {}).get("operations")
+                ),
+                blocker_counts=counts,
+            )
+        return _startup_check_result(True, blocker_counts=counts)
+
+    if name == "reservations":
+        issues = initial.get("reservation_issues")
+        if type(issues) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        return _startup_check_result(
+            not issues,
+            "RESERVATION_RECONCILIATION_REQUIRED" if issues else "",
+            source_age_seconds=_startup_source_age_seconds(
+                initial.get("source_timestamps", {}).get("reservations")
+            ),
+            blocker_counts=counts,
+        )
+
+    if name == "publication_claims":
+        issues = initial.get("publication_issues")
+        if type(issues) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        return _startup_check_result(
+            not issues,
+            "PUBLICATION_CLAIM_RECOVERY_REQUIRED" if issues else "",
+            source_age_seconds=_startup_source_age_seconds(
+                initial.get("source_timestamps", {}).get("publication_claims")
+            ),
+            blocker_counts=counts,
+        )
+
+    current = database.get_stability_startup_recovery_snapshot()
+    if current.get("authority_digest") != initial.get("authority_digest"):
+        return _startup_check_result(
+            False,
+            "STARTUP_AUTHORITY_CHANGED",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    configured_authority = _configured_startup_identity_authority(
+        binding,
+        context.get("wallet_fingerprint_hash"),
+        context.get("network"),
+    )
+    if configured_authority is None or configured_authority != state.get(
+        "configured_identity_authority"
+    ):
+        return _startup_check_result(
+            False,
+            "STARTUP_AUTHORITY_CHANGED",
+            source="configured_binding",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    if state.get("identity_source") == "configured_binding":
+        return _startup_check_result(
+            True,
+            source="configured_binding",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    if state.get("identity_source") != "authorized_snapshot":
+        return _startup_check_result(
+            False,
+            "WALLET_IDENTITY_UNAVAILABLE",
+            source="authorized_snapshot",
+            blocker_counts=current.get("blocker_counts"),
+        )
+
+    identity = context.get("cached_wallet_identity_revalidation_snapshot")
+    decision = mutation_gate.validate_wallet_identity(
+        binding,
+        identity,
+        last_observed_at_utc=state.get("identity_observed_at_utc"),
+    )
+    if decision.get("allowed") is not True:
+        return _startup_check_result(
+            False,
+            str(decision.get("reason") or "WALLET_IDENTITY_MALFORMED"),
+            source="authorized_snapshot",
+            source_age_seconds=_startup_source_age_seconds(
+                identity.get("observed_at_utc") if type(identity) is dict else None
+            ),
+            blocker_counts=current.get("blocker_counts"),
+        )
+    return _startup_check_result(
+        True,
+        source="authorized_snapshot",
+        source_age_seconds=_startup_source_age_seconds(decision["observed_at_utc"]),
+        blocker_counts=current.get("blocker_counts"),
+    )
+
+
+def _blocked_startup_recovery_status(
+    reason_code: str,
+    failed_check: str,
+    checks: list[dict],
+    runtime,
+) -> dict:
+    try:
+        raw_status = runtime.status().to_dict() if runtime is not None else {}
+    except Exception:
+        raw_status = {}
+    raw_lease = raw_status.get("lease")
+    if type(raw_lease) is not dict:
+        raw_lease = {}
+    return {
+        "allowed": False,
+        "reason_code": str(reason_code or "DURABLE_STATE_UNAVAILABLE")[:64],
+        "source": "startup_recovery",
+        "failed_check": failed_check,
+        "checks": [dict(item) for item in checks],
+        "blocker_counts": {},
+        "blocking_operation_count": _bounded_stability_count(
+            raw_status.get("blocking_operation_count")
+        ),
+        "lease": {
+            "active": raw_lease.get("active") is True,
+            "version": _bounded_stability_count(raw_lease.get("version")),
+            "expires_at": (
+                str(raw_lease.get("expires_at"))[:40]
+                if type(raw_lease.get("expires_at")) is str
+                else None
+            ),
+            "owned_by_this_run": raw_lease.get("owned_by_this_run") is True,
+        },
+    }
+
+
+def _redacted_startup_status(status: Any) -> dict:
+    """Retain diagnostics without durable owner, PID, or operation identities."""
+
+    if type(status) is not dict:
+        status = {}
+    raw_lease = status.get("lease")
+    if type(raw_lease) is not dict:
+        raw_lease = {}
+    raw_counts = status.get("blocker_counts")
+    if type(raw_counts) is not dict:
+        raw_counts = {}
+    raw_checks = status.get("checks")
+    if type(raw_checks) is not list:
+        raw_checks = []
+    return {
+        "allowed": status.get("allowed") is True,
+        "reason_code": str(status.get("reason_code") or "")[:64],
+        "source": "startup_recovery",
+        "failed_check": status.get("failed_check"),
+        "checks": [dict(item) for item in raw_checks[: len(_STABILITY_STARTUP_CHECKS)]],
+        "blocker_counts": {
+            key: _bounded_stability_count(raw_counts.get(key))
+            for key in _STABILITY_BLOCKER_COUNT_KEYS
+        },
+        "blocking_operation_count": _bounded_stability_count(
+            status.get("blocking_operation_count")
+        ),
+        "lease": {
+            "active": raw_lease.get("active") is True,
+            "version": _bounded_stability_count(raw_lease.get("version")),
+            "expires_at": (
+                str(raw_lease.get("expires_at"))[:40]
+                if type(raw_lease.get("expires_at")) is str
+                else None
+            ),
+            "owned_by_this_run": raw_lease.get("owned_by_this_run") is True,
+        },
+    }
+
+
+def _discard_failed_owner_startup_runtime(runtime: Any) -> None:
+    """Detach a failed pre-owner runtime without releasing any durable lease."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    if mutation_gate.current_runtime() is runtime and runtime is not None:
+        mutation_gate.shutdown_runtime(release_owned_lease=False)
+    _mutation_runtime = None
+    _mutation_runtime_db_path = None
+
+
 def initialize_mutation_runtime(
     *, start_heartbeat: bool = True, acquire_lease: bool = True
 ) -> dict:
-    """Acquire mutation ownership without contacting the configured wallet."""
+    """Complete ordered read-only recovery before acquiring mutation ownership."""
 
-    global _mutation_runtime, _mutation_runtime_db_path
+    global _mutation_runtime, _mutation_runtime_db_path, _stability_startup_status
     with _mutation_runtime_init_lock:
+        current_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        current_runtime = mutation_gate.current_runtime()
+        if (
+            current_runtime is not None
+            and _mutation_runtime is current_runtime
+            and _mutation_runtime_db_path == current_path
+        ):
+            result = current_runtime.status().to_dict()
+            startup = _stability_startup_status
+            if type(startup) is dict:
+                raw_checks = startup.get("checks")
+                raw_counts = startup.get("blocker_counts")
+                result["failed_check"] = startup.get("failed_check")
+                result["checks"] = (
+                    [dict(item) for item in raw_checks]
+                    if type(raw_checks) is list
+                    and all(type(item) is dict for item in raw_checks)
+                    else []
+                )
+                result["blocker_counts"] = (
+                    dict(raw_counts) if type(raw_counts) is dict else {}
+                )
+                if startup.get("allowed") is True and result.get("allowed") is True:
+                    result["source"] = "startup_recovery"
+            return result
+
         wallet_hash, network = _configured_mutation_binding()
         wallet_identity_binding = _configured_wallet_identity_binding(network)
+        if acquire_lease:
+            try:
+                integrity = database.check_db_integrity()
+            except Exception:
+                integrity = {"ok": False}
+            if type(integrity) is not dict or integrity.get("ok") is not True:
+                result = _blocked_startup_recovery_status(
+                    "DATABASE_INTEGRITY_FAILED",
+                    "database_integrity",
+                    [],
+                    None,
+                )
+                _discard_failed_owner_startup_runtime(mutation_gate.current_runtime())
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
         _mutation_runtime = mutation_gate.initialize(
             wallet_fingerprint_hash=wallet_hash,
             network=network,
             wallet_identity_binding=wallet_identity_binding,
             wallet_adapter_authority=get_wallet_adapter_authority(),
-            start_heartbeat=start_heartbeat,
-            acquire_lease=acquire_lease,
+            start_heartbeat=False if acquire_lease else start_heartbeat,
+            acquire_lease=False if acquire_lease else False,
         )
         _mutation_runtime_db_path = os.path.normcase(os.path.abspath(database.DB_PATH))
         _mutation_runtime.register_stop_handler(_mutation_stop_handler)
+        if acquire_lease:
+            state: dict[str, Any] = {}
+            checks = []
+            try:
+                for check_name in _STABILITY_STARTUP_CHECKS:
+                    check = _run_stability_startup_check(
+                        check_name,
+                        state=state,
+                        runtime=_mutation_runtime,
+                        wallet_identity_binding=wallet_identity_binding,
+                        wallet_fingerprint_hash=wallet_hash,
+                        network=network,
+                    )
+                    if type(check) is not dict or type(check.get("ok")) is not bool:
+                        raise RuntimeError(
+                            "startup recovery check returned malformed data"
+                        )
+                    recorded = {"name": check_name, **check}
+                    checks.append(recorded)
+                    if check["ok"] is not True:
+                        result = _blocked_startup_recovery_status(
+                            check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
+                            check_name,
+                            checks,
+                            _mutation_runtime,
+                        )
+                        result["blocker_counts"] = dict(
+                            check.get("blocker_counts") or {}
+                        )
+                        failed_runtime = _mutation_runtime
+                        _discard_failed_owner_startup_runtime(failed_runtime)
+                        _stability_startup_status = _redacted_startup_status(result)
+                        return result
+                _mutation_runtime = mutation_gate.initialize(
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    wallet_identity_binding=wallet_identity_binding,
+                    wallet_adapter_authority=get_wallet_adapter_authority(),
+                    start_heartbeat=start_heartbeat,
+                    acquire_lease=True,
+                )
+                _mutation_runtime.register_stop_handler(_mutation_stop_handler)
+            except Exception:
+                result = _blocked_startup_recovery_status(
+                    "DURABLE_STATE_UNAVAILABLE",
+                    checks[-1]["name"] if checks else "startup_recovery",
+                    checks,
+                    _mutation_runtime,
+                )
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
         result = _mutation_runtime.status().to_dict()
+        if acquire_lease:
+            result["failed_check"] = (
+                None if result.get("allowed") else "lease_promotion"
+            )
+            result["checks"] = checks
+            result["source"] = (
+                "startup_recovery" if result.get("allowed") else result.get("source")
+            )
+            result["blocker_counts"] = dict(
+                checks[-1].get("blocker_counts") if checks else {}
+            )
+            if result.get("allowed") is not True:
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+            _stability_startup_status = _redacted_startup_status(result)
     slog(
         "SAFETY",
         "Mutation runtime initialized",
@@ -2447,9 +3094,22 @@ def serve_gui():
 
 @app.route("/api/safety/status")
 def api_safety_status():
-    """Return bounded, non-secret latch and lease diagnostics."""
+    """Return bounded, non-secret startup and live safety diagnostics."""
 
-    return jsonify({"success": True, "safety": mutation_gate.status().to_dict()})
+    try:
+        return jsonify({"success": True, "safety": get_public_stability_status()})
+    except Exception:
+        return jsonify(
+            {
+                "success": False,
+                "error": "safety_status_unavailable",
+                "safety": {
+                    "allowed": False,
+                    "reason_code": "DURABLE_STATE_UNAVAILABLE",
+                    "recommended_action": "RESTORE_DATABASE_BACKUP",
+                },
+            }
+        ), 503
 
 
 @app.route("/console")

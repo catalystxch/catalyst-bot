@@ -25,6 +25,7 @@ import time
 import threading
 import traceback
 import requests
+import mutation_gate
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Optional
@@ -4462,6 +4463,35 @@ class BotLoop:
                 "warning",
                 "bot_start_blocked_stopping",
                 "Bot is still finishing the previous stop; wait for it to fully stop before starting again",
+            )
+            return False
+
+        try:
+            mutation_gate.require_allowed("startup:bot_loop_recovery")
+        except mutation_gate.MutationBlocked as exc:
+            self._set_state(
+                running=False,
+                status="blocked",
+                error=f"Startup recovery blocked: {exc.reason_code}",
+            )
+            log_event(
+                "error",
+                "bot_start_blocked_startup_recovery",
+                "Bot start remains read-only until startup recovery is authoritative",
+                data={"reason_code": exc.reason_code},
+            )
+            return False
+        except Exception:
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Startup recovery blocked: DURABLE_STATE_UNAVAILABLE",
+            )
+            log_event(
+                "error",
+                "bot_start_blocked_startup_recovery",
+                "Bot start remains read-only because startup authority is unavailable",
+                data={"reason_code": "DURABLE_STATE_UNAVAILABLE"},
             )
             return False
 

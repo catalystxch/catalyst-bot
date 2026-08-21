@@ -21546,6 +21546,412 @@ def get_mutation_authorization_snapshot(
         conn.close()
 
 
+_MAX_STARTUP_RECOVERY_ROWS = 4096
+
+
+def get_stability_startup_recovery_snapshot() -> Dict[str, Any]:
+    """Read the Task 3-9 startup blockers from one immutable DB snapshot.
+
+    This helper never repairs, releases, or reclassifies state.  It validates
+    enough of each durable authority row to make malformed history a blocker
+    and leaves all recovery effects to their existing guarded owners.
+    """
+
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if latch_row is None or lease_row is None:
+            raise RuntimeError("startup recovery authority singleton is missing")
+
+        blocker_rows = conn.execute(
+            """
+            SELECT journal.*
+            FROM offer_operation_journal AS journal
+            JOIN (
+                SELECT operation_id, MAX(sequence) AS latest_sequence
+                FROM offer_operation_journal GROUP BY operation_id
+            ) AS latest
+              ON latest.operation_id=journal.operation_id
+             AND latest.latest_sequence=journal.sequence
+            WHERE journal.blocks_mutation=1
+            ORDER BY journal.sequence
+            LIMIT ?
+            """,
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(blocker_rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup operation blocker limit exceeded")
+        blockers = [validate_offer_operation_event(dict(row)) for row in blocker_rows]
+
+        terminal_states = sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+        placeholders = ",".join("?" for _ in terminal_states)
+        intent_rows = conn.execute(
+            "SELECT intent_id,lifecycle_state,sage_trade_id,selected_coin_ids_json,"
+            "selected_coin_ids_sha256,updated_at FROM offer_intents "
+            f"WHERE lifecycle_state NOT IN ({placeholders}) "
+            "ORDER BY intent_id LIMIT ?",
+            (*terminal_states, _MAX_STARTUP_RECOVERY_ROWS + 1),
+        ).fetchall()
+        if len(intent_rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup reservation intent limit exceeded")
+
+        reservation_issues: list[str] = []
+        expected_coin_owners: dict[str, set[str]] = {}
+        reservation_material: list[list[Any]] = []
+        selected_coin_count = 0
+        reservation_updated_at: Optional[str] = None
+        for raw_intent in intent_rows:
+            intent = dict(raw_intent)
+            intent_id = _required_stability_text(intent["intent_id"], "intent_id")
+            selected_text = _canonical_json_text(
+                intent["selected_coin_ids_json"],
+                "selected_coin_ids_json",
+                expected_type=list,
+            )
+            if (
+                hashlib.sha256(selected_text.encode("utf-8")).hexdigest()
+                != intent["selected_coin_ids_sha256"]
+            ):
+                raise RuntimeError("startup reservation intent digest is invalid")
+            selected = json.loads(selected_text)
+            if not selected:
+                raise RuntimeError("startup reservation intent has no selected coins")
+            normalized = {
+                norm_coin_id(_required_stability_text(coin_id, "coin_id"))
+                for coin_id in selected
+            }
+            if len(normalized) != len(selected):
+                raise RuntimeError("startup reservation intent coins are not unique")
+            selected_coin_count += len(normalized)
+            if selected_coin_count > _MAX_STARTUP_RECOVERY_ROWS:
+                raise RuntimeError("startup selected coin limit exceeded")
+            allowed_owners = {f"intent:{intent_id}"}
+            trade_id = intent.get("sage_trade_id")
+            if trade_id:
+                allowed_owners.add(_required_stability_text(trade_id, "sage_trade_id"))
+            for coin_id in normalized:
+                expected_coin_owners.setdefault(coin_id, set()).update(allowed_owners)
+            coin_placeholders = ",".join("?" for _ in normalized)
+            coin_rows = conn.execute(
+                f"SELECT coin_id,status,trade_id FROM coins "
+                f"WHERE coin_id IN ({coin_placeholders})",
+                tuple(sorted(normalized)),
+            ).fetchall()
+            by_coin_id = {str(row["coin_id"]): dict(row) for row in coin_rows}
+            for coin_id in sorted(normalized):
+                coin = by_coin_id.get(coin_id)
+                authoritative = _authoritative_coin_outcome(conn, coin_id)
+                outcome_material = None
+                if authoritative is not None:
+                    outcome_material = [
+                        int(authoritative["outcome_sequence"]),
+                        str(authoritative["terminal_event_id"]),
+                        str(authoritative["evidence_sha256"]),
+                        str(authoritative["disposition"]),
+                    ]
+                if (
+                    coin is None
+                    or coin.get("status") != "locked"
+                    or coin.get("trade_id") not in allowed_owners
+                    or (
+                        authoritative is not None
+                        and authoritative.get("disposition") == "spent"
+                    )
+                ):
+                    reservation_issues.append(f"intent:{intent_id}")
+                reservation_material.append(
+                    [
+                        intent_id,
+                        coin_id,
+                        sorted(allowed_owners),
+                        outcome_material,
+                    ]
+                )
+            updated_at = intent.get("updated_at")
+            if type(updated_at) is str and (
+                reservation_updated_at is None or updated_at > reservation_updated_at
+            ):
+                reservation_updated_at = updated_at
+
+        locked_rows = conn.execute(
+            "SELECT coin_id,trade_id,last_seen FROM coins WHERE status='locked' "
+            "ORDER BY coin_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(locked_rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup locked coin limit exceeded")
+        locked_coin_material: list[list[str]] = []
+        for raw_coin in locked_rows:
+            coin_id = norm_coin_id(
+                _required_stability_text(raw_coin["coin_id"], "locked coin_id")
+            )
+            owner = _required_stability_text(raw_coin["trade_id"], "locked coin owner")
+            if owner not in expected_coin_owners.get(coin_id, set()):
+                reservation_issues.append(f"coin:{coin_id}")
+            last_seen = str(raw_coin["last_seen"] or "")
+            locked_coin_material.append([coin_id, owner, last_seen])
+            if last_seen and (
+                reservation_updated_at is None or last_seen > reservation_updated_at
+            ):
+                reservation_updated_at = last_seen
+
+        publication_rows = conn.execute(
+            "SELECT publication_id,idempotency_key,intent_id,network,"
+            "offer_fingerprint,publication_epoch,publisher,payload_json,state,"
+            "attempt_count,claim_owner_run_id,claim_expires_at,next_attempt_at,"
+            "last_error_json,queued_at,succeeded_at,terminal_at,updated_at "
+            "FROM publication_outbox ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(publication_rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup publication claim limit exceeded")
+        publication_issues: list[str] = []
+        publication_material: list[list[Any]] = []
+        publication_updated_at: Optional[str] = None
+        for row_index, raw_publication in enumerate(publication_rows):
+            publication = dict(raw_publication)
+            raw_material_digest = hashlib.sha256(
+                repr(tuple(publication.values())).encode("utf-8")
+            ).hexdigest()
+            raw_id = publication.get("publication_id")
+            issue_id = (
+                raw_id if type(raw_id) is str and raw_id.strip() else f"row-{row_index}"
+            )
+            try:
+                publication_id = _required_stability_text(raw_id, "publication_id")
+                idempotency_key = _required_stability_text(
+                    publication["idempotency_key"], "idempotency_key"
+                )
+                intent_id = _optional_stability_text(publication.get("intent_id"))
+                network = _required_stability_text(
+                    publication["network"], "publication network"
+                )
+                offer_fingerprint = _required_stability_text(
+                    publication["offer_fingerprint"], "offer_fingerprint"
+                )
+                publication_epoch = _required_stability_text(
+                    publication["publication_epoch"], "publication_epoch"
+                )
+                publisher = _required_stability_text(
+                    publication["publisher"], "publisher"
+                )
+                state_name = _required_stability_text(
+                    publication["state"], "publication state"
+                )
+                if state_name not in {
+                    "queued",
+                    "claimed",
+                    "succeeded",
+                    "retryable",
+                    "suppressed",
+                    "unresolved",
+                    "failed",
+                }:
+                    raise ValueError("publication state is invalid")
+                attempt_count = _exact_integer(
+                    publication["attempt_count"], "publication attempt_count"
+                )
+                payload_text = _canonical_json_text(
+                    publication["payload_json"],
+                    "publication payload",
+                    expected_type=dict,
+                    max_bytes=262144,
+                )
+                if payload_text != publication["payload_json"]:
+                    raise ValueError("publication payload is not canonical")
+
+                timestamp_values: dict[str, Optional[str]] = {}
+                for timestamp_name in (
+                    "claim_expires_at",
+                    "next_attempt_at",
+                    "queued_at",
+                    "succeeded_at",
+                    "terminal_at",
+                    "updated_at",
+                ):
+                    timestamp_value = publication.get(timestamp_name)
+                    if timestamp_value is None:
+                        timestamp_values[timestamp_name] = None
+                        continue
+                    canonical_timestamp = _stability_timestamp(
+                        timestamp_value, f"publication {timestamp_name}"
+                    )
+                    if canonical_timestamp != timestamp_value:
+                        raise ValueError(
+                            f"publication {timestamp_name} is not canonical"
+                        )
+                    timestamp_values[timestamp_name] = canonical_timestamp
+                if (
+                    timestamp_values["queued_at"] is None
+                    or timestamp_values["updated_at"] is None
+                ):
+                    raise ValueError("publication authority timestamps are missing")
+
+                claim_owner = _optional_stability_text(
+                    publication.get("claim_owner_run_id")
+                )
+                claim_expiry = timestamp_values["claim_expires_at"]
+                if state_name == "claimed":
+                    if claim_owner is None or claim_expiry is None:
+                        raise ValueError("claimed publication authority is incomplete")
+                elif claim_owner is not None or claim_expiry is not None:
+                    raise ValueError("non-claimed publication retains claim authority")
+
+                last_error = publication.get("last_error_json")
+                last_error_digest = None
+                if last_error is not None:
+                    error_text = _canonical_json_text(
+                        last_error,
+                        "publication last_error_json",
+                        expected_type=dict,
+                        max_bytes=262144,
+                    )
+                    if error_text != last_error:
+                        raise ValueError("publication error is not canonical")
+                    last_error_digest = hashlib.sha256(
+                        error_text.encode("utf-8")
+                    ).hexdigest()
+
+                if (
+                    state_name == "succeeded"
+                    and timestamp_values["succeeded_at"] is None
+                ):
+                    raise ValueError("succeeded publication lacks acknowledgement")
+                if (
+                    state_name in {"suppressed", "failed"}
+                    and timestamp_values["terminal_at"] is None
+                ):
+                    raise ValueError("terminal publication lacks terminal timestamp")
+                if state_name in {"queued", "claimed", "retryable", "unresolved"} and (
+                    timestamp_values["succeeded_at"] is not None
+                    or timestamp_values["terminal_at"] is not None
+                ):
+                    raise ValueError("nonterminal publication has terminal authority")
+
+                publication_material.append(
+                    [
+                        publication_id,
+                        idempotency_key,
+                        intent_id,
+                        network,
+                        offer_fingerprint,
+                        publication_epoch,
+                        publisher,
+                        hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+                        state_name,
+                        attempt_count,
+                        claim_owner,
+                        claim_expiry,
+                        timestamp_values["next_attempt_at"],
+                        last_error_digest,
+                        timestamp_values["queued_at"],
+                        timestamp_values["succeeded_at"],
+                        timestamp_values["terminal_at"],
+                        timestamp_values["updated_at"],
+                    ]
+                )
+                if state_name in {"claimed", "unresolved"}:
+                    publication_issues.append(publication_id)
+                updated_at = timestamp_values["updated_at"]
+                if updated_at is not None and (
+                    publication_updated_at is None
+                    or updated_at > publication_updated_at
+                ):
+                    publication_updated_at = updated_at
+            except Exception:
+                publication_issues.append(f"malformed:{issue_id}")
+                publication_material.append(
+                    [
+                        "malformed",
+                        str(issue_id)[:_MAX_STABILITY_TEXT_CHARS],
+                        raw_material_digest,
+                    ]
+                )
+
+        counts = {
+            "operations": len(blockers),
+            "prepared_creations": sum(
+                1
+                for row in blockers
+                if row["operation_type"] == "CREATE" and row["phase"] == "PREPARED"
+            ),
+            "submitted_cancels": sum(
+                1
+                for row in blockers
+                if row["operation_type"] == "CANCEL"
+                and row["outcome"] in {"PREPARED", "CANCEL_SUBMITTED_UNCONFIRMED"}
+            ),
+            "contradictory_history": sum(
+                1
+                for row in blockers
+                if row["outcome"] == "CONFLICT"
+                or "CONFLICT" in str(row.get("reason_code") or "")
+            ),
+            "reservations": len(set(reservation_issues)),
+            "publication_claims": len(set(publication_issues)),
+        }
+        authority_payload = {
+            "latch": {
+                "generation": int(latch_row["generation"]),
+                "state": str(latch_row["state"]),
+                "reason_code": str(latch_row["reason_code"] or ""),
+            },
+            "lease": {
+                "lease_version": int(lease_row["lease_version"]),
+                "active": int(lease_row["active"]),
+                "owner_run_id": str(lease_row["owner_run_id"] or ""),
+                "wallet_fingerprint_hash": str(
+                    lease_row["wallet_fingerprint_hash"] or ""
+                ),
+                "network": str(lease_row["network"] or ""),
+                "expires_at": str(lease_row["expires_at"] or ""),
+            },
+            "blockers": [[row["event_id"], row["evidence_sha256"]] for row in blockers],
+            "reservation_material": sorted(reservation_material),
+            "locked_coin_material": sorted(locked_coin_material),
+            "reservation_issues": sorted(set(reservation_issues)),
+            "publication_material": sorted(publication_material),
+            "publication_issues": sorted(set(publication_issues)),
+        }
+        authority_json = json.dumps(
+            authority_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        result = {
+            "latch": dict(latch_row),
+            "lease": dict(lease_row),
+            "blockers": blockers,
+            "reservation_issues": sorted(set(reservation_issues)),
+            "publication_issues": sorted(set(publication_issues)),
+            "blocker_counts": counts,
+            "source_timestamps": {
+                "operations": max(
+                    (str(row["created_at"]) for row in blockers), default=None
+                ),
+                "reservations": reservation_updated_at,
+                "publication_claims": publication_updated_at,
+            },
+            "authority_digest": hashlib.sha256(
+                authority_json.encode("utf-8")
+            ).hexdigest(),
+        }
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_runtime_safety_latch() -> Dict[str, Any]:
     row = (
         get_connection()

@@ -1925,7 +1925,10 @@ def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
     }
     assert calls["cancel"] == 0
     assert diagnostic.status_code == 200
-    assert diagnostic.get_json()["safety"]["lease"]["owner_run_id"] == "other-run"
+    safety = diagnostic.get_json()["safety"]
+    assert safety["identity"]["lease_owner"] == "other_run"
+    assert "owner_run_id" not in safety["lease"]
+    assert "other-run" not in json.dumps(safety, sort_keys=True)
     assert read_only_post.status_code == 200
 
 
@@ -1960,6 +1963,56 @@ import api_server
     assert completed.returncode == 0, completed.stderr
 
 
+def _clean_startup_recovery_snapshot():
+    return {
+        "latch": {"state": "resolved", "reason_code": None},
+        "lease": {
+            "active": 0,
+            "owner_pid": None,
+            "owner_host": None,
+            "heartbeat_at": None,
+            "expires_at": None,
+        },
+        "blockers": [],
+        "reservation_issues": [],
+        "publication_issues": [],
+        "blocker_counts": {
+            "operations": 0,
+            "prepared_creations": 0,
+            "submitted_cancels": 0,
+            "contradictory_history": 0,
+            "reservations": 0,
+            "publication_claims": 0,
+        },
+        "source_timestamps": {
+            "operations": None,
+            "reservations": None,
+            "publication_claims": None,
+        },
+        "authority_digest": "clean-startup-authority",
+    }
+
+
+def _configured_startup_identity_proof(monkeypatch, api_server, *, fingerprint):
+    bound_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Startup Test Wallet",
+        fingerprint=fingerprint,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=bound_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_configured_wallet_identity_binding",
+        lambda _network: binding,
+    )
+    return binding
+
+
 def test_generic_runtime_initialization_never_starts_cat_resolver(monkeypatch):
     import api_server
 
@@ -1979,7 +2032,27 @@ def test_generic_runtime_initialization_never_starts_cat_resolver(monkeypatch):
             )
 
     monkeypatch.setattr(
-        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+        api_server,
+        "_configured_mutation_binding",
+        lambda: (
+            mutation_gate.wallet_fingerprint_hash(123456789),
+            "mainnet",
+        ),
+    )
+    _configured_startup_identity_proof(
+        monkeypatch,
+        api_server,
+        fingerprint=123456789,
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "check_db_integrity",
+        lambda: {"ok": True, "result": "ok", "errors": []},
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        _clean_startup_recovery_snapshot,
     )
     monkeypatch.setattr(
         api_server.mutation_gate, "initialize", lambda **_kwargs: Runtime()
@@ -2000,6 +2073,11 @@ def test_generic_runtime_initialization_never_starts_cat_resolver(monkeypatch):
 
     assert read_only["allowed"] is True
     assert owner["allowed"] is True
+    assert [
+        check["source"]
+        for check in owner["checks"]
+        if check["name"] in {"wallet_identity_freshness", "authority_revalidation"}
+    ] == ["configured_binding", "configured_binding"]
     assert starts == []
 
     api_server._start_owned_runtime_services(owner)
@@ -2055,27 +2133,38 @@ def test_api_runtime_initialization_uses_config_binding_without_wallet_rpc(
 
     captured = {}
     fake_gate = SimpleNamespace(
-        last_acquire_result={"acquired": False, "reason": "owned_by_other_run"},
         register_stop_handler=lambda handler: captured.setdefault("handler", handler),
         status=lambda: mutation_gate.GateStatus(
-            allowed=False,
-            reason_code="LEASE_OWNED_BY_OTHER",
+            allowed=True,
+            reason_code="",
             source="lease",
+            lease_active=True,
+            owner_is_this_run=True,
         ),
     )
 
     def fake_initialize(**kwargs):
+        captured.setdefault("calls", []).append(dict(kwargs))
         captured.update(kwargs)
         return fake_gate
 
     monkeypatch.setattr(api_server.cfg, "SAGE_FINGERPRINT", "736588221")
     monkeypatch.setattr(api_server.cfg, "WALLET_FINGERPRINT", "")
     monkeypatch.setattr(api_server.mutation_gate, "initialize", fake_initialize)
+    _configured_startup_identity_proof(
+        monkeypatch,
+        api_server,
+        fingerprint=736588221,
+    )
     monkeypatch.setattr(
-        sys.modules["wallet"],
-        "get_wallet_identity",
-        lambda: (_ for _ in ()).throw(AssertionError("wallet RPC must not run")),
-        raising=False,
+        api_server.database,
+        "check_db_integrity",
+        lambda: {"ok": True, "result": "ok", "errors": []},
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        _clean_startup_recovery_snapshot,
     )
 
     result = api_server.initialize_mutation_runtime(start_heartbeat=False)
@@ -2084,8 +2173,14 @@ def test_api_runtime_initialization_uses_config_binding_without_wallet_rpc(
     assert captured["wallet_fingerprint_hash"] == expected_hash
     assert captured["network"] == "mainnet"
     assert captured["start_heartbeat"] is False
-    assert result["allowed"] is False
-    assert result["reason_code"] == "LEASE_OWNED_BY_OTHER"
+    assert [call["acquire_lease"] for call in captured["calls"]] == [False, True]
+    assert [
+        check["source"]
+        for check in result["checks"]
+        if check["name"] in {"wallet_identity_freshness", "authority_revalidation"}
+    ] == ["configured_binding", "configured_binding"]
+    assert result["allowed"] is True
+    assert result["reason_code"] == ""
 
 
 def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
@@ -6543,6 +6638,7 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
         allowed=False,
         reason_code="LEASE_OWNED_BY_OTHER",
         source="lease",
+        lease_active=True,
         owner_run_id="owner-run",
         owner_pid=456,
     )
@@ -6554,7 +6650,10 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
     ordinary = client.get("/api/status", environ_base={"REMOTE_ADDR": "127.0.0.1"})
 
     assert safety.status_code == 200
-    assert safety.get_json()["safety"]["lease"]["owner_run_id"] == "owner-run"
+    public_safety = safety.get_json()["safety"]
+    assert public_safety["identity"]["lease_owner"] == "other_run"
+    assert "owner_run_id" not in public_safety["lease"]
+    assert "owner-run" not in json.dumps(public_safety, sort_keys=True)
     assert ordinary.status_code == 423
     assert ordinary.get_json() == {
         "success": False,
