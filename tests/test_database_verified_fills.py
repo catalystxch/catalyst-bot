@@ -44,11 +44,23 @@ def _authoritatively_terminalize_offer(
         selected_coin_ids
         or [hashlib.sha256(f"selected:{trade_id}".encode("utf-8")).hexdigest()]
     )
+    cat_decimals = 3
+    xch_atomic_value = Decimal(str(offer["size_xch"])) * Decimal(10**12)
+    cat_atomic_value = Decimal(str(offer["size_cat"])) * Decimal(10**cat_decimals)
+    if (
+        xch_atomic_value != xch_atomic_value.to_integral_value()
+        or cat_atomic_value != cat_atomic_value.to_integral_value()
+    ):
+        raise AssertionError("offer fixture cannot be represented as atomic economics")
+    xch_atomic = int(xch_atomic_value)
+    cat_atomic = int(cat_atomic_value)
+    offered_atomic = xch_atomic if offer["side"] == "buy" else cat_atomic
+    requested_atomic = cat_atomic if offer["side"] == "buy" else xch_atomic
     for coin_id in selected:
         database.upsert_coin(
             coin_id,
             "xch" if offer["side"] == "buy" else "cat",
-            1,
+            offered_atomic,
             tier=offer.get("tier") or "unknown",
         )
     wallet_identity = {
@@ -68,9 +80,11 @@ def _authoritatively_terminalize_offer(
         purpose="verified_fill_test",
         slot_key=f"verified-fill-test-slot:{identity}",
         generation=0,
-        offered_amount_atomic="1",
-        requested_amount_atomic="1",
+        offered_amount_atomic=str(offered_atomic),
+        requested_amount_atomic=str(requested_atomic),
         selected_coin_ids_json=selected,
+        cat_decimals=cat_decimals,
+        fee_mojos_xch=int(offer.get("fee_mojos_xch") or 0),
         wallet_identity_json=wallet_identity,
         evidence_json={"fixture": "authoritative intent"},
         prepared_at=_TEST_PREPARED_AT,
@@ -91,6 +105,22 @@ def _authoritatively_terminalize_offer(
         finalized_at=_TEST_PREPARED_AT,
         finalize_selected_coin_reservations=True,
     )
+    economics = database.get_offer_intent_economic_authority(intent_id)
+    if economics is None:
+        raise AssertionError(f"missing immutable economics fixture: {trade_id}")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET price_xch=?, size_xch=?, size_cat=?, fee_mojos_xch=? "
+        "WHERE trade_id=?",
+        (
+            economics["price_xch"],
+            economics["size_xch"],
+            economics["size_cat"],
+            economics["fee_mojos_xch"],
+            trade_id,
+        ),
+    )
+    conn.commit()
     evidence = {"fixture": "authoritative terminal proof", "trade_id": trade_id}
     terminal = {}
     if classification == "FILLED_PROVEN":
@@ -107,34 +137,55 @@ def _authoritatively_terminalize_offer(
             "transaction_id": transaction_id,
             "block_height": 42,
             "receive_coin_id": receive_coin_id,
-            "receive_amount_mojos": 1,
+            "receive_amount_mojos": requested_atomic,
             "filled_at": canonical_filled_at,
         }
+        transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+            transaction_id,
+            None,
+            42,
+            economics["selected_coin_ids_sha256"],
+            economics["side"],
+            economics["cat_asset_id"],
+            economics["offered_amount_atomic"],
+            economics["requested_amount_atomic"],
+            database.norm_coin_id(receive_coin_id),
+            requested_atomic,
+        )
         evidence.update(
             {
                 "classification": {
                     "classification": "FILLED_PROVEN",
+                    "reason_code": "TEST_AUTHORITATIVE_PROOF",
                     "transaction_id": transaction_id,
                     "spend_identity": None,
                     "block_height": 42,
                     "receive_coin_id": receive_coin_id,
-                    "receive_amount_mojos": 1,
+                    "receive_amount_mojos": requested_atomic,
                     "filled_at": canonical_filled_at,
                 },
                 "fill_authority": {
                     "schema_version": 1,
                     "intent_id": intent_id,
+                    "prepared_event_id": economics["prepared_event_id"],
+                    "economic_authority_token": economics["authority_token"],
                     "trade_id": trade_id,
-                    "side": offer["side"],
-                    "price_xch": offer["price_xch"],
-                    "size_xch": offer["size_xch"],
-                    "size_cat": offer["size_cat"],
-                    "cat_asset_id": offer["cat_asset_id"],
-                    "tier": offer["tier"],
-                    "fee_mojos_xch": int(offer.get("fee_mojos_xch") or 0),
+                    "side": economics["side"],
+                    "price_xch": economics["price_xch"],
+                    "size_xch": economics["size_xch"],
+                    "size_cat": economics["size_cat"],
+                    "cat_asset_id": economics["cat_asset_id"],
+                    "tier": economics["tier"],
+                    "offered_amount_atomic": economics["offered_amount_atomic"],
+                    "requested_amount_atomic": economics["requested_amount_atomic"],
+                    "cat_decimals": economics["cat_decimals"],
+                    "fee_mojos_xch": economics["fee_mojos_xch"],
+                    "fee_provenance": economics["fee_provenance"],
+                    "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+                    "transaction_flow_sha256": transaction_flow_sha256,
                     "spent_block_height": 42,
                     "receive_coin_id": database.norm_coin_id(receive_coin_id),
-                    "receive_amount_mojos": 1,
+                    "receive_amount_mojos": requested_atomic,
                     "filled_at": canonical_filled_at,
                     "transaction_id": transaction_id,
                     "spend_identity": None,
@@ -246,7 +297,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
         stats = database.get_stats(asset_id)
 
-        self.assertEqual(stats["net_xch_flow"], "0.010")
+        self.assertEqual(stats["net_xch_flow"], "0.01")
         self.assertEqual(stats["fee_xch"], "0.002")
         self.assertEqual(stats["net_xch_flow_after_fees"], "0.008")
 
@@ -629,7 +680,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                     "fill_id": fill_id,
                     "trade_id": trade_id,
                     "side": "buy",
-                    "price_xch": "0.11",
+                    "price_xch": "0.00012",
                     "size_xch": "1.2",
                     "size_cat": "10000",
                     "filled_at": "2026-03-28T00:00:00.000000Z",
@@ -654,7 +705,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 hashlib.sha256(f"receive:{trade_id}".encode("utf-8")).hexdigest()
             ),
         )
-        self.assertEqual(row["receive_amount_mojos"], 1)
+        self.assertEqual(row["receive_amount_mojos"], 10_000_000)
         self.assertEqual(database.get_stats(asset_id)["total_fills"], 1)
 
     def test_backfill_parks_changed_authoritative_fill_identity(self):

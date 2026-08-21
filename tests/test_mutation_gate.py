@@ -621,6 +621,9 @@ def test_stability_connection_factory_closes_handle_when_setup_pragma_fails(
         def __init__(self):
             self.closed = False
 
+        def create_function(self, *_args, **_kwargs):
+            return None
+
         def execute(self, _statement):
             raise sqlite3.OperationalError("pragma setup failed")
 

@@ -67,7 +67,7 @@ def _seed_authoritative_fill(
     tier: str = "inner",
     fee_mojos_xch: int = 7,
     side: str = "buy",
-    price_xch: Decimal = Decimal("0.001"),
+    price_xch: Decimal | None = None,
     size_xch: Decimal = Decimal("0.1"),
     size_cat: Decimal = Decimal("100"),
     filled_at: str = FILLED_AT,
@@ -84,11 +84,18 @@ def _seed_authoritative_fill(
         "wallet_fingerprint_hash": WALLET,
         "network": "mainnet",
     }
+    cat_decimals = 3
+    if price_xch is None:
+        price_xch = size_xch / size_cat
+    xch_amount_atomic = int(size_xch * Decimal(1_000_000_000_000))
+    cat_amount_atomic = int(size_cat * (Decimal(10) ** cat_decimals))
+    offered_amount_atomic = xch_amount_atomic if side == "buy" else cat_amount_atomic
+    requested_amount_atomic = cat_amount_atomic if side == "buy" else xch_amount_atomic
 
     assert database.upsert_coin(
         selected_coin_id,
         "xch" if side == "buy" else "cat",
-        100_000_000_000,
+        offered_amount_atomic,
         designation="tier_spare",
         tier=tier,
     )
@@ -105,9 +112,12 @@ def _seed_authoritative_fill(
         purpose="fill_authority_test",
         slot_key=f"slot:{identity}",
         generation=0,
-        offered_amount_atomic="100000000000",
-        requested_amount_atomic="100000",
+        offered_amount_atomic=str(offered_amount_atomic),
+        requested_amount_atomic=str(requested_amount_atomic),
         selected_coin_ids_json=[selected_coin_id],
+        cat_decimals=cat_decimals,
+        fee_mojos_xch=fee_mojos_xch,
+        fee_provenance="EXPLICIT_TEST_CREATE_FEE_V1",
         wallet_identity_json=wallet_identity,
         evidence_json={"fixture": "fill authority intent"},
         prepared_at=AT,
@@ -137,12 +147,31 @@ def _seed_authoritative_fill(
         coin_id=database.norm_coin_id(selected_coin_id),
         fee_mojos_xch=fee_mojos_xch,
     )
+    economics = database.get_offer_intent_economic_authority(intent_id)
+    assert economics is not None
+    assert economics["price_xch"] == str(price_xch)
+    assert economics["size_xch"] == str(size_xch)
+    assert economics["size_cat"] == str(size_cat)
+    transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+        transaction_id,
+        None,
+        42,
+        economics["selected_coin_ids_sha256"],
+        side,
+        cat_asset_id,
+        str(offered_amount_atomic),
+        str(requested_amount_atomic),
+        database.norm_coin_id(receive_coin_id),
+        requested_amount_atomic,
+    )
     evidence = {
         "fixture": "fill authority terminal",
         "trade_id": trade_id,
         "fill_authority": {
             "schema_version": 1,
             "intent_id": intent_id,
+            "prepared_event_id": economics["prepared_event_id"],
+            "economic_authority_token": economics["authority_token"],
             "trade_id": trade_id,
             "side": side,
             "price_xch": str(price_xch),
@@ -150,21 +179,28 @@ def _seed_authoritative_fill(
             "size_cat": str(size_cat),
             "cat_asset_id": cat_asset_id,
             "tier": tier,
+            "offered_amount_atomic": str(offered_amount_atomic),
+            "requested_amount_atomic": str(requested_amount_atomic),
+            "cat_decimals": cat_decimals,
             "fee_mojos_xch": fee_mojos_xch,
+            "fee_provenance": "EXPLICIT_TEST_CREATE_FEE_V1",
+            "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+            "transaction_flow_sha256": transaction_flow_sha256,
             "spent_block_height": 42,
             "receive_coin_id": database.norm_coin_id(receive_coin_id),
-            "receive_amount_mojos": 100_000,
+            "receive_amount_mojos": requested_amount_atomic,
             "filled_at": filled_at,
             "transaction_id": transaction_id,
             "spend_identity": None,
         },
         "classification": {
             "classification": "FILLED_PROVEN",
+            "reason_code": "TEST_AUTHORITATIVE_PROOF",
             "transaction_id": transaction_id,
             "spend_identity": None,
             "block_height": 42,
             "receive_coin_id": receive_coin_id,
-            "receive_amount_mojos": 100_000,
+            "receive_amount_mojos": requested_amount_atomic,
             "filled_at": filled_at,
         },
     }
@@ -179,7 +215,7 @@ def _seed_authoritative_fill(
         "transaction_id": transaction_id,
         "block_height": 42,
         "receive_coin_id": receive_coin_id,
-        "receive_amount_mojos": 100_000,
+        "receive_amount_mojos": requested_amount_atomic,
         "filled_at": filled_at,
         "reconciled_at": reconciled_at,
     }
@@ -874,10 +910,62 @@ def test_authority_projections_are_indexed_and_migration_is_hard_bounded(
     ).fetchall()
     detail = " ".join(str(row["detail"]) for row in plan)
     assert "idx_offer_reconciliation_coin_outcomes_permanent" in detail
+    assert "idx_wallet_effect_claim_coins_coin" in detail
+    assert "VIRTUAL TABLE" not in detail
     assert database._MAX_FILL_AUTHORITY_CLOSURE_ROWS == 4096
     source = inspect.getsource(database._migrate_fill_authority_closure)
     assert source.count("_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1") >= 2
     assert "selected_count > _MAX_FILL_AUTHORITY_CLOSURE_ROWS" in source
+
+
+def test_wallet_effect_claim_root_materializes_exact_indexed_coin_cohort(
+    isolated_database,
+):
+    conn = database.get_connection()
+    source_id = hashlib.sha256(b"claim-trigger-source").hexdigest()
+    fee_id = hashlib.sha256(b"claim-trigger-fee").hexdigest()
+    source, source_json, source_sha = database._canonical_wallet_effect_coin_ids(
+        [source_id], "source_coin_ids", allow_empty=False
+    )
+    fee, fee_json, fee_sha = database._canonical_wallet_effect_coin_ids(
+        [fee_id], "fee_coin_ids", allow_empty=True
+    )
+    cohort, cohort_json, cohort_sha = database._canonical_wallet_effect_coin_ids(
+        source + fee, "cohort_coin_ids", allow_empty=False
+    )
+    wallet_hash, network = database._wallet_effect_claim_binding(conn)
+    claim_token = hashlib.sha256(b"claim-trigger-token").hexdigest()
+
+    conn.execute(
+        "INSERT INTO wallet_effect_claims ("
+        "claim_token, operation_id, operation_contract, generation, "
+        "source_coin_ids_json, source_coin_ids_sha256, fee_coin_ids_json, "
+        "fee_coin_ids_sha256, cohort_coin_ids_json, cohort_coin_ids_sha256, "
+        "wallet_fingerprint_hash, network, claimed_at) "
+        "VALUES (?, ?, 'EXPLICIT_COIN_COHORT_V1', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            claim_token,
+            "claim-trigger-materialization",
+            source_json,
+            source_sha,
+            fee_json,
+            fee_sha,
+            cohort_json,
+            cohort_sha,
+            wallet_hash,
+            network,
+            AT,
+        ),
+    )
+
+    rows = conn.execute(
+        "SELECT coin_id, role FROM wallet_effect_claim_coins "
+        "WHERE claim_token=? ORDER BY coin_id",
+        (claim_token,),
+    ).fetchall()
+    assert [(row["coin_id"], row["role"]) for row in rows] == [
+        (coin_id, "source" if coin_id in set(source) else "fee") for coin_id in cohort
+    ]
 
 
 def test_cross_intent_release_cannot_supersede_permanent_spend(isolated_database):
@@ -997,6 +1085,7 @@ def test_migration_audits_latches_and_repairs_prefixed_release_conflict(
         "SELECT COUNT(*) FROM offer_reconciliation_coin_outcomes WHERE coin_id=?",
         (coin_id,),
     ).fetchone()[0]
+    conn.execute("DROP TRIGGER offer_reconciliation_coin_outcomes_proof_guard_v2")
     conn.execute(
         "INSERT INTO offer_reconciliation_coin_outcomes "
         "(coin_id, intent_id, trade_id, outcome, disposition, terminal_event_id, "
@@ -1789,3 +1878,1026 @@ def test_post_fill_callback_reload_blocks_demotion_after_claim(
     assert calls == []
     assert "blocked" in statuses.values()
     assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+def test_worker_denies_auto_selected_source_and_fee_inputs(
+    isolated_database,
+):
+    import coin_prep_worker
+
+    source_coin_id = hashlib.sha256(b"explicit-worker-source").hexdigest()
+    assert database.upsert_coin(
+        source_coin_id, "xch", 200_000, designation="reserve", tier="none"
+    )
+    calls: list[str] = []
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._is_subprocess = False
+    worker.log = lambda _message: None
+
+    pool = worker._call_wallet_mutation(
+        "coin_prep.create_pool",
+        lambda *_args, **_kwargs: calls.append("auto-source") or {"success": True},
+        1,
+        100_000,
+        "xch1authority",
+        fee_mojos=0,
+    )
+    split = worker._call_wallet_mutation(
+        "coin_prep.split_single_sage",
+        lambda **_kwargs: calls.append("auto-fee") or {"success": True},
+        target_coin_id=source_coin_id,
+        fee_mojos=1,
+    )
+    ignored_source = worker._call_wallet_mutation(
+        "coin_prep.consolidate_balance",
+        lambda **_kwargs: calls.append("ignored-source") or {"success": True},
+        wallet_id=1,
+        amount_mojos=100_000,
+        address="xch1authority",
+        fee_mojos=0,
+        source_coin_ids=[source_coin_id],
+    )
+
+    assert pool is None
+    assert split is None
+    assert ignored_source is None
+    assert calls == []
+
+
+def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
+    isolated_database,
+    monkeypatch,
+):
+    import coin_prep_worker
+
+    source_coin_ids = [
+        hashlib.sha256(b"worker-combine-source-one").hexdigest(),
+        hashlib.sha256(b"worker-combine-source-two").hexdigest(),
+    ]
+    for coin_id in source_coin_ids:
+        assert database.upsert_coin(
+            coin_id, "xch", 200_000, designation="reserve", tier="none"
+        )
+
+    claims: list[dict] = []
+
+    def claim(**kwargs):
+        claims.append(kwargs)
+        return {"claim_token": "b" * 64, "generation": 1}
+
+    monkeypatch.setattr(coin_prep_worker, "claim_wallet_effect", claim)
+    monkeypatch.setattr(
+        coin_prep_worker, "wallet_effect_claim_is_current", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        coin_prep_worker, "resolve_wallet_effect_claim", lambda *_a, **_k: True
+    )
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._is_subprocess = False
+    worker.log = lambda _message: None
+    calls: list[tuple[list[str], int]] = []
+
+    subset = worker._call_wallet_mutation(
+        "coin_prep.combine",
+        lambda **_kwargs: calls.append(([], 0)) or {"success": True},
+        coin_ids=source_coin_ids,
+        fee_mojos=1,
+        _authority_fee_coin_ids=source_coin_ids[:1],
+    )
+    exact = worker._call_wallet_mutation(
+        "coin_prep.combine",
+        lambda *, coin_ids, fee_mojos: (
+            calls.append((coin_ids, fee_mojos)) or {"success": True}
+        ),
+        coin_ids=source_coin_ids,
+        fee_mojos=1,
+        _authority_fee_coin_ids=source_coin_ids,
+    )
+
+    assert subset is None
+    assert exact == {"success": True}
+    assert calls == [(source_coin_ids, 1)]
+    assert claims == [
+        {
+            "operation_id": "coin_prep.combine",
+            "source_coin_ids": source_coin_ids,
+            "fee_coin_ids": source_coin_ids,
+        }
+    ]
+
+
+def test_coin_manager_denies_unknown_or_malformed_wallet_effect_contract(
+    isolated_database,
+):
+    import coin_manager
+
+    source_coin_id = hashlib.sha256(b"manager-contract-source").hexdigest()
+    assert database.upsert_coin(
+        source_coin_id, "xch", 200_000, designation="reserve", tier="none"
+    )
+    calls: list[str] = []
+
+    unknown = coin_manager._run_claimed_wallet_effect(
+        "attacker_keyword_split",
+        lambda: calls.append("unknown") or {"success": True},
+        source_coin_ids=[source_coin_id],
+    )
+    malformed = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.consolidate_sage",
+        lambda: calls.append("malformed") or {"success": True},
+        source_coin_ids=[source_coin_id],
+    )
+    ignored_source = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.pool_send_sage",
+        lambda: calls.append("ignored-source") or {"success": True},
+        source_coin_ids=[source_coin_id],
+        fee_mojos=0,
+    )
+
+    assert unknown is coin_manager._WALLET_EFFECT_DENIED
+    assert malformed is coin_manager._WALLET_EFFECT_DENIED
+    assert ignored_source is coin_manager._WALLET_EFFECT_DENIED
+    assert calls == []
+
+
+def test_wallet_effect_recheck_denial_releases_exact_no_effect_claim(monkeypatch):
+    import coin_manager
+
+    source_coin_id = hashlib.sha256(b"claim-recheck-release").hexdigest()
+    callback_calls: list[str] = []
+    resolutions: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        coin_manager,
+        "claim_wallet_effect",
+        lambda **_kwargs: {"claim_token": "c" * 64, "generation": 3},
+    )
+    monkeypatch.setattr(
+        coin_manager,
+        "wallet_effect_claim_is_current",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        coin_manager,
+        "resolve_wallet_effect_claim",
+        lambda *args, **kwargs: resolutions.append((args, kwargs)) or True,
+    )
+
+    result = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.split_sage",
+        lambda: callback_calls.append("effect") or {"success": True},
+        source_coin_ids=[source_coin_id],
+    )
+
+    assert result is coin_manager._WALLET_EFFECT_DENIED
+    assert callback_calls == []
+    assert resolutions == [
+        (
+            ("c" * 64, 3),
+            {
+                "outcome": "RELEASED_NO_EFFECT",
+                "evidence": {
+                    "effect_attempted": False,
+                    "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
+                    "result_type": "not_dispatched",
+                },
+            },
+        )
+    ]
+
+
+def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
+    isolated_database,
+):
+    import coin_prep_worker
+
+    source_coin_id = hashlib.sha256(b"claim-task4-barrier").hexdigest()
+    assert database.upsert_coin(
+        source_coin_id, "xch", 200_000, designation="reserve", tier="none"
+    )
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._is_subprocess = False
+    worker.log = lambda _message: None
+    task4_denied: list[bool] = []
+
+    def effect(**_kwargs):
+        try:
+            database.prepare_offer_intent(
+                intent_id="claim-barrier-intent",
+                operation_id="create:claim-barrier-intent",
+                event_id="create:claim-barrier-intent:prepared",
+                run_id="claim-barrier-run",
+                wallet_fingerprint_hash=WALLET,
+                network="mainnet",
+                asset_id=ASSET,
+                side="buy",
+                tier="inner",
+                purpose="claim_barrier_test",
+                slot_key="claim-barrier-slot",
+                generation=0,
+                offered_amount_atomic="1000",
+                requested_amount_atomic="2000",
+                selected_coin_ids_json=[source_coin_id],
+                wallet_identity_json={
+                    "wallet_fingerprint_hash": WALLET,
+                    "network": "mainnet",
+                },
+                evidence_json={"fixture": "claim barrier"},
+                prepared_at=AT,
+                reserve_selected_coins=True,
+            )
+        except ValueError as exc:
+            task4_denied.append("wallet effect claim" in str(exc).lower())
+        return {"success": True, "transaction_id": "claim-barrier-effect"}
+
+    result = worker._call_wallet_mutation(
+        "coin_prep.split_single_sage",
+        effect,
+        target_coin_id=source_coin_id,
+        fee_mojos=0,
+    )
+
+    assert result["success"] is True
+    assert task4_denied == [True]
+
+
+def test_wallet_effect_claim_blocks_free_and_wallet_reconciliation(
+    isolated_database,
+):
+    free_coin_id = hashlib.sha256(b"claim-free-barrier").hexdigest()
+    gone_coin_id = hashlib.sha256(b"claim-reconcile-barrier").hexdigest()
+    assert database.upsert_coin(free_coin_id, "xch", 200_000, tier="none")
+    assert database.upsert_coin(gone_coin_id, "xch", 300_000, tier="none")
+    database.get_connection().execute(
+        "UPDATE coins SET status='gone' WHERE coin_id=?",
+        (database.norm_coin_id(gone_coin_id),),
+    )
+    database.get_connection().commit()
+    free_claim = database.claim_wallet_effect(
+        operation_id="claim-free-barrier",
+        source_coin_ids=[free_coin_id],
+    )
+    gone_claim = database.claim_wallet_effect(
+        operation_id="claim-reconcile-barrier",
+        source_coin_ids=[gone_coin_id],
+    )
+    assert free_claim is not None
+    assert gone_claim is not None
+
+    assert database.free_coin(free_coin_id) is False
+    stats = database.reconcile_coins_with_wallet(
+        {database.norm_coin_id(gone_coin_id): 300_000},
+        {database.norm_coin_id(gone_coin_id): 300_000},
+        "xch",
+    )
+
+    assert stats["protected"] == 2
+    assert stats["reappeared"] == 0
+    assert database.get_coin_state(gone_coin_id)["status"] == "gone"
+
+
+def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
+    isolated_database,
+):
+    import coin_prep_worker
+
+    source_coin_id = hashlib.sha256(b"claim-crash-restart").hexdigest()
+    assert database.upsert_coin(
+        source_coin_id, "xch", 200_000, designation="reserve", tier="none"
+    )
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._is_subprocess = False
+    worker.log = lambda _message: None
+
+    with pytest.raises(SystemExit):
+        worker._call_wallet_mutation(
+            "coin_prep.split_single_sage",
+            lambda **_kwargs: (_ for _ in ()).throw(SystemExit("crash boundary")),
+            target_coin_id=source_coin_id,
+            fee_mojos=0,
+        )
+
+    database.close_connection()
+    database._db_initialized_path = ""
+    database.init_database()
+    with pytest.raises(ValueError, match="wallet effect claim"):
+        database.prepare_offer_intent(
+            intent_id="claim-crash-intent",
+            operation_id="create:claim-crash-intent",
+            event_id="create:claim-crash-intent:prepared",
+            run_id="claim-crash-run",
+            wallet_fingerprint_hash=WALLET,
+            network="mainnet",
+            asset_id=ASSET,
+            side="buy",
+            tier="inner",
+            purpose="claim_crash_test",
+            slot_key="claim-crash-slot",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[source_coin_id],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": "mainnet",
+            },
+            evidence_json={"fixture": "claim crash"},
+            prepared_at=AT,
+            reserve_selected_coins=True,
+        )
+
+
+def test_wallet_effect_claim_guard_recomputes_exact_source_fee_union(
+    isolated_database,
+):
+    source_coin_id = database.norm_coin_id(
+        hashlib.sha256(b"claim-shape-source").hexdigest()
+    )
+    fee_coin_id = database.norm_coin_id(hashlib.sha256(b"claim-shape-fee").hexdigest())
+    source_json = json.dumps([source_coin_id], separators=(",", ":"))
+    fee_json = json.dumps([fee_coin_id], separators=(",", ":"))
+    # A canonical-looking root that omits the fee input from its cohort must
+    # not become durable authority, even on an application DB connection.
+    forged_cohort_json = source_json
+    digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    with pytest.raises(sqlite3.IntegrityError, match="claim cohort"):
+        database.get_connection().execute(
+            "INSERT INTO wallet_effect_claims ("
+            "claim_token, operation_id, operation_contract, generation, "
+            "source_coin_ids_json, source_coin_ids_sha256, fee_coin_ids_json, "
+            "fee_coin_ids_sha256, cohort_coin_ids_json, cohort_coin_ids_sha256, "
+            "wallet_fingerprint_hash, network, claimed_at) "
+            "VALUES (?, ?, 'EXPLICIT_COIN_COHORT_V1', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "1" * 64,
+                "claim-shape-forgery",
+                source_json,
+                digest(source_json),
+                fee_json,
+                digest(fee_json),
+                forged_cohort_json,
+                digest(forged_cohort_json),
+                WALLET,
+                "mainnet",
+                AT,
+            ),
+        )
+    database.get_connection().rollback()
+
+
+def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_replays(
+    isolated_database,
+):
+    source_coin_id = hashlib.sha256(b"claim-resolution-source").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+    claim = database.claim_wallet_effect(
+        operation_id="claim-resolution",
+        source_coin_ids=[source_coin_id],
+    )
+    assert claim is not None
+    forged = json.dumps(
+        {
+            "effect_attempted": True,
+            "reason_code": "FORGED_NO_EFFECT",
+            "result_type": "dict",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="claim resolution"):
+        database.get_connection().execute(
+            "INSERT INTO wallet_effect_claim_resolutions "
+            "(claim_token, generation, outcome, evidence_json, evidence_sha256, "
+            " resolved_at) VALUES (?, ?, 'RELEASED_NO_EFFECT', ?, ?, ?)",
+            (
+                claim["claim_token"],
+                claim["generation"],
+                forged,
+                hashlib.sha256(forged.encode("utf-8")).hexdigest(),
+                AT,
+            ),
+        )
+    database.get_connection().rollback()
+
+    evidence = {
+        "effect_attempted": False,
+        "reason_code": "ADAPTER_DENIED_BEFORE_EFFECT",
+        "result_type": "dict",
+    }
+    assert database.resolve_wallet_effect_claim(
+        claim["claim_token"],
+        claim["generation"],
+        outcome="RELEASED_NO_EFFECT",
+        evidence=evidence,
+        resolved_at=AT,
+    )
+    assert not database.resolve_wallet_effect_claim(
+        claim["claim_token"],
+        claim["generation"],
+        outcome="RELEASED_NO_EFFECT",
+        evidence=evidence,
+        resolved_at=AFTER,
+    )
+
+
+def test_post_fill_claim_attestation_guard_recomputes_exact_canonical_binding(
+    isolated_database,
+):
+    result, _proof = _seed_authoritative_fill(suffix="claim-attestation-shape")
+    fill_id = result["fill_id"]
+    receipt = database.get_authoritative_fill_by_id(fill_id)
+    claim_token = "c" * 64
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offer_fill_hook_outbox SET state='running', attempt=1, "
+        "claim_token=?, claimed_at=? WHERE fill_id=? "
+        "AND hook_name='offer_filled_event'",
+        (claim_token, AT, fill_id),
+    )
+    forged = json.dumps(
+        {
+            "schema_version": 1,
+            "fill_id": fill_id,
+            "hook_name": "offer_filled_event",
+            "claim_generation": 1,
+            "claim_token": "d" * 64,
+            "authority_token": receipt["authority_token"],
+            "revocation_epoch": 0,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="claim attestation"):
+        conn.execute(
+            "INSERT INTO offer_fill_hook_claim_attestations "
+            "(fill_id, hook_name, claim_generation, claim_token, authority_token, "
+            "revocation_epoch, attestation_json, attestation_sha256, claimed_at) "
+            "VALUES (?, 'offer_filled_event', 1, ?, ?, 0, ?, ?, ?)",
+            (
+                fill_id,
+                claim_token,
+                receipt["authority_token"],
+                forged,
+                hashlib.sha256(forged.encode("utf-8")).hexdigest(),
+                AT,
+            ),
+        )
+    conn.rollback()
+
+
+def test_raw_sqlite_without_authority_helpers_cannot_insert_forged_journal(
+    isolated_database,
+):
+    selected_coin_id = hashlib.sha256(b"raw-journal-source").hexdigest()
+    assert database.upsert_coin(selected_coin_id, "xch", 1000, tier="inner")
+    database.prepare_offer_intent(
+        intent_id="raw-journal-intent",
+        operation_id="create:raw-journal-intent",
+        event_id="create:raw-journal-intent:prepared",
+        run_id="raw-journal-run",
+        wallet_fingerprint_hash=WALLET,
+        network="mainnet",
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="raw_journal_guard_test",
+        slot_key="raw-journal-slot",
+        generation=0,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[selected_coin_id],
+        wallet_identity_json={},
+        evidence_json={},
+        prepared_at=AT,
+    )
+    raw = sqlite3.connect(str(isolated_database))
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            raw.execute(
+                "INSERT INTO offer_operation_journal "
+                "(event_id, operation_id, intent_id, operation_type, attempt, "
+                " phase, outcome, request_timestamp, wallet_identity_json, "
+                " evidence_json, evidence_sha256, blocks_mutation, created_at) "
+                "VALUES (?, ?, ?, 'RECONCILE', 1, 'FINALIZED', 'FILLED_PROVEN', "
+                " ?, '{}', '{}', ?, 0, ?)",
+                (
+                    "reconcile:raw-journal-intent:attempt:1:finalized",
+                    "reconcile:raw-journal-intent",
+                    "raw-journal-intent",
+                    AFTER,
+                    "0" * 64,
+                    AFTER,
+                ),
+            )
+    finally:
+        raw.rollback()
+        raw.close()
+
+
+def test_read_only_diagnostics_connections_register_authority_helpers():
+    import read_only_diagnostics
+
+    conn = read_only_diagnostics._sqlite_connect(":memory:")
+    try:
+        registered = {
+            str(row[0]): int(row[5])
+            for row in conn.execute("PRAGMA function_list").fetchall()
+        }
+    finally:
+        conn.close()
+
+    deterministic = 0x800
+    assert registered["catalyst_sha256"] & deterministic
+    assert registered["catalyst_is_canonical_json"] & deterministic
+    strict = read_only_diagnostics._sqlite_connect(":memory:")
+    try:
+        assert (
+            strict.execute(
+                "SELECT catalyst_is_canonical_json(?)", ('{"value":NaN}',)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            strict.execute(
+                "SELECT catalyst_is_canonical_json(?)", ('{"value":1}',)
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        strict.close()
+    assert inspect.getsource(read_only_diagnostics).count("sqlite3.connect(") == 1
+
+
+def test_selected_coin_digest_is_recomputed_by_insert_guard(isolated_database):
+    result, proof = _seed_authoritative_fill(suffix="selected-digest-guard")
+    del result
+    conn = database.get_connection()
+    source = dict(
+        conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (proof["intent_id"],)
+        ).fetchone()
+    )
+    source.update(
+        {
+            "intent_id": "wrong-selected-digest-intent",
+            "run_id": "wrong-selected-digest-run",
+            "slot_key": "wrong-selected-digest-slot",
+            "sage_trade_id": "wrong-selected-digest-trade",
+            "offer_text_sha256": hashlib.sha256(b"wrong-selected-offer").hexdigest(),
+            "selected_coin_ids_sha256": "0" * 64,
+        }
+    )
+    columns = tuple(source)
+
+    with pytest.raises(sqlite3.IntegrityError, match="selected coin"):
+        conn.execute(
+            f"INSERT INTO offer_intents ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _column in columns)})",
+            tuple(source[column] for column in columns),
+        )
+    conn.rollback()
+
+
+def test_revocation_after_claim_blocks_callback_and_completed_replay(
+    isolated_database, monkeypatch
+):
+    result, _proof = _seed_authoritative_fill(suffix="revocation-callback-race")
+    fill_id = result["fill_id"]
+    original_claim = database.claim_offer_fill_hook
+    revoked = False
+
+    def claim_then_revoke(claim_fill_id, hook_name):
+        nonlocal revoked
+        claim = original_claim(claim_fill_id, hook_name)
+        if claim["status"] == "claimed" and not revoked:
+            revoked = True
+            database.revoke_offer_fill_authority(
+                claim_fill_id,
+                reason_code="TEST_REVOCATION_INTERLEAVE",
+                evidence={"fixture": "revocation after claim"},
+                revoked_at=AFTER,
+            )
+        return claim
+
+    calls: list[str] = []
+
+    def callbacks(_fill):
+        return {
+            name: (
+                lambda _row, *, claim_token, claim_generation, name=name: (
+                    calls.append(name) or {}
+                )
+            )
+            for name in database._AUTHORITATIVE_FILL_HOOKS
+        }
+
+    monkeypatch.setattr(database, "claim_offer_fill_hook", claim_then_revoke)
+    monkeypatch.setattr(offer_reconciliation, "_post_fill_hook_callbacks", callbacks)
+
+    statuses = offer_reconciliation._run_post_fill_hooks(
+        database.get_authoritative_fill_by_id(fill_id), completed_at=FILLED_AT
+    )
+
+    assert calls == []
+    assert "blocked" in statuses.values()
+    assert database.get_offer_fill_hook_receipts(fill_id) == []
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert latch["reason_code"] == "AUTHORITATIVE_FILL_PROOF_LOST"
+
+
+def test_process_effect_fence_serializes_revocation_through_callback_boundary(
+    isolated_database,
+):
+    result, _proof = _seed_authoritative_fill(
+        suffix="revocation-process-effect-race", tier="boost"
+    )
+    fill_id = result["fill_id"]
+    claim = database.claim_offer_fill_hook(fill_id, "boost_notification")
+    assert hasattr(database, "offer_fill_process_effect_authority")
+    entered = threading.Event()
+    release_effect = threading.Event()
+    revocation_done = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def run_effect() -> None:
+        try:
+            with database.offer_fill_process_effect_authority(
+                fill_id,
+                "boost_notification",
+                claim["claim_token"],
+                claim["claim_generation"],
+            ):
+                order.append("effect-start")
+                entered.set()
+                assert release_effect.wait(timeout=5)
+                order.append("effect-end")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def revoke() -> None:
+        try:
+            database.revoke_offer_fill_authority(
+                fill_id,
+                reason_code="TEST_FINAL_EFFECT_REVOCATION_INTERLEAVE",
+                evidence={"fixture": "revocation waits for process effect"},
+                revoked_at=AFTER,
+            )
+            order.append("revoked")
+            revocation_done.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    effect_thread = threading.Thread(target=run_effect)
+    effect_thread.start()
+    assert entered.wait(timeout=5)
+    revoke_thread = threading.Thread(target=revoke)
+    revoke_thread.start()
+    assert not revocation_done.wait(timeout=0.1)
+    release_effect.set()
+    effect_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+
+    assert not effect_thread.is_alive()
+    assert not revoke_thread.is_alive()
+    assert errors == []
+    assert order == ["effect-start", "effect-end", "revoked"]
+    assert database.get_authoritative_fill_by_id(fill_id) is None
+
+
+def test_missing_receipt_uses_journal_binding_to_trip_named_latch(isolated_database):
+    result, _proof = _seed_authoritative_fill(suffix="missing-receipt-binding")
+    fill_id = result["fill_id"]
+    conn = database.get_connection()
+    _delete_authoritative_receipt_for_test(conn, fill_id)
+
+    blocked = database.claim_offer_fill_hook(fill_id, "boost_notification")
+
+    assert blocked["status"] == "blocked"
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert latch["reason_code"] == "AUTHORITATIVE_FILL_PROOF_LOST"
+
+
+def test_post_fill_classification_uses_immutable_selected_coin_not_offer_projection(
+    isolated_database, monkeypatch
+):
+    result, proof = _seed_authoritative_fill(suffix="immutable-callback-coin")
+    fill_id = result["fill_id"]
+    attacker_coin_id = database.norm_coin_id(
+        hashlib.sha256(b"attacker-callback-coin").hexdigest()
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET coin_id=? WHERE trade_id=?",
+        (attacker_coin_id, proof["intent_id"].replace("intent-", "trade-")),
+    )
+    conn.commit()
+    seen: list[str] = []
+
+    class Result:
+        classification = "dexie_combined"
+        spent_block_index = 42
+        taker_puzzle_hash = None
+        sweep_group_id = "sweep_42"
+        side = "buy"
+
+    import fill_classifier
+
+    def classify(_trade_id, detail, _wallet):
+        seen.append(detail["coin_id"])
+        return Result()
+
+    monkeypatch.setattr(fill_classifier, "classify_fill", classify)
+    callbacks = offer_reconciliation._post_fill_hook_callbacks(
+        database.get_authoritative_fill_by_id(fill_id)
+    )
+    claim = database.claim_offer_fill_hook(fill_id, "fill_classification")
+    callbacks["fill_classification"](
+        database.get_authoritative_fill_by_id(fill_id),
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+
+    assert seen == [proof["coin_id"]]
+
+
+def test_revoked_boost_effect_is_not_restored_from_durable_materialization(
+    isolated_database,
+):
+    result, _proof = _seed_authoritative_fill(
+        suffix="revoked-boost-restore", tier="boost"
+    )
+    fill = database.get_authoritative_fill_by_id(result["fill_id"])
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    materialization = {
+        "schema_version": 1,
+        "fill_id": fill["fill_id"],
+        "trade_id": fill["trade_id"],
+        "side": fill["side"],
+        "probe_trade_id": fill["trade_id"],
+        "probe_matched": True,
+        "settled_before": False,
+        "offset_bps": 10,
+        "floor_bps": 10,
+        "last_safe_offset_bps": 9,
+    }
+    database.register_authoritative_boost_fill_command(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        materialization=materialization,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    effect = database.materialize_authoritative_boost_fill_effect(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    database.complete_authoritative_boost_fill_command(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        effect,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    database.revoke_offer_fill_authority(
+        fill["fill_id"],
+        reason_code="TEST_REVOKED_BOOST_RESTORE",
+        evidence={"fixture": "revoked boost restore"},
+        revoked_at=AFTER,
+    )
+
+    with pytest.raises(RuntimeError, match="Boost effect"):
+        database.get_materialized_authoritative_boost_commands()
+
+    assert database.get_runtime_safety_latch()["reason_code"] == (
+        "AUTHORITATIVE_FILL_PROOF_LOST"
+    )
+
+
+def test_boost_restore_process_effect_fence_serializes_revocation_through_apply(
+    isolated_database,
+):
+    import boost_manager
+
+    result, _proof = _seed_authoritative_fill(
+        suffix="boost-restore-process-fence", tier="boost"
+    )
+    fill = database.get_authoritative_fill_by_id(result["fill_id"])
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
+    materialization = {
+        "schema_version": 1,
+        "fill_id": fill["fill_id"],
+        "trade_id": fill["trade_id"],
+        "side": fill["side"],
+        "probe_trade_id": fill["trade_id"],
+        "probe_matched": True,
+        "settled_before": False,
+        "offset_bps": 10,
+        "floor_bps": 10,
+        "last_safe_offset_bps": 9,
+    }
+    database.register_authoritative_boost_fill_command(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        materialization=materialization,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    effect = database.materialize_authoritative_boost_fill_effect(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    database.complete_authoritative_boost_fill_command(
+        fill["fill_id"],
+        fill["trade_id"],
+        fill["side"],
+        effect,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+
+    entered = threading.Event()
+    release_effect = threading.Event()
+    revocation_done = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def restore() -> None:
+        try:
+            with database.authoritative_boost_restore_effect_authority() as commands:
+                assert [command["fill_id"] for command in commands] == [fill["fill_id"]]
+                order.append("restore-start")
+                entered.set()
+                assert release_effect.wait(timeout=5)
+                order.append("restore-end")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def revoke() -> None:
+        try:
+            database.revoke_offer_fill_authority(
+                fill["fill_id"],
+                reason_code="TEST_BOOST_RESTORE_PROCESS_FENCE",
+                evidence={"fixture": "Boost restore process fence"},
+                revoked_at=AFTER,
+            )
+            order.append("revoked")
+            revocation_done.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    restore_thread = threading.Thread(target=restore)
+    restore_thread.start()
+    assert entered.wait(timeout=5)
+    revoke_thread = threading.Thread(target=revoke)
+    revoke_thread.start()
+    assert not revocation_done.wait(timeout=0.1)
+    release_effect.set()
+    restore_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+
+    assert errors == []
+    assert order == ["restore-start", "restore-end", "revoked"]
+    assert database.get_authoritative_fill_by_id(fill["fill_id"]) is None
+    assert "authoritative_boost_restore_effect_authority" in inspect.getsource(
+        boost_manager.BoostManager.__init__
+    )
+
+
+def test_revoked_fill_blocks_sweep_event_materialization_and_delivery(
+    isolated_database,
+):
+    first, _first_proof = _seed_authoritative_fill(suffix="revoked-sweep-first")
+    second, _second_proof = _seed_authoritative_fill(suffix="revoked-sweep-second")
+    fill_ids = [first["fill_id"], second["fill_id"]]
+    for fill_id in fill_ids:
+        fill = database.get_authoritative_fill_by_id(fill_id)
+        claim = database.claim_offer_fill_hook(fill_id, "sweep_registration")
+        database.register_authoritative_sweep_fill(
+            fill_id,
+            {
+                "trade_id": fill["trade_id"],
+                "classification": "unknown",
+                "spent_block_index": fill["spent_block_height"],
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+                "side": fill["side"],
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    event = database.finalize_authoritative_sweep_registrations(
+        fill_ids, 42, "sweep-revocation-test"
+    )
+    delivery = database.claim_authoritative_sweep_event()
+    assert delivery["event_id"] == event["event_id"]
+    database.revoke_offer_fill_authority(
+        fill_ids[0],
+        reason_code="TEST_REVOKED_SWEEP_DELIVERY",
+        evidence={"fixture": "revoked sweep delivery"},
+        revoked_at=AFTER,
+    )
+
+    with pytest.raises((RuntimeError, ValueError), match="sweep.*authority"):
+        database.materialize_authoritative_sweep_downstream_effect(
+            event["event_id"],
+            delivery["claim_token"],
+            delivery["claim_generation"],
+            known_protection_seconds=90,
+            unknown_protection_seconds=30,
+        )
+
+    assert (
+        database.get_connection()
+        .execute(
+            "SELECT 1 FROM offer_fill_sweep_downstream_effects WHERE event_id=?",
+            (event["event_id"],),
+        )
+        .fetchone()
+        is None
+    )
+
+
+def test_sweep_process_effect_fence_serializes_revocation_through_apply(
+    isolated_database,
+):
+    first, _first_proof = _seed_authoritative_fill(suffix="sweep-fence-first")
+    second, _second_proof = _seed_authoritative_fill(suffix="sweep-fence-second")
+    fill_ids = [first["fill_id"], second["fill_id"]]
+    for fill_id in fill_ids:
+        fill = database.get_authoritative_fill_by_id(fill_id)
+        claim = database.claim_offer_fill_hook(fill_id, "sweep_registration")
+        database.register_authoritative_sweep_fill(
+            fill_id,
+            {
+                "trade_id": fill["trade_id"],
+                "classification": "unknown",
+                "spent_block_index": fill["spent_block_height"],
+                "taker_puzzle_hash": None,
+                "sweep_group_id": None,
+                "side": fill["side"],
+            },
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+        )
+    event = database.finalize_authoritative_sweep_registrations(
+        fill_ids, 42, "sweep-process-fence"
+    )
+    delivery = database.claim_authoritative_sweep_event()
+    entered = threading.Event()
+    release_effect = threading.Event()
+    revocation_done = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def run_effect() -> None:
+        try:
+            with database.authoritative_sweep_process_effect_authority(
+                event["event_id"],
+                delivery["claim_token"],
+                delivery["claim_generation"],
+            ):
+                order.append("effect-start")
+                entered.set()
+                assert release_effect.wait(timeout=5)
+                order.append("effect-end")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def revoke() -> None:
+        try:
+            database.revoke_offer_fill_authority(
+                fill_ids[0],
+                reason_code="TEST_SWEEP_PROCESS_FENCE",
+                evidence={"fixture": "sweep process fence"},
+                revoked_at=AFTER,
+            )
+            order.append("revoked")
+            revocation_done.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    effect_thread = threading.Thread(target=run_effect)
+    effect_thread.start()
+    assert entered.wait(timeout=5)
+    revoke_thread = threading.Thread(target=revoke)
+    revoke_thread.start()
+    assert not revocation_done.wait(timeout=0.1)
+    release_effect.set()
+    effect_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+
+    assert errors == []
+    assert order == ["effect-start", "effect-end", "revoked"]

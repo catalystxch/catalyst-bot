@@ -30,6 +30,7 @@ class WalletSageSpendableViewTests(unittest.TestCase):
         fake_urllib3.exceptions = types.SimpleNamespace(InsecureRequestWarning=Warning)
 
         fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.dotenv_values = lambda *args, **kwargs: {}
         fake_dotenv.load_dotenv = lambda *args, **kwargs: True
         fake_dotenv.set_key = lambda *args, **kwargs: None
 

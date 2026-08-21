@@ -129,6 +129,12 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         fake_db.get_open_offers = lambda *a, **kw: []
         fake_db.get_offer = lambda *a, **kw: None
         fake_db.lock_coin = lambda *a, **kw: None
+        fake_db.claim_wallet_effect = lambda **kw: {
+            "claim_token": "c" * 64,
+            "generation": 1,
+        }
+        fake_db.wallet_effect_claim_is_current = lambda *a, **kw: True
+        fake_db.resolve_wallet_effect_claim = lambda *a, **kw: True
         sys.modules["database"] = fake_db
 
         fake_wallet = types.ModuleType("wallet")

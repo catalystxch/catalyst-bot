@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import coin_prep_worker
 
 
-def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
+def test_sage_tiered_prep_fails_closed_when_multi_send_cannot_bind_sources():
     fake_wallet_sage = types.ModuleType("wallet_sage")
     fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
         "address": "xch1testaddress",
@@ -94,9 +94,11 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
             {"wallet_sage": fake_wallet_sage, "wallet": fake_wallet},
         ),
         patch(
-            "coin_prep_worker.authorize_wallet_effect_coin_ids",
-            side_effect=lambda coin_ids: tuple(coin_ids),
+            "coin_prep_worker.claim_wallet_effect",
+            return_value={"claim_token": "a" * 64, "generation": 1},
         ),
+        patch("coin_prep_worker.wallet_effect_claim_is_current", return_value=True),
+        patch("coin_prep_worker.resolve_wallet_effect_claim", return_value=True),
         patch("coin_prep_worker.time.sleep", return_value=None),
     ):
         assert (
@@ -104,9 +106,9 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
                 Decimal("2"),
                 Decimal("0"),
             )
-            is True
+            is False
         )
 
-    fake_wallet_sage.send_transaction_multi.assert_called_once()
+    fake_wallet_sage.send_transaction_multi.assert_not_called()
     fake_wallet_sage.send_cat_multi.assert_not_called()
     fake_wallet_sage.sage_topup_split.assert_not_called()

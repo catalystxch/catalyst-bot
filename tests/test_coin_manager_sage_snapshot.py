@@ -37,6 +37,21 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
         fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
             coin_ids
         )
+        fake_database.claim_wallet_effect = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("wallet snapshot refresh must not claim a wallet effect")
+        )
+        fake_database.resolve_wallet_effect_claim = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("wallet snapshot refresh must not resolve a wallet effect")
+        )
+        fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("wallet snapshot refresh must not inspect an effect claim")
+        )
         fake_database.upsert_coin = (
             lambda coin_id, wallet_type, amount, tier="unknown": self.calls[
                 "upserts"

@@ -37,7 +37,12 @@ from amount_utils import (
     round_cat_display_amount_up_to_mojo,
 )
 from config import cfg
-from database import authorize_wallet_effect_coin_ids, log_event
+from database import (
+    claim_wallet_effect,
+    log_event,
+    resolve_wallet_effect_claim,
+    wallet_effect_claim_is_current,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,21 +72,145 @@ _fast_reconcile_flag: bool = False
 _fast_reconcile_lock: threading.Lock = threading.Lock()
 _TOPUP_PENDING = "pending"
 _TOPUP_STALE_SOURCE = "stale_source"
+_WALLET_EFFECT_DENIED = object()
+_WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS = frozenset(
+    {
+        "coin_manager.split_sage",
+        "coin_manager.topup_split_sage",
+        "coin_manager.pool_split_sage",
+    }
+)
+_WALLET_EFFECT_MULTI_SOURCE_CONTRACTS = frozenset(
+    {
+        "coin_manager.consolidate_sage",
+        "coin_manager.absorb_sage",
+    }
+)
 
 
-def _wallet_effect_cohort_authorized(operation: str, coin_ids: List[str]) -> bool:
-    """Fail closed immediately before a raw wallet coin mutation."""
+def _run_claimed_wallet_effect(
+    operation: str,
+    callback,
+    *,
+    source_coin_ids: List[str],
+    fee_mojos: int = 0,
+    fee_coin_ids: Optional[List[str]] = None,
+):
+    """Linearize one exact durable coin claim before adapter dispatch."""
 
-    if authorize_wallet_effect_coin_ids(list(coin_ids)) is not None:
-        return True
+    known_contract = operation in (
+        _WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS | _WALLET_EFFECT_MULTI_SOURCE_CONTRACTS
+    )
+    exact_sources = list(source_coin_ids) if type(source_coin_ids) is list else []
+    malformed_fee_cohort = fee_coin_ids is not None and type(fee_coin_ids) is not list
+    exact_fee_coin_ids = (
+        []
+        if fee_coin_ids is None
+        else list(fee_coin_ids)
+        if type(fee_coin_ids) is list
+        else []
+    )
+    single_source_shape = (
+        operation in _WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS
+        and len(exact_sources) == 1
+        and len(exact_fee_coin_ids) <= 1
+        and (
+            operation == "coin_manager.topup_split_sage"
+            or set(exact_fee_coin_ids).issubset(exact_sources)
+        )
+    )
+    multi_source_shape = (
+        operation in _WALLET_EFFECT_MULTI_SOURCE_CONTRACTS
+        and len(exact_sources) >= 2
+        and (fee_mojos == 0 or set(exact_fee_coin_ids) == set(exact_sources))
+    )
+    fee_shape = (
+        type(fee_mojos) is int
+        and fee_mojos >= 0
+        and (
+            (fee_mojos == 0 and not exact_fee_coin_ids)
+            or (fee_mojos > 0 and bool(exact_fee_coin_ids))
+        )
+    )
+    if (
+        malformed_fee_cohort
+        or not known_contract
+        or not fee_shape
+        or not (single_source_shape or multi_source_shape)
+    ):
+        claim = None
+    else:
+        claim = claim_wallet_effect(
+            operation_id=operation,
+            source_coin_ids=exact_sources,
+            fee_coin_ids=exact_fee_coin_ids,
+        )
+    if claim is not None and not wallet_effect_claim_is_current(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=operation,
+        source_coin_ids=exact_sources,
+        fee_coin_ids=exact_fee_coin_ids,
+    ):
+        resolve_wallet_effect_claim(
+            claim["claim_token"],
+            claim["generation"],
+            outcome="RELEASED_NO_EFFECT",
+            evidence={
+                "effect_attempted": False,
+                "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
+                "result_type": "not_dispatched",
+            },
+        )
+        claim = None
+    if claim is not None:
+        try:
+            result = callback()
+        except Exception as exc:
+            resolve_wallet_effect_claim(
+                claim["claim_token"],
+                claim["generation"],
+                outcome="UNKNOWN",
+                evidence={
+                    "effect_attempted": True,
+                    "reason_code": "CALLBACK_EXCEPTION",
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            raise
+        if type(result) is dict and result.get("_catalyst_effect_attempted") is False:
+            outcome = "RELEASED_NO_EFFECT"
+            effect_attempted = False
+        elif type(result) is dict and (
+            result.get("success") is True
+            or result.get("transaction_id")
+            or result.get("coin_spends") is not None
+            or result.get("summary") is not None
+        ):
+            outcome = "SUBMITTED"
+            effect_attempted = True
+        else:
+            outcome = "UNKNOWN"
+            effect_attempted = True
+        resolve_wallet_effect_claim(
+            claim["claim_token"],
+            claim["generation"],
+            outcome=outcome,
+            evidence={
+                "effect_attempted": effect_attempted,
+                "reason_code": f"CALLBACK_{outcome}",
+                "result_type": type(result).__name__,
+            },
+        )
+        return result
     log_event(
         "warning",
         f"{operation}_coin_authority_denied",
         "Wallet effect aborted because an input coin no longer has durable "
         "spend authority.",
-        data={"operation": operation, "input_count": len(coin_ids)},
+        data={"operation": operation, "input_count": len(exact_sources)},
     )
-    return False
+    return _WALLET_EFFECT_DENIED
 
 
 def _topup_event_log_level(event_type: str) -> str:
@@ -3435,8 +3564,6 @@ class CoinManager:
 
         # --- Dispatch to Sage RPC or Chia CLI ---
         wallet_type = get_wallet_type()
-        if not _wallet_effect_cohort_authorized(f"split_{name}", [coin_id]):
-            return False
 
         if wallet_type == "sage":
             # Sage native /split endpoint — uses output_count, auto-sizes
@@ -3453,14 +3580,24 @@ class CoinManager:
                 # If we want 6 coins of 3.2 XCH from a 26.98 XCH coin, we can't
                 # control individual sizes — Sage divides equally. So we request
                 # the total number we need and accept even splits.
-                result = split_coins_rpc(
-                    wallet_id=wallet_id,
-                    target_coin_id=coin_id,
-                    num_coins=num_coins + 1,  # +1 for remainder
-                    amount_per_coin=0,  # Sage ignores this, splits evenly
-                    fee_mojos=self._tx_fee_mojos(),
-                    is_cat=is_cat,
+                fee_mojos = self._tx_fee_mojos()
+                fee_coin_ids = [coin_id] if not is_cat and fee_mojos > 0 else []
+                result = _run_claimed_wallet_effect(
+                    "coin_manager.split_sage",
+                    lambda: split_coins_rpc(
+                        wallet_id=wallet_id,
+                        target_coin_id=coin_id,
+                        num_coins=num_coins + 1,  # +1 for remainder
+                        amount_per_coin=0,  # Sage ignores this, splits evenly
+                        fee_mojos=fee_mojos,
+                        is_cat=is_cat,
+                    ),
+                    source_coin_ids=[coin_id],
+                    fee_mojos=fee_mojos,
+                    fee_coin_ids=fee_coin_ids,
                 )
+                if result is _WALLET_EFFECT_DENIED:
+                    return False
                 if result is None:
                     log_event(
                         "warning",
@@ -3485,6 +3622,13 @@ class CoinManager:
                 )
                 return False
         else:
+            log_event(
+                "warning",
+                f"split_chia_{name}_authority_denied",
+                "Chia CLI split cannot honor an exact durable source/fee cohort; "
+                "disabled pending Task 12.",
+            )
+            return False
             # Chia CLI split (reliable — broadcasts to network every time)
             # NOTE: CLI `-a` takes DISPLAY UNITS (XCH or CAT tokens), NOT mojos.
             bare_coin_id = coin_id.replace("0x", "")
@@ -8644,20 +8788,30 @@ class CoinManager:
         # --- Submit the single create_transaction RPC ---
         weak_submit_onchain_confirmed = False
         try:
-            effect_coin_ids = [source_coin_id]
-            if fee_coin_id:
-                effect_coin_ids.append(fee_coin_id)
-            if not _wallet_effect_cohort_authorized(tag, effect_coin_ids):
-                return False
-            result = sage_topup_split(
-                source_coin_id=source_coin_id,
-                num_coins=num_to_create,
-                trading_size_mojos=trading_size_mojos,
-                own_address=address,
-                fee_mojos=fee_mojos,
-                is_cat=is_cat,
-                fee_coin_id=fee_coin_id,
+            fee_coin_ids = (
+                [fee_coin_id]
+                if fee_coin_id
+                else [source_coin_id]
+                if fee_mojos > 0 and not is_cat
+                else []
             )
+            result = _run_claimed_wallet_effect(
+                "coin_manager.topup_split_sage",
+                lambda: sage_topup_split(
+                    source_coin_id=source_coin_id,
+                    num_coins=num_to_create,
+                    trading_size_mojos=trading_size_mojos,
+                    own_address=address,
+                    fee_mojos=fee_mojos,
+                    is_cat=is_cat,
+                    fee_coin_id=fee_coin_id,
+                ),
+                source_coin_ids=[source_coin_id],
+                fee_mojos=fee_mojos,
+                fee_coin_ids=fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
+                return False
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
                     log_event(
@@ -9113,19 +9267,36 @@ class CoinManager:
             # automatically, but we've already re-fetched fresh IDs so it should
             # pick the largest available coin (our reserve).
             wallet_type = get_wallet_type()
+            if wallet_type != "sage":
+                log_event(
+                    "warning",
+                    f"{tag}_pool_send_authority_denied",
+                    "Chia pool creation auto-selects its source; disabled pending "
+                    "Task 12.",
+                )
+                return False
+            pool_fee_mojos = self._tx_fee_mojos()
             send_kwargs = {
                 "wallet_id": wallet_id,
                 "amount_mojos": pool_amount_mojos,
                 "address": address,
-                "fee_mojos": self._tx_fee_mojos(),
+                "fee_mojos": pool_fee_mojos,
+                "source_coin_ids": [source_coin_id],
             }
-            if wallet_type == "sage":
-                send_kwargs["source_coin_ids"] = [source_coin_id]
-            if not _wallet_effect_cohort_authorized(
-                f"{tag}_pool_send", [source_coin_id]
-            ):
+            pool_fee_coin_ids = (
+                [source_coin_id]
+                if pool_fee_mojos > 0 and wallet_id == WALLET_ID_XCH
+                else []
+            )
+            result = _run_claimed_wallet_effect(
+                "coin_manager.pool_send_sage",
+                lambda: send_transaction(**send_kwargs),
+                source_coin_ids=[source_coin_id],
+                fee_mojos=pool_fee_mojos,
+                fee_coin_ids=pool_fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
                 return False
-            result = send_transaction(**send_kwargs)
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
                     log_event(
@@ -9387,21 +9558,38 @@ class CoinManager:
         )
 
         wallet_type = get_wallet_type()
-
-        if not _wallet_effect_cohort_authorized(f"{tag}_pool_split", [pool_coin_id]):
+        if wallet_type != "sage":
+            log_event(
+                "warning",
+                f"{tag}_pool_split_authority_denied",
+                "Chia CLI split cannot honor the complete source/fee cohort; "
+                "disabled pending Task 12.",
+            )
             return False
 
         if wallet_type == "sage":
             # Sage native /split — output_count = num_to_create (even split)
             try:
-                split_result = split_coins_rpc(
-                    wallet_id=wallet_id,
-                    target_coin_id=pool_coin_id,
-                    num_coins=num_to_create,
-                    amount_per_coin=trading_size_mojos,
-                    fee_mojos=self._tx_fee_mojos(),
-                    is_cat=is_cat,
+                split_fee_mojos = self._tx_fee_mojos()
+                split_fee_coin_ids = (
+                    [pool_coin_id] if split_fee_mojos > 0 and not is_cat else []
                 )
+                split_result = _run_claimed_wallet_effect(
+                    "coin_manager.pool_split_sage",
+                    lambda: split_coins_rpc(
+                        wallet_id=wallet_id,
+                        target_coin_id=pool_coin_id,
+                        num_coins=num_to_create,
+                        amount_per_coin=trading_size_mojos,
+                        fee_mojos=split_fee_mojos,
+                        is_cat=is_cat,
+                    ),
+                    source_coin_ids=[pool_coin_id],
+                    fee_mojos=split_fee_mojos,
+                    fee_coin_ids=split_fee_coin_ids,
+                )
+                if split_result is _WALLET_EFFECT_DENIED:
+                    return False
                 if split_result is None:
                     if self._spacescan_coin_spent_confirmed(pool_coin_id, tag, "split"):
                         log_event(
@@ -9806,11 +9994,18 @@ class CoinManager:
             fee = self._tx_fee_mojos()
             from wallet import combine_coins
 
-            if not _wallet_effect_cohort_authorized(
-                f"consolidate_{name.lower()}", filtered_ids
-            ):
+            fee_coin_ids = (
+                list(filtered_ids) if fee > 0 and wallet_id == WALLET_ID_XCH else []
+            )
+            result = _run_claimed_wallet_effect(
+                "coin_manager.consolidate_sage",
+                lambda: combine_coins(coin_ids=filtered_ids, fee_mojos=fee),
+                source_coin_ids=list(filtered_ids),
+                fee_mojos=fee,
+                fee_coin_ids=fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
                 return False
-            result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 
             # /combine returns {summary, coin_spends} on success — same shape
             # as send_xch/send_cat.
@@ -10229,11 +10424,16 @@ class CoinManager:
 
             from wallet import combine_coins
 
-            if not _wallet_effect_cohort_authorized(
-                f"topup_{name.lower()}_absorb", filtered_ids
-            ):
+            fee_coin_ids = list(filtered_ids) if fee > 0 and not is_cat else []
+            result = _run_claimed_wallet_effect(
+                "coin_manager.absorb_sage",
+                lambda: combine_coins(coin_ids=filtered_ids, fee_mojos=fee),
+                source_coin_ids=list(filtered_ids),
+                fee_mojos=fee,
+                fee_coin_ids=fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
                 return False
-            result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 
             # Sage's send_xch/send_cat returns {summary, coin_spends} on success
             # (no "success" key in that response format). Accept either form.

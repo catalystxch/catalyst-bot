@@ -2835,7 +2835,11 @@ def test_terminal_journal_accepts_bounded_full_proof_digest_and_rejects_tail_cha
     durable = json.loads(first["event"]["evidence_json"])
 
     assert durable["bounded"] is True
-    assert durable["full_evidence_sha256"] == first["evidence_sha256"]
+    assert durable["full_evidence_sha256"] == first["full_evidence_sha256"]
+    assert (
+        hashlib.sha256(first["event"]["evidence_json"].encode()).hexdigest()
+        == first["evidence_sha256"]
+    )
 
     changed = json.loads(json.dumps(evidence))
     changed["offer_history"]["records"][-1]["status"] = 2
@@ -2888,17 +2892,77 @@ def _persist_created_offer(
         finalized_at=AT,
         finalize_selected_coin_reservations=True,
     )
+    economics = database.get_offer_intent_economic_authority("intent-task9")
+    assert economics is not None
     assert database.add_offer(
         TRADE,
         "buy",
-        price_xch=database.Decimal("0.0000005"),
-        size_xch=database.Decimal(offered) / database.Decimal("1000000000000"),
-        size_cat=database.Decimal("2"),
+        price_xch=database.Decimal(economics["price_xch"]),
+        size_xch=database.Decimal(economics["size_xch"]),
+        size_cat=database.Decimal(economics["size_cat"]),
         cat_asset_id=ASSET,
         tier=tier,
         coin_id=database.norm_coin_id(coin_id),
+        fee_mojos_xch=economics["fee_mojos_xch"],
     )
     return database.get_offer_intent("intent-task9")
+
+
+def test_reconcile_rejects_legacy_offer_economic_rebinding_before_terminal_journal(
+    isolated_database,
+):
+    """Task 4 PREPARED authority, not the mutable offer projection, owns value."""
+
+    _persist_created_offer()
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET price_xch=?, size_xch=?, size_cat=?, tier=?, "
+        "fee_mojos_xch=? WHERE trade_id=?",
+        ("877", "878", "879", "outer", 880, TRADE),
+    )
+    conn.commit()
+
+    result = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+
+    assert result["applied"] is False
+    assert result["classification"] in {"CONFLICT", "UNKNOWN"}
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] in {
+        "conflicted",
+        "unknown",
+    }
+    assert database.get_fill_by_trade_id(TRADE) is None
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+def test_terminal_transaction_rejects_offer_economic_rebinding_after_authorization(
+    isolated_database,
+    monkeypatch,
+):
+    """The final BEGIN IMMEDIATE boundary repeats the immutable-value check."""
+
+    _persist_created_offer()
+    captured: dict = {}
+    original_commit = database.commit_offer_reconciliation
+
+    class CapturedCommit(RuntimeError):
+        pass
+
+    def capture_commit(**kwargs):
+        captured.update(kwargs)
+        raise CapturedCommit
+
+    monkeypatch.setattr(database, "commit_offer_reconciliation", capture_commit)
+    with pytest.raises(CapturedCommit):
+        reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    monkeypatch.setattr(database, "commit_offer_reconciliation", original_commit)
+
+    conn = database.get_connection()
+    conn.execute("UPDATE offers SET price_xch='877' WHERE trade_id=?", (TRADE,))
+    conn.commit()
+
+    with pytest.raises(ValueError, match="immutable economics"):
+        original_commit(**captured)
+    assert database.get_fill_by_trade_id(TRADE) is None
 
 
 def _persist_prepared_offer_with_unlinked_reservation() -> dict:
@@ -3641,12 +3705,15 @@ def _commit_fill_without_draining_hooks(monkeypatch, *, tier: str = "inner") -> 
     _persist_created_offer(tier=tier)
     monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", lambda *_a, **_k: {})
     committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
-    fill = database.get_fill_by_trade_id(TRADE)
+    fill = database.get_authoritative_fill_by_id(committed["fill_id"])
     assert fill is not None and fill["fill_id"] == committed["fill_id"]
     return fill
 
 
-def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) -> dict:
+def _insert_authoritative_test_fill(
+    trade_id: str, *, block_height: int = 42, side: str = "buy"
+) -> dict:
+    assert side in {"buy", "sell"}
     identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
     intent_id = f"authoritative-test-fill:{identity}"
     selected_coin_id = hashlib.sha256(
@@ -3657,10 +3724,12 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         f"transaction:{trade_id}".encode("utf-8")
     ).hexdigest()
     wallet_identity = {"wallet_fingerprint_hash": WALLET, "network": NETWORK}
+    offered_amount = 1000 if side == "buy" else 2000
+    requested_amount = 2000 if side == "buy" else 1000
     assert database.upsert_coin(
         selected_coin_id,
-        "xch",
-        1000,
+        "xch" if side == "buy" else "cat",
+        offered_amount,
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
@@ -3673,13 +3742,13 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         wallet_fingerprint_hash=WALLET,
         network=NETWORK,
         asset_id=ASSET,
-        side="buy",
+        side=side,
         tier="inner",
         purpose="authoritative_test_fill",
         slot_key=f"slot:{intent_id}",
         generation=0,
-        offered_amount_atomic="1000",
-        requested_amount_atomic="2000",
+        offered_amount_atomic=str(offered_amount),
+        requested_amount_atomic=str(requested_amount),
         selected_coin_ids_json=[selected_coin_id],
         wallet_identity_json=wallet_identity,
         evidence_json={"fixture": "prepared"},
@@ -3701,31 +3770,53 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         finalized_at=AT,
         finalize_selected_coin_reservations=True,
     )
+    economics = database.get_offer_intent_economic_authority(intent_id)
+    assert economics is not None
     assert database.add_offer(
         trade_id,
-        "buy",
-        price_xch=database.Decimal("0.0000005"),
-        size_xch=database.Decimal("0.000000001"),
-        size_cat=database.Decimal("2"),
+        side,
+        price_xch=database.Decimal(economics["price_xch"]),
+        size_xch=database.Decimal(economics["size_xch"]),
+        size_cat=database.Decimal(economics["size_cat"]),
         cat_asset_id=ASSET,
         tier="inner",
         coin_id=database.norm_coin_id(selected_coin_id),
+        fee_mojos_xch=economics["fee_mojos_xch"],
     )
-    offer = database.get_offer(trade_id)
+    transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+        transaction_id,
+        None,
+        block_height,
+        economics["selected_coin_ids_sha256"],
+        economics["side"],
+        economics["cat_asset_id"],
+        economics["offered_amount_atomic"],
+        economics["requested_amount_atomic"],
+        database.norm_coin_id(receive_coin_id),
+        requested_amount,
+    )
     authority = {
         "schema_version": 1,
         "intent_id": intent_id,
+        "prepared_event_id": economics["prepared_event_id"],
+        "economic_authority_token": economics["authority_token"],
         "trade_id": trade_id,
-        "side": offer["side"],
-        "price_xch": offer["price_xch"],
-        "size_xch": offer["size_xch"],
-        "size_cat": offer["size_cat"],
-        "cat_asset_id": offer["cat_asset_id"],
-        "tier": offer["tier"],
-        "fee_mojos_xch": offer["fee_mojos_xch"],
+        "side": economics["side"],
+        "price_xch": economics["price_xch"],
+        "size_xch": economics["size_xch"],
+        "size_cat": economics["size_cat"],
+        "cat_asset_id": economics["cat_asset_id"],
+        "tier": economics["tier"],
+        "offered_amount_atomic": economics["offered_amount_atomic"],
+        "requested_amount_atomic": economics["requested_amount_atomic"],
+        "cat_decimals": economics["cat_decimals"],
+        "fee_mojos_xch": economics["fee_mojos_xch"],
+        "fee_provenance": economics["fee_provenance"],
+        "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+        "transaction_flow_sha256": transaction_flow_sha256,
         "spent_block_height": block_height,
         "receive_coin_id": database.norm_coin_id(receive_coin_id),
-        "receive_amount_mojos": 2000,
+        "receive_amount_mojos": requested_amount,
         "filled_at": AFTER,
         "transaction_id": transaction_id,
         "spend_identity": None,
@@ -3734,11 +3825,12 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         "fixture": "authoritative test fill",
         "classification": {
             "classification": "FILLED_PROVEN",
+            "reason_code": "AUTHORITATIVE_TEST_PROOF",
             "transaction_id": transaction_id,
             "spend_identity": None,
             "block_height": block_height,
             "receive_coin_id": receive_coin_id,
-            "receive_amount_mojos": 2000,
+            "receive_amount_mojos": requested_amount,
             "filled_at": AFTER,
         },
         "fill_authority": authority,
@@ -3755,11 +3847,11 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         transaction_id=transaction_id,
         block_height=block_height,
         receive_coin_id=receive_coin_id,
-        receive_amount_mojos=2000,
+        receive_amount_mojos=requested_amount,
         filled_at=AFTER,
         reconciled_at=AFTER,
     )
-    fill = database.get_fill_by_id(committed["fill_id"])
+    fill = database.get_authoritative_fill_by_id(committed["fill_id"])
     assert fill is not None
     return fill
 
@@ -4906,43 +4998,91 @@ def _insert_materialized_sweep_effect(
     finalized_at: str,
 ) -> dict:
     block_index = 10_000 + index
-    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
-        block_index,
-        f"sweep_restore_{block_index}",
-        [
-            {
-                "fill_id": 20_000 + index,
-                "trade_id": f"{30_000 + index:064x}",
-                "classification": classification,
-                "spent_block_index": block_index,
-                "taker_puzzle_hash": None,
-                "side": side,
-            }
-        ],
+    fill = _insert_authoritative_test_fill(
+        f"{30_000 + index:064x}", block_height=block_index, side=side
     )
-    assert payload["spent_block_index"] == block_index
-    token = f"{40_000 + index:064x}"
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+    database.register_authoritative_sweep_fill(
+        fill["fill_id"],
+        {
+            "trade_id": fill["trade_id"],
+            "classification": classification,
+            "spent_block_index": block_index,
+            "taker_puzzle_hash": None,
+            "sweep_group_id": None,
+            "side": side,
+        },
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    event = database.finalize_authoritative_sweep_registrations(
+        [fill["fill_id"]], block_index, f"sweep_restore_{block_index}"
+    )
+    assert event["spent_block_index"] == block_index
+    delivery = database.claim_authoritative_sweep_event()
+    assert delivery is not None and delivery["event_id"] == event["event_id"]
+    return database.materialize_authoritative_sweep_downstream_effect(
+        event["event_id"],
+        delivery["claim_token"],
+        delivery["claim_generation"],
+        known_protection_seconds=90,
+        unknown_protection_seconds=30,
+    )
+
+
+def _insert_prior_authoritative_sweep_event(
+    *,
+    block_index: int,
+    sweep_group_id: str,
+    trade_id: str,
+    classification: str,
+    side: str,
+) -> tuple[dict, str, str]:
+    """Seed a pre-delivery-protocol event with its complete immutable authority."""
+
+    fill = _insert_authoritative_test_fill(
+        trade_id, block_height=block_index, side=side
+    )
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+    database.register_authoritative_sweep_fill(
+        fill["fill_id"],
+        {
+            "trade_id": trade_id,
+            "classification": classification,
+            "spent_block_index": block_index,
+            "taker_puzzle_hash": None,
+            "sweep_group_id": None,
+            "side": side,
+        },
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
     conn = database.get_connection()
+    event_fills = database._load_authoritative_sweep_event_fills(
+        conn, [fill["fill_id"]], block_index
+    )
+    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
+        block_index, sweep_group_id, event_fills
+    )
     conn.execute(
         "INSERT INTO offer_fill_sweep_events "
         "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (event_id, block_index, payload["sweep_group_id"], encoded, finalized_at),
+        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
     )
     conn.execute(
-        "INSERT INTO offer_fill_sweep_delivery_queue "
-        "(event_id, state, generation, claim_token, claimed_at, completed_at, queued_at) "
-        "VALUES (?, 'running', 1, ?, ?, NULL, ?)",
-        (event_id, token, finalized_at, finalized_at),
+        "INSERT INTO offer_fill_sweep_finalizations "
+        "(fill_id, event_id, finalized_at) VALUES (?, ?, ?)",
+        (fill["fill_id"], event_id, AFTER),
     )
-    conn.commit()
-    return database.materialize_authoritative_sweep_downstream_effect(
-        event_id,
-        token,
-        1,
-        known_protection_seconds=90,
-        unknown_protection_seconds=30,
+    transitioned = conn.execute(
+        "UPDATE offer_fill_sweep_registration_queue "
+        "SET state='finalized', finalized_at=?, event_id=? "
+        "WHERE fill_id=? AND state='active'",
+        (AFTER, event_id, fill["fill_id"]),
     )
+    assert transitioned.rowcount == 1
+    return payload, encoded, event_id
 
 
 def test_sweep_restore_preserves_both_sides_beyond_recent_effect_window(
@@ -5597,27 +5737,14 @@ def test_legacy_sweep_receipt_without_effect_or_ack_is_requeued_and_applied_once
     import sweep_coordinator
 
     block_index = 142
-    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
-        block_index,
-        "legacy_sweep_142",
-        [
-            {
-                "fill_id": 42_000,
-                "trade_id": "4" * 64,
-                "classification": "arb_sweep_sell",
-                "spent_block_index": block_index,
-                "taker_puzzle_hash": None,
-                "side": "sell",
-            }
-        ],
+    _payload, _encoded, event_id = _insert_prior_authoritative_sweep_event(
+        block_index=block_index,
+        sweep_group_id="legacy_sweep_142",
+        trade_id="4" * 64,
+        classification="arb_sweep_sell",
+        side="sell",
     )
     conn = database.get_connection()
-    conn.execute(
-        "INSERT INTO offer_fill_sweep_events "
-        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
-    )
     conn.execute(
         "INSERT INTO offer_fill_sweep_event_receipts (event_id, consumed_at) "
         "VALUES (?, ?)",
@@ -5689,27 +5816,14 @@ def test_legacy_sweep_receipt_on_pending_queue_is_audited_and_acknowledged(
     import sweep_coordinator
 
     block_index = 143
-    payload, encoded, event_id = database._canonical_authoritative_sweep_event(
-        block_index,
-        "legacy_sweep_pending_143",
-        [
-            {
-                "fill_id": 42_001,
-                "trade_id": "5" * 64,
-                "classification": "arb_sweep_buy",
-                "spent_block_index": block_index,
-                "taker_puzzle_hash": None,
-                "side": "buy",
-            }
-        ],
+    _payload, _encoded, event_id = _insert_prior_authoritative_sweep_event(
+        block_index=block_index,
+        sweep_group_id="legacy_sweep_pending_143",
+        trade_id="5" * 64,
+        classification="arb_sweep_buy",
+        side="buy",
     )
     conn = database.get_connection()
-    conn.execute(
-        "INSERT INTO offer_fill_sweep_events "
-        "(event_id, spent_block_index, sweep_group_id, event_json, finalized_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (event_id, block_index, payload["sweep_group_id"], encoded, AFTER),
-    )
     conn.execute(
         "INSERT INTO offer_fill_sweep_event_receipts (event_id, consumed_at) "
         "VALUES (?, ?)",
@@ -6732,7 +6846,8 @@ def test_default_offer_filled_event_sink_is_idempotent_by_durable_fill_id(
         },
     )
     committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
-    fill = database.get_fill_by_trade_id(TRADE)
+    fill = database.get_authoritative_fill_by_id(committed["fill_id"])
+    assert fill is not None
     assert fill["fill_id"] == committed["fill_id"]
 
     callback = original_callbacks(fill)["offer_filled_event"]
@@ -6803,6 +6918,7 @@ def test_default_post_fill_hooks_retry_unpersisted_event_and_unavailable_boost(
         "tier": "boost",
         "filled_at": AFTER,
         "spent_block_index": 42,
+        "selected_coin_ids_json": json.dumps([COIN], separators=(",", ":")),
     }
     monkeypatch.setattr(database, "get_offer", lambda _trade_id: {"coin_id": COIN})
     monkeypatch.setattr(

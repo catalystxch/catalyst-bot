@@ -28,6 +28,49 @@ from urllib.parse import quote
 _SOCKET_TYPE = socket.socket
 
 
+def _authority_sql_sha256(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _authority_sql_is_canonical_json(value: Any) -> int:
+    if type(value) is not str or len(value) > 262_144:
+        return 0
+    try:
+        decoded = json.loads(value)
+        canonical = json.dumps(
+            decoded,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return 0
+    return int(value == canonical)
+
+
+def _sqlite_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+    """Open SQLite with the deterministic authority helpers installed."""
+
+    conn = sqlite3.connect(*args, **kwargs)
+    try:
+        conn.create_function(
+            "catalyst_sha256", 1, _authority_sql_sha256, deterministic=True
+        )
+        conn.create_function(
+            "catalyst_is_canonical_json",
+            1,
+            _authority_sql_is_canonical_json,
+            deterministic=True,
+        )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def _close_socket_handle(handle) -> tuple[bool, BaseException | None]:
     """Close one socket even when an override raises before releasing it."""
 
@@ -416,7 +459,7 @@ def preflight_requires_diagnostics(path: Path | None = None) -> bool:
         snapshot_dir = tempfile.TemporaryDirectory(prefix="catalyst-preflight-")
         snapshot = _copy_consistent_sqlite_snapshot(target, Path(snapshot_dir.name))
         uri = f"file:{quote(str(snapshot.absolute()).replace(os.sep, '/'), safe='/:')}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
+        conn = _sqlite_connect(uri, uri=True, timeout=1, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         try:
@@ -508,7 +551,7 @@ def read_safety_status(path: Path | None = None) -> dict[str, Any]:
         snapshot_dir = tempfile.TemporaryDirectory(prefix="catalyst-diagnostics-")
         snapshot = _copy_consistent_sqlite_snapshot(target, Path(snapshot_dir.name))
         uri = f"file:{quote(str(snapshot.absolute()).replace(os.sep, '/'), safe='/:')}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
+        conn = _sqlite_connect(uri, uri=True, timeout=1, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")

@@ -240,7 +240,9 @@ try:
         mark_coins_gone,
         get_setting,
         set_setting,
-        authorize_wallet_effect_coin_ids,
+        claim_wallet_effect,
+        wallet_effect_claim_is_current,
+        resolve_wallet_effect_claim,
     )
 
     DB_AVAILABLE = True
@@ -852,34 +854,175 @@ class CoinPrepWorker:
         self.log("   ⚡ Parallel optimization enabled!")
 
     def _call_wallet_mutation(self, operation: str, callback, *args, **kwargs):
-        authority_ids = []
-        for key in ("coin_ids", "source_coin_ids"):
-            values = kwargs.get(key)
-            if type(values) is list:
-                authority_ids.extend(values)
-        for key in ("source_coin_id", "target_coin_id", "fee_coin_id"):
-            value = kwargs.get(key)
-            if value:
-                authority_ids.append(value)
-        operation_lower = str(operation).lower()
-        if not authority_ids and "combine" in operation_lower and args:
-            positional_ids = args[0]
-            if type(positional_ids) is list:
-                authority_ids.extend(positional_ids)
-        requires_exact_cohort = any(
-            effect in operation_lower
-            for effect in ("split", "combine", "consolidate", "absorb", "topup")
-        )
-        if requires_exact_cohort and (
-            not authority_ids
-            or not DB_AVAILABLE
-            or authorize_wallet_effect_coin_ids(authority_ids) is None
-        ):
+        """Dispatch only an exact, durably claimed coin-effect contract."""
+
+        no_coin_effect_operations = {"coin_prep.sage_resync"}
+        disabled_auto_selection_operations = {
+            "coin_prep.create_pool",
+            "coin_prep.create_tier_pool",
+            "coin_prep.create_cat_tier_pools",
+            "coin_prep.create_xch_tier_pools",
+            "coin_prep.create_cat_fee_inputs",
+            # Sage's send_xch/send_cat structs do not bind coin_ids.  Passing
+            # source_coin_ids through wallet.send_transaction is therefore
+            # only a hint which the adapter can silently ignore.
+            "coin_prep.consolidate_staged_batch",
+            "coin_prep.consolidate_final_batch",
+            "coin_prep.consolidate_balance",
+        }
+        positional_cohort_operations = {"coin_prep.combine_fee_reserve"}
+        list_cohort_operations = {
+            "coin_prep.combine_batch": "coin_ids",
+            "coin_prep.combine": "coin_ids",
+        }
+        single_source_operations = {
+            "coin_prep.split_tier_pool": "target_coin_id",
+            "coin_prep.split_xch_pool": "target_coin_id",
+            "coin_prep.retry_xch_split": "target_coin_id",
+            "coin_prep.split_single_sage": "target_coin_id",
+            "coin_prep.split_cat_pool": "source_coin_id",
+            "coin_prep.retry_cat_split": "source_coin_id",
+        }
+        if operation in no_coin_effect_operations:
+            if not getattr(self, "_is_subprocess", False):
+                return callback(*args, **kwargs)
+            return _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+        if operation in disabled_auto_selection_operations or not DB_AVAILABLE:
             self.log(f"Wallet mutation {operation} denied by durable coin authority")
             return None
-        if not getattr(self, "_is_subprocess", False):
-            return callback(*args, **kwargs)
-        return _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+
+        source_coin_ids = None
+        if operation in positional_cohort_operations:
+            source_coin_ids = args[0] if args and type(args[0]) is list else None
+        elif operation in list_cohort_operations:
+            candidate = kwargs.get(list_cohort_operations[operation])
+            source_coin_ids = candidate if type(candidate) is list else None
+        elif operation in single_source_operations:
+            candidate = kwargs.get(single_source_operations[operation])
+            source_coin_ids = [candidate] if type(candidate) is str else None
+        else:
+            self.log(f"Wallet mutation {operation} has no exact coin contract")
+            return None
+        if not source_coin_ids:
+            self.log(f"Wallet mutation {operation} has no explicit source cohort")
+            return None
+
+        authority_fee_coin_ids = kwargs.pop("_authority_fee_coin_ids", None)
+        if (
+            authority_fee_coin_ids is not None
+            and type(authority_fee_coin_ids) is not list
+        ):
+            self.log(f"Wallet mutation {operation} has a malformed fee cohort")
+            return None
+        fee_mojos = kwargs.get("fee_mojos", 0)
+        if type(fee_mojos) is not int or fee_mojos < 0:
+            self.log(f"Wallet mutation {operation} has an invalid fee contract")
+            return None
+        fee_coin_id = kwargs.get("fee_coin_id")
+        fee_coin_ids: list[str] = []
+        sage_topup_operations = {
+            "coin_prep.split_cat_pool",
+            "coin_prep.retry_cat_split",
+        }
+        source_fee_operations = {
+            "coin_prep.combine_fee_reserve",
+            "coin_prep.combine_batch",
+            "coin_prep.combine",
+        }
+        if fee_mojos > 0:
+            if operation in sage_topup_operations and type(fee_coin_id) is str:
+                fee_coin_ids = [fee_coin_id]
+                if authority_fee_coin_ids not in (None, fee_coin_ids):
+                    self.log(
+                        f"Wallet mutation {operation} has a contradictory fee cohort"
+                    )
+                    return None
+            elif operation in source_fee_operations:
+                fee_coin_ids = authority_fee_coin_ids or []
+                if fee_coin_ids != list(source_coin_ids):
+                    self.log(
+                        f"Wallet mutation {operation} denied because its exact XCH "
+                        "fee cohort was not bound to the source cohort"
+                    )
+                    return None
+            else:
+                self.log(
+                    f"Wallet mutation {operation} denied because its fee input "
+                    "would be auto-selected"
+                )
+                return None
+        elif authority_fee_coin_ids:
+            self.log(f"Wallet mutation {operation} supplied a fee cohort without a fee")
+            return None
+
+        claim = claim_wallet_effect(
+            operation_id=operation,
+            source_coin_ids=list(source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        )
+        if claim is None:
+            self.log(f"Wallet mutation {operation} denied by durable coin authority")
+            return None
+        if not wallet_effect_claim_is_current(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=operation,
+            source_coin_ids=list(source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        ):
+            resolve_wallet_effect_claim(
+                claim["claim_token"],
+                claim["generation"],
+                outcome="RELEASED_NO_EFFECT",
+                evidence={
+                    "effect_attempted": False,
+                    "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
+                    "result_type": "not_dispatched",
+                },
+            )
+            return None
+        try:
+            if not getattr(self, "_is_subprocess", False):
+                result = callback(*args, **kwargs)
+            else:
+                result = _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+        except Exception as exc:
+            resolve_wallet_effect_claim(
+                claim["claim_token"],
+                claim["generation"],
+                outcome="UNKNOWN",
+                evidence={
+                    "effect_attempted": True,
+                    "reason_code": "CALLBACK_EXCEPTION",
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            raise
+        if type(result) is dict and result.get("_catalyst_effect_attempted") is False:
+            outcome = "RELEASED_NO_EFFECT"
+            effect_attempted = False
+        elif type(result) is dict and (
+            result.get("success") is True
+            or result.get("transaction_id")
+            or result.get("coin_spends") is not None
+            or result.get("summary") is not None
+        ):
+            outcome = "SUBMITTED"
+            effect_attempted = True
+        else:
+            outcome = "UNKNOWN"
+            effect_attempted = True
+        resolve_wallet_effect_claim(
+            claim["claim_token"],
+            claim["generation"],
+            outcome=outcome,
+            evidence={
+                "effect_attempted": effect_attempted,
+                "reason_code": f"CALLBACK_{outcome}",
+                "result_type": type(result).__name__,
+            },
+        )
+        return result
 
     def _require_cli_mutation(self, operation: str) -> None:
         raise mutation_gate.MutationBlocked("WALLET_BACKEND_UNSUPPORTED", operation)
@@ -1531,11 +1674,14 @@ class CoinPrepWorker:
         self.log(
             f"XCH fee cleanup: merging {len(extra_ids)} extra coin(s) ({extra_total:,} mojos) back into reserve"
         )
+        source_coin_ids = [reserve_id] + extra_ids
+        fee_mojos = self._tx_fee_mojos()
         result = self._call_wallet_mutation(
             "coin_prep.combine_fee_reserve",
             combine_coins,
-            [reserve_id] + extra_ids,
-            fee_mojos=self._tx_fee_mojos(),
+            source_coin_ids,
+            fee_mojos=fee_mojos,
+            _authority_fee_coin_ids=source_coin_ids if fee_mojos > 0 else None,
         )
         if not self._sage_submit_succeeded(result):
             self.log("XCH fee cleanup combine was not accepted by Sage")
@@ -2890,6 +3036,11 @@ class CoinPrepWorker:
                         combine_coins,
                         coin_ids=batch,
                         fee_mojos=combine_fee,
+                        _authority_fee_coin_ids=(
+                            batch
+                            if combine_fee > 0 and wallet_id == self.xch_wallet_id
+                            else None
+                        ),
                     )
                     if not self._sage_submit_succeeded(result):
                         self.log(
@@ -2915,6 +3066,11 @@ class CoinPrepWorker:
                 combine_coins,
                 coin_ids=coin_ids,
                 fee_mojos=combine_fee,
+                _authority_fee_coin_ids=(
+                    coin_ids
+                    if combine_fee > 0 and wallet_id == self.xch_wallet_id
+                    else None
+                ),
             )
 
             if self._sage_submit_succeeded(result):

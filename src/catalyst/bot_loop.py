@@ -7778,6 +7778,7 @@ class BotLoop:
         """Claim, durably materialize, apply and positively ack Sweep events."""
 
         from database import (
+            authoritative_sweep_process_effect_authority,
             consume_authoritative_sweep_event,
             materialize_authoritative_sweep_downstream_effect,
         )
@@ -7807,7 +7808,12 @@ class BotLoop:
                         getattr(cfg, "SWEEP_PROTECTION_UNKNOWN_SECS", 30)
                     ),
                 )
-                self._apply_authoritative_sweep_downstream_effect(effect)
+                with authoritative_sweep_process_effect_authority(
+                    event.event_id,
+                    event.claim_token,
+                    event.claim_generation,
+                ):
+                    self._apply_authoritative_sweep_downstream_effect(effect)
                 if consume_authoritative_sweep_event(
                     event.event_id,
                     event.claim_token,

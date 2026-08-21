@@ -13,6 +13,7 @@ import sys
 import threading
 from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from offer_registry import (
@@ -2317,26 +2318,6 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
     import database
 
     trade_id = fill["trade_id"]
-    stored_offer = database.get_offer(trade_id)
-    offer = stored_offer if type(stored_offer) is dict else {}
-    stored_coin_id = offer.get("coin_id")
-    coin_id = (
-        stored_coin_id
-        if type(stored_coin_id) is str and stored_coin_id.strip()
-        else "unknown"
-    )
-    fill_detail = {
-        "fill_id": fill["fill_id"],
-        "trade_id": trade_id,
-        "side": fill["side"],
-        "price": fill["price_xch"],
-        "size_xch": fill["size_xch"],
-        "size_cat": fill["size_cat"],
-        "tier": fill["tier"],
-        "coin_id": coin_id,
-        "timestamp": fill["filled_at"],
-        "spent_block_index": fill.get("spent_block_index"),
-    }
     classification_box: dict[str, Any] = {}
 
     def offer_filled_event(
@@ -2440,18 +2421,23 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
             claim_token=claim_token,
             claim_generation=claim_generation,
         )
-        if database.get_authoritative_fill_by_id(int(fill["fill_id"])) is None:
-            database.block_offer_fill_hook_authority_loss(int(fill["fill_id"]))
-            raise RuntimeError("Boost fill authority changed before process effect")
-        effect_state = manager.notify_authoritative_boost_fill(
+        with database.offer_fill_process_effect_authority(
             int(fill["fill_id"]),
-            trade_id,
-            str(fill["side"]),
-            command["materialization"],
-            durable_effect=durable_effect,
-        )
-        if type(effect_state) is not dict or effect_state != durable_effect:
-            raise RuntimeError("BoostManager returned no exact authoritative effect")
+            "boost_notification",
+            claim_token,
+            claim_generation,
+        ):
+            effect_state = manager.notify_authoritative_boost_fill(
+                int(fill["fill_id"]),
+                trade_id,
+                str(fill["side"]),
+                command["materialization"],
+                durable_effect=durable_effect,
+            )
+            if type(effect_state) is not dict or effect_state != durable_effect:
+                raise RuntimeError(
+                    "BoostManager returned no exact authoritative effect"
+                )
         try:
             return database.complete_authoritative_boost_fill_command(
                 int(fill["fill_id"]),
@@ -2470,6 +2456,27 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
         existing = classification_box.get("value")
         if existing is not None:
             return existing
+        try:
+            selected_coin_ids = json.loads(fill["selected_coin_ids_json"])
+            if type(selected_coin_ids) is not list or not selected_coin_ids:
+                raise ValueError("authoritative fill selected cohort is empty")
+            coin_id = database.norm_coin_id(selected_coin_ids[0])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "authoritative fill selected cohort cannot be reconstructed"
+            ) from exc
+        fill_detail = {
+            "fill_id": fill["fill_id"],
+            "trade_id": trade_id,
+            "side": fill["side"],
+            "price": fill["price_xch"],
+            "size_xch": fill["size_xch"],
+            "size_cat": fill["size_cat"],
+            "tier": fill["tier"],
+            "coin_id": coin_id,
+            "timestamp": fill["filled_at"],
+            "spent_block_index": fill.get("spent_block_index"),
+        }
         from fill_classifier import classify_fill
 
         result = classify_fill(trade_id, fill_detail, None)
@@ -2514,20 +2521,23 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
         try:
             from sweep_coordinator import get_coordinator
 
-            if database.get_authoritative_fill_by_id(int(fill["fill_id"])) is None:
-                database.block_offer_fill_hook_authority_loss(int(fill["fill_id"]))
-                raise RuntimeError("sweep fill authority changed before process effect")
-            coordinator = get_coordinator()
-            if hasattr(coordinator, "process_authoritative_fill"):
-                coordinator.process_authoritative_fill(int(fill["fill_id"]), result)
-            else:
-                coordinator.process_fill(int(fill["fill_id"]), result)
-            if (
-                result.spent_block_index is not None
-                and hasattr(coordinator, "has_registered_fill")
-                and not (coordinator.has_registered_fill(int(fill["fill_id"])))
+            with database.offer_fill_process_effect_authority(
+                int(fill["fill_id"]),
+                "sweep_registration",
+                claim_token,
+                claim_generation,
             ):
-                raise RuntimeError("SweepCoordinator rejected durable registration")
+                coordinator = get_coordinator()
+                if hasattr(coordinator, "process_authoritative_fill"):
+                    coordinator.process_authoritative_fill(int(fill["fill_id"]), result)
+                else:
+                    coordinator.process_fill(int(fill["fill_id"]), result)
+                if (
+                    result.spent_block_index is not None
+                    and hasattr(coordinator, "has_registered_fill")
+                    and not (coordinator.has_registered_fill(int(fill["fill_id"])))
+                ):
+                    raise RuntimeError("SweepCoordinator rejected durable registration")
             return database.acknowledge_authoritative_sweep_registration(
                 int(fill["fill_id"]),
                 claim_token=claim_token,
@@ -2774,6 +2784,38 @@ def reconcile_offer(
         cancel_context=cancel_context,
         now=observed_at,
     )
+    immutable_economics = None
+    if result["classification"] == FILLED_PROVEN:
+        immutable_economics = database.get_offer_intent_economic_authority(
+            intent["intent_id"]
+        )
+        stored_offer = database.get_offer(intent["sage_trade_id"])
+        legacy_contradiction = False
+        if immutable_economics is None:
+            legacy_contradiction = True
+        elif type(stored_offer) is dict:
+            legacy_contradiction = (
+                any(
+                    stored_offer.get(key) != immutable_economics[value_key]
+                    for key, value_key in (
+                        ("side", "side"),
+                        ("cat_asset_id", "cat_asset_id"),
+                        ("tier", "tier"),
+                    )
+                )
+                or stored_offer.get("fee_mojos_xch")
+                != immutable_economics["fee_mojos_xch"]
+            )
+            try:
+                legacy_contradiction = legacy_contradiction or any(
+                    Decimal(str(stored_offer.get(key)))
+                    != Decimal(str(immutable_economics[key]))
+                    for key in ("price_xch", "size_xch", "size_cat")
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                legacy_contradiction = True
+        if legacy_contradiction:
+            result = _conflict("IMMUTABLE_ECONOMIC_AUTHORITY_CONFLICT")
     destination, registry_evidence = _registry_evidence(intent, result, observed_at)
     records = tuple(
         offer_record_from_row(row) for row in database.get_offer_intents_for_registry()
@@ -2806,20 +2848,39 @@ def reconcile_offer(
         }
     durable_proof = {"classification": result, "evidence": collected}
     if result["classification"] == FILLED_PROVEN:
-        stored_offer = database.get_offer(intent["sage_trade_id"])
-        if type(stored_offer) is not dict:
-            raise RuntimeError("proven fill lost its durable offer economics")
+        if type(immutable_economics) is not dict:
+            raise RuntimeError("proven fill lost immutable PREPARED economics")
+        transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+            result.get("transaction_id"),
+            result.get("spend_identity"),
+            result["block_height"],
+            immutable_economics["selected_coin_ids_sha256"],
+            immutable_economics["side"],
+            immutable_economics["cat_asset_id"],
+            immutable_economics["offered_amount_atomic"],
+            immutable_economics["requested_amount_atomic"],
+            database.norm_coin_id(result["receive_coin_id"]),
+            result["receive_amount_mojos"],
+        )
         durable_proof["fill_authority"] = {
             "schema_version": 1,
             "intent_id": intent["intent_id"],
+            "prepared_event_id": immutable_economics["prepared_event_id"],
+            "economic_authority_token": immutable_economics["authority_token"],
             "trade_id": intent["sage_trade_id"],
-            "side": stored_offer["side"],
-            "price_xch": stored_offer["price_xch"],
-            "size_xch": stored_offer["size_xch"],
-            "size_cat": stored_offer["size_cat"],
-            "cat_asset_id": stored_offer["cat_asset_id"],
-            "tier": stored_offer["tier"],
-            "fee_mojos_xch": int(stored_offer.get("fee_mojos_xch") or 0),
+            "side": immutable_economics["side"],
+            "price_xch": immutable_economics["price_xch"],
+            "size_xch": immutable_economics["size_xch"],
+            "size_cat": immutable_economics["size_cat"],
+            "cat_asset_id": immutable_economics["cat_asset_id"],
+            "tier": immutable_economics["tier"],
+            "offered_amount_atomic": immutable_economics["offered_amount_atomic"],
+            "requested_amount_atomic": immutable_economics["requested_amount_atomic"],
+            "cat_decimals": immutable_economics["cat_decimals"],
+            "fee_mojos_xch": immutable_economics["fee_mojos_xch"],
+            "fee_provenance": immutable_economics["fee_provenance"],
+            "selected_coin_ids_sha256": immutable_economics["selected_coin_ids_sha256"],
+            "transaction_flow_sha256": transaction_flow_sha256,
             "spent_block_height": result["block_height"],
             "receive_coin_id": database.norm_coin_id(result["receive_coin_id"]),
             "receive_amount_mojos": result["receive_amount_mojos"],
@@ -2836,7 +2897,7 @@ def reconcile_offer(
         # Leave enough room to expose the immutable fill binding at the root
         # of a bounded envelope.  SQLite's receipt guard must be able to prove
         # these exact values without trusting the caller or an opaque digest.
-        durable_json, evidence_sha256 = canonical_evidence_and_digest(
+        durable_json, full_evidence_sha256 = canonical_evidence_and_digest(
             durable_proof,
             max_bytes=57344 if result["classification"] == FILLED_PROVEN else 65536,
         )
@@ -2861,6 +2922,7 @@ def reconcile_offer(
             )
             if len(durable_json.encode("utf-8")) > 65536:
                 raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
+        evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
     except Exception:
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
         fallback_destination, fallback_evidence = _registry_evidence(
@@ -2903,6 +2965,7 @@ def reconcile_offer(
             separators=(",", ":"),
         )
         evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
+        full_evidence_sha256 = evidence_sha256
         committed = database.commit_offer_reconciliation(
             intent_id=intent["intent_id"],
             operation_id=operation_id,
@@ -2930,6 +2993,7 @@ def reconcile_offer(
             "applied": False,
             "authorization_code": fallback_decision.code.value,
             "evidence_sha256": evidence_sha256,
+            "full_evidence_sha256": full_evidence_sha256,
             "event": committed["event"],
             "idempotent": committed["idempotent"],
         }
@@ -2976,12 +3040,17 @@ def reconcile_offer(
         in {FILLED_PROVEN, CANCELLED_PROVEN, EXPIRED_PROVEN},
         "authorization_code": decision.code.value,
         "evidence_sha256": evidence_sha256,
+        "full_evidence_sha256": full_evidence_sha256,
         "event": committed["event"],
         "idempotent": committed["idempotent"],
     }
     if result["classification"] == FILLED_PROVEN:
         fill_id = committed.get("fill_id")
-        fill = database.get_fill_by_trade_id(intent["sage_trade_id"])
+        fill = (
+            database.get_authoritative_fill_by_id(int(fill_id))
+            if fill_id is not None
+            else None
+        )
         if fill_id is None or fill is None or int(fill["fill_id"]) != int(fill_id):
             raise RuntimeError(
                 "authoritative fill commit lost its durable fill identity"

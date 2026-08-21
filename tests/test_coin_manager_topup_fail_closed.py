@@ -93,13 +93,23 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         # These legacy top-up tests exercise wallet response handling rather
         # than Task 9 coin authority.  Grant the pre-effect authority check
         # explicitly; denial/race behavior is covered by the closure suite.
-        self._wallet_effect_authority = patch.object(
-            coin_manager,
-            "authorize_wallet_effect_coin_ids",
-            side_effect=lambda coin_ids: tuple(coin_ids),
+        self._wallet_effect_authority = ExitStack()
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager,
+                "claim_wallet_effect",
+                return_value={"claim_token": "a" * 64, "generation": 1},
+            )
         )
-        self._wallet_effect_authority.start()
-        self.addCleanup(self._wallet_effect_authority.stop)
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager, "wallet_effect_claim_is_current", return_value=True
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(coin_manager, "resolve_wallet_effect_claim", return_value=True)
+        )
+        self.addCleanup(self._wallet_effect_authority.close)
 
     @classmethod
     def setUpClass(cls):
@@ -1743,7 +1753,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch.object(coin_manager, "get_wallet_type", return_value="sage"),
-            patch.object(manager, "_tx_fee_mojos", return_value=1),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),
@@ -1783,7 +1793,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch.object(coin_manager, "get_wallet_type", return_value="sage"),
-            patch.object(manager, "_tx_fee_mojos", return_value=1),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),
@@ -1837,7 +1847,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
 
         with (
             patch.object(coin_manager, "get_wallet_type", return_value="sage"),
-            patch.object(manager, "_tx_fee_mojos", return_value=1),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),

@@ -288,6 +288,7 @@ def test_authoritative_coin_outcomes_are_append_only_and_coin_indexed(
     assert triggers == {
         "offer_reconciliation_coin_outcomes_no_update",
         "offer_reconciliation_coin_outcomes_no_delete",
+        "offer_reconciliation_coin_outcomes_proof_guard_v2",
     }
 
 
@@ -346,24 +347,39 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         finalized_at=LATER,
         finalize_selected_coin_reservations=True,
     )
+    economics = database.get_offer_intent_economic_authority(intent_id)
+    assert economics is not None
     assert database.add_offer(
         trade_id=trade_id,
         side="buy",
-        price_xch=database.Decimal("0.0000005"),
-        size_xch=database.Decimal("0.000000001"),
-        size_cat=database.Decimal("2"),
+        price_xch=database.Decimal(economics["price_xch"]),
+        size_xch=database.Decimal(economics["size_xch"]),
+        size_cat=database.Decimal(economics["size_cat"]),
         cat_asset_id=asset_id,
         tier="inner",
         coin_id=database.norm_coin_id(coin_id),
+        fee_mojos_xch=economics["fee_mojos_xch"],
     )
     transaction_id = _sha("migration-terminal-transaction")
     receive_coin_id = _sha("migration-terminal-receive")
     filled_at = "2026-08-15T12:01:30.000000Z"
-    stored_offer = database.get_offer(trade_id)
+    transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+        transaction_id,
+        None,
+        42,
+        economics["selected_coin_ids_sha256"],
+        economics["side"],
+        economics["cat_asset_id"],
+        economics["offered_amount_atomic"],
+        economics["requested_amount_atomic"],
+        database.norm_coin_id(receive_coin_id),
+        2000,
+    )
     evidence = {
         "migration": "exact terminal coin outcome",
         "classification": {
             "classification": "FILLED_PROVEN",
+            "reason_code": "MIGRATION_TEST_PROOF",
             "transaction_id": transaction_id,
             "spend_identity": None,
             "block_height": 42,
@@ -374,14 +390,22 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         "fill_authority": {
             "schema_version": 1,
             "intent_id": intent_id,
+            "prepared_event_id": economics["prepared_event_id"],
+            "economic_authority_token": economics["authority_token"],
             "trade_id": trade_id,
-            "side": stored_offer["side"],
-            "price_xch": stored_offer["price_xch"],
-            "size_xch": stored_offer["size_xch"],
-            "size_cat": stored_offer["size_cat"],
-            "cat_asset_id": stored_offer["cat_asset_id"],
-            "tier": stored_offer["tier"],
-            "fee_mojos_xch": stored_offer["fee_mojos_xch"],
+            "side": economics["side"],
+            "price_xch": economics["price_xch"],
+            "size_xch": economics["size_xch"],
+            "size_cat": economics["size_cat"],
+            "cat_asset_id": economics["cat_asset_id"],
+            "tier": economics["tier"],
+            "offered_amount_atomic": economics["offered_amount_atomic"],
+            "requested_amount_atomic": economics["requested_amount_atomic"],
+            "cat_decimals": economics["cat_decimals"],
+            "fee_mojos_xch": economics["fee_mojos_xch"],
+            "fee_provenance": economics["fee_provenance"],
+            "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+            "transaction_flow_sha256": transaction_flow_sha256,
             "spent_block_height": 42,
             "receive_coin_id": database.norm_coin_id(receive_coin_id),
             "receive_amount_mojos": 2000,

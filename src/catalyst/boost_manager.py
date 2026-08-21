@@ -309,24 +309,25 @@ class BoostManager:
         self._authoritative_boost_fill_ids: set[int] = set()
         self._authoritative_boost_effects: dict[int, dict] = {}
         try:
-            from database import get_materialized_authoritative_boost_commands
+            from database import authoritative_boost_restore_effect_authority
 
-            for command in get_materialized_authoritative_boost_commands():
-                fill_id = command["fill_id"]
-                effect = command["effect"]
-                side = effect["side"]
-                self._authoritative_boost_fill_ids.add(fill_id)
-                self._authoritative_boost_effects[fill_id] = dict(effect)
-                if side == "buy":
-                    self._buy_settled = True
-                    self._buy_offset_bps = effect["offset_bps"]
-                    self._buy_floor_bps = effect["floor_bps"]
-                    self._buy_last_safe_offset_bps = effect["last_safe_offset_bps"]
-                else:
-                    self._sell_settled = True
-                    self._sell_offset_bps = effect["offset_bps"]
-                    self._sell_floor_bps = effect["floor_bps"]
-                    self._sell_last_safe_offset_bps = effect["last_safe_offset_bps"]
+            with authoritative_boost_restore_effect_authority() as commands:
+                for command in commands:
+                    fill_id = command["fill_id"]
+                    effect = command["effect"]
+                    side = effect["side"]
+                    self._authoritative_boost_fill_ids.add(fill_id)
+                    self._authoritative_boost_effects[fill_id] = dict(effect)
+                    if side == "buy":
+                        self._buy_settled = True
+                        self._buy_offset_bps = effect["offset_bps"]
+                        self._buy_floor_bps = effect["floor_bps"]
+                        self._buy_last_safe_offset_bps = effect["last_safe_offset_bps"]
+                    else:
+                        self._sell_settled = True
+                        self._sell_offset_bps = effect["offset_bps"]
+                        self._sell_floor_bps = effect["floor_bps"]
+                        self._sell_last_safe_offset_bps = effect["last_safe_offset_bps"]
         except Exception:
             pass
         # Alternation flag — only push one side per cycle to avoid

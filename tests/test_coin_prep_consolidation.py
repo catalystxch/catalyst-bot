@@ -82,9 +82,12 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_database.mark_coins_gone = lambda *args, **kwargs: True
         fake_database.get_setting = lambda *args, **kwargs: None
         fake_database.set_setting = lambda *args, **kwargs: True
-        fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
-            coin_ids
-        )
+        fake_database.claim_wallet_effect = lambda **kwargs: {
+            "claim_token": "a" * 64,
+            "generation": 1,
+        }
+        fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
+        fake_database.resolve_wallet_effect_claim = lambda *args, **kwargs: True
         fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 
@@ -109,7 +112,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def test_sage_consolidation_uses_send_to_self_and_subtracts_xch_fee(self):
+    def test_sage_xch_send_to_self_fails_closed_when_sources_are_only_hints(self):
         calls = {"send": []}
         counts = iter([3, 0, 1])
 
@@ -157,22 +160,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 10
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(1, "XCH"))
+            self.assertFalse(worker._consolidate_wallet_sage(1, "XCH"))
 
-        self.assertEqual(
-            calls["send"],
-            [
-                {
-                    "wallet_id": 1,
-                    "amount_mojos": 990,
-                    "address": "xch1self",
-                    "fee_mojos": 10,
-                    "source_coin_ids": ["11" * 32, "22" * 32],
-                }
-            ],
-        )
+        self.assertEqual(calls["send"], [])
 
-    def test_sage_cat_consolidation_sends_full_cat_balance_to_self(self):
+    def test_sage_cat_send_to_self_fails_closed_with_unbound_fee_input(self):
         calls = {"send": []}
         counts = iter([2, 0, 1])
 
@@ -246,22 +238,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 10
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
+            self.assertFalse(worker._consolidate_wallet_sage(2, "CAT"))
 
-        self.assertEqual(
-            calls["send"],
-            [
-                {
-                    "wallet_id": 2,
-                    "amount_mojos": 1000,
-                    "address": "xch1self",
-                    "fee_mojos": 10,
-                    "source_coin_ids": ["11" * 32, "22" * 32],
-                }
-            ],
-        )
+        self.assertEqual(calls["send"], [])
 
-    def test_sage_large_xch_consolidation_uses_priority_fee(self):
+    def test_sage_xch_priority_self_send_fails_closed_on_ignored_sources(self):
         calls = {"send": []}
         counts = iter([20, 0, 1])
 
@@ -301,12 +282,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 10
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(1, "XCH"))
+            self.assertFalse(worker._consolidate_wallet_sage(1, "XCH"))
 
-        self.assertEqual(calls["send"][0]["amount_mojos"], 1980)
-        self.assertEqual(calls["send"][0]["fee_mojos"], 20)
+        self.assertEqual(calls["send"], [])
 
-    def test_sage_large_xch_consolidation_uses_one_balance_self_send(self):
+    def test_sage_large_xch_balance_self_send_fails_closed(self):
         records = [
             {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
             for i in range(1, 46)
@@ -346,14 +326,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 10
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(1, "XCH"))
+            self.assertFalse(worker._consolidate_wallet_sage(1, "XCH"))
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["amount_mojos"], 4500 - 20)
-        self.assertEqual(calls[0]["fee_mojos"], 20)
-        self.assertEqual(len(calls[0]["source_coin_ids"]), 45)
+        self.assertEqual(calls, [])
 
-    def test_sage_large_xch_consolidation_waits_between_self_send_batches(self):
+    def test_sage_large_xch_staged_self_send_fails_closed_before_dispatch(self):
         initial_records = [
             {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
             for i in range(1, 61)
@@ -419,14 +396,12 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._wait_for_sage_coin_count_at_most = wait_for_stage
         worker._wait_for_sage_consolidation = lambda *args, **kwargs: True
 
-        self.assertTrue(worker._consolidate_wallet_sage_fallback(1, "XCH"))
+        self.assertFalse(worker._consolidate_wallet_sage_fallback(1, "XCH"))
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(len(calls[0]["source_coin_ids"]), 50)
-        self.assertEqual(len(calls[1]["source_coin_ids"]), 11)
-        self.assertEqual(waits, [(1, "XCH", 60, 11)])
+        self.assertEqual(calls, [])
+        self.assertEqual(waits, [])
 
-    def test_sage_large_cat_consolidation_batches_self_send_inputs(self):
+    def test_sage_large_cat_staged_self_send_fails_closed_before_dispatch(self):
         def records_for(prefix, count):
             return [
                 {
@@ -494,22 +469,12 @@ class CoinPrepConsolidationTests(unittest.TestCase):
 
         worker._wait_for_sage_coin_count_at_most = wait_for_stage
 
-        self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
+        self.assertFalse(worker._consolidate_wallet_sage(2, "CAT"))
 
-        self.assertEqual(len(calls), 5)
-        self.assertTrue(all(len(call["source_coin_ids"]) <= 50 for call in calls))
-        self.assertEqual(
-            waits,
-            [
-                (199, 150),
-                (150, 101),
-                (101, 52),
-                (52, 3),
-            ],
-        )
-        self.assertEqual(len(calls[-1]["source_coin_ids"]), 3)
+        self.assertEqual(calls, [])
+        self.assertEqual(waits, [])
 
-    def test_sage_large_cat_consolidation_waits_and_refreshes_between_batches(self):
+    def test_sage_large_cat_fee_self_send_fails_closed_before_dispatch(self):
         initial_records = [
             {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
             for i in range(1, 66)
@@ -582,14 +547,10 @@ class CoinPrepConsolidationTests(unittest.TestCase):
 
         worker._wait_for_sage_coin_count_at_most = wait_for_stage
 
-        self.assertTrue(worker._consolidate_wallet_sage_fallback(2, "CAT"))
+        self.assertFalse(worker._consolidate_wallet_sage_fallback(2, "CAT"))
 
-        self.assertEqual(waits, [(2, "CAT", 65, 16)])
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(len(calls[0]["source_coin_ids"]), 50)
-        self.assertEqual(calls[1]["amount_mojos"], 6500)
-        self.assertEqual(calls[1]["source_coin_ids"][0], "aa" * 32)
-        self.assertEqual(len(calls[1]["source_coin_ids"]), 16)
+        self.assertEqual(waits, [])
+        self.assertEqual(calls, [])
 
     def test_sage_xch_consolidation_accepts_small_fee_change_set(self):
         counts = iter([0, 3])
@@ -650,7 +611,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         self.assertTrue(all(len(batch) <= 50 for batch in calls))
         self.assertEqual(sum(len(batch) for batch in calls), 199)
 
-    def test_sage_consolidation_rejects_transient_pending_lock_that_restores_old_count(
+    def test_sage_consolidation_rejects_ignored_source_adapter_before_pending_poll(
         self,
     ):
         calls = []
@@ -685,9 +646,9 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
             self.assertFalse(worker._consolidate_wallet_sage(1, "XCH"))
 
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls, [])
 
-    def test_sage_consolidation_recovers_by_resync_when_wallet_view_is_stale(self):
+    def test_sage_consolidation_does_not_resync_without_a_safe_submission(self):
         calls = {"send": 0, "resync": 0}
         counts = iter([3, 0, 3, 3, 3, 3, 3, 3, 1])
 
@@ -725,11 +686,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._tx_fee_mojos = lambda: 0
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(1, "XCH"))
+            self.assertFalse(worker._consolidate_wallet_sage(1, "XCH"))
 
-        self.assertEqual(calls, {"send": 1, "resync": 1})
+        self.assertEqual(calls, {"send": 0, "resync": 0})
 
-    def test_sage_consolidation_reports_wallet_still_settling_when_resync_count_changes(
+    def test_sage_consolidation_reports_authority_denial_before_settling_checks(
         self,
     ):
         logs = []
@@ -763,10 +724,10 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             self.assertFalse(worker._consolidate_wallet_sage(1, "CAT"))
 
         joined = "\n".join(logs).lower()
-        self.assertIn("sage wallet is still settling", joined)
+        self.assertIn("denied by durable coin authority", joined)
         self.assertNotIn("rejected or dropped", joined)
 
-    def test_sage_consolidation_runs_follow_up_pass_after_partial_reduction(self):
+    def test_sage_consolidation_does_not_follow_up_an_unsafe_submission(self):
         calls = {"send": [], "wait": 0}
         visible_count = {"value": 15}
         coin_batches = [
@@ -832,12 +793,10 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._wait_for_sage_consolidation = wait_for_consolidation
 
         with patch.object(self.coin_prep_worker.time, "sleep", return_value=None):
-            self.assertTrue(worker._consolidate_wallet_sage(2, "CAT"))
+            self.assertFalse(worker._consolidate_wallet_sage(2, "CAT"))
 
-        self.assertEqual(calls["wait"], 2)
-        self.assertEqual(len(calls["send"]), 2)
-        self.assertEqual(len(calls["send"][0]["source_coin_ids"]), 15)
-        self.assertEqual(len(calls["send"][1]["source_coin_ids"]), 2)
+        self.assertEqual(calls["wait"], 0)
+        self.assertEqual(calls["send"], [])
 
     def test_worker_aborts_when_consolidation_never_verifies(self):
         source = (

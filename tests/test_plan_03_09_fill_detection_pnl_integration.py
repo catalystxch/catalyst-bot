@@ -76,6 +76,11 @@ class _TempDB(unittest.TestCase):
         size_cat=Decimal("100"),
         asset="testcat",
     ):
+        # Task 9 economics are immutable atomic facts.  Several legacy cases
+        # supplied a default XCH size which contradicted their explicit price;
+        # derive the XCH leg from price and CAT size for an internally
+        # consistent PREPARED authority instead of minting a mutable projection.
+        size_xch = Decimal(str(price)) * Decimal(str(size_cat))
         intent_id = f"intent:{trade_id}"
         coin_id = hashlib.sha256(f"coin:{trade_id}".encode()).hexdigest()
         wallet_type = "xch" if side == "buy" else "cat"
@@ -118,6 +123,8 @@ class _TempDB(unittest.TestCase):
             offered_amount_atomic=str(offered_atomic),
             requested_amount_atomic=str(requested_atomic),
             selected_coin_ids_json=[coin_id],
+            cat_decimals=3,
+            fee_mojos_xch=0,
             wallet_identity_json=wallet_identity,
             evidence_json={"fixture": "pnl intent"},
             prepared_at="2026-08-20T12:00:00.000000Z",
@@ -164,7 +171,66 @@ class _TempDB(unittest.TestCase):
         filled_at = f"2026-08-20T12:00:{fill_second:02d}.000000Z"
         reconciled_at = f"2026-08-20T12:00:{fill_second + 1:02d}.000000Z"
         intent_id = f"intent:{trade_id}"
-        evidence = {"fixture": "pnl terminal", "trade_id": trade_id}
+        economics = _db.get_offer_intent_economic_authority(intent_id)
+        if economics is None:
+            raise AssertionError(f"missing immutable economics fixture: {trade_id}")
+        transaction_id = hashlib.sha256(f"transaction:{trade_id}".encode()).hexdigest()
+        receive_coin_id = hashlib.sha256(f"receive:{trade_id}".encode()).hexdigest()
+        block_height = self._fill_sequence
+        receive_amount_mojos = int(economics["requested_amount_atomic"])
+        canonical_filled_at = _db._stability_timestamp(filled_at, "fixture filled_at")
+        transaction_flow_sha256 = _db.canonical_fill_transaction_flow_token(
+            transaction_id,
+            None,
+            block_height,
+            economics["selected_coin_ids_sha256"],
+            economics["side"],
+            economics["cat_asset_id"],
+            economics["offered_amount_atomic"],
+            economics["requested_amount_atomic"],
+            _db.norm_coin_id(receive_coin_id),
+            receive_amount_mojos,
+        )
+        evidence = {
+            "fixture": "pnl terminal",
+            "trade_id": trade_id,
+            "classification": {
+                "classification": "FILLED_PROVEN",
+                "reason_code": "TEST_AUTHORITATIVE_PROOF",
+                "transaction_id": transaction_id,
+                "spend_identity": None,
+                "block_height": block_height,
+                "receive_coin_id": receive_coin_id,
+                "receive_amount_mojos": receive_amount_mojos,
+                "filled_at": canonical_filled_at,
+            },
+            "fill_authority": {
+                "schema_version": 1,
+                "intent_id": intent_id,
+                "prepared_event_id": economics["prepared_event_id"],
+                "economic_authority_token": economics["authority_token"],
+                "trade_id": trade_id,
+                "side": economics["side"],
+                "price_xch": economics["price_xch"],
+                "size_xch": economics["size_xch"],
+                "size_cat": economics["size_cat"],
+                "cat_asset_id": economics["cat_asset_id"],
+                "tier": economics["tier"],
+                "offered_amount_atomic": economics["offered_amount_atomic"],
+                "requested_amount_atomic": economics["requested_amount_atomic"],
+                "cat_decimals": economics["cat_decimals"],
+                "fee_mojos_xch": economics["fee_mojos_xch"],
+                "fee_provenance": economics["fee_provenance"],
+                "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+                "transaction_flow_sha256": transaction_flow_sha256,
+                "spent_block_height": block_height,
+                "receive_coin_id": _db.norm_coin_id(receive_coin_id),
+                "receive_amount_mojos": receive_amount_mojos,
+                "filled_at": canonical_filled_at,
+                "transaction_id": transaction_id,
+                "spend_identity": None,
+            },
+        }
         evidence_json = json.dumps(
             evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
         )
@@ -179,15 +245,11 @@ class _TempDB(unittest.TestCase):
             },
             "evidence_json": evidence,
             "evidence_sha256": hashlib.sha256(evidence_json.encode()).hexdigest(),
-            "transaction_id": hashlib.sha256(
-                f"transaction:{trade_id}".encode()
-            ).hexdigest(),
-            "block_height": self._fill_sequence,
-            "receive_coin_id": hashlib.sha256(
-                f"receive:{trade_id}".encode()
-            ).hexdigest(),
-            "receive_amount_mojos": 100,
-            "filled_at": filled_at,
+            "transaction_id": transaction_id,
+            "block_height": block_height,
+            "receive_coin_id": receive_coin_id,
+            "receive_amount_mojos": receive_amount_mojos,
+            "filled_at": canonical_filled_at,
             "reconciled_at": reconciled_at,
         }
         self._fill_commits[trade_id] = kwargs
@@ -255,7 +317,7 @@ class TestGetUnmatchedFills(_TempDB):
         self._add_offer("s1", "sell", Decimal("0.002"))
         bid = self._record_fill("b1", "buy", Decimal("0.001"))
         sid = self._record_fill("s1", "sell", Decimal("0.002"))
-        _db.match_round_trip(bid, sid, Decimal("0.0001"))
+        _db.match_round_trip(bid, sid, Decimal("0.1"))
         buy_unmatched = _db.get_unmatched_fills("testcat", "buy")
         sell_unmatched = _db.get_unmatched_fills("testcat", "sell")
         self.assertEqual(len(buy_unmatched), 0)
@@ -293,12 +355,12 @@ class TestMatchRoundTrip(_TempDB):
 
     def test_returns_positive_round_trip_id(self):
         bid, sid = self._pair()
-        rt_id = _db.match_round_trip(bid, sid, Decimal("0.0001"))
+        rt_id = _db.match_round_trip(bid, sid, Decimal("0.01"))
         self.assertGreater(rt_id, 0)
 
     def test_pnl_stored_on_both_fills(self):
         bid, sid = self._pair()
-        pnl = Decimal("0.000100")
+        pnl = Decimal("0.01")
         _db.match_round_trip(bid, sid, pnl)
         fills = _db.get_fills(cat_asset_id="testcat", include_legacy=True)
         pnls = {
@@ -311,7 +373,7 @@ class TestMatchRoundTrip(_TempDB):
 
     def test_round_trip_id_set_on_both_fills(self):
         bid, sid = self._pair()
-        rt_id = _db.match_round_trip(bid, sid, Decimal("0.0001"))
+        rt_id = _db.match_round_trip(bid, sid, Decimal("0.01"))
         fills = _db.get_fills(cat_asset_id="testcat", include_legacy=True)
         rt_ids = {f["fill_id"]: f["round_trip_id"] for f in fills}
         self.assertEqual(rt_ids[bid], rt_id)
@@ -319,7 +381,7 @@ class TestMatchRoundTrip(_TempDB):
 
     def test_matched_fills_no_longer_in_unmatched(self):
         bid, sid = self._pair()
-        _db.match_round_trip(bid, sid, Decimal("0.0001"))
+        _db.match_round_trip(bid, sid, Decimal("0.01"))
         self.assertEqual(_db.get_unmatched_fills("testcat", "buy"), [])
         self.assertEqual(_db.get_unmatched_fills("testcat", "sell"), [])
 
