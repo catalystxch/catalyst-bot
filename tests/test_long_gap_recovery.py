@@ -529,6 +529,7 @@ def test_runtime_recovery_reuses_ordered_startup_coordinator_and_retries_same_ep
         "wallet_fingerprint_hash": WALLET_HASH,
         "network": NETWORK,
         "owner_run_id": "run-recovery",
+        "lease_version": 4,
     }
 
     class _Status:
@@ -677,6 +678,7 @@ def test_runtime_recovery_promotion_retries_with_new_append_only_attempt(
         "wallet_fingerprint_hash": WALLET_HASH,
         "network": NETWORK,
         "owner_run_id": "run-promotion",
+        "lease_version": 9,
     }
 
     class _Runtime:
@@ -743,12 +745,14 @@ def test_runtime_recovery_promotion_retries_with_new_append_only_attempt(
     monkeypatch.setattr(
         api_server.database,
         "get_runtime_mutation_lease",
-        lambda: lease_reads.append(True)
-        or {
-            "lease_version": 9,
-            "owner_run_id": runtime.run_id,
-            "wallet_fingerprint_hash": WALLET_HASH,
-            "network": NETWORK,
+            lambda: lease_reads.append(True)
+            or {
+                # A normal heartbeat renewed this same incarnation after the
+                # recovery epoch captured version 9.
+                "lease_version": 10,
+                "owner_run_id": runtime.run_id,
+                "wallet_fingerprint_hash": WALLET_HASH,
+                "network": NETWORK,
         },
     )
     pass_attempts = []
@@ -843,10 +847,11 @@ def test_pause_between_effect_phases_fences_before_next_effect(
 @pytest.mark.parametrize(
     ("column", "value"),
     [
-        ("lease_version", 2),
         ("active", 0),
         ("owner_pid", 4343),
         ("owner_host", "replacement-host"),
+        ("acquired_at", "2026-08-21T12:00:01.000000Z"),
+        ("heartbeat_at", "2026-08-21T00:00:00.000000Z"),
         ("expires_at", "2026-08-21T14:00:00.000000Z"),
     ],
 )
@@ -876,6 +881,138 @@ def test_recovery_epoch_replay_rejects_exact_lease_aba(
     )
     db.get_connection().commit()
 
+    with pytest.raises(ValueError, match="lease authority changed"):
+        db.begin_runtime_recovery_epoch(**kwargs)
+
+
+def test_recovery_epoch_accepts_monotonic_heartbeat_renewal_for_every_transition(
+    isolated_database,
+):
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    kwargs = {
+        "recovery_id": "recovery:" + "8" * 64,
+        "reason_code": "MONOTONIC_GAP",
+        "clock_evidence": {"phase": "create"},
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "owner_run_id": "run-gap",
+        "started_at": "2026-08-21T12:00:40.000000Z",
+    }
+    epoch = db.begin_runtime_recovery_epoch(**kwargs)["record"]
+    heartbeat = db.heartbeat_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+        heartbeat_at="2026-08-21T12:01:00.000000Z",
+        lease_expires_at="2026-08-22T23:59:00.000000Z",
+    )
+
+    assert heartbeat["heartbeat"] is True
+    assert heartbeat["lease"]["lease_version"] == lease["lease_version"] + 1
+    replay = db.begin_runtime_recovery_epoch(**kwargs)
+    assert replay["idempotent"] is True
+    assert replay["record"]["recovery_id"] == epoch["recovery_id"]
+    quarantine = db.quarantine_runtime_blockers(
+        confirmation=True,
+        quarantine_id="quarantine:" + "8" * 64,
+        blocker_ids=[epoch["blocker_id"]],
+        expected_latch_generation=epoch["latch_generation"],
+        expected_recovery_id=epoch["recovery_id"],
+        owner_run_id="run-gap",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        quarantined_at="2026-08-21T12:01:01.000000Z",
+    )
+    requirements = db.get_runtime_quarantine_resolution_requirements(
+        quarantine["quarantine_id"]
+    )
+    observed = datetime.now(timezone.utc)
+    proof = {
+        "version": 1,
+        "quarantine_id": requirements["quarantine_id"],
+        "recovery_id": requirements["recovery_id"],
+        "latch_generation": requirements["latch_generation"],
+        "wallet_fingerprint_hash": requirements["wallet_fingerprint_hash"],
+        "network": requirements["network"],
+        "authority_digest": requirements["authority_digest"],
+        "observed_at": observed.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+        "history_complete": True,
+        "authoritative_read_performed": True,
+        "history_provenance": "wallet.get_all_offers",
+        "identity_provenance": "wallet.get_wallet_identity",
+        "absent_offer_ids": [],
+        "coins": [],
+    }
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=observed,
+        maximum_age_seconds=30,
+    )
+    assert decision["allowed"] is True
+    resolved = db.resolve_runtime_quarantine(
+        quarantine_id=quarantine["quarantine_id"],
+        expected_recovery_id=epoch["recovery_id"],
+        expected_latch_generation=epoch["latch_generation"],
+        expected_owner_run_id="run-gap",
+        proof_decision=decision,
+        resolved_at="2026-08-21T12:01:02.000000Z",
+    )
+    assert resolved["resolved"] is True
+    db.record_runtime_recovery_pass(
+        recovery_id=epoch["recovery_id"],
+        expected_latch_generation=epoch["latch_generation"],
+        authority_digest="8" * 64,
+        checks=[{"name": "integrity", "ok": True}],
+        passed_at="2026-08-21T12:01:03.000000Z",
+    )
+    latch = db.resolve_runtime_safety_latch(
+        expected_generation=epoch["latch_generation"],
+        resolved_operation_ids=[epoch["blocker_id"]],
+        resolved_at="2026-08-21T12:01:04.000000Z",
+    )
+    assert latch["resolved"] is True
+    assert latch["latch"]["state"] == "resolved"
+
+
+def test_recovery_epoch_rejects_same_owner_release_and_reacquire_aba(
+    isolated_database,
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    kwargs = {
+        "recovery_id": "recovery:" + "9" * 64,
+        "reason_code": "MONOTONIC_GAP",
+        "clock_evidence": {"phase": "cancel"},
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "owner_run_id": "run-gap",
+        "started_at": "2026-08-21T12:00:40.000000Z",
+    }
+    epoch = db.begin_runtime_recovery_epoch(**kwargs)["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+        released_at="2026-08-21T12:02:00.000000Z",
+    )
+    reacquired = db.acquire_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        owner_pid=4242,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        now="2026-08-21T12:03:00.000000Z",
+        lease_expires_at="2026-08-22T23:59:00.000000Z",
+    )
+
+    assert released["released"] is True
+    assert reacquired["acquired"] is True
+    assert reacquired["lease"]["owner_run_id"] == epoch["owner_run_id"]
+    assert reacquired["lease"]["acquired_at"] != epoch["lease_acquired_at"]
     with pytest.raises(ValueError, match="lease authority changed"):
         db.begin_runtime_recovery_epoch(**kwargs)
 
@@ -1153,6 +1290,104 @@ def test_quarantine_api_rejects_oversized_body_before_json_allocation():
         "success": False,
         "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
     }
+
+
+@pytest.mark.parametrize(
+    ("path", "route_name", "downstream_name"),
+    [
+        (
+            "/api/safety/quarantine",
+            "api_safety_quarantine",
+            "_quarantine_runtime_request",
+        ),
+        (
+            "/api/safety/quarantine/resolve",
+            "api_safety_quarantine_resolve",
+            "_resolve_runtime_quarantine_request",
+        ),
+    ],
+)
+def test_quarantine_api_streams_only_one_bounded_extra_byte_without_content_length(
+    monkeypatch, path, route_name, downstream_name
+):
+    import api_server
+
+    class CountingStream:
+        def __init__(self, payload):
+            self.payload = payload
+            self.offset = 0
+            self.bytes_read = 0
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(self.payload) - self.offset
+            chunk = self.payload[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            self.bytes_read += len(chunk)
+            return chunk
+
+    stream = CountingStream(b"{" + (b"x" * 20000) + b"}")
+    downstream_calls = []
+    monkeypatch.setattr(
+        api_server,
+        downstream_name,
+        lambda _payload: downstream_calls.append(True)
+        or {"success": True},
+    )
+    with api_server.app.test_request_context(
+        path,
+        method="POST",
+        content_type="application/json",
+        environ_overrides={
+            "wsgi.input": stream,
+            "wsgi.input_terminated": True,
+        },
+    ):
+        assert api_server.request.headers.get("Content-Length") is None
+        response, status = getattr(api_server, route_name)()
+
+    assert status == 409
+    assert response.get_json() == {
+        "success": False,
+        "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+    }
+    assert stream.bytes_read == 16385
+    assert downstream_calls == []
+
+
+def test_quarantine_api_rejects_malformed_content_length_without_read_or_db_call(
+    monkeypatch,
+):
+    import api_server
+
+    class HostileStream:
+        def read(self, _size=-1):
+            raise AssertionError("malformed Content-Length must reject before reading")
+
+    calls = []
+    monkeypatch.setattr(
+        api_server,
+        "_quarantine_runtime_request",
+        lambda _payload: calls.append(True) or {"success": True},
+    )
+    with api_server.app.test_request_context(
+        "/api/safety/quarantine",
+        method="POST",
+        content_type="application/json",
+        headers={"Content-Length": "not-a-size"},
+        environ_overrides={
+            "wsgi.input": HostileStream(),
+            "wsgi.input_terminated": True,
+        },
+    ):
+        response, status = api_server.api_safety_quarantine()
+
+    assert status == 409
+    assert response.get_json() == {
+        "success": False,
+        "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+    }
+    assert calls == []
 
 
 def test_quarantine_status_reports_current_latch_state_not_capture_constant(monkeypatch):

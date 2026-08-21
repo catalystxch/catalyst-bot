@@ -23928,12 +23928,24 @@ def _runtime_identifier(value: Any, name: str, prefix: str) -> str:
     return text
 
 
-_RECOVERY_LEASE_EPOCH_FIELDS = {
-    "lease_version": "lease_version",
+_RECOVERY_LEASE_INCARNATION_FIELDS = {
     "active": "lease_active",
     "owner_pid": "lease_owner_pid",
     "owner_host": "lease_owner_host",
     "acquired_at": "lease_acquired_at",
+}
+
+
+_RECOVERY_LEASE_RENEWAL_FLOORS = {
+    "heartbeat_at": "lease_heartbeat_at",
+    "expires_at": "lease_expires_at",
+    "updated_at": "lease_updated_at",
+}
+
+
+_RECOVERY_LEASE_EPOCH_FIELDS = {
+    "lease_version": "lease_version",
+    **_RECOVERY_LEASE_INCARNATION_FIELDS,
     "heartbeat_at": "lease_heartbeat_at",
     "expires_at": "lease_expires_at",
     "updated_at": "lease_updated_at",
@@ -23989,10 +24001,25 @@ def _runtime_recovery_lease_snapshot(lease: Any) -> tuple[Dict[str, Any], str]:
             or _stability_timestamp(timestamp, timestamp_name) != timestamp
         ):
             raise ValueError("runtime recovery lease timestamps are not canonical")
-    snapshot_json = _canonical_json_text(
-        snapshot, "runtime recovery lease snapshot", expected_type=dict, max_bytes=4096
+    incarnation = {
+        key: snapshot[key]
+        for key in (
+            "active",
+            "owner_run_id",
+            "owner_pid",
+            "owner_host",
+            "wallet_fingerprint_hash",
+            "network",
+            "acquired_at",
+        )
+    }
+    incarnation_json = _canonical_json_text(
+        incarnation,
+        "runtime recovery lease incarnation",
+        expected_type=dict,
+        max_bytes=4096,
     )
-    return snapshot, hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    return snapshot, hashlib.sha256(incarnation_json.encode("utf-8")).hexdigest()
 
 
 def _assert_runtime_recovery_lease(
@@ -24004,18 +24031,44 @@ def _assert_runtime_recovery_lease(
         lease if type(lease) is dict else dict(lease)
     )
     expected_digest = epoch.get("lease_snapshot_sha256")
+    captured_version = epoch.get("lease_version")
+    captured_renewal = {
+        lease_field: epoch.get(epoch_field)
+        for lease_field, epoch_field in _RECOVERY_LEASE_RENEWAL_FLOORS.items()
+    }
     if (
         type(expected_digest) is not str
         or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
         or expected_digest != current_digest
         or any(
             epoch.get(epoch_field) != current[lease_field]
-            for lease_field, epoch_field in _RECOVERY_LEASE_EPOCH_FIELDS.items()
+            for lease_field, epoch_field in _RECOVERY_LEASE_INCARNATION_FIELDS.items()
         )
         or epoch.get("owner_run_id") != current["owner_run_id"]
         or epoch.get("wallet_fingerprint_hash")
         != current["wallet_fingerprint_hash"]
         or epoch.get("network") != current["network"]
+        or type(captured_version) is not int
+        or captured_version < 1
+        or current["lease_version"] < captured_version
+    ):
+        raise ValueError("runtime recovery lease authority changed")
+    for field_name, captured in captured_renewal.items():
+        if (
+            type(captured) is not str
+            or _stability_timestamp(captured, field_name) != captured
+            or current[field_name] < captured
+        ):
+            raise ValueError("runtime recovery lease authority changed")
+    if current["lease_version"] == captured_version:
+        if any(
+            current[field_name] != captured
+            for field_name, captured in captured_renewal.items()
+        ):
+            raise ValueError("runtime recovery lease authority changed")
+    elif any(
+        current[field_name] <= captured
+        for field_name, captured in captured_renewal.items()
     ):
         raise ValueError("runtime recovery lease authority changed")
     if (

@@ -19,6 +19,7 @@ origin or token checks must preserve that invariant.
 """
 
 import os
+import re
 import sys
 import io
 import json
@@ -1836,9 +1837,14 @@ def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
                     or lease.get("network") != runtime.network
                     or type(lease.get("lease_version")) is not int
                     or lease["lease_version"] < 1
+                    or type(existing_epoch.get("lease_version")) is not int
+                    or existing_epoch["lease_version"] < 1
                 ):
                     raise
-                lease_version = lease["lease_version"]
+                # Recovery identity is bound to the captured lease incarnation,
+                # not its expected monotonic heartbeat renewals.  The database
+                # transaction below verifies the current renewal floors.
+                lease_version = existing_epoch["lease_version"]
             recovery_material = json.dumps(
                 {
                     "owner_run_id": runtime.run_id,
@@ -3333,25 +3339,69 @@ def _quarantine_runtime_request(payload: Any) -> dict:
 
 
 def _bounded_quarantine_json_request() -> tuple[Any, Optional[dict]]:
-    content_length = request.content_length
-    if type(content_length) is int and content_length > 16384:
+    maximum_bytes = 16384
+    raw_content_length = request.headers.get("Content-Length")
+    content_length = None
+    if raw_content_length is not None:
+        if (
+            type(raw_content_length) is not str
+            or not raw_content_length
+            or len(raw_content_length) > 5
+            or re.fullmatch(r"(?:0|[1-9][0-9]*)", raw_content_length) is None
+        ):
+            return None, {
+                "success": False,
+                "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+            }
+        content_length = int(raw_content_length)
+    if content_length is not None and content_length > maximum_bytes:
         return None, {
             "success": False,
             "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
         }
+
+    chunks = []
+    remaining = maximum_bytes + 1
     try:
-        raw = request.get_data(cache=True)
+        while remaining > 0:
+            chunk = request.stream.read(remaining)
+            if type(chunk) is not bytes:
+                return None, {
+                    "success": False,
+                    "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+                }
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                return None, {
+                    "success": False,
+                    "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+                }
+            chunks.append(chunk)
+            remaining -= len(chunk)
     except Exception:
         return None, {
             "success": False,
             "reason_code": "QUARANTINE_REQUEST_MALFORMED",
         }
-    if type(raw) is not bytes or len(raw) > 16384:
+    raw = b"".join(chunks)
+    if len(raw) > maximum_bytes:
         return None, {
             "success": False,
             "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
         }
-    return request.get_json(silent=True), None
+    if content_length is not None and len(raw) != content_length:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
+    try:
+        return json.loads(raw), None
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
 
 
 @app.route("/api/safety/quarantine", methods=["POST"])
