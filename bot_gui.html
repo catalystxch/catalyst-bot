@@ -10868,6 +10868,10 @@
                                     <span class="safety-diagnostics-value" id="safetyDiagnosticsLease">Unknown</span>
                                 </div>
                                 <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Wallet / network binding</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsBinding">Unknown</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
                                     <span class="safety-diagnostics-label">Durable records</span>
                                     <span class="safety-diagnostics-value" id="safetyDiagnosticsCounts">Registry — · Lineage — · Reserve — · Publication —</span>
                                 </div>
@@ -15266,6 +15270,7 @@
 
         // SAFETY_DIAGNOSTICS_BEGIN
         const SAFETY_DIAGNOSTICS_POLL_MS = 15000;
+        const SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS = 30;
         const SAFETY_DIAGNOSTICS_REASONS = Object.freeze({
             '': 'No blocker reported',
             STARTUP_RECOVERY_NOT_RUN: 'Startup recovery has not run',
@@ -15303,9 +15308,7 @@
             REVIEW_SAFETY_DIAGNOSTICS: 'Review safety diagnostics'
         });
         const SAFETY_DIAGNOSTICS_PROVENANCE = Object.freeze({
-            durable_snapshot: 'durable snapshot',
-            configured_binding: 'configured binding',
-            authorized_snapshot: 'authorized snapshot'
+            live_gate_and_durable_snapshot: 'live gate + durable snapshot'
         });
         const SAFETY_DIAGNOSTICS_OWNERS = Object.freeze({
             this_run: 'This CATalyst instance',
@@ -15314,6 +15317,7 @@
         let _safetyDiagnosticsTimer = null;
         let _safetyDiagnosticsPolling = false;
         let _safetyDiagnosticsActionPanel = null;
+        let _safetyDiagnosticsActionHandler = null;
         let _safetyDiagnosticsGeneration = 0;
         let _safetyDiagnosticsRequestInFlight = false;
 
@@ -15338,6 +15342,7 @@
             safetyDiagnosticsText('safetyDiagnosticsFreshness', 'Unknown / stale · unavailable');
             safetyDiagnosticsText('safetyDiagnosticsUnresolved', 'Unknown');
             safetyDiagnosticsText('safetyDiagnosticsLease', 'Unknown');
+            safetyDiagnosticsText('safetyDiagnosticsBinding', 'Unknown');
             safetyDiagnosticsText('safetyDiagnosticsCounts', 'Registry — · Lineage — · Reserve — · Publication —');
             safetyDiagnosticsText('safetyDiagnosticsAction', 'Review safety diagnostics');
             safetyDiagnosticsText(
@@ -15368,6 +15373,8 @@
                 && !Array.isArray(recovery.durable_counts) ? recovery.durable_counts : {};
             const blockerCounts = value.blocker_counts && typeof value.blocker_counts === 'object'
                 && !Array.isArray(value.blocker_counts) ? value.blocker_counts : {};
+            const identity = value.identity && typeof value.identity === 'object'
+                && !Array.isArray(value.identity) ? value.identity : {};
             const lease = value.lease && typeof value.lease === 'object' && !Array.isArray(value.lease)
                 ? value.lease : {};
             const registryCount = safetyDiagnosticsCount(durableCounts.registry);
@@ -15377,9 +15384,27 @@
             const operationCount = safetyDiagnosticsCount(value.blocking_operation_count);
             const reservationCount = safetyDiagnosticsCount(blockerCounts.reservations);
             const publicationBlockers = safetyDiagnosticsCount(blockerCounts.publication_claims);
-            const age = safetyDiagnosticsCount(freshness.age_seconds);
-            const provenanceKnown = typeof freshness.provenance === 'string'
-                && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_PROVENANCE, freshness.provenance);
+            const reportedAge = safetyDiagnosticsCount(freshness.age_seconds);
+            const observedAtFormatKnown = typeof freshness.observed_at_utc === 'string'
+                && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(freshness.observed_at_utc);
+            const observedAtMillis = observedAtFormatKnown
+                ? Date.parse(freshness.observed_at_utc)
+                : NaN;
+            const observedAtKnown = Number.isFinite(observedAtMillis)
+                && new Date(observedAtMillis).toISOString()
+                    === `${freshness.observed_at_utc.slice(0, 23)}Z`;
+            const elapsedMillis = observedAtKnown
+                ? Date.now() - observedAtMillis
+                : -1;
+            const age = elapsedMillis >= 0
+                ? safetyDiagnosticsCount(Math.floor(elapsedMillis / 1000))
+                : null;
+            const provenanceKnown = freshness.provenance === 'live_gate_and_durable_snapshot';
+            const freshnessContractKnown = reportedAge === 0
+                && freshness.max_age_seconds === SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS
+                && freshness.valid === true && observedAtKnown && age !== null && provenanceKnown;
+            const freshnessCurrent = freshnessContractKnown
+                && age <= SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS;
             const ownerKnown = typeof lease.owner === 'string'
                 && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_OWNERS, lease.owner);
             const leaseVersion = safetyDiagnosticsCount(lease.version);
@@ -15387,14 +15412,22 @@
                 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(lease.expires_at);
             const actionKnown = typeof value.recommended_action === 'string'
                 && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_ACTIONS, value.recommended_action);
+            const fingerprintKnown = typeof identity.wallet_fingerprint === 'string'
+                && /^sha256:[0-9a-f]{12}…$/.test(identity.wallet_fingerprint);
+            const networkKnown = typeof identity.network === 'string'
+                && identity.network !== 'unknown'
+                && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(identity.network);
+            const bindingKnown = fingerprintKnown && networkKnown;
             const complete = reasonKnown && sourceKnown
                 && registryCount !== null && lineageCount !== null
                 && reserveCount !== null && publicationCount !== null
                 && operationCount !== null && reservationCount !== null && publicationBlockers !== null
-                && age !== null && provenanceKnown && typeof lease.active === 'boolean'
+                && freshnessContractKnown && typeof lease.active === 'boolean'
                 && leaseVersion !== null && actionKnown
+                && bindingKnown
                 && (!lease.active || (ownerKnown && expiryKnown));
-            const allowed = complete && value.allowed === true && value.reason_code === '';
+            const allowed = complete && freshnessCurrent
+                && value.allowed === true && value.reason_code === '';
 
             panel.classList.toggle('is-allowed', allowed);
             panel.classList.toggle('is-blocked', !allowed);
@@ -15403,13 +15436,15 @@
                 'safetyDiagnosticsReason',
                 reasonKnown
                     ? (Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_REASONS, value.reason_code)
-                        ? SAFETY_DIAGNOSTICS_REASONS[value.reason_code]
+                        ? (value.reason_code
+                            ? `${value.reason_code} — ${SAFETY_DIAGNOSTICS_REASONS[value.reason_code]}`
+                            : SAFETY_DIAGNOSTICS_REASONS[value.reason_code])
                         : value.reason_code)
                     : 'Unknown safety status'
             );
             safetyDiagnosticsText(
                 'safetyDiagnosticsFreshness',
-                age !== null && provenanceKnown
+                freshnessContractKnown
                     ? `${age}s old · ${SAFETY_DIAGNOSTICS_PROVENANCE[freshness.provenance]}`
                     : 'Unknown / stale · unavailable'
             );
@@ -15428,6 +15463,12 @@
                         : 'Unknown'
             );
             safetyDiagnosticsText(
+                'safetyDiagnosticsBinding',
+                bindingKnown
+                    ? `Wallet ${identity.wallet_fingerprint} · Network ${identity.network}`
+                    : 'Unknown'
+            );
+            safetyDiagnosticsText(
                 'safetyDiagnosticsCounts',
                 registryCount !== null && lineageCount !== null
                     && reserveCount !== null && publicationCount !== null
@@ -15440,7 +15481,11 @@
             );
             safetyDiagnosticsText(
                 'safetyDiagnosticsError',
-                complete ? '' : 'Status incomplete / stale — mutations remain blocked.'
+                complete && freshnessCurrent
+                    ? ''
+                    : freshnessContractKnown && !freshnessCurrent
+                        ? 'Status stale — mutations remain blocked.'
+                        : 'Status incomplete / stale — mutations remain blocked.'
             );
         }
 
@@ -15492,6 +15537,14 @@
         }
 
         function stopSafetyDiagnosticsPolling() {
+            if (_safetyDiagnosticsActionPanel && _safetyDiagnosticsActionHandler) {
+                _safetyDiagnosticsActionPanel.removeEventListener(
+                    'click',
+                    _safetyDiagnosticsActionHandler
+                );
+            }
+            _safetyDiagnosticsActionPanel = null;
+            _safetyDiagnosticsActionHandler = null;
             if (!_safetyDiagnosticsPolling && _safetyDiagnosticsTimer === null) return;
             _safetyDiagnosticsPolling = false;
             _safetyDiagnosticsGeneration += 1;
@@ -15504,7 +15557,7 @@
         function installSafetyDiagnosticsActions() {
             const panel = document.getElementById('safetyDiagnosticsPanel');
             if (!panel || _safetyDiagnosticsActionPanel === panel) return;
-            panel.addEventListener('click', (event) => {
+            _safetyDiagnosticsActionHandler = (event) => {
                 const button = event.target && typeof event.target.closest === 'function'
                     ? event.target.closest('button[data-safety-action]')
                     : null;
@@ -15512,7 +15565,8 @@
                 if (button.getAttribute('data-safety-action') === 'refresh') {
                     refreshSafetyDiagnosticsStatus();
                 }
-            });
+            };
+            panel.addEventListener('click', _safetyDiagnosticsActionHandler);
             _safetyDiagnosticsActionPanel = panel;
         }
         // SAFETY_DIAGNOSTICS_END

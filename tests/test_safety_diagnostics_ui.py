@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,7 +99,9 @@ def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(monk
 
     _install_status_fakes(monkeypatch, api_server)
 
+    before = datetime.now(timezone.utc)
     response = api_server.app.test_client().get("/api/safety/status")
+    after = datetime.now(timezone.utc)
 
     assert response.status_code == 200
     body = response.get_json()
@@ -119,9 +122,22 @@ def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(monk
         "freshness",
         "durable_counts",
     }
-    assert safety["recovery"]["freshness"] == {
-        "age_seconds": 7,
-        "provenance": "authorized_snapshot",
+    freshness = safety["recovery"]["freshness"]
+    assert set(freshness) == {
+        "observed_at_utc",
+        "age_seconds",
+        "max_age_seconds",
+        "provenance",
+        "valid",
+    }
+    observed = datetime.fromisoformat(freshness["observed_at_utc"].replace("Z", "+00:00"))
+    assert before <= observed <= after
+    assert freshness == {
+        "observed_at_utc": freshness["observed_at_utc"],
+        "age_seconds": 0,
+        "max_age_seconds": 30,
+        "provenance": "live_gate_and_durable_snapshot",
+        "valid": True,
     }
     assert safety["recovery"]["durable_counts"] == {
         "registry": 3,
@@ -213,8 +229,11 @@ def test_malformed_internal_status_fails_closed_to_allowlisted_values(monkeypatc
     assert safety["recovery"]["failed_check"] == "startup_recovery"
     assert safety["recovery"]["checks"] == []
     assert safety["recovery"]["freshness"] == {
+        "observed_at_utc": None,
         "age_seconds": None,
+        "max_age_seconds": 30,
         "provenance": "unavailable",
+        "valid": False,
     }
     assert safety["recovery"]["durable_counts"] == {
         "registry": 0,
@@ -487,6 +506,7 @@ def test_panel_is_semantic_blocked_while_unknown_and_has_only_fixed_actions():
         "safetyDiagnosticsFreshness",
         "safetyDiagnosticsUnresolved",
         "safetyDiagnosticsLease",
+        "safetyDiagnosticsBinding",
         "safetyDiagnosticsCounts",
         "safetyDiagnosticsAction",
         "safetyDiagnosticsError",
@@ -541,6 +561,10 @@ class FakeElement {
     if (!this.listeners[type]) this.listeners[type] = [];
     this.listeners[type].push(callback);
   }
+  removeEventListener(type, callback) {
+    if (!this.listeners[type]) return;
+    this.listeners[type] = this.listeners[type].filter(item => item !== callback);
+  }
   setAttribute(name, value) { this.attrs[name] = String(value); }
   getAttribute(name) { return this.attrs[name] ?? null; }
   contains(element) { return element === this || element.panel === this; }
@@ -548,7 +572,7 @@ class FakeElement {
 const ids = [
   'safetyDiagnosticsPanel', 'safetyDiagnosticsState', 'safetyDiagnosticsReason',
   'safetyDiagnosticsFreshness', 'safetyDiagnosticsUnresolved',
-  'safetyDiagnosticsLease', 'safetyDiagnosticsCounts',
+  'safetyDiagnosticsLease', 'safetyDiagnosticsBinding', 'safetyDiagnosticsCounts',
   'safetyDiagnosticsAction', 'safetyDiagnosticsError',
   'safetyDiagnosticsRefresh'
 ];
@@ -624,16 +648,24 @@ def test_canonical_extensible_reason_code_remains_operator_visible():
     """Catches legitimate new latch blockers being collapsed into unknown UI copy."""
     _run_node(
         r"""
+Date.now = () => Date.parse('2026-08-21T12:00:05.000Z');
 renderSafetyDiagnosticsStatus({
   allowed: false,
   reason_code: 'RUNTIME_DISCONTINUITY',
   source: 'durable_latch',
   blocking_operation_count: 1,
   blocker_counts: { operations: 1, reservations: 0, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:00:30.000000Z' },
   recovery: {
     failed_check: 'authority_revalidation',
-    freshness: { age_seconds: 3, provenance: 'authorized_snapshot' },
+    freshness: {
+      observed_at_utc: '2026-08-21T12:00:00.000000Z',
+      age_seconds: 0,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
     durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
   },
   recommended_action: 'REVIEW_SAFETY_DIAGNOSTICS'
@@ -641,6 +673,181 @@ renderSafetyDiagnosticsStatus({
 assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
 assert.strictEqual(elements.safetyDiagnosticsReason.textContent, 'RUNTIME_DISCONTINUITY');
 assert.strictEqual(elements.safetyDiagnosticsError.textContent, '');
+"""
+    )
+
+
+def test_recognized_reason_keeps_exact_stable_code_visible():
+    """Catches friendly copy replacing the stable operator reason code."""
+    _run_node(
+        r"""
+Date.now = () => Date.parse('2026-08-21T12:00:05.000Z');
+renderSafetyDiagnosticsStatus({
+  allowed: false,
+  reason_code: 'UNRESOLVED_OPERATIONS',
+  source: 'operation_journal',
+  blocking_operation_count: 2,
+  blocker_counts: { operations: 2, reservations: 1, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
+  recovery: {
+    failed_check: 'unresolved_operations',
+    freshness: {
+      observed_at_utc: '2026-08-21T12:00:00.000000Z',
+      age_seconds: 0,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
+    durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
+  },
+  recommended_action: 'RUN_AUTHORITATIVE_RECONCILIATION'
+});
+assert.strictEqual(
+  elements.safetyDiagnosticsReason.textContent,
+  'UNRESOLVED_OPERATIONS — Unresolved operations require review'
+);
+"""
+    )
+
+
+def test_stale_current_authority_observation_is_visibly_blocked():
+    """Catches an old but otherwise valid cached payload remaining green."""
+    _run_node(
+        r"""
+Date.now = () => Date.parse('2026-08-21T12:01:00.000Z');
+renderSafetyDiagnosticsStatus({
+  allowed: true,
+  reason_code: '',
+  source: 'lease',
+  blocking_operation_count: 0,
+  blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
+  recovery: {
+    failed_check: null,
+    freshness: {
+      observed_at_utc: '2026-08-21T12:00:00.000000Z',
+      age_seconds: 0,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
+    durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
+  },
+  recommended_action: 'NONE'
+});
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
+assert.strictEqual(elements.safetyDiagnosticsFreshness.textContent, '60s old · live gate + durable snapshot');
+assert.ok(elements.safetyDiagnosticsError.textContent.includes('stale'));
+assert.ok(elements.safetyDiagnosticsPanel.classList.values.has('is-blocked'));
+assert.ok(!elements.safetyDiagnosticsPanel.classList.values.has('is-allowed'));
+"""
+    )
+
+
+def test_nonexistent_utc_observation_date_fails_closed():
+    """Catches format-shaped but noncanonical UTC dates being treated as fresh."""
+    _run_node(
+        r"""
+Date.now = () => Date.parse('2026-03-03T12:00:05.000Z');
+renderSafetyDiagnosticsStatus({
+  allowed: true,
+  reason_code: '',
+  source: 'lease',
+  blocking_operation_count: 0,
+  blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-03-03T12:02:00.000000Z' },
+  recovery: {
+    failed_check: null,
+    freshness: {
+      observed_at_utc: '2026-02-31T12:00:00.000000Z',
+      age_seconds: 0,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
+    durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
+  },
+  recommended_action: 'NONE'
+});
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
+assert.strictEqual(elements.safetyDiagnosticsFreshness.textContent, 'Unknown / stale · unavailable');
+"""
+    )
+
+
+def test_inconsistent_reported_freshness_age_fails_closed():
+    """Catches a bounded but contradictory server age being accepted as fresh."""
+    _run_node(
+        r"""
+Date.now = () => Date.parse('2026-08-21T12:00:05.000Z');
+renderSafetyDiagnosticsStatus({
+  allowed: true,
+  reason_code: '',
+  source: 'lease',
+  blocking_operation_count: 0,
+  blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
+  recovery: {
+    failed_check: null,
+    freshness: {
+      observed_at_utc: '2026-08-21T12:00:00.000000Z',
+      age_seconds: 36000,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
+    durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
+  },
+  recommended_action: 'NONE'
+});
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
+assert.strictEqual(elements.safetyDiagnosticsFreshness.textContent, 'Unknown / stale · unavailable');
+"""
+    )
+
+
+def test_redacted_wallet_network_binding_is_rendered_and_required():
+    """Catches the API binding being omitted from the operator panel."""
+    _run_node(
+        r"""
+Date.now = () => Date.parse('2026-08-21T12:00:05.000Z');
+const safety = {
+  allowed: true,
+  reason_code: '',
+  source: 'lease',
+  blocking_operation_count: 0,
+  blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
+  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
+  recovery: {
+    failed_check: null,
+    freshness: {
+      observed_at_utc: '2026-08-21T12:00:00.000000Z',
+      age_seconds: 0,
+      max_age_seconds: 30,
+      provenance: 'live_gate_and_durable_snapshot',
+      valid: true
+    },
+    durable_counts: { registry: 2, lineage: 1, reserve: 1, publication: 0 }
+  },
+  recommended_action: 'NONE'
+};
+renderSafetyDiagnosticsStatus(safety);
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Allowed');
+assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Wallet sha256:ffffffffffff… · Network mainnet');
+safety.identity = { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'unknown', lease_owner: 'this_run' };
+renderSafetyDiagnosticsStatus(safety);
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
+assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Unknown');
+safety.identity = { wallet_fingerprint: '<img onerror=alert(1)>', network: 'mainnet<script>', lease_owner: 'this_run' };
+renderSafetyDiagnosticsStatus(safety);
+assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
+assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Unknown');
+assert.ok(!elements.safetyDiagnosticsBinding.textContent.includes('<'));
 """
     )
 
@@ -683,6 +890,15 @@ def test_listener_and_bounded_polling_are_idempotent_and_do_not_retry_mutations(
   stopSafetyDiagnosticsPolling();
   stopSafetyDiagnosticsPolling();
   assert.strictEqual(clearCalls, 1);
+  assert.strictEqual(elements.safetyDiagnosticsPanel.listeners.click.length, 0);
+  startSafetyDiagnosticsPolling();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.strictEqual(elements.safetyDiagnosticsPanel.listeners.click.length, 1);
+  assert.strictEqual(apiCalls, 2);
+  assert.strictEqual(timeoutCalls, 2);
+  stopSafetyDiagnosticsPolling();
+  assert.strictEqual(clearCalls, 2);
+  assert.strictEqual(elements.safetyDiagnosticsPanel.listeners.click.length, 0);
   const replacementPanel = new FakeElement('safetyDiagnosticsPanel');
   elements.safetyDiagnosticsPanel = replacementPanel;
   installSafetyDiagnosticsActions();

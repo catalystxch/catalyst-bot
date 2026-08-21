@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 
@@ -140,9 +141,15 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     }
     assert safety["recommended_action"] == "RUN_AUTHORITATIVE_RECONCILIATION"
     assert safety["recovery"]["failed_check"] == "unresolved_operations"
-    assert safety["recovery"]["freshness"] == {
-        "age_seconds": 6,
-        "provenance": "durable_snapshot",
+    freshness = safety["recovery"]["freshness"]
+    observed = datetime.fromisoformat(freshness["observed_at_utc"].replace("Z", "+00:00"))
+    assert 0 <= (datetime.now(timezone.utc) - observed).total_seconds() < 2
+    assert freshness == {
+        "observed_at_utc": freshness["observed_at_utc"],
+        "age_seconds": 0,
+        "max_age_seconds": 30,
+        "provenance": "live_gate_and_durable_snapshot",
+        "valid": True,
     }
     assert safety["recovery"]["durable_counts"] == expected_counts
     assert safety["lease"]["owner"] == "other_run"
@@ -211,7 +218,16 @@ def test_app_bridge_safety_status_matches_api_exactly(monkeypatch):
     result = app_bridge.AppBridge().get_safety_status()
 
     assert type(result) is dict
+    expected_observed = expected["safety"]["recovery"]["freshness"].pop(
+        "observed_at_utc"
+    )
+    result_observed = result["safety"]["recovery"]["freshness"].pop(
+        "observed_at_utc"
+    )
     assert result == expected
+    for observed_at in (expected_observed, result_observed):
+        observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        assert 0 <= (datetime.now(timezone.utc) - observed).total_seconds() < 2
 
 
 def test_app_bridge_safety_status_never_raises(monkeypatch):

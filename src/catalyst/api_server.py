@@ -1253,6 +1253,7 @@ _STABILITY_EMPTY_DURABLE_COUNTS = {
     "reserve": 0,
     "publication": 0,
 }
+_STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS = 30
 
 
 def _bounded_stability_count(value: Any) -> int:
@@ -1485,24 +1486,16 @@ def get_public_stability_status() -> dict:
     if not counts_valid:
         malformed = True
 
-    freshness_check = next(
-        (item for item in public_checks if item["name"] == "authority_revalidation"),
-        None,
-    )
-    if freshness_check is None:
-        age_checks = [item for item in public_checks if item["source_age_seconds"] is not None]
-        freshness_check = max(
-            age_checks,
-            key=lambda item: item["source_age_seconds"],
-            default=None,
-        )
+    # This observation is taken only after both per-request authority reads:
+    # the live mutation gate snapshot and the fixed durable-count aggregate.
+    # It deliberately does not relabel the static startup-check ages as fresh.
+    observed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     freshness = {
-        "age_seconds": (
-            freshness_check["source_age_seconds"] if freshness_check is not None else None
-        ),
-        "provenance": (
-            freshness_check["source"] if freshness_check is not None else "unavailable"
-        ),
+        "observed_at_utc": observed_at_utc,
+        "age_seconds": 0,
+        "max_age_seconds": _STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS,
+        "provenance": "live_gate_and_durable_snapshot",
+        "valid": True,
     }
 
     if malformed:
@@ -1520,7 +1513,13 @@ def get_public_stability_status() -> dict:
         failed_check = "startup_recovery"
         public_checks = []
         source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
-        freshness = {"age_seconds": None, "provenance": "unavailable"}
+        freshness = {
+            "observed_at_utc": None,
+            "age_seconds": None,
+            "max_age_seconds": _STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS,
+            "provenance": "unavailable",
+            "valid": False,
+        }
         durable_counts = dict(_STABILITY_EMPTY_DURABLE_COUNTS)
         blocker_counts = {key: 0 for key in _STABILITY_BLOCKER_COUNT_KEYS}
 
