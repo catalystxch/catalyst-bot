@@ -18,10 +18,18 @@ import time
 import hashlib
 import requests
 import threading
+import uuid
 from typing import Dict, List, Optional
 
 from config import cfg
-from database import update_offer_dexie, log_event
+from database import (
+    claim_publication_outbox,
+    complete_publication_outbox,
+    log_event,
+    retry_publication_outbox,
+    update_offer_dexie,
+)
+from publication_outbox import retry_timestamp
 
 
 _offer_detail_cache: Dict[str, Dict] = {}
@@ -50,6 +58,9 @@ class DexieManager:
 
         # Lock for thread safety
         self._lock = threading.Lock()
+        self._durable_outbox_owner: Optional[str] = None
+        self._durable_now_provider = None
+        self._durable_lease_expires_provider = None
 
         # Rate limit cooldown (epoch time until which we skip Dexie calls)
         self._rate_limited_until: float = 0.0
@@ -74,6 +85,102 @@ class DexieManager:
     # -------------------------------------------------------------------
     # Queue management
     # -------------------------------------------------------------------
+
+    def enable_durable_outbox(
+        self, *, owner_run_id: str, now_provider, lease_expires_provider
+    ) -> None:
+        """Route subsequent flushes through committed publication claims."""
+
+        if type(owner_run_id) is not str or not owner_run_id.strip():
+            raise ValueError("owner_run_id must be exact non-empty text")
+        if not callable(now_provider) or not callable(lease_expires_provider):
+            raise TypeError("durable outbox timestamp providers must be callable")
+        self._durable_outbox_owner = owner_run_id.strip()
+        self._durable_now_provider = now_provider
+        self._durable_lease_expires_provider = lease_expires_provider
+
+    def _flush_durable_outbox(self, flush_all: bool) -> Dict:
+        limit = 500 if flush_all else int(cfg.MAX_POSTS_PER_LOOP)
+        posted = failed = skipped = requeued = 0
+        for _index in range(max(1, limit)):
+            observed_at = self._durable_now_provider()
+            claim = claim_publication_outbox(
+                publisher="dexie",
+                owner_run_id=self._durable_outbox_owner,
+                claim_token=uuid.uuid4().hex,
+                claimed_at=observed_at,
+                claim_expires_at=self._durable_lease_expires_provider(observed_at),
+            )
+            if claim is None:
+                break
+            offer_bech32 = claim.get("offer_bech32")
+            trade_id = claim.get("trade_id")
+            if offer_bech32:
+                result = self._post_single(
+                    offer_bech32,
+                    trade_id,
+                    True,
+                    idempotency_key=claim["idempotency_key"],
+                )
+            else:
+                result = {"success": False, "error": "offer_reference_unavailable"}
+            effect_completed_at = self._durable_now_provider()
+            provider_id = result.get("dexie_id") or result.get(
+                "provider_response_id"
+            )
+            if result.get("success") is True and provider_id:
+                completed = complete_publication_outbox(
+                    publication_id=claim["publication_id"],
+                    owner_run_id=claim["claim_owner_run_id"],
+                    claim_token=claim["claim_token"],
+                    claim_generation=claim["claim_generation"],
+                    expected_row_version=claim["row_version"],
+                    acknowledgement_json={
+                        "provider_response_id": str(provider_id),
+                        "idempotency_key": claim["idempotency_key"],
+                    },
+                    completed_at=effect_completed_at,
+                )
+                if completed is not None:
+                    posted += 1
+                    self._total_posted += 1
+                else:
+                    failed += 1
+            else:
+                retried = retry_publication_outbox(
+                    publication_id=claim["publication_id"],
+                    owner_run_id=claim["claim_owner_run_id"],
+                    claim_token=claim["claim_token"],
+                    claim_generation=claim["claim_generation"],
+                    expected_row_version=claim["row_version"],
+                    error_json={
+                        "code": "AMBIGUOUS_REMOTE_RESPONSE"
+                        if result.get("success") is True
+                        else "REMOTE_PUBLICATION_FAILED",
+                        "error": result.get("error") or "provider acknowledgement missing",
+                    },
+                    retry_at=retry_timestamp(
+                        effect_completed_at, claim["attempt_count"]
+                    ),
+                    updated_at=effect_completed_at,
+                )
+                failed += 1
+                self._total_failed += 1
+                if retried is not None:
+                    requeued += 1
+            if trade_id:
+                with self._lock:
+                    self._queue = [
+                        item
+                        for item in self._queue
+                        if item.get("trade_id") != trade_id
+                    ]
+        return {
+            "posted": posted,
+            "failed": failed,
+            "skipped": skipped,
+            "requeued": requeued,
+        }
 
     def queue_post(self, offer_bech32: str, trade_id: str = None, force: bool = False):
         """Queue an offer for posting to Dexie.
@@ -166,6 +273,8 @@ class DexieManager:
         """
         if not cfg.DEXIE_POST_ENABLED:
             return {"posted": 0, "failed": 0, "skipped": 0, "disabled": True}
+        if self._durable_outbox_owner is not None:
+            return self._flush_durable_outbox(flush_all)
 
         # Grab items from queue
         with self._lock:
@@ -282,7 +391,11 @@ class DexieManager:
     # -------------------------------------------------------------------
 
     def _post_single(
-        self, offer_bech32: str, trade_id: str = None, force: bool = False
+        self,
+        offer_bech32: str,
+        trade_id: str = None,
+        force: bool = False,
+        idempotency_key: str = None,
     ) -> Dict:
         """Post a single offer to Dexie with retries.
 
@@ -322,6 +435,8 @@ class DexieManager:
             "accept": "application/json",
             "x-bot-tag": cfg.BOT_TAG,
         }
+        if idempotency_key:
+            headers["idempotency-key"] = idempotency_key
 
         last_err = None
         _permanent = False  # Set True for HTTP 4xx — don't requeue

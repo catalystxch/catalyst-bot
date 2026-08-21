@@ -3218,9 +3218,18 @@ CREATE TABLE IF NOT EXISTS publication_outbox (
                         'suppressed', 'unresolved', 'failed')),
     attempt_count               INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     claim_owner_run_id          TEXT,
+    claim_token                 TEXT,
+    claim_generation            INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0),
     claim_expires_at            TEXT,
     next_attempt_at             TEXT,
+    payload_sha256              TEXT NOT NULL,
     last_error_json             TEXT,
+    last_error_sha256           TEXT,
+    acknowledgement_json        TEXT,
+    acknowledgement_sha256      TEXT,
+    suppression_json            TEXT,
+    suppression_sha256          TEXT,
+    row_version                 INTEGER NOT NULL DEFAULT 0 CHECK(row_version >= 0),
     queued_at                   TEXT NOT NULL,
     succeeded_at                TEXT,
     terminal_at                 TEXT,
@@ -3669,9 +3678,18 @@ _STABILITY_REQUIRED_COLUMNS = {
         "state",
         "attempt_count",
         "claim_owner_run_id",
+        "claim_token",
+        "claim_generation",
         "claim_expires_at",
         "next_attempt_at",
+        "payload_sha256",
         "last_error_json",
+        "last_error_sha256",
+        "acknowledgement_json",
+        "acknowledgement_sha256",
+        "suppression_json",
+        "suppression_sha256",
+        "row_version",
         "queued_at",
         "succeeded_at",
         "terminal_at",
@@ -5085,6 +5103,46 @@ def _migrate_stability_schema() -> None:
             conn.execute(
                 "ALTER TABLE offer_refresh_lineage_blockers "
                 "ADD COLUMN snapshot_material_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        publication_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(publication_outbox)"
+            ).fetchall()
+        }
+        publication_column_upgrades = {
+            "claim_token": "TEXT",
+            "claim_generation": "INTEGER NOT NULL DEFAULT 0",
+            "payload_sha256": "TEXT",
+            "last_error_sha256": "TEXT",
+            "acknowledgement_json": "TEXT",
+            "acknowledgement_sha256": "TEXT",
+            "suppression_json": "TEXT",
+            "suppression_sha256": "TEXT",
+            "row_version": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, column_sql in publication_column_upgrades.items():
+            if column_name not in publication_columns:
+                conn.execute(
+                    f"ALTER TABLE publication_outbox ADD COLUMN "
+                    f"{column_name} {column_sql}"
+                )
+        for publication_row in conn.execute(
+            "SELECT publication_id,payload_json,last_error_json "
+            "FROM publication_outbox"
+        ).fetchall():
+            payload_text = str(publication_row["payload_json"])
+            error_text = publication_row["last_error_json"]
+            conn.execute(
+                "UPDATE publication_outbox SET payload_sha256=?, "
+                "last_error_sha256=? WHERE publication_id=?",
+                (
+                    hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+                    hashlib.sha256(str(error_text).encode("utf-8")).hexdigest()
+                    if error_text is not None
+                    else None,
+                    publication_row["publication_id"],
+                ),
             )
         _upgrade_offer_fill_boost_command_guard(conn)
         _upgrade_offer_intent_slot_indexes(conn)
@@ -20365,6 +20423,104 @@ def get_offer_intent_coin_reservations(intent_id: str) -> List[Dict[str, Any]]:
     return result
 
 
+def _bounded_publication_evidence(value: Any, label: str) -> tuple[str, str]:
+    """Redact and digest one bounded publication evidence object."""
+
+    from publication_outbox import redact_publication_evidence
+
+    redacted = redact_publication_evidence(value)
+    canonical = _canonical_json_text(
+        redacted,
+        label,
+        expected_type=dict,
+        default={},
+        max_bytes=16384,
+    )
+    return canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _insert_confirmed_publication_rows(
+    conn: sqlite3.Connection,
+    *,
+    intent: Dict[str, Any],
+    trade_id: str,
+    offer_fingerprint: str,
+    queued_at: str,
+) -> str:
+    """Insert both provider epochs inside the creation-confirmation transaction."""
+
+    from publication_outbox import canonical_publication_identity
+
+    generation = _exact_integer(intent["generation"], "generation")
+    network = _required_stability_text(intent["network"], "network")
+    base_identity = canonical_publication_identity(
+        network, offer_fingerprint, str(generation)
+    )
+    payload_json = _canonical_json_text(
+        {"offer_ref": trade_id},
+        "publication payload",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    for publisher in ("dexie", "splash"):
+        identity = canonical_publication_identity(
+            network,
+            offer_fingerprint,
+            f"{generation}:{publisher}",
+        )
+        publication_id = "publication:" + hashlib.sha256(
+            identity.idempotency_key.encode("utf-8")
+        ).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM publication_outbox WHERE idempotency_key=? OR "
+            "(network=? AND offer_fingerprint=? AND publication_epoch=?)",
+            (
+                identity.idempotency_key,
+                identity.network,
+                identity.offer_fingerprint,
+                identity.publication_epoch,
+            ),
+        ).fetchone()
+        if existing is not None:
+            current = dict(existing)
+            if any(
+                current[column] != expected
+                for column, expected in {
+                    "intent_id": intent["intent_id"],
+                    "publisher": publisher,
+                    "payload_json": payload_json,
+                    "payload_sha256": payload_sha256,
+                }.items()
+            ):
+                raise ValueError("confirmed publication identity conflicts")
+            continue
+        conn.execute(
+            """
+            INSERT INTO publication_outbox (
+                publication_id,idempotency_key,intent_id,network,
+                offer_fingerprint,publication_epoch,publisher,payload_json,
+                payload_sha256,state,attempt_count,claim_generation,row_version,
+                queued_at,updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, 0, ?, ?)
+            """,
+            (
+                publication_id,
+                identity.idempotency_key,
+                intent["intent_id"],
+                identity.network,
+                identity.offer_fingerprint,
+                identity.publication_epoch,
+                publisher,
+                payload_json,
+                payload_sha256,
+                queued_at,
+                queued_at,
+            ),
+        )
+    return base_identity.idempotency_key
+
+
 def finalize_offer_intent(
     *,
     intent_id: str,
@@ -20437,13 +20593,14 @@ def finalize_offer_intent(
     )
     trade_id = _optional_stability_text(sage_trade_id)
     offer_hash = _optional_stability_text(offer_text_sha256)
-    publication = _optional_stability_text(publication_identity)
+    requested_publication = _optional_stability_text(publication_identity)
     child = _optional_stability_text(child_intent_id)
     is_confirmed = matrix_key == ("created", "CONFIRMED")
     if is_confirmed and (trade_id is None or offer_hash is None):
         raise ValueError("confirmed creation requires a Sage trade ID and offer hash")
     if not is_confirmed and any(
-        value is not None for value in (trade_id, offer_hash, publication, child)
+        value is not None
+        for value in (trade_id, offer_hash, requested_publication, child)
     ):
         raise ValueError("only confirmed creation may commit offer identity")
     if not is_confirmed and journal["reason_code"] is None:
@@ -20457,6 +20614,15 @@ def finalize_offer_intent(
         if current is None:
             raise ValueError("intent_id does not exist")
         current_dict = dict(current)
+        publication = requested_publication
+        if is_confirmed and publication is None:
+            from publication_outbox import canonical_publication_identity
+
+            publication = canonical_publication_identity(
+                current_dict["network"],
+                offer_hash,
+                str(_exact_integer(current_dict["generation"], "generation")),
+            ).idempotency_key
         existing_event = conn.execute(
             "SELECT event_id FROM offer_operation_journal WHERE event_id=?",
             (journal["event_id"],),
@@ -20470,6 +20636,14 @@ def finalize_offer_intent(
                 or current_dict["child_intent_id"] != child
             ):
                 raise ValueError("event_id already finalized a different intent state")
+            if is_confirmed:
+                _insert_confirmed_publication_rows(
+                    conn,
+                    intent=current_dict,
+                    trade_id=trade_id,
+                    offer_fingerprint=offer_hash,
+                    queued_at=final_time,
+                )
             conn.commit()
             return current_dict
         source_state = current_dict["lifecycle_state"]
@@ -20601,6 +20775,14 @@ def finalize_offer_intent(
                 for coin_id in registry_coin_ids
             ):
                 raise RuntimeError("offer intent selected coin reservation is not held")
+        if is_confirmed:
+            _insert_confirmed_publication_rows(
+                conn,
+                intent=current_dict,
+                trade_id=trade_id,
+                offer_fingerprint=offer_hash,
+                queued_at=final_time,
+            )
         _insert_offer_operation_event(conn, journal)
         conn.commit()
         row = conn.execute(
@@ -21609,6 +21791,16 @@ def commit_offer_reconciliation(
             raise ValueError(
                 "offer intent state changed during terminal reconciliation"
             )
+        _suppress_publication_outbox_rows(
+            conn,
+            intent_id=safe_intent_id,
+            proof_json={
+                "terminal_event_id": event["event_id"],
+                "outcome": safe_classification,
+                "evidence_sha256": expected_digest,
+            },
+            suppressed_at=when,
+        )
         _insert_authoritative_coin_outcomes(
             conn,
             intent_id=safe_intent_id,
@@ -24114,20 +24306,41 @@ def enqueue_publication_outbox(
 ) -> Dict[str, Any]:
     """Queue one publication identity or return its exact idempotent row."""
 
+    from publication_outbox import canonical_publication_identity
+
     queued = _stability_timestamp_or_now(queued_at, "queued_at")
+    identity = canonical_publication_identity(
+        network, offer_fingerprint, publication_epoch
+    )
+    supplied_key = _required_stability_text(idempotency_key, "idempotency_key")
+    if supplied_key != identity.idempotency_key:
+        raise ValueError("idempotency_key does not match the canonical identity")
+    safe_publisher = _required_stability_text(publisher, "publisher")
+    if safe_publisher not in {"dexie", "splash"}:
+        raise ValueError("publisher is not canonical")
+    payload_text = _canonical_json_text(
+        payload_json,
+        "payload_json",
+        expected_type=dict,
+        default={},
+        max_bytes=4096,
+    )
+    payload_value = json.loads(payload_text)
+    if any(
+        type(value) is str and value.lower().startswith("offer1")
+        for value in payload_value.values()
+    ):
+        raise ValueError("publication payload must reference, not contain, an offer")
     values = {
         "publication_id": _required_stability_text(publication_id, "publication_id"),
-        "idempotency_key": _required_stability_text(idempotency_key, "idempotency_key"),
+        "idempotency_key": identity.idempotency_key,
         "intent_id": _optional_stability_text(intent_id),
-        "network": _required_stability_text(network, "network"),
-        "offer_fingerprint": _required_stability_text(
-            offer_fingerprint, "offer_fingerprint"
-        ),
-        "publication_epoch": _required_stability_text(
-            publication_epoch, "publication_epoch"
-        ),
-        "publisher": _required_stability_text(publisher, "publisher"),
-        "payload_json": _canonical_json_text(payload_json, "payload_json", default={}),
+        "network": identity.network,
+        "offer_fingerprint": identity.offer_fingerprint,
+        "publication_epoch": identity.publication_epoch,
+        "publisher": safe_publisher,
+        "payload_json": payload_text,
+        "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
         "queued_at": queued,
     }
     conn = _stability_connection()
@@ -24164,17 +24377,34 @@ def enqueue_publication_outbox(
             ):
                 conn.commit()
                 return {"queued": False, "idempotent": True, "record": row}
+            error_json, error_sha256 = _bounded_publication_evidence(
+                {"code": "PUBLICATION_IDEMPOTENCY_CONFLICT"},
+                "publication conflict",
+            )
+            conn.execute(
+                """
+                UPDATE publication_outbox
+                SET state='unresolved', claim_owner_run_id=NULL, claim_token=NULL,
+                    claim_expires_at=NULL, last_error_json=?, last_error_sha256=?,
+                    row_version=row_version+1, updated_at=?
+                WHERE publication_id=?
+                """,
+                (error_json, error_sha256, queued, row["publication_id"]),
+            )
+            conn.commit()
             raise ValueError("publication idempotency conflict")
         conn.execute(
             """
             INSERT INTO publication_outbox (
                 publication_id, idempotency_key, intent_id, network,
                 offer_fingerprint, publication_epoch, publisher, payload_json,
+                payload_sha256,
                 state, attempt_count, queued_at, updated_at
             ) VALUES (
                 :publication_id, :idempotency_key, :intent_id, :network,
                 :offer_fingerprint, :publication_epoch, :publisher,
-                :payload_json, 'queued', 0, :queued_at, :queued_at
+                :payload_json, :payload_sha256, 'queued', 0,
+                :queued_at, :queued_at
             )
             """,
             values,
@@ -24202,3 +24432,297 @@ def get_publication_outbox(publication_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+def list_publication_outbox(
+    *, intent_id: Optional[str] = None, publisher: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return a stable publication snapshot for repository consumers."""
+
+    clauses = []
+    params: list[Any] = []
+    if intent_id is not None:
+        clauses.append("intent_id=?")
+        params.append(_required_stability_text(intent_id, "intent_id"))
+    if publisher is not None:
+        safe_publisher = _required_stability_text(publisher, "publisher")
+        if safe_publisher not in {"dexie", "splash"}:
+            raise ValueError("publisher is not canonical")
+        clauses.append("publisher=?")
+        params.append(safe_publisher)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = get_connection().execute(
+        "SELECT * FROM publication_outbox"
+        + where
+        + " ORDER BY publisher,publication_epoch,publication_id",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def claim_publication_outbox(
+    *,
+    publisher: str,
+    owner_run_id: str,
+    claim_token: str,
+    claimed_at: Any,
+    claim_expires_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Claim one ready provider row with a short compare-and-set transaction."""
+
+    safe_publisher = _required_stability_text(publisher, "publisher")
+    if safe_publisher not in {"dexie", "splash"}:
+        raise ValueError("publisher is not canonical")
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    token = _required_stability_text(claim_token, "claim_token")
+    at = _stability_timestamp(claimed_at, "claimed_at")
+    expires = _stability_timestamp(claim_expires_at, "claim_expires_at")
+    at_dt = _parse_iso_timestamp(at, "claimed_at", require_timezone=True)
+    expiry_dt = _parse_iso_timestamp(
+        expires, "claim_expires_at", require_timezone=True
+    )
+    lease_seconds = (expiry_dt - at_dt).total_seconds()
+    if lease_seconds <= 0 or lease_seconds > 300:
+        raise ValueError("publication claim lease is outside its bounded window")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate = conn.execute(
+            """
+            SELECT * FROM publication_outbox
+            WHERE publisher=? AND (
+                state='queued' OR
+                (state='retryable' AND (next_attempt_at IS NULL OR next_attempt_at<=?)) OR
+                (state='claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at<?)
+            )
+            ORDER BY queued_at,publication_id LIMIT 1
+            """,
+            (safe_publisher, at, at),
+        ).fetchone()
+        if candidate is None:
+            conn.commit()
+            return None
+        current = dict(candidate)
+        cursor = conn.execute(
+            """
+            UPDATE publication_outbox
+            SET state='claimed', claim_owner_run_id=?, claim_token=?,
+                claim_generation=claim_generation+1, claim_expires_at=?,
+                next_attempt_at=NULL, attempt_count=attempt_count+1,
+                row_version=row_version+1, updated_at=?
+            WHERE publication_id=? AND row_version=? AND (
+                state='queued' OR
+                (state='retryable' AND (next_attempt_at IS NULL OR next_attempt_at<=?)) OR
+                (state='claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at<?)
+            )
+            """,
+            (
+                owner,
+                token,
+                expires,
+                at,
+                current["publication_id"],
+                current["row_version"],
+                at,
+                at,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        row = dict(
+            conn.execute(
+                "SELECT * FROM publication_outbox WHERE publication_id=?",
+                (current["publication_id"],),
+            ).fetchone()
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        payload = {}
+    offer_ref = payload.get("offer_ref") if type(payload) is dict else None
+    row["trade_id"] = offer_ref if type(offer_ref) is str else None
+    row["offer_bech32"] = None
+    if row["trade_id"]:
+        offer = get_connection().execute(
+            "SELECT offer_bech32 FROM offers WHERE trade_id=? AND status='open'",
+            (row["trade_id"],),
+        ).fetchone()
+        if offer is not None and type(offer["offer_bech32"]) is str:
+            row["offer_bech32"] = offer["offer_bech32"]
+    return row
+
+
+def complete_publication_outbox(
+    *,
+    publication_id: str,
+    owner_run_id: str,
+    claim_token: str,
+    claim_generation: int,
+    expected_row_version: int,
+    acknowledgement_json: Any,
+    completed_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Commit provider acknowledgement only for the exact live claim."""
+
+    publication = _required_stability_text(publication_id, "publication_id")
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    token = _required_stability_text(claim_token, "claim_token")
+    generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
+    completed = _stability_timestamp(completed_at, "completed_at")
+    acknowledgement, acknowledgement_sha256 = _bounded_publication_evidence(
+        acknowledgement_json,
+        "publication acknowledgement",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE publication_outbox
+            SET state='succeeded', acknowledgement_json=?,
+                acknowledgement_sha256=?, claim_owner_run_id=NULL,
+                claim_token=NULL, claim_expires_at=NULL, succeeded_at=?,
+                terminal_at=?, row_version=row_version+1, updated_at=?
+            WHERE publication_id=? AND state='claimed'
+              AND claim_owner_run_id=? AND claim_token=?
+              AND claim_generation=? AND row_version=?
+              AND claim_expires_at>=?
+            """,
+            (
+                acknowledgement,
+                acknowledgement_sha256,
+                completed,
+                completed,
+                completed,
+                publication,
+                owner,
+                token,
+                generation,
+                version,
+                completed,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        row = dict(
+            conn.execute(
+                "SELECT * FROM publication_outbox WHERE publication_id=?",
+                (publication,),
+            ).fetchone()
+        )
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def retry_publication_outbox(
+    *,
+    publication_id: str,
+    owner_run_id: str,
+    claim_token: str,
+    claim_generation: int,
+    expected_row_version: int,
+    error_json: Any,
+    retry_at: Any,
+    updated_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Release an exact claim for a deterministic caller-supplied retry time."""
+
+    publication = _required_stability_text(publication_id, "publication_id")
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    token = _required_stability_text(claim_token, "claim_token")
+    generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
+    updated = _stability_timestamp(updated_at, "updated_at")
+    retry = _stability_timestamp(retry_at, "retry_at")
+    if retry <= updated:
+        raise ValueError("retry_at must follow updated_at")
+    error, error_sha256 = _bounded_publication_evidence(
+        error_json,
+        "publication error",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE publication_outbox
+            SET state='retryable', claim_owner_run_id=NULL, claim_token=NULL,
+                claim_expires_at=NULL, next_attempt_at=?, last_error_json=?,
+                last_error_sha256=?, row_version=row_version+1, updated_at=?
+            WHERE publication_id=? AND state='claimed'
+              AND claim_owner_run_id=? AND claim_token=?
+              AND claim_generation=? AND row_version=?
+              AND claim_expires_at>=?
+            """,
+            (
+                retry,
+                error,
+                error_sha256,
+                updated,
+                publication,
+                owner,
+                token,
+                generation,
+                version,
+                updated,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        row = dict(
+            conn.execute(
+                "SELECT * FROM publication_outbox WHERE publication_id=?",
+                (publication,),
+            ).fetchone()
+        )
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _suppress_publication_outbox_rows(
+    conn: sqlite3.Connection,
+    *,
+    intent_id: str,
+    proof_json: Any,
+    suppressed_at: Any,
+) -> int:
+    """Suppress mutable publication rows inside a proof-owning transaction."""
+
+    safe_intent = _required_stability_text(intent_id, "intent_id")
+    at = _stability_timestamp(suppressed_at, "suppressed_at")
+    proof, proof_sha256 = _bounded_publication_evidence(
+        proof_json,
+        "publication suppression proof",
+    )
+    cursor = conn.execute(
+        """
+        UPDATE publication_outbox
+        SET state='suppressed', claim_owner_run_id=NULL, claim_token=NULL,
+            claim_expires_at=NULL, next_attempt_at=NULL,
+            suppression_json=?, suppression_sha256=?, terminal_at=?,
+            row_version=row_version+1, updated_at=?
+        WHERE intent_id=? AND state IN ('queued','claimed','retryable')
+        """,
+        (proof, proof_sha256, at, at, safe_intent),
+    )
+    return int(cursor.rowcount)

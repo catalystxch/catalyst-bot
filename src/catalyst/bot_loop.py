@@ -26,7 +26,8 @@ import threading
 import traceback
 import requests
 import mutation_gate
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, Optional
 
@@ -853,6 +854,33 @@ class BotLoop:
         self, offer_bech32: str, trade_id: Optional[str] = None
     ) -> None:
         self.dexie_manager.queue_post(offer_bech32, trade_id, force=True)
+
+    def _enable_durable_publication_outbox(self) -> None:
+        """Bind outbound managers to one post-recovery durable worker owner."""
+
+        owner = "publication-worker:" + uuid.uuid4().hex
+
+        def observed_at() -> str:
+            return datetime.now(timezone.utc).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
+        def lease_expires(at: str) -> str:
+            parsed = datetime.fromisoformat(at[:-1] + "+00:00")
+            return (parsed + timedelta(seconds=30)).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
+        self.dexie_manager.enable_durable_outbox(
+            owner_run_id=owner + ":dexie",
+            now_provider=observed_at,
+            lease_expires_provider=lease_expires,
+        )
+        self.splash_manager.enable_durable_outbox(
+            owner_run_id=owner + ":splash",
+            now_provider=observed_at,
+            lease_expires_provider=lease_expires,
+        )
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -5197,11 +5225,16 @@ class BotLoop:
         # Startup: sync state from wallet
         # Background threads wait for this to finish before writing to DB.
         self._startup_sync()
+        self._enable_durable_publication_outbox()
         slog(
             "STARTUP",
             "========== _startup_sync COMPLETE — releasing thread gates ==========",
         )
         self._startup_complete.set()  # Ungate background threads
+
+        # Drain restart-surviving publication work only after read-only startup
+        # recovery has completed and every outbound adapter is claim-backed.
+        self._flush_public_offer_queues()
 
         self._set_state(status="running")
 
