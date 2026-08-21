@@ -11059,6 +11059,7 @@ class BotLoop:
                 target_count_trunc = 0
                 original_target = 0
                 tier_filter_drained = False
+                lineage_pending_count = 0
                 made_progress = False
                 if isinstance(requote_result, dict):
                     new_offers = requote_result.get("offers", [])
@@ -11071,7 +11072,17 @@ class BotLoop:
                     tier_filter_drained = bool(
                         requote_result.get("tier_filter_drained", False)
                     )
-                    made_progress = replaced_count > 0 or len(new_offers) > 0
+                    lineage_pending_count = int(
+                        requote_result.get("lineage_pending_count", 0) or 0
+                    )
+                    # A staged child is intentionally overlapping its parent;
+                    # it is not a replacement until registry visibility plus
+                    # Task 8/9 resolution complete.  Do not hide the old
+                    # quote by advancing the drift baseline at this boundary.
+                    made_progress = (
+                        (replaced_count > 0 or len(new_offers) > 0)
+                        and lineage_pending_count == 0
+                    )
 
                     if requote_result.get("fully_replaced"):
                         # True full replace: advance baselines + refresh
@@ -11099,6 +11110,13 @@ class BotLoop:
                         self._last_quoted_plain_mid[side] = mid_price  # F67
                         self._ladder_grid_mid[side] = requote_mid
                         self._ladder_anchor_plain_mid[side] = mid_price
+                    elif lineage_pending_count:
+                        log_event(
+                            "info",
+                            "requote_lineage_staged",
+                            f"{side} staged {lineage_pending_count} child offer(s); "
+                            "parent cancellation remains proof-gated",
+                        )
                     elif tier_filter_drained:
                         log_event(
                             "info",

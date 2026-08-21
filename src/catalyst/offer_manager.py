@@ -51,6 +51,7 @@ from wallet import (
 import database
 import mutation_gate
 import offer_registry
+from refresh_safety import RefreshPlan, plan_refresh
 from sage_offer_wire import canonical_sage_offer_text
 import wallet
 from cancel_outcomes import (
@@ -159,6 +160,28 @@ class OfferManager:
     - Manage offer expiry (staggered expiry to avoid cascades)
     - Queue offers for Dexie posting
     """
+
+    @staticmethod
+    def plan_staged_refresh(
+        targets: List[Dict[str, Any]],
+        *,
+        overlap_capacity: int,
+        batch_size: int,
+        operator_mass_cancel: bool = False,
+    ) -> RefreshPlan:
+        """Return the pure Task 11 plan before any requote wallet effect.
+
+        Capacity is deliberately supplied by the caller's authoritative
+        snapshot.  This manager boundary must not guess or repurpose Task 12
+        capacity accounting.
+        """
+
+        return plan_refresh(
+            targets,
+            overlap_capacity=overlap_capacity,
+            batch_size=batch_size,
+            operator_mass_cancel=operator_mass_cancel,
+        )
 
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
@@ -1701,6 +1724,20 @@ class OfferManager:
             raise ValueError("durable generation authority is malformed")
         resolved = dict(creation_context)
         del resolved["select_next_generation"]
+        parent_intent_id = resolved.get("parent_intent_id")
+        if parent_intent_id is not None:
+            parent = database.get_offer_intent(parent_intent_id)
+            if type(parent) is not dict:
+                raise ValueError("refresh parent intent is missing")
+            if (
+                parent.get("slot_key") != slot_key
+                or parent.get("run_id") != run_id
+                or type(parent.get("generation")) is not int
+                or parent.get("child_intent_id") is not None
+                or parent.get("lifecycle_state") not in {"created", "visible"}
+            ):
+                raise ValueError("refresh parent generation authority is invalid")
+            generation = int(parent["generation"]) + 1
         resolved["generation"] = generation
         resolved["_authority_run_id"] = run_id
         return resolved
@@ -3103,6 +3140,7 @@ class OfferManager:
         price_cap: Decimal = None,
         price_floor: Decimal = None,
         interpolate_refill_prices: bool = True,
+        refresh_parent_ids: Dict[int, str] = None,
     ) -> List[Dict]:
         """Create a ladder of offers on one side (buy or sell).
 
@@ -3128,6 +3166,9 @@ class OfferManager:
                 into the surviving tier's price band. Recovery anchor-drift
                 refills set this False so missing slots price from the current
                 grid instead of stale surviving offers.
+            refresh_parent_ids: Exact durable parent intent keyed by ladder
+                slot.  When supplied, creation is a Task 11 child and is
+                bound only after its confirmed Sage identity is durable.
 
         Returns list of created offer details (trade_id, price, size, etc.)
         """
@@ -3779,6 +3820,11 @@ class OfferManager:
                     f"— serial mode, letting Sage pick from wallet",
                 )
 
+            parent_intent_id = (
+                refresh_parent_ids.get(int(spec["slot"]))
+                if refresh_parent_ids is not None
+                else None
+            )
             res = self.create_offer_with_retry(
                 spec["offer_dict"],
                 expiry_offset=spec["stagger"],
@@ -3793,6 +3839,7 @@ class OfferManager:
                     "side": side,
                     "tier": spec["tier"],
                     "purpose": "normal_lifecycle",
+                    "parent_intent_id": parent_intent_id,
                     "offer_size_uniqueness": {
                         "slot": spec["slot"],
                         "requested_amount_atomic": str(
@@ -3874,6 +3921,32 @@ class OfferManager:
 
             if not trade_id:
                 continue
+
+            parent_intent_id = (
+                refresh_parent_ids.get(int(slot))
+                if refresh_parent_ids is not None
+                else None
+            )
+            child_intent_id = res.get("_catalyst_intent_id")
+            if parent_intent_id is not None:
+                if type(child_intent_id) is not str or not child_intent_id:
+                    log_event(
+                        "error",
+                        "refresh_child_identity_missing",
+                        "Confirmed refresh child did not return its durable intent ID",
+                    )
+                    continue
+                try:
+                    database.bind_refresh_lineage(parent_intent_id, child_intent_id)
+                except Exception as exc:
+                    # The child is durable and remains a recovery boundary;
+                    # do not cancel the parent when the reverse edge is not.
+                    log_event(
+                        "error",
+                        "refresh_lineage_bind_failed",
+                        f"Held parent cancellation after child creation: {exc}",
+                    )
+                    continue
 
             locked_coin_id = res.get("locked_coin_id")
             verified_locked_coin_ids = []
@@ -4620,6 +4693,121 @@ class OfferManager:
                 "failed_cancel_count": 0,
                 "tier_filter_drained": False,
             }
+
+        # Task 11 refresh is create-child-first.  Legacy/open rows which do
+        # not have an exact durable registry parent are deliberately held:
+        # guessing lineage would make a later cancel unsafe.  Task 12 owns
+        # the capacity accounting; this routine only consumes the authoritative
+        # spare count it already calculated for the current bounded batch.
+        refresh_by_parent = {}
+        for offer in open_offers:
+            trade_id = offer.get("trade_id")
+            if not isinstance(trade_id, str) or not trade_id:
+                continue
+            parent = database.get_offer_intent_by_trade_id(trade_id)
+            if (
+                type(parent) is not dict
+                or parent.get("parent_intent_id") is not None
+                or parent.get("child_intent_id") is not None
+                or parent.get("lifecycle_state") not in {"created", "visible"}
+            ):
+                continue
+            slot_key = parent.get("slot_key")
+            slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
+            if not isinstance(slot_key, str) or not slot_key.startswith(slot_prefix):
+                continue
+            try:
+                slot = int(slot_key[len(slot_prefix) :])
+            except ValueError:
+                continue
+            refresh_by_parent[parent["intent_id"]] = (offer, parent, slot)
+        slots = [slot for _offer, _parent, slot in refresh_by_parent.values()]
+        if not refresh_by_parent or len(slots) != len(set(slots)):
+            log_event(
+                "info",
+                "requote_staged_refresh_paused",
+                f"Requote {side}: missing or conflicting registry parents; holding cancels",
+            )
+            return {
+                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "pending_cancel_count": 0, "failed_cancel_count": 0,
+                "tier_filter_drained": False, "refresh_paused": True,
+            }
+        refresh_plan = self.plan_staged_refresh(
+            [
+                {
+                    "intent_id": intent_id,
+                    "severity": max(0, target_count - index),
+                    "slot_key": parent["slot_key"],
+                    "generation": parent["generation"],
+                }
+                for index, (intent_id, (_offer, parent, _slot)) in enumerate(
+                    refresh_by_parent.items()
+                )
+            ],
+            overlap_capacity=spare_count,
+            batch_size=target_count,
+        )
+        if refresh_plan.mode != "stage":
+            log_event(
+                "info",
+                "requote_staged_refresh_paused",
+                f"Requote {side}: {refresh_plan.reason}",
+            )
+            return {
+                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "pending_cancel_count": 0, "failed_cancel_count": 0,
+                "tier_filter_drained": False, "refresh_paused": True,
+            }
+        staged = [
+            refresh_by_parent[parent_id] for parent_id in refresh_plan.stage_parent_ids
+        ]
+        refresh_parent_ids = {
+            slot: parent["intent_id"] for _offer, parent, slot in staged
+        }
+        new_offers = self.create_ladder(
+            current_price,
+            side,
+            num_offers=len(staged),
+            slot_sequence=sorted(refresh_parent_ids),
+            total_slots=(
+                cfg.MAX_ACTIVE_BUY_OFFERS
+                if side == "buy"
+                else cfg.MAX_ACTIVE_SELL_OFFERS
+            ),
+            risk_manager=risk_manager,
+            spread_fraction=spread_fraction,
+            coin_ids_enabled=cfg.COIN_IDS_ENABLED,
+            price_cap=price_cap,
+            price_floor=price_floor,
+            refresh_parent_ids=refresh_parent_ids,
+        )
+        if dexie_manager:
+            for offer in new_offers:
+                bech32 = offer.get("offer_bech32", "")
+                trade_id = offer.get("trade_id", "")
+                if bech32 and trade_id:
+                    dexie_manager.queue_post(bech32, trade_id)
+        # Queueing publication is not visibility.  The parent remains intact
+        # until the registry visibility boundary is durably recorded and Task
+        # 8 independently authorizes cancellation.
+        with self._lock:
+            self._last_requote_time[side] = time.time()
+        return {
+            "offers": new_offers,
+            "fully_replaced": False,
+            "replaced_count": len(new_offers),
+            "target_count": target_count,
+            "original_target_count": original_target_count,
+            "pending_cancel_count": 0,
+            "failed_cancel_count": 0,
+            "lineage_pending_count": len(new_offers),
+            "tier_filter_drained": False,
+        }
 
         # Cancel old offers first. Creating before cancellation briefly
         # over-stacks the side whenever Sage keeps cancelled offers

@@ -1493,10 +1493,10 @@ CREATE INDEX IF NOT EXISTS idx_offer_intents_state
 CREATE INDEX IF NOT EXISTS idx_offer_intents_slot_generation
     ON offer_intents(slot_key, generation, run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_offer_intents_active_slot_generation
-    ON offer_intents(slot_key)
+    ON offer_intents(slot_key, generation)
     WHERE slot_key IS NOT NULL AND lifecycle_state IN (
         'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created',
-        'unknown', 'conflicted'
+        'visible', 'unknown', 'conflicted'
     );
 CREATE INDEX IF NOT EXISTS idx_offer_intents_parent
     ON offer_intents(parent_intent_id);
@@ -3662,9 +3662,9 @@ _STABILITY_INDEXES = {
         "offer_intents",
         True,
         True,
-        ("slot_key",),
+        ("slot_key", "generation"),
         "slot_keyisnotnullandlifecycle_statein('prepared','submitted_unconfirmed',"
-        "'creation_unknown','created','unknown','conflicted')",
+        "'creation_unknown','created','visible','unknown','conflicted')",
     ),
     "idx_offer_intents_parent": (
         "offer_intents",
@@ -3920,12 +3920,21 @@ WHERE slot_key IS NOT NULL AND lifecycle_state IN (
 )
 """
 
-_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
+_TASK10_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
 CREATE UNIQUE INDEX uniq_offer_intents_active_slot_generation
 ON offer_intents(slot_key)
 WHERE slot_key IS NOT NULL AND lifecycle_state IN (
     'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created',
     'unknown', 'conflicted'
+)
+"""
+
+_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL = """
+CREATE UNIQUE INDEX uniq_offer_intents_active_slot_generation
+ON offer_intents(slot_key, generation)
+WHERE slot_key IS NOT NULL AND lifecycle_state IN (
+    'prepared', 'submitted_unconfirmed', 'creation_unknown', 'created',
+    'visible', 'unknown', 'conflicted'
 )
 """
 
@@ -3960,6 +3969,7 @@ def _upgrade_offer_intent_slot_indexes(conn: sqlite3.Connection) -> None:
             (
                 _LEGACY_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
                 _PREVIOUS_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
+                _TASK10_OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
             ),
             _OFFER_INTENT_ACTIVE_SLOT_INDEX_SQL,
         ),
@@ -21195,6 +21205,239 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+_REFRESH_CHILD_CREATED_STATES = frozenset({"created", "visible"})
+
+
+def _refresh_lineage_rows(
+    conn: sqlite3.Connection, parent_intent_id: str, child_intent_id: str
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load and validate one exact parent/child replacement pair."""
+
+    parent_row = conn.execute(
+        "SELECT * FROM offer_intents WHERE intent_id=?", (parent_intent_id,)
+    ).fetchone()
+    child_row = conn.execute(
+        "SELECT * FROM offer_intents WHERE intent_id=?", (child_intent_id,)
+    ).fetchone()
+    if parent_row is None or child_row is None:
+        raise ValueError("refresh lineage parent or child intent is missing")
+    parent, child = dict(parent_row), dict(child_row)
+    required_equal = (
+        "run_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "asset_id",
+        "side",
+        "tier",
+        "slot_key",
+    )
+    if any(parent[field] != child[field] for field in required_equal):
+        raise ValueError("refresh lineage authority does not match")
+    if parent["slot_key"] is None:
+        raise ValueError("refresh lineage requires an authoritative slot")
+    if int(child["generation"]) != int(parent["generation"]) + 1:
+        raise ValueError("refresh lineage generation is not monotonic")
+    if child["parent_intent_id"] != parent_intent_id:
+        raise ValueError("refresh child does not point to the exact parent")
+    if child["child_intent_id"] is not None:
+        raise ValueError("refresh child already has a replacement child")
+    if parent["child_intent_id"] not in (None, child_intent_id):
+        raise ValueError("refresh parent is already bound to another child")
+    return parent, child
+
+
+def bind_refresh_lineage(parent_intent_id: str, child_intent_id: str) -> Dict[str, Any]:
+    """CAS-bind one confirmed child to exactly one parent.
+
+    The child is prepared with ``parent_intent_id`` before its wallet effect;
+    this function is the recovery-safe post-creation commit that makes the
+    reverse edge durable.  It performs no wallet/network work.
+    """
+
+    parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
+    child_id = _required_stability_text(child_intent_id, "child_intent_id")
+    if parent_id == child_id:
+        raise ValueError("refresh parent and child must differ")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        parent, child = _refresh_lineage_rows(conn, parent_id, child_id)
+        if parent["lifecycle_state"] not in {"created", "visible", "cancel_requested"}:
+            raise ValueError("refresh parent is not an actionable created offer")
+        if child["lifecycle_state"] not in _REFRESH_CHILD_CREATED_STATES:
+            raise ValueError("refresh child is not confirmed")
+        if not child["sage_trade_id"] or not child["offer_text_sha256"]:
+            raise ValueError("refresh child confirmation lacks exact offer identity")
+        if parent["child_intent_id"] == child_id:
+            conn.commit()
+            return {"parent": parent, "child": child, "idempotent": True}
+        cursor = conn.execute(
+            """
+            UPDATE offer_intents
+            SET child_intent_id=?, row_version=row_version+1, updated_at=?
+            WHERE intent_id=? AND child_intent_id IS NULL AND row_version=?
+            """,
+            (
+                child_id,
+                _stability_wall_clock(),
+                parent_id,
+                int(parent["row_version"]),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("refresh lineage compare-and-set failed")
+        parent = dict(
+            conn.execute(
+                "SELECT * FROM offer_intents WHERE intent_id=?", (parent_id,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {"parent": parent, "child": child, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_offer_intent_visibility(
+    intent_id: str, *, publication_identity: str, visible_at: Any = None
+) -> Dict[str, Any]:
+    """Persist the existing registry visibility boundary for a created offer."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    publication = _required_stability_text(
+        publication_identity, "publication_identity"
+    )
+    when = _stability_timestamp_or_now(visible_at, "visible_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("offer intent does not exist")
+        current = dict(row)
+        if current["lifecycle_state"] == "visible":
+            if current["publication_identity"] != publication or not current["first_visible_at"]:
+                raise ValueError("offer visibility replay conflicts with durable authority")
+            conn.commit()
+            return {"intent": current, "idempotent": True}
+        if current["lifecycle_state"] != "created":
+            raise ValueError("only a confirmed created offer may become visible")
+        if not current["sage_trade_id"] or not current["offer_text_sha256"]:
+            raise ValueError("visibility requires confirmed offer identity")
+        cursor = conn.execute(
+            """
+            UPDATE offer_intents
+            SET lifecycle_state='visible', publication_identity=?, first_visible_at=?,
+                row_version=row_version+1, updated_at=?
+            WHERE intent_id=? AND lifecycle_state='created' AND row_version=?
+            """,
+            (publication, when, when, safe_intent_id, int(current["row_version"])),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("offer visibility compare-and-set failed")
+        updated = dict(
+            conn.execute(
+                "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {"intent": updated, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def refresh_parent_cancel_eligibility(
+    parent_intent_id: str, *, require_visible: bool = True
+) -> Dict[str, Any]:
+    """Return whether a parent may enter Task 8 cancellation preparation.
+
+    This is deliberately only an eligibility check.  Task 8 remains the sole
+    cancellation authority and must still acquire its mutation/lease checks.
+    """
+
+    if type(require_visible) is not bool:
+        raise TypeError("require_visible must be an exact bool")
+    parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
+    conn = _stability_connection()
+    try:
+        parent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (parent_id,)
+        ).fetchone()
+        if parent_row is None:
+            return {"eligible": False, "reason": "parent_missing"}
+        parent = dict(parent_row)
+        child_id = parent.get("child_intent_id")
+        if not child_id:
+            return {"eligible": False, "reason": "child_not_bound"}
+        try:
+            _parent, child = _refresh_lineage_rows(conn, parent_id, str(child_id))
+        except ValueError:
+            return {"eligible": False, "reason": "invalid_lineage"}
+        if child["lifecycle_state"] not in _REFRESH_CHILD_CREATED_STATES:
+            return {"eligible": False, "reason": "child_not_confirmed"}
+        if not child["sage_trade_id"] or not child["offer_text_sha256"]:
+            return {"eligible": False, "reason": "child_identity_missing"}
+        if require_visible and (
+            child["lifecycle_state"] != "visible"
+            or not child["publication_identity"]
+            or not child["first_visible_at"]
+        ):
+            return {"eligible": False, "reason": "child_not_visible"}
+        return {
+            "eligible": True,
+            "reason": "eligible",
+            "parent_intent_id": parent_id,
+            "child_intent_id": str(child_id),
+            "child_trade_id": child["sage_trade_id"],
+            "child_offer_text_sha256": child["offer_text_sha256"],
+        }
+    finally:
+        conn.close()
+
+
+def refresh_lineage_completion(
+    parent_intent_id: str, *, require_visible: bool = True
+) -> Dict[str, Any]:
+    """Verify that a replacement parent has Task 8 and Task 9 closure.
+
+    The parent becomes terminal only through Task 9 reconciliation; this
+    function refuses to infer it from expiry, absence, or a legacy status.
+    """
+
+    eligibility = refresh_parent_cancel_eligibility(
+        parent_intent_id, require_visible=require_visible
+    )
+    if not eligibility["eligible"]:
+        return {"complete": False, "reason": eligibility["reason"]}
+    parent = get_offer_intent(parent_intent_id)
+    assert parent is not None  # checked by eligibility in the same durable DB
+    trade_id = parent.get("sage_trade_id")
+    if not trade_id:
+        return {"complete": False, "reason": "parent_identity_missing"}
+    terminal = get_authoritative_terminal_record(str(trade_id))
+    if terminal is None:
+        return {"complete": False, "reason": "terminal_proof_missing"}
+    latest = get_offer_operation_events(f"cancel:{trade_id}")
+    if not latest:
+        return {"complete": False, "reason": "cancel_resolution_missing"}
+    cancel = validate_offer_operation_event(latest[-1])
+    if (
+        cancel["intent_id"] != parent_intent_id
+        or cancel["phase"] != "RECONCILED"
+        or cancel["outcome"] != "CANCEL_CONFIRMED"
+        or cancel["blocks_mutation"] != 0
+    ):
+        return {"complete": False, "reason": "cancel_resolution_missing"}
+    return {"complete": True, "reason": "complete", "terminal": terminal}
 
 
 def get_offer_intents_for_registry() -> List[Dict[str, Any]]:
