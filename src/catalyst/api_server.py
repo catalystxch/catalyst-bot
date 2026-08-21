@@ -1247,11 +1247,60 @@ _STABILITY_CHECK_SOURCES = frozenset(
     {"durable_snapshot", "configured_binding", "authorized_snapshot"}
 )
 
+_STABILITY_EMPTY_DURABLE_COUNTS = {
+    "registry": 0,
+    "lineage": 0,
+    "reserve": 0,
+    "publication": 0,
+}
+
 
 def _bounded_stability_count(value: Any) -> int:
     if type(value) is not int or value < 0:
         return 0
     return min(value, 2_147_483_647)
+
+
+def _public_stability_durable_counts() -> tuple[dict[str, int], bool]:
+    """Project exact Task 10/11/13 repository counts without exposing rows."""
+
+    try:
+        # Before the first database initialization there cannot be durable
+        # rows to count.  Treat the absent file as the exact empty snapshot;
+        # never create/migrate storage from this read-only status endpoint.
+        database_path = getattr(database, "DB_PATH", None)
+        if type(database_path) is str and not os.path.isfile(database_path):
+            return dict(_STABILITY_EMPTY_DURABLE_COUNTS), True
+        raw_counts = database.get_stability_diagnostic_counts()
+        if type(raw_counts) is not dict or set(raw_counts) != set(
+            _STABILITY_EMPTY_DURABLE_COUNTS
+        ):
+            return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+        counts = {}
+        for key in _STABILITY_EMPTY_DURABLE_COUNTS:
+            value = raw_counts.get(key)
+            if type(value) is not int or value < 0 or value > 2_147_483_647:
+                return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+            counts[key] = value
+        return counts, True
+    except Exception:
+        return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+
+
+def _public_stability_timestamp(value: Any) -> Optional[str]:
+    if type(value) is not str or len(value) > 40:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value) is None:
+        return None
+    return value
+
+
+def _public_stability_reason(value: Any) -> Optional[str]:
+    if type(value) is not str:
+        return None
+    if value == "":
+        return value
+    return value if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", value) is not None else None
 
 
 def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
@@ -1286,20 +1335,37 @@ def get_public_stability_status() -> dict:
     if type(live) is not dict or type(startup) is not dict:
         raise RuntimeError("malformed stability status")
 
+    malformed = False
     startup_allowed = startup.get("allowed") is True
     live_allowed = live.get("allowed") is True
     allowed = startup_allowed and live_allowed
     authority = live if startup_allowed else startup
-    reason_code = str(authority.get("reason_code") or "")[:64]
+    raw_reason_code = authority.get("reason_code")
+    public_reason_code = _public_stability_reason(raw_reason_code)
+    if public_reason_code is None:
+        malformed = True
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+    else:
+        reason_code = public_reason_code
+    if allowed and reason_code:
+        malformed = True
     if not allowed and not reason_code:
         reason_code = "DURABLE_STATE_UNAVAILABLE"
-    source = str(authority.get("source") or "durable_read")
-    if source not in _STABILITY_PUBLIC_SOURCES:
+    raw_source = authority.get("source")
+    if type(raw_source) is not str or raw_source not in _STABILITY_PUBLIC_SOURCES:
+        malformed = True
         source = "durable_read"
+    else:
+        source = raw_source
 
     raw_counts = startup.get("blocker_counts")
     if type(raw_counts) is not dict:
+        malformed = True
         raw_counts = {}
+    for key in _STABILITY_BLOCKER_COUNT_KEYS:
+        value = raw_counts.get(key)
+        if type(value) is not int or value < 0:
+            malformed = True
     blocker_counts = {
         key: _bounded_stability_count(raw_counts.get(key))
         for key in _STABILITY_BLOCKER_COUNT_KEYS
@@ -1307,20 +1373,55 @@ def get_public_stability_status() -> dict:
 
     checks = startup.get("checks")
     if type(checks) is not list:
+        malformed = True
         checks = []
     source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
     public_checks = []
+    seen_checks = set()
+    if len(checks) > len(_STABILITY_STARTUP_CHECKS):
+        malformed = True
     for raw_check in checks[: len(_STABILITY_STARTUP_CHECKS)]:
         if type(raw_check) is not dict:
+            malformed = True
             continue
         name = raw_check.get("name")
-        if name not in _STABILITY_STARTUP_CHECKS:
+        if name not in _STABILITY_STARTUP_CHECKS or name in seen_checks:
+            malformed = True
             continue
+        seen_checks.add(name)
         age = raw_check.get("source_age_seconds")
-        age = _bounded_stability_count(age) if type(age) is int else None
+        if age is None:
+            public_age = None
+        elif type(age) is int and age >= 0:
+            public_age = _bounded_stability_count(age)
+        else:
+            malformed = True
+            continue
+        age = public_age
         source_ages[name] = age
-        check_reason = str(raw_check.get("reason_code") or "")[:64]
-        check_source = str(raw_check.get("source") or "durable_snapshot")
+        raw_check_reason = raw_check.get("reason_code")
+        public_check_reason = _public_stability_reason(raw_check_reason)
+        if public_check_reason is None:
+            malformed = True
+            continue
+        check_reason = public_check_reason
+        raw_check_source = raw_check.get("source", "durable_snapshot")
+        if (
+            type(raw_check_source) is not str
+            or raw_check_source not in _STABILITY_CHECK_SOURCES
+        ):
+            malformed = True
+            continue
+        check_source = raw_check_source
+        if type(raw_check.get("ok")) is not bool:
+            malformed = True
+            continue
+        if raw_check.get("ok") is True and check_reason:
+            malformed = True
+            continue
+        if raw_check.get("ok") is not True and not check_reason:
+            malformed = True
+            continue
         if check_source not in _STABILITY_CHECK_SOURCES:
             check_source = "durable_snapshot"
         public_checks.append(
@@ -1334,34 +1435,94 @@ def get_public_stability_status() -> dict:
         )
 
     wallet_hash, network = _configured_mutation_binding()
-    if type(wallet_hash) is not str or len(wallet_hash) < 12:
+    if type(wallet_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", wallet_hash) is None:
+        malformed = True
         redacted_fingerprint = None
     else:
         redacted_fingerprint = f"sha256:{wallet_hash[:12]}…"
-    if type(network) is not str or not network or len(network) > 64:
+    if (
+        type(network) is not str
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", network) is None
+    ):
+        malformed = True
         network = "unknown"
 
     raw_lease = live.get("lease")
     if type(raw_lease) is not dict:
+        malformed = True
         raw_lease = {}
+    if type(raw_lease.get("active")) is not bool:
+        malformed = True
     lease_active = raw_lease.get("active") is True
+    if type(raw_lease.get("owned_by_this_run")) is not bool:
+        malformed = True
     owned_by_this_run = lease_active and raw_lease.get("owned_by_this_run") is True
     lease_owner = (
         "this_run" if owned_by_this_run else "other_run" if lease_active else None
     )
+    lease_version = raw_lease.get("version")
+    if type(lease_version) is not int or lease_version < 0:
+        malformed = True
+    lease_expiry = _public_stability_timestamp(raw_lease.get("expires_at"))
+    if lease_active and lease_expiry is None:
+        malformed = True
     lease = {
         "active": lease_active,
-        "version": _bounded_stability_count(raw_lease.get("version")),
-        "expires_at": (
-            str(raw_lease.get("expires_at"))[:40]
-            if type(raw_lease.get("expires_at")) is str
-            else None
-        ),
+        "owner": lease_owner,
+        "version": _bounded_stability_count(lease_version),
+        "expires_at": lease_expiry,
         "owned_by_this_run": owned_by_this_run,
     }
+    live_blocking_count = live.get("blocking_operation_count")
+    if type(live_blocking_count) is not int or live_blocking_count < 0:
+        malformed = True
     failed_check = startup.get("failed_check")
     if failed_check not in {*_STABILITY_STARTUP_CHECKS, "database_integrity", None}:
+        malformed = True
         failed_check = "startup_recovery"
+
+    durable_counts, counts_valid = _public_stability_durable_counts()
+    if not counts_valid:
+        malformed = True
+
+    freshness_check = next(
+        (item for item in public_checks if item["name"] == "authority_revalidation"),
+        None,
+    )
+    if freshness_check is None:
+        age_checks = [item for item in public_checks if item["source_age_seconds"] is not None]
+        freshness_check = max(
+            age_checks,
+            key=lambda item: item["source_age_seconds"],
+            default=None,
+        )
+    freshness = {
+        "age_seconds": (
+            freshness_check["source_age_seconds"] if freshness_check is not None else None
+        ),
+        "provenance": (
+            freshness_check["source"] if freshness_check is not None else "unavailable"
+        ),
+    }
+
+    if malformed:
+        allowed = False
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+        source = "durable_read"
+        lease = {
+            "active": False,
+            "owner": None,
+            "version": 0,
+            "expires_at": None,
+            "owned_by_this_run": False,
+        }
+        lease_owner = None
+        failed_check = "startup_recovery"
+        public_checks = []
+        source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
+        freshness = {"age_seconds": None, "provenance": "unavailable"}
+        durable_counts = dict(_STABILITY_EMPTY_DURABLE_COUNTS)
+        blocker_counts = {key: 0 for key in _STABILITY_BLOCKER_COUNT_KEYS}
 
     return {
         "allowed": allowed,
@@ -1385,6 +1546,8 @@ def get_public_stability_status() -> dict:
         "recovery": {
             "failed_check": failed_check,
             "checks": public_checks,
+            "freshness": freshness,
+            "durable_counts": durable_counts,
         },
     }
 

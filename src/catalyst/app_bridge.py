@@ -1245,7 +1245,10 @@ class AppBridge:
 
         with api_server.app.test_request_context("/api/safety/status"):
             resp = api_server.api_safety_status()
-        return _unwrap_flask_response(resp)
+        result = _unwrap_flask_response(resp)
+        if type(result) is not dict:
+            raise RuntimeError("malformed safety status response")
+        return result
 
     @_safe
     def get_fingerprints(self):

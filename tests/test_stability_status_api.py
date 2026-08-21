@@ -60,9 +60,26 @@ def _startup_status(*, allowed=False, reason_code="UNRESOLVED_OPERATIONS"):
     }
 
 
+def _install_diagnostic_counts(monkeypatch, api_server):
+    counts = {
+        "registry": 8,
+        "lineage": 3,
+        "reserve": 11,
+        "publication": 6,
+    }
+    monkeypatch.setattr(api_server.database, "DB_PATH", __file__)
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_diagnostic_counts",
+        lambda: dict(counts),
+    )
+    return counts
+
+
 def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     import api_server
 
+    expected_counts = _install_diagnostic_counts(monkeypatch, api_server)
     monkeypatch.setattr(
         api_server,
         "_stability_startup_status",
@@ -123,6 +140,12 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     }
     assert safety["recommended_action"] == "RUN_AUTHORITATIVE_RECONCILIATION"
     assert safety["recovery"]["failed_check"] == "unresolved_operations"
+    assert safety["recovery"]["freshness"] == {
+        "age_seconds": 6,
+        "provenance": "durable_snapshot",
+    }
+    assert safety["recovery"]["durable_counts"] == expected_counts
+    assert safety["lease"]["owner"] == "other_run"
     assert [item["name"] for item in safety["recovery"]["checks"]] == [
         "lease",
         "wallet_identity_freshness",
@@ -138,6 +161,7 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
 def test_clean_safety_status_recommends_no_operator_action(monkeypatch):
     import api_server
 
+    expected_counts = _install_diagnostic_counts(monkeypatch, api_server)
     monkeypatch.setattr(
         api_server,
         "_stability_startup_status",
@@ -162,12 +186,15 @@ def test_clean_safety_status_recommends_no_operator_action(monkeypatch):
     assert payload["safety"]["reason_code"] == ""
     assert payload["safety"]["recommended_action"] == "NONE"
     assert payload["safety"]["identity"]["lease_owner"] == "this_run"
+    assert payload["safety"]["lease"]["owner"] == "this_run"
+    assert payload["safety"]["recovery"]["durable_counts"] == expected_counts
 
 
 def test_app_bridge_safety_status_matches_api_exactly(monkeypatch):
     import api_server
     import app_bridge
 
+    _install_diagnostic_counts(monkeypatch, api_server)
     monkeypatch.setattr(api_server, "_stability_startup_status", _startup_status())
     monkeypatch.setattr(
         api_server.mutation_gate,

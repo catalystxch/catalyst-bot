@@ -3339,6 +3339,84 @@
             text-align: center;
         }
 
+        .safety-diagnostics-panel {
+            margin: 0 0 14px;
+            padding: 14px;
+            border: 1px solid rgba(248, 113, 113, 0.5);
+            border-radius: 10px;
+            background: rgba(127, 29, 29, 0.16);
+        }
+        .safety-diagnostics-panel.is-allowed {
+            border-color: rgba(52, 211, 153, 0.5);
+            background: rgba(6, 78, 59, 0.18);
+        }
+        .safety-diagnostics-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .safety-diagnostics-title {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            margin: 0;
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        .safety-diagnostics-state {
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(248, 113, 113, 0.2);
+            color: #fecaca;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .safety-diagnostics-panel.is-allowed .safety-diagnostics-state {
+            background: rgba(52, 211, 153, 0.2);
+            color: #a7f3d0;
+        }
+        .safety-diagnostics-refresh {
+            min-height: 32px;
+            padding: 5px 10px;
+        }
+        .safety-diagnostics-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px 14px;
+        }
+        .safety-diagnostics-item {
+            min-width: 0;
+        }
+        .safety-diagnostics-label {
+            display: block;
+            margin-bottom: 2px;
+            color: var(--text-tertiary);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .safety-diagnostics-value {
+            color: var(--text-primary);
+            font-size: 12px;
+            overflow-wrap: anywhere;
+        }
+        .safety-diagnostics-error {
+            margin: 0 0 10px;
+            color: #fecaca;
+            font-size: 12px;
+        }
+        .safety-diagnostics-panel.is-allowed .safety-diagnostics-error:empty {
+            display: none;
+        }
+        @media (max-width: 720px) {
+            .safety-diagnostics-grid { grid-template-columns: 1fr; }
+        }
+
         /* Centred settings container — narrower than dashboard for form readability */
         #v4View-settings .container {
             max-width: 900px;
@@ -10763,6 +10841,42 @@
                     <!-- ══ SECTION: Safety & Limits ══ -->
                     <div id="settings-section-safety" class="v4-settings-section v4-settings-blue">
                         <div class="v4-settings-section-title" style="color: var(--status-info);">Safety & Limits <span class="cc-help">?<span class="cc-tooltip">Emergency protection settings. These circuit breakers halt trading if something unexpected happens — price crashes, spikes, or moves outside your comfort zone.</span></span></div>
+                        <section id="safetyDiagnosticsPanel" class="safety-diagnostics-panel is-blocked" role="status" aria-live="polite" aria-labelledby="safetyDiagnosticsTitle">
+                            <div class="safety-diagnostics-header">
+                                <h3 class="safety-diagnostics-title" id="safetyDiagnosticsTitle">
+                                    Runtime safety
+                                    <span class="safety-diagnostics-state" id="safetyDiagnosticsState">Blocked</span>
+                                </h3>
+                                <button type="button" class="btn btn-secondary safety-diagnostics-refresh" id="safetyDiagnosticsRefresh" data-safety-action="refresh">Refresh</button>
+                            </div>
+                            <p class="safety-diagnostics-error" id="safetyDiagnosticsError">Status loading — mutations are treated as blocked.</p>
+                            <div class="safety-diagnostics-grid">
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Reason</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsReason">Unknown safety status</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Freshness</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsFreshness">Unknown / stale · unavailable</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Unresolved</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsUnresolved">Unknown</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Lease</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsLease">Unknown</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Durable records</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsCounts">Registry — · Lineage — · Reserve — · Publication —</span>
+                                </div>
+                                <div class="safety-diagnostics-item">
+                                    <span class="safety-diagnostics-label">Safe next action</span>
+                                    <span class="safety-diagnostics-value" id="safetyDiagnosticsAction">Review safety diagnostics</span>
+                                </div>
+                            </div>
+                        </section>
                         <!-- Buy/sell side controls remain user-facing.
                              Developer-only dry run stays hidden in .env. -->
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
@@ -13081,6 +13195,9 @@
                 clearTimeout(_settingsUpdateTimer);
                 _settingsUpdateTimer = null;
             }
+            if (viewName !== 'settings') {
+                stopSafetyDiagnosticsPolling();
+            }
 
             // Hide all views
             document.querySelectorAll('.v4-view').forEach(v => v.classList.remove('active'));
@@ -13185,6 +13302,7 @@
             }
             // If switching to Settings, load config from API into form fields
             if (viewName === 'settings') {
+                startSafetyDiagnosticsPolling();
                 // Update lock state to show/hide banner and lock sections
                 updateSettingsLock();
                 try { updateWalletSessionSettings().catch(() => {}); } catch (_) {}
@@ -14953,6 +15071,7 @@
             if (m === 'GET'  && clean === 'inventory')          return 'get_inventory';
             if (m === 'GET'  && clean === 'risk/spreads')       return 'get_risk_spreads';
             if (m === 'GET'  && clean === 'stats')              return 'get_stats';
+            if (m === 'GET'  && clean === 'safety/status')      return 'get_safety_status';
 
             // --- Offers ---
             if (m === 'GET'  && clean === 'offers')             return 'get_offers';
@@ -15144,6 +15263,259 @@
             // Browser mode or unmapped endpoint: use native fetch()
             return fetch(path, options);
         }
+
+        // SAFETY_DIAGNOSTICS_BEGIN
+        const SAFETY_DIAGNOSTICS_POLL_MS = 15000;
+        const SAFETY_DIAGNOSTICS_REASONS = Object.freeze({
+            '': 'No blocker reported',
+            STARTUP_RECOVERY_NOT_RUN: 'Startup recovery has not run',
+            DATABASE_INTEGRITY_FAILED: 'Database integrity check failed',
+            DURABLE_STATE_UNAVAILABLE: 'Durable safety state is unavailable',
+            LEASE_EXPIRED: 'Mutation lease expired',
+            LEASE_LOST: 'Mutation lease was lost',
+            LEASE_OWNED_BY_OTHER: 'Another CATalyst instance owns the lease',
+            LEASE_UNAVAILABLE: 'Mutation lease is unavailable',
+            LATCH_BINDING_MISMATCH: 'Safety latch binding changed',
+            STARTUP_AUTHORITY_CHANGED: 'Startup authority changed',
+            UNRESOLVED_OPERATIONS: 'Unresolved operations require review',
+            RECONCILIATION_REQUIRED: 'Authoritative reconciliation is required',
+            CONTRADICTORY_HISTORY: 'Authoritative history is contradictory',
+            RESERVATION_RECONCILIATION_REQUIRED: 'Coin reservations require reconciliation',
+            PUBLICATION_CLAIM_RECOVERY_REQUIRED: 'Publication claims require recovery',
+            WALLET_BACKEND_UNSUPPORTED: 'Wallet backend is unsupported',
+            WALLET_IDENTITY_BINDING_INVALID: 'Wallet identity binding is invalid',
+            WALLET_IDENTITY_MALFORMED: 'Wallet identity response is malformed',
+            WALLET_IDENTITY_MISMATCH: 'Wallet identity changed',
+            WALLET_IDENTITY_NON_SIGNING: 'Wallet identity cannot sign',
+            WALLET_IDENTITY_STALE: 'Wallet identity is stale',
+            WALLET_IDENTITY_UNAVAILABLE: 'Wallet identity is unavailable',
+            WORKER_PARENT_LEASE_INVALID: 'Worker lease authority is invalid'
+        });
+        const SAFETY_DIAGNOSTICS_ACTIONS = Object.freeze({
+            NONE: 'No operator action required',
+            RESTORE_DATABASE_BACKUP: 'Restore a verified database backup',
+            USE_ACTIVE_CATALYST_INSTANCE: 'Use the active CATalyst instance',
+            RESTART_CATALYST: 'Restart CATalyst',
+            VERIFY_WALLET_IDENTITY: 'Verify the active wallet identity',
+            RECONCILE_COIN_RESERVATIONS: 'Reconcile coin reservations',
+            RETRY_PUBLICATION_RECOVERY: 'Retry publication recovery',
+            RUN_AUTHORITATIVE_RECONCILIATION: 'Run authoritative reconciliation',
+            REVIEW_SAFETY_DIAGNOSTICS: 'Review safety diagnostics'
+        });
+        const SAFETY_DIAGNOSTICS_PROVENANCE = Object.freeze({
+            durable_snapshot: 'durable snapshot',
+            configured_binding: 'configured binding',
+            authorized_snapshot: 'authorized snapshot'
+        });
+        const SAFETY_DIAGNOSTICS_OWNERS = Object.freeze({
+            this_run: 'This CATalyst instance',
+            other_run: 'Another CATalyst instance'
+        });
+        let _safetyDiagnosticsTimer = null;
+        let _safetyDiagnosticsPolling = false;
+        let _safetyDiagnosticsActionPanel = null;
+        let _safetyDiagnosticsGeneration = 0;
+        let _safetyDiagnosticsRequestInFlight = false;
+
+        function safetyDiagnosticsCount(value) {
+            return Number.isInteger(value) && value >= 0 && value <= 2147483647
+                ? value
+                : null;
+        }
+
+        function safetyDiagnosticsText(id, value) {
+            const element = document.getElementById(id);
+            if (element) element.textContent = value;
+        }
+
+        function renderSafetyDiagnosticsUnavailable(kind) {
+            const panel = document.getElementById('safetyDiagnosticsPanel');
+            if (!panel) return;
+            panel.classList.remove('is-allowed');
+            panel.classList.add('is-blocked');
+            safetyDiagnosticsText('safetyDiagnosticsState', 'Blocked');
+            safetyDiagnosticsText('safetyDiagnosticsReason', 'Unknown safety status');
+            safetyDiagnosticsText('safetyDiagnosticsFreshness', 'Unknown / stale · unavailable');
+            safetyDiagnosticsText('safetyDiagnosticsUnresolved', 'Unknown');
+            safetyDiagnosticsText('safetyDiagnosticsLease', 'Unknown');
+            safetyDiagnosticsText('safetyDiagnosticsCounts', 'Registry — · Lineage — · Reserve — · Publication —');
+            safetyDiagnosticsText('safetyDiagnosticsAction', 'Review safety diagnostics');
+            safetyDiagnosticsText(
+                'safetyDiagnosticsError',
+                kind === 'loading'
+                    ? 'Status loading — mutations are treated as blocked.'
+                    : 'Status error / stale — blocked until a fresh status is available.'
+            );
+        }
+
+        function renderSafetyDiagnosticsStatus(safety) {
+            const panel = document.getElementById('safetyDiagnosticsPanel');
+            if (!panel) return;
+            const value = safety && typeof safety === 'object' && !Array.isArray(safety)
+                ? safety
+                : {};
+            const reasonKnown = typeof value.reason_code === 'string'
+                && (value.reason_code === '' || /^[A-Z][A-Z0-9_]{0,63}$/.test(value.reason_code));
+            const sourceKnown = [
+                'startup_recovery', 'durable_latch', 'durable_read',
+                'operation_journal', 'lease', 'process'
+            ].includes(value.source);
+            const recovery = value.recovery && typeof value.recovery === 'object'
+                && !Array.isArray(value.recovery) ? value.recovery : {};
+            const freshness = recovery.freshness && typeof recovery.freshness === 'object'
+                && !Array.isArray(recovery.freshness) ? recovery.freshness : {};
+            const durableCounts = recovery.durable_counts && typeof recovery.durable_counts === 'object'
+                && !Array.isArray(recovery.durable_counts) ? recovery.durable_counts : {};
+            const blockerCounts = value.blocker_counts && typeof value.blocker_counts === 'object'
+                && !Array.isArray(value.blocker_counts) ? value.blocker_counts : {};
+            const lease = value.lease && typeof value.lease === 'object' && !Array.isArray(value.lease)
+                ? value.lease : {};
+            const registryCount = safetyDiagnosticsCount(durableCounts.registry);
+            const lineageCount = safetyDiagnosticsCount(durableCounts.lineage);
+            const reserveCount = safetyDiagnosticsCount(durableCounts.reserve);
+            const publicationCount = safetyDiagnosticsCount(durableCounts.publication);
+            const operationCount = safetyDiagnosticsCount(value.blocking_operation_count);
+            const reservationCount = safetyDiagnosticsCount(blockerCounts.reservations);
+            const publicationBlockers = safetyDiagnosticsCount(blockerCounts.publication_claims);
+            const age = safetyDiagnosticsCount(freshness.age_seconds);
+            const provenanceKnown = typeof freshness.provenance === 'string'
+                && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_PROVENANCE, freshness.provenance);
+            const ownerKnown = typeof lease.owner === 'string'
+                && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_OWNERS, lease.owner);
+            const leaseVersion = safetyDiagnosticsCount(lease.version);
+            const expiryKnown = typeof lease.expires_at === 'string'
+                && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(lease.expires_at);
+            const actionKnown = typeof value.recommended_action === 'string'
+                && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_ACTIONS, value.recommended_action);
+            const complete = reasonKnown && sourceKnown
+                && registryCount !== null && lineageCount !== null
+                && reserveCount !== null && publicationCount !== null
+                && operationCount !== null && reservationCount !== null && publicationBlockers !== null
+                && age !== null && provenanceKnown && typeof lease.active === 'boolean'
+                && leaseVersion !== null && actionKnown
+                && (!lease.active || (ownerKnown && expiryKnown));
+            const allowed = complete && value.allowed === true && value.reason_code === '';
+
+            panel.classList.toggle('is-allowed', allowed);
+            panel.classList.toggle('is-blocked', !allowed);
+            safetyDiagnosticsText('safetyDiagnosticsState', allowed ? 'Allowed' : 'Blocked');
+            safetyDiagnosticsText(
+                'safetyDiagnosticsReason',
+                reasonKnown
+                    ? (Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_REASONS, value.reason_code)
+                        ? SAFETY_DIAGNOSTICS_REASONS[value.reason_code]
+                        : value.reason_code)
+                    : 'Unknown safety status'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsFreshness',
+                age !== null && provenanceKnown
+                    ? `${age}s old · ${SAFETY_DIAGNOSTICS_PROVENANCE[freshness.provenance]}`
+                    : 'Unknown / stale · unavailable'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsUnresolved',
+                operationCount !== null && reservationCount !== null && publicationBlockers !== null
+                    ? `Operations ${operationCount} · Reservations ${reservationCount} · Publications ${publicationBlockers}`
+                    : 'Unknown'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsLease',
+                lease.active === false
+                    ? 'No active lease'
+                    : ownerKnown && leaseVersion !== null && expiryKnown
+                        ? `${SAFETY_DIAGNOSTICS_OWNERS[lease.owner]} · v${leaseVersion} · expires ${lease.expires_at}`
+                        : 'Unknown'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsCounts',
+                registryCount !== null && lineageCount !== null
+                    && reserveCount !== null && publicationCount !== null
+                    ? `Registry ${registryCount} · Lineage ${lineageCount} · Reserve ${reserveCount} · Publication ${publicationCount}`
+                    : 'Registry — · Lineage — · Reserve — · Publication —'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsAction',
+                actionKnown ? SAFETY_DIAGNOSTICS_ACTIONS[value.recommended_action] : 'Review safety diagnostics'
+            );
+            safetyDiagnosticsText(
+                'safetyDiagnosticsError',
+                complete ? '' : 'Status incomplete / stale — mutations remain blocked.'
+            );
+        }
+
+        async function refreshSafetyDiagnosticsStatus() {
+            if (_safetyDiagnosticsRequestInFlight) return;
+            const panel = document.getElementById('safetyDiagnosticsPanel');
+            if (!panel) return;
+            const refresh = document.getElementById('safetyDiagnosticsRefresh');
+            _safetyDiagnosticsRequestInFlight = true;
+            if (refresh) refresh.disabled = true;
+            try {
+                const response = await apiFetch(`${API_URL}/safety/status`);
+                const payload = await response.json();
+                if (!response.ok || !payload || payload.success !== true) {
+                    throw new Error('safety status unavailable');
+                }
+                renderSafetyDiagnosticsStatus(payload.safety);
+            } catch (_error) {
+                renderSafetyDiagnosticsUnavailable('error');
+            } finally {
+                _safetyDiagnosticsRequestInFlight = false;
+                if (refresh && document.getElementById('safetyDiagnosticsPanel')) {
+                    refresh.disabled = false;
+                }
+            }
+        }
+
+        async function pollSafetyDiagnostics(generation) {
+            await refreshSafetyDiagnosticsStatus();
+            if (!_safetyDiagnosticsPolling || generation !== _safetyDiagnosticsGeneration) return;
+            if (!document.getElementById('safetyDiagnosticsPanel')) {
+                stopSafetyDiagnosticsPolling();
+                return;
+            }
+            _safetyDiagnosticsTimer = setTimeout(
+                () => pollSafetyDiagnostics(generation),
+                SAFETY_DIAGNOSTICS_POLL_MS
+            );
+        }
+
+        function startSafetyDiagnosticsPolling() {
+            const panel = document.getElementById('safetyDiagnosticsPanel');
+            if (!panel || _safetyDiagnosticsPolling) return;
+            installSafetyDiagnosticsActions();
+            _safetyDiagnosticsPolling = true;
+            _safetyDiagnosticsGeneration += 1;
+            renderSafetyDiagnosticsUnavailable('loading');
+            pollSafetyDiagnostics(_safetyDiagnosticsGeneration);
+        }
+
+        function stopSafetyDiagnosticsPolling() {
+            if (!_safetyDiagnosticsPolling && _safetyDiagnosticsTimer === null) return;
+            _safetyDiagnosticsPolling = false;
+            _safetyDiagnosticsGeneration += 1;
+            if (_safetyDiagnosticsTimer !== null) {
+                clearTimeout(_safetyDiagnosticsTimer);
+                _safetyDiagnosticsTimer = null;
+            }
+        }
+
+        function installSafetyDiagnosticsActions() {
+            const panel = document.getElementById('safetyDiagnosticsPanel');
+            if (!panel || _safetyDiagnosticsActionPanel === panel) return;
+            panel.addEventListener('click', (event) => {
+                const button = event.target && typeof event.target.closest === 'function'
+                    ? event.target.closest('button[data-safety-action]')
+                    : null;
+                if (!button || !panel.contains(button)) return;
+                if (button.getAttribute('data-safety-action') === 'refresh') {
+                    refreshSafetyDiagnosticsStatus();
+                }
+            });
+            _safetyDiagnosticsActionPanel = panel;
+        }
+        // SAFETY_DIAGNOSTICS_END
 
         async function openExternalUrlInBrowser(url) {
             let parsed;

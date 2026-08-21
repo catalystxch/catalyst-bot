@@ -23496,6 +23496,47 @@ def get_mutation_authorization_snapshot(
 _MAX_STARTUP_RECOVERY_ROWS = 4096
 
 
+def get_stability_diagnostic_counts() -> Dict[str, int]:
+    """Return fixed operator totals from one read-only aggregate snapshot.
+
+    A lineage is counted once at its child row: the durable registry stores
+    exactly one ``parent_intent_id`` on each replacement child.  Reserve rows
+    use the guarded-reset protection predicate so locked coins and any coin
+    retaining a trade owner are both visible to operators without exposing
+    coin or offer identities.
+    """
+
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM offer_intents) AS registry,
+                (SELECT COUNT(*) FROM offer_intents
+                    WHERE parent_intent_id IS NOT NULL) AS lineage,
+                (SELECT COUNT(*) FROM coins
+                    WHERE status='locked' OR trade_id IS NOT NULL) AS reserve,
+                (SELECT COUNT(*) FROM publication_outbox) AS publication
+            """
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("stability diagnostic aggregate is unavailable")
+        result = {
+            key: row[key]
+            for key in ("registry", "lineage", "reserve", "publication")
+        }
+        if any(type(value) is not int or value < 0 for value in result.values()):
+            raise RuntimeError("stability diagnostic aggregate is malformed")
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_stability_startup_recovery_snapshot() -> Dict[str, Any]:
     """Read the Task 3-9 startup blockers from one immutable DB snapshot.
 
