@@ -34,6 +34,7 @@ from publication_outbox import (  # noqa: E402
     redact_publication_evidence,
     transition_publication,
 )
+import publication_outbox as publication_policy  # noqa: E402
 import database  # noqa: E402
 import bot_loop  # noqa: E402
 import dexie_manager  # noqa: E402
@@ -42,6 +43,10 @@ import splash_manager  # noqa: E402
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _offer_text(intent_id: str) -> str:
+    return f"offer1durable-{intent_id}"
 
 
 AT = "2026-08-15T12:00:00.000000Z"
@@ -71,7 +76,7 @@ def isolated_database(tmp_path):
 
 
 def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
-    offer_fingerprint = _sha(f"offer:{intent_id}")
+    offer_fingerprint = _sha(_offer_text(intent_id))
     trade_id = _sha(f"trade:{intent_id}")
     db.prepare_offer_intent(
         intent_id=intent_id,
@@ -106,6 +111,14 @@ def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
         finalized_at=LATER,
     )
     return intent, trade_id, offer_fingerprint
+
+
+def _prepare_claimable(db, *, intent_id="intent-1", generation=7):
+    intent, trade_id, fingerprint = _prepare_and_confirm(
+        db, intent_id=intent_id, generation=generation
+    )
+    _persist_offer_projection(db, trade_id, _offer_text(intent_id))
+    return intent, trade_id, fingerprint
 
 
 def _claim(db, publisher="dexie", *, owner="worker-a", token="claim-a", at=LATER):
@@ -201,6 +214,66 @@ def test_evidence_is_redacted_size_bounded_and_offer_free():
     assert redacted["provider_response_id"] == "response-1"
 
 
+@pytest.mark.parametrize(
+    ("result", "expected_state"),
+    [
+        (
+            {
+                "outcome": "acknowledged",
+                "provider": "dexie",
+                "provider_response_id": "dexie-1",
+                "echoed_idempotency_key": "expected-key",
+                "request_sha256": _sha("request"),
+                "response_sha256": _sha("response"),
+                "status_code": 201,
+            },
+            PublicationState.SUCCEEDED,
+        ),
+        (
+            {
+                "outcome": "acknowledged",
+                "provider": "dexie",
+                "provider_response_id": "dexie-1",
+                "echoed_idempotency_key": "wrong-key",
+                "request_sha256": _sha("request"),
+                "response_sha256": _sha("response"),
+                "status_code": 201,
+            },
+            PublicationState.UNRESOLVED,
+        ),
+        (
+            {
+                "outcome": "no_effect",
+                "provider": "dexie",
+                "reason_code": "RATE_LIMITED",
+                "request_sha256": _sha("request"),
+                "response_sha256": _sha("response"),
+                "status_code": 429,
+                "acceptance": False,
+            },
+            PublicationState.RETRYABLE,
+        ),
+        (
+            {
+                "outcome": "ambiguous",
+                "provider": "dexie",
+                "reason_code": "TIMEOUT_AFTER_DISPATCH",
+                "request_sha256": _sha("request"),
+            },
+            PublicationState.UNRESOLVED,
+        ),
+    ],
+)
+def test_provider_result_policy_retries_only_explicit_no_effect(result, expected_state):
+    decision = publication_policy.classify_provider_result(
+        publisher="dexie",
+        result=result,
+        expected_idempotency_key="expected-key",
+        expected_request_sha256=_sha("request"),
+    )
+    assert decision.state is expected_state
+
+
 def test_confirmation_transactionally_enqueues_both_destinations_by_reference(
     isolated_database,
 ):
@@ -264,6 +337,125 @@ def test_finalize_rolls_back_confirmation_if_publication_insert_fails(
     assert isolated_database.list_publication_outbox(intent_id="intent-rollback") == []
 
 
+def test_confirmation_conflict_rolls_back_intent_but_persists_unresolved_evidence(
+    isolated_database,
+):
+    intent_id = "intent-confirmation-conflict"
+    trade_id = _sha(f"trade:{intent_id}")
+    offer_fingerprint = _sha(_offer_text(intent_id))
+    isolated_database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id=f"run:{intent_id}",
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        asset_id=_sha("asset"),
+        side="buy",
+        tier="inner",
+        purpose="ladder",
+        slot_key=f"slot:{intent_id}",
+        generation=7,
+        offered_amount_atomic="10",
+        requested_amount_atomic="20",
+        selected_coin_ids_json=[_sha(f"coin:{intent_id}")],
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={},
+        prepared_at=AT,
+    )
+    conflict_identity = canonical_publication_identity(
+        "mainnet", offer_fingerprint, "7:dexie"
+    )
+    isolated_database.enqueue_publication_outbox(
+        publication_id="preexisting-conflict",
+        idempotency_key=conflict_identity.idempotency_key,
+        intent_id=intent_id,
+        network="mainnet",
+        offer_fingerprint=offer_fingerprint,
+        publication_epoch="7:dexie",
+        publisher="splash",
+        payload_json={"offer_ref": trade_id},
+        queued_at=AT,
+    )
+
+    with pytest.raises(ValueError, match="publication.*conflict"):
+        isolated_database.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:confirmed",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=trade_id,
+            offer_text_sha256=offer_fingerprint,
+            wallet_identity_json={"network": "mainnet"},
+            evidence_json={},
+            finalized_at=LATER,
+        )
+
+    assert isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+    conflict = isolated_database.get_publication_outbox("preexisting-conflict")
+    assert conflict["state"] == "unresolved"
+    assert conflict["last_error_sha256"] == _sha(conflict["last_error_json"])
+
+
+def test_finalize_requires_exact_canonical_publication_identity(isolated_database):
+    intent_id = "intent-canonical-publication"
+    isolated_database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id=f"run:{intent_id}",
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        asset_id=_sha("asset"),
+        side="buy",
+        tier="inner",
+        purpose="ladder",
+        slot_key=f"slot:{intent_id}",
+        generation=3,
+        offered_amount_atomic="10",
+        requested_amount_atomic="20",
+        selected_coin_ids_json=[_sha(f"coin:{intent_id}")],
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={},
+        prepared_at=AT,
+    )
+    trade_id = _sha(f"trade:{intent_id}")
+    offer_fingerprint = _sha(_offer_text(intent_id))
+    canonical = f"mainnet:{offer_fingerprint}:3"
+
+    with pytest.raises(ValueError, match="publication_identity"):
+        isolated_database.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:hostile",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=trade_id,
+            offer_text_sha256=offer_fingerprint,
+            publication_identity="publication:alias",
+            wallet_identity_json={"network": "mainnet"},
+            evidence_json={},
+            finalized_at=LATER,
+        )
+    assert isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+
+    confirmed = isolated_database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:confirmed",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=offer_fingerprint,
+        publication_identity=canonical,
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={},
+        finalized_at=LATER,
+    )
+    assert confirmed["publication_identity"] == canonical
+
+
 def test_exact_duplicate_is_idempotent_and_conflicting_duplicate_unresolves(
     isolated_database,
 ):
@@ -296,7 +488,7 @@ def test_exact_duplicate_is_idempotent_and_conflicting_duplicate_unresolves(
 def test_claim_is_compare_and_set_with_exact_owner_token_generation_and_version(
     isolated_database,
 ):
-    _prepare_and_confirm(isolated_database)
+    _prepare_claimable(isolated_database)
     first = _claim(isolated_database)
     racing = _claim(isolated_database, owner="worker-b", token="claim-b")
 
@@ -308,10 +500,43 @@ def test_claim_is_compare_and_set_with_exact_owner_token_generation_and_version(
     assert racing is None
 
 
+@pytest.mark.parametrize("projection", ["missing", "mutated"])
+def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
+    isolated_database, monkeypatch, projection
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    if projection == "mutated":
+        _persist_offer_projection(isolated_database, trade_id, "offer1mutated-bytes")
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-dexie",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    remote_calls = []
+    monkeypatch.setattr(
+        manager,
+        "_post_single",
+        lambda *args, **kwargs: remote_calls.append((args, kwargs))
+        or {"success": True, "dexie_id": "should-not-run"},
+    )
+
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert remote_calls == []
+    assert result["requeued"] == 0
+    assert row["state"] == "unresolved"
+    assert row["last_error_sha256"] == _sha(row["last_error_json"])
+
+
 def test_success_requires_current_claim_version_and_digest_binds_acknowledgement(
     isolated_database,
 ):
-    _prepare_and_confirm(isolated_database)
+    _prepare_claimable(isolated_database)
     claim = _claim(isolated_database)
     completed = isolated_database.complete_publication_outbox(
         publication_id=claim["publication_id"],
@@ -340,7 +565,7 @@ def test_success_requires_current_claim_version_and_digest_binds_acknowledgement
 def test_retry_preserves_identity_payload_and_uses_injected_backoff_time(
     isolated_database,
 ):
-    _prepare_and_confirm(isolated_database)
+    _prepare_claimable(isolated_database)
     claim = _claim(isolated_database)
     retried = isolated_database.retry_publication_outbox(
         publication_id=claim["publication_id"],
@@ -363,7 +588,7 @@ def test_retry_preserves_identity_payload_and_uses_injected_backoff_time(
 def test_crash_after_remote_success_reclaims_stale_claim_with_same_identity(
     isolated_database,
 ):
-    _prepare_and_confirm(isolated_database)
+    _prepare_claimable(isolated_database)
     abandoned = _claim(isolated_database)
     reclaimed = _claim(
         isolated_database,
@@ -389,7 +614,7 @@ def test_crash_after_remote_success_reclaims_stale_claim_with_same_identity(
 def test_terminal_suppression_invalidates_late_claim_without_wallet_side_effect(
     isolated_database,
 ):
-    intent, _trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    intent, _trade_id, _fingerprint = _prepare_claimable(isolated_database)
     claim = _claim(isolated_database)
     conn = isolated_database._stability_connection()
     try:
@@ -432,17 +657,17 @@ def _persist_offer_projection(db, trade_id, offer_text):
 
 
 @pytest.mark.parametrize(
-    ("module", "manager_name", "publisher", "response"),
+    ("module", "manager_name", "publisher", "provider_id"),
     [
-        (dexie_manager, "DexieManager", "dexie", {"success": True, "dexie_id": "dexie-1"}),
-        (splash_manager, "SplashManager", "splash", {"success": True, "provider_response_id": "splash-1"}),
+        (dexie_manager, "DexieManager", "dexie", "dexie-1"),
+        (splash_manager, "SplashManager", "splash", "splash-1"),
     ],
 )
 def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize_wallet(
-    isolated_database, monkeypatch, module, manager_name, publisher, response
+    isolated_database, monkeypatch, module, manager_name, publisher, provider_id
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
-    offer_text = "offer1durable-publication"
+    offer_text = _offer_text(intent["intent_id"])
     _persist_offer_projection(isolated_database, trade_id, offer_text)
     manager = getattr(module, manager_name)()
     monkeypatch.setattr(module.cfg, "DEXIE_POST_ENABLED", True, raising=False)
@@ -456,7 +681,17 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
 
     def fake_post(payload, observed_trade_id=None, force=False, idempotency_key=None):
         observed.append((payload, observed_trade_id, force, idempotency_key))
-        return dict(response)
+        return {
+            "outcome": "acknowledged",
+            "provider": publisher,
+            "provider_response_id": provider_id,
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                publisher, payload, idempotency_key
+            ),
+            "response_sha256": _sha("bounded-provider-ack"),
+            "status_code": 201,
+        }
 
     monkeypatch.setattr(manager, "_post_single", fake_post)
     result = manager.flush_queue()
@@ -464,16 +699,18 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     assert result["posted"] == 1
     assert observed[0][0] == offer_text
     assert observed[0][1] == trade_id
-    assert observed[0][3].startswith(f"mainnet:{_sha(f'offer:{intent['intent_id']}')}")
+    assert observed[0][3].startswith(f"mainnet:{_sha(_offer_text(intent['intent_id']))}")
     assert isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
     assert isolated_database.get_offer(trade_id)["status"] == "open"
 
 
-def test_durable_manager_keeps_ambiguous_remote_success_retryable(
+def test_durable_manager_latches_ambiguous_remote_success_unresolved(
     isolated_database, monkeypatch
 ):
     _intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
-    _persist_offer_projection(isolated_database, trade_id, "offer1ambiguous")
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(_intent["intent_id"])
+    )
     manager = splash_manager.SplashManager()
     monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
     manager.enable_durable_outbox(
@@ -489,14 +726,16 @@ def test_durable_manager_keeps_ambiguous_remote_success_retryable(
     )[0]
     assert result["posted"] == 0
     assert result["failed"] == 1
-    assert row["state"] == "retryable"
+    assert row["state"] == "unresolved"
 
 
 def test_worker_rechecks_injected_time_after_remote_success_before_completion(
     isolated_database, monkeypatch
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
-    _persist_offer_projection(isolated_database, trade_id, "offer1late-success")
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
     observed_times = iter((LATER, AFTER_LEASE))
     manager = dexie_manager.DexieManager()
     monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
@@ -518,6 +757,237 @@ def test_worker_rechecks_injected_time_after_remote_success_before_completion(
     )[0]
     assert result["posted"] == 0
     assert row["state"] == "claimed"
+
+
+class _TransportResponse:
+    def __init__(self, status_code, payload, *, headers=None):
+        import json
+
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = json.dumps(payload) if payload is not None else ""
+        self.content = self.text.encode("utf-8")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("malformed response")
+        return self._payload
+
+
+@pytest.mark.parametrize(
+    ("module", "manager_name", "publisher", "provider_id"),
+    [
+        (dexie_manager, "DexieManager", "dexie", "dexie-response-1"),
+        (splash_manager, "SplashManager", "splash", "splash-response-1"),
+    ],
+)
+def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgement(
+    isolated_database, monkeypatch, module, manager_name, publisher, provider_id
+):
+    intent, trade_id, fingerprint = _prepare_and_confirm(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = getattr(module, manager_name)()
+    monkeypatch.setattr(module.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(module.cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(module.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id=f"worker-{publisher}",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(
+            201,
+            {"id": provider_id, "idempotency_key": key},
+        )
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    result = manager.flush_queue()
+
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher=publisher
+    )[0]
+    assert result["posted"] == 1
+    assert len(calls) == 1
+    assert calls[0][1]["json"]["offer"] == offer_text
+    assert _sha(calls[0][1]["json"]["offer"]) == fingerprint
+    assert calls[0][1]["headers"]["idempotency-key"] == row["idempotency_key"]
+    assert row["state"] == "succeeded"
+    acknowledgement = __import__("json").loads(row["acknowledgement_json"])
+    assert acknowledgement["provider_response_id"] == provider_id
+    assert acknowledgement["request_sha256"] == row["request_sha256"]
+    assert acknowledgement["response_sha256"] == _sha(calls[0][0] and _TransportResponse(201, {"id": provider_id, "idempotency_key": row["idempotency_key"]}).content.decode())
+
+
+@pytest.mark.parametrize("failure", ["mismatched_echo", "timeout"])
+def test_dispatched_ambiguous_response_is_unresolved_and_never_retried(
+    isolated_database, monkeypatch, failure
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_RETRIES", 3, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-dexie",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        if failure == "timeout":
+            raise dexie_manager.requests.Timeout("timed out after dispatch")
+        return _TransportResponse(
+            200,
+            {"id": "dexie-ambiguous", "idempotency_key": "wrong-key"},
+        )
+
+    monkeypatch.setattr(dexie_manager.requests, "post", fake_post)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert len(calls) == 1
+    assert result["requeued"] == 0
+    assert row["state"] == "unresolved"
+
+
+def test_stale_dispatched_claim_without_observation_contract_never_replays(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    first = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    first.enable_durable_outbox(
+        owner_run_id="worker-first",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    calls = []
+
+    def accepted_post(url, **kwargs):
+        calls.append((url, kwargs))
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(201, {"id": "dexie-1", "idempotency_key": key})
+
+    monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
+    monkeypatch.setattr(
+        dexie_manager,
+        "complete_publication_outbox",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("crash after remote success")),
+    )
+    with pytest.raises(RuntimeError, match="crash after remote success"):
+        first.flush_queue()
+    assert len(calls) == 1
+
+    second = dexie_manager.DexieManager()
+    second.enable_durable_outbox(
+        owner_run_id="worker-second",
+        now_provider=lambda: AFTER_LEASE,
+        lease_expires_provider=lambda _now: "2026-08-15T12:01:00.000000Z",
+    )
+    result = second.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert len(calls) == 1
+    assert result["posted"] == 0
+    assert row["state"] == "unresolved"
+
+
+def test_legacy_plaintext_queue_is_migrated_to_durable_reference_before_effect(
+    isolated_database, monkeypatch
+):
+    trade_id = _sha("legacy-trade")
+    offer_text = "offer1legacy-durable"
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = dexie_manager.DexieManager()
+    manager.queue_post(offer_text, trade_id, force=True)
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    calls = []
+
+    def accepted_post(url, **kwargs):
+        calls.append((url, kwargs))
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(201, {"id": "dexie-legacy", "idempotency_key": key})
+
+    monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
+    manager.enable_durable_outbox(
+        owner_run_id="legacy-worker",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+
+    assert manager._queue == []
+    queued = isolated_database.list_publication_outbox(publisher="dexie")
+    assert len(queued) == 1
+    assert queued[0]["publication_epoch"] == "legacy-0000000001:dexie"
+    assert __import__("json").loads(queued[0]["payload_json"]) == {
+        "offer_ref": trade_id
+    }
+    assert offer_text not in queued[0]["payload_json"]
+
+    result = manager.flush_queue()
+    assert result["posted"] == 1
+    assert len(calls) == 1
+
+
+def test_intentional_reposts_allocate_monotonic_durable_publisher_epochs(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+
+    def accepted_post(url, **kwargs):
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(201, {"id": "dexie-repost", "idempotency_key": key})
+
+    monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
+    manager.enable_durable_outbox(
+        owner_run_id="repost-worker",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    assert manager.flush_queue()["posted"] == 1
+
+    manager.queue_post(offer_text, trade_id, force=True)
+    assert manager._queue == []
+    rows = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )
+    assert [row["publication_epoch"] for row in rows] == [
+        "7:dexie",
+        "repost-0000000001:dexie",
+    ]
+    assert manager.flush_queue()["posted"] == 1
+
+    manager.queue_post(offer_text, trade_id, force=True)
+    rows = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )
+    assert [row["publication_epoch"] for row in rows] == [
+        "7:dexie",
+        "repost-0000000001:dexie",
+        "repost-0000000002:dexie",
+    ]
 
 
 def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():

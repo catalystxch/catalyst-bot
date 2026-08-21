@@ -33,6 +33,7 @@ from typing import Dict, Optional
 
 from config import cfg
 from database import (
+    get_runtime_mutation_lease,
     log_event,
     get_stats,
     get_offer,
@@ -859,6 +860,10 @@ class BotLoop:
         """Bind outbound managers to one post-recovery durable worker owner."""
 
         owner = "publication-worker:" + uuid.uuid4().hex
+        lease = get_runtime_mutation_lease()
+        network = lease.get("network")
+        if type(network) is not str or not network:
+            raise RuntimeError("durable publication requires the active runtime network")
 
         def observed_at() -> str:
             return datetime.now(timezone.utc).isoformat(
@@ -873,11 +878,13 @@ class BotLoop:
 
         self.dexie_manager.enable_durable_outbox(
             owner_run_id=owner + ":dexie",
+            network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
         )
         self.splash_manager.enable_durable_outbox(
             owner_run_id=owner + ":splash",
+            network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
         )

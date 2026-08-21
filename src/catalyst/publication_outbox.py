@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import hashlib
+import json
 import re
 from typing import Any
 
@@ -34,6 +36,12 @@ class PublicationIdentity:
     offer_fingerprint: str
     publication_epoch: str
     idempotency_key: str
+
+
+@dataclass(frozen=True)
+class PublicationDecision:
+    state: PublicationState
+    evidence: dict[str, Any]
 
 
 def _exact_matching_text(value: Any, pattern: re.Pattern[str], label: str) -> str:
@@ -64,6 +72,143 @@ def canonical_publication_identity(
     )
 
 
+def publication_request_sha256(
+    publisher: Any, offer_bech32: Any, idempotency_key: Any
+) -> str:
+    """Digest the exact provider, offer bytes, and durable key before dispatch."""
+
+    safe_publisher = _exact_matching_text(
+        publisher, re.compile(r"(?:dexie|splash)\Z"), "publisher"
+    )
+    if type(offer_bech32) is not str or not offer_bech32.startswith("offer1"):
+        raise ValueError("offer_bech32 must be exact canonical offer text")
+    encoded_offer = offer_bech32.encode("utf-8")
+    if len(encoded_offer) > 2 * 1024 * 1024:
+        raise ValueError("offer_bech32 exceeds its byte limit")
+    if (
+        type(idempotency_key) is not str
+        or not idempotency_key
+        or len(idempotency_key) > 512
+    ):
+        raise ValueError("idempotency_key must be bounded exact text")
+    material = json.dumps(
+        {
+            "idempotency_key": idempotency_key,
+            "offer_sha256": hashlib.sha256(encoded_offer).hexdigest(),
+            "publisher": safe_publisher,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def provider_response_sha256(response_body: Any) -> str:
+    """Digest one bounded exact response body without retaining its content."""
+
+    if type(response_body) is not bytes:
+        raise TypeError("provider response body must be exact bytes")
+    if len(response_body) > 65536:
+        raise ValueError("provider response body exceeds its byte limit")
+    return hashlib.sha256(response_body).hexdigest()
+
+
+def classify_provider_result(
+    *,
+    publisher: Any,
+    result: Any,
+    expected_idempotency_key: Any,
+    expected_request_sha256: Any,
+) -> PublicationDecision:
+    """Classify a synchronous provider result without performing side effects."""
+
+    safe_publisher = _exact_matching_text(
+        publisher, re.compile(r"(?:dexie|splash)\Z"), "publisher"
+    )
+    if type(expected_idempotency_key) is not str or not expected_idempotency_key:
+        raise ValueError("expected_idempotency_key must be exact text")
+    expected_request = _exact_matching_text(
+        expected_request_sha256,
+        _FINGERPRINT_RE,
+        "expected_request_sha256",
+    )
+
+    def unresolved(code: str) -> PublicationDecision:
+        return PublicationDecision(
+            PublicationState.UNRESOLVED,
+            {
+                "code": code,
+                "provider": safe_publisher,
+                "request_sha256": expected_request,
+            },
+        )
+
+    if type(result) is not dict:
+        return unresolved("MALFORMED_PROVIDER_RESULT")
+    if result.get("provider") != safe_publisher:
+        return unresolved("PROVIDER_BINDING_MISMATCH")
+    if result.get("request_sha256") != expected_request:
+        return unresolved("REQUEST_BINDING_MISMATCH")
+    outcome = result.get("outcome")
+    if outcome == "acknowledged":
+        status = result.get("status_code")
+        provider_id = result.get("provider_response_id")
+        response_digest = result.get("response_sha256")
+        echo = result.get("echoed_idempotency_key")
+        if (
+            type(status) is not int
+            or not 200 <= status < 300
+            or type(provider_id) is not str
+            or not provider_id
+            or len(provider_id) > 256
+            or any(ord(character) < 33 for character in provider_id)
+            or type(response_digest) is not str
+            or _FINGERPRINT_RE.fullmatch(response_digest) is None
+        ):
+            return unresolved("MALFORMED_PROVIDER_ACKNOWLEDGEMENT")
+        if echo is not None and echo != expected_idempotency_key:
+            return unresolved("IDEMPOTENCY_ECHO_MISMATCH")
+        return PublicationDecision(
+            PublicationState.SUCCEEDED,
+            {
+                "code": "SYNCHRONOUS_PROVIDER_ACKNOWLEDGEMENT",
+                "provider": safe_publisher,
+                "provider_response_id": provider_id,
+                "request_sha256": expected_request,
+                "response_sha256": response_digest,
+                "status_code": status,
+            },
+        )
+    if outcome == "no_effect":
+        status = result.get("status_code")
+        response_digest = result.get("response_sha256")
+        reason = result.get("reason_code")
+        if (
+            result.get("acceptance") is not False
+            or type(status) is not int
+            or not 400 <= status < 500
+            or type(response_digest) is not str
+            or _FINGERPRINT_RE.fullmatch(response_digest) is None
+            or type(reason) is not str
+            or not reason
+        ):
+            return unresolved("NO_EFFECT_PROOF_INVALID")
+        evidence = {
+            "code": reason[:128],
+            "provider": safe_publisher,
+            "request_sha256": expected_request,
+            "response_sha256": response_digest,
+            "status_code": status,
+        }
+        if status == 429 or (status == 400 and reason == "INVALID_OFFER"):
+            return PublicationDecision(PublicationState.RETRYABLE, evidence)
+        return PublicationDecision(PublicationState.UNRESOLVED, evidence)
+    return unresolved(
+        result.get("reason_code")
+        if type(result.get("reason_code")) is str and result.get("reason_code")
+        else "AMBIGUOUS_PROVIDER_RESULT"
+    )
 _TRANSITIONS = {
     PublicationState.QUEUED: frozenset(
         {
