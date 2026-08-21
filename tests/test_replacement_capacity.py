@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import database
+import mutation_gate
 import replacement_capacity
 
 
@@ -37,8 +40,18 @@ def _coin(label: str, purpose: str | None, **overrides):
 
 @pytest.fixture
 def isolated_database(tmp_path: Path, monkeypatch):
+    def clear_process_effect_authorities():
+        with database._wallet_effect_process_authorities_lock:
+            states = list(database._wallet_effect_process_authorities.values())
+            database._wallet_effect_process_authorities.clear()
+        for state in states:
+            mutation_gate.exit_wallet_mutation(state.permit)
+
     original_path = database.DB_PATH
     original_initialized_path = database._db_initialized_path
+    clear_process_effect_authorities()
+    mutation_gate.shutdown_runtime()
+    mutation_gate.clear_worker_authority_environment()
     database.close_connection()
     database.DB_PATH = str(tmp_path / "capacity.db")
     database._db_initialized_path = ""
@@ -51,9 +64,44 @@ def isolated_database(tmp_path: Path, monkeypatch):
     try:
         yield
     finally:
+        clear_process_effect_authorities()
+        mutation_gate.shutdown_runtime()
+        mutation_gate.clear_worker_authority_environment()
         database.close_connection()
         database.DB_PATH = original_path
         database._db_initialized_path = original_initialized_path
+
+
+def _activate_wallet_authority(monkeypatch, *, run_id: str):
+    now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Task 12 Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(now - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    monkeypatch.setattr(mutation_gate, "_utc_now", lambda: now)
+    runtime = mutation_gate.initialize(
+        run_id=run_id,
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network="mainnet",
+        lease_seconds=30,
+        start_heartbeat=False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=object(),
+    )
+    assert runtime.last_acquire_result["acquired"] is True
+    return binding
 
 
 @pytest.mark.parametrize("purpose", PURPOSES)
@@ -336,7 +384,7 @@ def test_split_and_combine_identities_are_deterministic_and_purpose_bound():
 
 
 def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
-    isolated_database,
+    isolated_database, monkeypatch
 ):
     """Catches blind split replay after a lost wallet response."""
 
@@ -345,16 +393,18 @@ def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
     assert hasattr(database, "get_recoverable_coin_prep_operations")
     database.init_database()
     source = hashlib.sha256(b"journal-source").hexdigest()
-    identity = {
-        "backend": "sage",
-        "name": "test-wallet",
-        "fingerprint": 123,
-        "network_id": "mainnet",
-        "kind": "hot",
-        "has_secrets": True,
-        "bound_at_utc": "2026-08-21T12:00:00.000000Z",
-        "maximum_age_seconds": 300,
-    }
+    binding = _activate_wallet_authority(monkeypatch, run_id="task-12-journal")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_target_contract(),
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"], source_coin_ids=[source]
+    )
+    assert claim is not None
     first = database.prepare_coin_prep_operation(
         operation_kind="split",
         purpose="replacement",
@@ -362,6 +412,8 @@ def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
         target_contract=_target_contract(),
         wallet_identity_json=identity,
         evidence_json={"run_id": "prep-a"},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
     )
     replay = database.prepare_coin_prep_operation(
         operation_kind="split",
@@ -370,6 +422,8 @@ def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
         target_contract=_target_contract(),
         wallet_identity_json=identity,
         evidence_json={"run_id": "prep-a"},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
     )
     assert first["idempotent"] is False
     assert replay["idempotent"] is True
@@ -378,7 +432,12 @@ def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
     unknown = database.record_coin_prep_operation_outcome(
         first["operation"]["operation_id"],
         outcome="SUBMITTED_UNKNOWN",
-        evidence_json={"reason_code": "wallet_response_lost"},
+        evidence_json={
+            "reason_code": "wallet_response_lost",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "dispatch_outcome": "UNKNOWN",
+        },
     )
     assert unknown["operation"]["outcome"] == "SUBMITTED_UNKNOWN"
     recoverable = database.get_recoverable_coin_prep_operations()
@@ -388,6 +447,235 @@ def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
+def test_prepared_operation_must_bind_active_effect_claim_and_fences_capacity(
+    isolated_database, monkeypatch
+):
+    """Catches PREPARED sources remaining ordinary free replacement capacity."""
+
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="task-12-prepared")
+    source = hashlib.sha256(b"bound-prepared-source").hexdigest()
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_target_contract(),
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"],
+        source_coin_ids=[source],
+    )
+    assert claim is not None
+    assert database.get_authoritative_replacement_capacity_count(wallet_type="xch") == 0
+
+    with pytest.raises(ValueError, match="effect claim"):
+        database.prepare_coin_prep_operation(
+            operation_kind="split",
+            purpose="replacement",
+            source_coin_ids=[source],
+            target_contract=_target_contract(),
+            wallet_identity_json=mutation_gate.wallet_identity_binding_payload(binding),
+            evidence_json={"pre_view_coin_ids": []},
+            effect_claim_token="0" * 64,
+            effect_claim_generation=1,
+        )
+    prepared = database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_target_contract(),
+        wallet_identity_json=mutation_gate.wallet_identity_binding_payload(binding),
+        evidence_json={"pre_view_coin_ids": []},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+
+    assert prepared["operation"]["effect_claim_token"] == claim["claim_token"]
+    assert database.get_authoritative_replacement_capacity_count(wallet_type="xch") == 0
+    assert database.get_recoverable_coin_prep_operations()
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+    output = hashlib.sha256(b"bound-prepared-output").hexdigest()
+    fee_output = hashlib.sha256(b"bound-prepared-fee-output").hexdigest()
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    expected_outputs = [
+        {"coin_id": output, "amount_mojos": 60, "purpose": "replacement"},
+        {"coin_id": fee_output, "amount_mojos": 40, "purpose": "fee_reserve"},
+    ]
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:01.000000Z",
+        "expires_at": "2026-08-21T12:00:14.000000Z",
+        "coins": expected_outputs,
+    }
+    contradictory_outputs = [
+        {"coin_id": output, "amount_mojos": 60, "purpose": "lifecycle"},
+        {"coin_id": fee_output, "amount_mojos": 40, "purpose": "fee_reserve"},
+    ]
+    with pytest.raises(ValueError, match="target contract"):
+        database.record_coin_prep_operation_outcome(
+            prepared["operation"]["operation_id"],
+            outcome="CONFIRMED",
+            evidence_json={
+                "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+                "effect_claim_token": claim["claim_token"],
+                "effect_claim_generation": claim["generation"],
+                "source_coin_ids": [source],
+                "expected_outputs": contradictory_outputs,
+                "authoritative_view": {**view, "coins": contradictory_outputs},
+                "expected_wallet_identity": identity,
+            },
+        )
+    confirmed = database.record_coin_prep_operation_outcome(
+        prepared["operation"]["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": [source],
+            "expected_outputs": expected_outputs,
+            "authoritative_view": view,
+            "expected_wallet_identity": identity,
+        },
+    )
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    capacity = database.get_authoritative_coin_capacity(
+        "replacement", wallet_type="xch"
+    )
+    assert capacity["count"] == 1
+    assert capacity["coin_ids"] == ["0x" + output]
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_confirmed_outcome_requires_complete_authoritative_proof(isolated_database):
+    """Catches a CONFIRMED row created from an empty or count-only assertion."""
+
+    database.init_database()
+    with pytest.raises(ValueError, match="confirmed evidence"):
+        database.record_coin_prep_operation_outcome(
+            "coin-prep:" + hashlib.sha256(b"missing-operation").hexdigest(),
+            outcome="CONFIRMED",
+            evidence_json={},
+        )
+
+
+def test_reserving_selected_coins_derives_one_exact_non_null_purpose(
+    isolated_database,
+):
+    """Catches omitted coin_purpose bypassing purpose isolation."""
+
+    database.init_database()
+    replacement_id = hashlib.sha256(b"derive-replacement").hexdigest()
+    lifecycle_id = hashlib.sha256(b"derive-lifecycle").hexdigest()
+    assert database.upsert_coin(
+        replacement_id, "xch", 100, purpose="replacement"
+    )
+    assert database.upsert_coin(lifecycle_id, "xch", 100, purpose="lifecycle")
+
+    with pytest.raises(ValueError, match="one exact purpose"):
+        database.prepare_offer_intent(
+            intent_id="mixed-purpose-reservation",
+            operation_id="create:mixed-purpose-reservation",
+            event_id="create:mixed-purpose-reservation:prepared",
+            run_id="run-a",
+            wallet_fingerprint_hash=hashlib.sha256(b"wallet").hexdigest(),
+            network="mainnet",
+            asset_id=hashlib.sha256(b"asset").hexdigest(),
+            side="buy",
+            tier="inner",
+            purpose="ladder",
+            offered_amount_atomic="100",
+            requested_amount_atomic="200",
+            selected_coin_ids_json=[replacement_id, lifecycle_id],
+            reserve_selected_coins=True,
+            wallet_identity_json={"network": "mainnet"},
+            evidence_json={"source": "task-12-test"},
+        )
+
+    accepted = database.prepare_offer_intent(
+        intent_id="derived-purpose-reservation",
+        operation_id="create:derived-purpose-reservation",
+        event_id="create:derived-purpose-reservation:prepared",
+        run_id="run-a",
+        wallet_fingerprint_hash=hashlib.sha256(b"wallet").hexdigest(),
+        network="mainnet",
+        asset_id=hashlib.sha256(b"asset").hexdigest(),
+        side="buy",
+        tier="inner",
+        purpose="ladder",
+        offered_amount_atomic="100",
+        requested_amount_atomic="200",
+        selected_coin_ids_json=[replacement_id],
+        reserve_selected_coins=True,
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={"source": "task-12-test"},
+    )
+    assert accepted["intent_id"] == "derived-purpose-reservation"
+
+
+def test_real_expired_worker_handoff_blocks_actual_wallet_boundary(
+    isolated_database, monkeypatch
+):
+    """Catches an expired real delegation reaching the wallet callback."""
+
+    database.init_database()
+    mutation_gate.shutdown_runtime()
+    mutation_gate.clear_worker_authority_environment()
+    clock = {"now": datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc)}
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Task 12 Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc=(clock["now"] - timedelta(seconds=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=15,
+    )
+    parent = mutation_gate.MutationGate(
+        run_id="task-12-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network="mainnet",
+        lease_seconds=30,
+        clock=lambda: clock["now"],
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=object(),
+    )
+    monkeypatch.setattr(mutation_gate, "_utc_now", lambda: clock["now"])
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:run-expired",
+        purpose="coin_prep",
+        worker_id="coin-prep-worker:run-expired",
+        ttl_seconds=1,
+    )
+    clock["now"] += timedelta(seconds=2)
+    wallet_calls = []
+    import coin_prep_worker
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        coin_prep_worker._guarded_wallet_mutation(
+            "coin_prep.split_single_sage",
+            lambda: wallet_calls.append("called"),
+            environment=handoff.to_environment(),
+        )
+
+    assert blocked.value.reason_code == "WORKER_DELEGATION_INVALID"
+    assert wallet_calls == []
+    mutation_gate.shutdown_runtime()
+
+
 def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
     """Catches count-only success despite stale identity or output drift."""
 
@@ -395,12 +683,14 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
     output_a = hashlib.sha256(b"post-output-a").hexdigest()
     output_b = hashlib.sha256(b"post-output-b").hexdigest()
     expected_identity = {
+        "backend": "sage",
+        "name": "Task 12 Wallet",
         "fingerprint": 123,
-        "network": "mainnet",
-        "wallet_type": "sage",
-        "wallet_id": 1,
-        "binding_digest": hashlib.sha256(b"binding").hexdigest(),
-        "expires_at": "2026-08-21T12:10:00.000000Z",
+        "network_id": "mainnet",
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": "2026-08-21T12:00:00.000000Z",
+        "maximum_age_seconds": 300,
     }
     expected_outputs = [
         {"coin_id": output_a, "amount_mojos": 60, "purpose": "replacement"},
@@ -410,6 +700,8 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
         "fresh": True,
         "complete": True,
         "wallet_identity": dict(expected_identity),
+        "observed_at": "2026-08-21T12:00:01.000000Z",
+        "expires_at": "2026-08-21T12:05:00.000000Z",
         "coins": [dict(item) for item in expected_outputs],
     }
     confirmed = replacement_capacity.verify_coin_prep_post_view(
@@ -424,8 +716,35 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
         ({**view, "fresh": 1}, "authoritative_view_not_fresh"),
         ({**view, "complete": False}, "authoritative_view_incomplete"),
         (
-            {**view, "wallet_identity": {**expected_identity, "wallet_id": 2}},
+            {**view, "observed_at": "2026-08-21 12:00:01"},
+            "authoritative_view_time_malformed",
+        ),
+        (
+            {key: value for key, value in view.items() if key != "observed_at"},
+            "authoritative_view_time_malformed",
+        ),
+        (
+            {key: value for key, value in view.items() if key != "expires_at"},
+            "authoritative_view_time_malformed",
+        ),
+        (
+            {**view, "observed_at": "2026-08-21T12:05:01.000000Z"},
+            "wallet_identity_expired",
+        ),
+        (
+            {**view, "expires_at": "2026-08-21T12:05:01.000000Z"},
+            "authoritative_view_time_malformed",
+        ),
+        (
+            {**view, "wallet_identity": {**expected_identity, "fingerprint": 999}},
             "wallet_identity_mismatch",
+        ),
+        (
+            {
+                **view,
+                "wallet_identity": {**expected_identity, "binding_digest": "0" * 64},
+            },
+            "wallet_identity_malformed",
         ),
         (
             {**view, "coins": [dict(expected_outputs[0])]},

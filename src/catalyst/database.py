@@ -1411,6 +1411,8 @@ CREATE TABLE IF NOT EXISTS coin_prep_operations (
     target_contract_json   TEXT NOT NULL,
     wallet_identity_json   TEXT NOT NULL,
     prepared_evidence_json TEXT NOT NULL,
+    effect_claim_token     TEXT,
+    effect_claim_generation INTEGER,
     outcome                TEXT NOT NULL CHECK(outcome IN (
                                'PREPARED', 'CONFIRMED',
                                'SUBMITTED_UNKNOWN', 'FAILED')),
@@ -5326,6 +5328,21 @@ def _init_database_impl():
     )
     conn.commit()
 
+    for column_name, column_sql in (
+        ("effect_claim_token", "TEXT"),
+        ("effect_claim_generation", "INTEGER"),
+    ):
+        try:
+            conn.execute(
+                f"SELECT {column_name} FROM coin_prep_operations LIMIT 1"
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                f"ALTER TABLE coin_prep_operations ADD COLUMN "
+                f"{column_name} {column_sql}"
+            )
+            conn.commit()
+
     # Migration: create trading_pace table for adaptive replenishment
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS trading_pace (
@@ -8014,7 +8031,12 @@ def _authoritative_coin_available_predicate(alias: str = "coins") -> str:
         "       OR effect_resolution.outcome<>'RELEASED_NO_EFFECT' "
         "       OR effect_dispatch.dispatch_token IS NULL "
         "       OR effect_dispatch.dispatch_token<>json_extract("
-        "              effect_resolution.evidence_json, '$.dispatch_token')))"
+        "              effect_resolution.evidence_json, '$.dispatch_token'))) "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM coin_prep_operations AS prep, "
+        "json_each(prep.source_coin_ids_json) AS prep_source "
+        f"WHERE prep.outcome IN ('PREPARED','SUBMITTED_UNKNOWN') "
+        f"AND '0x' || lower(prep_source.value)={alias}.coin_id)"
     )
 
 
@@ -19530,6 +19552,8 @@ def prepare_coin_prep_operation(
     target_contract: dict[str, Any],
     wallet_identity_json: dict[str, Any],
     evidence_json: Any,
+    effect_claim_token: str,
+    effect_claim_generation: int,
     prepared_at: Any = None,
 ) -> Dict[str, Any]:
     """Persist one deterministic PREPARED split/combine before wallet effect."""
@@ -19554,8 +19578,16 @@ def prepare_coin_prep_operation(
         expected_type=dict,
         max_bytes=65536,
     )
-    wallet_json, _wallet_hash, _network = _canonical_coin_prep_wallet_identity(
+    wallet_json, wallet_hash, network = _canonical_coin_prep_wallet_identity(
         wallet_identity_json
+    )
+    safe_claim_token = _required_stability_text(
+        effect_claim_token, "coin prep effect claim token"
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", safe_claim_token) is None:
+        raise ValueError("coin prep effect claim token is invalid")
+    safe_claim_generation = _exact_integer(
+        effect_claim_generation, "coin prep effect claim generation", minimum=1
     )
     prepared_evidence = _canonical_json_text(
         evidence_json,
@@ -19573,11 +19605,37 @@ def prepare_coin_prep_operation(
         "target_contract_json": target_json,
         "wallet_identity_json": wallet_json,
         "prepared_evidence_json": prepared_evidence,
+        "effect_claim_token": safe_claim_token,
+        "effect_claim_generation": safe_claim_generation,
         "prepared_at": when,
     }
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        claim = conn.execute(
+            "SELECT claim.* FROM wallet_effect_claims AS claim "
+            "LEFT JOIN wallet_effect_claim_resolutions AS resolution "
+            "ON resolution.claim_token=claim.claim_token "
+            "WHERE claim.claim_token=? AND claim.generation=? "
+            "AND claim.operation_id=? AND resolution.claim_token IS NULL",
+            (
+                safe_claim_token,
+                safe_claim_generation,
+                contract["operation_id"],
+            ),
+        ).fetchone()
+        expected_claim_sources = sorted(
+            norm_coin_id(coin_id) for coin_id in contract["source_coin_ids"]
+        )
+        if (
+            claim is None
+            or json.loads(claim["source_coin_ids_json"]) != expected_claim_sources
+            or claim["wallet_fingerprint_hash"] != wallet_hash
+            or claim["network"] != network
+        ):
+            raise ValueError(
+                "coin prep operation is not bound to the exact active effect claim"
+            )
         existing = conn.execute(
             "SELECT * FROM coin_prep_operations WHERE operation_id=?",
             (contract["operation_id"],),
@@ -19596,9 +19654,10 @@ def prepare_coin_prep_operation(
             INSERT INTO coin_prep_operations (
                 operation_id, operation_kind, purpose, source_coin_ids_json,
                 target_contract_json, wallet_identity_json,
-                prepared_evidence_json, outcome, outcome_evidence_json,
+                prepared_evidence_json, effect_claim_token,
+                effect_claim_generation, outcome, outcome_evidence_json,
                 prepared_at, finalized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, NULL)
             """,
             (
                 immutable["operation_id"],
@@ -19608,6 +19667,8 @@ def prepare_coin_prep_operation(
                 immutable["target_contract_json"],
                 immutable["wallet_identity_json"],
                 immutable["prepared_evidence_json"],
+                immutable["effect_claim_token"],
+                immutable["effect_claim_generation"],
                 immutable["prepared_at"],
             ),
         )
@@ -19626,6 +19687,74 @@ def prepare_coin_prep_operation(
         conn.close()
 
 
+def _coin_prep_outcome_evidence(
+    outcome: str, value: Any
+) -> tuple[str, Dict[str, Any]]:
+    if type(value) is not dict:
+        raise ValueError("coin prep outcome evidence must be an exact mapping")
+    common = {"reason_code", "effect_claim_token", "effect_claim_generation"}
+    expected = {
+        "CONFIRMED": common
+        | {
+            "source_coin_ids",
+            "expected_outputs",
+            "authoritative_view",
+            "expected_wallet_identity",
+        },
+        "SUBMITTED_UNKNOWN": common | {"dispatch_outcome"},
+        "FAILED": common | {"dispatch_outcome", "effect_attempted"},
+    }[outcome]
+    if set(value) != expected:
+        label = "confirmed evidence" if outcome == "CONFIRMED" else "outcome evidence"
+        raise ValueError(f"coin prep {label} fields are invalid")
+    reason = value.get("reason_code")
+    token = value.get("effect_claim_token")
+    generation = value.get("effect_claim_generation")
+    if (
+        type(reason) is not str
+        or not reason
+        or len(reason) > 128
+        or type(token) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", token) is None
+        or type(generation) is not int
+        or generation < 1
+    ):
+        raise ValueError("coin prep outcome evidence values are invalid")
+    if outcome == "CONFIRMED":
+        if reason != "AUTHORITATIVE_POST_VIEW_CONFIRMED":
+            raise ValueError("coin prep confirmed evidence reason is invalid")
+        from replacement_capacity import verify_coin_prep_post_view
+
+        decision = verify_coin_prep_post_view(
+            source_coin_ids=value["source_coin_ids"],
+            expected_outputs=value["expected_outputs"],
+            authoritative_view=value["authoritative_view"],
+            expected_wallet_identity=value["expected_wallet_identity"],
+        )
+        if decision.confirmed is not True:
+            raise ValueError("coin prep confirmed evidence is not authoritative")
+    elif outcome == "SUBMITTED_UNKNOWN":
+        if value.get("dispatch_outcome") not in {
+            "PREPARED",
+            "SUBMITTED",
+            "UNKNOWN",
+            "ADAPTER_EXCEPTION",
+        }:
+            raise ValueError("coin prep outcome evidence dispatch is invalid")
+    elif (
+        value.get("dispatch_outcome") != "RELEASED_NO_EFFECT"
+        or value.get("effect_attempted") is not False
+    ):
+        raise ValueError("coin prep failed evidence is invalid")
+    encoded = _canonical_json_text(
+        value,
+        "coin prep outcome evidence",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    return encoded, dict(value)
+
+
 def record_coin_prep_operation_outcome(
     operation_id: str,
     *,
@@ -19642,13 +19771,7 @@ def record_coin_prep_operation_outcome(
         "FAILED",
     }:
         raise ValueError("coin prep outcome is invalid")
-    evidence = _canonical_json_text(
-        evidence_json,
-        "coin prep outcome evidence",
-        expected_type=dict,
-        default={},
-        max_bytes=65536,
-    )
+    evidence, evidence_payload = _coin_prep_outcome_evidence(outcome, evidence_json)
     when = _stability_timestamp_or_now(finalized_at, "coin prep finalized_at")
     conn = _stability_connection()
     try:
@@ -19660,6 +19783,36 @@ def record_coin_prep_operation_outcome(
         if stored is None:
             raise ValueError("coin prep operation does not exist")
         current = dict(stored)
+        if (
+            current.get("effect_claim_token") != evidence_payload["effect_claim_token"]
+            or current.get("effect_claim_generation")
+            != evidence_payload["effect_claim_generation"]
+        ):
+            raise ValueError("coin prep outcome evidence effect claim differs")
+        if outcome == "CONFIRMED":
+            stored_sources = json.loads(current["source_coin_ids_json"])
+            supplied_sources = sorted(
+                _reconciliation_coin_identity(value, "coin prep confirmed source")[0]
+                for value in evidence_payload["source_coin_ids"]
+            )
+            if supplied_sources != stored_sources:
+                raise ValueError("coin prep confirmed evidence source cohort differs")
+            stored_identity = json.loads(current["wallet_identity_json"])
+            if evidence_payload["expected_wallet_identity"] != stored_identity:
+                raise ValueError("coin prep confirmed evidence wallet identity differs")
+            stored_target = json.loads(current["target_contract_json"])
+            target_outputs = sorted(
+                (output["amount_mojos"], output["purpose"])
+                for output in stored_target["outputs"]
+            )
+            confirmed_outputs = sorted(
+                (output["amount_mojos"], output["purpose"])
+                for output in evidence_payload["expected_outputs"]
+            )
+            if confirmed_outputs != target_outputs:
+                raise ValueError(
+                    "coin prep confirmed output differs from target contract"
+                )
         if current["outcome"] == outcome:
             if current["outcome_evidence_json"] != evidence:
                 raise ValueError("coin prep outcome replay evidence differs")
@@ -19669,6 +19822,70 @@ def record_coin_prep_operation_outcome(
             raise ValueError("coin prep operation is already terminal")
         if current["outcome"] == "SUBMITTED_UNKNOWN" and outcome != "CONFIRMED":
             raise ValueError("effect-unknown coin prep may resolve only from confirmation")
+        if outcome == "CONFIRMED":
+            target = json.loads(current["target_contract_json"])
+            wallet_type = target.get("wallet_type")
+            if wallet_type not in {"xch", "cat"}:
+                raise ValueError("coin prep target wallet type is invalid")
+            for source_coin_id in stored_sources:
+                conn.execute(
+                    "UPDATE coins SET status='spent', trade_id=NULL, "
+                    "designation='unknown', assigned_tier='none', purpose=NULL, "
+                    "last_seen=? WHERE coin_id=?",
+                    (when, norm_coin_id(source_coin_id)),
+                )
+            for output in evidence_payload["expected_outputs"]:
+                output_coin_id = norm_coin_id(output["coin_id"])
+                amount_mojos = _exact_integer(
+                    output["amount_mojos"],
+                    "coin prep confirmed output amount",
+                    minimum=1,
+                )
+                output_purpose = _validated_coin_purpose(
+                    output["purpose"], allow_none=False
+                )
+                if _coin_terminal_mutation_is_protected(conn, output_coin_id):
+                    raise ValueError(
+                        "coin prep confirmed output has protected permanent history"
+                    )
+                existing_output = conn.execute(
+                    "SELECT wallet_type, amount_mojos, status, trade_id, purpose "
+                    "FROM coins WHERE coin_id=?",
+                    (output_coin_id,),
+                ).fetchone()
+                if existing_output is not None and (
+                    existing_output["wallet_type"] != wallet_type
+                    or int(existing_output["amount_mojos"]) != amount_mojos
+                    or existing_output["status"] not in {"free", "gone"}
+                    or existing_output["trade_id"] is not None
+                    or existing_output["purpose"] not in {None, output_purpose}
+                ):
+                    raise ValueError(
+                        "coin prep confirmed output contradicts durable coin state"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO coins (
+                        coin_id, wallet_type, amount_mojos, tier, status,
+                        first_seen, last_seen, designation, assigned_tier, purpose
+                    ) VALUES (?, ?, ?, NULL, 'free', ?, ?, 'unknown', 'none', ?)
+                    ON CONFLICT(coin_id) DO UPDATE SET
+                        status='free', trade_id=NULL, last_seen=excluded.last_seen,
+                        designation=CASE WHEN coins.status='gone'
+                                         THEN 'unknown' ELSE coins.designation END,
+                        assigned_tier=CASE WHEN coins.status='gone'
+                                           THEN 'none' ELSE coins.assigned_tier END,
+                        purpose=excluded.purpose
+                    """,
+                    (
+                        output_coin_id,
+                        wallet_type,
+                        amount_mojos,
+                        when,
+                        when,
+                        output_purpose,
+                    ),
+                )
         conn.execute(
             """
             UPDATE coin_prep_operations
@@ -19699,6 +19916,9 @@ def record_coin_prep_operation_outcome(
             ),
             reconciled_at=when,
             blocking=blocking,
+            additionally_resolved=(
+                f"wallet-effect:{current['effect_claim_token']}",
+            ),
         )
         row = dict(
             conn.execute(
@@ -19716,23 +19936,46 @@ def record_coin_prep_operation_outcome(
 
 
 def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, Any]]:
-    """Read-only restart inventory; callers must observe, never redispatch."""
+    """Return restart inventory and durably fence it before observation."""
 
     safe_limit = _exact_integer(limit, "coin prep recovery limit", minimum=1)
     if safe_limit > 128:
         raise ValueError("coin prep recovery limit exceeds hard limit")
-    rows = (
-        get_connection()
-        .execute(
+    conn = get_connection()
+    rows = conn.execute(
             """
             SELECT * FROM coin_prep_operations
              WHERE outcome IN ('PREPARED', 'SUBMITTED_UNKNOWN')
              ORDER BY prepared_at, operation_id LIMIT ?
             """,
             (safe_limit,),
-        )
-        .fetchall()
-    )
+        ).fetchall()
+    if rows:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                identity = json.loads(row["wallet_identity_json"])
+                import mutation_gate
+
+                _reconciliation_latch_update(
+                    conn,
+                    operation_id=str(row["operation_id"]),
+                    wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+                        identity["fingerprint"]
+                    ),
+                    network=str(identity["network_id"]),
+                    reason_code="COIN_PREP_RECOVERY_REQUIRED",
+                    reason=(
+                        "recoverable coin prep ownership requires authoritative "
+                        "read-only observation"
+                    ),
+                    reconciled_at=_stability_wall_clock(),
+                    blocking=True,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return [dict(row) for row in rows]
 
 
@@ -19999,8 +20242,31 @@ def prepare_offer_intent(
                 raise ValueError(
                     "selected coin does not exist in the durable coin registry"
                 )
-            if safe_coin_purpose is not None and any(
-                by_coin_id[coin_id]["purpose"] != safe_coin_purpose
+            reserved_purposes = {
+                by_coin_id[coin_id]["purpose"] for coin_id in registry_coin_ids
+            }
+            if safe_coin_purpose is None:
+                if (
+                    len(reserved_purposes) != 1
+                    or None in reserved_purposes
+                    or next(iter(reserved_purposes))
+                    not in {
+                        "lifecycle",
+                        "replacement",
+                        "fill_response",
+                        "operator_recovery",
+                        "top_up",
+                        "fee_reserve",
+                    }
+                ):
+                    raise ValueError(
+                        "selected coins must authoritatively derive one exact purpose"
+                    )
+                effective_coin_purpose = next(iter(reserved_purposes))
+            else:
+                effective_coin_purpose = safe_coin_purpose
+            if any(
+                by_coin_id[coin_id]["purpose"] != effective_coin_purpose
                 for coin_id in registry_coin_ids
             ):
                 raise ValueError(

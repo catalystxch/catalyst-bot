@@ -29,9 +29,13 @@ def test_authoritative_post_operation_identity_drift_is_durable_failure(monkeypa
     output = hashlib.sha256(b"output").hexdigest()
     expected_identity = {
         "backend": "sage",
+        "name": "Task 12 Wallet",
         "fingerprint": 123,
         "network_id": "mainnet",
-        "binding_digest": hashlib.sha256(b"binding").hexdigest(),
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": "2026-08-21T12:00:00.000000Z",
+        "maximum_age_seconds": 300,
     }
 
     verified = worker._verify_authoritative_post_operation_view(
@@ -44,11 +48,16 @@ def test_authoritative_post_operation_identity_drift_is_durable_failure(monkeypa
             "fresh": True,
             "complete": True,
             "wallet_identity": {**expected_identity, "fingerprint": 999},
+            "observed_at": "2026-08-21T12:00:01.000000Z",
+            "expires_at": "2026-08-21T12:05:00.000000Z",
             "coins": [
                 {"coin_id": output, "amount_mojos": 100, "purpose": "replacement"}
             ],
         },
         expected_wallet_identity=expected_identity,
+        effect_claim_token="e" * 64,
+        effect_claim_generation=1,
+        dispatch_outcome="SUBMITTED",
     )
 
     assert verified is False
@@ -158,6 +167,8 @@ def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
     worker._merge_xch_fee_change_into_reserve = MagicMock(return_value=False)
     worker._designate_final_sweep = MagicMock()
     worker._format_cat_amount = str
+    worker._recover_coin_prep_operations_read_only = MagicMock(return_value=True)
+    worker._observe_recoverable_coin_prep_operation = MagicMock()
 
     assert worker.run_full_preparation() is False
     worker.update_status.assert_any_call(

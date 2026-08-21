@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
@@ -26,6 +26,7 @@ COIN_PURPOSES = (
 _PURPOSE_SET = frozenset(COIN_PURPOSES)
 COIN_PREP_OPERATION_KINDS = ("split", "combine")
 _COIN_ID_RE = re.compile(r"[0-9a-f]{64}")
+_CANONICAL_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 _MAX_CAPACITY_COINS = 4096
 _MAX_TARGET_OUTPUTS = 512
 
@@ -240,13 +241,35 @@ def coin_prep_operation_identity(**kwargs: Any) -> str:
     return canonical_coin_prep_contract(**kwargs)["operation_id"]
 
 
-def _parse_time(value: Any) -> datetime | None:
-    if type(value) is not str or not value:
+def _canonical_utc_time(value: Any) -> datetime:
+    if (
+        type(value) is not str
+        or len(value) != 27
+        or _CANONICAL_UTC_RE.fullmatch(value) is None
+    ):
+        raise ValueError("timestamp is not canonical bounded UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("timestamp is not canonical bounded UTC") from exc
+    if parsed.tzinfo is not timezone.utc:
+        parsed = parsed.astimezone(timezone.utc)
+    if parsed.isoformat(timespec="microseconds").replace("+00:00", "Z") != value:
+        raise ValueError("timestamp is not canonical bounded UTC")
+    return parsed
+
+
+def _canonical_wallet_identity(value: Any) -> dict[str, Any] | None:
+    if type(value) is not dict:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        import mutation_gate
+
+        binding = mutation_gate.WalletIdentityBinding(**value)
+        payload = mutation_gate.wallet_identity_binding_payload(binding)
+    except (TypeError, ValueError):
         return None
+    return payload if payload == value else None
 
 
 def verify_coin_prep_post_view(
@@ -264,15 +287,30 @@ def verify_coin_prep_post_view(
         return CoinPrepPostViewDecision(False, "authoritative_view_not_fresh", ())
     if authoritative_view.get("complete") is not True:
         return CoinPrepPostViewDecision(False, "authoritative_view_incomplete", ())
-    if (
-        type(expected_wallet_identity) is not dict
-        or type(authoritative_view.get("wallet_identity")) is not dict
-        or authoritative_view["wallet_identity"] != expected_wallet_identity
-    ):
+    expected_identity = _canonical_wallet_identity(expected_wallet_identity)
+    observed_identity = _canonical_wallet_identity(
+        authoritative_view.get("wallet_identity")
+    )
+    if expected_identity is None or observed_identity is None:
+        return CoinPrepPostViewDecision(False, "wallet_identity_malformed", ())
+    if observed_identity != expected_identity:
         return CoinPrepPostViewDecision(False, "wallet_identity_mismatch", ())
-    observed_at = _parse_time(authoritative_view.get("observed_at"))
-    expires_at = _parse_time(expected_wallet_identity.get("expires_at"))
-    if observed_at is not None and (expires_at is None or observed_at > expires_at):
+    try:
+        observed_at = _canonical_utc_time(authoritative_view.get("observed_at"))
+        expires_at = _canonical_utc_time(authoritative_view.get("expires_at"))
+        bound_at = _canonical_utc_time(expected_identity["bound_at_utc"])
+    except ValueError:
+        return CoinPrepPostViewDecision(
+            False, "authoritative_view_time_malformed", ()
+        )
+    authoritative_expiry = bound_at + timedelta(
+        seconds=expected_identity["maximum_age_seconds"]
+    )
+    if expires_at != authoritative_expiry:
+        return CoinPrepPostViewDecision(
+            False, "authoritative_view_time_malformed", ()
+        )
+    if observed_at <= bound_at or observed_at > expires_at:
         return CoinPrepPostViewDecision(False, "wallet_identity_expired", ())
     try:
         sources = {_canonical_coin_id(value, "source coin id") for value in source_coin_ids}

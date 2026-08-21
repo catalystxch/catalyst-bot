@@ -29,7 +29,7 @@ import threading
 import re
 from queue import Empty, Full, Queue
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -257,6 +257,14 @@ def get_recoverable_coin_prep_operations(*args, **kwargs):
     """Load the Task 12 recovery API without widening DB bootstrap coupling."""
 
     from database import get_recoverable_coin_prep_operations as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def prepare_coin_prep_operation(*args, **kwargs):
+    """Load the Task 12 PREPARED API without widening DB bootstrap coupling."""
+
+    from database import prepare_coin_prep_operation as repository_call
 
     return repository_call(*args, **kwargs)
 
@@ -902,6 +910,11 @@ class CoinPrepWorker:
             "coin_prep.split_cat_pool": "source_coin_id",
             "coin_prep.retry_cat_split": "source_coin_id",
         }
+        prep_operation_kind = (
+            "combine"
+            if operation in positional_cohort_operations | set(list_cohort_operations)
+            else "split" if operation in single_source_operations else None
+        )
         if operation in no_coin_effect_operations:
             if not getattr(self, "_is_subprocess", False):
                 return callback(*args, **kwargs)
@@ -925,6 +938,39 @@ class CoinPrepWorker:
         if not source_coin_ids:
             self.log(f"Wallet mutation {operation} has no explicit source cohort")
             return None
+
+        prep_contract = kwargs.pop("_prep_contract", None)
+        canonical_prep = None
+        prep_identity = None
+        if prep_operation_kind is not None:
+            if type(prep_contract) is not dict or set(prep_contract) != {
+                "operation_kind",
+                "purpose",
+                "target_contract",
+                "pre_view_coin_ids",
+            }:
+                self.log(
+                    f"Wallet mutation {operation} has no exact Task 12 prep contract"
+                )
+                return None
+            try:
+                from replacement_capacity import canonical_coin_prep_contract
+
+                canonical_prep = canonical_coin_prep_contract(
+                    operation_kind=prep_contract["operation_kind"],
+                    purpose=prep_contract["purpose"],
+                    source_coin_ids=list(source_coin_ids),
+                    target_contract=prep_contract["target_contract"],
+                )
+                if canonical_prep["operation_kind"] != prep_operation_kind:
+                    raise ValueError("prep operation kind differs")
+                pre_view_coin_ids = prep_contract["pre_view_coin_ids"]
+                if type(pre_view_coin_ids) is not list:
+                    raise ValueError("pre-view coin identities are malformed")
+                prep_identity = self._current_coin_prep_wallet_identity()
+            except Exception as exc:
+                self.log(f"Wallet mutation {operation} prep contract denied: {exc}")
+                return None
 
         authority_fee_coin_ids = kwargs.pop("_authority_fee_coin_ids", None)
         if (
@@ -974,18 +1020,43 @@ class CoinPrepWorker:
             self.log(f"Wallet mutation {operation} supplied a fee cohort without a fee")
             return None
 
+        authority_operation = (
+            canonical_prep["operation_id"] if canonical_prep is not None else operation
+        )
         claim = claim_wallet_effect(
-            operation_id=operation,
+            operation_id=authority_operation,
             source_coin_ids=list(source_coin_ids),
             fee_coin_ids=fee_coin_ids,
         )
         if claim is None:
             self.log(f"Wallet mutation {operation} denied by durable coin authority")
             return None
+        prepared_operation = None
+        if canonical_prep is not None:
+            try:
+                prepared = prepare_coin_prep_operation(
+                    operation_kind=canonical_prep["operation_kind"],
+                    purpose=canonical_prep["purpose"],
+                    source_coin_ids=canonical_prep["source_coin_ids"],
+                    target_contract=canonical_prep["target_contract"],
+                    wallet_identity_json=prep_identity,
+                    evidence_json={"pre_view_coin_ids": pre_view_coin_ids},
+                    effect_claim_token=claim["claim_token"],
+                    effect_claim_generation=claim["generation"],
+                )
+                prepared_operation = dict(prepared["operation"])
+            except Exception as exc:
+                retain_wallet_effect_claim_for_reconciliation(
+                    claim["claim_token"],
+                    claim["generation"],
+                    reason_code="COIN_PREP_PREPARED_PERSIST_FAILED",
+                )
+                self.log(f"Wallet mutation {operation} PREPARED denied: {exc}")
+                return None
         if not wallet_effect_claim_is_current(
             claim["claim_token"],
             claim["generation"],
-            operation_id=operation,
+            operation_id=authority_operation,
             source_coin_ids=list(source_coin_ids),
             fee_coin_ids=fee_coin_ids,
         ):
@@ -998,7 +1069,7 @@ class CoinPrepWorker:
         dispatch = begin_wallet_effect_dispatch(
             claim["claim_token"],
             claim["generation"],
-            operation_id=operation,
+            operation_id=authority_operation,
             source_coin_ids=list(source_coin_ids),
             fee_coin_ids=fee_coin_ids,
         )
@@ -1018,9 +1089,47 @@ class CoinPrepWorker:
                         operation, callback, *args, **kwargs
                     )
         except Exception as exc:
-            complete_wallet_effect_dispatch(dispatch, exception=exc)
+            dispatch_outcome = complete_wallet_effect_dispatch(
+                dispatch, exception=exc
+            )
+            if prepared_operation is not None:
+                self._record_coin_prep_dispatch_outcome(
+                    prepared_operation,
+                    dispatch_outcome=dispatch_outcome,
+                    reason_code="ADAPTER_EXCEPTION_UNKNOWN",
+                )
             raise
-        complete_wallet_effect_dispatch(dispatch, result=result)
+        dispatch_outcome = complete_wallet_effect_dispatch(dispatch, result=result)
+        if prepared_operation is None:
+            return result
+        if dispatch_outcome == "RELEASED_NO_EFFECT":
+            self._record_coin_prep_dispatch_outcome(
+                prepared_operation,
+                dispatch_outcome=dispatch_outcome,
+                reason_code="ADAPTER_PROVEN_NO_EFFECT",
+            )
+            return None
+        self._record_coin_prep_dispatch_outcome(
+            prepared_operation,
+            dispatch_outcome=dispatch_outcome,
+            reason_code=f"WALLET_EFFECT_{dispatch_outcome}_UNRECONCILED",
+        )
+        observation = self._observe_coin_prep_post_effect(prepared_operation)
+        if type(observation) is not dict:
+            return None
+        if not self._verify_authoritative_post_operation_view(
+            operation_id=prepared_operation["operation_id"],
+            source_coin_ids=json.loads(prepared_operation["source_coin_ids_json"]),
+            expected_outputs=observation.get("expected_outputs"),
+            authoritative_view=observation.get("authoritative_view"),
+            expected_wallet_identity=json.loads(
+                prepared_operation["wallet_identity_json"]
+            ),
+            effect_claim_token=prepared_operation["effect_claim_token"],
+            effect_claim_generation=prepared_operation["effect_claim_generation"],
+            dispatch_outcome=dispatch_outcome,
+        ):
+            return None
         return result
 
     def _require_cli_mutation(self, operation: str) -> None:
@@ -1181,8 +1290,106 @@ class CoinPrepWorker:
         return coin_id if coin_id.startswith("0x") else "0x" + coin_id
 
     @staticmethod
+    def _canonical_coin_id(coin_id: str) -> str:
+        if type(coin_id) is not str:
+            raise TypeError("coin id must be an exact string")
+        normalized = coin_id[2:] if coin_id.startswith("0x") else coin_id
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in normalized
+        ):
+            raise ValueError("coin id is not canonical")
+        return normalized.lower()
+
+    @staticmethod
     def _purpose_for_tier(tier_name: str | None) -> str:
         return "fee_reserve" if tier_name == "fees" else "replacement"
+
+    def _build_coin_prep_contract(
+        self,
+        *,
+        wallet_id: int,
+        operation_kind: str,
+        purpose: str,
+        output_amounts_and_purposes: list[tuple[int, str]],
+    ) -> dict | None:
+        """Capture the exact pre-view and target contract before a mutation."""
+
+        try:
+            wallet_type = "xch" if wallet_id == self.xch_wallet_id else "cat"
+            observed = self._get_owned_coins_via_rpc(
+                wallet_id, "coin-prep-authoritative-pre-view"
+            )
+            if type(observed) is not list:
+                return None
+            pre_view_coin_ids = []
+            for coin in observed:
+                coin_id = self._canonical_coin_id(
+                    coin.get("coin_id") or coin.get("id")
+                )
+                if not coin_id or coin_id in pre_view_coin_ids:
+                    return None
+                pre_view_coin_ids.append(coin_id)
+            outputs = [
+                {
+                    "output_index": index,
+                    "amount_mojos": amount,
+                    "purpose": output_purpose,
+                }
+                for index, (amount, output_purpose) in enumerate(
+                    output_amounts_and_purposes
+                )
+                if type(amount) is int and amount > 0
+            ]
+            if len(outputs) != len(output_amounts_and_purposes) or not outputs:
+                return None
+            return {
+                "operation_kind": operation_kind,
+                "purpose": purpose,
+                "target_contract": {
+                    "wallet_type": wallet_type,
+                    "outputs": outputs,
+                },
+                "pre_view_coin_ids": sorted(pre_view_coin_ids),
+            }
+        except Exception:
+            return None
+
+    def _build_split_prep_contract(
+        self,
+        *,
+        wallet_id: int,
+        purpose: str,
+        source_amount_mojos: int,
+        count: int,
+        amount_per_coin: int,
+        fee_mojos: int = 0,
+    ) -> dict | None:
+        """Build every expected split output, including an exact remainder."""
+
+        if (
+            type(source_amount_mojos) is not int
+            or source_amount_mojos <= 0
+            or type(count) is not int
+            or count <= 0
+            or type(amount_per_coin) is not int
+            or amount_per_coin <= 0
+            or type(fee_mojos) is not int
+            or fee_mojos < 0
+        ):
+            return None
+        spendable = source_amount_mojos - fee_mojos
+        remainder = spendable - (count * amount_per_coin)
+        if remainder < 0:
+            return None
+        outputs = [(amount_per_coin, purpose)] * count
+        if remainder > 0:
+            outputs.append((remainder, "top_up"))
+        return self._build_coin_prep_contract(
+            wallet_id=wallet_id,
+            operation_kind="split",
+            purpose=purpose,
+            output_amounts_and_purposes=outputs,
+        )
 
     def _designate_coins_from_snapshot(
         self,
@@ -1694,12 +1901,22 @@ class CoinPrepWorker:
         )
         source_coin_ids = [reserve_id] + extra_ids
         fee_mojos = self._tx_fee_mojos()
+        combined_amount = int(reserve_coin.get("amount", 0)) + int(extra_total)
+        prep_contract = self._build_coin_prep_contract(
+            wallet_id=self.xch_wallet_id,
+            operation_kind="combine",
+            purpose="fee_reserve",
+            output_amounts_and_purposes=[
+                (combined_amount - fee_mojos, "fee_reserve")
+            ],
+        )
         result = self._call_wallet_mutation(
             "coin_prep.combine_fee_reserve",
             combine_coins,
             source_coin_ids,
             fee_mojos=fee_mojos,
             _authority_fee_coin_ids=source_coin_ids if fee_mojos > 0 else None,
+            _prep_contract=prep_contract,
         )
         if not self._sage_submit_succeeded(result):
             self.log("XCH fee cleanup combine was not accepted by Sage")
@@ -3030,6 +3247,7 @@ class CoinPrepWorker:
 
             # Extract all coin IDs, then submit them in block-cost-safe batches.
             coin_ids = []
+            coin_amounts = {}
             for r in unspent:
                 cid = r.get("coin_id", "")
                 if not cid and r.get("coin"):
@@ -3037,6 +3255,13 @@ class CoinPrepWorker:
                     cid = r["coin"].get("coin_id", "")
                 if cid:
                     coin_ids.append(cid)
+                    amount = r.get("amount")
+                    if amount is None and r.get("coin"):
+                        amount = r["coin"].get("amount")
+                    if type(amount) is not int or amount <= 0:
+                        self.log("❌ /combine coin amount is not authoritative")
+                        return False
+                    coin_amounts[self._canonical_coin_id(cid)] = amount
 
             if len(coin_ids) < 2:
                 self.log("❌ Not enough coin IDs found for /combine")
@@ -3064,6 +3289,21 @@ class CoinPrepWorker:
                             batch
                             if combine_fee > 0 and wallet_id == self.xch_wallet_id
                             else None
+                        ),
+                        _prep_contract=self._build_coin_prep_contract(
+                            wallet_id=wallet_id,
+                            operation_kind="combine",
+                            purpose="top_up",
+                            output_amounts_and_purposes=[
+                                (
+                                    sum(
+                                        coin_amounts[self._canonical_coin_id(cid)]
+                                        for cid in batch
+                                    )
+                                    - combine_fee,
+                                    "top_up",
+                                )
+                            ],
                         ),
                     )
                     if not self._sage_submit_succeeded(result):
@@ -3094,6 +3334,14 @@ class CoinPrepWorker:
                     coin_ids
                     if combine_fee > 0 and wallet_id == self.xch_wallet_id
                     else None
+                ),
+                _prep_contract=self._build_coin_prep_contract(
+                    wallet_id=wallet_id,
+                    operation_kind="combine",
+                    purpose="top_up",
+                    output_amounts_and_purposes=[
+                        (sum(coin_amounts.values()) - combine_fee, "top_up")
+                    ],
                 ),
             )
 
@@ -4211,6 +4459,21 @@ class CoinPrepWorker:
             )
 
             split_ok = False
+            split_fee_mojos = self._split_tx_fee_mojos()
+            source_amount_mojos = pool_coin.get("amount")
+            source_fee_mojos = 0 if is_cat else split_fee_mojos
+            prep_contract = (
+                self._build_split_prep_contract(
+                    wallet_id=wallet_id,
+                    purpose=self._purpose_for_tier(tier_name),
+                    source_amount_mojos=source_amount_mojos,
+                    count=count,
+                    amount_per_coin=(source_amount_mojos - source_fee_mojos) // count,
+                    fee_mojos=source_fee_mojos,
+                )
+                if type(source_amount_mojos) is int and count > 0
+                else None
+            )
             for attempt in range(3):
                 try:
                     result = self._call_wallet_mutation(
@@ -4220,8 +4483,9 @@ class CoinPrepWorker:
                         target_coin_id=coin_id,
                         num_coins=count,
                         amount_per_coin=0,  # Sage splits equally
-                        fee_mojos=self._split_tx_fee_mojos(),
+                        fee_mojos=split_fee_mojos,
                         is_cat=is_cat,
+                        _prep_contract=prep_contract,
                     )
                     if result is None:
                         self.log(
@@ -4821,10 +5085,23 @@ class CoinPrepWorker:
                     f"      Using dedicated XCH fee coin {_fee_coin_short}... for CAT {tier_name}"
                 )
 
+            split_fee_mojos = self._split_tx_fee_mojos() if not is_cat else 0
+            amount_per_coin = (
+                pool_mojos // count
+                if is_cat
+                else (pool_mojos - split_fee_mojos) // count
+            )
+            prep_contract = self._build_split_prep_contract(
+                wallet_id=wallet_id,
+                purpose=self._purpose_for_tier(tier_name),
+                source_amount_mojos=pool_mojos,
+                count=count,
+                amount_per_coin=amount_per_coin,
+                fee_mojos=split_fee_mojos,
+            )
             for attempt in range(3):
                 try:
                     if is_cat:
-                        amount_per_coin = pool_mojos // count
                         result = self._call_wallet_mutation(
                             "coin_prep.split_cat_pool",
                             sage_topup_split,
@@ -4835,6 +5112,7 @@ class CoinPrepWorker:
                             fee_mojos=cat_fee_mojos,
                             is_cat=True,
                             fee_coin_id=fee_coin_id,
+                            _prep_contract=prep_contract,
                         )
                     else:
                         result = self._call_wallet_mutation(
@@ -4844,8 +5122,9 @@ class CoinPrepWorker:
                             target_coin_id=coin_id,
                             num_coins=count,
                             amount_per_coin=0,
-                            fee_mojos=self._split_tx_fee_mojos(),
+                            fee_mojos=split_fee_mojos,
                             is_cat=False,
+                            _prep_contract=prep_contract,
                         )
                     if result is None:
                         self.log(f"      Split returned None (attempt {attempt + 1}/3)")
@@ -5428,6 +5707,21 @@ class CoinPrepWorker:
                         retry_counts[idx] = retry_counts.get(idx, 0) + 1
                         try:
                             cat_retry_fee_mojos = self._tx_fee_mojos() if ic else 0
+                            xch_retry_fee_mojos = (
+                                0 if ic else self._split_tx_fee_mojos()
+                            )
+                            retry_prep_contract = self._build_split_prep_contract(
+                                wallet_id=wid,
+                                purpose=self._purpose_for_tier(tn),
+                                source_amount_mojos=pm,
+                                count=cnt,
+                                amount_per_coin=(
+                                    pm // cnt
+                                    if ic
+                                    else (pm - xch_retry_fee_mojos) // cnt
+                                ),
+                                fee_mojos=xch_retry_fee_mojos,
+                            )
                             if should_wait_for_pending_fee_inputs_before_split(
                                 is_cat=ic,
                                 fee_mojos=cat_retry_fee_mojos,
@@ -5452,6 +5746,7 @@ class CoinPrepWorker:
                                     own_address=address,
                                     fee_mojos=cat_retry_fee_mojos,
                                     is_cat=True,
+                                    _prep_contract=retry_prep_contract,
                                 )
                             else:
                                 result = self._call_wallet_mutation(
@@ -5461,8 +5756,9 @@ class CoinPrepWorker:
                                     target_coin_id=split_state["pool_coin_id"],
                                     num_coins=cnt,
                                     amount_per_coin=0,
-                                    fee_mojos=self._split_tx_fee_mojos(),
+                                    fee_mojos=xch_retry_fee_mojos,
                                     is_cat=False,
+                                    _prep_contract=retry_prep_contract,
                                 )
                             if result is None:
                                 self.log(
@@ -6844,6 +7140,17 @@ class CoinPrepWorker:
                 self.log(
                     f"   🔄 Sage RPC split: {num_coins} coins of {coin_size} from {bare_coin_id[:16]}..."
                 )
+                split_fee_mojos = self._split_tx_fee_mojos()
+                source_fee_mojos = 0 if is_cat else split_fee_mojos
+                tier_name = str(name).rsplit("-", 1)[-1].lower()
+                prep_contract = self._build_split_prep_contract(
+                    wallet_id=wallet_id,
+                    purpose=self._purpose_for_tier(tier_name),
+                    source_amount_mojos=coin_amount,
+                    count=num_coins,
+                    amount_per_coin=mojos_per_coin,
+                    fee_mojos=source_fee_mojos,
+                )
                 result = self._call_wallet_mutation(
                     "coin_prep.split_single_sage",
                     sage_split,
@@ -6851,8 +7158,9 @@ class CoinPrepWorker:
                     target_coin_id=bare_coin_id,
                     num_coins=num_coins,
                     amount_per_coin=mojos_per_coin,
-                    fee_mojos=self._split_tx_fee_mojos(),
+                    fee_mojos=split_fee_mojos,
                     is_cat=is_cat,
+                    _prep_contract=prep_contract,
                 )
                 if self._sage_submit_succeeded(result):
                     self.log("   ✅ Sage split submitted")
@@ -7641,6 +7949,9 @@ class CoinPrepWorker:
         expected_outputs: list[dict],
         authoritative_view: dict,
         expected_wallet_identity: dict,
+        effect_claim_token: str,
+        effect_claim_generation: int,
+        dispatch_outcome: str,
     ) -> bool:
         """Commit success only for one exact, fresh post-effect wallet view."""
 
@@ -7653,10 +7964,24 @@ class CoinPrepWorker:
             expected_wallet_identity=expected_wallet_identity,
         )
         outcome = "CONFIRMED" if decision.confirmed else "SUBMITTED_UNKNOWN"
-        evidence = {
-            "reason_code": decision.reason or "authoritative_post_view_confirmed",
-            "output_coin_ids": list(decision.output_coin_ids),
-        }
+        evidence = (
+            {
+                "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+                "effect_claim_token": effect_claim_token,
+                "effect_claim_generation": effect_claim_generation,
+                "source_coin_ids": source_coin_ids,
+                "expected_outputs": expected_outputs,
+                "authoritative_view": authoritative_view,
+                "expected_wallet_identity": expected_wallet_identity,
+            }
+            if decision.confirmed
+            else {
+                "reason_code": decision.reason or "AUTHORITATIVE_VIEW_UNRESOLVED",
+                "effect_claim_token": effect_claim_token,
+                "effect_claim_generation": effect_claim_generation,
+                "dispatch_outcome": dispatch_outcome,
+            }
+        )
         try:
             record_coin_prep_operation_outcome(
                 operation_id,
@@ -7683,6 +8008,63 @@ class CoinPrepWorker:
             self.log(f"Post-operation authority status update failed: {exc}")
         return False
 
+    @staticmethod
+    def _current_coin_prep_wallet_identity() -> dict:
+        """Return the exact Task 5 binding from the active owner/worker authority."""
+
+        runtime = mutation_gate.current_runtime()
+        if runtime is not None:
+            binding = runtime.require_wallet_identity_authority(
+                "coin_prep.prepare"
+            )
+        else:
+            lease = mutation_gate.worker_identity_lease_binding()
+            binding = lease.get("binding") if type(lease) is dict else None
+        if type(binding) is not mutation_gate.WalletIdentityBinding:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID", "coin_prep.prepare"
+            )
+        return mutation_gate.wallet_identity_binding_payload(binding)
+
+    def _record_coin_prep_dispatch_outcome(
+        self,
+        operation: dict,
+        *,
+        dispatch_outcome: str,
+        reason_code: str,
+    ) -> None:
+        token = operation["effect_claim_token"]
+        generation = operation["effect_claim_generation"]
+        if dispatch_outcome == "RELEASED_NO_EFFECT":
+            outcome = "FAILED"
+            evidence = {
+                "reason_code": reason_code,
+                "effect_claim_token": token,
+                "effect_claim_generation": generation,
+                "dispatch_outcome": dispatch_outcome,
+                "effect_attempted": False,
+            }
+        else:
+            outcome = "SUBMITTED_UNKNOWN"
+            evidence = {
+                "reason_code": reason_code,
+                "effect_claim_token": token,
+                "effect_claim_generation": generation,
+                "dispatch_outcome": (
+                    dispatch_outcome
+                    if dispatch_outcome in {"SUBMITTED", "UNKNOWN"}
+                    else "ADAPTER_EXCEPTION"
+                ),
+            }
+        record_coin_prep_operation_outcome(
+            operation["operation_id"], outcome=outcome, evidence_json=evidence
+        )
+
+    def _observe_coin_prep_post_effect(self, operation: dict):
+        """Perform one read-only exact observation after an attempted effect."""
+
+        return self._observe_recoverable_coin_prep_operation(operation)
+
     def _recover_coin_prep_operations_read_only(self, observer) -> bool:
         """Resolve PREPARED/effect-unknown rows by observation, never replay."""
 
@@ -7706,7 +8088,13 @@ class CoinPrepWorker:
                             outcome="SUBMITTED_UNKNOWN",
                             evidence_json={
                                 "reason_code": "authoritative_observation_unavailable",
-                                "output_coin_ids": [],
+                                "effect_claim_token": operation[
+                                    "effect_claim_token"
+                                ],
+                                "effect_claim_generation": operation[
+                                    "effect_claim_generation"
+                                ],
+                                "dispatch_outcome": "PREPARED",
                             },
                         )
                     all_confirmed = False
@@ -7719,6 +8107,15 @@ class CoinPrepWorker:
                     expected_outputs=expected_outputs,
                     authoritative_view=authoritative_view,
                     expected_wallet_identity=expected_identity,
+                    effect_claim_token=operation["effect_claim_token"],
+                    effect_claim_generation=operation[
+                        "effect_claim_generation"
+                    ],
+                    dispatch_outcome=(
+                        "PREPARED"
+                        if operation.get("outcome") == "PREPARED"
+                        else "SUBMITTED"
+                    ),
                 ):
                     all_confirmed = False
             except Exception as exc:
@@ -7729,11 +8126,92 @@ class CoinPrepWorker:
                 all_confirmed = False
         return all_confirmed
 
-    @staticmethod
-    def _observe_recoverable_coin_prep_operation(_operation: dict):
-        """Default restart observer fails closed until exact outputs are available."""
+    def _observe_recoverable_coin_prep_operation(self, operation: dict):
+        """Build exact outputs from a complete pre/post owned-coin difference."""
 
-        return None
+        try:
+            target = json.loads(operation["target_contract_json"])
+            prepared_evidence = json.loads(operation["prepared_evidence_json"])
+            expected_identity = json.loads(operation["wallet_identity_json"])
+            if self._current_coin_prep_wallet_identity() != expected_identity:
+                return None
+            pre_ids = {
+                self._canonical_coin_id(value)
+                for value in prepared_evidence["pre_view_coin_ids"]
+            }
+            wallet_id = (
+                self.xch_wallet_id
+                if target["wallet_type"] == "xch"
+                else self.cat_wallet_id
+            )
+            observed = self._get_owned_coins_via_rpc(
+                wallet_id, "coin-prep-authoritative-post-view"
+            )
+            if type(observed) is not list:
+                return None
+            by_id = {}
+            for coin in observed:
+                coin_id = self._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
+                amount = coin.get("amount_mojos", coin.get("amount"))
+                if not coin_id or type(amount) is not int or amount <= 0 or coin_id in by_id:
+                    return None
+                by_id[coin_id] = amount
+            source_ids = {
+                self._canonical_coin_id(value)
+                for value in json.loads(operation["source_coin_ids_json"])
+            }
+            if source_ids.intersection(by_id):
+                return None
+            new_coins = sorted(
+                (
+                    {"coin_id": coin_id, "amount_mojos": amount}
+                    for coin_id, amount in by_id.items()
+                    if coin_id not in pre_ids
+                ),
+                key=lambda item: (item["amount_mojos"], item["coin_id"]),
+            )
+            outputs = sorted(
+                target["outputs"],
+                key=lambda item: (item["amount_mojos"], item["output_index"]),
+            )
+            if len(new_coins) != len(outputs) or [
+                item["amount_mojos"] for item in new_coins
+            ] != [item["amount_mojos"] for item in outputs]:
+                return None
+            expected_outputs = [
+                {
+                    "coin_id": coin["coin_id"],
+                    "amount_mojos": coin["amount_mojos"],
+                    "purpose": output["purpose"],
+                }
+                for coin, output in zip(new_coins, outputs)
+            ]
+            observed_at = datetime.now(timezone.utc)
+            bound_at = datetime.fromisoformat(
+                expected_identity["bound_at_utc"][:-1] + "+00:00"
+            )
+            expires_at = bound_at + timedelta(
+                seconds=expected_identity["maximum_age_seconds"]
+            )
+            observed_text = observed_at.isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+            expires_text = expires_at.isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+            return {
+                "expected_outputs": expected_outputs,
+                "authoritative_view": {
+                    "fresh": True,
+                    "complete": True,
+                    "wallet_identity": expected_identity,
+                    "observed_at": observed_text,
+                    "expires_at": expires_text,
+                    "coins": expected_outputs,
+                },
+            }
+        except Exception:
+            return None
 
     def run_full_preparation(self) -> bool:
         """
@@ -7749,7 +8227,12 @@ class CoinPrepWorker:
         Total time: ~1.7 minutes (was ~3 minutes)
         """
         try:
-            if self._db_ready and not self._recover_coin_prep_operations_read_only(
+            # A successfully imported repository must always be recovered,
+            # even when its per-run bootstrap flag is false.  When the
+            # repository itself is unavailable every wallet-effect path below
+            # is already denied by `_call_wallet_mutation`, so a genuinely
+            # read-only/prepared run may still report its state.
+            if DB_AVAILABLE and not self._recover_coin_prep_operations_read_only(
                 self._observe_recoverable_coin_prep_operation
             ):
                 self.update_status(
