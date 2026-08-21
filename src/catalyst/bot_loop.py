@@ -602,6 +602,25 @@ class BotLoop:
         self._step_sla_secs: float = 60.0  # warn if a single step exceeds 60s
         self._step_sla_alerted_for: Optional[str] = None
 
+        # A process-local baseline is established only after Task 10 has
+        # authorized startup. It is never persisted or compared across runs.
+        try:
+            recovery_cadence = Decimal(str(getattr(cfg, "LOOP_SECONDS", 30)))
+            if not recovery_cadence.is_finite() or recovery_cadence <= 0:
+                raise ValueError
+        except Exception:
+            recovery_cadence = Decimal("30")
+        self._runtime_recovery_gap_seconds = min(
+            max(recovery_cadence * 3, Decimal("15")), Decimal("900")
+        )
+        self._runtime_recovery_skew_seconds = min(
+            max(recovery_cadence, Decimal("5")), Decimal("300")
+        )
+        self._runtime_recovery_monotonic = time.monotonic
+        self._runtime_recovery_wall_clock = lambda: datetime.now(timezone.utc)
+        self._runtime_recovery_baseline = None
+        self._runtime_recovery_coordinator = None
+
         # ---- Sweep protection (Tier 3) ----
         # Maps side ("buy"/"sell") → wall-clock expiry time.
         # When active, offer creation on that side is paused for one cycle
@@ -888,6 +907,81 @@ class BotLoop:
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
         )
+
+    def set_runtime_recovery_coordinator(self, coordinator) -> None:
+        """Inject the API-owned read-only Task 10 recovery coordinator."""
+
+        if coordinator is not None and not callable(coordinator):
+            raise TypeError("runtime recovery coordinator must be callable")
+        self._runtime_recovery_coordinator = coordinator
+
+    def _establish_runtime_recovery_baseline(self) -> bool:
+        """Sample a fresh in-process baseline after startup recovery passes."""
+
+        from runtime_recovery import ClockSample, detect_discontinuity
+
+        sample = ClockSample(
+            monotonic_seconds=self._runtime_recovery_monotonic(),
+            wall_utc=self._runtime_recovery_wall_clock(),
+        )
+        decision = detect_discontinuity(
+            None,
+            sample,
+            maximum_monotonic_gap_seconds=self._runtime_recovery_gap_seconds,
+            maximum_wall_skew_seconds=self._runtime_recovery_skew_seconds,
+        )
+        if decision.discontinuity:
+            return False
+        self._runtime_recovery_baseline = sample
+        return True
+
+    def _runtime_recovery_cycle_boundary(self) -> bool:
+        """Fence a discontinuity before any later cycle mutation."""
+
+        from runtime_recovery import ClockSample, detect_discontinuity
+
+        sample = ClockSample(
+            monotonic_seconds=self._runtime_recovery_monotonic(),
+            wall_utc=self._runtime_recovery_wall_clock(),
+        )
+        decision = detect_discontinuity(
+            self._runtime_recovery_baseline,
+            sample,
+            maximum_monotonic_gap_seconds=self._runtime_recovery_gap_seconds,
+            maximum_wall_skew_seconds=self._runtime_recovery_skew_seconds,
+        )
+        if not decision.discontinuity:
+            self._runtime_recovery_baseline = sample
+            return True
+        coordinator = self._runtime_recovery_coordinator
+        if not callable(coordinator):
+            log_event(
+                "critical",
+                "runtime_recovery_unavailable",
+                "Runtime clock discontinuity detected without a recovery coordinator",
+                data={"reason_code": decision.reason_code},
+            )
+            return False
+        try:
+            result = coordinator(decision, sample)
+        except Exception:
+            result = {"allowed": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+        if type(result) is dict and result.get("allowed") is True:
+            self._runtime_recovery_baseline = sample
+            return True
+        log_event(
+            "critical",
+            "runtime_recovery_blocked",
+            "Runtime recovery remains read-only after a clock discontinuity",
+            data={
+                "reason_code": str(
+                    result.get("reason_code")
+                    if type(result) is dict
+                    else "DURABLE_STATE_UNAVAILABLE"
+                )
+            },
+        )
+        return False
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -4475,6 +4569,7 @@ class BotLoop:
         self._position_baseline_cat = None
         self._position_baseline_net_cat = None
         self._position_baseline_at = 0
+        self._runtime_recovery_baseline = None
         # Full risk-manager session reset — clears inventory, circuit
         # breaker, volatility, and all market data caches so nothing from
         # the previous CAT/session leaks into the new one.
@@ -4531,6 +4626,14 @@ class BotLoop:
             return False
 
         self._reset_runtime_state()
+
+        if not self._establish_runtime_recovery_baseline():
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Startup recovery blocked: CLOCK_SAMPLE_MALFORMED",
+            )
+            return False
 
         # Database already initialised at app startup (api_server.py).
         # Just reload config to pick up any .env changes from GUI.
@@ -7965,6 +8068,8 @@ class BotLoop:
 
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
+        if not self._runtime_recovery_cycle_boundary():
+            return False
         self._cycle_started_running = bool(self._running)
         self._recovery_state["cycle_probe_churn"] = False
         self._recovery_state["cycle_create_stalled"] = False

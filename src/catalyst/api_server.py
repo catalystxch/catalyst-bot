@@ -274,6 +274,8 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
 }
 
 _CONTROL_WRITE_API_ENDPOINTS = {
+    "api_safety_quarantine",
+    "api_safety_quarantine_resolve",
     "api_open_data_folder",
     "api_open_external",
     "bot.api_bot_stop",
@@ -1200,6 +1202,7 @@ bot: BotLoop = None
 _mutation_runtime = None
 _mutation_runtime_db_path = None
 _mutation_runtime_init_lock = threading.RLock()
+_runtime_recovery_lock = threading.RLock()
 _stability_startup_status = {
     "allowed": False,
     "reason_code": "STARTUP_RECOVERY_NOT_RUN",
@@ -1585,6 +1588,21 @@ def _run_stability_startup_check(name: str, **context) -> dict:
         if lease.get("active") not in {0, 1, False, True}:
             return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
         if bool(lease.get("active")):
+            recovery_epoch = context.get("recovery_epoch")
+            exact_current_owner = (
+                type(recovery_epoch) is dict
+                and lease.get("owner_run_id") == runtime.run_id
+                and lease.get("owner_pid") == runtime.owner_pid
+                and lease.get("owner_host") == runtime.owner_host
+                and lease.get("wallet_fingerprint_hash")
+                == recovery_epoch.get("wallet_fingerprint_hash")
+                and lease.get("network") == recovery_epoch.get("network")
+                and recovery_epoch.get("owner_run_id") == runtime.run_id
+            )
+            if exact_current_owner:
+                return _startup_check_result(
+                    True, source_age_seconds=heartbeat_age
+                )
             try:
                 expiry = datetime.fromisoformat(
                     str(lease.get("expires_at") or "").replace("Z", "+00:00")
@@ -1665,7 +1683,19 @@ def _run_stability_startup_check(name: str, **context) -> dict:
         blockers = initial.get("blockers")
         if type(latch) is not dict or type(blockers) is not list:
             return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
-        if latch.get("state") != "resolved":
+        recovery_epoch = context.get("recovery_epoch")
+        recovery_latch = (
+            type(recovery_epoch) is dict
+            and latch.get("state") == "tripped"
+            and int(latch.get("generation") or -1)
+            == recovery_epoch.get("latch_generation")
+            and latch.get("wallet_fingerprint_hash")
+            == recovery_epoch.get("wallet_fingerprint_hash")
+            and latch.get("network") == recovery_epoch.get("network")
+            and json.loads(latch.get("blocking_operation_ids_json") or "null")
+            == [recovery_epoch.get("blocker_id")]
+        )
+        if latch.get("state") != "resolved" and not recovery_latch:
             reason = str(latch.get("reason_code") or "RECONCILIATION_REQUIRED")
             return _startup_check_result(False, reason, blocker_counts=counts)
         if blockers:
@@ -1762,6 +1792,152 @@ def _run_stability_startup_check(name: str, **context) -> dict:
         source_age_seconds=_startup_source_age_seconds(decision["observed_at_utc"]),
         blocker_counts=current.get("blocker_counts"),
     )
+
+
+def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
+    """Fence one discontinuity and reuse the exact ordered Task 10 checks."""
+
+    global _stability_startup_status
+    with _runtime_recovery_lock:
+        runtime = mutation_gate.current_runtime()
+        if runtime is None:
+            return {"allowed": False, "reason_code": "MUTATION_RUNTIME_NOT_INITIALIZED"}
+        clock_evidence = {
+            "reason_code": decision.reason_code,
+            "monotonic_delta_seconds": decision.monotonic_delta_seconds,
+            "wall_delta_seconds": decision.wall_delta_seconds,
+            "sample_monotonic_seconds": str(sample.monotonic_seconds),
+            "sample_wall_utc": sample.wall_utc.isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z"),
+        }
+        try:
+            try:
+                lease_version = runtime.require_allowed(
+                    "runtime_recovery:boundary"
+                ).lease_version
+                existing_epoch = None
+            except Exception:
+                # A failed read-only recovery pass deliberately leaves the durable
+                # latch tripped.  Only the exact same owner/binding/lease may retry
+                # that epoch; this neither clears the gate nor acquires a lease.
+                existing_epoch = database.get_current_runtime_recovery()
+                lease = database.get_runtime_mutation_lease()
+                if (
+                    type(existing_epoch) is not dict
+                    or type(lease) is not dict
+                    or existing_epoch.get("owner_run_id") != runtime.run_id
+                    or existing_epoch.get("wallet_fingerprint_hash")
+                    != runtime.wallet_fingerprint_hash
+                    or existing_epoch.get("network") != runtime.network
+                    or lease.get("owner_run_id") != runtime.run_id
+                    or lease.get("wallet_fingerprint_hash")
+                    != runtime.wallet_fingerprint_hash
+                    or lease.get("network") != runtime.network
+                    or type(lease.get("lease_version")) is not int
+                    or lease["lease_version"] < 1
+                ):
+                    raise
+                lease_version = lease["lease_version"]
+            recovery_material = json.dumps(
+                {
+                    "owner_run_id": runtime.run_id,
+                    "lease_version": lease_version,
+                    "clock_evidence": clock_evidence,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            recovery_id = "recovery:" + hashlib.sha256(
+                recovery_material.encode("utf-8")
+            ).hexdigest()
+            if (
+                existing_epoch is not None
+                and existing_epoch.get("recovery_id") != recovery_id
+            ):
+                raise ValueError("runtime recovery replay does not match current epoch")
+            epoch_result = database.begin_runtime_recovery_epoch(
+                recovery_id=recovery_id,
+                reason_code=decision.reason_code,
+                clock_evidence=clock_evidence,
+                wallet_fingerprint_hash=runtime.wallet_fingerprint_hash,
+                network=runtime.network,
+                owner_run_id=runtime.run_id,
+                started_at=sample.wall_utc,
+            )
+            epoch = epoch_result["record"]
+        except Exception:
+            return {"allowed": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+        wallet_hash, network = _configured_mutation_binding()
+        binding = runtime.wallet_identity_binding
+        try:
+            from wallet import get_wallet_identity
+
+            first_identity = get_wallet_identity()
+            second_identity = get_wallet_identity()
+        except Exception:
+            first_identity = None
+            second_identity = None
+        state: dict[str, Any] = {}
+        checks: list[dict] = []
+        for check_name in _STABILITY_STARTUP_CHECKS:
+            check = _run_stability_startup_check(
+                check_name,
+                state=state,
+                runtime=runtime,
+                recovery_epoch=epoch,
+                wallet_identity_binding=binding,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                cached_wallet_identity_snapshot=first_identity,
+                cached_wallet_identity_revalidation_snapshot=second_identity,
+            )
+            recorded = {"name": check_name, **check}
+            checks.append(recorded)
+            if check.get("ok") is not True:
+                result = _blocked_startup_recovery_status(
+                    check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
+                    check_name,
+                    checks,
+                    runtime,
+                )
+                result["blocker_counts"] = dict(check.get("blocker_counts") or {})
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
+        try:
+            initial = state["initial_snapshot"]
+            database.record_runtime_recovery_pass(
+                recovery_id=recovery_id,
+                expected_latch_generation=int(epoch["latch_generation"]),
+                authority_digest=initial["authority_digest"],
+                checks=checks,
+                passed_at=datetime.now(timezone.utc),
+            )
+            rotate = getattr(mutation_gate, "_rotate_owner_identity_authority", None)
+            if not callable(rotate) or rotate(runtime) is not True:
+                raise RuntimeError("mutation authority rotation unavailable")
+            released = runtime.release_resolved(
+                int(epoch["latch_generation"]), [epoch["blocker_id"]]
+            )
+            if released.get("released") is not True:
+                raise RuntimeError("runtime recovery latch release failed")
+        except Exception:
+            return {"allowed": False, "reason_code": "RECOVERY_PROMOTION_FAILED"}
+        result = released["status"]
+        result.update(
+            {
+                "allowed": True,
+                "reason_code": "RECOVERY_COMPLETE",
+                "source": "startup_recovery",
+                "failed_check": None,
+                "checks": checks,
+                "blocker_counts": dict(checks[-1].get("blocker_counts") or {}),
+            }
+        )
+        _stability_startup_status = _redacted_startup_status(result)
+        return result
 
 
 def _blocked_startup_recovery_status(
@@ -2930,6 +3106,7 @@ def create_bot() -> BotLoop:
         initialize_mutation_runtime()
     mutation_gate.require_allowed("startup:create_bot")
     bot = BotLoop()
+    bot.set_runtime_recovery_coordinator(_run_runtime_recovery)
     # Wire up event bus to bot loop for push updates
     bot._event_bus = events
     # Inject spacescan getter so SSE dashboard_update events include spacescan metrics.
@@ -3110,6 +3287,240 @@ def api_safety_status():
                 },
             }
         ), 503
+
+
+def _quarantine_runtime_request(payload: Any) -> dict:
+    """Validate a bounded operator CAS and archive server-derived evidence."""
+
+    if type(payload) is not dict:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    required = {
+        "confirmation",
+        "quarantine_id",
+        "blocker_ids",
+        "expected_latch_generation",
+        "expected_recovery_id",
+    }
+    if set(payload) != required or type(payload.get("confirmation")) is not bool:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    if payload["confirmation"] is not True:
+        return {"success": False, "reason_code": "QUARANTINE_CONFIRMATION_REQUIRED"}
+    try:
+        epoch = database.get_runtime_recovery_epoch(payload["expected_recovery_id"])
+        if type(epoch) is not dict:
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        archived = database.quarantine_runtime_blockers(
+            confirmation=payload["confirmation"],
+            quarantine_id=payload["quarantine_id"],
+            blocker_ids=payload["blocker_ids"],
+            expected_latch_generation=payload["expected_latch_generation"],
+            expected_recovery_id=payload["expected_recovery_id"],
+            owner_run_id=epoch["owner_run_id"],
+            wallet_fingerprint_hash=epoch["wallet_fingerprint_hash"],
+            network=epoch["network"],
+            quarantined_at=datetime.now(timezone.utc),
+        )
+        return {
+            "success": True,
+            "quarantine_id": archived["quarantine_id"],
+            "reason_code": "QUARANTINE_ARCHIVED_MUTATION_BLOCKED",
+            "manifest_sha256": archived["manifest_sha256"],
+        }
+    except (TypeError, ValueError):
+        return {"success": False, "reason_code": "QUARANTINE_AUTHORITY_CONFLICT"}
+    except Exception:
+        return {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+
+@app.route("/api/safety/quarantine", methods=["POST"])
+def api_safety_quarantine():
+    """Archive one exact recovery epoch without restoring mutation."""
+
+    result = _quarantine_runtime_request(request.get_json(silent=True))
+    return jsonify(result), (200 if result.get("success") is True else 409)
+
+
+@app.route("/api/safety/quarantine/<quarantine_id>")
+def api_safety_quarantine_status(quarantine_id: str):
+    """Return bounded, redacted quarantine status."""
+
+    try:
+        row = database.get_runtime_quarantine_manifest(quarantine_id)
+        if row is None:
+            return jsonify(
+                {"success": False, "reason_code": "QUARANTINE_NOT_FOUND"}
+            ), 404
+        return jsonify(
+            {
+                "success": True,
+                "quarantine": {
+                    "quarantine_id": row["quarantine_id"],
+                    "recovery_id": row["recovery_id"],
+                    "latch_generation": int(row["latch_generation"]),
+                    "manifest_sha256": row["manifest_sha256"],
+                    "quarantined_at": row["quarantined_at"],
+                    "mutation_blocked": True,
+                },
+            }
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+        ), 400
+    except Exception:
+        return jsonify(
+            {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+        ), 503
+
+
+def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
+    """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
+
+    from offer_reconciliation import load_authoritative_evidence
+
+    absent_offer_ids: list[str] = []
+    coins_by_id: dict[str, dict] = {}
+    observed_at = None
+    complete = True
+    for offer in requirements.get("offers", []):
+        evidence = load_authoritative_evidence(offer["intent"])
+        if (
+            type(evidence) is not dict
+            or evidence.get("wallet_fingerprint_hash")
+            != requirements["wallet_fingerprint_hash"]
+            or evidence.get("network") != requirements["network"]
+        ):
+            complete = False
+            continue
+        history = evidence.get("offer_history")
+        transactions = evidence.get("transaction_history")
+        coin_records = evidence.get("coin_records")
+        identity = evidence.get("wallet_identity")
+        if any(
+            type(section) is not dict or section.get("complete") is not True
+            for section in (history, transactions, coin_records, identity)
+        ):
+            complete = False
+            continue
+        records = history.get("records")
+        if type(records) is not list:
+            complete = False
+            continue
+        trade_id = offer["trade_id"]
+        if any(
+            type(row) is dict
+            and str(row.get("trade_id") or row.get("offer_id") or "").lower()
+            == trade_id.lower()
+            for row in records
+        ):
+            complete = False
+        else:
+            absent_offer_ids.append(trade_id)
+        raw_coins = coin_records.get("records")
+        if type(raw_coins) is not dict:
+            complete = False
+            continue
+        for coin_id in offer["selected_coin_ids"]:
+            row = raw_coins.get(coin_id)
+            if type(row) is not dict:
+                complete = False
+                continue
+            owned = row.get("owned") is True
+            unlocked = (
+                row.get("spent_height") in (None, 0)
+                and row.get("locked") is not True
+                and not row.get("offer_id")
+            )
+            candidate = {"coin_id": coin_id, "owned": owned, "unlocked": unlocked}
+            if coin_id in coins_by_id and coins_by_id[coin_id] != candidate:
+                complete = False
+            coins_by_id[coin_id] = candidate
+        candidate_observed = evidence.get("observed_at")
+        if type(candidate_observed) is str and (
+            observed_at is None or candidate_observed > observed_at
+        ):
+            observed_at = candidate_observed
+    if not requirements.get("offers"):
+        observed_at = datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    return {
+        "version": 1,
+        "quarantine_id": requirements["quarantine_id"],
+        "recovery_id": requirements["recovery_id"],
+        "latch_generation": requirements["latch_generation"],
+        "wallet_fingerprint_hash": requirements["wallet_fingerprint_hash"],
+        "network": requirements["network"],
+        "authority_digest": requirements["authority_digest"],
+        "observed_at": observed_at,
+        "history_complete": complete,
+        "absent_offer_ids": sorted(absent_offer_ids),
+        "coins": [coins_by_id[key] for key in sorted(coins_by_id)],
+    }
+
+
+def _resolve_runtime_quarantine_request(payload: Any) -> dict:
+    """Resolve from fresh server-collected evidence, never request booleans."""
+
+    required = {
+        "confirmation",
+        "quarantine_id",
+        "expected_recovery_id",
+        "expected_latch_generation",
+    }
+    if type(payload) is not dict or set(payload) != required:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    if type(payload.get("confirmation")) is not bool or payload["confirmation"] is not True:
+        return {"success": False, "reason_code": "QUARANTINE_CONFIRMATION_REQUIRED"}
+    try:
+        requirements = database.get_runtime_quarantine_resolution_requirements(
+            payload["quarantine_id"]
+        )
+        if (
+            requirements["recovery_id"] != payload["expected_recovery_id"]
+            or requirements["latch_generation"]
+            != payload["expected_latch_generation"]
+        ):
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        proof = _collect_quarantine_resolution_proof(requirements)
+        from runtime_recovery import validate_quarantine_resolution_proof
+
+        decision = validate_quarantine_resolution_proof(
+            requirements,
+            proof,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )
+        if decision.get("allowed") is not True:
+            return {"success": False, "reason_code": decision["reason_code"]}
+        epoch = database.get_runtime_recovery_epoch(requirements["recovery_id"])
+        if type(epoch) is not dict:
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        result = database.resolve_runtime_quarantine(
+            quarantine_id=requirements["quarantine_id"],
+            expected_recovery_id=requirements["recovery_id"],
+            expected_latch_generation=requirements["latch_generation"],
+            expected_owner_run_id=epoch["owner_run_id"],
+            proof_decision=decision,
+            resolved_at=datetime.now(timezone.utc),
+        )
+        return {
+            "success": True,
+            "quarantine_id": requirements["quarantine_id"],
+            "reason_code": "QUARANTINE_PROOF_ARCHIVED_RECOVERY_REQUIRED",
+            "proof_sha256": result["record"]["proof_sha256"],
+            "mutation_blocked": True,
+        }
+    except (TypeError, ValueError):
+        return {"success": False, "reason_code": "QUARANTINE_RESOLUTION_BLOCKED"}
+    except Exception:
+        return {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+
+@app.route("/api/safety/quarantine/resolve", methods=["POST"])
+def api_safety_quarantine_resolve():
+    result = _resolve_runtime_quarantine_request(request.get_json(silent=True))
+    return jsonify(result), (200 if result.get("success") is True else 409)
 
 
 @app.route("/console")
