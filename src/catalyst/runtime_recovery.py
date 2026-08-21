@@ -147,14 +147,6 @@ def validate_quarantine_resolution_proof(
     try:
         if type(requirements) is not dict or type(proof) is not dict:
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
-        maximum_age = _threshold(maximum_age_seconds, allow_zero=False)
-        current = _canonical_utc(now)
-        observed = _canonical_utc_text(proof.get("observed_at"))
-        if maximum_age is None or current is None or observed is None:
-            return _proof_denied("QUARANTINE_PROOF_MALFORMED")
-        age = _timedelta_seconds(current - observed)
-        if age < 0 or age > maximum_age:
-            return _proof_denied("QUARANTINE_PROOF_STALE")
         binding_fields = (
             "quarantine_id",
             "recovery_id",
@@ -169,8 +161,23 @@ def validate_quarantine_resolution_proof(
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
         if type(proof.get("history_complete")) is not bool:
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
+        if (
+            type(proof.get("authoritative_read_performed")) is not bool
+            or proof["authoritative_read_performed"] is not True
+            or proof.get("history_provenance") != "wallet.get_all_offers"
+            or proof.get("identity_provenance") != "wallet.get_wallet_identity"
+        ):
+            return _proof_denied("QUARANTINE_FULL_HISTORY_INCOMPLETE")
         if proof["history_complete"] is not True:
             return _proof_denied("QUARANTINE_FULL_HISTORY_INCOMPLETE")
+        maximum_age = _threshold(maximum_age_seconds, allow_zero=False)
+        current = _canonical_utc(now)
+        observed = _canonical_utc_text(proof.get("observed_at"))
+        if maximum_age is None or current is None or observed is None:
+            return _proof_denied("QUARANTINE_PROOF_MALFORMED")
+        age = _timedelta_seconds(current - observed)
+        if age < 0 or age > maximum_age:
+            return _proof_denied("QUARANTINE_PROOF_STALE")
         offers = requirements.get("offers")
         absent = proof.get("absent_offer_ids")
         coins = proof.get("coins")

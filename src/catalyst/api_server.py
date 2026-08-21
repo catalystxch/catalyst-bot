@@ -3332,11 +3332,34 @@ def _quarantine_runtime_request(payload: Any) -> dict:
         return {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
 
 
+def _bounded_quarantine_json_request() -> tuple[Any, Optional[dict]]:
+    content_length = request.content_length
+    if type(content_length) is int and content_length > 16384:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+        }
+    try:
+        raw = request.get_data(cache=True)
+    except Exception:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
+    if type(raw) is not bytes or len(raw) > 16384:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+        }
+    return request.get_json(silent=True), None
+
+
 @app.route("/api/safety/quarantine", methods=["POST"])
 def api_safety_quarantine():
     """Archive one exact recovery epoch without restoring mutation."""
 
-    result = _quarantine_runtime_request(request.get_json(silent=True))
+    payload, error = _bounded_quarantine_json_request()
+    result = error or _quarantine_runtime_request(payload)
     return jsonify(result), (200 if result.get("success") is True else 409)
 
 
@@ -3350,6 +3373,10 @@ def api_safety_quarantine_status(quarantine_id: str):
             return jsonify(
                 {"success": False, "reason_code": "QUARANTINE_NOT_FOUND"}
             ), 404
+        latch = database.get_runtime_safety_latch()
+        current_blocked = (
+            type(latch) is dict and latch.get("state") == "tripped"
+        )
         return jsonify(
             {
                 "success": True,
@@ -3359,7 +3386,14 @@ def api_safety_quarantine_status(quarantine_id: str):
                     "latch_generation": int(row["latch_generation"]),
                     "manifest_sha256": row["manifest_sha256"],
                     "quarantined_at": row["quarantined_at"],
-                    "mutation_blocked": True,
+                    "archival_blocked_at_capture": True,
+                    "current_mutation_blocked": current_blocked,
+                    "current_latch_generation": (
+                        int(latch["generation"])
+                        if type(latch) is dict
+                        and type(latch.get("generation")) is int
+                        else None
+                    ),
                 },
             }
         )
@@ -3376,14 +3410,21 @@ def api_safety_quarantine_status(quarantine_id: str):
 def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
 
-    from offer_reconciliation import load_authoritative_evidence
+    from offer_reconciliation import (
+        load_authoritative_evidence,
+        load_sage_offer_history,
+    )
 
     absent_offer_ids: list[str] = []
     coins_by_id: dict[str, dict] = {}
     observed_at = None
     complete = True
+    authoritative_read_performed = False
+    history_provenance = "wallet.get_all_offers"
+    identity_provenance = "wallet.get_wallet_identity"
     for offer in requirements.get("offers", []):
         evidence = load_authoritative_evidence(offer["intent"])
+        authoritative_read_performed = True
         if (
             type(evidence) is not dict
             or evidence.get("wallet_fingerprint_hash")
@@ -3399,6 +3440,12 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         if any(
             type(section) is not dict or section.get("complete") is not True
             for section in (history, transactions, coin_records, identity)
+        ):
+            complete = False
+            continue
+        if (
+            history.get("provenance") != history_provenance
+            or identity.get("provenance") != identity_provenance
         ):
             complete = False
             continue
@@ -3441,9 +3488,56 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         ):
             observed_at = candidate_observed
     if not requirements.get("offers"):
-        observed_at = datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        import wallet
+
+        try:
+            identity = wallet.get_wallet_identity()
+        except Exception:
+            identity = None
+        try:
+            history = load_sage_offer_history(
+                get_all_offers=wallet.get_all_offers,
+                include_completed=True,
+            )
+            authoritative_read_performed = True
+        except Exception:
+            history = None
+        identity_hash = (
+            identity.get("wallet_fingerprint_hash")
+            if type(identity) is dict
+            else None
+        )
+        if (
+            type(identity) is dict
+            and identity_hash is None
+            and type(identity.get("fingerprint")) is int
+            and identity["fingerprint"] > 0
+        ):
+            identity_hash = hashlib.sha256(
+                f"fingerprint:{identity['fingerprint']}".encode("utf-8")
+            ).hexdigest()
+        identity_network = (
+            identity.get("network_id")
+            if type(identity) is dict
+            else None
+        )
+        if identity_network is None and type(identity) is dict:
+            identity_network = identity.get("network")
+        identity_ok = bool(
+            type(identity) is dict
+            and identity.get("success") is True
+            and identity_hash == requirements["wallet_fingerprint_hash"]
+            and identity_network == requirements["network"]
+            and type(identity.get("observed_at_utc")) is str
+        )
+        history_ok = bool(
+            type(history) is dict
+            and history.get("complete") is True
+            and history.get("provenance") == history_provenance
+            and type(history.get("records")) is list
+        )
+        complete = identity_ok and history_ok
+        observed_at = history.get("observed_at") if history_ok else None
     return {
         "version": 1,
         "quarantine_id": requirements["quarantine_id"],
@@ -3454,6 +3548,9 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         "authority_digest": requirements["authority_digest"],
         "observed_at": observed_at,
         "history_complete": complete,
+        "authoritative_read_performed": authoritative_read_performed,
+        "history_provenance": history_provenance,
+        "identity_provenance": identity_provenance,
         "absent_offer_ids": sorted(absent_offer_ids),
         "coins": [coins_by_id[key] for key in sorted(coins_by_id)],
     }
@@ -3519,7 +3616,8 @@ def _resolve_runtime_quarantine_request(payload: Any) -> dict:
 
 @app.route("/api/safety/quarantine/resolve", methods=["POST"])
 def api_safety_quarantine_resolve():
-    result = _resolve_runtime_quarantine_request(request.get_json(silent=True))
+    payload, error = _bounded_quarantine_json_request()
+    result = error or _resolve_runtime_quarantine_request(payload)
     return jsonify(result), (200 if result.get("success") is True else 409)
 
 

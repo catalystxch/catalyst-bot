@@ -59,6 +59,20 @@ def _sample(monotonic: object, wall: object):
     return ClockSample(monotonic_seconds=monotonic, wall_utc=wall)
 
 
+def _acquire_runtime_lease(db, *, owner="run-gap"):
+    result = db.acquire_runtime_mutation_lease(
+        owner_run_id=owner,
+        owner_pid=4242,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        now="2026-08-21T12:00:00.000000Z",
+        lease_expires_at="2026-08-21T23:59:00.000000Z",
+    )
+    assert result["acquired"] is True
+    return result["lease"]
+
+
 @pytest.mark.parametrize(
     ("current_monotonic", "current_wall", "reason"),
     [
@@ -113,6 +127,7 @@ def test_begin_recovery_epoch_atomically_trips_latch_and_fences_late_publication
     isolated_database,
 ):
     db = isolated_database
+    _acquire_runtime_lease(db)
     offer_fingerprint = hashlib.sha256(b"offer").hexdigest()
     from publication_outbox import canonical_publication_identity
 
@@ -164,6 +179,7 @@ def test_recovery_epoch_fences_delayed_claimed_cancel_completion(isolated_databa
     from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
 
     trade_id = "3" * 64
+    _acquire_runtime_lease(isolated_database)
     operation_id = f"cancel:{trade_id}"
     wallet_identity = {"wallet_fingerprint_hash": WALLET_HASH, "network": NETWORK}
     isolated_database.prepare_offer_cancel(
@@ -215,6 +231,7 @@ def test_recovery_epoch_fences_delayed_claimed_cancel_completion(isolated_databa
 
 
 def test_recovery_epoch_replay_is_exact_and_conflict_is_rejected(isolated_database):
+    _acquire_runtime_lease(isolated_database)
     kwargs = {
         "recovery_id": "recovery:" + "b" * 64,
         "reason_code": "WALL_CLOCK_JUMP",
@@ -240,6 +257,7 @@ def test_quarantine_archives_immutable_evidence_without_clearing_authority(
     isolated_database,
 ):
     db = isolated_database
+    _acquire_runtime_lease(db)
     epoch = db.begin_runtime_recovery_epoch(
         recovery_id="recovery:" + "c" * 64,
         reason_code="MONOTONIC_GAP",
@@ -260,7 +278,7 @@ def test_quarantine_archives_immutable_evidence_without_clearing_authority(
         owner_run_id="run-gap",
         wallet_fingerprint_hash=WALLET_HASH,
         network=NETWORK,
-        quarantined_at="2026-08-21T12:01:00.000000Z",
+        quarantined_at="2026-08-21T12:01:30.000000Z",
     )
 
     assert archived["manifest_sha256"] == hashlib.sha256(
@@ -384,6 +402,9 @@ def test_quarantine_resolution_requires_complete_absence_and_owned_unlocked_inpu
         "authority_digest": "c" * 64,
         "observed_at": "2026-08-21T12:02:00.000000Z",
         "history_complete": True,
+        "authoritative_read_performed": True,
+        "history_provenance": "wallet.get_all_offers",
+        "identity_provenance": "wallet.get_wallet_identity",
         "absent_offer_ids": ["2" * 64],
         "coins": [{"coin_id": "1" * 64, "owned": True, "unlocked": True}],
     }
@@ -421,6 +442,9 @@ def test_quarantine_resolution_accepts_only_fresh_exact_complete_proof():
         "authority_digest": "c" * 64,
         "observed_at": "2026-08-21T12:02:00.000000Z",
         "history_complete": True,
+        "authoritative_read_performed": True,
+        "history_provenance": "wallet.get_all_offers",
+        "identity_provenance": "wallet.get_wallet_identity",
         "absent_offer_ids": ["2" * 64],
         "coins": [{"coin_id": "1" * 64, "owned": True, "unlocked": True}],
     }
@@ -636,3 +660,528 @@ def test_runtime_recovery_reuses_ordered_startup_coordinator_and_retries_same_ep
 
 
 _STABILITY_FAILURE_INDEX = 4
+
+
+@pytest.mark.parametrize("failure_stage", ["rotate", "release"])
+def test_runtime_recovery_promotion_retries_with_new_append_only_attempt(
+    monkeypatch, failure_stage
+):
+    import api_server
+    import wallet
+
+    events = []
+    epoch = {
+        "recovery_id": "recovery:" + "4" * 64,
+        "blocker_id": "runtime-recovery:" + "4" * 64,
+        "latch_generation": 8,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "owner_run_id": "run-promotion",
+    }
+
+    class _Runtime:
+        run_id = "run-promotion"
+        wallet_fingerprint_hash = WALLET_HASH
+        network = NETWORK
+        wallet_identity_binding = SimpleNamespace()
+
+        def __init__(self):
+            self.boundary_calls = 0
+            self.release_calls = 0
+
+        def require_allowed(self, _operation):
+            self.boundary_calls += 1
+            if self.boundary_calls > 1:
+                raise RuntimeError("latch remains tripped")
+            return SimpleNamespace(lease_version=9)
+
+        def status(self):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "allowed": False,
+                    "lease": {"lease_version": 9},
+                }
+            )
+
+        def release_resolved(self, generation, blockers):
+            self.release_calls += 1
+            events.append(("release", generation, tuple(blockers)))
+            if failure_stage == "release" and self.release_calls == 1:
+                return {"released": False}
+            return {
+                "released": True,
+                "status": {"allowed": True, "lease": {"lease_version": 9}},
+            }
+
+    runtime = _Runtime()
+    monkeypatch.setattr(api_server.mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, NETWORK)
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": NETWORK,
+            "observed_at_utc": "2026-08-21T12:00:41.000000Z",
+        },
+    )
+    begin_ids = []
+
+    def _begin(**kwargs):
+        begin_ids.append(kwargs["recovery_id"])
+        epoch["recovery_id"] = kwargs["recovery_id"]
+        return {"record": dict(epoch), "idempotent": len(begin_ids) > 1}
+
+    monkeypatch.setattr(api_server.database, "begin_runtime_recovery_epoch", _begin)
+    monkeypatch.setattr(
+        api_server.database, "get_current_runtime_recovery", lambda: dict(epoch)
+    )
+    lease_reads = []
+    monkeypatch.setattr(
+        api_server.database,
+        "get_runtime_mutation_lease",
+        lambda: lease_reads.append(True)
+        or {
+            "lease_version": 9,
+            "owner_run_id": runtime.run_id,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": NETWORK,
+        },
+    )
+    pass_attempts = []
+    monkeypatch.setattr(
+        api_server.database,
+        "record_runtime_recovery_pass",
+        lambda **kwargs: pass_attempts.append(kwargs)
+        or {"attempt_number": len(pass_attempts)},
+    )
+
+    def _check(check_name, *, state, **_kwargs):
+        events.append(("check", check_name))
+        if check_name == api_server._STABILITY_STARTUP_CHECKS[0]:
+            state["initial_snapshot"] = {"authority_digest": "8" * 64}
+        return {"ok": True, "reason_code": "OK", "blocker_counts": {}}
+
+    monkeypatch.setattr(api_server, "_run_stability_startup_check", _check)
+    rotate_calls = []
+
+    def _rotate(_runtime):
+        rotate_calls.append(True)
+        return not (failure_stage == "rotate" and len(rotate_calls) == 1)
+
+    monkeypatch.setattr(
+        api_server.mutation_gate, "_rotate_owner_identity_authority", _rotate
+    )
+    decision = SimpleNamespace(
+        reason_code="MONOTONIC_GAP",
+        monotonic_delta_seconds="40",
+        wall_delta_seconds="40",
+    )
+    sample = _sample(Decimal("140"), NOW + timedelta(seconds=40))
+
+    first = api_server._run_runtime_recovery(decision, sample)
+    second = api_server._run_runtime_recovery(decision, sample)
+
+    assert first == {"allowed": False, "reason_code": "RECOVERY_PROMOTION_FAILED"}
+    assert second["allowed"] is True
+    assert begin_ids[0] == begin_ids[1]
+    assert len(lease_reads) == 1
+    assert len(pass_attempts) == 2
+    assert [event[1] for event in events if event[0] == "check"] == list(
+        api_server._STABILITY_STARTUP_CHECKS
+    ) * 2
+
+
+@pytest.mark.parametrize(
+    "phase_name",
+    ["cancel", "create", "publication", "coin_prep"],
+)
+def test_pause_between_effect_phases_fences_before_next_effect(
+    isolated_database, phase_name
+):
+    import bot_loop
+
+    lease = _acquire_runtime_lease(isolated_database)
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    monotonic = {"value": Decimal("100")}
+    wall = {"value": NOW}
+    loop._runtime_recovery_baseline = _sample(monotonic["value"], wall["value"])
+    loop._runtime_recovery_monotonic = lambda: monotonic["value"]
+    loop._runtime_recovery_wall_clock = lambda: wall["value"]
+    loop._runtime_recovery_gap_seconds = Decimal("10")
+    loop._runtime_recovery_skew_seconds = Decimal("2")
+    loop._runtime_recovery_coordinator = lambda decision, sample: (
+        isolated_database.begin_runtime_recovery_epoch(
+            recovery_id="recovery:" + "1" * 64,
+            reason_code=decision.reason_code,
+            clock_evidence={"phase": phase_name},
+            wallet_fingerprint_hash=WALLET_HASH,
+            network=NETWORK,
+            owner_run_id="run-gap",
+            started_at=sample.wall_utc,
+        )
+        and {"allowed": False, "reason_code": "RECOVERY_REQUIRED"}
+    )
+    effects = []
+
+    assert loop._runtime_recovery_cycle_boundary() is True
+    monotonic["value"] = Decimal("140")
+    wall["value"] = NOW + timedelta(seconds=40)
+    if loop._enter_runtime_effect_phase(phase_name):
+        effects.append(phase_name)
+
+    assert effects == []
+    latch = isolated_database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert int(latch["generation"]) > 0
+    assert lease["lease_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("lease_version", 2),
+        ("active", 0),
+        ("owner_pid", 4343),
+        ("owner_host", "replacement-host"),
+        ("expires_at", "2026-08-21T14:00:00.000000Z"),
+    ],
+)
+def test_recovery_epoch_replay_rejects_exact_lease_aba(
+    isolated_database, column, value
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    kwargs = {
+        "recovery_id": "recovery:" + "2" * 64,
+        "reason_code": "MONOTONIC_GAP",
+        "clock_evidence": {"phase": "create"},
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "owner_run_id": "run-gap",
+        "started_at": "2026-08-21T12:00:40.000000Z",
+    }
+    epoch = db.begin_runtime_recovery_epoch(**kwargs)["record"]
+
+    assert epoch["lease_version"] == lease["lease_version"]
+    assert epoch["lease_active"] == 1
+    assert epoch["lease_owner_pid"] == 4242
+    assert epoch["lease_owner_host"] == "task14-host"
+    db.get_connection().execute(
+        f"UPDATE runtime_mutation_lease SET {column}=? WHERE singleton_id=1",
+        (value,),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(ValueError, match="lease authority changed"):
+        db.begin_runtime_recovery_epoch(**kwargs)
+
+
+def test_gap_fences_late_publication_retry_and_unresolve_callbacks(isolated_database):
+    db = isolated_database
+    _acquire_runtime_lease(db)
+    offer_fingerprint = hashlib.sha256(b"failure-callbacks").hexdigest()
+    from publication_outbox import canonical_publication_identity
+
+    identity = canonical_publication_identity(NETWORK, offer_fingerprint, "epoch-f")
+    db.enqueue_publication_outbox(
+        publication_id="publication-failure-gap",
+        idempotency_key=identity.idempotency_key,
+        network=NETWORK,
+        offer_fingerprint=offer_fingerprint,
+        publication_epoch="epoch-f",
+        publisher="dexie",
+        payload_json={"offer_ref": hashlib.sha256(b"trade:failure").hexdigest()},
+        queued_at="2026-08-21T12:00:00.000000Z",
+    )
+    db.get_connection().execute(
+        "UPDATE publication_outbox SET state='claimed', attempt_count=1, "
+        "claim_owner_run_id='run-gap', claim_token='claim-failure', "
+        "claim_generation=1, claim_expires_at='2026-08-21T12:05:00.000000Z', "
+        "recovery_generation=0, row_version=1 "
+        "WHERE publication_id='publication-failure-gap'"
+    )
+    db.get_connection().commit()
+    claim = db.get_publication_outbox("publication-failure-gap")
+    db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "3" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "publication"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )
+    common = {
+        "publication_id": claim["publication_id"],
+        "owner_run_id": claim["claim_owner_run_id"],
+        "claim_token": claim["claim_token"],
+        "claim_generation": claim["claim_generation"],
+        "expected_row_version": claim["row_version"],
+        "error_json": {"reason": "late timeout"},
+    }
+
+    assert db.retry_publication_outbox(
+        **common,
+        retry_at="2026-08-21T12:01:40.000000Z",
+        updated_at="2026-08-21T12:00:41.000000Z",
+    ) is None
+    assert db.unresolve_publication_outbox(
+        **common,
+        unresolved_at="2026-08-21T12:00:41.000000Z",
+    ) is None
+    assert db.get_publication_outbox(claim["publication_id"])["state"] == "claimed"
+
+
+def test_recovery_pass_attempts_are_append_only_and_retryable(isolated_database):
+    db = isolated_database
+    _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "4" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "create"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    first = db.record_runtime_recovery_pass(
+        recovery_id=epoch["recovery_id"],
+        expected_latch_generation=epoch["latch_generation"],
+        authority_digest="a" * 64,
+        checks=[{"name": "lease", "ok": True}],
+        passed_at="2026-08-21T12:00:41.000000Z",
+    )
+    second = db.record_runtime_recovery_pass(
+        recovery_id=epoch["recovery_id"],
+        expected_latch_generation=epoch["latch_generation"],
+        authority_digest="b" * 64,
+        checks=[{"name": "lease", "ok": True}, {"name": "retry", "ok": True}],
+        passed_at="2026-08-21T12:00:42.000000Z",
+    )
+
+    rows = db.get_connection().execute(
+        "SELECT * FROM runtime_recovery_passes WHERE recovery_id=? "
+        "ORDER BY attempt_number",
+        (epoch["recovery_id"],),
+    ).fetchall()
+    assert first["attempt_number"] == 1
+    assert second["attempt_number"] == 2
+    assert len(rows) == 2
+    assert rows[0]["checks_sha256"] != rows[1]["checks_sha256"]
+
+
+@pytest.mark.parametrize("operation", ["pass", "quarantine", "release"])
+def test_exact_lease_aba_blocks_every_recovery_promotion_step(
+    isolated_database, operation
+):
+    db = isolated_database
+    _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "5" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"monotonic_delta": "40", "wall_delta": "40"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    if operation == "release":
+        db.record_runtime_recovery_pass(
+            recovery_id=epoch["recovery_id"],
+            expected_latch_generation=epoch["latch_generation"],
+            authority_digest="1" * 64,
+            checks=[{"name": "integrity", "ok": True}],
+            passed_at="2026-08-21T12:01:00.000000Z",
+        )
+    db.get_connection().execute(
+        "UPDATE runtime_mutation_lease SET lease_version=lease_version+1 "
+        "WHERE singleton_id=1"
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(ValueError, match="lease authority changed"):
+        if operation == "pass":
+            db.record_runtime_recovery_pass(
+                recovery_id=epoch["recovery_id"],
+                expected_latch_generation=epoch["latch_generation"],
+                authority_digest="1" * 64,
+                checks=[{"name": "integrity", "ok": True}],
+                passed_at="2026-08-21T12:01:00.000000Z",
+            )
+        elif operation == "quarantine":
+            db.quarantine_runtime_blockers(
+                confirmation=True,
+                quarantine_id="quarantine:" + "5" * 64,
+                blocker_ids=[epoch["blocker_id"]],
+                expected_latch_generation=epoch["latch_generation"],
+                expected_recovery_id=epoch["recovery_id"],
+                owner_run_id="run-gap",
+                wallet_fingerprint_hash=WALLET_HASH,
+                network=NETWORK,
+                quarantined_at="2026-08-21T12:01:00.000000Z",
+            )
+        else:
+            db.resolve_runtime_safety_latch(
+                expected_generation=epoch["latch_generation"],
+                resolved_operation_ids=[epoch["blocker_id"]],
+                resolved_at="2026-08-21T12:01:01.000000Z",
+            )
+
+
+def test_quarantine_rejects_hostile_iterable_without_traversal(isolated_database):
+    traversed = {"value": False}
+
+    def hostile():
+        traversed["value"] = True
+        yield "runtime-recovery:" + "5" * 64
+
+    with pytest.raises(TypeError, match="exact bounded list or tuple"):
+        isolated_database.quarantine_runtime_blockers(
+            confirmation=True,
+            quarantine_id="quarantine:" + "5" * 64,
+            blocker_ids=hostile(),
+            expected_latch_generation=1,
+            expected_recovery_id="recovery:" + "5" * 64,
+            owner_run_id="run-gap",
+            wallet_fingerprint_hash=WALLET_HASH,
+            network=NETWORK,
+            quarantined_at="2026-08-21T12:01:00.000000Z",
+        )
+    assert traversed["value"] is False
+
+
+def test_empty_quarantine_proof_requires_actual_authoritative_history_read(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    calls = []
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: calls.append("identity") or (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_all_offers",
+        lambda **_kwargs: calls.append("history")
+        or (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    requirements = {
+        "quarantine_id": "quarantine:" + "6" * 64,
+        "recovery_id": "recovery:" + "6" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "c" * 64,
+        "offers": [],
+    }
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+
+    assert calls == ["identity", "history"]
+    assert decision == {
+        "allowed": False,
+        "reason_code": "QUARANTINE_FULL_HISTORY_INCOMPLETE",
+    }
+
+
+def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": NETWORK,
+            "observed_at_utc": observed.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        },
+    )
+    monkeypatch.setattr(wallet, "get_all_offers", lambda **_kwargs: [])
+    requirements = {
+        "quarantine_id": "quarantine:" + "7" * 64,
+        "recovery_id": "recovery:" + "7" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "d" * 64,
+        "offers": [],
+    }
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+
+    assert decision["allowed"] is True
+    assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
+
+
+def test_quarantine_api_rejects_oversized_body_before_json_allocation():
+    import api_server
+
+    with api_server.app.test_request_context(
+        "/api/safety/quarantine",
+        method="POST",
+        data=b"{" + (b"x" * 16384) + b"}",
+        content_type="application/json",
+    ):
+        response, status = api_server.api_safety_quarantine()
+
+    assert status == 409
+    assert response.get_json() == {
+        "success": False,
+        "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+    }
+
+
+def test_quarantine_status_reports_current_latch_state_not_capture_constant(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(
+        api_server.database,
+        "get_runtime_quarantine_manifest",
+        lambda _quarantine_id: {
+            "quarantine_id": "quarantine:" + "7" * 64,
+            "recovery_id": "recovery:" + "7" * 64,
+            "latch_generation": 9,
+            "manifest_sha256": "8" * 64,
+            "quarantined_at": "2026-08-21T12:01:00.000000Z",
+        },
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_runtime_safety_latch",
+        lambda: {"state": "resolved", "generation": 9},
+    )
+    with api_server.app.test_request_context(
+        "/api/safety/quarantine/" + "quarantine:" + "7" * 64
+    ):
+        response = api_server.api_safety_quarantine_status(
+            "quarantine:" + "7" * 64
+        )
+
+    body = response.get_json()
+    assert body["quarantine"]["archival_blocked_at_capture"] is True
+    assert body["quarantine"]["current_mutation_blocked"] is False
+    assert "mutation_blocked" not in body["quarantine"]

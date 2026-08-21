@@ -3169,6 +3169,15 @@ CREATE TABLE IF NOT EXISTS runtime_recovery_epochs (
     owner_run_id                TEXT NOT NULL,
     wallet_fingerprint_hash     TEXT NOT NULL,
     network                     TEXT NOT NULL,
+    lease_version               INTEGER,
+    lease_active                INTEGER,
+    lease_owner_pid             INTEGER,
+    lease_owner_host            TEXT,
+    lease_acquired_at           TEXT,
+    lease_heartbeat_at          TEXT,
+    lease_expires_at            TEXT,
+    lease_updated_at            TEXT,
+    lease_snapshot_sha256       TEXT,
     latch_generation            INTEGER NOT NULL CHECK(latch_generation > 0),
     started_at                  TEXT NOT NULL
 );
@@ -3184,16 +3193,37 @@ CREATE INDEX IF NOT EXISTS idx_runtime_recovery_epochs_binding
     ON runtime_recovery_epochs(wallet_fingerprint_hash, network, latch_generation);
 
 CREATE TABLE IF NOT EXISTS runtime_recovery_passes (
-    recovery_id                 TEXT PRIMARY KEY,
+    attempt_sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
+    recovery_id                 TEXT NOT NULL,
+    attempt_number              INTEGER NOT NULL CHECK(attempt_number > 0),
+    attempt_id                  TEXT NOT NULL UNIQUE,
     authority_digest            TEXT NOT NULL CHECK(length(authority_digest)=64),
     checks_json                 TEXT NOT NULL,
     checks_sha256               TEXT NOT NULL CHECK(length(checks_sha256)=64),
     passed_at                   TEXT NOT NULL,
+    UNIQUE(recovery_id, attempt_number),
     FOREIGN KEY(recovery_id) REFERENCES runtime_recovery_epochs(recovery_id)
 );
 CREATE TRIGGER IF NOT EXISTS runtime_recovery_passes_no_update
 BEFORE UPDATE ON runtime_recovery_passes BEGIN
     SELECT RAISE(ABORT, 'runtime_recovery_passes is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS runtime_recovery_promotions (
+    recovery_id                 TEXT PRIMARY KEY,
+    attempt_id                  TEXT NOT NULL UNIQUE,
+    latch_generation            INTEGER NOT NULL CHECK(latch_generation > 0),
+    promoted_at                 TEXT NOT NULL,
+    FOREIGN KEY(recovery_id) REFERENCES runtime_recovery_epochs(recovery_id),
+    FOREIGN KEY(attempt_id) REFERENCES runtime_recovery_passes(attempt_id)
+);
+CREATE TRIGGER IF NOT EXISTS runtime_recovery_promotions_no_update
+BEFORE UPDATE ON runtime_recovery_promotions BEGIN
+    SELECT RAISE(ABORT, 'runtime_recovery_promotions is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS runtime_recovery_promotions_no_delete
+BEFORE DELETE ON runtime_recovery_promotions BEGIN
+    SELECT RAISE(ABORT, 'runtime_recovery_promotions is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS runtime_recovery_passes_no_delete
 BEFORE DELETE ON runtime_recovery_passes BEGIN
@@ -3739,11 +3769,17 @@ _STABILITY_REQUIRED_COLUMNS = {
     "runtime_recovery_epochs": {
         "recovery_id", "blocker_id", "reason_code", "clock_evidence_json",
         "clock_evidence_sha256", "owner_run_id", "wallet_fingerprint_hash",
-        "network", "latch_generation", "started_at",
+        "network", "lease_version", "lease_active", "lease_owner_pid",
+        "lease_owner_host", "lease_acquired_at", "lease_heartbeat_at",
+        "lease_expires_at", "lease_updated_at", "lease_snapshot_sha256",
+        "latch_generation", "started_at",
     },
     "runtime_recovery_passes": {
-        "recovery_id", "authority_digest", "checks_json", "checks_sha256",
-        "passed_at",
+        "attempt_sequence", "recovery_id", "attempt_number", "attempt_id",
+        "authority_digest", "checks_json", "checks_sha256", "passed_at",
+    },
+    "runtime_recovery_promotions": {
+        "recovery_id", "attempt_id", "latch_generation", "promoted_at",
     },
     "runtime_quarantine_manifests": {
         "quarantine_id", "recovery_id", "latch_generation", "owner_run_id",
@@ -4357,6 +4393,11 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_cancel_effect_claims", ("operation_id", "attempt"))
     _require_unique_key(conn, "offer_cancel_effect_claims", ("prepared_event_id",))
     _require_unique_key(conn, "runtime_recovery_epochs", ("blocker_id",))
+    _require_unique_key(
+        conn, "runtime_recovery_passes", ("recovery_id", "attempt_number")
+    )
+    _require_unique_key(conn, "runtime_recovery_passes", ("attempt_id",))
+    _require_unique_key(conn, "runtime_recovery_promotions", ("attempt_id",))
     _require_unique_key(conn, "runtime_quarantine_manifests", ("manifest_sha256",))
     _require_unique_key(conn, "runtime_quarantine_resolutions", ("proof_sha256",))
     _require_unique_key(conn, "runtime_worker_delegations", ("delegation_token_hash",))
@@ -5220,6 +5261,124 @@ def _migrate_stability_schema() -> None:
             "offer_reconciliation_coin_outcomes" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        epoch_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(runtime_recovery_epochs)"
+            ).fetchall()
+        }
+        recovery_epoch_upgrades = {
+            "lease_version": "INTEGER",
+            "lease_active": "INTEGER",
+            "lease_owner_pid": "INTEGER",
+            "lease_owner_host": "TEXT",
+            "lease_acquired_at": "TEXT",
+            "lease_heartbeat_at": "TEXT",
+            "lease_expires_at": "TEXT",
+            "lease_updated_at": "TEXT",
+            "lease_snapshot_sha256": "TEXT",
+        }
+        for column_name, column_sql in recovery_epoch_upgrades.items():
+            if column_name not in epoch_columns:
+                conn.execute(
+                    "ALTER TABLE runtime_recovery_epochs ADD COLUMN "
+                    f"{column_name} {column_sql}"
+                )
+        pass_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(runtime_recovery_passes)"
+            ).fetchall()
+        }
+        if "attempt_sequence" not in pass_columns:
+            legacy_columns = {
+                "recovery_id",
+                "authority_digest",
+                "checks_json",
+                "checks_sha256",
+                "passed_at",
+            }
+            if pass_columns != legacy_columns:
+                raise RuntimeError("runtime recovery pass schema cannot be upgraded")
+            conn.execute("DROP TRIGGER IF EXISTS runtime_recovery_promotions_no_update")
+            conn.execute("DROP TRIGGER IF EXISTS runtime_recovery_promotions_no_delete")
+            conn.execute("DROP TABLE IF EXISTS runtime_recovery_promotions")
+            conn.execute("DROP TRIGGER IF EXISTS runtime_recovery_passes_no_update")
+            conn.execute("DROP TRIGGER IF EXISTS runtime_recovery_passes_no_delete")
+            conn.execute(
+                "ALTER TABLE runtime_recovery_passes "
+                "RENAME TO runtime_recovery_passes_legacy_task14"
+            )
+            conn.executescript(
+                """
+                CREATE TABLE runtime_recovery_passes (
+                    attempt_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recovery_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                    attempt_id TEXT NOT NULL UNIQUE,
+                    authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64),
+                    checks_json TEXT NOT NULL,
+                    checks_sha256 TEXT NOT NULL CHECK(length(checks_sha256)=64),
+                    passed_at TEXT NOT NULL,
+                    UNIQUE(recovery_id, attempt_number),
+                    FOREIGN KEY(recovery_id) REFERENCES runtime_recovery_epochs(recovery_id)
+                );
+                CREATE TRIGGER runtime_recovery_passes_no_update
+                BEFORE UPDATE ON runtime_recovery_passes BEGIN
+                    SELECT RAISE(ABORT, 'runtime_recovery_passes is append-only');
+                END;
+                CREATE TRIGGER runtime_recovery_passes_no_delete
+                BEFORE DELETE ON runtime_recovery_passes BEGIN
+                    SELECT RAISE(ABORT, 'runtime_recovery_passes is append-only');
+                END;
+                """
+            )
+            for legacy_pass in conn.execute(
+                "SELECT * FROM runtime_recovery_passes_legacy_task14 "
+                "ORDER BY recovery_id"
+            ).fetchall():
+                attempt_material = (
+                    f"{legacy_pass['recovery_id']}:{legacy_pass['checks_sha256']}:"
+                    f"{legacy_pass['passed_at']}"
+                )
+                attempt_id = "recovery-pass:" + hashlib.sha256(
+                    attempt_material.encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    "INSERT INTO runtime_recovery_passes "
+                    "(recovery_id,attempt_number,attempt_id,authority_digest,"
+                    "checks_json,checks_sha256,passed_at) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        legacy_pass["recovery_id"],
+                        1,
+                        attempt_id,
+                        legacy_pass["authority_digest"],
+                        legacy_pass["checks_json"],
+                        legacy_pass["checks_sha256"],
+                        legacy_pass["passed_at"],
+                    ),
+                )
+            conn.execute("DROP TABLE runtime_recovery_passes_legacy_task14")
+            conn.executescript(
+                """
+                CREATE TABLE runtime_recovery_promotions (
+                    recovery_id TEXT PRIMARY KEY,
+                    attempt_id TEXT NOT NULL UNIQUE,
+                    latch_generation INTEGER NOT NULL CHECK(latch_generation > 0),
+                    promoted_at TEXT NOT NULL,
+                    FOREIGN KEY(recovery_id) REFERENCES runtime_recovery_epochs(recovery_id),
+                    FOREIGN KEY(attempt_id) REFERENCES runtime_recovery_passes(attempt_id)
+                );
+                CREATE TRIGGER runtime_recovery_promotions_no_update
+                BEFORE UPDATE ON runtime_recovery_promotions BEGIN
+                    SELECT RAISE(ABORT, 'runtime_recovery_promotions is append-only');
+                END;
+                CREATE TRIGGER runtime_recovery_promotions_no_delete
+                BEFORE DELETE ON runtime_recovery_promotions BEGIN
+                    SELECT RAISE(ABORT, 'runtime_recovery_promotions is append-only');
+                END;
+                """
+            )
         blocker_columns = {
             str(row["name"])
             for row in conn.execute(
@@ -5309,6 +5468,7 @@ def _migrate_stability_schema() -> None:
             "offer_refresh_lineage_blockers",
             "runtime_recovery_epochs",
             "runtime_recovery_passes",
+            "runtime_recovery_promotions",
             "runtime_quarantine_manifests",
             "runtime_quarantine_resolutions",
         }
@@ -23768,6 +23928,104 @@ def _runtime_identifier(value: Any, name: str, prefix: str) -> str:
     return text
 
 
+_RECOVERY_LEASE_EPOCH_FIELDS = {
+    "lease_version": "lease_version",
+    "active": "lease_active",
+    "owner_pid": "lease_owner_pid",
+    "owner_host": "lease_owner_host",
+    "acquired_at": "lease_acquired_at",
+    "heartbeat_at": "lease_heartbeat_at",
+    "expires_at": "lease_expires_at",
+    "updated_at": "lease_updated_at",
+}
+
+
+def _runtime_recovery_lease_snapshot(lease: Any) -> tuple[Dict[str, Any], str]:
+    if type(lease) is not dict:
+        raise ValueError("runtime recovery lease authority is missing")
+    if (
+        type(lease.get("lease_version")) is not int
+        or lease["lease_version"] < 1
+        or type(lease.get("active")) is not int
+        or lease["active"] != 1
+        or type(lease.get("owner_pid")) is not int
+        or lease["owner_pid"] < 1
+        or type(lease.get("owner_host")) is not str
+        or not lease["owner_host"]
+        or type(lease.get("owner_run_id")) is not str
+        or not lease["owner_run_id"]
+        or type(lease.get("wallet_fingerprint_hash")) is not str
+        or not lease["wallet_fingerprint_hash"]
+        or type(lease.get("network")) is not str
+        or not lease["network"]
+        or lease.get("released_at") is not None
+    ):
+        raise ValueError("runtime recovery lease authority changed")
+    snapshot = {
+        key: lease.get(key)
+        for key in (
+            "lease_version",
+            "active",
+            "owner_run_id",
+            "owner_pid",
+            "owner_host",
+            "wallet_fingerprint_hash",
+            "network",
+            "acquired_at",
+            "heartbeat_at",
+            "expires_at",
+            "updated_at",
+        )
+    }
+    for timestamp_name in (
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "updated_at",
+    ):
+        timestamp = snapshot[timestamp_name]
+        if (
+            type(timestamp) is not str
+            or _stability_timestamp(timestamp, timestamp_name) != timestamp
+        ):
+            raise ValueError("runtime recovery lease timestamps are not canonical")
+    snapshot_json = _canonical_json_text(
+        snapshot, "runtime recovery lease snapshot", expected_type=dict, max_bytes=4096
+    )
+    return snapshot, hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+
+
+def _assert_runtime_recovery_lease(
+    epoch: Any, lease: Any, *, require_unexpired_at: Optional[str] = None
+) -> Dict[str, Any]:
+    if type(epoch) is not dict:
+        epoch = dict(epoch)
+    current, current_digest = _runtime_recovery_lease_snapshot(
+        lease if type(lease) is dict else dict(lease)
+    )
+    expected_digest = epoch.get("lease_snapshot_sha256")
+    if (
+        type(expected_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        or expected_digest != current_digest
+        or any(
+            epoch.get(epoch_field) != current[lease_field]
+            for lease_field, epoch_field in _RECOVERY_LEASE_EPOCH_FIELDS.items()
+        )
+        or epoch.get("owner_run_id") != current["owner_run_id"]
+        or epoch.get("wallet_fingerprint_hash")
+        != current["wallet_fingerprint_hash"]
+        or epoch.get("network") != current["network"]
+    ):
+        raise ValueError("runtime recovery lease authority changed")
+    if (
+        require_unexpired_at is not None
+        and current["expires_at"] <= require_unexpired_at
+    ):
+        raise ValueError("runtime recovery lease authority changed")
+    return current
+
+
 def begin_runtime_recovery_epoch(
     *,
     recovery_id: str,
@@ -23801,6 +24059,20 @@ def begin_runtime_recovery_epoch(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if lease_row is None:
+            raise ValueError("runtime recovery lease authority is missing")
+        lease, lease_digest = _runtime_recovery_lease_snapshot(dict(lease_row))
+        locked_at = max(when, _stability_wall_clock())
+        if (
+            lease["owner_run_id"] != owner
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != safe_network
+            or lease["expires_at"] <= locked_at
+        ):
+            raise ValueError("runtime recovery lease authority changed")
         existing = conn.execute(
             "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
             (recovery,),
@@ -23820,6 +24092,9 @@ def begin_runtime_recovery_epoch(
             }
             if any(record[key] != value for key, value in exact.items()):
                 raise ValueError("runtime recovery replay conflict")
+            _assert_runtime_recovery_lease(
+                record, lease, require_unexpired_at=locked_at
+            )
             latch = conn.execute(
                 "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
             ).fetchone()
@@ -23863,8 +24138,11 @@ def begin_runtime_recovery_epoch(
             INSERT INTO runtime_recovery_epochs (
                 recovery_id, blocker_id, reason_code, clock_evidence_json,
                 clock_evidence_sha256, owner_run_id, wallet_fingerprint_hash,
-                network, latch_generation, started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                network, lease_version, lease_active, lease_owner_pid,
+                lease_owner_host, lease_acquired_at, lease_heartbeat_at,
+                lease_expires_at, lease_updated_at, lease_snapshot_sha256,
+                latch_generation, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 recovery,
@@ -23875,6 +24153,15 @@ def begin_runtime_recovery_epoch(
                 owner,
                 wallet_hash,
                 safe_network,
+                lease["lease_version"],
+                lease["active"],
+                lease["owner_pid"],
+                lease["owner_host"],
+                lease["acquired_at"],
+                lease["heartbeat_at"],
+                lease["expires_at"],
+                lease["updated_at"],
+                lease_digest,
                 generation,
                 when,
             ),
@@ -23940,8 +24227,14 @@ def record_runtime_recovery_pass(
         latch = conn.execute(
             "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
         ).fetchone()
-        if epoch is None or latch is None:
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if epoch is None or latch is None or lease is None:
             raise ValueError("runtime recovery epoch is missing")
+        _assert_runtime_recovery_lease(
+            dict(epoch), dict(lease), require_unexpired_at=_stability_wall_clock()
+        )
         if (
             int(epoch["latch_generation"]) != generation
             or int(latch["generation"]) != generation
@@ -23950,29 +24243,45 @@ def record_runtime_recovery_pass(
             != [epoch["blocker_id"]]
         ):
             raise ValueError("runtime recovery authority changed")
-        existing = conn.execute(
-            "SELECT * FROM runtime_recovery_passes WHERE recovery_id=?",
+        previous = conn.execute(
+            "SELECT MAX(attempt_number) AS attempt_number "
+            "FROM runtime_recovery_passes WHERE recovery_id=?",
             (recovery,),
         ).fetchone()
-        values = (authority_digest, checks_json, checks_sha256, when)
-        if existing is not None:
-            record = dict(existing)
-            if tuple(record[key] for key in (
-                "authority_digest", "checks_json", "checks_sha256", "passed_at"
-            )) != values:
-                raise ValueError("runtime recovery pass replay conflict")
-            conn.commit()
-            return record
+        attempt_number = int(previous["attempt_number"] or 0) + 1
+        attempt_material = json.dumps(
+            {
+                "recovery_id": recovery,
+                "attempt_number": attempt_number,
+                "authority_digest": authority_digest,
+                "checks_sha256": checks_sha256,
+                "passed_at": when,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        attempt_id = "recovery-pass:" + hashlib.sha256(
+            attempt_material.encode("utf-8")
+        ).hexdigest()
         conn.execute(
             "INSERT INTO runtime_recovery_passes "
-            "(recovery_id,authority_digest,checks_json,checks_sha256,passed_at) "
-            "VALUES (?,?,?,?,?)",
-            (recovery, *values),
+            "(recovery_id,attempt_number,attempt_id,authority_digest,checks_json,"
+            "checks_sha256,passed_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                recovery,
+                attempt_number,
+                attempt_id,
+                authority_digest,
+                checks_json,
+                checks_sha256,
+                when,
+            ),
         )
         record = dict(
             conn.execute(
-                "SELECT * FROM runtime_recovery_passes WHERE recovery_id=?",
-                (recovery,),
+                "SELECT * FROM runtime_recovery_passes WHERE attempt_id=?",
+                (attempt_id,),
             ).fetchone()
         )
         conn.commit()
@@ -23988,7 +24297,7 @@ def quarantine_runtime_blockers(
     *,
     confirmation: bool,
     quarantine_id: str,
-    blocker_ids: Iterable[str],
+    blocker_ids: Any,
     expected_latch_generation: int,
     expected_recovery_id: str,
     owner_run_id: str,
@@ -24009,13 +24318,22 @@ def quarantine_runtime_blockers(
     generation = _exact_integer(
         expected_latch_generation, "expected_latch_generation", minimum=1
     )
-    blockers = sorted(
-        {_required_stability_text(value, "blocker_id") for value in blocker_ids}
-    )
-    if not blockers or len(blockers) > 64 or any(
-        len(value) > 128 or not value.isascii() for value in blockers
-    ):
+    if type(blocker_ids) not in (list, tuple):
+        raise TypeError("blocker_ids must be an exact bounded list or tuple")
+    if not blocker_ids or len(blocker_ids) > 64:
         raise ValueError("blocker_ids are not canonical and bounded")
+    blockers = []
+    for value in blocker_ids:
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 128
+            or not value.isascii()
+            or re.fullmatch(r"[A-Za-z0-9._:-]+", value) is None
+        ):
+            raise ValueError("blocker_ids are not canonical and bounded")
+        blockers.append(value)
+    blockers = sorted(set(blockers))
     blockers_json = _canonical_json_text(
         blockers, "blocker_ids", expected_type=list, max_bytes=16384
     )
@@ -24036,10 +24354,29 @@ def quarantine_runtime_blockers(
             "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
             (recovery,),
         ).fetchone()
-        if latch_row is None or epoch_row is None:
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if latch_row is None or epoch_row is None or lease_row is None:
             raise ValueError("current recovery authority is missing")
         latch, epoch = dict(latch_row), dict(epoch_row)
+        _assert_runtime_recovery_lease(
+            epoch, dict(lease_row), require_unexpired_at=_stability_wall_clock()
+        )
         current_blockers = json.loads(latch["blocking_operation_ids_json"])
+        unresolved_rows = conn.execute(
+            "SELECT journal.operation_id FROM offer_operation_journal AS journal "
+            "JOIN (SELECT operation_id,MAX(sequence) AS sequence FROM "
+            "offer_operation_journal GROUP BY operation_id) AS latest "
+            "ON latest.operation_id=journal.operation_id "
+            "AND latest.sequence=journal.sequence "
+            "WHERE journal.blocks_mutation=1 ORDER BY journal.operation_id LIMIT 65"
+        ).fetchall()
+        if len(unresolved_rows) > 64:
+            raise ValueError("current blocker authority exceeds quarantine bound")
+        authoritative_blockers = set(current_blockers) | {
+            str(row["operation_id"]) for row in unresolved_rows
+        }
         if (
             latch["state"] != "tripped"
             or int(latch["generation"]) != generation
@@ -24049,9 +24386,27 @@ def quarantine_runtime_blockers(
             or epoch["network"] != safe_network
             or latch["wallet_fingerprint_hash"] != wallet_hash
             or latch["network"] != safe_network
-            or not set(blockers).issubset(set(current_blockers))
+            or not set(blockers).issubset(authoritative_blockers)
         ):
             raise ValueError("quarantine authority binding changed")
+        existing = conn.execute(
+            "SELECT * FROM runtime_quarantine_manifests WHERE quarantine_id=?",
+            (quarantine,),
+        ).fetchone()
+        if existing is not None:
+            record = dict(existing)
+            if (
+                record["recovery_id"] != recovery
+                or int(record["latch_generation"]) != generation
+                or record["owner_run_id"] != owner
+                or record["wallet_fingerprint_hash"] != wallet_hash
+                or record["network"] != safe_network
+                or record["blocker_ids_sha256"] != blockers_sha256
+                or record["blocker_ids_json"] != blockers_json
+            ):
+                raise ValueError("quarantine replay conflict")
+            conn.commit()
+            return record
         prior_latch_json = _canonical_json_text(
             latch, "prior_latch", expected_type=dict, max_bytes=16384
         )
@@ -24062,10 +24417,65 @@ def quarantine_runtime_blockers(
             "SELECT event_id,operation_id,intent_id,evidence_sha256,reason_code,"
             "blocks_mutation,created_at FROM offer_operation_journal "
             f"WHERE operation_id IN ({','.join('?' for _ in blockers)}) "
-            "ORDER BY operation_id,sequence",
+            "ORDER BY operation_id,sequence LIMIT 65",
             tuple(blockers),
         ).fetchall()
-        evidence = [dict(row) for row in journal_rows]
+        if len(journal_rows) > 64:
+            raise ValueError("quarantine journal evidence exceeds bound")
+        evidence = []
+        for raw_row in journal_rows:
+            row = dict(raw_row)
+            for field, maximum in (
+                ("event_id", 256),
+                ("operation_id", 128),
+                ("intent_id", 256),
+                ("evidence_sha256", 64),
+                ("reason_code", 128),
+                ("created_at", 64),
+            ):
+                value = row.get(field)
+                if value is not None and (
+                    type(value) is not str or len(value) > maximum
+                ):
+                    raise ValueError("quarantine journal evidence is not bounded")
+            evidence.append(row)
+        terminal_states = sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+        terminal_placeholders = ",".join("?" for _ in terminal_states)
+        intent_rows = conn.execute(
+            "SELECT intent_id,sage_trade_id,selected_coin_ids_json,"
+            "selected_coin_ids_sha256,lifecycle_state,row_version FROM offer_intents "
+            f"WHERE wallet_fingerprint_hash=? AND network=? AND lifecycle_state "
+            f"NOT IN ({terminal_placeholders}) ORDER BY intent_id LIMIT 65",
+            (wallet_hash, safe_network, *terminal_states),
+        ).fetchall()
+        if len(intent_rows) > 64:
+            raise ValueError("affected intent authority exceeds quarantine bound")
+        affected_intents = []
+        affected_coin_count = 0
+        for raw_intent in intent_rows:
+            intent = dict(raw_intent)
+            selected_json = _canonical_json_text(
+                intent["selected_coin_ids_json"],
+                "selected_coin_ids_json",
+                expected_type=list,
+                max_bytes=8192,
+            )
+            selected = json.loads(selected_json)
+            if any(type(coin_id) is not str or len(coin_id) > 128 for coin_id in selected):
+                raise ValueError("affected selected coin authority is invalid")
+            affected_coin_count += len(selected)
+            if affected_coin_count > 64:
+                raise ValueError("affected selected coin authority exceeds bound")
+            affected_intents.append(
+                {
+                    "intent_id": intent["intent_id"],
+                    "trade_id": intent["sage_trade_id"],
+                    "selected_coin_ids": selected,
+                    "selected_coin_ids_sha256": intent["selected_coin_ids_sha256"],
+                    "lifecycle_state": intent["lifecycle_state"],
+                    "row_version": int(intent["row_version"]),
+                }
+            )
         manifest = {
             "version": 1,
             "quarantine_id": quarantine,
@@ -24077,22 +24487,13 @@ def quarantine_runtime_blockers(
             "blocker_ids": blockers,
             "prior_latch_sha256": prior_latch_sha256,
             "journal_evidence": evidence,
+            "affected_intents": affected_intents,
             "quarantined_at": when,
         }
         manifest_json = _canonical_json_text(
-            manifest, "quarantine manifest", expected_type=dict, max_bytes=262144
+            manifest, "quarantine manifest", expected_type=dict, max_bytes=16384
         )
         manifest_sha256 = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
-        existing = conn.execute(
-            "SELECT * FROM runtime_quarantine_manifests WHERE quarantine_id=?",
-            (quarantine,),
-        ).fetchone()
-        if existing is not None:
-            record = dict(existing)
-            if record["manifest_sha256"] != manifest_sha256:
-                raise ValueError("quarantine replay conflict")
-            conn.commit()
-            return record
         conn.execute(
             """
             INSERT INTO runtime_quarantine_manifests (
@@ -24183,26 +24584,55 @@ def get_runtime_quarantine_resolution_requirements(
         or latch["network"] != quarantine["network"]
     ):
         raise ValueError("quarantine authority is stale")
-    blocker_ids = json.loads(quarantine["blocker_ids_json"])
+    manifest_text = _canonical_json_text(
+        quarantine["manifest_json"],
+        "quarantine manifest",
+        expected_type=dict,
+        max_bytes=16384,
+    )
+    if (
+        hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+        != quarantine["manifest_sha256"]
+    ):
+        raise ValueError("quarantine manifest digest is invalid")
+    manifest = json.loads(manifest_text)
+    affected = manifest.get("affected_intents")
+    if type(affected) is not list or len(affected) > 64:
+        raise ValueError("quarantine affected intent authority is incomplete")
     conn = get_connection()
-    placeholders = ",".join("?" for _ in blocker_ids)
-    intent_rows = conn.execute(
-        "SELECT DISTINCT intent.* FROM offer_intents AS intent "
-        "JOIN offer_operation_journal AS journal ON journal.intent_id=intent.intent_id "
-        f"WHERE journal.operation_id IN ({placeholders}) "
-        "ORDER BY intent.intent_id",
-        tuple(blocker_ids),
-    ).fetchall()
     offers = []
-    for row in intent_rows:
+    selected_count = 0
+    for captured in affected:
+        if (
+            type(captured) is not dict
+            or type(captured.get("intent_id")) is not str
+            or type(captured.get("selected_coin_ids")) is not list
+        ):
+            raise ValueError("quarantine affected intent authority is malformed")
+        row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?",
+            (captured["intent_id"],),
+        ).fetchone()
+        if row is None:
+            raise ValueError("quarantine affected intent authority is missing")
         intent = dict(row)
         selected = json.loads(intent["selected_coin_ids_json"])
         if (
-            not intent.get("sage_trade_id")
+            intent.get("wallet_fingerprint_hash")
+            != quarantine["wallet_fingerprint_hash"]
+            or intent.get("network") != quarantine["network"]
+            or intent.get("sage_trade_id") != captured.get("trade_id")
+            or intent.get("selected_coin_ids_sha256")
+            != captured.get("selected_coin_ids_sha256")
+            or selected != captured["selected_coin_ids"]
             or type(selected) is not list
-            or not selected
             or any(type(item) is not str for item in selected)
         ):
+            raise ValueError("quarantine offer authority is incomplete")
+        selected_count += len(selected)
+        if selected_count > 64:
+            raise ValueError("quarantine selected input authority exceeds bound")
+        if not intent.get("sage_trade_id"):
             raise ValueError("quarantine offer authority is incomplete")
         offers.append(
             {
@@ -24280,6 +24710,9 @@ def resolve_runtime_quarantine(
         ).fetchone()
         if quarantine is None or epoch is None or latch is None or lease is None:
             raise ValueError("quarantine authority is missing")
+        _assert_runtime_recovery_lease(
+            dict(epoch), dict(lease), require_unexpired_at=_stability_wall_clock()
+        )
         if (
             quarantine["recovery_id"] != recovery_id
             or int(quarantine["latch_generation"]) != generation
@@ -24473,7 +24906,7 @@ def trip_runtime_safety_latch(
 def resolve_runtime_safety_latch(
     *,
     expected_generation: int,
-    resolved_operation_ids: Iterable[str],
+    resolved_operation_ids: Any,
     resolved_at: Any = None,
 ) -> Dict[str, Any]:
     """Resolve exactly one observed latch generation with all blockers named."""
@@ -24481,6 +24914,12 @@ def resolve_runtime_safety_latch(
     safe_expected_generation = _exact_integer(
         expected_generation, "expected_generation"
     )
+    if type(resolved_operation_ids) not in (list, tuple):
+        raise TypeError(
+            "resolved_operation_ids must be an exact bounded list or tuple"
+        )
+    if len(resolved_operation_ids) > 64:
+        raise ValueError("resolved_operation_ids exceeds bound")
     resolved_ids = sorted(
         {
             _required_stability_text(value, "resolved operation id")
@@ -24508,6 +24947,7 @@ def resolve_runtime_safety_latch(
                 "latch": latch,
             }
         blockers = set(json.loads(latch["blocking_operation_ids_json"]))
+        recovery_rows = []
         if not blockers.issubset(set(resolved_ids)):
             conn.commit()
             return {
@@ -24546,13 +24986,25 @@ def resolve_runtime_safety_latch(
                 str(item["operation_id"]) for item in refresh_rows
             )
             recovery_rows = conn.execute(
-                f"SELECT epoch.blocker_id FROM runtime_recovery_epochs AS epoch "
-                f"JOIN runtime_recovery_passes AS pass "
-                f"ON pass.recovery_id=epoch.recovery_id "
+                f"SELECT epoch.*,pass.attempt_id FROM runtime_recovery_epochs AS epoch "
+                f"JOIN runtime_recovery_passes AS pass ON pass.recovery_id=epoch.recovery_id "
                 f"WHERE epoch.blocker_id IN ({placeholders}) "
-                f"AND epoch.latch_generation=?",
+                f"AND epoch.latch_generation=? AND pass.attempt_number=("
+                f"SELECT MAX(latest.attempt_number) FROM runtime_recovery_passes "
+                f"AS latest WHERE latest.recovery_id=epoch.recovery_id)",
                 (*tuple(sorted(blockers)), safe_expected_generation),
             ).fetchall()
+            lease_row = conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+            if recovery_rows and lease_row is None:
+                raise ValueError("runtime recovery lease authority is missing")
+            for recovery_row in recovery_rows:
+                _assert_runtime_recovery_lease(
+                    dict(recovery_row),
+                    dict(lease_row),
+                    require_unexpired_at=_stability_wall_clock(),
+                )
             resolved_by_journal.update(
                 str(item["blocker_id"]) for item in recovery_rows
             )
@@ -24597,6 +25049,19 @@ def resolve_runtime_safety_latch(
         result = conn.execute(
             "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
         ).fetchone()
+        if cursor.rowcount == 1:
+            for recovery_row in recovery_rows:
+                conn.execute(
+                    "INSERT INTO runtime_recovery_promotions "
+                    "(recovery_id,attempt_id,latch_generation,promoted_at) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        recovery_row["recovery_id"],
+                        recovery_row["attempt_id"],
+                        safe_expected_generation,
+                        when,
+                    ),
+                )
         conn.commit()
         result_dict = dict(result)
         transitioned = cursor.rowcount == 1
@@ -25828,6 +26293,10 @@ def unresolve_publication_outbox(
               AND claim_owner_run_id=? AND claim_token=?
               AND claim_generation=? AND row_version=?
               AND claim_expires_at>=?
+              AND recovery_generation=(
+                  SELECT generation FROM runtime_safety_latch
+                  WHERE singleton_id=1 AND state='resolved'
+              )
             """,
             (
                 error,
@@ -25972,6 +26441,10 @@ def retry_publication_outbox(
               AND claim_owner_run_id=? AND claim_token=?
               AND claim_generation=? AND row_version=?
               AND claim_expires_at>=?
+              AND recovery_generation=(
+                  SELECT generation FROM runtime_safety_latch
+                  WHERE singleton_id=1 AND state='resolved'
+              )
             """,
             (
                 retry,

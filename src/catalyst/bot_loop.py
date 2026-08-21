@@ -113,6 +113,11 @@ def _format_sage_cleanup_skip_summary(total: int, new: int, repeated: int) -> st
     )
 
 
+_RUNTIME_EFFECT_PHASES = frozenset(
+    {"cancel", "create", "publication", "coin_prep", "requote", "trim"}
+)
+
+
 def _normalize_coin_id_value(coin_id: object) -> str:
     cid = str(coin_id or "").strip().lower()
     if cid and not cid.startswith("0x"):
@@ -982,6 +987,24 @@ class BotLoop:
             },
         )
         return False
+
+    def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
+        """Re-sample continuity at every outer-cycle mutation phase boundary."""
+
+        if type(phase_name) is not str or phase_name not in _RUNTIME_EFFECT_PHASES:
+            return False
+        detector_fields = (
+            "_runtime_recovery_monotonic",
+            "_runtime_recovery_wall_clock",
+            "_runtime_recovery_gap_seconds",
+            "_runtime_recovery_skew_seconds",
+        )
+        if any(not hasattr(self, field) for field in detector_fields):
+            # A normally constructed running BotLoop always owns these fields.
+            # Keep isolated off-cycle utility calls compatible, but a partial
+            # object that claims to be in a running cycle must fail closed.
+            return not bool(getattr(self, "_cycle_started_running", False))
+        return self._runtime_recovery_cycle_boundary()
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -2047,6 +2070,8 @@ class BotLoop:
         is_full = self.risk_manager.is_full_halt()
 
         try:
+            if not self._enter_runtime_effect_phase("cancel"):
+                return
             if is_full:
                 # Price CB — cancel everything
                 log_event(
@@ -2897,6 +2922,8 @@ class BotLoop:
             )
 
             try:
+                if not self._enter_runtime_effect_phase("cancel"):
+                    return cancelled_by_side
                 results = self.offer_manager.cancel_offers(
                     sorted(live_ids),
                     reason="market_toxicity_guard",
@@ -4402,6 +4429,8 @@ class BotLoop:
                 _open = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
                 _active_buy = sum(1 for o in _open if o.get("side") == "buy")
                 _active_sell = sum(1 for o in _open if o.get("side") == "sell")
+                if not self._enter_runtime_effect_phase("coin_prep"):
+                    return
                 if self.coin_manager.start_topup(
                     _active_buy, _active_sell, is_drip=True
                 ):
@@ -6162,6 +6191,8 @@ class BotLoop:
                 f"({len(buys)} buy + {len(sells)} sell, reason={reason})",
             )
             try:
+                if not self._enter_runtime_effect_phase("cancel"):
+                    return 0
                 results = self.offer_manager.cancel_offers(
                     tids,
                     reason=reason,
@@ -8654,6 +8685,8 @@ class BotLoop:
                     f"offer(s) not tracked by probe state — cancelling",
                 )
                 try:
+                    if not self._enter_runtime_effect_phase("cancel"):
+                        return False
                     self.offer_manager.cancel_offers(
                         list(_orphan_snipes),
                         reason="sniper_orphan_sweep",
@@ -9087,6 +9120,8 @@ class BotLoop:
                 )
                 # skip_confirmation=True: expiry refreshes happen every cycle;
                 # blocking 60-90s for coins to return would stall the loop.
+                if not self._enter_runtime_effect_phase("cancel"):
+                    return False
                 cancel_result = self.offer_manager.cancel_offers(
                     expiring_tids, reason="pre_emptive_refresh", skip_confirmation=True
                 )
@@ -9161,6 +9196,8 @@ class BotLoop:
                 )
 
         # ---- Step 7c: Retry failed cancels (V1 parity) ----
+        if not self._enter_runtime_effect_phase("cancel"):
+            return False
         retried = self.offer_manager.retry_failed_cancels()
         if retried > 0:
             suffix = "" if retried == 1 else "s"
@@ -9244,6 +9281,8 @@ class BotLoop:
             # skip_confirmation=True: probe retirement is fire-and-forget.
             # The main ladder builds immediately after; waiting 60-90s for
             # coins to return from the probe cancel blocks the whole cycle.
+            if not self._enter_runtime_effect_phase("cancel"):
+                return False
             self.offer_manager.cancel_offers(
                 live_probe_ids,
                 reason=reason,
@@ -9760,6 +9799,8 @@ class BotLoop:
                             f"{[t[:16] + '...' for t in _orphan_tids]}",
                         )
                         try:
+                            if not self._enter_runtime_effect_phase("cancel"):
+                                return False
                             self.offer_manager.cancel_offers(
                                 list(_orphan_tids),
                                 reason="probe_orphan_cleanup",
@@ -9916,6 +9957,8 @@ class BotLoop:
                     _live_ids = (
                         current_buy_ids if eq_side == "buy" else current_sell_ids
                     )
+                    if not self._enter_runtime_effect_phase("requote"):
+                        return False
                     requote_result = self.offer_manager.requote_side(
                         eq_side,
                         requote_mid,
@@ -10093,6 +10136,8 @@ class BotLoop:
             try:
                 # skip_confirmation=True: sniper cleanup is routine maintenance;
                 # blocking 60-90s for coins freezes the cycle unnecessarily.
+                if not self._enter_runtime_effect_phase("cancel"):
+                    return False
                 self.offer_manager.cancel_offers(
                     snipe_ids_to_cancel, reason="sniper_cleanup", skip_confirmation=True
                 )
@@ -10319,6 +10364,8 @@ class BotLoop:
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
                     if _all_open:
+                        if not self._enter_runtime_effect_phase("cancel"):
+                            return False
                         self.offer_manager.cancel_offers(
                             _all_open, reason="reserve_floor_breached", force_storm=True
                         )
@@ -10384,6 +10431,8 @@ class BotLoop:
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
                     if _all_open:
+                        if not self._enter_runtime_effect_phase("cancel"):
+                            return False
                         self.offer_manager.cancel_offers(
                             _all_open, reason="reserve_floor_breached", force_storm=True
                         )
@@ -10501,6 +10550,8 @@ class BotLoop:
             _db_filtered_sells = [
                 o for o in open_sells if o.get("trade_id") in _db_open_sell_ids
             ]
+            if not self._enter_runtime_effect_phase("trim"):
+                return False
             trimmed = self.offer_manager.trim_excess_offers(
                 mid_price,
                 wallet_buys=_db_filtered_buys,
@@ -11175,6 +11226,8 @@ class BotLoop:
                         continue
 
                 _live_ids_req = current_buy_ids if side == "buy" else current_sell_ids
+                if not self._enter_runtime_effect_phase("requote"):
+                    return
                 requote_result = self.offer_manager.requote_side(
                     side,
                     requote_mid,
@@ -11442,6 +11495,8 @@ class BotLoop:
         skip_sell: bool = False,
     ):
         """Create new offers if we're below target count."""
+        if not self._enter_runtime_effect_phase("create"):
+            return False
         recovery_active = self._recovery_is_active()
 
         # Fix F: check if suspended slots can be unsuspended (coins available)
@@ -11875,6 +11930,8 @@ class BotLoop:
                 cat_asset_id=cfg.CAT_ASSET_ID,
                 live_offer_ids=_live_ids,
             )[:needed]
+            if not self._enter_runtime_effect_phase("create"):
+                return
             offers = self.offer_manager.create_ladder(
                 ladder_mid_price,
                 side,
@@ -12124,6 +12181,8 @@ class BotLoop:
 
     def _flush_public_offer_queues(self):
         """Flush public offer queues after reclaiming unsafe locked coins."""
+        if not self._enter_runtime_effect_phase("publication"):
+            return False
         self._set_cycle_step("step11_dexie_post")
 
         # Recovered wallet offers can be inserted before offer-to-coin linking
@@ -12161,6 +12220,8 @@ class BotLoop:
                 log_event(
                     "debug", "dexie_flush_start", f"Flushing {q_len} offers to Dexie..."
                 )
+            if not self._enter_runtime_effect_phase("publication"):
+                return False
             result = self.dexie_manager.flush_queue()
             if q_len > 0:
                 print(f" {result}", flush=True)
@@ -12186,6 +12247,8 @@ class BotLoop:
                         "splash_flush_start",
                         f"Submitting {splash_q} offers to local Splash node...",
                     )
+                if not self._enter_runtime_effect_phase("publication"):
+                    return False
                 result = self.splash_manager.flush_queue()
                 if splash_q > 0:
                     print(f" {result}", flush=True)
@@ -12259,6 +12322,8 @@ class BotLoop:
             data={"trade_ids": trade_ids, "flagged": flagged[:10]},
         )
         try:
+            if not self._enter_runtime_effect_phase("cancel"):
+                return False
             self.offer_manager.cancel_offers(
                 trade_ids,
                 reason="oversized_coin_reclaim",
@@ -12282,6 +12347,8 @@ class BotLoop:
         2. needs_topup() — FREE coins low → lightweight split
         3. check_runtime_health() — every 5 loops, independent free coin check
         """
+        if not self._enter_runtime_effect_phase("coin_prep"):
+            return False
         if self._reclaim_oversized_locked_offers():
             return
 
@@ -12306,6 +12373,8 @@ class BotLoop:
                     "Coins critically low during recovery — forcing runtime top-up "
                     "to break coin-exhaustion deadlock",
                 )
+                if not self._enter_runtime_effect_phase("coin_prep"):
+                    return False
                 self.coin_manager.start_topup(
                     active_buy_count, active_sell_count, is_drip=False
                 )
@@ -12316,6 +12385,8 @@ class BotLoop:
                     "Tier coin shortage during recovery — running topup to "
                     "restore genuinely low spare pools",
                 )
+                if not self._enter_runtime_effect_phase("coin_prep"):
+                    return False
                 self.coin_manager.start_topup(active_buy_count, active_sell_count)
             else:
                 log_event(
@@ -12529,6 +12600,8 @@ class BotLoop:
                 "coin_prep_trigger",
                 "TOTAL coins critically low — starting auto coin top-up",
             )
+            if not self._enter_runtime_effect_phase("coin_prep"):
+                return False
             self.coin_manager.start_topup(
                 active_buy_count, active_sell_count, is_drip=False
             )
@@ -12561,6 +12634,8 @@ class BotLoop:
                 "topup_trigger",
                 "Starting coin top-up to replenish free coins (existing offers stay active)...",
             )
+            if not self._enter_runtime_effect_phase("coin_prep"):
+                return False
             self.coin_manager.start_topup(active_buy_count, active_sell_count)
             return
 
@@ -12571,6 +12646,8 @@ class BotLoop:
                 "health_topup_trigger",
                 "Runtime health check triggered coin top-up",
             )
+            if not self._enter_runtime_effect_phase("coin_prep"):
+                return False
             self.coin_manager.start_topup(
                 active_buy_count, active_sell_count, is_drip=False
             )
