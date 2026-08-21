@@ -7737,26 +7737,24 @@ class BotLoop:
         """Rebuild bounded protection/buffer state from immutable effects."""
 
         try:
-            from database import (
-                get_authoritative_sweep_downstream_effects,
-                get_authoritative_sweep_safety_state,
-            )
+            from database import authoritative_sweep_downstream_restore_authority
         except ImportError:
             # Narrow compatibility contexts can provide a deliberately partial
             # database double. Production database.py always exposes both APIs.
             return False
 
         try:
-            effects = get_authoritative_sweep_downstream_effects(limit=20)
-            safety_state = get_authoritative_sweep_safety_state()
-            for effect in effects:
-                self._apply_authoritative_sweep_downstream_effect(effect)
-            for state in safety_state:
-                side = state["side"]
-                expiry = self._sweep_timestamp_epoch(state["expires_at"])
-                self._sweep_protection[side] = max(
-                    float(self._sweep_protection.get(side, 0.0)), expiry
-                )
+            with authoritative_sweep_downstream_restore_authority(
+                limit=20
+            ) as restoration:
+                for effect in restoration.effects:
+                    self._apply_authoritative_sweep_downstream_effect(effect)
+                for state in restoration.safety_state:
+                    side = state["side"]
+                    expiry = self._sweep_timestamp_epoch(state["expires_at"])
+                    self._sweep_protection[side] = max(
+                        float(self._sweep_protection.get(side, 0.0)), expiry
+                    )
             return True
         except Exception as exc:
             # Missing or corrupt restart evidence must pause both sides.  An
@@ -7779,7 +7777,6 @@ class BotLoop:
 
         from database import (
             authoritative_sweep_process_effect_authority,
-            consume_authoritative_sweep_event,
             materialize_authoritative_sweep_downstream_effect,
         )
         from sweep_coordinator import get_coordinator
@@ -7812,14 +7809,10 @@ class BotLoop:
                     event.event_id,
                     event.claim_token,
                     event.claim_generation,
-                ):
+                ) as effect_authority:
                     self._apply_authoritative_sweep_downstream_effect(effect)
-                if consume_authoritative_sweep_event(
-                    event.event_id,
-                    event.claim_token,
-                    event.claim_generation,
-                ):
-                    applied_count += 1
+                    if effect_authority.consume():
+                        applied_count += 1
             except Exception:
                 continue
         try:

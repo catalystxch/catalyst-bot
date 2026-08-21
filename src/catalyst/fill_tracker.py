@@ -644,11 +644,10 @@ class FillTracker:
         Each entry in ``_pending_reverify`` was a disappeared offer whose
         available provider evidence was inconclusive. Here we retry:
           - "filled" → record fill, clear entry.
-          - "rejected" → retire (expired if local clock says so, else
-            cancelled), clear entry.
+          - "rejected" → retain the row and coin lock for authoritative
+            source-truth reconciliation.
           - "unverified" → increment attempts; if the budget is exhausted,
-            retire conservatively and alert the operator with enough info
-            to resolve manually.
+            retain the row and coin lock and alert the operator.
         """
         out = {"buy_fills": [], "sell_fills": []}
         if not self._pending_reverify:

@@ -7939,7 +7939,7 @@ class _WalletEffectClaimProcessAuthority:
         "authority",
         "authority_json",
         "authority_sha256",
-        "authority_identity_sha256",
+        "authority_subject_sha256",
         "wallet_fingerprint_hash",
         "network",
         "operation_id",
@@ -7958,17 +7958,175 @@ class _WalletEffectDispatchCapability:
         self.dispatch_token = dispatch_token
 
 
+class _WalletEffectAdapterFacadeCapability:
+    __slots__ = ()
+
+
+class _WalletEffectAdapterOutcomeAttestation:
+    __slots__ = (
+        "dispatch_capability",
+        "dispatch_token",
+        "adapter_operation",
+        "wallet_operation",
+        "wallet_authority_sha256",
+        "effect_attempted",
+        "_sealed",
+    )
+
+    def __init__(
+        self,
+        dispatch_capability: _WalletEffectDispatchCapability,
+        adapter_operation: str,
+        wallet_operation: str,
+        wallet_authority_sha256: str,
+        effect_attempted: bool,
+    ):
+        object.__setattr__(self, "dispatch_capability", dispatch_capability)
+        object.__setattr__(self, "dispatch_token", dispatch_capability.dispatch_token)
+        object.__setattr__(self, "adapter_operation", adapter_operation)
+        object.__setattr__(self, "wallet_operation", wallet_operation)
+        object.__setattr__(self, "wallet_authority_sha256", wallet_authority_sha256)
+        object.__setattr__(self, "effect_attempted", effect_attempted)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("wallet effect adapter outcome is immutable")
+        object.__setattr__(self, _name, _value)
+
+
+class _WalletEffectAdapterDispatchContext:
+    __slots__ = ("dispatch_capability", "process_authority", "active")
+
+
 _wallet_effect_process_authorities_lock = threading.RLock()
 _wallet_effect_process_authorities: Dict[str, _WalletEffectClaimProcessAuthority] = {}
+_wallet_effect_adapter_attestations: Dict[
+    int, _WalletEffectAdapterOutcomeAttestation
+] = {}
+_wallet_effect_adapter_dispatch_local = threading.local()
 
 
-def _wallet_effect_authority_identity_sha256(authority: Dict[str, Any]) -> str:
+def _wallet_effect_authority_subject_sha256(authority: Dict[str, Any]) -> str:
     identity = dict(authority)
     identity.pop("lease_version", None)
     encoded = json.dumps(
         identity, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_wallet_effect_adapter_attestation_api():
+    facade_capability = _WalletEffectAdapterFacadeCapability()
+    claimed = False
+
+    def take_facade_authority() -> Optional[object]:
+        """Hand the opaque issuer to wallet.py exactly once per process."""
+
+        nonlocal claimed
+        with _wallet_effect_process_authorities_lock:
+            if claimed:
+                return None
+            claimed = True
+            return facade_capability
+
+    def issue_outcome_attestation(
+        supplied_capability: Any,
+        *,
+        wallet_operation: Any,
+        wallet_authority: Any,
+        effect_attempted: Any,
+    ) -> Optional[object]:
+        """Issue one opaque outcome only inside the exact outer dispatch context."""
+
+        context = getattr(_wallet_effect_adapter_dispatch_local, "current", None)
+        if (
+            supplied_capability is not facade_capability
+            or type(context) is not _WalletEffectAdapterDispatchContext
+            or not context.active
+            or type(wallet_operation) is not str
+            or not wallet_operation.startswith("wallet:")
+            or type(effect_attempted) is not bool
+            or type(wallet_authority) is not dict
+        ):
+            return None
+        state = context.process_authority
+        exact_authority = dict(wallet_authority)
+        if (
+            _wallet_effect_authority_subject_sha256(exact_authority)
+            != state.authority_subject_sha256
+        ):
+            return None
+        authority_json = _canonical_json_text(
+            exact_authority, "wallet adapter outcome authority", expected_type=dict
+        )
+        attestation = _WalletEffectAdapterOutcomeAttestation(
+            context.dispatch_capability,
+            state.operation_id,
+            wallet_operation,
+            hashlib.sha256(authority_json.encode("utf-8")).hexdigest(),
+            effect_attempted,
+        )
+        with _wallet_effect_process_authorities_lock:
+            _wallet_effect_adapter_attestations[id(attestation)] = attestation
+        return attestation
+
+    return take_facade_authority, issue_outcome_attestation
+
+
+(
+    _take_wallet_effect_adapter_facade_authority,
+    _issue_wallet_effect_adapter_outcome_attestation,
+) = _build_wallet_effect_adapter_attestation_api()
+del _build_wallet_effect_adapter_attestation_api
+
+
+@contextmanager
+def wallet_effect_adapter_dispatch_authority(capability: Any):
+    """Bind exactly one outer dispatch to the wallet facade on this thread."""
+
+    if type(capability) is not _WalletEffectDispatchCapability:
+        raise ValueError("wallet effect dispatch capability is invalid")
+    with _wallet_effect_process_authorities_lock:
+        state = _wallet_effect_process_authorities.get(capability.claim_token)
+    if (
+        type(state) is not _WalletEffectClaimProcessAuthority
+        or state.generation != capability.generation
+        or state.dispatch_token != capability.dispatch_token
+    ):
+        raise ValueError("wallet effect dispatch capability is not current")
+    if getattr(_wallet_effect_adapter_dispatch_local, "current", None) is not None:
+        raise RuntimeError("wallet effect adapter dispatch context is already active")
+    context = _WalletEffectAdapterDispatchContext()
+    context.dispatch_capability = capability
+    context.process_authority = state
+    context.active = True
+    _wallet_effect_adapter_dispatch_local.current = context
+    try:
+        yield capability
+    finally:
+        context.active = False
+        _wallet_effect_adapter_dispatch_local.current = None
+
+
+def _consume_wallet_effect_adapter_outcome_attestation(
+    capability: _WalletEffectDispatchCapability,
+    state: _WalletEffectClaimProcessAuthority,
+    attestation: Any,
+) -> Optional[_WalletEffectAdapterOutcomeAttestation]:
+    if type(attestation) is not _WalletEffectAdapterOutcomeAttestation:
+        return None
+    with _wallet_effect_process_authorities_lock:
+        registered = _wallet_effect_adapter_attestations.get(id(attestation))
+        if (
+            registered is not attestation
+            or attestation.dispatch_capability is not capability
+            or attestation.dispatch_token != capability.dispatch_token
+            or attestation.adapter_operation != state.operation_id
+        ):
+            return None
+        _wallet_effect_adapter_attestations.pop(id(attestation), None)
+    return attestation
 
 
 def _acquire_wallet_effect_process_authority(
@@ -8011,7 +8169,7 @@ def _acquire_wallet_effect_process_authority(
         state.authority = authority
         state.authority_json = authority_json
         state.authority_sha256 = authority_sha
-        state.authority_identity_sha256 = _wallet_effect_authority_identity_sha256(
+        state.authority_subject_sha256 = _wallet_effect_authority_subject_sha256(
             authority
         )
         state.wallet_fingerprint_hash = authority["wallet_fingerprint_hash"]
@@ -8384,13 +8542,16 @@ def complete_wallet_effect_dispatch(
         or state.dispatch_token != capability.dispatch_token
     ):
         raise ValueError("wallet effect dispatch capability is not current")
-    marker_matches = bool(
-        type(result) is dict
-        and result.get("_catalyst_wallet_authority_sha256")
-        == state.authority_identity_sha256
+    opaque_attestation = (
+        result.pop("_catalyst_wallet_effect_attestation", None)
+        if type(result) is dict
+        else None
+    )
+    adapter_outcome = _consume_wallet_effect_adapter_outcome_attestation(
+        capability, state, opaque_attestation
     )
     attempted = (
-        result.get("_catalyst_effect_attempted") if type(result) is dict else None
+        adapter_outcome.effect_attempted if adapter_outcome is not None else None
     )
     if exception is not None:
         outcome = "UNKNOWN"
@@ -8399,7 +8560,7 @@ def complete_wallet_effect_dispatch(
             "reason_code": "ADAPTER_EXCEPTION_UNKNOWN",
             "exception_type": type(exception).__name__,
         }
-    elif marker_matches and attempted is False:
+    elif adapter_outcome is not None and attempted is False:
         outcome = "RELEASED_NO_EFFECT"
         evidence = {
             "effect_attempted": False,
@@ -8407,7 +8568,7 @@ def complete_wallet_effect_dispatch(
             "result_type": type(result).__name__,
         }
     elif (
-        marker_matches
+        adapter_outcome is not None
         and attempted is True
         and (
             result.get("success") is True
@@ -13586,6 +13747,31 @@ def claim_authoritative_sweep_event() -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+class _AuthoritativeSweepProcessEffectCapability:
+    __slots__ = (
+        "_conn",
+        "event_id",
+        "claim_token",
+        "claim_generation",
+        "event",
+        "active",
+        "acknowledged",
+    )
+
+    def consume(self) -> bool:
+        if not self.active:
+            raise ValueError("sweep process effect capability is not active")
+        acknowledged = _consume_authoritative_sweep_event_on_connection(
+            self._conn,
+            self.event_id,
+            self.claim_token,
+            self.claim_generation,
+            _stability_wall_clock(),
+        )
+        self.acknowledged = True
+        return acknowledged
+
+
 @contextmanager
 def authoritative_sweep_process_effect_authority(
     event_id: Any, claim_token: Any, claim_generation: Any
@@ -13603,16 +13789,40 @@ def authoritative_sweep_process_effect_authority(
         event = _require_current_authoritative_sweep_delivery_claim(
             conn, safe_event_id, safe_token, safe_generation
         )
-        yield event
-        _require_current_authoritative_sweep_delivery_claim(
-            conn, safe_event_id, safe_token, safe_generation
-        )
+        capability = _AuthoritativeSweepProcessEffectCapability()
+        capability._conn = conn
+        capability.event_id = safe_event_id
+        capability.claim_token = safe_token
+        capability.claim_generation = safe_generation
+        capability.event = event
+        capability.active = True
+        capability.acknowledged = False
+        yield capability
+        if capability.acknowledged:
+            current_event = _load_authoritative_sweep_event(conn, safe_event_id)
+            _require_authoritative_sweep_event_binding(conn, current_event)
+            _require_authoritative_sweep_claim_attestation(
+                conn, current_event, safe_token, safe_generation
+            )
+            ack = conn.execute(
+                "SELECT 1 FROM offer_fill_sweep_delivery_acks "
+                "WHERE event_id=? AND claim_token=? AND claim_generation=?",
+                (safe_event_id, safe_token, safe_generation),
+            ).fetchone()
+            if ack is None:
+                raise RuntimeError("sweep process effect acknowledgement is missing")
+        else:
+            _require_current_authoritative_sweep_delivery_claim(
+                conn, safe_event_id, safe_token, safe_generation
+            )
         conn.commit()
     except BaseException:
         if conn.in_transaction:
             conn.rollback()
         raise
     finally:
+        if "capability" in locals():
+            capability.active = False
         conn.close()
 
 
@@ -13896,6 +14106,38 @@ def materialize_authoritative_sweep_downstream_effect(
         conn.close()
 
 
+def _load_authoritative_sweep_downstream_effects_on_connection(
+    conn: sqlite3.Connection, safe_limit: int
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT effect.event_id, effect.effect_json, effect.effect_sha256, "
+        "       event.spent_block_index, event.sweep_group_id, event.event_json "
+        "FROM offer_fill_sweep_downstream_effects AS effect "
+        "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+        "ORDER BY effect.applied_at DESC, effect.event_id LIMIT ?",
+        (safe_limit,),
+    ).fetchall()
+    effects: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        event_id = str(row["event_id"])
+        try:
+            event = _canonical_authoritative_sweep_event_row(row)
+            _require_authoritative_sweep_event_binding(conn, event)
+            decoded = json.loads(str(row["effect_json"]))
+            payload, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                decoded, event
+            )
+            if encoded != str(row["effect_json"]) or digest != str(
+                row["effect_sha256"]
+            ):
+                raise ValueError("sweep downstream effect digest differs")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            _block_authoritative_sweep_event_id_loss(conn, event_id)
+            raise RuntimeError("stored sweep downstream effect is invalid") from exc
+        effects.append(payload)
+    return effects
+
+
 def get_authoritative_sweep_downstream_effects(limit: int = 20) -> List[Dict[str, Any]]:
     """Return only the newest bounded durable process effects via an index."""
 
@@ -13905,41 +14147,75 @@ def get_authoritative_sweep_downstream_effects(limit: int = 20) -> List[Dict[str
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            "SELECT effect.event_id, effect.effect_json, effect.effect_sha256, "
-            "       event.spent_block_index, event.sweep_group_id, event.event_json "
-            "FROM offer_fill_sweep_downstream_effects AS effect "
-            "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
-            "ORDER BY effect.applied_at DESC, effect.event_id LIMIT ?",
-            (safe_limit,),
-        ).fetchall()
-        effects: List[Dict[str, Any]] = []
-        for row in reversed(rows):
-            event_id = str(row["event_id"])
-            try:
-                event = _canonical_authoritative_sweep_event_row(row)
-                _require_authoritative_sweep_event_binding(conn, event)
-                decoded = json.loads(str(row["effect_json"]))
-                payload, encoded, digest = (
-                    _canonical_authoritative_sweep_downstream_effect(decoded, event)
-                )
-                if encoded != str(row["effect_json"]) or digest != str(
-                    row["effect_sha256"]
-                ):
-                    raise ValueError("sweep downstream effect digest differs")
-            except (RuntimeError, TypeError, ValueError) as exc:
-                _block_authoritative_sweep_event_id_loss(conn, event_id)
-                conn.commit()
-                raise RuntimeError("stored sweep downstream effect is invalid") from exc
-            effects.append(payload)
+        effects = _load_authoritative_sweep_downstream_effects_on_connection(
+            conn, safe_limit
+        )
         conn.commit()
         return effects
-    except Exception:
+    except Exception as exc:
         if conn.in_transaction:
-            conn.rollback()
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "stored sweep downstream effect"
+            ):
+                conn.commit()
+            else:
+                conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _load_authoritative_sweep_safety_state_on_connection(
+    conn: sqlite3.Connection,
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT safety.side, safety.event_id, safety.expires_at, "
+        "       safety.effect_at, effect.effect_json, effect.effect_sha256, "
+        "       event.spent_block_index, event.sweep_group_id, event.event_json "
+        "FROM offer_fill_sweep_safety_state AS safety "
+        "JOIN offer_fill_sweep_downstream_effects AS effect "
+        "  ON effect.event_id=safety.event_id "
+        "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
+        "ORDER BY safety.side LIMIT 3"
+    ).fetchall()
+    if len(rows) > 2:
+        raise RuntimeError("authoritative sweep safety state exceeds two sides")
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        event_id = str(row["event_id"])
+        try:
+            event = _canonical_authoritative_sweep_event_row(row)
+            _require_authoritative_sweep_event_binding(conn, event)
+            decoded = json.loads(str(row["effect_json"]))
+            effect, encoded, digest = _canonical_authoritative_sweep_downstream_effect(
+                decoded, event
+            )
+            side = str(row["side"])
+            matching = [
+                protected
+                for protected in effect["protected_sides"]
+                if protected["side"] == side
+            ]
+            if (
+                encoded != str(row["effect_json"])
+                or digest != str(row["effect_sha256"])
+                or len(matching) != 1
+                or matching[0]["expires_at"] != str(row["expires_at"])
+                or effect["effect_at"] != str(row["effect_at"])
+            ):
+                raise ValueError("sweep safety materialization differs")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            _block_authoritative_sweep_event_id_loss(conn, event_id)
+            raise RuntimeError("stored sweep safety state is invalid") from exc
+        result.append(
+            {
+                "side": side,
+                "event_id": event_id,
+                "expires_at": str(row["expires_at"]),
+                "effect_at": str(row["effect_at"]),
+            }
+        )
+    return result
 
 
 def get_authoritative_sweep_safety_state() -> List[Dict[str, Any]]:
@@ -13948,62 +14224,137 @@ def get_authoritative_sweep_safety_state() -> List[Dict[str, Any]]:
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            "SELECT safety.side, safety.event_id, safety.expires_at, "
-            "       safety.effect_at, effect.effect_json, effect.effect_sha256, "
-            "       event.spent_block_index, event.sweep_group_id, event.event_json "
-            "FROM offer_fill_sweep_safety_state AS safety "
-            "JOIN offer_fill_sweep_downstream_effects AS effect "
-            "  ON effect.event_id=safety.event_id "
-            "JOIN offer_fill_sweep_events AS event ON event.event_id=effect.event_id "
-            "ORDER BY safety.side LIMIT 3"
-        ).fetchall()
-        if len(rows) > 2:
-            raise RuntimeError("authoritative sweep safety state exceeds two sides")
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            event_id = str(row["event_id"])
-            try:
-                event = _canonical_authoritative_sweep_event_row(row)
-                _require_authoritative_sweep_event_binding(conn, event)
-                decoded = json.loads(str(row["effect_json"]))
-                effect, encoded, digest = (
-                    _canonical_authoritative_sweep_downstream_effect(decoded, event)
-                )
-                side = str(row["side"])
-                matching = [
-                    protected
-                    for protected in effect["protected_sides"]
-                    if protected["side"] == side
-                ]
-                if (
-                    encoded != str(row["effect_json"])
-                    or digest != str(row["effect_sha256"])
-                    or len(matching) != 1
-                    or matching[0]["expires_at"] != str(row["expires_at"])
-                    or effect["effect_at"] != str(row["effect_at"])
-                ):
-                    raise ValueError("sweep safety materialization differs")
-            except (RuntimeError, TypeError, ValueError) as exc:
-                _block_authoritative_sweep_event_id_loss(conn, event_id)
-                conn.commit()
-                raise RuntimeError("stored sweep safety state is invalid") from exc
-            result.append(
-                {
-                    "side": side,
-                    "event_id": event_id,
-                    "expires_at": str(row["expires_at"]),
-                    "effect_at": str(row["effect_at"]),
-                }
-            )
+        result = _load_authoritative_sweep_safety_state_on_connection(conn)
         conn.commit()
         return result
-    except Exception:
+    except Exception as exc:
         if conn.in_transaction:
-            conn.rollback()
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "stored sweep safety state"
+            ):
+                conn.commit()
+            else:
+                conn.rollback()
         raise
     finally:
         conn.close()
+
+
+class _AuthoritativeSweepDownstreamRestoreCapability:
+    __slots__ = ("effects", "safety_state", "active")
+
+
+@contextmanager
+def authoritative_sweep_downstream_restore_authority(limit: int = 20):
+    """Hold one durable authority boundary through restart process mutation."""
+
+    safe_limit = _exact_integer(limit, "sweep downstream effect limit", minimum=1)
+    if safe_limit > 20:
+        raise ValueError("sweep downstream effect limit exceeds 20")
+    conn = _stability_connection()
+    phase = "load"
+    capability = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        effects = _load_authoritative_sweep_downstream_effects_on_connection(
+            conn, safe_limit
+        )
+        safety_state = _load_authoritative_sweep_safety_state_on_connection(conn)
+        original = _canonical_json_text(
+            {"effects": effects, "safety_state": safety_state},
+            "sweep downstream restore snapshot",
+            expected_type=dict,
+            max_bytes=4 * 1024 * 1024,
+        )
+        capability = _AuthoritativeSweepDownstreamRestoreCapability()
+        capability.effects = effects
+        capability.safety_state = safety_state
+        capability.active = True
+        phase = "apply"
+        yield capability
+        phase = "revalidate"
+        reloaded_effects = _load_authoritative_sweep_downstream_effects_on_connection(
+            conn, safe_limit
+        )
+        reloaded_safety = _load_authoritative_sweep_safety_state_on_connection(conn)
+        reloaded = _canonical_json_text(
+            {"effects": reloaded_effects, "safety_state": reloaded_safety},
+            "sweep downstream restore snapshot",
+            expected_type=dict,
+            max_bytes=4 * 1024 * 1024,
+        )
+        if reloaded != original:
+            raise RuntimeError(
+                "sweep downstream restore authority changed during apply"
+            )
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            if phase in {"load", "revalidate"}:
+                conn.commit()
+            else:
+                conn.rollback()
+        raise
+    finally:
+        if capability is not None:
+            capability.active = False
+        conn.close()
+
+
+def _consume_authoritative_sweep_event_on_connection(
+    conn: sqlite3.Connection,
+    event_id: str,
+    claim_token: str,
+    claim_generation: int,
+    consumed_at: str,
+) -> bool:
+    """Acknowledge an active delivery without leaving its caller's transaction."""
+
+    _require_current_authoritative_sweep_delivery_claim(
+        conn, event_id, claim_token, claim_generation
+    )
+    if (
+        conn.execute(
+            "SELECT 1 FROM offer_fill_sweep_downstream_effects WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        is None
+    ):
+        raise ValueError("sweep downstream effect is not durably materialized")
+    prior_receipt = conn.execute(
+        "SELECT consumed_at FROM offer_fill_sweep_event_receipts WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    if prior_receipt is not None and (
+        conn.execute(
+            "SELECT 1 FROM offer_fill_sweep_migration_audit "
+            "WHERE event_id=? "
+            "AND reason_code='LEGACY_RECEIPT_MISSING_DOWNSTREAM_ACK'",
+            (event_id,),
+        ).fetchone()
+        is None
+    ):
+        raise ValueError("sweep event receipt lacks a migration audit")
+    conn.execute(
+        "INSERT OR IGNORE INTO offer_fill_sweep_event_receipts "
+        "(event_id, consumed_at) VALUES (?, ?)",
+        (event_id, consumed_at),
+    )
+    conn.execute(
+        "INSERT INTO offer_fill_sweep_delivery_acks "
+        "(event_id, claim_generation, claim_token, consumed_at) "
+        "VALUES (?, ?, ?, ?)",
+        (event_id, claim_generation, claim_token, consumed_at),
+    )
+    cursor = conn.execute(
+        "UPDATE offer_fill_sweep_delivery_queue SET state='completed', "
+        "completed_at=? WHERE event_id=? AND state='running' "
+        "AND claim_token=? AND generation=?",
+        (consumed_at, event_id, claim_token, claim_generation),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("sweep delivery acknowledgement compare-and-set failed")
+    return True
 
 
 def consume_authoritative_sweep_event(

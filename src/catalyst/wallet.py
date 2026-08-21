@@ -27,6 +27,10 @@ from dotenv import load_dotenv
 from config import cfg
 import mutation_gate
 from cancel_outcomes import CANCEL_UNKNOWN, cancellation_result
+from database import (
+    _issue_wallet_effect_adapter_outcome_attestation,
+    _take_wallet_effect_adapter_facade_authority,
+)
 
 load_dotenv()
 
@@ -962,19 +966,28 @@ def validate_runtime_target_fingerprint(target) -> dict:
         return _blocked_mutation("WALLET_IDENTITY_MALFORMED")
 
 
-def _run_wallet_mutation(export_name: str, *args, **kwargs):
+def _run_wallet_mutation_with_authority(
+    facade_authority: object, export_name: str, *args, **kwargs
+):
     operation = f"wallet:{export_name}"
     permit = None
     effect_attempted = False
-    authority_identity_sha256 = None
+    wallet_authority = None
 
     def authoritative_result(value):
         if type(value) is not dict:
             value = _blocked_mutation("WALLET_MUTATION_FAILED")
         value = dict(value)
         value["_catalyst_effect_attempted"] = effect_attempted
-        if authority_identity_sha256 is not None:
-            value["_catalyst_wallet_authority_sha256"] = authority_identity_sha256
+        if wallet_authority is not None:
+            attestation = _issue_wallet_effect_adapter_outcome_attestation(
+                facade_authority,
+                wallet_operation=operation,
+                wallet_authority=wallet_authority,
+                effect_attempted=effect_attempted,
+            )
+            if attestation is not None:
+                value["_catalyst_wallet_effect_attestation"] = attestation
         return value
 
     try:
@@ -986,23 +999,14 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
             raise mutation_gate.MutationBlocked(
                 "WALLET_IDENTITY_BINDING_INVALID", operation
             )
-        authority = mutation_gate.wallet_mutation_permit_journal_authority(
+        wallet_authority = mutation_gate.wallet_mutation_permit_journal_authority(
             permit, f"{operation}:authority"
         )
-        authority = dict(authority)
-        authority["wallet_fingerprint_hash"] = mutation_gate.wallet_fingerprint_hash(
-            binding.fingerprint
+        wallet_authority = dict(wallet_authority)
+        wallet_authority["wallet_fingerprint_hash"] = (
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
         )
-        authority["network"] = binding.network_id
-        authority.pop("lease_version", None)
-        authority_identity_sha256 = hashlib.sha256(
-            json.dumps(
-                authority,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        wallet_authority["network"] = binding.network_id
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
         snapshot = _identity_from_adapter(adapter)
         mutation_gate.require_wallet_mutation_permit_authority(
@@ -1038,6 +1042,9 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
         )
         effect_attempted = True
         result = callback(*args, **kwargs)
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:outcome"
+        )
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if callable(close):
@@ -1063,6 +1070,22 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
                 mutation_gate.exit_wallet_mutation(permit)
             except BaseException:
                 pass
+
+
+def _build_wallet_mutation_runner(facade_authority: object):
+    def run_wallet_mutation(export_name: str, *args, **kwargs):
+        return _run_wallet_mutation_with_authority(
+            facade_authority, export_name, *args, **kwargs
+        )
+
+    return run_wallet_mutation
+
+
+_run_wallet_mutation = _build_wallet_mutation_runner(
+    _take_wallet_effect_adapter_facade_authority()
+)
+del _build_wallet_mutation_runner
+del _take_wallet_effect_adapter_facade_authority
 
 
 def get_wallet_balance(wallet_id: int):

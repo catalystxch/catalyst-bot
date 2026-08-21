@@ -244,6 +244,7 @@ try:
         claim_wallet_effect,
         complete_wallet_effect_dispatch,
         retain_wallet_effect_claim_for_reconciliation,
+        wallet_effect_adapter_dispatch_authority,
         wallet_effect_claim_is_current,
     )
 
@@ -993,10 +994,13 @@ class CoinPrepWorker:
             )
             return None
         try:
-            if not getattr(self, "_is_subprocess", False):
-                result = callback(*args, **kwargs)
-            else:
-                result = _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+            with wallet_effect_adapter_dispatch_authority(dispatch):
+                if not getattr(self, "_is_subprocess", False):
+                    result = callback(*args, **kwargs)
+                else:
+                    result = _guarded_wallet_mutation(
+                        operation, callback, *args, **kwargs
+                    )
         except Exception as exc:
             complete_wallet_effect_dispatch(dispatch, exception=exc)
             raise

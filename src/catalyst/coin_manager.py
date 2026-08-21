@@ -43,6 +43,7 @@ from database import (
     complete_wallet_effect_dispatch,
     log_event,
     retain_wallet_effect_claim_for_reconciliation,
+    wallet_effect_adapter_dispatch_authority,
     wallet_effect_claim_is_current,
 )
 
@@ -177,7 +178,8 @@ def _run_claimed_wallet_effect(
             claim = None
     if claim is not None:
         try:
-            result = callback()
+            with wallet_effect_adapter_dispatch_authority(dispatch):
+                result = callback()
         except Exception as exc:
             complete_wallet_effect_dispatch(dispatch, exception=exc)
             raise

@@ -8,6 +8,7 @@ import json
 import socket
 import sqlite3
 import threading
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -70,7 +71,11 @@ def active_wallet_effect_runtime(isolated_database):
         bound_at_utc="2026-08-20T11:59:59.000000Z",
         maximum_age_seconds=15,
     )
-    adapter = object()
+
+    class WalletAdapterDouble:
+        pass
+
+    adapter = WalletAdapterDouble()
     runtime = mutation_gate.MutationGate(
         run_id="task9-wallet-effect-owner",
         owner_pid=4242,
@@ -112,13 +117,44 @@ def _wallet_effect_result_marker(claim_token: str, *, attempted: bool) -> dict:
     )
     assert row is not None
     authority = json.loads(str(row["authority_json"]))
+    authority.pop("lease_version", None)
     return {
         "success": False,
         "_catalyst_effect_attempted": attempted,
-        "_catalyst_wallet_authority_sha256": (
-            database._wallet_effect_authority_identity_sha256(authority)
-        ),
+        "_catalyst_wallet_authority_sha256": _canonical_digest(authority),
     }
+
+
+def _wallet_effect_real_facade_result(
+    runtime, monkeypatch, *, attempted: bool, success: bool = False
+) -> dict:
+    import mutation_gate
+    import wallet
+
+    adapter = runtime._wallet_adapter_authority
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    if attempted:
+        monkeypatch.setattr(wallet, "_identity_from_adapter", lambda _adapter: {})
+        monkeypatch.setattr(
+            mutation_gate,
+            "require_fresh_wallet_identity",
+            lambda _binding, _snapshot, _operation: None,
+        )
+        monkeypatch.setattr(
+            adapter,
+            "test_effect_adapter",
+            lambda: {"success": success},
+            raising=False,
+        )
+    else:
+
+        def blocked_identity(_adapter):
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_CHANGED", "wallet:test_effect_adapter"
+            )
+
+        monkeypatch.setattr(wallet, "_identity_from_adapter", blocked_identity)
+    return wallet._run_wallet_mutation("test_effect_adapter")
 
 
 def _seed_authoritative_fill(
@@ -981,7 +1017,9 @@ def test_authority_projections_are_indexed_and_migration_is_hard_bounded(
 
 def test_wallet_effect_claim_root_materializes_exact_indexed_coin_cohort(
     active_wallet_effect_runtime,
+    monkeypatch,
 ):
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
     source_id = hashlib.sha256(b"claim-trigger-source").hexdigest()
     fee_id = hashlib.sha256(b"claim-trigger-fee").hexdigest()
     assert database.upsert_coin(source_id, "xch", 1000, tier="none")
@@ -1014,12 +1052,261 @@ def test_wallet_effect_claim_root_materializes_exact_indexed_coin_cohort(
         fee_coin_ids=[fee_id],
     )
     assert dispatch is not None
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        no_effect_result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=False
+        )
     assert (
         database.complete_wallet_effect_dispatch(
             dispatch,
-            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+            result=no_effect_result,
         )
         == "RELEASED_NO_EFFECT"
+    )
+
+
+def test_persisted_wallet_authority_marker_cannot_release_effect_claim(
+    active_wallet_effect_runtime,
+):
+    source_coin_id = hashlib.sha256(b"persisted-marker-forgery").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.split_sage",
+        source_coin_ids=[source_coin_id],
+    )
+    assert claim is not None
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[source_coin_id],
+    )
+    assert dispatch is not None
+
+    # Every field below is reconstructed from durable rows.  No caller-authored
+    # serialization may prove that the wallet facade returned before an effect.
+    forged = _wallet_effect_result_marker(claim["claim_token"], attempted=False)
+    assert (
+        database.complete_wallet_effect_dispatch(dispatch, result=forged) == "UNKNOWN"
+    )
+    assert (
+        database.get_connection()
+        .execute(
+            "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (claim["claim_token"],),
+        )
+        .fetchone()[0]
+        == "UNKNOWN"
+    )
+
+
+def test_wallet_facade_attestation_issuer_is_not_retrievable_after_bootstrap(
+    active_wallet_effect_runtime,
+):
+    import wallet  # noqa: F401 - importing consumes the one-shot bootstrap
+
+    source_coin_id = hashlib.sha256(b"facade-issuer-bootstrap").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.split_sage",
+        source_coin_ids=[source_coin_id],
+    )
+    assert claim is not None
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[source_coin_id],
+    )
+    assert dispatch is not None
+    durable_authority = json.loads(
+        database.get_connection()
+        .execute(
+            "SELECT authority_json FROM wallet_effect_claim_authorities "
+            "WHERE claim_token=?",
+            (claim["claim_token"],),
+        )
+        .fetchone()[0]
+    )
+
+    recovered_issuer = database._take_wallet_effect_adapter_facade_authority()
+    assert recovered_issuer is None
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        forged_attestation = database._issue_wallet_effect_adapter_outcome_attestation(
+            recovered_issuer,
+            wallet_operation="wallet:forged_callback",
+            wallet_authority=durable_authority,
+            effect_attempted=False,
+        )
+    assert forged_attestation is None
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch,
+            result={
+                "success": False,
+                "_catalyst_effect_attempted": False,
+                "_catalyst_wallet_effect_attestation": forged_attestation,
+            },
+        )
+        == "UNKNOWN"
+    )
+
+
+def test_opaque_wallet_outcome_attestation_is_bound_to_exact_dispatch(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    dispatches = []
+    for index in range(2):
+        coin_id = hashlib.sha256(f"opaque-replay-{index}".encode()).hexdigest()
+        assert database.upsert_coin(coin_id, "xch", 1000, tier="none")
+        claim = database.claim_wallet_effect(
+            operation_id="coin_manager.split_sage",
+            source_coin_ids=[coin_id],
+        )
+        assert claim is not None
+        dispatch = database.begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=claim["operation_id"],
+            source_coin_ids=[coin_id],
+        )
+        assert dispatch is not None
+        dispatches.append(dispatch)
+
+    with database.wallet_effect_adapter_dispatch_authority(dispatches[0]):
+        original = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=False
+        )
+    wrong_dispatch_copy = dict(original)
+
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatches[1], result=wrong_dispatch_copy
+        )
+        == "UNKNOWN"
+    )
+
+
+def test_opaque_wallet_outcome_attestation_is_consumed_exactly_once(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    dispatches = []
+    for index in range(2):
+        coin_id = hashlib.sha256(f"opaque-single-use-{index}".encode()).hexdigest()
+        assert database.upsert_coin(coin_id, "xch", 1000, tier="none")
+        claim = database.claim_wallet_effect(
+            operation_id="coin_manager.split_sage",
+            source_coin_ids=[coin_id],
+        )
+        assert claim is not None
+        dispatch = database.begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=claim["operation_id"],
+            source_coin_ids=[coin_id],
+        )
+        assert dispatch is not None
+        dispatches.append(dispatch)
+
+    with database.wallet_effect_adapter_dispatch_authority(dispatches[0]):
+        original = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=False
+        )
+    with pytest.raises(AttributeError):
+        original["_catalyst_wallet_effect_attestation"].effect_attempted = True
+    valid_copy = dict(original)
+    consumed_replay = dict(original)
+
+    assert (
+        database.complete_wallet_effect_dispatch(dispatches[0], result=valid_copy)
+        == "RELEASED_NO_EFFECT"
+    )
+    assert (
+        database.complete_wallet_effect_dispatch(dispatches[1], result=consumed_replay)
+        == "UNKNOWN"
+    )
+    with pytest.raises(ValueError, match="not current"):
+        database.complete_wallet_effect_dispatch(dispatches[0], result=original)
+
+
+def test_real_wallet_facade_pre_effect_block_emits_releasable_attestation(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    import coin_manager
+    import mutation_gate
+    import wallet
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    source_coin_id = hashlib.sha256(b"wallet-facade-pre-effect-block").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+    monkeypatch.setattr(wallet, "_wallet_adapter", runtime._wallet_adapter_authority)
+
+    def blocked_identity(_adapter):
+        raise mutation_gate.MutationBlocked(
+            "WALLET_IDENTITY_CHANGED", "wallet:split_coins_rpc"
+        )
+
+    monkeypatch.setattr(wallet, "_identity_from_adapter", blocked_identity)
+    result = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.split_sage",
+        lambda: wallet._run_wallet_mutation("split_coins_rpc"),
+        source_coin_ids=[source_coin_id],
+    )
+
+    assert result["success"] is False
+    assert result["_catalyst_effect_attempted"] is False
+    assert "_catalyst_wallet_effect_attestation" not in result
+    assert (
+        database.get_connection()
+        .execute("SELECT outcome FROM wallet_effect_claim_resolutions")
+        .fetchone()[0]
+        == "RELEASED_NO_EFFECT"
+    )
+
+
+def test_real_wallet_facade_post_effect_exception_remains_fenced_unknown(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    import coin_manager
+    import mutation_gate
+    import wallet
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    adapter = runtime._wallet_adapter_authority
+    source_coin_id = hashlib.sha256(b"wallet-facade-post-effect-error").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_identity_from_adapter", lambda _adapter: {})
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_identity",
+        lambda _binding, _snapshot, _operation: None,
+    )
+
+    def backend_error():
+        raise RuntimeError("adapter outcome lost after effect boundary")
+
+    monkeypatch.setattr(adapter, "test_effect_adapter", backend_error, raising=False)
+    result = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.split_sage",
+        lambda: wallet._run_wallet_mutation("test_effect_adapter"),
+        source_coin_ids=[source_coin_id],
+    )
+
+    assert result["success"] is False
+    assert result["_catalyst_effect_attempted"] is True
+    assert "_catalyst_wallet_effect_attestation" not in result
+    assert (
+        database.get_connection()
+        .execute("SELECT outcome FROM wallet_effect_claim_resolutions")
+        .fetchone()[0]
+        == "UNKNOWN"
     )
 
 
@@ -2013,6 +2300,11 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     )
     monkeypatch.setattr(
         coin_prep_worker,
+        "wallet_effect_adapter_dispatch_authority",
+        lambda capability: nullcontext(capability),
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
         "complete_wallet_effect_dispatch",
         lambda capability, **_kwargs: capability is dispatch,
     )
@@ -2126,6 +2418,7 @@ def test_wallet_effect_recheck_denial_retains_uncertain_claim(monkeypatch):
 
 def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
     active_wallet_effect_runtime,
+    monkeypatch,
 ):
     import coin_prep_worker
 
@@ -2137,7 +2430,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
     worker._is_subprocess = False
     worker.log = lambda _message: None
     task4_denied: list[bool] = []
-    _runtime, _clock, wallet_hash = active_wallet_effect_runtime
+    runtime, _clock, wallet_hash = active_wallet_effect_runtime
 
     def effect(**_kwargs):
         try:
@@ -2167,15 +2460,10 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
             )
         except ValueError as exc:
             task4_denied.append("wallet effect claim" in str(exc).lower())
-        claim_token = (
-            database.get_connection()
-            .execute(
-                "SELECT claim_token FROM wallet_effect_claims ORDER BY claim_sequence DESC"
-            )
-            .fetchone()[0]
-        )
         return {
-            **_wallet_effect_result_marker(claim_token, attempted=True),
+            **_wallet_effect_real_facade_result(
+                runtime, monkeypatch, attempted=True, success=True
+            ),
             "success": True,
             "transaction_id": "claim-barrier-effect",
         }
@@ -2339,7 +2627,9 @@ def test_wallet_effect_claim_guard_recomputes_exact_source_fee_union(
 
 def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_replays(
     active_wallet_effect_runtime,
+    monkeypatch,
 ):
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
     source_coin_id = hashlib.sha256(b"claim-resolution-source").hexdigest()
     assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
     claim = database.claim_wallet_effect(
@@ -2378,10 +2668,14 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
         )
     database.get_connection().rollback()
 
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        no_effect_result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=False
+        )
     assert (
         database.complete_wallet_effect_dispatch(
             dispatch,
-            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+            result=no_effect_result,
             resolved_at=AT,
         )
         == "RELEASED_NO_EFFECT"
@@ -2389,7 +2683,7 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
     with pytest.raises(ValueError, match="not current"):
         database.complete_wallet_effect_dispatch(
             dispatch,
-            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+            result={},
             resolved_at=AFTER,
         )
 
@@ -3020,7 +3314,7 @@ def test_wallet_effect_claim_requires_exact_active_runtime_authority(
 @pytest.mark.parametrize("boundary", ["coin_manager", "coin_prep_worker"])
 @pytest.mark.parametrize("authority_change", ["heartbeat", "owner_takeover"])
 def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
-    active_wallet_effect_runtime, boundary, authority_change
+    active_wallet_effect_runtime, monkeypatch, boundary, authority_change
 ):
     import coin_manager
     import coin_prep_worker
@@ -3071,17 +3365,6 @@ def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
         )
         assert dispatch_count == 1
         assert prepare_after_dispatch(f"during-{boundary}-{authority_change}") is False
-        authority_row = (
-            database.get_connection()
-            .execute(
-                "SELECT authority_json FROM wallet_effect_claim_authorities "
-                "ORDER BY recorded_at DESC, claim_token DESC LIMIT 1"
-            )
-            .fetchone()
-        )
-        marker = database._wallet_effect_authority_identity_sha256(
-            json.loads(str(authority_row["authority_json"]))
-        )
         if authority_change == "heartbeat":
             clock["now"] += timedelta(seconds=1)
             assert runtime.heartbeat()["heartbeat"] is True
@@ -3094,11 +3377,7 @@ def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
                 (AFTER,),
             )
             database.get_connection().commit()
-        return {
-            "success": False,
-            "_catalyst_effect_attempted": False,
-            "_catalyst_wallet_authority_sha256": marker,
-        }
+        return _wallet_effect_real_facade_result(runtime, monkeypatch, attempted=False)
 
     if boundary == "coin_manager":
         result = coin_manager._run_claimed_wallet_effect(
@@ -3391,3 +3670,5 @@ def test_fill_tracker_retry_docs_describe_source_truth_not_spacescan_only():
     assert "source-truth verification" in initializer
     assert "source-truth verification" in retry
     assert "Re-run Spacescan verification" not in retry
+    assert '"rejected" → retain the row and coin lock' in retry
+    assert "budget is exhausted,\n            retain the row and coin lock" in retry

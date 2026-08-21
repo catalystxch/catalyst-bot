@@ -5397,11 +5397,11 @@ def test_real_bot_loop_partial_effect_crash_redelivers_without_duplicate_effects
     dynamic_amm_buffer.reset_buffer()
     sweep_coordinator.reset_coordinator()
     first_loop = bot_loop.BotLoop()
-    real_consume = database.consume_authoritative_sweep_event
+    real_consume = database._AuthoritativeSweepProcessEffectCapability.consume
     monkeypatch.setattr(
-        database,
-        "consume_authoritative_sweep_event",
-        lambda *_a, **_k: (_ for _ in ()).throw(
+        database._AuthoritativeSweepProcessEffectCapability,
+        "consume",
+        lambda _self: (_ for _ in ()).throw(
             RuntimeError("crash after process effects")
         ),
     )
@@ -5410,7 +5410,11 @@ def test_real_bot_loop_partial_effect_crash_redelivers_without_duplicate_effects
     assert dynamic_amm_buffer.get_state()["sweep_count_in_window"] == 1
     assert len(first_loop._recent_sweep_events) == 1
 
-    monkeypatch.setattr(database, "consume_authoritative_sweep_event", real_consume)
+    monkeypatch.setattr(
+        database._AuthoritativeSweepProcessEffectCapability,
+        "consume",
+        real_consume,
+    )
     clock["now"] = "2026-08-20T12:10:31.000000Z"
     sweep_coordinator.reset_coordinator()
     recreated_loop = bot_loop.BotLoop()
@@ -5440,6 +5444,124 @@ def test_real_bot_loop_partial_effect_crash_redelivers_without_duplicate_effects
         ).fetchone()[0]
         == 1
     )
+
+
+def test_bot_loop_sweep_effect_and_ack_share_revocation_fence(
+    isolated_database,
+    monkeypatch,
+):
+    import sweep_coordinator
+
+    stored = _finalize_test_authoritative_sweep(monkeypatch)
+    fill_id = (
+        database.get_connection()
+        .execute(
+            "SELECT fill_id FROM offer_fill_sweep_finalizations WHERE event_id=? "
+            "ORDER BY fill_id LIMIT 1",
+            (stored["event_id"],),
+        )
+        .fetchone()[0]
+    )
+    sweep_coordinator.reset_coordinator()
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._sweep_protection = {}
+    loop._recent_sweep_events = []
+    revocation_started = threading.Event()
+    revocation_done = threading.Event()
+    revocation_thread: list[threading.Thread] = []
+
+    def revoke() -> None:
+        revocation_started.set()
+        database.revoke_offer_fill_authority(
+            fill_id,
+            reason_code="TEST_SWEEP_EFFECT_ACK_RACE",
+            evidence={"fixture": "sweep effect to acknowledgement fence"},
+        )
+        revocation_done.set()
+
+    def apply_effect(_effect) -> None:
+        thread = threading.Thread(target=revoke)
+        revocation_thread.append(thread)
+        thread.start()
+        assert revocation_started.wait(timeout=5)
+        assert not revocation_done.wait(timeout=0.1)
+
+    real_consume = database.consume_authoritative_sweep_event
+
+    def consume_after_revocation(*args, **kwargs):
+        assert revocation_done.wait(timeout=5)
+        return real_consume(*args, **kwargs)
+
+    loop._apply_authoritative_sweep_downstream_effect = apply_effect
+    monkeypatch.setattr(
+        database, "consume_authoritative_sweep_event", consume_after_revocation
+    )
+
+    assert loop._process_authoritative_sweep_events() == 1
+    for thread in revocation_thread:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert revocation_done.is_set()
+    assert (
+        database.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM offer_fill_sweep_delivery_acks WHERE event_id=?",
+            (stored["event_id"],),
+        )
+        .fetchone()[0]
+        == 1
+    )
+
+
+def test_bot_loop_sweep_restore_holds_authority_through_process_apply(
+    isolated_database,
+    monkeypatch,
+):
+    effect = _insert_materialized_sweep_effect(
+        index=909,
+        classification="arb_sweep_sell",
+        side="sell",
+        finalized_at="2099-08-20T12:00:00.000000Z",
+    )
+    fill_id = (
+        database.get_connection()
+        .execute(
+            "SELECT fill_id FROM offer_fill_sweep_finalizations WHERE event_id=? "
+            "ORDER BY fill_id LIMIT 1",
+            (effect["event_id"],),
+        )
+        .fetchone()[0]
+    )
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._sweep_protection = {}
+    loop._recent_sweep_events = []
+    revocation_started = threading.Event()
+    revocation_done = threading.Event()
+    revocation_thread: list[threading.Thread] = []
+
+    def revoke() -> None:
+        revocation_started.set()
+        database.revoke_offer_fill_authority(
+            fill_id,
+            reason_code="TEST_SWEEP_RESTORE_APPLY_RACE",
+            evidence={"fixture": "sweep restore process-apply fence"},
+        )
+        revocation_done.set()
+
+    def apply_effect(_effect) -> None:
+        thread = threading.Thread(target=revoke)
+        revocation_thread.append(thread)
+        thread.start()
+        assert revocation_started.wait(timeout=5)
+        assert not revocation_done.wait(timeout=0.1)
+
+    loop._apply_authoritative_sweep_downstream_effect = apply_effect
+
+    assert loop._restore_authoritative_sweep_downstream_effects() is True
+    assert revocation_done.wait(timeout=5)
+    for thread in revocation_thread:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_sweep_auxiliary_compaction_is_bounded_and_preserves_immutable_audit(
