@@ -21758,7 +21758,8 @@ def record_refresh_lineage_blocker(
             if any(current[key] != values[key] for key in values if key != "recorded_at"):
                 raise ValueError("refresh blocker replay conflicts with durable authority")
             if current["state"] == "resolved":
-                raise ValueError("resolved refresh blocker cannot be replayed")
+                conn.commit()
+                return current
         _reconciliation_latch_update(
             conn, operation_id=op, wallet_fingerprint_hash=values["wallet_fingerprint_hash"],
             network=values["network"], reason_code="REFRESH_LINEAGE_INCONSISTENT",
@@ -21826,6 +21827,13 @@ def resolve_refresh_lineage_blocker(
                 conn.commit()
                 return {"resolved": False, "reason": "malformed_snapshot_unrepaired", "blocker": blocker}
             repaired_trades.extend(repair_by_index.values())
+        if len(repaired_trades) != len(set(repaired_trades)):
+            conn.commit()
+            return {
+                "resolved": False,
+                "reason": "repair_trade_ids_not_unique",
+                "blocker": blocker,
+            }
         repaired = True
         for trade_id in repaired_trades:
             intent_row = conn.execute(

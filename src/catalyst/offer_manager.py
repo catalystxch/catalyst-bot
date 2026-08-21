@@ -271,21 +271,24 @@ class OfferManager:
         candidates: Dict[str, tuple[Dict[str, Any], Dict[str, Any], int]] = {}
         resume_actions: List[tuple[str, Dict[str, Any], str]] = []
         issues: List[tuple[str, Optional[Dict[str, Any]]]] = []
-        cohort_trade_ids = [
-            offer.get("trade_id") for offer in open_offers
-            if isinstance(offer.get("trade_id"), str) and offer.get("trade_id")
-        ]
-        malformed_snapshot_entries = [
-            {"entry_index": index, "trade_id": offer.get("trade_id"), "tier": offer.get("tier")}
-            for index, offer in enumerate(open_offers)
-            if not isinstance(offer.get("trade_id"), str) or not offer.get("trade_id")
-        ]
+        canonical_trade_ids: Dict[int, str] = {}
+        malformed_snapshot_entries = []
+        for index, offer in enumerate(open_offers):
+            candidate = offer.get("trade_id") if type(offer) is dict else None
+            canonical = self._canonical_sage_trade_id(candidate)
+            if canonical is None:
+                malformed_snapshot_entries.append(
+                    self._malformed_refresh_identity_entry(index, candidate)
+                )
+            else:
+                canonical_trade_ids[index] = canonical
+        cohort_trade_ids = list(canonical_trade_ids.values())
         slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
-        for offer in open_offers:
-            trade_id = offer.get("trade_id")
+        for index, offer in enumerate(open_offers):
+            trade_id = canonical_trade_ids.get(index)
             intent = (
                 database.get_offer_intent_by_trade_id(trade_id)
-                if isinstance(trade_id, str) and trade_id
+                if trade_id is not None
                 else None
             )
             if type(intent) is not dict:
@@ -1686,6 +1689,31 @@ class OfferManager:
         if any(character not in "0123456789abcdef" for character in value):
             return None
         return value
+
+    @staticmethod
+    def _malformed_refresh_identity_entry(index: int, value: Any) -> Dict[str, Any]:
+        """Return bounded, redacted incident material for an invalid trade ID."""
+
+        digest = hashlib.sha256()
+        if isinstance(value, str):
+            for offset in range(0, len(value), 4096):
+                digest.update(
+                    str.encode(
+                        value[offset : offset + 4096], "utf-8", "surrogatepass"
+                    )
+                )
+        else:
+            type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+            try:
+                representation = repr(value)
+            except Exception:
+                representation = "<unrepresentable>"
+            digest.update(
+                f"{type_name}:{representation[:4096]}".encode(
+                    "utf-8", "backslashreplace"
+                )
+            )
+        return {"entry_index": index, "entry_sha256": digest.hexdigest()}
 
     @staticmethod
     def _canonical_sage_offer_text(value: Any) -> Optional[str]:

@@ -7,17 +7,23 @@ planner/database behaviour rather than source text or mock call counts.
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import database
+from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
 from refresh_safety import plan_refresh
 
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+class _TradeIdSubclass(str):
+    pass
 
 
 def _parent(intent_id: str, *, severity: int = 1, slot: str | None = None):
@@ -52,7 +58,14 @@ def isolated_database(tmp_path: Path, monkeypatch):
         database._db_initialized_path = original_initialized_path
 
 
-def _prepare(intent_id: str, *, parent_intent_id: str | None = None, generation=0):
+def _prepare(
+    intent_id: str,
+    *,
+    parent_intent_id: str | None = None,
+    generation=0,
+    reserve_selected_coins: bool = False,
+    slot_key: str = "asset-a:buy:inner",
+):
     return database.prepare_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
@@ -64,7 +77,7 @@ def _prepare(intent_id: str, *, parent_intent_id: str | None = None, generation=
         side="buy",
         tier="inner",
         purpose="ladder",
-        slot_key="asset-a:buy:inner",
+        slot_key=slot_key,
         generation=generation,
         parent_intent_id=parent_intent_id,
         offered_amount_atomic="100",
@@ -73,10 +86,11 @@ def _prepare(intent_id: str, *, parent_intent_id: str | None = None, generation=
         wallet_identity_json={"fingerprint_sha256": _sha("wallet-a"), "network": "mainnet"},
         evidence_json={"source": "task-11-test"},
         prepared_at="2026-08-15T12:00:00.000000Z",
+        reserve_selected_coins=reserve_selected_coins,
     )
 
 
-def _confirm(intent_id: str):
+def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = False):
     return database.finalize_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
@@ -88,6 +102,7 @@ def _confirm(intent_id: str):
         wallet_identity_json={"fingerprint_sha256": _sha("wallet-a"), "network": "mainnet"},
         evidence_json={"source": "task-11-test"},
         finalized_at="2026-08-15T12:01:00.000000Z",
+        finalize_selected_coin_reservations=finalize_selected_coin_reservations,
     )
 
 
@@ -278,6 +293,153 @@ def test_lineage_completion_requires_cancel_resolution_and_terminal_proof(isolat
 
     pending = database.commit_refresh_lineage_completion("parent")
     assert pending == {"committed": False, "reason": "terminal_proof_missing"}
+
+
+def test_real_task8_task9_completion_replays_one_exact_lineage_commit(isolated_database):
+    """Catches completion tests that replace either durable proof authority with a mock."""
+
+    database.init_database()
+    parent_coin = _sha("coin:parent")
+    return_coin = _sha("coin:parent-return")
+    transaction_id = _sha("transaction:parent-cancel")
+    spend_identity = f"sha256:{_sha('spend:parent-cancel')}"
+    assert database.upsert_coin(
+        parent_coin, "xch", 100, tier="inner",
+        designation="tier_active", assigned_tier="inner",
+    )
+    _prepare("parent", reserve_selected_coins=True)
+    _confirm("parent", finalize_selected_coin_reservations=True)
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    database.record_offer_intent_visibility(
+        "child", publication_identity="registry:child"
+    )
+
+    parent_trade = _sha("trade:parent")
+    cancel_operation = f"cancel:{parent_trade}"
+    prepared = database.prepare_offer_cancel(
+        operation_id=cancel_operation,
+        event_id=f"{cancel_operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"), "network": "mainnet"
+        },
+        evidence_json={
+            "trade_id": parent_trade,
+            "effect_claim_protocol": "durable_cohort_claim_v1",
+        },
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    assert database.claim_offer_cancel_effect(
+        operation_id=cancel_operation,
+        trade_id=parent_trade,
+        attempt=1,
+        claimed_at="2026-08-15T12:02:00.000000Z",
+    )
+    cancel_result = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="task11_integration",
+        raw_response={"success": True},
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+    database.finalize_offer_cancel(
+        operation_id=cancel_operation,
+        event_id=f"{cancel_operation}:attempt:1:finalized",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        cancel_result=cancel_result,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"), "network": "mainnet"
+        },
+        evidence_json={"trade_id": parent_trade, "cancel_result": cancel_result},
+        finalized_at="2026-08-15T12:02:30.000000Z",
+    )
+    cancel_context = {
+        "cohort_id": "cancel-cohort:task11-integration",
+        "manifest_sha256": prepared["evidence_sha256"],
+        "members": [{
+            "intent_id": "parent",
+            "trade_id": parent_trade,
+            "member_id": "cancel-member:task11-integration",
+            "prepared_event_id": f"{cancel_operation}:attempt:1:prepared",
+            "selected_coin_ids": [parent_coin],
+            "request_timestamp": "2026-08-15T12:02:00.000000Z",
+            "transaction_timestamp": "2026-08-15T12:03:00.000000Z",
+            "asset_id": _sha("asset-a"),
+            "side": "buy",
+            "offered_amount_atomic": "100",
+            "requested_amount_atomic": "200",
+            "offer_text_sha256": _sha("offer:parent"),
+            "transaction_id": transaction_id,
+            "spend_identity": spend_identity,
+        }],
+        "auxiliary_coin_ids": [],
+    }
+    terminal_evidence = {
+        "source": "task-9-authoritative-test-proof",
+        "trade_id": parent_trade,
+        "transaction_id": transaction_id,
+    }
+    terminal_text = json.dumps(
+        terminal_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    terminal = database.commit_offer_reconciliation(
+        intent_id="parent",
+        operation_id="reconcile:parent",
+        classification="CANCELLED_PROVEN",
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"), "network": "mainnet"
+        },
+        evidence_json=terminal_evidence,
+        evidence_sha256=hashlib.sha256(terminal_text.encode("utf-8")).hexdigest(),
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+        block_height=42,
+        coin_rebindings=[{
+            "input_coin_id": parent_coin,
+            "return_coin_id": return_coin,
+            "asset_id": "xch",
+            "amount": 100,
+        }],
+        cancel_context_json=cancel_context,
+        reconciled_at="2026-08-15T12:03:00.000000Z",
+    )
+
+    # A retry before Task 11's final commit re-verifies the exact durable
+    # authorities but cannot manufacture a lineage-commit record.
+    first_proof = database.refresh_lineage_completion("parent")
+    retry_proof = database.refresh_lineage_completion("parent")
+    assert first_proof["complete"] is retry_proof["complete"] is True
+    assert retry_proof["terminal"]["event_id"] == terminal["event"]["event_id"]
+    assert database.get_refresh_lineage_commit_for_child("child") is None
+
+    first_commit = database.commit_refresh_lineage_completion("parent")
+    # Simulate loss of the successful response after the final commit, then retry.
+    replay_proof = database.refresh_lineage_completion("parent")
+    replay_commit = database.commit_refresh_lineage_completion("parent")
+    expected_tuple = {
+        "parent_intent_id": "parent",
+        "child_intent_id": "child",
+        "cancel_event_id": f"{cancel_operation}:attempt:1:reconciled",
+        "terminal_event_id": terminal["event"]["event_id"],
+    }
+    assert replay_proof["complete"] is True
+    assert first_commit["idempotent"] is False
+    assert replay_commit["idempotent"] is True
+    assert {
+        key: first_commit["commit"][key] for key in expected_tuple
+    } == expected_tuple
+    assert replay_commit["commit"] == first_commit["commit"]
+    assert database.get_refresh_lineage_commit_for_child("child") == first_commit["commit"]
+    assert database.get_pending_refresh_lineage_parent_ids(
+        asset_id=_sha("asset-a"), side="buy", limit=8
+    ) == []
 
 
 def test_incomplete_refresh_parent_coverage_trips_the_durable_mutation_latch(
@@ -554,9 +716,18 @@ def test_refresh_blocker_incidents_are_exact_cohort_scoped_and_replayable(
     )
     _prepare("first-incident")
     _confirm("first-incident")
-    assert database.resolve_refresh_lineage_blocker(
+    resolved_first = database.resolve_refresh_lineage_blocker(
         operation_id=first["operation_id"], cohort_trade_ids=[first_trade]
-    )["resolved"] is True
+    )
+    assert resolved_first["resolved"] is True
+    resolved_generation = database.get_runtime_safety_latch()["generation"]
+    resolved_replay = database.record_refresh_lineage_blocker(
+        operation_id=first_id, wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet", side="buy", asset_id=_sha("asset-a"),
+        cohort_trade_ids=[first_trade], reason_code="REGISTRY_PARENT_MISSING",
+    )
+    assert resolved_replay == resolved_first["blocker"]
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
 
     second_id = database.refresh_lineage_blocker_operation_id(
         reason_code="REGISTRY_PARENT_MISSING", cohort_trade_ids=[second_trade]
@@ -573,7 +744,9 @@ def test_refresh_blocker_incidents_are_exact_cohort_scoped_and_replayable(
         cohort_trade_ids=[second_trade], reason_code="REGISTRY_PARENT_MISSING",
     )
     assert second["state"] == replay["state"] == "blocking"
-    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    later_latch = database.get_runtime_safety_latch()
+    assert later_latch["state"] == "tripped"
+    assert later_latch["generation"] > resolved_generation
 
 
 def test_all_malformed_refresh_snapshot_latches_without_inventing_a_trade_id(
@@ -618,6 +791,78 @@ def test_all_malformed_refresh_snapshot_latches_without_inventing_a_trade_id(
     )["idempotent"] is True
 
 
+@pytest.mark.parametrize("collision", ["duplicate-repair", "valid-cohort"])
+def test_malformed_snapshot_repair_requires_one_to_one_trade_mapping(
+    isolated_database, collision,
+):
+    """Catches two malformed indexes or a valid row sharing one repaired trade."""
+
+    database.init_database()
+    _prepare("valid-cohort", slot_key="asset-a:buy:valid")
+    _confirm("valid-cohort")
+    _prepare("repair-a", slot_key="asset-a:buy:repair-a")
+    _confirm("repair-a")
+    _prepare("repair-b", slot_key="asset-a:buy:repair-b")
+    _confirm("repair-b")
+    valid_trade = _sha("trade:valid-cohort")
+    repair_a = _sha("trade:repair-a")
+    repair_b = _sha("trade:repair-b")
+    material = [
+        {"entry_index": 0, "entry_sha256": _sha("malformed:0")},
+        {"entry_index": 1, "entry_sha256": _sha("malformed:1")},
+    ]
+    operation_id = database.refresh_lineage_blocker_operation_id(
+        reason_code="REGISTRY_PARENT_MISSING",
+        cohort_trade_ids=[valid_trade],
+        malformed_snapshot_entries=material,
+    )
+    database.record_refresh_lineage_blocker(
+        operation_id=operation_id,
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        side="buy",
+        asset_id=_sha("asset-a"),
+        cohort_trade_ids=[valid_trade],
+        malformed_snapshot_entries=material,
+        reason_code="REGISTRY_PARENT_MISSING",
+    )
+    colliding_trade = repair_a if collision == "duplicate-repair" else valid_trade
+    invalid = database.resolve_refresh_lineage_blocker(
+        operation_id=operation_id,
+        cohort_trade_ids=[valid_trade],
+        malformed_snapshot_entries=material,
+        repaired_snapshot_entries=[
+            {"entry_index": 0, "trade_id": colliding_trade},
+            {"entry_index": 1, "trade_id": repair_a},
+        ],
+    )
+    assert invalid["resolved"] is False
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+    exact = database.resolve_refresh_lineage_blocker(
+        operation_id=operation_id,
+        cohort_trade_ids=[valid_trade],
+        malformed_snapshot_entries=material,
+        repaired_snapshot_entries=[
+            {"entry_index": 0, "trade_id": repair_a},
+            {"entry_index": 1, "trade_id": repair_b},
+        ],
+    )
+    assert exact["resolved"] is True
+    assert exact["idempotent"] is False
+    replay = database.resolve_refresh_lineage_blocker(
+        operation_id=operation_id,
+        cohort_trade_ids=[valid_trade],
+        malformed_snapshot_entries=material,
+        repaired_snapshot_entries=[
+            {"entry_index": 0, "trade_id": repair_a},
+            {"entry_index": 1, "trade_id": repair_b},
+        ],
+    )
+    assert replay["resolved"] is True
+    assert replay["idempotent"] is True
+
+
 def test_all_malformed_open_rows_latch_before_any_refresh_effect(
     isolated_database, monkeypatch
 ):
@@ -645,3 +890,76 @@ def test_all_malformed_open_rows_latch_before_any_refresh_effect(
     assert pause == "registry_parent_missing"
     assert cancelled == []
     assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "not-a-canonical-trade-id",
+        _sha("upper-case-trade-id").upper(),
+        _TradeIdSubclass(_sha("string-subclass-trade-id")),
+        "f" * 4097,
+    ],
+    ids=["nonhex", "uppercase", "str-subclass", "oversized"],
+)
+def test_malformed_nonempty_trade_id_latches_before_cancel_or_create(
+    isolated_database, monkeypatch, candidate,
+):
+    """Catches malformed nonempty identities escaping before durable latching."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a", owner_pid=1, owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"), network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    monkeypatch.setattr(
+        "offer_manager.get_open_offers",
+        lambda **_kwargs: [{"trade_id": candidate, "tier": "inner"}],
+    )
+    manager = OfferManager.__new__(OfferManager)
+    manager._sort_open_offers_for_requote = lambda offers, *_args, **_kwargs: offers
+    cancelled = []
+    created = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids)
+    manager.create_ladder = lambda *_args, **_kwargs: created.append("create") or []
+
+    result = manager.requote_side("buy", Decimal("1"))
+
+    assert result["refresh_paused"] is True
+    assert cancelled == []
+    assert created == []
+    material = [{
+        "entry_index": 0,
+        "entry_sha256": hashlib.sha256(str.encode(candidate, "utf-8")).hexdigest(),
+    }]
+    operation_id = database.refresh_lineage_blocker_operation_id(
+        reason_code="refresh-lineage:buy:coverage",
+        cohort_trade_ids=[],
+        malformed_snapshot_entries=material,
+    )
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert operation_id in json.loads(latch["blocking_operation_ids_json"])
+    assert database.resolve_refresh_lineage_blocker(
+        operation_id=operation_id,
+        cohort_trade_ids=[],
+        malformed_snapshot_entries=material,
+    )["resolved"] is False
+
+    _prepare("malformed-candidate-repair")
+    _confirm("malformed-candidate-repair")
+    repaired = database.resolve_refresh_lineage_blocker(
+        operation_id=operation_id,
+        cohort_trade_ids=[],
+        malformed_snapshot_entries=material,
+        repaired_snapshot_entries=[{
+            "entry_index": 0,
+            "trade_id": _sha("trade:malformed-candidate-repair"),
+        }],
+    )
+    assert repaired["resolved"] is True
