@@ -87,7 +87,13 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "generation": 1,
         }
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
-        fake_database.resolve_wallet_effect_claim = lambda *args, **kwargs: True
+        fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: object()
+        fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
+            "SUBMITTED"
+        )
+        fake_database.retain_wallet_effect_claim_for_reconciliation = (
+            lambda *args, **kwargs: True
+        )
         fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 

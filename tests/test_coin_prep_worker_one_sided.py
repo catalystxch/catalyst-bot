@@ -98,7 +98,14 @@ def test_sage_tiered_prep_fails_closed_when_multi_send_cannot_bind_sources():
             return_value={"claim_token": "a" * 64, "generation": 1},
         ),
         patch("coin_prep_worker.wallet_effect_claim_is_current", return_value=True),
-        patch("coin_prep_worker.resolve_wallet_effect_claim", return_value=True),
+        patch("coin_prep_worker.begin_wallet_effect_dispatch", return_value=object()),
+        patch(
+            "coin_prep_worker.complete_wallet_effect_dispatch", return_value="SUBMITTED"
+        ),
+        patch(
+            "coin_prep_worker.retain_wallet_effect_claim_for_reconciliation",
+            return_value=True,
+        ),
         patch("coin_prep_worker.time.sleep", return_value=None),
     ):
         assert (

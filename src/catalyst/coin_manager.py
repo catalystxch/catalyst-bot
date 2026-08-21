@@ -38,9 +38,11 @@ from amount_utils import (
 )
 from config import cfg
 from database import (
+    begin_wallet_effect_dispatch,
     claim_wallet_effect,
+    complete_wallet_effect_dispatch,
     log_event,
-    resolve_wallet_effect_claim,
+    retain_wallet_effect_claim_for_reconciliation,
     wallet_effect_claim_is_current,
 )
 
@@ -152,56 +154,34 @@ def _run_claimed_wallet_effect(
         source_coin_ids=exact_sources,
         fee_coin_ids=exact_fee_coin_ids,
     ):
-        resolve_wallet_effect_claim(
+        retain_wallet_effect_claim_for_reconciliation(
             claim["claim_token"],
             claim["generation"],
-            outcome="RELEASED_NO_EFFECT",
-            evidence={
-                "effect_attempted": False,
-                "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
-                "result_type": "not_dispatched",
-            },
+            reason_code="AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
         )
         claim = None
+    if claim is not None:
+        dispatch = begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=operation,
+            source_coin_ids=exact_sources,
+            fee_coin_ids=exact_fee_coin_ids,
+        )
+        if dispatch is None:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DISPATCH_AUTHORITY_RECHECK_FAILED",
+            )
+            claim = None
     if claim is not None:
         try:
             result = callback()
         except Exception as exc:
-            resolve_wallet_effect_claim(
-                claim["claim_token"],
-                claim["generation"],
-                outcome="UNKNOWN",
-                evidence={
-                    "effect_attempted": True,
-                    "reason_code": "CALLBACK_EXCEPTION",
-                    "exception_type": type(exc).__name__,
-                },
-            )
+            complete_wallet_effect_dispatch(dispatch, exception=exc)
             raise
-        if type(result) is dict and result.get("_catalyst_effect_attempted") is False:
-            outcome = "RELEASED_NO_EFFECT"
-            effect_attempted = False
-        elif type(result) is dict and (
-            result.get("success") is True
-            or result.get("transaction_id")
-            or result.get("coin_spends") is not None
-            or result.get("summary") is not None
-        ):
-            outcome = "SUBMITTED"
-            effect_attempted = True
-        else:
-            outcome = "UNKNOWN"
-            effect_attempted = True
-        resolve_wallet_effect_claim(
-            claim["claim_token"],
-            claim["generation"],
-            outcome=outcome,
-            evidence={
-                "effect_attempted": effect_attempted,
-                "reason_code": f"CALLBACK_{outcome}",
-                "result_type": type(result).__name__,
-            },
-        )
+        complete_wallet_effect_dispatch(dispatch, result=result)
         return result
     log_event(
         "warning",

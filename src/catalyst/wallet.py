@@ -965,6 +965,18 @@ def validate_runtime_target_fingerprint(target) -> dict:
 def _run_wallet_mutation(export_name: str, *args, **kwargs):
     operation = f"wallet:{export_name}"
     permit = None
+    effect_attempted = False
+    authority_identity_sha256 = None
+
+    def authoritative_result(value):
+        if type(value) is not dict:
+            value = _blocked_mutation("WALLET_MUTATION_FAILED")
+        value = dict(value)
+        value["_catalyst_effect_attempted"] = effect_attempted
+        if authority_identity_sha256 is not None:
+            value["_catalyst_wallet_authority_sha256"] = authority_identity_sha256
+        return value
+
     try:
         permit = mutation_gate.enter_wallet_mutation(operation)
         binding, adapter = mutation_gate.require_wallet_mutation_permit_authority(
@@ -974,6 +986,23 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
             raise mutation_gate.MutationBlocked(
                 "WALLET_IDENTITY_BINDING_INVALID", operation
             )
+        authority = mutation_gate.wallet_mutation_permit_journal_authority(
+            permit, f"{operation}:authority"
+        )
+        authority = dict(authority)
+        authority["wallet_fingerprint_hash"] = mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        )
+        authority["network"] = binding.network_id
+        authority.pop("lease_version", None)
+        authority_identity_sha256 = hashlib.sha256(
+            json.dumps(
+                authority,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
         snapshot = _identity_from_adapter(adapter)
         mutation_gate.require_wallet_mutation_permit_authority(
@@ -1007,6 +1036,7 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:effect"
         )
+        effect_attempted = True
         result = callback(*args, **kwargs)
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
@@ -1015,16 +1045,18 @@ def _run_wallet_mutation(export_name: str, *args, **kwargs):
                     close()
                 except Exception:
                     pass
-            return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
-        return result
+            return authoritative_result(_blocked_mutation("WALLET_BACKEND_UNSUPPORTED"))
+        return authoritative_result(result)
     except mutation_gate.MutationBlocked as exc:
-        return _blocked_mutation(exc.reason_code)
+        return authoritative_result(_blocked_mutation(exc.reason_code))
     except Exception:
-        return {
-            "success": False,
-            "error": "Wallet mutation failed after authorization",
-            "reason": "WALLET_MUTATION_FAILED",
-        }
+        return authoritative_result(
+            {
+                "success": False,
+                "error": "Wallet mutation failed after authorization",
+                "reason": "WALLET_MUTATION_FAILED",
+            }
+        )
     finally:
         if permit is not None:
             try:

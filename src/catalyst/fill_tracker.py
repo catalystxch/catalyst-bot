@@ -156,13 +156,13 @@ class FillTracker:
         self._last_dexie_details: Dict[str, Optional[Dict]] = {}
         self._exact_trade_confirmations: Set[str] = set()
 
-        # Unverified-fill retry bookkeeping. A disappeared offer whose on-chain
-        # verification is "unverified" (Spacescan unreachable, coin data not
-        # yet indexed, etc.) used to be retired immediately as cancelled,
+        # Unverified-fill retry bookkeeping. A disappeared offer whose
+        # source-truth verification is inconclusive (provider unreachable,
+        # coin data not yet indexed, etc.) used to be retired immediately,
         # which permanently erased any real fill that landed during the
-        # Spacescan outage. Instead, we now park the trade_id here, retry
-        # verification on subsequent cycles, and only retire the offer once
-        # we either get a decisive verdict or exhaust the retry budget.
+        # which could erase a real fill. Instead, we now park the trade_id and
+        # retry source-truth verification on subsequent cycles while Task 9
+        # retains the offer row and coin authority until exact reconciliation.
         # Map: trade_id → {"side": str, "attempts": int, "first_seen": float}.
         self._pending_reverify: Dict[str, Dict] = {}
         self._pending_reverify_max_attempts: int = 6  # ~6 cycles before giving up
@@ -639,10 +639,10 @@ class FillTracker:
     def _retry_pending_reverify(
         self, details_cache: Dict[str, Dict]
     ) -> Dict[str, List[Dict]]:
-        """Re-run Spacescan verification for offers parked as 'unverified'.
+        """Re-run source-truth verification for offers parked as unverified.
 
         Each entry in ``_pending_reverify`` was a disappeared offer whose
-        Spacescan verdict was inconclusive. Here we retry:
+        available provider evidence was inconclusive. Here we retry:
           - "filled" → record fill, clear entry.
           - "rejected" → retire (expired if local clock says so, else
             cancelled), clear entry.

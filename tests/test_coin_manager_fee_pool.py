@@ -83,6 +83,17 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         fake_database.resolve_wallet_effect_claim = lambda *args, **kwargs: (
             _ for _ in ()
         ).throw(AssertionError("fee classification must not resolve a wallet effect"))
+        fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(AssertionError("fee classification must not dispatch a wallet effect"))
+        fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(AssertionError("fee classification must not complete a wallet effect"))
+        fake_database.retain_wallet_effect_claim_for_reconciliation = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("fee classification must not retain a wallet effect")
+            )
+        )
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: (
             _ for _ in ()
         ).throw(AssertionError("fee classification must not inspect an effect claim"))

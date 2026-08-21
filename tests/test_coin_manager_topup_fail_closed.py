@@ -107,7 +107,23 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             )
         )
         self._wallet_effect_authority.enter_context(
-            patch.object(coin_manager, "resolve_wallet_effect_claim", return_value=True)
+            patch.object(
+                coin_manager, "begin_wallet_effect_dispatch", return_value=object()
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager,
+                "complete_wallet_effect_dispatch",
+                return_value="SUBMITTED",
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager,
+                "retain_wallet_effect_claim_for_reconciliation",
+                return_value=True,
+            )
         )
         self.addCleanup(self._wallet_effect_authority.close)
 

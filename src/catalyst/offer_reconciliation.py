@@ -1317,7 +1317,9 @@ def _classify_terminal_evidence(
         or type(evidence.get("schema_version")) is not int
     ):
         return _unknown("EVIDENCE_SCHEMA_INVALID")
-    observed_now = datetime.now(timezone.utc) if now is None else _parse_utc(now)
+    if now is None:
+        return _unknown("NOW_TIMESTAMP_REQUIRED")
+    observed_now = _parse_utc(now)
     if observed_now is None:
         return _unknown("NOW_TIMESTAMP_INVALID")
     source_error = _source_error(evidence, observed_now)
@@ -2312,6 +2314,10 @@ class _PostFillEffectUncertain(RuntimeError):
     """A durable or process effect may exist but its acknowledgement is unsure."""
 
 
+class _PostFillEffectNotApplied(RuntimeError):
+    """The process callback returned its exact no-effect result."""
+
+
 def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., Any]]:
     """Build additive, replay-safe callbacks for one committed durable fill."""
 
@@ -2421,32 +2427,36 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
             claim_token=claim_token,
             claim_generation=claim_generation,
         )
-        with database.offer_fill_process_effect_authority(
-            int(fill["fill_id"]),
-            "boost_notification",
-            claim_token,
-            claim_generation,
-        ):
-            effect_state = manager.notify_authoritative_boost_fill(
-                int(fill["fill_id"]),
-                trade_id,
-                str(fill["side"]),
-                command["materialization"],
-                durable_effect=durable_effect,
-            )
-            if type(effect_state) is not dict or effect_state != durable_effect:
-                raise RuntimeError(
-                    "BoostManager returned no exact authoritative effect"
-                )
         try:
-            return database.complete_authoritative_boost_fill_command(
+            with database.offer_fill_process_effect_authority(
                 int(fill["fill_id"]),
-                trade_id,
-                str(fill["side"]),
-                effect_state,
-                claim_token=claim_token,
-                claim_generation=claim_generation,
-            )
+                "boost_notification",
+                claim_token,
+                claim_generation,
+            ) as effect_authority:
+                effect_authority.begin_process_effect()
+                effect_state = manager.notify_authoritative_boost_fill(
+                    int(fill["fill_id"]),
+                    trade_id,
+                    str(fill["side"]),
+                    command["materialization"],
+                    durable_effect=durable_effect,
+                )
+                if effect_state is False:
+                    raise _PostFillEffectNotApplied(
+                        "BoostManager returned its exact no-effect result"
+                    )
+                if type(effect_state) is not dict or effect_state != durable_effect:
+                    raise RuntimeError(
+                        "BoostManager returned no exact authoritative effect"
+                    )
+                return effect_authority.complete_authoritative_boost_fill_command(
+                    trade_id,
+                    str(fill["side"]),
+                    effect_state,
+                )
+        except _PostFillEffectNotApplied:
+            raise
         except Exception as exc:
             raise _PostFillEffectUncertain(
                 "Boost effect succeeded before durable acknowledgement"
@@ -2526,7 +2536,8 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
                 "sweep_registration",
                 claim_token,
                 claim_generation,
-            ):
+            ) as effect_authority:
+                effect_authority.begin_process_effect()
                 coordinator = get_coordinator()
                 if hasattr(coordinator, "process_authoritative_fill"):
                     coordinator.process_authoritative_fill(int(fill["fill_id"]), result)
@@ -2538,11 +2549,7 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
                     and not (coordinator.has_registered_fill(int(fill["fill_id"])))
                 ):
                     raise RuntimeError("SweepCoordinator rejected durable registration")
-            return database.acknowledge_authoritative_sweep_registration(
-                int(fill["fill_id"]),
-                claim_token=claim_token,
-                claim_generation=claim_generation,
-            )
+                return effect_authority.acknowledge_authoritative_sweep_registration()
         except Exception as exc:
             raise _PostFillEffectUncertain(
                 "sweep registration is durable but process delivery is uncertain"

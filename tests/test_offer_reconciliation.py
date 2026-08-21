@@ -4738,10 +4738,10 @@ def test_boost_crash_after_process_apply_replays_without_duplicate_log(
         "api_server",
         SimpleNamespace(bot=SimpleNamespace(boost_manager=manager)),
     )
-    real_complete = database.complete_authoritative_boost_fill_command
+    real_complete = database._complete_authoritative_boost_fill_command_in_connection
     monkeypatch.setattr(
         database,
-        "complete_authoritative_boost_fill_command",
+        "_complete_authoritative_boost_fill_command_in_connection",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             SystemExit("crash after process Boost apply")
         ),
@@ -4756,7 +4756,9 @@ def test_boost_crash_after_process_apply_replays_without_duplicate_log(
         )
 
     monkeypatch.setattr(
-        database, "complete_authoritative_boost_fill_command", real_complete
+        database,
+        "_complete_authoritative_boost_fill_command_in_connection",
+        real_complete,
     )
     recreated = BoostManager()
     assert recreated._buy_settled is True

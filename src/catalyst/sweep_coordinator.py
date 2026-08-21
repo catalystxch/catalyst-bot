@@ -245,23 +245,23 @@ class SweepCoordinator:
         """Reconstruct process-local grouping from immutable database rows."""
 
         try:
-            from database import get_authoritative_sweep_registrations
+            from database import authoritative_sweep_restore_effect_authority
 
-            registrations = get_authoritative_sweep_registrations()
+            with authoritative_sweep_restore_effect_authority() as registrations:
+                for registration in registrations:
+                    classification = SimpleNamespace(
+                        trade_id=registration["trade_id"],
+                        classification=registration["classification"],
+                        spent_block_index=registration["spent_block_index"],
+                        taker_puzzle_hash=registration["taker_puzzle_hash"],
+                        sweep_group_id=registration["sweep_group_id"],
+                        side=registration["side"],
+                    )
+                    self.process_authoritative_fill(
+                        int(registration["fill_id"]), classification
+                    )
         except Exception:
             return
-        for registration in registrations:
-            classification = SimpleNamespace(
-                trade_id=registration["trade_id"],
-                classification=registration["classification"],
-                spent_block_index=registration["spent_block_index"],
-                taker_puzzle_hash=registration["taker_puzzle_hash"],
-                sweep_group_id=registration["sweep_group_id"],
-                side=registration["side"],
-            )
-            self.process_authoritative_fill(
-                int(registration["fill_id"]), classification
-            )
 
     @staticmethod
     def _event_from_stored_delivery(stored: dict) -> SweepEvent:

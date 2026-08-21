@@ -8,6 +8,7 @@ import json
 import socket
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -53,11 +54,71 @@ def isolated_database(tmp_path, monkeypatch):
     database.close_connection()
 
 
+@pytest.fixture
+def active_wallet_effect_runtime(isolated_database):
+    import mutation_gate
+
+    mutation_gate.shutdown_runtime(release_owned_lease=True)
+    clock = {"now": datetime(2026, 8, 20, 12, 0, 0, tzinfo=timezone.utc)}
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Task 9 Wallet",
+        fingerprint=123456789,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc="2026-08-20T11:59:59.000000Z",
+        maximum_age_seconds=15,
+    )
+    adapter = object()
+    runtime = mutation_gate.MutationGate(
+        run_id="task9-wallet-effect-owner",
+        owner_pid=4242,
+        owner_host="task9-host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network="mainnet",
+        lease_seconds=30,
+        clock=lambda: clock["now"],
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+        wallet_adapter_authority=adapter,
+    )
+    assert runtime.acquire()["acquired"] is True
+    mutation_gate._runtime = runtime
+    try:
+        yield runtime, clock, mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+    finally:
+        mutation_gate.shutdown_runtime(release_owned_lease=True)
+
+
 def _canonical_digest(value: dict) -> str:
     encoded = json.dumps(
         value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _wallet_effect_result_marker(claim_token: str, *, attempted: bool) -> dict:
+    row = (
+        database.get_connection()
+        .execute(
+            "SELECT authority_json FROM wallet_effect_claim_authorities "
+            "WHERE claim_token=?",
+            (claim_token,),
+        )
+        .fetchone()
+    )
+    assert row is not None
+    authority = json.loads(str(row["authority_json"]))
+    return {
+        "success": False,
+        "_catalyst_effect_attempted": attempted,
+        "_catalyst_wallet_authority_sha256": (
+            database._wallet_effect_authority_identity_sha256(authority)
+        ),
+    }
 
 
 def _seed_authoritative_fill(
@@ -919,53 +980,47 @@ def test_authority_projections_are_indexed_and_migration_is_hard_bounded(
 
 
 def test_wallet_effect_claim_root_materializes_exact_indexed_coin_cohort(
-    isolated_database,
+    active_wallet_effect_runtime,
 ):
-    conn = database.get_connection()
     source_id = hashlib.sha256(b"claim-trigger-source").hexdigest()
     fee_id = hashlib.sha256(b"claim-trigger-fee").hexdigest()
-    source, source_json, source_sha = database._canonical_wallet_effect_coin_ids(
-        [source_id], "source_coin_ids", allow_empty=False
+    assert database.upsert_coin(source_id, "xch", 1000, tier="none")
+    assert database.upsert_coin(fee_id, "xch", 1000, tier="none")
+    claim = database.claim_wallet_effect(
+        operation_id="claim-trigger-materialization",
+        source_coin_ids=[source_id],
+        fee_coin_ids=[fee_id],
     )
-    fee, fee_json, fee_sha = database._canonical_wallet_effect_coin_ids(
-        [fee_id], "fee_coin_ids", allow_empty=True
-    )
-    cohort, cohort_json, cohort_sha = database._canonical_wallet_effect_coin_ids(
-        source + fee, "cohort_coin_ids", allow_empty=False
-    )
-    wallet_hash, network = database._wallet_effect_claim_binding(conn)
-    claim_token = hashlib.sha256(b"claim-trigger-token").hexdigest()
+    assert claim is not None
 
-    conn.execute(
-        "INSERT INTO wallet_effect_claims ("
-        "claim_token, operation_id, operation_contract, generation, "
-        "source_coin_ids_json, source_coin_ids_sha256, fee_coin_ids_json, "
-        "fee_coin_ids_sha256, cohort_coin_ids_json, cohort_coin_ids_sha256, "
-        "wallet_fingerprint_hash, network, claimed_at) "
-        "VALUES (?, ?, 'EXPLICIT_COIN_COHORT_V1', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            claim_token,
-            "claim-trigger-materialization",
-            source_json,
-            source_sha,
-            fee_json,
-            fee_sha,
-            cohort_json,
-            cohort_sha,
-            wallet_hash,
-            network,
-            AT,
-        ),
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT coin_id, role FROM wallet_effect_claim_coins "
+            "WHERE claim_token=? ORDER BY coin_id",
+            (claim["claim_token"],),
+        )
+        .fetchall()
     )
-
-    rows = conn.execute(
-        "SELECT coin_id, role FROM wallet_effect_claim_coins "
-        "WHERE claim_token=? ORDER BY coin_id",
-        (claim_token,),
-    ).fetchall()
     assert [(row["coin_id"], row["role"]) for row in rows] == [
-        (coin_id, "source" if coin_id in set(source) else "fee") for coin_id in cohort
+        (coin_id, "source" if coin_id in set(claim["source_coin_ids"]) else "fee")
+        for coin_id in claim["cohort_coin_ids"]
     ]
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[source_id],
+        fee_coin_ids=[fee_id],
+    )
+    assert dispatch is not None
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch,
+            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+        )
+        == "RELEASED_NO_EFFECT"
+    )
 
 
 def test_cross_intent_release_cannot_supersede_permanent_spend(isolated_database):
@@ -1112,12 +1167,15 @@ def test_migration_audits_latches_and_repairs_prefixed_release_conflict(
         ]
         == "spent"
     )
-    audit = conn.execute(
-        "SELECT reason_code FROM offer_authority_migration_audit "
-        "WHERE authority_type='coin' AND subject_id=?",
-        (coin_id,),
-    ).fetchone()
-    assert audit["reason_code"] == "PERMANENT_SPEND_AUTHORITY_CONFLICT"
+    audit_codes = {
+        row["reason_code"]
+        for row in conn.execute(
+            "SELECT reason_code FROM offer_authority_migration_audit "
+            "WHERE authority_type='coin' AND subject_id=?",
+            (coin_id,),
+        ).fetchall()
+    }
+    assert "MALFORMED_COIN_OUTCOME_QUARANTINED" in audit_codes
     latch = database.get_runtime_safety_latch()
     assert latch["state"] == "tripped"
     assert f"authority:coin:{coin_id}" in json.loads(
@@ -1949,8 +2007,14 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     monkeypatch.setattr(
         coin_prep_worker, "wallet_effect_claim_is_current", lambda *_a, **_k: True
     )
+    dispatch = object()
     monkeypatch.setattr(
-        coin_prep_worker, "resolve_wallet_effect_claim", lambda *_a, **_k: True
+        coin_prep_worker, "begin_wallet_effect_dispatch", lambda *_a, **_k: dispatch
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "complete_wallet_effect_dispatch",
+        lambda capability, **_kwargs: capability is dispatch,
     )
     worker = object.__new__(coin_prep_worker.CoinPrepWorker)
     worker._is_subprocess = False
@@ -2020,12 +2084,12 @@ def test_coin_manager_denies_unknown_or_malformed_wallet_effect_contract(
     assert calls == []
 
 
-def test_wallet_effect_recheck_denial_releases_exact_no_effect_claim(monkeypatch):
+def test_wallet_effect_recheck_denial_retains_uncertain_claim(monkeypatch):
     import coin_manager
 
     source_coin_id = hashlib.sha256(b"claim-recheck-release").hexdigest()
     callback_calls: list[str] = []
-    resolutions: list[tuple[tuple, dict]] = []
+    retained: list[tuple[tuple, dict]] = []
     monkeypatch.setattr(
         coin_manager,
         "claim_wallet_effect",
@@ -2038,8 +2102,8 @@ def test_wallet_effect_recheck_denial_releases_exact_no_effect_claim(monkeypatch
     )
     monkeypatch.setattr(
         coin_manager,
-        "resolve_wallet_effect_claim",
-        lambda *args, **kwargs: resolutions.append((args, kwargs)) or True,
+        "retain_wallet_effect_claim_for_reconciliation",
+        lambda *args, **kwargs: retained.append((args, kwargs)) or True,
     )
 
     result = coin_manager._run_claimed_wallet_effect(
@@ -2050,23 +2114,18 @@ def test_wallet_effect_recheck_denial_releases_exact_no_effect_claim(monkeypatch
 
     assert result is coin_manager._WALLET_EFFECT_DENIED
     assert callback_calls == []
-    assert resolutions == [
+    assert retained == [
         (
             ("c" * 64, 3),
             {
-                "outcome": "RELEASED_NO_EFFECT",
-                "evidence": {
-                    "effect_attempted": False,
-                    "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
-                    "result_type": "not_dispatched",
-                },
+                "reason_code": "AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
             },
         )
     ]
 
 
 def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
-    isolated_database,
+    active_wallet_effect_runtime,
 ):
     import coin_prep_worker
 
@@ -2078,6 +2137,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
     worker._is_subprocess = False
     worker.log = lambda _message: None
     task4_denied: list[bool] = []
+    _runtime, _clock, wallet_hash = active_wallet_effect_runtime
 
     def effect(**_kwargs):
         try:
@@ -2086,7 +2146,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
                 operation_id="create:claim-barrier-intent",
                 event_id="create:claim-barrier-intent:prepared",
                 run_id="claim-barrier-run",
-                wallet_fingerprint_hash=WALLET,
+                wallet_fingerprint_hash=wallet_hash,
                 network="mainnet",
                 asset_id=ASSET,
                 side="buy",
@@ -2098,7 +2158,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
                 requested_amount_atomic="2000",
                 selected_coin_ids_json=[source_coin_id],
                 wallet_identity_json={
-                    "wallet_fingerprint_hash": WALLET,
+                    "wallet_fingerprint_hash": wallet_hash,
                     "network": "mainnet",
                 },
                 evidence_json={"fixture": "claim barrier"},
@@ -2107,7 +2167,18 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
             )
         except ValueError as exc:
             task4_denied.append("wallet effect claim" in str(exc).lower())
-        return {"success": True, "transaction_id": "claim-barrier-effect"}
+        claim_token = (
+            database.get_connection()
+            .execute(
+                "SELECT claim_token FROM wallet_effect_claims ORDER BY claim_sequence DESC"
+            )
+            .fetchone()[0]
+        )
+        return {
+            **_wallet_effect_result_marker(claim_token, attempted=True),
+            "success": True,
+            "transaction_id": "claim-barrier-effect",
+        }
 
     result = worker._call_wallet_mutation(
         "coin_prep.split_single_sage",
@@ -2121,7 +2192,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
 
 
 def test_wallet_effect_claim_blocks_free_and_wallet_reconciliation(
-    isolated_database,
+    active_wallet_effect_runtime,
 ):
     free_coin_id = hashlib.sha256(b"claim-free-barrier").hexdigest()
     gone_coin_id = hashlib.sha256(b"claim-reconcile-barrier").hexdigest()
@@ -2153,10 +2224,20 @@ def test_wallet_effect_claim_blocks_free_and_wallet_reconciliation(
     assert stats["protected"] == 2
     assert stats["reappeared"] == 0
     assert database.get_coin_state(gone_coin_id)["status"] == "gone"
+    assert database.retain_wallet_effect_claim_for_reconciliation(
+        free_claim["claim_token"],
+        free_claim["generation"],
+        reason_code="TEST_COMPLETE",
+    )
+    assert database.retain_wallet_effect_claim_for_reconciliation(
+        gone_claim["claim_token"],
+        gone_claim["generation"],
+        reason_code="TEST_COMPLETE",
+    )
 
 
 def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
-    isolated_database,
+    active_wallet_effect_runtime,
 ):
     import coin_prep_worker
 
@@ -2167,6 +2248,7 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
     worker = object.__new__(coin_prep_worker.CoinPrepWorker)
     worker._is_subprocess = False
     worker.log = lambda _message: None
+    _runtime, _clock, wallet_hash = active_wallet_effect_runtime
 
     with pytest.raises(SystemExit):
         worker._call_wallet_mutation(
@@ -2176,6 +2258,16 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
             fee_mojos=0,
         )
 
+    import mutation_gate
+
+    # Simulate process death: only process-local permits disappear. The
+    # unresolved durable claim and dispatch must survive the restart.
+    with database._wallet_effect_process_authorities_lock:
+        crashed_states = list(database._wallet_effect_process_authorities.values())
+        database._wallet_effect_process_authorities.clear()
+    for state in crashed_states:
+        mutation_gate.exit_wallet_mutation(state.permit)
+    mutation_gate.shutdown_runtime(release_owned_lease=True)
     database.close_connection()
     database._db_initialized_path = ""
     database.init_database()
@@ -2185,7 +2277,7 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
             operation_id="create:claim-crash-intent",
             event_id="create:claim-crash-intent:prepared",
             run_id="claim-crash-run",
-            wallet_fingerprint_hash=WALLET,
+            wallet_fingerprint_hash=wallet_hash,
             network="mainnet",
             asset_id=ASSET,
             side="buy",
@@ -2197,7 +2289,7 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
             requested_amount_atomic="2000",
             selected_coin_ids_json=[source_coin_id],
             wallet_identity_json={
-                "wallet_fingerprint_hash": WALLET,
+                "wallet_fingerprint_hash": wallet_hash,
                 "network": "mainnet",
             },
             evidence_json={"fixture": "claim crash"},
@@ -2246,7 +2338,7 @@ def test_wallet_effect_claim_guard_recomputes_exact_source_fee_union(
 
 
 def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_replays(
-    isolated_database,
+    active_wallet_effect_runtime,
 ):
     source_coin_id = hashlib.sha256(b"claim-resolution-source").hexdigest()
     assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
@@ -2255,6 +2347,13 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
         source_coin_ids=[source_coin_id],
     )
     assert claim is not None
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[source_coin_id],
+    )
+    assert dispatch is not None
     forged = json.dumps(
         {
             "effect_attempted": True,
@@ -2279,25 +2378,20 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
         )
     database.get_connection().rollback()
 
-    evidence = {
-        "effect_attempted": False,
-        "reason_code": "ADAPTER_DENIED_BEFORE_EFFECT",
-        "result_type": "dict",
-    }
-    assert database.resolve_wallet_effect_claim(
-        claim["claim_token"],
-        claim["generation"],
-        outcome="RELEASED_NO_EFFECT",
-        evidence=evidence,
-        resolved_at=AT,
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch,
+            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+            resolved_at=AT,
+        )
+        == "RELEASED_NO_EFFECT"
     )
-    assert not database.resolve_wallet_effect_claim(
-        claim["claim_token"],
-        claim["generation"],
-        outcome="RELEASED_NO_EFFECT",
-        evidence=evidence,
-        resolved_at=AFTER,
-    )
+    with pytest.raises(ValueError, match="not current"):
+        database.complete_wallet_effect_dispatch(
+            dispatch,
+            result=_wallet_effect_result_marker(claim["claim_token"], attempted=False),
+            resolved_at=AFTER,
+        )
 
 
 def test_post_fill_claim_attestation_guard_recomputes_exact_canonical_binding(
@@ -2901,3 +2995,399 @@ def test_sweep_process_effect_fence_serializes_revocation_through_apply(
 
     assert errors == []
     assert order == ["effect-start", "effect-end", "revoked"]
+
+
+def test_wallet_effect_claim_requires_exact_active_runtime_authority(
+    isolated_database,
+):
+    source_coin_id = hashlib.sha256(b"runtime-authority-required").hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 1000, tier="none")
+
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.split_sage",
+        source_coin_ids=[source_coin_id],
+    )
+
+    assert claim is None
+    assert (
+        database.get_connection()
+        .execute("SELECT COUNT(*) FROM wallet_effect_claims")
+        .fetchone()[0]
+        == 0
+    )
+
+
+@pytest.mark.parametrize("boundary", ["coin_manager", "coin_prep_worker"])
+@pytest.mark.parametrize("authority_change", ["heartbeat", "owner_takeover"])
+def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
+    active_wallet_effect_runtime, boundary, authority_change
+):
+    import coin_manager
+    import coin_prep_worker
+
+    runtime, clock, wallet_hash = active_wallet_effect_runtime
+    source_coin_id = hashlib.sha256(
+        f"dispatch-fence:{boundary}:{authority_change}".encode()
+    ).hexdigest()
+    assert database.upsert_coin(source_coin_id, "xch", 200_000, tier="none")
+    task4_denials: list[str] = []
+
+    def prepare_after_dispatch(suffix: str) -> bool:
+        try:
+            database.prepare_offer_intent(
+                intent_id=f"dispatch-fence-{suffix}",
+                operation_id=f"create:dispatch-fence-{suffix}",
+                event_id=f"create:dispatch-fence-{suffix}:prepared",
+                run_id="dispatch-fence-task4",
+                wallet_fingerprint_hash=wallet_hash,
+                network="mainnet",
+                asset_id=ASSET,
+                side="buy",
+                tier="inner",
+                purpose="dispatch_fence_test",
+                slot_key=f"dispatch-fence-slot-{suffix}",
+                generation=0,
+                offered_amount_atomic="200000",
+                requested_amount_atomic="400000",
+                selected_coin_ids_json=[source_coin_id],
+                wallet_identity_json={
+                    "wallet_fingerprint_hash": wallet_hash,
+                    "network": "mainnet",
+                },
+                evidence_json={"fixture": "dispatch fence"},
+                prepared_at=AT,
+                reserve_selected_coins=True,
+            )
+        except ValueError as exc:
+            task4_denials.append(str(exc))
+            return False
+        return True
+
+    def adapter_result(*_args, **_kwargs):
+        dispatch_count = (
+            database.get_connection()
+            .execute("SELECT COUNT(*) FROM wallet_effect_dispatches")
+            .fetchone()[0]
+        )
+        assert dispatch_count == 1
+        assert prepare_after_dispatch(f"during-{boundary}-{authority_change}") is False
+        authority_row = (
+            database.get_connection()
+            .execute(
+                "SELECT authority_json FROM wallet_effect_claim_authorities "
+                "ORDER BY recorded_at DESC, claim_token DESC LIMIT 1"
+            )
+            .fetchone()
+        )
+        marker = database._wallet_effect_authority_identity_sha256(
+            json.loads(str(authority_row["authority_json"]))
+        )
+        if authority_change == "heartbeat":
+            clock["now"] += timedelta(seconds=1)
+            assert runtime.heartbeat()["heartbeat"] is True
+        else:
+            database.get_connection().execute(
+                "UPDATE runtime_mutation_lease "
+                "SET owner_run_id='replacement-owner', owner_pid=5252, "
+                "    acquired_at=?, lease_version=lease_version+1 "
+                "WHERE singleton_id=1",
+                (AFTER,),
+            )
+            database.get_connection().commit()
+        return {
+            "success": False,
+            "_catalyst_effect_attempted": False,
+            "_catalyst_wallet_authority_sha256": marker,
+        }
+
+    if boundary == "coin_manager":
+        result = coin_manager._run_claimed_wallet_effect(
+            "coin_manager.split_sage",
+            adapter_result,
+            source_coin_ids=[source_coin_id],
+        )
+    else:
+        worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+        worker._is_subprocess = False
+        worker.log = lambda _message: None
+        result = worker._call_wallet_mutation(
+            "coin_prep.split_single_sage",
+            adapter_result,
+            target_coin_id=source_coin_id,
+            fee_mojos=0,
+        )
+
+    assert result["_catalyst_effect_attempted"] is False
+    outcome = (
+        database.get_connection()
+        .execute("SELECT outcome FROM wallet_effect_claim_resolutions")
+        .fetchone()[0]
+    )
+    assert any("wallet effect claim" in denial.lower() for denial in task4_denials)
+    if authority_change == "heartbeat":
+        assert outcome == "RELEASED_NO_EFFECT"
+        assert prepare_after_dispatch(f"after-{boundary}") is True
+    else:
+        assert outcome == "UNKNOWN"
+        assert prepare_after_dispatch(f"after-{boundary}") is False
+
+
+def test_malformed_prior_coin_outcome_does_not_remain_an_availability_authority(
+    isolated_database,
+):
+    _result, proof = _seed_authoritative_fill(suffix="malformed-prior-coin-outcome")
+    conn = database.get_connection()
+    conn.execute("DROP TRIGGER offer_operation_journal_no_update")
+    conn.execute(
+        "UPDATE offer_operation_journal SET attempt=2 WHERE event_id=?",
+        (f"reconcile:{proof['intent_id']}:attempt:1:finalized",),
+    )
+    conn.execute(
+        """CREATE TRIGGER offer_operation_journal_no_update
+        BEFORE UPDATE ON offer_operation_journal
+        BEGIN
+            SELECT RAISE(ABORT, 'offer_operation_journal is append-only');
+        END"""
+    )
+    conn.commit()
+    _clear_fill_authority_closure_watermark(conn)
+
+    database._migrate_fill_authority_closure(conn)
+
+    available = conn.execute(
+        "SELECT coin_id FROM coins WHERE coin_id=? AND "
+        + database._authoritative_coin_available_predicate(),
+        (proof["coin_id"],),
+    ).fetchall()
+    assert [row["coin_id"] for row in available] == [proof["coin_id"]]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_authority_migration_audit "
+            "WHERE authority_type='coin' AND subject_id=? "
+            "AND reason_code='MALFORMED_COIN_OUTCOME_QUARANTINED'",
+            (proof["coin_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_prior_coin_outcome_outside_selected_cohort_is_quarantined_on_upgrade(
+    isolated_database,
+):
+    _result, proof = _seed_authoritative_fill(suffix="prior-outcome-wrong-member")
+    wrong_coin_id = database.norm_coin_id(
+        hashlib.sha256(b"prior-outcome-wrong-member").hexdigest()
+    )
+    assert wrong_coin_id != proof["coin_id"]
+    assert database.upsert_coin(wrong_coin_id, "xch", 1000, tier="none")
+    conn = database.get_connection()
+    conn.execute("DROP TRIGGER offer_reconciliation_coin_outcomes_proof_guard_v2")
+    cursor = conn.execute(
+        "INSERT INTO offer_reconciliation_coin_outcomes "
+        "(coin_id, intent_id, trade_id, outcome, disposition, terminal_event_id, "
+        " evidence_sha256, recorded_at) "
+        "SELECT ?, intent_id, trade_id, outcome, disposition, terminal_event_id, "
+        "       evidence_sha256, recorded_at "
+        "FROM offer_reconciliation_coin_outcomes WHERE coin_id=?",
+        (wrong_coin_id, proof["coin_id"]),
+    )
+    forged_sequence = int(cursor.lastrowid)
+    conn.commit()
+    _clear_fill_authority_closure_watermark(conn)
+
+    database._migrate_fill_authority_closure(conn)
+
+    quarantine = conn.execute(
+        "SELECT reason_code FROM offer_reconciliation_coin_outcome_quarantine "
+        "WHERE outcome_sequence=?",
+        (forged_sequence,),
+    ).fetchone()
+    assert quarantine is not None
+    assert quarantine["reason_code"] == "MALFORMED_COIN_OUTCOME"
+    available = conn.execute(
+        "SELECT coin_id FROM coins WHERE coin_id=? AND "
+        + database._authoritative_coin_available_predicate(),
+        (wrong_coin_id,),
+    ).fetchall()
+    assert [row["coin_id"] for row in available] == [wrong_coin_id]
+
+
+def test_boost_and_sweep_process_effect_boundaries_include_durable_acknowledgement():
+    source = inspect.getsource(offer_reconciliation._post_fill_hook_callbacks)
+    boost_boundary = source[
+        source.index(
+            "with database.offer_fill_process_effect_authority("
+        ) : source.index("    def classification")
+    ]
+    sweep_start = source.index(
+        "with database.offer_fill_process_effect_authority(",
+        source.index("    def sweep_registration"),
+    )
+    sweep_boundary = source[sweep_start : source.index("    return {", sweep_start)]
+
+    assert (
+        "complete_authoritative_boost_fill_command"
+        in boost_boundary.split("        try:", 1)[0]
+    )
+    assert (
+        "acknowledge_authoritative_sweep_registration"
+        in sweep_boundary.split("        except Exception", 1)[0]
+    )
+
+
+def test_sweep_startup_restore_serializes_receipt_revocation_through_process_apply(
+    isolated_database, monkeypatch
+):
+    import sweep_coordinator
+
+    coordinator = sweep_coordinator.SweepCoordinator(window_secs=15)
+    result, _proof = _seed_authoritative_fill(suffix="sweep-restore-process-fence")
+    fill = database.get_authoritative_fill_by_id(result["fill_id"])
+    claim = database.claim_offer_fill_hook(fill["fill_id"], "sweep_registration")
+    database.register_authoritative_sweep_fill(
+        fill["fill_id"],
+        {
+            "trade_id": fill["trade_id"],
+            "classification": "unknown",
+            "spent_block_index": fill["spent_block_height"],
+            "taker_puzzle_hash": None,
+            "sweep_group_id": None,
+            "side": fill["side"],
+        },
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    entered = threading.Event()
+    release_apply = threading.Event()
+    revoked = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+    original_process = coordinator.process_authoritative_fill
+
+    def gated_process(fill_id, classification):
+        order.append("restore-start")
+        entered.set()
+        assert release_apply.wait(timeout=5)
+        result = original_process(fill_id, classification)
+        order.append("restore-end")
+        return result
+
+    monkeypatch.setattr(coordinator, "process_authoritative_fill", gated_process)
+
+    def restore() -> None:
+        try:
+            coordinator._restore_authoritative_registrations()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def revoke() -> None:
+        try:
+            database.revoke_offer_fill_authority(
+                fill["fill_id"],
+                reason_code="TEST_SWEEP_RESTORE_PROCESS_FENCE",
+                evidence={"fixture": "Sweep restore process fence"},
+                revoked_at=AFTER,
+            )
+            order.append("revoked")
+            revoked.set()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    restore_thread = threading.Thread(target=restore)
+    restore_thread.start()
+    assert entered.wait(timeout=5)
+    revoke_thread = threading.Thread(target=revoke)
+    revoke_thread.start()
+    revocation_interleaved = revoked.wait(timeout=0.1)
+    release_apply.set()
+    restore_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+
+    assert not restore_thread.is_alive()
+    assert not revoke_thread.is_alive()
+    assert errors == []
+    assert revocation_interleaved is False
+    assert order == ["restore-start", "restore-end", "revoked"]
+    assert "authoritative_sweep_restore_effect_authority" in inspect.getsource(
+        sweep_coordinator.SweepCoordinator._restore_authoritative_registrations
+    )
+
+
+def test_economic_fill_dedupe_uses_immutable_selected_coin_authority(
+    isolated_database,
+):
+    first, first_proof = _seed_authoritative_fill(suffix="immutable-dedupe-first")
+    second, second_proof = _seed_authoritative_fill(suffix="immutable-dedupe-second")
+    assert first_proof["coin_id"] != second_proof["coin_id"]
+    first_fill = database.get_authoritative_fill_by_id(first["fill_id"])
+    second_fill = database.get_authoritative_fill_by_id(second["fill_id"])
+    conn = database.get_connection()
+    attacker_coin_id = hashlib.sha256(b"mutable-shared-offer-coin").hexdigest()
+    conn.execute(
+        "UPDATE offers SET coin_id=? WHERE trade_id IN (?, ?)",
+        (attacker_coin_id, first_fill["trade_id"], second_fill["trade_id"]),
+    )
+    conn.commit()
+
+    fill_ids = database._get_economic_verified_fill_ids(conn, ASSET)
+
+    assert sorted(fill_ids) == sorted([first["fill_id"], second["fill_id"]])
+    stats = database.get_stats(ASSET)
+    assert stats["total_fills"] == 2
+    assert stats["duplicate_fill_rows"] == 0
+
+
+def test_unrelated_revocation_does_not_invalidate_current_fill_claim(
+    isolated_database,
+):
+    subject, _subject_proof = _seed_authoritative_fill(
+        suffix="unrelated-revocation-subject"
+    )
+    unrelated, _unrelated_proof = _seed_authoritative_fill(
+        suffix="unrelated-revocation-other"
+    )
+    subject_fill = database.get_authoritative_fill_by_id(subject["fill_id"])
+    claim = database.claim_offer_fill_hook(subject["fill_id"], "boost_notification")
+    acknowledgement = database.record_offer_fill_hook_sink_ack(
+        subject["fill_id"],
+        "boost_notification",
+        {"trade_id": subject_fill["trade_id"], "applicable": False},
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    database.revoke_offer_fill_authority(
+        unrelated["fill_id"],
+        reason_code="TEST_UNRELATED_REVOCATION",
+        evidence={"fixture": "unrelated fill only"},
+        revoked_at=AFTER,
+    )
+
+    assert database.validate_offer_fill_hook_sink_ack(
+        subject["fill_id"],
+        "boost_notification",
+        acknowledgement,
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+    assert database.complete_offer_fill_hook(
+        subject["fill_id"],
+        "boost_notification",
+        claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+    )
+
+
+def test_terminal_classifier_has_no_implicit_wall_clock_default():
+    source = inspect.getsource(offer_reconciliation._classify_terminal_evidence)
+    assert "datetime.now(" not in source
+    assert "NOW_TIMESTAMP_REQUIRED" in source
+
+
+def test_fill_tracker_retry_docs_describe_source_truth_not_spacescan_only():
+    import fill_tracker
+
+    initializer = inspect.getsource(fill_tracker.FillTracker.__init__)
+    retry = inspect.getsource(fill_tracker.FillTracker._retry_pending_reverify)
+    assert "source-truth verification" in initializer
+    assert "source-truth verification" in retry
+    assert "Re-run Spacescan verification" not in retry

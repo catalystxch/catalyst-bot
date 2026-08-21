@@ -44,6 +44,27 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
         ).throw(
             AssertionError("read-only selectable view must not resolve a wallet effect")
         )
+        fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "read-only selectable view must not dispatch a wallet effect"
+            )
+        )
+        fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "read-only selectable view must not complete a wallet effect"
+            )
+        )
+        fake_database.retain_wallet_effect_claim_for_reconciliation = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "read-only selectable view must not retain a wallet effect"
+                )
+            )
+        )
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: (
             _ for _ in ()
         ).throw(
