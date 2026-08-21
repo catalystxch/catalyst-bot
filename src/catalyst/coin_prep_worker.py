@@ -253,6 +253,22 @@ except ImportError:
     DB_AVAILABLE = False
 
 
+def get_recoverable_coin_prep_operations(*args, **kwargs):
+    """Load the Task 12 recovery API without widening DB bootstrap coupling."""
+
+    from database import get_recoverable_coin_prep_operations as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def record_coin_prep_operation_outcome(*args, **kwargs):
+    """Load the Task 12 outcome API without widening DB bootstrap coupling."""
+
+    from database import record_coin_prep_operation_outcome as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
 def _mark_coin_already_advised(coin_id: str) -> None:
     """Suppress the deposit-advisory alert for a coin that coin prep itself
     just created/designated as reserve. Without this the advisor treats
@@ -1164,6 +1180,10 @@ class CoinPrepWorker:
             return coin_id
         return coin_id if coin_id.startswith("0x") else "0x" + coin_id
 
+    @staticmethod
+    def _purpose_for_tier(tier_name: str | None) -> str:
+        return "fee_reserve" if tier_name == "fees" else "replacement"
+
     def _designate_coins_from_snapshot(
         self,
         wallet_id: int,
@@ -1196,7 +1216,10 @@ class CoinPrepWorker:
             try:
                 upsert_coin(coin_id, wallet_type, amount)
                 set_coin_designation(
-                    coin_id, designation, assigned_tier=tier_name or "none"
+                    coin_id,
+                    designation,
+                    assigned_tier=tier_name or "none",
+                    purpose=self._purpose_for_tier(tier_name),
                 )
                 count += 1
             except Exception as e:
@@ -1260,7 +1283,12 @@ class CoinPrepWorker:
                 # If amount matches tier size (exact) → tier_spare
                 # If amount doesn't match → it's the topup pool change coin
                 if expected_mojos > 0 and amount == expected_mojos:
-                    set_coin_designation(cid, "tier_spare", assigned_tier=tier_name)
+                    set_coin_designation(
+                        cid,
+                        "tier_spare",
+                        assigned_tier=tier_name,
+                        purpose=self._purpose_for_tier(tier_name),
+                    )
                     tier_count += 1
                 else:
                     # Likely the topup pool change coin — track the largest one
@@ -1278,7 +1306,12 @@ class CoinPrepWorker:
         # (internally stored as 'reserve' in the DB; displayed as 'topup pool' in logs)
         if reserve_coin:
             try:
-                designate_reserve(reserve_coin[0], wallet_type, reserve_coin[1])
+                designate_reserve(
+                    reserve_coin[0],
+                    wallet_type,
+                    reserve_coin[1],
+                    purpose="top_up",
+                )
                 _mark_coin_already_advised(reserve_coin[0])
                 self.log(
                     f"   DB: topup pool coin {wallet_type} → {reserve_coin[0][:16]}... "
@@ -1306,7 +1339,9 @@ class CoinPrepWorker:
             if coin_id:
                 try:
                     upsert_coin(coin_id, wallet_type, amount)
-                    designate_reserve(coin_id, wallet_type, amount)
+                    designate_reserve(
+                        coin_id, wallet_type, amount, purpose="top_up"
+                    )
                     _mark_coin_already_advised(coin_id)
                     self.log(
                         f"   DB: post-consolidation {wallet_type} topup pool coin → "
@@ -1893,7 +1928,10 @@ class CoinPrepWorker:
                         continue
                     try:
                         result = set_coin_designation(
-                            coin_id, "tier_spare", assigned_tier=tier_name
+                            coin_id,
+                            "tier_spare",
+                            assigned_tier=tier_name,
+                            purpose=self._purpose_for_tier(tier_name),
                         )
                         if result:
                             desig_ok += 1
@@ -1913,7 +1951,10 @@ class CoinPrepWorker:
                 reserve_amount = reserve_candidate.get("amount", 0)
                 try:
                     result = designate_reserve(
-                        reserve_coin_id, wallet_type, reserve_amount
+                        reserve_coin_id,
+                        wallet_type,
+                        reserve_amount,
+                        purpose="top_up",
                     )
                     if result:
                         desig_ok += 1
@@ -4299,7 +4340,10 @@ class CoinPrepWorker:
                                     try:
                                         upsert_coin(cid, wallet_type, coin_size_mojos)
                                         set_coin_designation(
-                                            cid, "tier_spare", assigned_tier=tier_name
+                                            cid,
+                                            "tier_spare",
+                                            assigned_tier=tier_name,
+                                            purpose=self._purpose_for_tier(tier_name),
                                         )
                                         db_recorded += 1
                                     except Exception as dbe:
@@ -7589,6 +7633,108 @@ class CoinPrepWorker:
             self.log(f"Post-prep drift status update failed: {status_err}")
         return False
 
+    def _verify_authoritative_post_operation_view(
+        self,
+        *,
+        operation_id: str,
+        source_coin_ids: list[str],
+        expected_outputs: list[dict],
+        authoritative_view: dict,
+        expected_wallet_identity: dict,
+    ) -> bool:
+        """Commit success only for one exact, fresh post-effect wallet view."""
+
+        from replacement_capacity import verify_coin_prep_post_view
+
+        decision = verify_coin_prep_post_view(
+            source_coin_ids=source_coin_ids,
+            expected_outputs=expected_outputs,
+            authoritative_view=authoritative_view,
+            expected_wallet_identity=expected_wallet_identity,
+        )
+        outcome = "CONFIRMED" if decision.confirmed else "SUBMITTED_UNKNOWN"
+        evidence = {
+            "reason_code": decision.reason or "authoritative_post_view_confirmed",
+            "output_coin_ids": list(decision.output_coin_ids),
+        }
+        try:
+            record_coin_prep_operation_outcome(
+                operation_id,
+                outcome=outcome,
+                evidence_json=evidence,
+            )
+        except Exception as exc:
+            self.log(
+                f"Coin prep authoritative outcome could not be persisted: {exc}"
+            )
+            return False
+        if decision.confirmed:
+            return True
+        error = f"POST_PREP_AUTHORITY_UNRESOLVED: {decision.reason}"
+        self.log(error)
+        try:
+            self.update_status(
+                PrepPhase.ERROR,
+                0.99,
+                "Authoritative post-operation coin view is unresolved",
+                error=error,
+            )
+        except Exception as exc:
+            self.log(f"Post-operation authority status update failed: {exc}")
+        return False
+
+    def _recover_coin_prep_operations_read_only(self, observer) -> bool:
+        """Resolve PREPARED/effect-unknown rows by observation, never replay."""
+
+        if not callable(observer):
+            raise TypeError("coin prep recovery observer must be callable")
+        try:
+            operations = get_recoverable_coin_prep_operations()
+        except Exception as exc:
+            self.log(f"Coin prep recovery inventory unavailable: {exc}")
+            return False
+        all_confirmed = True
+        for operation in operations:
+            try:
+                source_coin_ids = json.loads(operation["source_coin_ids_json"])
+                expected_identity = json.loads(operation["wallet_identity_json"])
+                observation = observer(dict(operation))
+                if type(observation) is not dict:
+                    if operation.get("outcome") == "PREPARED":
+                        record_coin_prep_operation_outcome(
+                            operation["operation_id"],
+                            outcome="SUBMITTED_UNKNOWN",
+                            evidence_json={
+                                "reason_code": "authoritative_observation_unavailable",
+                                "output_coin_ids": [],
+                            },
+                        )
+                    all_confirmed = False
+                    continue
+                expected_outputs = observation.get("expected_outputs")
+                authoritative_view = observation.get("authoritative_view")
+                if not self._verify_authoritative_post_operation_view(
+                    operation_id=operation["operation_id"],
+                    source_coin_ids=source_coin_ids,
+                    expected_outputs=expected_outputs,
+                    authoritative_view=authoritative_view,
+                    expected_wallet_identity=expected_identity,
+                ):
+                    all_confirmed = False
+            except Exception as exc:
+                self.log(
+                    "Coin prep recovery observation was malformed for "
+                    f"{operation.get('operation_id', '?')}: {exc}"
+                )
+                all_confirmed = False
+        return all_confirmed
+
+    @staticmethod
+    def _observe_recoverable_coin_prep_operation(_operation: dict):
+        """Default restart observer fails closed until exact outputs are available."""
+
+        return None
+
     def run_full_preparation(self) -> bool:
         """
         Execute complete coin preparation flow with PARALLEL OPTIMIZATION
@@ -7603,6 +7749,16 @@ class CoinPrepWorker:
         Total time: ~1.7 minutes (was ~3 minutes)
         """
         try:
+            if self._db_ready and not self._recover_coin_prep_operations_read_only(
+                self._observe_recoverable_coin_prep_operation
+            ):
+                self.update_status(
+                    PrepPhase.ERROR,
+                    0.0,
+                    "Unresolved prior coin-prep operation requires observation",
+                    error="COIN_PREP_RECOVERY_UNRESOLVED",
+                )
+                return False
             self.update_status(PrepPhase.ANALYZING, 0.05, "Analyzing current state...")
 
             # Get initial state

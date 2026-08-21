@@ -1374,6 +1374,9 @@ CREATE TABLE IF NOT EXISTS coins (
     status          TEXT NOT NULL DEFAULT 'free'
                     CHECK(status IN ('free', 'locked', 'spent', 'gone')),
     trade_id        TEXT,
+    purpose         TEXT CHECK(purpose IS NULL OR purpose IN (
+                        'lifecycle', 'replacement', 'fill_response',
+                        'operator_recovery', 'top_up', 'fee_reserve')),
     first_seen      TEXT NOT NULL,
     last_seen       TEXT NOT NULL
 );
@@ -1395,6 +1398,28 @@ CREATE INDEX IF NOT EXISTS idx_events_time ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_coins_status ON coins(status);
 CREATE INDEX IF NOT EXISTS idx_coins_wallet ON coins(wallet_type);
 CREATE INDEX IF NOT EXISTS idx_coins_trade ON coins(trade_id);
+
+-- Task 12: exact idempotent split/combine contracts.  PREPARED is committed
+-- before wallet dispatch; every later outcome retains the immutable contract.
+CREATE TABLE IF NOT EXISTS coin_prep_operations (
+    operation_id           TEXT PRIMARY KEY,
+    operation_kind         TEXT NOT NULL CHECK(operation_kind IN ('split', 'combine')),
+    purpose                TEXT NOT NULL CHECK(purpose IN (
+                               'lifecycle', 'replacement', 'fill_response',
+                               'operator_recovery', 'top_up', 'fee_reserve')),
+    source_coin_ids_json   TEXT NOT NULL,
+    target_contract_json   TEXT NOT NULL,
+    wallet_identity_json   TEXT NOT NULL,
+    prepared_evidence_json TEXT NOT NULL,
+    outcome                TEXT NOT NULL CHECK(outcome IN (
+                               'PREPARED', 'CONFIRMED',
+                               'SUBMITTED_UNKNOWN', 'FAILED')),
+    outcome_evidence_json  TEXT,
+    prepared_at            TEXT NOT NULL,
+    finalized_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_coin_prep_operations_recovery
+    ON coin_prep_operations(outcome, prepared_at, operation_id);
 
 -- Simple key-value settings table (persists across restarts)
 CREATE TABLE IF NOT EXISTS bot_settings (
@@ -4931,7 +4956,7 @@ def _migrate_fill_authority_closure(conn: sqlite3.Connection) -> None:
             if coin_row is not None:
                 conn.execute(
                     "UPDATE coins SET status='spent', trade_id=?, "
-                    "designation='unknown', assigned_tier='none', last_seen=? "
+                    "designation='unknown', assigned_tier='none', purpose=NULL, last_seen=? "
                     "WHERE coin_id=?",
                     (first_spent["trade_id"], audited_at, coin_id),
                 )
@@ -5247,12 +5272,17 @@ def _init_database_impl():
                 status          TEXT NOT NULL DEFAULT 'free'
                                 CHECK(status IN ('free', 'locked', 'spent', 'gone')),
                 trade_id        TEXT,
+                purpose         TEXT CHECK(purpose IS NULL OR purpose IN (
+                                    'lifecycle', 'replacement', 'fill_response',
+                                    'operator_recovery', 'top_up', 'fee_reserve')),
                 first_seen      TEXT NOT NULL,
                 last_seen       TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_coins_status ON coins(status);
             CREATE INDEX IF NOT EXISTS idx_coins_wallet ON coins(wallet_type);
             CREATE INDEX IF NOT EXISTS idx_coins_trade ON coins(trade_id);
+            CREATE INDEX IF NOT EXISTS idx_coins_purpose
+                ON coins(purpose, wallet_type, status);
         """)
         conn.commit()
         log_event(
@@ -5276,6 +5306,25 @@ def _init_database_impl():
         conn.execute("ALTER TABLE coins ADD COLUMN assigned_tier TEXT DEFAULT 'none'")
         conn.commit()
         log_event("info", "db_migration", "Added 'assigned_tier' column to coins table")
+
+    # Task 12: an unclassified legacy coin is intentionally ambiguous and
+    # contributes zero spendable capacity until explicitly purposed.
+    try:
+        conn.execute("SELECT purpose FROM coins LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute(
+            """ALTER TABLE coins ADD COLUMN purpose TEXT
+               CHECK(purpose IS NULL OR purpose IN (
+                   'lifecycle', 'replacement', 'fill_response',
+                   'operator_recovery', 'top_up', 'fee_reserve'))"""
+        )
+        conn.commit()
+        log_event("info", "db_migration", "Added exact 'purpose' column to coins table")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_coins_purpose "
+        "ON coins(purpose, wallet_type, status)"
+    )
+    conn.commit()
 
     # Migration: create trading_pace table for adaptive replenishment
     conn.executescript("""
@@ -6433,14 +6482,14 @@ def update_offer_status(trade_id: str, status: str) -> bool:
             if coarse_status in {"filled", "cancelled"}:
                 conn.execute(
                     "UPDATE coins SET status='spent', last_seen=?, "
-                    "designation='unknown', assigned_tier='none' "
+                    "designation='unknown', assigned_tier='none', purpose=NULL "
                     "WHERE trade_id=? AND status='locked'",
                     (now, trade_id),
                 )
                 if row and row["coin_id"]:
                     conn.execute(
                         "UPDATE coins SET status='spent', last_seen=?, "
-                        "designation='unknown', assigned_tier='none' "
+                        "designation='unknown', assigned_tier='none', purpose=NULL "
                         "WHERE coin_id=? AND status='locked'",
                         (now, row["coin_id"]),
                     )
@@ -7398,6 +7447,14 @@ def get_trade_dexie_map(cat_asset_id: str = None) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _validated_coin_purpose(value: Any, *, allow_none: bool = True) -> Optional[str]:
+    if value is None and allow_none:
+        return None
+    from replacement_capacity import validate_purpose
+
+    return validate_purpose(value)
+
+
 def upsert_coin(
     coin_id: str,
     wallet_type: str,
@@ -7405,6 +7462,7 @@ def upsert_coin(
     tier: str = None,
     designation: str = None,
     assigned_tier: str = None,
+    purpose: str = None,
     **kwargs,
 ) -> bool:
     """Insert a new coin or update last_seen if it already exists.
@@ -7425,6 +7483,7 @@ def upsert_coin(
         designation: Role designation (reserve/tier_spare/tier_active/dust/unknown)
         assigned_tier: Which tier this coin serves (inner/mid/outer/extreme/none)
     """
+    safe_purpose = _validated_coin_purpose(purpose)
     conn = None
     started_transaction = False
     try:
@@ -7446,7 +7505,7 @@ def upsert_coin(
 
         # Check if coin already exists and its current status (for logging)
         existing = conn.execute(
-            "SELECT status, amount_mojos, designation FROM coins WHERE coin_id=?",
+            "SELECT status, amount_mojos, designation, purpose FROM coins WHERE coin_id=?",
             (coin_id,),
         ).fetchone()
         # Try INSERT first, on conflict update last_seen and potentially status
@@ -7456,8 +7515,9 @@ def upsert_coin(
         # - REAPPEARING coins (was 'gone'): reset designation to 'unknown'
         conn.execute(
             """INSERT INTO coins (coin_id, wallet_type, amount_mojos, tier, status,
-                                  first_seen, last_seen, designation, assigned_tier)
-               VALUES (?, ?, ?, ?, 'free', ?, ?, ?, ?)
+                                  first_seen, last_seen, designation, assigned_tier,
+                                  purpose)
+               VALUES (?, ?, ?, ?, 'free', ?, ?, ?, ?, ?)
                ON CONFLICT(coin_id) DO UPDATE SET
                    last_seen = ?,
                    tier = COALESCE(?, tier),
@@ -7473,6 +7533,10 @@ def upsert_coin(
                    assigned_tier = CASE
                        WHEN coins.status = 'gone' THEN 'none'
                        ELSE COALESCE(coins.assigned_tier, 'none')
+                   END,
+                   purpose = CASE
+                       WHEN coins.status = 'gone' THEN NULL
+                       ELSE coins.purpose
                    END""",
             (
                 coin_id,
@@ -7483,6 +7547,7 @@ def upsert_coin(
                 now,
                 desig,
                 atier,
+                safe_purpose,
                 now,
                 tier,
                 amount_mojos,
@@ -7507,6 +7572,7 @@ def upsert_coin(
                     "wallet_type": wallet_type,
                     "is_new": True,
                     "reappearing": False,
+                    "purpose": safe_purpose,
                 },
             )
         elif existing["status"] == "gone":
@@ -7559,6 +7625,7 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
                 wallet_type,
                 c["amount_mojos"],
                 tier=c.get("tier", "unknown"),
+                purpose=c.get("purpose"),
                 _skip_commit=True,
             )
             count += 1
@@ -7754,7 +7821,7 @@ def mark_coin_spent(coin_id: str) -> bool:
         ).fetchone()
         cursor = conn.execute(
             """UPDATE coins SET status='spent', last_seen=?,
-               designation='unknown', assigned_tier='none'
+               designation='unknown', assigned_tier='none', purpose=NULL
                WHERE coin_id=?""",
             (_now(), normalized),
         )
@@ -7843,7 +7910,7 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         # Batch UPDATE
         cursor = conn.execute(
             f"""UPDATE coins SET status='gone', last_seen=?,
-                designation='unknown', assigned_tier='none'
+                designation='unknown', assigned_tier='none', purpose=NULL
                 WHERE coin_id IN ({safe_placeholders}) AND status='free'
                   AND trade_id IS NULL""",
             [now] + safe_coin_list,
@@ -8890,6 +8957,68 @@ def get_free_coins(wallet_type: str) -> List[Dict]:
         for row in rows
         if norm_coin_id(row["coin_id"]) not in protected and row["trade_id"] is None
     ]
+
+
+def get_authoritative_coin_capacity(
+    purpose: str, *, wallet_type: Optional[str] = None
+) -> Dict[str, Any]:
+    """Return exact free capacity for one policy purpose.
+
+    Task 4 intent reservations, Task 6 effect claims, and Task 9 permanent
+    spends are all excluded.  NULL/legacy purpose rows contribute zero.
+    """
+
+    safe_purpose = _validated_coin_purpose(purpose, allow_none=False)
+    if wallet_type is not None and (
+        type(wallet_type) is not str or wallet_type not in {"xch", "cat"}
+    ):
+        raise ValueError("wallet_type must be xch, cat, or None")
+    query = (
+        "SELECT coin_id, amount_mojos, purpose FROM coins "
+        "WHERE status='free' AND trade_id IS NULL AND purpose=? AND "
+        + _authoritative_coin_available_predicate()
+    )
+    params: list[Any] = [safe_purpose]
+    if wallet_type is not None:
+        query += " AND wallet_type=?"
+        params.append(wallet_type)
+    query += " ORDER BY coin_id"
+    conn = get_connection()
+    rows = conn.execute(query, params).fetchall()
+    protected = _nonterminal_registry_coin_ids(conn)
+    coins = [
+        {
+            "coin_id": str(row["coin_id"]),
+            "amount_mojos": int(row["amount_mojos"]),
+            "purpose": str(row["purpose"]),
+            "spendable": True,
+            "authoritative": True,
+        }
+        for row in rows
+        if norm_coin_id(row["coin_id"]) not in protected
+    ]
+    from replacement_capacity import decide_capacity
+
+    decision = decide_capacity(coins, purpose=safe_purpose)
+    return {
+        "purpose": safe_purpose,
+        "wallet_type": wallet_type,
+        "count": decision.available_count,
+        "amount_mojos": decision.available_amount_mojos,
+        "coin_ids": [norm_coin_id(coin_id) for coin_id in decision.selected_coin_ids],
+        "authoritative": decision.reason != "ambiguous_coin_view",
+    }
+
+
+def get_authoritative_replacement_capacity_count(
+    *, wallet_type: Optional[str] = None
+) -> int:
+    """Task 11's explicit authoritative overlap-capacity input."""
+
+    result = get_authoritative_coin_capacity(
+        "replacement", wallet_type=wallet_type
+    )
+    return int(result["count"]) if result["authoritative"] is True else 0
 
 
 def get_smallest_free_tier_spare(wallet_type: str) -> Optional[Dict]:
@@ -9995,7 +10124,10 @@ def link_offers_to_locked_coins(active_offers: list, cat_asset_id: str) -> dict:
 
 
 def set_coin_designation(
-    coin_id: str, designation: str, assigned_tier: str = "none"
+    coin_id: str,
+    designation: str,
+    assigned_tier: str = "none",
+    purpose: str = None,
 ) -> bool:
     """Mark a coin's role (reserve, tier_spare, tier_active, dust, unknown).
 
@@ -10008,17 +10140,23 @@ def set_coin_designation(
         assigned_tier: Which tier this coin serves ('inner', 'mid', 'outer',
                        'extreme', or 'none' for reserve/dust)
     """
+    safe_purpose = _validated_coin_purpose(purpose)
     try:
         conn = get_connection()
+        coin_id = norm_coin_id(coin_id)
         # Get current state before updating (for logging changes)
         row = conn.execute(
-            "SELECT wallet_type, amount_mojos, designation AS old_desig, assigned_tier AS old_tier FROM coins WHERE coin_id=?",
+            "SELECT wallet_type, amount_mojos, designation AS old_desig, "
+            "assigned_tier AS old_tier, purpose AS old_purpose "
+            "FROM coins WHERE coin_id=?",
             (coin_id,),
         ).fetchone()
         cursor = conn.execute(
-            """UPDATE coins SET designation=?, assigned_tier=?, last_seen=?
+            """UPDATE coins SET designation=?, assigned_tier=?,
+                   purpose=CASE WHEN ? IS NULL THEN purpose ELSE ? END,
+                   last_seen=?
                WHERE coin_id=?""",
-            (designation, assigned_tier, _now(), coin_id),
+            (designation, assigned_tier, safe_purpose, safe_purpose, _now(), coin_id),
         )
         conn.commit()
         if cursor.rowcount == 0:
@@ -10047,6 +10185,7 @@ def set_coin_designation(
                         "assigned_tier": assigned_tier,
                         "old_designation": old_d,
                         "old_assigned_tier": old_t,
+                        "purpose": safe_purpose or row["old_purpose"],
                     },
                 )
         return True
@@ -10103,7 +10242,12 @@ def get_reserve_coins(wallet_type: str) -> List[Dict]:
     return get_coins_by_designation(wallet_type, "reserve")
 
 
-def designate_reserve(coin_id: str, wallet_type: str, amount_mojos: int) -> bool:
+def designate_reserve(
+    coin_id: str,
+    wallet_type: str,
+    amount_mojos: int,
+    purpose: str = None,
+) -> bool:
     """Shorthand to mark a coin as reserve.
 
     Also logs the designation for visibility.
@@ -10113,7 +10257,7 @@ def designate_reserve(coin_id: str, wallet_type: str, amount_mojos: int) -> bool
         wallet_type: 'xch' or 'cat'
         amount_mojos: Size (for logging only)
     """
-    result = set_coin_designation(coin_id, "reserve", "none")
+    result = set_coin_designation(coin_id, "reserve", "none", purpose=purpose)
     if result:
         if wallet_type == "xch":
             xch_val = amount_mojos / 1_000_000_000_000
@@ -19352,6 +19496,246 @@ def finalize_offer_cancel(
         conn.close()
 
 
+def _canonical_coin_prep_wallet_identity(value: Any) -> tuple[str, str, str]:
+    """Return canonical Task 5 identity payload, fingerprint hash, and network."""
+
+    if type(value) is not dict:
+        raise ValueError("coin prep wallet identity must be an exact mapping")
+    import mutation_gate
+
+    binding = mutation_gate.WalletIdentityBinding(**value)
+    if type(binding) is not mutation_gate.WalletIdentityBinding:
+        raise ValueError("coin prep wallet identity binding is invalid")
+    payload = mutation_gate.wallet_identity_binding_payload(binding)
+    if payload != value:
+        raise ValueError("coin prep wallet identity is not canonical")
+    encoded = _canonical_json_text(
+        payload,
+        "coin prep wallet identity",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    return (
+        encoded,
+        mutation_gate.wallet_fingerprint_hash(binding.fingerprint),
+        binding.network_id,
+    )
+
+
+def prepare_coin_prep_operation(
+    *,
+    operation_kind: str,
+    purpose: str,
+    source_coin_ids: list[str],
+    target_contract: dict[str, Any],
+    wallet_identity_json: dict[str, Any],
+    evidence_json: Any,
+    prepared_at: Any = None,
+) -> Dict[str, Any]:
+    """Persist one deterministic PREPARED split/combine before wallet effect."""
+
+    from replacement_capacity import canonical_coin_prep_contract
+
+    contract = canonical_coin_prep_contract(
+        operation_kind=operation_kind,
+        purpose=purpose,
+        source_coin_ids=source_coin_ids,
+        target_contract=target_contract,
+    )
+    source_json = _canonical_json_text(
+        contract["source_coin_ids"],
+        "coin prep source cohort",
+        expected_type=list,
+        max_bytes=65536,
+    )
+    target_json = _canonical_json_text(
+        contract["target_contract"],
+        "coin prep target contract",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    wallet_json, _wallet_hash, _network = _canonical_coin_prep_wallet_identity(
+        wallet_identity_json
+    )
+    prepared_evidence = _canonical_json_text(
+        evidence_json,
+        "coin prep prepared evidence",
+        expected_type=dict,
+        default={},
+        max_bytes=65536,
+    )
+    when = _stability_timestamp_or_now(prepared_at, "coin prep prepared_at")
+    immutable = {
+        "operation_id": contract["operation_id"],
+        "operation_kind": contract["operation_kind"],
+        "purpose": contract["purpose"],
+        "source_coin_ids_json": source_json,
+        "target_contract_json": target_json,
+        "wallet_identity_json": wallet_json,
+        "prepared_evidence_json": prepared_evidence,
+        "prepared_at": when,
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (contract["operation_id"],),
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            contract_keys = tuple(key for key in immutable if key != "prepared_at")
+            if any(row[key] != immutable[key] for key in contract_keys):
+                raise ValueError(
+                    "coin prep operation identity has a different durable contract"
+                )
+            conn.commit()
+            return {"operation": row, "idempotent": True}
+        conn.execute(
+            """
+            INSERT INTO coin_prep_operations (
+                operation_id, operation_kind, purpose, source_coin_ids_json,
+                target_contract_json, wallet_identity_json,
+                prepared_evidence_json, outcome, outcome_evidence_json,
+                prepared_at, finalized_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, NULL)
+            """,
+            (
+                immutable["operation_id"],
+                immutable["operation_kind"],
+                immutable["purpose"],
+                immutable["source_coin_ids_json"],
+                immutable["target_contract_json"],
+                immutable["wallet_identity_json"],
+                immutable["prepared_evidence_json"],
+                immutable["prepared_at"],
+            ),
+        )
+        row = dict(
+            conn.execute(
+                "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+                (contract["operation_id"],),
+            ).fetchone()
+        )
+        conn.commit()
+        return {"operation": row, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_operation_outcome(
+    operation_id: str,
+    *,
+    outcome: str,
+    evidence_json: Any,
+    finalized_at: Any = None,
+) -> Dict[str, Any]:
+    """Record a bounded result; unknown effects durably trip mutation safety."""
+
+    safe_operation_id = _required_stability_text(operation_id, "operation_id")
+    if type(outcome) is not str or outcome not in {
+        "CONFIRMED",
+        "SUBMITTED_UNKNOWN",
+        "FAILED",
+    }:
+        raise ValueError("coin prep outcome is invalid")
+    evidence = _canonical_json_text(
+        evidence_json,
+        "coin prep outcome evidence",
+        expected_type=dict,
+        default={},
+        max_bytes=65536,
+    )
+    when = _stability_timestamp_or_now(finalized_at, "coin prep finalized_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (safe_operation_id,),
+        ).fetchone()
+        if stored is None:
+            raise ValueError("coin prep operation does not exist")
+        current = dict(stored)
+        if current["outcome"] == outcome:
+            if current["outcome_evidence_json"] != evidence:
+                raise ValueError("coin prep outcome replay evidence differs")
+            conn.commit()
+            return {"operation": current, "idempotent": True}
+        if current["outcome"] not in {"PREPARED", "SUBMITTED_UNKNOWN"}:
+            raise ValueError("coin prep operation is already terminal")
+        if current["outcome"] == "SUBMITTED_UNKNOWN" and outcome != "CONFIRMED":
+            raise ValueError("effect-unknown coin prep may resolve only from confirmation")
+        conn.execute(
+            """
+            UPDATE coin_prep_operations
+               SET outcome=?, outcome_evidence_json=?, finalized_at=?
+             WHERE operation_id=?
+            """,
+            (outcome, evidence, when, safe_operation_id),
+        )
+        identity = json.loads(current["wallet_identity_json"])
+        import mutation_gate
+
+        wallet_hash = mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+        blocking = outcome == "SUBMITTED_UNKNOWN"
+        _reconciliation_latch_update(
+            conn,
+            operation_id=safe_operation_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=identity["network_id"],
+            reason_code=(
+                "COIN_PREP_EFFECT_UNKNOWN"
+                if blocking
+                else "COIN_PREP_AUTHORITATIVE_RESOLUTION"
+            ),
+            reason=(
+                "coin prep wallet effect requires authoritative post-operation observation"
+                if blocking
+                else "coin prep operation reached an authoritative terminal result"
+            ),
+            reconciled_at=when,
+            blocking=blocking,
+        )
+        row = dict(
+            conn.execute(
+                "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+                (safe_operation_id,),
+            ).fetchone()
+        )
+        conn.commit()
+        return {"operation": row, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, Any]]:
+    """Read-only restart inventory; callers must observe, never redispatch."""
+
+    safe_limit = _exact_integer(limit, "coin prep recovery limit", minimum=1)
+    if safe_limit > 128:
+        raise ValueError("coin prep recovery limit exceeds hard limit")
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT * FROM coin_prep_operations
+             WHERE outcome IN ('PREPARED', 'SUBMITTED_UNKNOWN')
+             ORDER BY prepared_at, operation_id LIMIT ?
+            """,
+            (safe_limit,),
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
 def prepare_offer_intent(
     *,
     intent_id: str,
@@ -19364,6 +19748,7 @@ def prepare_offer_intent(
     side: str,
     tier: str,
     purpose: str,
+    coin_purpose: Optional[str] = None,
     offered_amount_atomic: Any,
     requested_amount_atomic: Any,
     selected_coin_ids_json: Any,
@@ -19382,6 +19767,7 @@ def prepare_offer_intent(
 ) -> Dict[str, Any]:
     """Atomically persist a creation intent and its PREPARED journal event."""
 
+    safe_coin_purpose = _validated_coin_purpose(coin_purpose)
     if type(reserve_selected_coins) is not bool:
         raise TypeError("reserve_selected_coins must be an exact bool")
     if type(require_new_intent) is not bool:
@@ -19604,7 +19990,7 @@ def prepare_offer_intent(
         if reserve_selected_coins and existing_state in {None, "prepared"}:
             placeholders = ",".join("?" for _ in registry_coin_ids)
             rows = conn.execute(
-                f"SELECT coin_id, status, trade_id FROM coins "
+                f"SELECT coin_id, status, trade_id, purpose FROM coins "
                 f"WHERE coin_id IN ({placeholders})",
                 registry_coin_ids,
             ).fetchall()
@@ -19612,6 +19998,13 @@ def prepare_offer_intent(
             if set(by_coin_id) != set(registry_coin_ids):
                 raise ValueError(
                     "selected coin does not exist in the durable coin registry"
+                )
+            if safe_coin_purpose is not None and any(
+                by_coin_id[coin_id]["purpose"] != safe_coin_purpose
+                for coin_id in registry_coin_ids
+            ):
+                raise ValueError(
+                    "selected coin does not belong to the required purpose"
                 )
             unavailable = [
                 coin_id
@@ -19672,7 +20065,8 @@ def get_offer_intent_coin_reservations(intent_id: str) -> List[Dict[str, Any]]:
     rows = (
         get_connection()
         .execute(
-            f"SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN ({placeholders})",
+            f"SELECT coin_id, status, trade_id, purpose FROM coins "
+            f"WHERE coin_id IN ({placeholders})",
             registry_coin_ids,
         )
         .fetchall()
@@ -19699,6 +20093,7 @@ def get_offer_intent_coin_reservations(intent_id: str) -> List[Dict[str, Any]]:
                 "reservation_identity": reservation_identity,
                 "status": state,
                 "trade_id": trade_id,
+                "purpose": row["purpose"],
             }
         )
     return result
@@ -21067,7 +21462,7 @@ def commit_offer_reconciliation(
             conn.execute(
                 f"""
                 UPDATE coins
-                SET status='spent', designation='unknown', assigned_tier='none',
+                SET status='spent', designation='unknown', assigned_tier='none', purpose=NULL,
                     last_seen=?
                 WHERE coin_id IN ({placeholders}) AND status='locked'
                   AND trade_id=?
@@ -21092,8 +21487,8 @@ def commit_offer_reconciliation(
                         INSERT INTO coins (
                             coin_id, wallet_type, amount_mojos, tier, status,
                             trade_id, first_seen, last_seen, designation,
-                            assigned_tier
-                        ) VALUES (?, ?, ?, ?, 'free', NULL, ?, ?, ?, ?)
+                            assigned_tier, purpose
+                        ) VALUES (?, ?, ?, ?, 'free', NULL, ?, ?, ?, ?, ?)
                         """,
                         (
                             rebinding["return_registry"],
@@ -21104,6 +21499,7 @@ def commit_offer_reconciliation(
                             when,
                             source["designation"],
                             source["assigned_tier"],
+                            source["purpose"],
                         ),
                     )
                 else:
@@ -21119,13 +21515,14 @@ def commit_offer_reconciliation(
                         )
                     conn.execute(
                         """
-                        UPDATE coins SET tier=?, designation=?, assigned_tier=?,
+                        UPDATE coins SET tier=?, designation=?, assigned_tier=?, purpose=?,
                             last_seen=? WHERE coin_id=?
                         """,
                         (
                             source["tier"],
                             source["designation"],
                             source["assigned_tier"],
+                            source["purpose"],
                             when,
                             rebinding["return_registry"],
                         ),
@@ -21133,7 +21530,7 @@ def commit_offer_reconciliation(
             conn.execute(
                 f"""
                 UPDATE coins
-                SET status='spent', designation='unknown', assigned_tier='none',
+                SET status='spent', designation='unknown', assigned_tier='none', purpose=NULL,
                     last_seen=?
                 WHERE coin_id IN ({placeholders}) AND status='locked'
                   AND trade_id=?

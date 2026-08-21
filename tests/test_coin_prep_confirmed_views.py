@@ -3,6 +3,7 @@ import os
 import sys
 import types
 import unittest
+import hashlib
 
 
 _MODS_TO_RESTORE = ("coin_prep_worker", "wallet_sage", "database", "wallet", "dotenv")
@@ -350,6 +351,116 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.assertTrue(state["confirmed"])
         self.assertEqual(state["confirmed_count"], 1)
         self.assertEqual(state["height"], 12345)
+
+    def test_restart_recovery_observes_prepared_operation_without_wallet_replay(self):
+        """Catches a PREPARED split being blindly submitted again after restart."""
+
+        self.assertTrue(
+            hasattr(
+                self.coin_prep_worker.CoinPrepWorker,
+                "_recover_coin_prep_operations_read_only",
+            )
+        )
+        source = hashlib.sha256(b"recover-source").hexdigest()
+        output = hashlib.sha256(b"recover-output").hexdigest()
+        identity = {
+            "backend": "sage",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "binding_digest": hashlib.sha256(b"binding").hexdigest(),
+        }
+        operation_id = "coin-prep:" + hashlib.sha256(b"recover").hexdigest()
+        operation = {
+            "operation_id": operation_id,
+            "source_coin_ids_json": '["' + source + '"]',
+            "target_contract_json": '{"outputs":[{"amount_mojos":100,"output_index":0,"purpose":"replacement"}],"wallet_type":"xch"}',
+            "wallet_identity_json": __import__("json").dumps(
+                identity, sort_keys=True, separators=(",", ":")
+            ),
+            "outcome": "PREPARED",
+        }
+        recorded = []
+        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [
+            operation
+        ]
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda op_id, **kwargs: recorded.append((op_id, kwargs))
+            or {"operation": {"operation_id": op_id, **kwargs}}
+        )
+        self.worker._call_wallet_mutation = lambda *_args, **_kwargs: self.fail(
+            "restart recovery must not dispatch a wallet effect"
+        )
+
+        recovered = self.worker._recover_coin_prep_operations_read_only(
+            lambda row: {
+                "expected_outputs": [
+                    {
+                        "coin_id": output,
+                        "amount_mojos": 100,
+                        "purpose": "replacement",
+                    }
+                ],
+                "authoritative_view": {
+                    "fresh": True,
+                    "complete": True,
+                    "wallet_identity": identity,
+                    "coins": [
+                        {
+                            "coin_id": output,
+                            "amount_mojos": 100,
+                            "purpose": "replacement",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(recorded[0][0], operation_id)
+        self.assertEqual(recorded[0][1]["outcome"], "CONFIRMED")
+
+    def test_worker_delegation_expiry_blocks_before_wallet_callback(self):
+        """Catches a once-valid worker handoff being reused after expiry."""
+
+        environment = {
+            name: f"value-{index}"
+            for index, name in enumerate(
+                self.coin_prep_worker._WORKER_DELEGATION_ENV_NAMES
+            )
+        }
+        environment[
+            self.coin_prep_worker.mutation_gate.DELEGATION_OPERATION_ENV
+        ] = "coin-prep:run-expired"
+        environment[
+            self.coin_prep_worker.mutation_gate.DELEGATION_PURPOSE_ENV
+        ] = "coin_prep"
+        environment[
+            self.coin_prep_worker.mutation_gate.DELEGATION_WORKER_ENV
+        ] = "coin-prep-worker:run-expired"
+        original = (
+            self.coin_prep_worker.mutation_gate.require_worker_allowed_from_environment
+        )
+        try:
+            self.coin_prep_worker.mutation_gate.require_worker_allowed_from_environment = (
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    self.coin_prep_worker.mutation_gate.MutationBlocked(
+                        "LEASE_EXPIRED", "coin_prep.start"
+                    )
+                )
+            )
+            with self.assertRaises(
+                self.coin_prep_worker.mutation_gate.MutationBlocked
+            ) as blocked:
+                self.coin_prep_worker._validate_coin_prep_worker_delegation(
+                    types.SimpleNamespace(
+                        sage_rpc_smoke=False, run_id="run-expired"
+                    ),
+                    environment=environment,
+                )
+        finally:
+            self.coin_prep_worker.mutation_gate.require_worker_allowed_from_environment = original
+
+        self.assertEqual(blocked.exception.reason_code, "LEASE_EXPIRED")
 
 
 if __name__ == "__main__":

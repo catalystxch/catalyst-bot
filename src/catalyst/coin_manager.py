@@ -444,6 +444,16 @@ def _revoke_coin_prep_worker_delegation(handoff):
         return {"revoked": False, "reason": "delegation_revoke_failed"}
 
 
+def get_authoritative_replacement_capacity_count_standalone(
+    wallet_type: Optional[str] = None,
+) -> int:
+    """Expose Task 12's repository count without duplicating Task 11 lineage."""
+
+    from database import get_authoritative_replacement_capacity_count
+
+    return get_authoritative_replacement_capacity_count(wallet_type=wallet_type)
+
+
 class _TopupWalletDegraded(Exception):
     """Raised when wallet RPC becomes too degraded to continue topup safely."""
 
