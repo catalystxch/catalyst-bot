@@ -7,6 +7,7 @@ planner/database behaviour rather than source text or mock call counts.
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -307,3 +308,173 @@ def test_incomplete_refresh_parent_coverage_trips_the_durable_mutation_latch(
     latch = database.get_runtime_safety_latch()
     assert latch["state"] == "tripped"
     assert "refresh-lineage:buy:coverage" in latch["blocking_operation_ids_json"]
+
+
+def test_refresh_blocker_requires_exact_repair_proof_before_latch_resolution(isolated_database):
+    """Catches synthetic refresh blockers that can never be resolved safely."""
+
+    database.init_database()
+    blocker = database.record_refresh_lineage_blocker(
+        operation_id="refresh-lineage:buy:coverage",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        side="buy",
+        asset_id=_sha("asset-a"),
+        cohort_trade_ids=[_sha("trade:repair-parent")],
+        reason_code="REGISTRY_PARENT_MISSING",
+    )
+    assert blocker["state"] == "blocking"
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    unresolved = database.resolve_refresh_lineage_blocker(
+        operation_id="refresh-lineage:buy:coverage",
+        cohort_trade_ids=[_sha("trade:repair-parent")],
+    )
+    assert unresolved["resolved"] is False
+    assert unresolved["reason"] == "cohort_not_repaired"
+    blind_clear = database.resolve_runtime_safety_latch(
+        expected_generation=latch["generation"],
+        resolved_operation_ids=["refresh-lineage:buy:coverage"],
+    )
+    assert blind_clear["resolved"] is False
+
+    _prepare("repair-parent")
+    _confirm("repair-parent")
+    repaired = database.resolve_refresh_lineage_blocker(
+        operation_id="refresh-lineage:buy:coverage",
+        cohort_trade_ids=[_sha("trade:repair-parent")],
+    )
+    assert repaired["resolved"] is True
+    assert database.resolve_refresh_lineage_blocker(
+        operation_id="refresh-lineage:buy:coverage",
+        cohort_trade_ids=[_sha("trade:repair-parent")],
+    )["idempotent"] is True
+    final_clear = database.resolve_runtime_safety_latch(
+        expected_generation=latch["generation"],
+        resolved_operation_ids=["refresh-lineage:buy:coverage"],
+    )
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert final_clear["reason"] == "not_tripped"
+
+
+def test_refresh_cohort_validation_latches_before_any_eligible_parent_cancel(
+    isolated_database, monkeypatch
+):
+    """Catches a valid early parent being cancelled before a later row is proven exact."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    database.record_offer_intent_visibility("child", publication_identity="registry:child")
+
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    manager = OfferManager.__new__(OfferManager)
+    cancelled = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids)
+    parent_trade = _sha("trade:parent")
+    missing_trade = _sha("later-unregistered-open-offer")
+
+    parents, pause = manager._collect_staged_refresh_parents(
+        [{"trade_id": parent_trade}, {"trade_id": missing_trade}], "buy"
+    )
+
+    assert parents == {}
+    assert pause == "registry_parent_missing"
+    assert cancelled == []
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+
+
+def test_requote_resumes_eligible_lineage_before_zero_spare_capacity_gate(
+    isolated_database, monkeypatch
+):
+    """Catches zero overlap capacity stranding Task 8 cancellation behind planning."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    database.record_offer_intent_visibility("child", publication_identity="registry:child")
+
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    parent_trade = _sha("trade:parent")
+    monkeypatch.setattr("offer_manager.get_open_offers", lambda **_kwargs: [{"trade_id": parent_trade}])
+    monkeypatch.setattr(database, "get_free_coins", lambda _wallet_type: [])
+    manager = OfferManager.__new__(OfferManager)
+    manager._sort_open_offers_for_requote = lambda offers, *_args, **_kwargs: offers
+    cancelled = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids) or {}
+
+    result = manager.requote_side("buy", Decimal("1"))
+
+    assert cancelled == [parent_trade]
+    assert result["refresh_paused"] is True
+
+
+def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
+    isolated_database, monkeypatch
+):
+    """Catches a restart issuing a second cancel after Task 8 reconciliation."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a", owner_pid=1, owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"), network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    database.record_offer_intent_visibility("child", publication_identity="registry:child")
+
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    monkeypatch.setattr(
+        database, "get_offer_operation_events",
+        lambda _operation_id: [{
+            "blocks_mutation": 0, "phase": "RECONCILED",
+            "outcome": "CANCEL_CONFIRMED",
+        }],
+    )
+    manager = OfferManager.__new__(OfferManager)
+    cancelled = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids)
+
+    parents, pause = manager._collect_staged_refresh_parents(
+        [{"trade_id": _sha("trade:parent")}], "buy"
+    )
+
+    assert parents == {}
+    assert pause == "awaiting_task8_task9"
+    assert cancelled == []

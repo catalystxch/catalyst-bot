@@ -3214,6 +3214,18 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_commits (
     terminal_event_id          TEXT NOT NULL UNIQUE,
     committed_at               TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
+    operation_id               TEXT PRIMARY KEY,
+    wallet_fingerprint_hash    TEXT NOT NULL,
+    network                    TEXT NOT NULL,
+    side                       TEXT NOT NULL CHECK(side IN ('buy','sell')),
+    asset_id                   TEXT NOT NULL,
+    cohort_trade_ids_json      TEXT NOT NULL,
+    reason_code                TEXT NOT NULL,
+    state                      TEXT NOT NULL CHECK(state IN ('blocking','resolved')),
+    recorded_at                TEXT NOT NULL,
+    resolved_at                TEXT
+);
 """
 
 
@@ -3643,6 +3655,11 @@ _STABILITY_REQUIRED_COLUMNS = {
         "cancel_event_id",
         "terminal_event_id",
         "committed_at",
+    },
+    "offer_refresh_lineage_blockers": {
+        "operation_id", "wallet_fingerprint_hash", "network", "side",
+        "asset_id", "cohort_trade_ids_json", "reason_code", "state",
+        "recorded_at", "resolved_at",
     },
 }
 
@@ -5051,6 +5068,7 @@ def _migrate_stability_schema() -> None:
             "offer_fill_hook_claim_attestations",
             "offer_fill_sweep_delivery_claim_attestations",
             "offer_refresh_lineage_commits",
+            "offer_refresh_lineage_blockers",
         }
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -21572,6 +21590,168 @@ def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def record_refresh_lineage_blocker(
+    *,
+    operation_id: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    side: str,
+    asset_id: str,
+    cohort_trade_ids: Any,
+    reason_code: str,
+) -> Dict[str, Any]:
+    """Persist one refresh inconsistency and trip its durable latch blocker."""
+
+    op = _required_stability_text(operation_id, "refresh operation_id")
+    if not op.startswith("refresh-lineage:"):
+        raise ValueError("refresh operation_id is invalid")
+    safe_side = _required_stability_text(side, "refresh side")
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("refresh side is invalid")
+    trades = sorted(
+        _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
+        for value in cohort_trade_ids
+    )
+    if not trades or len(trades) != len(set(trades)):
+        raise ValueError("refresh cohort trade identities are invalid")
+    values = {
+        "operation_id": op,
+        "wallet_fingerprint_hash": _required_stability_text(
+            wallet_fingerprint_hash, "wallet_fingerprint_hash"
+        ),
+        "network": _required_stability_text(network, "network"),
+        "side": safe_side,
+        "asset_id": _required_stability_text(asset_id, "asset_id"),
+        "cohort_trade_ids_json": _canonical_json_text(
+            trades, "refresh cohort_trade_ids", expected_type=list
+        ),
+        "reason_code": _required_stability_text(reason_code, "reason_code").upper(),
+        "recorded_at": _stability_wall_clock(),
+    }
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO offer_refresh_lineage_blockers (
+                    operation_id, wallet_fingerprint_hash, network, side, asset_id,
+                    cohort_trade_ids_json, reason_code, state, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'blocking', ?)""",
+                tuple(values[key] for key in (
+                    "operation_id", "wallet_fingerprint_hash", "network", "side",
+                    "asset_id", "cohort_trade_ids_json", "reason_code", "recorded_at"
+                )),
+            )
+        else:
+            current = dict(row)
+            if any(current[key] != values[key] for key in values if key != "recorded_at"):
+                raise ValueError("refresh blocker replay conflicts with durable authority")
+            if current["state"] == "resolved":
+                raise ValueError("resolved refresh blocker cannot be replayed")
+        _reconciliation_latch_update(
+            conn, operation_id=op, wallet_fingerprint_hash=values["wallet_fingerprint_hash"],
+            network=values["network"], reason_code="REFRESH_LINEAGE_INCONSISTENT",
+            reason="Refresh lineage requires authoritative reconciliation",
+            reconciled_at=values["recorded_at"], blocking=True,
+        )
+        result = dict(conn.execute(
+            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
+        ).fetchone())
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_refresh_lineage_blocker(
+    *, operation_id: str, cohort_trade_ids: Any
+) -> Dict[str, Any]:
+    """Resolve a blocker only when every recorded cohort trade is now exact."""
+
+    op = _required_stability_text(operation_id, "refresh operation_id")
+    trades = sorted(
+        _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
+        for value in cohort_trade_ids
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("refresh blocker is missing")
+        blocker = dict(row)
+        if trades != json.loads(blocker["cohort_trade_ids_json"]):
+            raise ValueError("refresh repair cohort is not exact")
+        if blocker["state"] == "resolved":
+            conn.commit()
+            return {"resolved": True, "idempotent": True, "blocker": blocker}
+        repaired = True
+        for trade_id in trades:
+            intent_row = conn.execute(
+                "SELECT * FROM offer_intents WHERE sage_trade_id=?", (trade_id,)
+            ).fetchone()
+            if intent_row is None:
+                repaired = False
+                break
+            intent = dict(intent_row)
+            if (
+                intent["side"] != blocker["side"]
+                or intent["asset_id"] != blocker["asset_id"]
+                or intent["wallet_fingerprint_hash"]
+                != blocker["wallet_fingerprint_hash"]
+                or intent["network"] != blocker["network"]
+                or intent["lifecycle_state"] not in {"created", "visible"}
+            ):
+                repaired = False
+                break
+            if intent["parent_intent_id"]:
+                try:
+                    _refresh_lineage_rows(
+                        conn, intent["parent_intent_id"], intent["intent_id"]
+                    )
+                except ValueError:
+                    repaired = False
+                    break
+            if intent["child_intent_id"]:
+                try:
+                    _refresh_lineage_rows(conn, intent["intent_id"], intent["child_intent_id"])
+                except ValueError:
+                    repaired = False
+                    break
+        if not repaired:
+            conn.commit()
+            return {"resolved": False, "reason": "cohort_not_repaired", "blocker": blocker}
+        when = _stability_wall_clock()
+        conn.execute(
+            "UPDATE offer_refresh_lineage_blockers SET state='resolved', resolved_at=? "
+            "WHERE operation_id=? AND state='blocking'", (when, op)
+        )
+        _reconciliation_latch_update(
+            conn, operation_id=op, wallet_fingerprint_hash=blocker["wallet_fingerprint_hash"],
+            network=blocker["network"], reason_code="REFRESH_LINEAGE_REPAIRED",
+            reason="Refresh lineage cohort repaired by exact durable proof",
+            reconciled_at=when, blocking=False,
+        )
+        result = dict(conn.execute(
+            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
+        ).fetchone())
+        conn.commit()
+        return {"resolved": True, "idempotent": False, "blocker": result}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_refresh_lineage_commit_for_child(child_intent_id: str) -> Optional[Dict[str, Any]]:
     """Return the one durable completed incoming edge for a child, if any."""
 
@@ -22502,6 +22682,14 @@ def resolve_runtime_safety_latch(
                 for item in latest_rows
                 if int(item["blocks_mutation"] or 0) == 0
             }
+            refresh_rows = conn.execute(
+                f"SELECT operation_id FROM offer_refresh_lineage_blockers "
+                f"WHERE operation_id IN ({placeholders}) AND state='resolved'",
+                tuple(sorted(blockers)),
+            ).fetchall()
+            resolved_by_journal.update(
+                str(item["operation_id"]) for item in refresh_rows
+            )
             if not blockers.issubset(resolved_by_journal):
                 conn.commit()
                 return {
