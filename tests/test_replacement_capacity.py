@@ -563,6 +563,75 @@ def test_confirmed_outcome_requires_complete_authoritative_proof(isolated_databa
         )
 
 
+def test_ambiguous_equal_amount_purposes_stay_latched_with_zero_capacity(
+    isolated_database, monkeypatch
+):
+    """Catches ambiguous output ownership being promoted into policy capacity."""
+
+    import coin_prep_worker
+
+    database.init_database()
+    binding = _activate_wallet_authority(
+        monkeypatch, run_id="task-12-ambiguous-output"
+    )
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"ambiguous-capacity-source").hexdigest()
+    outputs = [
+        hashlib.sha256(b"ambiguous-capacity-output-a").hexdigest(),
+        hashlib.sha256(b"ambiguous-capacity-output-b").hexdigest(),
+    ]
+    target = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": 0,
+                "amount_mojos": 50,
+                "purpose": "replacement",
+            },
+            {
+                "output_index": 1,
+                "amount_mojos": 50,
+                "purpose": "fee_reserve",
+            },
+        ],
+    }
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"], source_coin_ids=[source]
+    )
+    prepared = database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )["operation"]
+    recoverable = database.get_recoverable_coin_prep_operations()
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.xch_wallet_id = 1
+    worker.cat_wallet_id = 2
+    worker._current_coin_prep_wallet_identity = lambda: identity
+    worker._get_owned_coins_via_rpc = lambda *_args: [
+        {"coin_id": coin_id, "amount_mojos": 50} for coin_id in outputs
+    ]
+
+    observation = worker._observe_recoverable_coin_prep_operation(prepared)
+
+    assert observation is None
+    assert recoverable[0]["outcome"] == "PREPARED"
+    assert database.get_authoritative_replacement_capacity_count(wallet_type="xch") == 0
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 def test_reserving_selected_coins_derives_one_exact_non_null_purpose(
     isolated_database,
 ):

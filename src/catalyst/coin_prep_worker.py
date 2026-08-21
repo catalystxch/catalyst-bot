@@ -31,7 +31,7 @@ from queue import Empty, Full, Queue
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -308,6 +308,15 @@ class PrepPhase(Enum):
     VERIFYING = "verifying"
     COMPLETE = "complete"
     ERROR = "error"
+
+
+@dataclass(frozen=True)
+class CoinPrepSubmittedUnknown:
+    """Typed caller result: effect submitted, durable confirmation unresolved."""
+
+    operation_id: str
+    dispatch_outcome: str
+    outcome: str = field(init=False, default="SUBMITTED_UNKNOWN")
 
 
 _STRUCTURED_COIN_PREP_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s")
@@ -1116,7 +1125,10 @@ class CoinPrepWorker:
         )
         observation = self._observe_coin_prep_post_effect(prepared_operation)
         if type(observation) is not dict:
-            return None
+            return CoinPrepSubmittedUnknown(
+                operation_id=prepared_operation["operation_id"],
+                dispatch_outcome=dispatch_outcome,
+            )
         if not self._verify_authoritative_post_operation_view(
             operation_id=prepared_operation["operation_id"],
             source_coin_ids=json.loads(prepared_operation["source_coin_ids_json"]),
@@ -1129,7 +1141,10 @@ class CoinPrepWorker:
             effect_claim_generation=prepared_operation["effect_claim_generation"],
             dispatch_outcome=dispatch_outcome,
         ):
-            return None
+            return CoinPrepSubmittedUnknown(
+                operation_id=prepared_operation["operation_id"],
+                dispatch_outcome=dispatch_outcome,
+            )
         return result
 
     def _require_cli_mutation(self, operation: str) -> None:
@@ -1187,6 +1202,8 @@ class CoinPrepWorker:
     @staticmethod
     def _sage_submit_succeeded(result) -> bool:
         """Treat Sage RPC submission as successful only for non-error responses."""
+        if type(result) is CoinPrepSubmittedUnknown:
+            return True
         if result is None:
             return False
         if isinstance(result, dict):
@@ -8174,6 +8191,15 @@ class CoinPrepWorker:
                 target["outputs"],
                 key=lambda item: (item["amount_mojos"], item["output_index"]),
             )
+            purposes_by_amount = {}
+            for output in outputs:
+                purposes_by_amount.setdefault(output["amount_mojos"], set()).add(
+                    output["purpose"]
+                )
+            if any(
+                len(purposes) != 1 for purposes in purposes_by_amount.values()
+            ):
+                return None
             if len(new_coins) != len(outputs) or [
                 item["amount_mojos"] for item in new_coins
             ] != [item["amount_mojos"] for item in outputs]:
