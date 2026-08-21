@@ -27,6 +27,7 @@ import time
 import subprocess
 import threading
 import re
+from collections.abc import Iterator, Mapping
 from queue import Empty, Full, Queue
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
@@ -311,12 +312,37 @@ class PrepPhase(Enum):
 
 
 @dataclass(frozen=True)
-class CoinPrepSubmittedUnknown:
-    """Typed caller result: effect submitted, durable confirmation unresolved."""
+class CoinPrepSubmittedUnknown(Mapping[str, object]):
+    """Immutable accepted result without transaction or confirmation semantics."""
 
     operation_id: str
     dispatch_outcome: str
     outcome: str = field(init=False, default="SUBMITTED_UNKNOWN")
+
+    def __getitem__(self, key: str) -> object:
+        if key == "success" or key == "submitted":
+            return True
+        if key == "outcome":
+            return self.outcome
+        if key == "operation_id":
+            return self.operation_id
+        if key == "dispatch_outcome":
+            return self.dispatch_outcome
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "success",
+                "submitted",
+                "outcome",
+                "operation_id",
+                "dispatch_outcome",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 5
 
 
 _STRUCTURED_COIN_PREP_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s")
@@ -1206,7 +1232,7 @@ class CoinPrepWorker:
             return True
         if result is None:
             return False
-        if isinstance(result, dict):
+        if isinstance(result, Mapping):
             if result.get("error"):
                 return False
             if result.get("success") is False:
@@ -1223,7 +1249,7 @@ class CoinPrepWorker:
             return []
 
         tx_ids = []
-        if isinstance(result, dict):
+        if isinstance(result, Mapping):
             raw_ids = result.get("transaction_ids")
             if isinstance(raw_ids, list):
                 tx_ids.extend(raw_ids)
@@ -1231,7 +1257,7 @@ class CoinPrepWorker:
             if single:
                 tx_ids.append(single)
             nested = result.get("transaction") or result.get("tx")
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 nested_single = nested.get("transaction_id")
                 if nested_single:
                     tx_ids.append(nested_single)
