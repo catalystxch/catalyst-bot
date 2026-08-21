@@ -34,6 +34,7 @@ from database import (
 )
 from publication_outbox import (
     PublicationState,
+    canonical_publication_request_contract,
     classify_provider_result,
     provider_response_sha256,
     publication_request_sha256,
@@ -145,9 +146,18 @@ class DexieManager:
                 break
             offer_bech32 = claim.get("offer_bech32")
             trade_id = claim.get("trade_id")
-            request_digest = publication_request_sha256(
-                "dexie", offer_bech32, claim["idempotency_key"]
+            claim_rewards = getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)
+            if type(claim_rewards) is not bool:
+                raise TypeError("DEXIE_AUTO_CLAIM_REWARDS must be an exact bool")
+            request_contract = canonical_publication_request_contract(
+                publisher="dexie",
+                offer_bech32=offer_bech32,
+                idempotency_key=claim["idempotency_key"],
+                destination_url=f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers",
+                claim_rewards=claim_rewards,
+                bot_tag=cfg.BOT_TAG,
             )
+            request_digest = publication_request_sha256(request_contract)
             dispatched_at = self._durable_now_provider()
             dispatched = mark_publication_dispatch_started(
                 publication_id=claim["publication_id"],
@@ -166,6 +176,7 @@ class DexieManager:
                 trade_id,
                 True,
                 idempotency_key=claim["idempotency_key"],
+                request_contract=request_contract,
             )
             effect_completed_at = self._durable_now_provider()
             decision = classify_provider_result(
@@ -469,6 +480,7 @@ class DexieManager:
         trade_id: str = None,
         force: bool = False,
         idempotency_key: str = None,
+        request_contract: Dict = None,
     ) -> Dict:
         """Post a single offer to Dexie with retries.
 
@@ -492,29 +504,34 @@ class DexieManager:
             if not force and fp in self._posted_fingerprints:
                 return {"success": True, "skipped": True, "reason": "already_posted"}
 
-        url = f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"
-        payload = {"offer": offer_bech32}
-        # Auto-claim flag: when set, Dexie pays liquidity rewards
-        # automatically to the maker address — batched once daily (per
-        # dexie's API docs, to prevent excessive coin dust). For
-        # incentivized pairs we get DBX passively; for non-incentivized
-        # pairs the flag is a no-op. That makes "always on" safe — and
-        # avoids the Sage-RPC signing gap that blocks the manual claim
-        # flow (which pays every ~15 min but needs a signed message).
-        if bool(getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)):
-            payload["claim_rewards"] = True
-        headers = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "x-bot-tag": cfg.BOT_TAG,
-        }
-        if idempotency_key:
-            headers["idempotency-key"] = idempotency_key
-
         if idempotency_key is not None:
-            request_digest = publication_request_sha256(
-                "dexie", offer_bech32, idempotency_key
-            )
+            if request_contract is None:
+                claim_rewards = getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)
+                if type(claim_rewards) is not bool:
+                    raise TypeError(
+                        "DEXIE_AUTO_CLAIM_REWARDS must be an exact bool"
+                    )
+                request_contract = canonical_publication_request_contract(
+                    publisher="dexie",
+                    offer_bech32=offer_bech32,
+                    idempotency_key=idempotency_key,
+                    destination_url=(
+                        f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"
+                    ),
+                    claim_rewards=claim_rewards,
+                    bot_tag=cfg.BOT_TAG,
+                )
+            request_digest = publication_request_sha256(request_contract)
+            if (
+                request_contract["publisher"] != "dexie"
+                or request_contract["body"]["offer"] != offer_bech32
+                or request_contract["headers"]["idempotency-key"]
+                != idempotency_key
+            ):
+                raise ValueError("durable Dexie request contract does not match claim")
+            url = request_contract["destination_url"]
+            payload = dict(request_contract["body"])
+            headers = dict(request_contract["headers"])
             try:
                 r = requests.post(
                     url,
@@ -580,6 +597,22 @@ class DexieManager:
                     "reason_code": "MALFORMED_PROVIDER_RESPONSE",
                 }
 
+        url = f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"
+        payload = {"offer": offer_bech32}
+        # Auto-claim flag: when set, Dexie pays liquidity rewards
+        # automatically to the maker address — batched once daily (per
+        # dexie's API docs, to prevent excessive coin dust). For
+        # incentivized pairs we get DBX passively; for non-incentivized
+        # pairs the flag is a no-op. That makes "always on" safe — and
+        # avoids the Sage-RPC signing gap that blocks the manual claim
+        # flow (which pays every ~15 min but needs a signed message).
+        if bool(getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)):
+            payload["claim_rewards"] = True
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json",
+            "x-bot-tag": cfg.BOT_TAG,
+        }
         last_err = None
         _permanent = False  # Set True for HTTP 4xx — don't requeue
         _invalid_offer_race = False

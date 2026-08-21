@@ -35,6 +35,7 @@ from database import (
 )
 from publication_outbox import (
     PublicationState,
+    canonical_publication_request_contract,
     classify_provider_result,
     provider_response_sha256,
     publication_request_sha256,
@@ -129,9 +130,15 @@ class SplashManager:
                 break
             offer_bech32 = claim.get("offer_bech32")
             trade_id = claim.get("trade_id")
-            request_digest = publication_request_sha256(
-                "splash", offer_bech32, claim["idempotency_key"]
+            request_contract = canonical_publication_request_contract(
+                publisher="splash",
+                offer_bech32=offer_bech32,
+                idempotency_key=claim["idempotency_key"],
+                destination_url=getattr(
+                    cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000"
+                ).rstrip("/"),
             )
+            request_digest = publication_request_sha256(request_contract)
             dispatched_at = self._durable_now_provider()
             dispatched = mark_publication_dispatch_started(
                 publication_id=claim["publication_id"],
@@ -150,6 +157,7 @@ class SplashManager:
                 trade_id,
                 True,
                 idempotency_key=claim["idempotency_key"],
+                request_contract=request_contract,
             )
             effect_completed_at = self._durable_now_provider()
             decision = classify_provider_result(
@@ -396,6 +404,7 @@ class SplashManager:
         trade_id: str = None,
         force: bool = False,
         idempotency_key: str = None,
+        request_contract: Dict = None,
     ) -> Dict:
         """Post a single offer to Splash with retries.
 
@@ -422,17 +431,29 @@ class SplashManager:
         retry_sleep = getattr(cfg, "SPLASH_POST_RETRY_SLEEP", 1.5)
 
         if idempotency_key is not None:
-            request_digest = publication_request_sha256(
-                "splash", offer_bech32, idempotency_key
-            )
+            if request_contract is None:
+                request_contract = canonical_publication_request_contract(
+                    publisher="splash",
+                    offer_bech32=offer_bech32,
+                    idempotency_key=idempotency_key,
+                    destination_url=url,
+                )
+            request_digest = publication_request_sha256(request_contract)
+            if (
+                request_contract["publisher"] != "splash"
+                or request_contract["body"]["offer"] != offer_bech32
+                or request_contract["headers"]["idempotency-key"]
+                != idempotency_key
+            ):
+                raise ValueError("durable Splash request contract does not match claim")
+            url = request_contract["destination_url"]
+            payload = dict(request_contract["body"])
+            headers = dict(request_contract["headers"])
             try:
                 r = requests.post(
                     url,
                     json=payload,
-                    headers={
-                        "content-type": "application/json",
-                        "idempotency-key": idempotency_key,
-                    },
+                    headers=headers,
                     timeout=timeout,
                 )
                 response_digest = provider_response_sha256(bytes(r.content))

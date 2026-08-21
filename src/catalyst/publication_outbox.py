@@ -72,10 +72,24 @@ def canonical_publication_identity(
     )
 
 
-def publication_request_sha256(
-    publisher: Any, offer_bech32: Any, idempotency_key: Any
-) -> str:
-    """Digest the exact provider, offer bytes, and durable key before dispatch."""
+def _bounded_request_text(value: Any, label: str, maximum: int) -> str:
+    if type(value) is not str or not value or len(value) > maximum:
+        raise ValueError(f"{label} must be bounded exact text")
+    if value != value.strip() or any(ord(character) < 32 for character in value):
+        raise ValueError(f"{label} is not canonical")
+    return value
+
+
+def canonical_publication_request_contract(
+    *,
+    publisher: Any,
+    offer_bech32: Any,
+    idempotency_key: Any,
+    destination_url: Any,
+    claim_rewards: Any = None,
+    bot_tag: Any = None,
+) -> dict[str, Any]:
+    """Build the complete bounded contract used for digest and transport."""
 
     safe_publisher = _exact_matching_text(
         publisher, re.compile(r"(?:dexie|splash)\Z"), "publisher"
@@ -85,18 +99,97 @@ def publication_request_sha256(
     encoded_offer = offer_bech32.encode("utf-8")
     if len(encoded_offer) > 2 * 1024 * 1024:
         raise ValueError("offer_bech32 exceeds its byte limit")
+    safe_key = _bounded_request_text(idempotency_key, "idempotency_key", 512)
+    destination = _bounded_request_text(destination_url, "destination_url", 2048)
+    if not destination.startswith(("https://", "http://")):
+        raise ValueError("destination_url must use HTTP or HTTPS")
+    if safe_publisher == "dexie":
+        if type(claim_rewards) is not bool:
+            raise TypeError("claim_rewards must be an exact bool for Dexie")
+        safe_bot_tag = _bounded_request_text(bot_tag, "bot_tag", 128)
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "idempotency-key": safe_key,
+            "x-bot-tag": safe_bot_tag,
+        }
+        body = {"claim_rewards": claim_rewards, "offer": offer_bech32}
+    else:
+        if claim_rewards is not None or bot_tag is not None:
+            raise ValueError("Splash request contract rejects Dexie-only fields")
+        headers = {
+            "content-type": "application/json",
+            "idempotency-key": safe_key,
+        }
+        body = {"offer": offer_bech32}
+    return {
+        "body": body,
+        "destination_url": destination,
+        "headers": headers,
+        "method": "POST",
+        "publisher": safe_publisher,
+        "schema_version": 1,
+    }
+
+
+def publication_request_sha256(contract: Any) -> str:
+    """Validate and digest one complete canonical outbound request contract."""
+
+    if type(contract) is not dict or set(contract) != {
+        "body",
+        "destination_url",
+        "headers",
+        "method",
+        "publisher",
+        "schema_version",
+    }:
+        raise ValueError("canonical request contract fields are invalid")
     if (
-        type(idempotency_key) is not str
-        or not idempotency_key
-        or len(idempotency_key) > 512
+        type(contract.get("method")) is not str
+        or contract.get("method") != "POST"
+        or type(contract.get("schema_version")) is not int
+        or contract.get("schema_version") != 1
     ):
-        raise ValueError("idempotency_key must be bounded exact text")
+        raise ValueError("canonical request contract version is invalid")
+    body = contract.get("body")
+    headers = contract.get("headers")
+    if type(body) is not dict or type(headers) is not dict:
+        raise ValueError("canonical request contract mappings are invalid")
+    publisher = contract.get("publisher")
+    if publisher == "dexie":
+        if set(body) != {"claim_rewards", "offer"} or set(headers) != {
+            "accept",
+            "content-type",
+            "idempotency-key",
+            "x-bot-tag",
+        }:
+            raise ValueError("canonical request contract shape is invalid")
+        rebuilt = canonical_publication_request_contract(
+            publisher=publisher,
+            offer_bech32=body.get("offer"),
+            idempotency_key=headers.get("idempotency-key"),
+            destination_url=contract.get("destination_url"),
+            claim_rewards=body.get("claim_rewards"),
+            bot_tag=headers.get("x-bot-tag"),
+        )
+    elif publisher == "splash":
+        if set(body) != {"offer"} or set(headers) != {
+            "content-type",
+            "idempotency-key",
+        }:
+            raise ValueError("canonical request contract shape is invalid")
+        rebuilt = canonical_publication_request_contract(
+            publisher=publisher,
+            offer_bech32=body.get("offer"),
+            idempotency_key=headers.get("idempotency-key"),
+            destination_url=contract.get("destination_url"),
+        )
+    else:
+        raise ValueError("canonical request contract publisher is invalid")
+    if rebuilt != contract:
+        raise ValueError("canonical request contract is not normalized")
     material = json.dumps(
-        {
-            "idempotency_key": idempotency_key,
-            "offer_sha256": hashlib.sha256(encoded_offer).hexdigest(),
-            "publisher": safe_publisher,
-        },
+        contract,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,

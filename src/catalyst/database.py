@@ -24525,16 +24525,17 @@ def enqueue_publication_for_trade(
         intent = conn.execute(
             """
                 SELECT intent_id,network FROM offer_intents
-                WHERE sage_trade_id=? AND lifecycle_state='created'
+                WHERE sage_trade_id=? AND offer_text_sha256=?
+                  AND lifecycle_state IN ('created','visible')
                 ORDER BY confirmed_at DESC,intent_id LIMIT 1
             """,
-            (trade,),
+            (trade, fingerprint),
         ).fetchone()
-        authoritative_network = (
-            str(intent["network"]) if intent is not None else supplied_network
-        )
-        if authoritative_network is None:
-            raise ValueError("legacy publication requires an explicit network")
+        if intent is None:
+            raise ValueError(
+                "publication requires an exact nonterminal authoritative intent"
+            )
+        authoritative_network = str(intent["network"])
         if (
             supplied_network is not None
             and supplied_network != authoritative_network
@@ -24551,6 +24552,21 @@ def enqueue_publication_for_trade(
                 (authoritative_network, fingerprint, safe_publisher),
             ).fetchall()
         ]
+        if any(row["state"] == "unresolved" for row in existing_rows):
+            raise ValueError("unresolved publication history blocks new work")
+        if any(
+            row["state"] == "claimed"
+            and (
+                row.get("dispatch_started_at") is not None
+                or row.get("request_sha256") is not None
+            )
+            for row in existing_rows
+        ):
+            raise ValueError(
+                "possible dispatched publication history blocks new work"
+            )
+        if any(row["state"] == "suppressed" for row in existing_rows):
+            raise ValueError("suppressed publication history blocks new work")
         mutable = next(
             (
                 row
@@ -24571,6 +24587,8 @@ def enqueue_publication_for_trade(
                 conn.commit()
                 return {"queued": False, "idempotent": True, "record": succeeded}
         if existing_rows:
+            if not all(row["state"] == "succeeded" for row in existing_rows):
+                raise ValueError("publication history does not authorize a new epoch")
             repost_numbers = []
             pattern = re.compile(
                 rf"repost-([0-9]{{10}}):{re.escape(safe_publisher)}\Z"

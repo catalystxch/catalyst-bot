@@ -1,6 +1,7 @@
 """Durable public-offer publication policy and repository tests."""
 
 import hashlib
+import json
 import os
 import socket
 import sys
@@ -75,7 +76,9 @@ def isolated_database(tmp_path):
         database.DB_PATH = original_path
 
 
-def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
+def _prepare_and_confirm(
+    db, *, intent_id="intent-1", generation=7, reserve_selected_coins=False
+):
     offer_fingerprint = _sha(_offer_text(intent_id))
     trade_id = _sha(f"trade:{intent_id}")
     db.prepare_offer_intent(
@@ -89,6 +92,7 @@ def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
         side="buy",
         tier="inner",
         purpose="ladder",
+        coin_purpose="lifecycle" if reserve_selected_coins else None,
         slot_key=f"slot:{intent_id}",
         generation=generation,
         offered_amount_atomic="1000000000000",
@@ -97,6 +101,7 @@ def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
         wallet_identity_json={"network": "mainnet"},
         evidence_json={"phase": "prepared"},
         prepared_at=AT,
+        reserve_selected_coins=reserve_selected_coins,
     )
     intent = db.finalize_offer_intent(
         intent_id=intent_id,
@@ -109,6 +114,7 @@ def _prepare_and_confirm(db, *, intent_id="intent-1", generation=7):
         wallet_identity_json={"network": "mainnet"},
         evidence_json={"phase": "confirmed"},
         finalized_at=LATER,
+        finalize_selected_coin_reservations=reserve_selected_coins,
     )
     return intent, trade_id, offer_fingerprint
 
@@ -679,7 +685,13 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     )
     observed = []
 
-    def fake_post(payload, observed_trade_id=None, force=False, idempotency_key=None):
+    def fake_post(
+        payload,
+        observed_trade_id=None,
+        force=False,
+        idempotency_key=None,
+        request_contract=None,
+    ):
         observed.append((payload, observed_trade_id, force, idempotency_key))
         return {
             "outcome": "acknowledged",
@@ -687,7 +699,7 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
             "provider_response_id": provider_id,
             "echoed_idempotency_key": idempotency_key,
             "request_sha256": publication_policy.publication_request_sha256(
-                publisher, payload, idempotency_key
+                request_contract
             ),
             "response_sha256": _sha("bounded-provider-ack"),
             "status_code": 201,
@@ -905,8 +917,25 @@ def test_stale_dispatched_claim_without_observation_contract_never_replays(
     assert result["posted"] == 0
     assert row["state"] == "unresolved"
 
+    before = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )
+    for force in (False, True):
+        with pytest.raises(ValueError, match="unresolved"):
+            second.queue_post(
+                _offer_text(intent["intent_id"]), trade_id, force=force
+            )
+    after = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )
+    assert [item["publication_id"] for item in after] == [
+        item["publication_id"] for item in before
+    ]
+    assert second.flush_queue()["posted"] == 0
+    assert len(calls) == 1
 
-def test_legacy_plaintext_queue_is_migrated_to_durable_reference_before_effect(
+
+def test_legacy_plaintext_queue_without_authoritative_intent_fails_closed(
     isolated_database, monkeypatch
 ):
     trade_id = _sha("legacy-trade")
@@ -924,25 +953,17 @@ def test_legacy_plaintext_queue_is_migrated_to_durable_reference_before_effect(
         return _TransportResponse(201, {"id": "dexie-legacy", "idempotency_key": key})
 
     monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
-    manager.enable_durable_outbox(
-        owner_run_id="legacy-worker",
-        network="mainnet",
-        now_provider=lambda: LATER,
-        lease_expires_provider=lambda _now: LEASE_END,
-    )
+    with pytest.raises(ValueError, match="authoritative intent"):
+        manager.enable_durable_outbox(
+            owner_run_id="legacy-worker",
+            network="mainnet",
+            now_provider=lambda: LATER,
+            lease_expires_provider=lambda _now: LEASE_END,
+        )
 
     assert manager._queue == []
-    queued = isolated_database.list_publication_outbox(publisher="dexie")
-    assert len(queued) == 1
-    assert queued[0]["publication_epoch"] == "legacy-0000000001:dexie"
-    assert __import__("json").loads(queued[0]["payload_json"]) == {
-        "offer_ref": trade_id
-    }
-    assert offer_text not in queued[0]["payload_json"]
-
-    result = manager.flush_queue()
-    assert result["posted"] == 1
-    assert len(calls) == 1
+    assert isolated_database.list_publication_outbox(publisher="dexie") == []
+    assert calls == []
 
 
 def test_intentional_reposts_allocate_monotonic_durable_publisher_epochs(
@@ -968,6 +989,13 @@ def test_intentional_reposts_allocate_monotonic_durable_publisher_epochs(
     )
     assert manager.flush_queue()["posted"] == 1
 
+    manager.queue_post(offer_text, trade_id, force=False)
+    assert len(
+        isolated_database.list_publication_outbox(
+            intent_id=intent["intent_id"], publisher="dexie"
+        )
+    ) == 1
+
     manager.queue_post(offer_text, trade_id, force=True)
     assert manager._queue == []
     rows = isolated_database.list_publication_outbox(
@@ -988,6 +1016,179 @@ def test_intentional_reposts_allocate_monotonic_durable_publisher_epochs(
         "repost-0000000001:dexie",
         "repost-0000000002:dexie",
     ]
+
+
+def test_visible_repost_keeps_intent_link_and_task9_suppresses_late_worker(
+    isolated_database, monkeypatch
+):
+    selected_coin_id = _sha("coin:intent-1")
+    assert isolated_database.upsert_coin(
+        selected_coin_id,
+        "xch",
+        1000000000000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    intent, trade_id, fingerprint = _prepare_and_confirm(
+        isolated_database, reserve_selected_coins=True
+    )
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+
+    def accepted_post(url, **kwargs):
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(201, {"id": "dexie-visible", "idempotency_key": key})
+
+    monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
+    manager.enable_durable_outbox(
+        owner_run_id="visible-worker",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    assert manager.flush_queue()["posted"] == 1
+    isolated_database.record_offer_intent_visibility(
+        intent["intent_id"],
+        publication_identity=intent["publication_identity"],
+        visible_at="2026-08-15T12:00:06.000000Z",
+    )
+    manager.queue_post(offer_text, trade_id, force=True)
+    rows = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )
+    assert len(rows) == 2
+    assert rows[-1]["intent_id"] == intent["intent_id"]
+    assert rows[-1]["offer_fingerprint"] == fingerprint
+    claim = isolated_database.claim_publication_outbox(
+        publisher="dexie",
+        owner_run_id="late-visible-worker",
+        claim_token="late-visible-claim",
+        claimed_at="2026-08-15T12:00:07.000000Z",
+        claim_expires_at="2026-08-15T12:00:30.000000Z",
+    )
+    assert claim["publication_id"] == rows[-1]["publication_id"]
+
+    evidence = {"proof": "authoritative expiry"}
+    evidence_text = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    isolated_database.commit_offer_reconciliation(
+        intent_id=intent["intent_id"],
+        operation_id=f"reconcile:{intent['intent_id']}",
+        classification="EXPIRED_PROVEN",
+        reason_code="AUTHORITATIVE_EXPIRY",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet"),
+            "network": "mainnet",
+        },
+        evidence_json=evidence,
+        evidence_sha256=_sha(evidence_text),
+        reconciled_at="2026-08-15T12:00:08.000000Z",
+    )
+    suppressed = isolated_database.get_publication_outbox(
+        claim["publication_id"]
+    )
+    assert suppressed["state"] == "suppressed"
+    assert isolated_database.complete_publication_outbox(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        acknowledgement_json={"provider_response_id": "too-late"},
+        completed_at="2026-08-15T12:00:09.000000Z",
+    ) is None
+
+
+def test_canonical_request_digest_binds_claim_rewards_and_rejects_payload_drift():
+    builder = getattr(
+        publication_policy, "canonical_publication_request_contract", None
+    )
+    assert builder is not None, "canonical request-contract builder is required"
+    common = {
+        "publisher": "dexie",
+        "offer_bech32": "offer1request-contract",
+        "idempotency_key": "mainnet:fingerprint:epoch",
+        "destination_url": "https://api.dexie.space/v1/offers",
+        "bot_tag": "catalyst-test",
+    }
+    enabled = builder(**common, claim_rewards=True)
+    disabled = builder(**common, claim_rewards=False)
+    enabled_digest = publication_policy.publication_request_sha256(enabled)
+    disabled_digest = publication_policy.publication_request_sha256(disabled)
+    assert enabled_digest != disabled_digest
+
+    changed = json.loads(json.dumps(enabled))
+    changed["body"]["claim_rewards"] = False
+    changed_digest = publication_policy.publication_request_sha256(changed)
+    assert changed_digest == disabled_digest
+    assert changed_digest != enabled_digest
+
+    bool_version = json.loads(json.dumps(enabled))
+    bool_version["schema_version"] = True
+    with pytest.raises(ValueError, match="version"):
+        publication_policy.publication_request_sha256(bool_version)
+
+
+def test_dexie_dispatch_uses_one_claim_rewards_contract_despite_config_drift(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    monkeypatch.setattr(
+        dexie_manager.cfg, "DEXIE_AUTO_CLAIM_REWARDS", True, raising=False
+    )
+    manager.enable_durable_outbox(
+        owner_run_id="contract-worker",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    original_mark = dexie_manager.mark_publication_dispatch_started
+
+    def mark_then_change_config(**kwargs):
+        marked = original_mark(**kwargs)
+        monkeypatch.setattr(
+            dexie_manager.cfg, "DEXIE_AUTO_CLAIM_REWARDS", False, raising=False
+        )
+        return marked
+
+    monkeypatch.setattr(
+        dexie_manager, "mark_publication_dispatch_started", mark_then_change_config
+    )
+    calls = []
+
+    def accepted_post(url, **kwargs):
+        calls.append((url, kwargs))
+        key = kwargs["headers"]["idempotency-key"]
+        return _TransportResponse(201, {"id": "dexie-contract", "idempotency_key": key})
+
+    monkeypatch.setattr(dexie_manager.requests, "post", accepted_post)
+    assert manager.flush_queue()["posted"] == 1
+    assert calls[0][1]["json"].get("claim_rewards") is True
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    contract = publication_policy.canonical_publication_request_contract(
+        publisher="dexie",
+        offer_bech32=offer_text,
+        idempotency_key=row["idempotency_key"],
+        destination_url=calls[0][0],
+        bot_tag=dexie_manager.cfg.BOT_TAG,
+        claim_rewards=True,
+    )
+    assert row["request_sha256"] == publication_policy.publication_request_sha256(
+        contract
+    )
 
 
 def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
