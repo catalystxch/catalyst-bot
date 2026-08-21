@@ -80,6 +80,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_database.designate_reserve = lambda *args, **kwargs: True
         fake_database.get_reserve_coins = lambda *args, **kwargs: []
         fake_database.mark_coins_gone = lambda *args, **kwargs: True
+        fake_database.get_setting = lambda *args, **kwargs: None
+        fake_database.set_setting = lambda *args, **kwargs: True
+        fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
+            coin_ids
+        )
         fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 

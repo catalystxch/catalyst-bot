@@ -89,6 +89,18 @@ _CACHED_MODS = (
 
 
 class CoinManagerTopupFailClosedTests(unittest.TestCase):
+    def setUp(self):
+        # These legacy top-up tests exercise wallet response handling rather
+        # than Task 9 coin authority.  Grant the pre-effect authority check
+        # explicitly; denial/race behavior is covered by the closure suite.
+        self._wallet_effect_authority = patch.object(
+            coin_manager,
+            "authorize_wallet_effect_coin_ids",
+            side_effect=lambda coin_ids: tuple(coin_ids),
+        )
+        self._wallet_effect_authority.start()
+        self.addCleanup(self._wallet_effect_authority.stop)
+
     @classmethod
     def setUpClass(cls):
         # Save originals of modules we will replace/evict so tearDownClass

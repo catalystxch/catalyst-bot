@@ -37,7 +37,7 @@ from amount_utils import (
     round_cat_display_amount_up_to_mojo,
 )
 from config import cfg
-from database import log_event
+from database import authorize_wallet_effect_coin_ids, log_event
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +67,21 @@ _fast_reconcile_flag: bool = False
 _fast_reconcile_lock: threading.Lock = threading.Lock()
 _TOPUP_PENDING = "pending"
 _TOPUP_STALE_SOURCE = "stale_source"
+
+
+def _wallet_effect_cohort_authorized(operation: str, coin_ids: List[str]) -> bool:
+    """Fail closed immediately before a raw wallet coin mutation."""
+
+    if authorize_wallet_effect_coin_ids(list(coin_ids)) is not None:
+        return True
+    log_event(
+        "warning",
+        f"{operation}_coin_authority_denied",
+        "Wallet effect aborted because an input coin no longer has durable "
+        "spend authority.",
+        data={"operation": operation, "input_count": len(coin_ids)},
+    )
+    return False
 
 
 def _topup_event_log_level(event_type: str) -> str:
@@ -3420,6 +3435,8 @@ class CoinManager:
 
         # --- Dispatch to Sage RPC or Chia CLI ---
         wallet_type = get_wallet_type()
+        if not _wallet_effect_cohort_authorized(f"split_{name}", [coin_id]):
+            return False
 
         if wallet_type == "sage":
             # Sage native /split endpoint — uses output_count, auto-sizes
@@ -8627,6 +8644,11 @@ class CoinManager:
         # --- Submit the single create_transaction RPC ---
         weak_submit_onchain_confirmed = False
         try:
+            effect_coin_ids = [source_coin_id]
+            if fee_coin_id:
+                effect_coin_ids.append(fee_coin_id)
+            if not _wallet_effect_cohort_authorized(tag, effect_coin_ids):
+                return False
             result = sage_topup_split(
                 source_coin_id=source_coin_id,
                 num_coins=num_to_create,
@@ -9099,6 +9121,10 @@ class CoinManager:
             }
             if wallet_type == "sage":
                 send_kwargs["source_coin_ids"] = [source_coin_id]
+            if not _wallet_effect_cohort_authorized(
+                f"{tag}_pool_send", [source_coin_id]
+            ):
+                return False
             result = send_transaction(**send_kwargs)
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
@@ -9361,6 +9387,9 @@ class CoinManager:
         )
 
         wallet_type = get_wallet_type()
+
+        if not _wallet_effect_cohort_authorized(f"{tag}_pool_split", [pool_coin_id]):
+            return False
 
         if wallet_type == "sage":
             # Sage native /split — output_count = num_to_create (even split)
@@ -9777,6 +9806,10 @@ class CoinManager:
             fee = self._tx_fee_mojos()
             from wallet import combine_coins
 
+            if not _wallet_effect_cohort_authorized(
+                f"consolidate_{name.lower()}", filtered_ids
+            ):
+                return False
             result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 
             # /combine returns {summary, coin_spends} on success — same shape
@@ -10196,6 +10229,10 @@ class CoinManager:
 
             from wallet import combine_coins
 
+            if not _wallet_effect_cohort_authorized(
+                f"topup_{name.lower()}_absorb", filtered_ids
+            ):
+                return False
             result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
 
             # Sage's send_xch/send_cat returns {summary, coin_spends} on success

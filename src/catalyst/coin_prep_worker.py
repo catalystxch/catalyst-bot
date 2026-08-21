@@ -240,6 +240,7 @@ try:
         mark_coins_gone,
         get_setting,
         set_setting,
+        authorize_wallet_effect_coin_ids,
     )
 
     DB_AVAILABLE = True
@@ -851,6 +852,31 @@ class CoinPrepWorker:
         self.log("   ⚡ Parallel optimization enabled!")
 
     def _call_wallet_mutation(self, operation: str, callback, *args, **kwargs):
+        authority_ids = []
+        for key in ("coin_ids", "source_coin_ids"):
+            values = kwargs.get(key)
+            if type(values) is list:
+                authority_ids.extend(values)
+        for key in ("source_coin_id", "target_coin_id", "fee_coin_id"):
+            value = kwargs.get(key)
+            if value:
+                authority_ids.append(value)
+        operation_lower = str(operation).lower()
+        if not authority_ids and "combine" in operation_lower and args:
+            positional_ids = args[0]
+            if type(positional_ids) is list:
+                authority_ids.extend(positional_ids)
+        requires_exact_cohort = any(
+            effect in operation_lower
+            for effect in ("split", "combine", "consolidate", "absorb", "topup")
+        )
+        if requires_exact_cohort and (
+            not authority_ids
+            or not DB_AVAILABLE
+            or authorize_wallet_effect_coin_ids(authority_ids) is None
+        ):
+            self.log(f"Wallet mutation {operation} denied by durable coin authority")
+            return None
         if not getattr(self, "_is_subprocess", False):
             return callback(*args, **kwargs)
         return _guarded_wallet_mutation(operation, callback, *args, **kwargs)

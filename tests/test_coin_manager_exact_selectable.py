@@ -31,6 +31,9 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
 
         fake_database = types.ModuleType("database")
         fake_database.log_event = lambda *args, **kwargs: None
+        fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
+            coin_ids
+        )
         sys.modules["database"] = fake_database
 
         merged_coin_id = "0x" + "11" * 32

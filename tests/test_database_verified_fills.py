@@ -92,22 +92,58 @@ def _authoritatively_terminalize_offer(
         finalize_selected_coin_reservations=True,
     )
     evidence = {"fixture": "authoritative terminal proof", "trade_id": trade_id}
+    terminal = {}
+    if classification == "FILLED_PROVEN":
+        transaction_id = hashlib.sha256(
+            f"transaction:{trade_id}".encode("utf-8")
+        ).hexdigest()
+        receive_coin_id = hashlib.sha256(
+            f"receive:{trade_id}".encode("utf-8")
+        ).hexdigest()
+        canonical_filled_at = database._stability_timestamp(
+            filled_at, "fixture filled_at"
+        )
+        terminal = {
+            "transaction_id": transaction_id,
+            "block_height": 42,
+            "receive_coin_id": receive_coin_id,
+            "receive_amount_mojos": 1,
+            "filled_at": canonical_filled_at,
+        }
+        evidence.update(
+            {
+                "classification": {
+                    "classification": "FILLED_PROVEN",
+                    "transaction_id": transaction_id,
+                    "spend_identity": None,
+                    "block_height": 42,
+                    "receive_coin_id": receive_coin_id,
+                    "receive_amount_mojos": 1,
+                    "filled_at": canonical_filled_at,
+                },
+                "fill_authority": {
+                    "schema_version": 1,
+                    "intent_id": intent_id,
+                    "trade_id": trade_id,
+                    "side": offer["side"],
+                    "price_xch": offer["price_xch"],
+                    "size_xch": offer["size_xch"],
+                    "size_cat": offer["size_cat"],
+                    "cat_asset_id": offer["cat_asset_id"],
+                    "tier": offer["tier"],
+                    "fee_mojos_xch": int(offer.get("fee_mojos_xch") or 0),
+                    "spent_block_height": 42,
+                    "receive_coin_id": database.norm_coin_id(receive_coin_id),
+                    "receive_amount_mojos": 1,
+                    "filled_at": canonical_filled_at,
+                    "transaction_id": transaction_id,
+                    "spend_identity": None,
+                },
+            }
+        )
     evidence_json = json.dumps(
         evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
-    terminal = {}
-    if classification == "FILLED_PROVEN":
-        terminal = {
-            "transaction_id": hashlib.sha256(
-                f"transaction:{trade_id}".encode("utf-8")
-            ).hexdigest(),
-            "block_height": 42,
-            "receive_coin_id": hashlib.sha256(
-                f"receive:{trade_id}".encode("utf-8")
-            ).hexdigest(),
-            "receive_amount_mojos": 1,
-            "filled_at": filled_at,
-        }
     return database.commit_offer_reconciliation(
         intent_id=intent_id,
         operation_id=f"reconcile:{intent_id}",

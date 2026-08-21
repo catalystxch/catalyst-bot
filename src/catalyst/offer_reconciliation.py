@@ -2440,6 +2440,9 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
             claim_token=claim_token,
             claim_generation=claim_generation,
         )
+        if database.get_authoritative_fill_by_id(int(fill["fill_id"])) is None:
+            database.block_offer_fill_hook_authority_loss(int(fill["fill_id"]))
+            raise RuntimeError("Boost fill authority changed before process effect")
         effect_state = manager.notify_authoritative_boost_fill(
             int(fill["fill_id"]),
             trade_id,
@@ -2511,6 +2514,9 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
         try:
             from sweep_coordinator import get_coordinator
 
+            if database.get_authoritative_fill_by_id(int(fill["fill_id"])) is None:
+                database.block_offer_fill_hook_authority_loss(int(fill["fill_id"]))
+                raise RuntimeError("sweep fill authority changed before process effect")
             coordinator = get_coordinator()
             if hasattr(coordinator, "process_authoritative_fill"):
                 coordinator.process_authoritative_fill(int(fill["fill_id"]), result)
@@ -2547,6 +2553,12 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
 
     _ = completed_at
     results: dict[str, str] = {}
+    fill_id = int(fill["fill_id"])
+    current_fill = database.get_authoritative_fill_by_id(fill_id)
+    if current_fill is None:
+        database.block_offer_fill_hook_authority_loss(fill_id)
+        return {name: "blocked" for name in database._AUTHORITATIVE_FILL_HOOKS}
+    fill = current_fill
     try:
         callbacks = _post_fill_hook_callbacks(fill)
     except Exception:
@@ -2587,6 +2599,26 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         if claim["status"] != "claimed":
             results[hook_name] = claim["status"]
             continue
+        current_fill = database.get_authoritative_fill_by_id(fill_id)
+        if current_fill is None:
+            database.block_offer_fill_hook_authority_loss(fill_id)
+            results[hook_name] = "blocked"
+            continue
+        try:
+            callback = _post_fill_hook_callbacks(current_fill)[hook_name]
+        except Exception:
+            try:
+                database.fail_offer_fill_hook(
+                    fill_id,
+                    hook_name,
+                    claim["claim_token"],
+                    claim_generation=claim["claim_generation"],
+                    error_code="CALLBACK_CONSTRUCTION_FAILED",
+                )
+            except Exception:
+                pass
+            results[hook_name] = "failed"
+            continue
         claim_token = claim["claim_token"]
         claim_generation = claim["claim_generation"]
         heartbeat_stop = threading.Event()
@@ -2615,7 +2647,7 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         effect_boundary = False
         try:
             acknowledgement = callback(
-                fill,
+                current_fill,
                 claim_token=claim_token,
                 claim_generation=claim_generation,
             )
@@ -2700,8 +2732,9 @@ def drain_offer_fill_hook_outbox(*, limit: int = 32) -> dict[int, dict[str, str]
 
     drained: dict[int, dict[str, str]] = {}
     for fill_id in database.get_offer_fill_hook_outbox_work(limit=limit):
-        fill = database.get_fill_by_id(fill_id)
+        fill = database.get_authoritative_fill_by_id(fill_id)
         if fill is None:
+            database.block_offer_fill_hook_authority_loss(fill_id)
             continue
         drained[fill_id] = _run_post_fill_hooks(
             fill, completed_at=str(fill["filled_at"])
@@ -2772,13 +2805,62 @@ def reconcile_offer(
             "authorization_code": decision.code.value,
         }
     durable_proof = {"classification": result, "evidence": collected}
+    if result["classification"] == FILLED_PROVEN:
+        stored_offer = database.get_offer(intent["sage_trade_id"])
+        if type(stored_offer) is not dict:
+            raise RuntimeError("proven fill lost its durable offer economics")
+        durable_proof["fill_authority"] = {
+            "schema_version": 1,
+            "intent_id": intent["intent_id"],
+            "trade_id": intent["sage_trade_id"],
+            "side": stored_offer["side"],
+            "price_xch": stored_offer["price_xch"],
+            "size_xch": stored_offer["size_xch"],
+            "size_cat": stored_offer["size_cat"],
+            "cat_asset_id": stored_offer["cat_asset_id"],
+            "tier": stored_offer["tier"],
+            "fee_mojos_xch": int(stored_offer.get("fee_mojos_xch") or 0),
+            "spent_block_height": result["block_height"],
+            "receive_coin_id": database.norm_coin_id(result["receive_coin_id"]),
+            "receive_amount_mojos": result["receive_amount_mojos"],
+            "filled_at": result["filled_at"],
+            "transaction_id": result.get("transaction_id"),
+            "spend_identity": result.get("spend_identity"),
+        }
     exact_cancel_context = _validated_cancel_context(cancel_context)
     if result["classification"] == CANCELLED_PROVEN:
         if exact_cancel_context is None:
             raise RuntimeError("proven cancellation lost its validated Task 8 context")
         durable_proof["cancel_context"] = exact_cancel_context
     try:
-        durable_json, evidence_sha256 = canonical_evidence_and_digest(durable_proof)
+        # Leave enough room to expose the immutable fill binding at the root
+        # of a bounded envelope.  SQLite's receipt guard must be able to prove
+        # these exact values without trusting the caller or an opaque digest.
+        durable_json, evidence_sha256 = canonical_evidence_and_digest(
+            durable_proof,
+            max_bytes=57344 if result["classification"] == FILLED_PROVEN else 65536,
+        )
+        bounded_proof = json.loads(durable_json)
+        if (
+            result["classification"] == FILLED_PROVEN
+            and bounded_proof.get("bounded") is True
+        ):
+            exact_subset = bounded_proof.get("exact_subset")
+            if type(exact_subset) is not dict:
+                raise _EvidenceEncodingError(
+                    "bounded fill proof lost its exact authority subset"
+                )
+            bounded_proof["classification"] = exact_subset["classification"]
+            bounded_proof["fill_authority"] = exact_subset["fill_authority"]
+            durable_json = json.dumps(
+                bounded_proof,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(durable_json.encode("utf-8")) > 65536:
+                raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
     except Exception:
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
         fallback_destination, fallback_evidence = _registry_evidence(

@@ -26,6 +26,7 @@ from config import cfg
 from database import (
     _economic_fill_authority_join,
     get_connection,
+    get_net_position,
     get_market_analysis_cache,
     set_market_analysis_cache,
     get_pool_snapshots,
@@ -1710,6 +1711,9 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         "total_fill_volume_xch": 0,
         "avg_fill_size_xch": 0,
         "inventory_snapshots": 0,
+        "legacy_inventory_snapshots": 0,
+        "latest_legacy_net_position": None,
+        "inventory_position_authority": "authoritative_fill_receipts",
         "latest_net_position": 0,
         "pool_snapshots": 0,
         "pool_trend": "unknown",
@@ -1760,15 +1764,18 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
             (asset_id,),
         ).fetchone()
         result["inventory_snapshots"] = row["cnt"] if row else 0
+        result["legacy_inventory_snapshots"] = result["inventory_snapshots"]
 
-        # Latest net position
+        # Historical snapshots remain UI history only.  Current positioning,
+        # drift and risk derive from exact authoritative fill receipts.
         row = conn.execute(
             "SELECT net_position FROM inventory "
             "WHERE cat_asset_id = ? ORDER BY timestamp DESC LIMIT 1",
             (asset_id,),
         ).fetchone()
         if row:
-            result["latest_net_position"] = _safe_float(row["net_position"])
+            result["latest_legacy_net_position"] = _safe_float(row["net_position"])
+        result["latest_net_position"] = _safe_float(get_net_position(asset_id))
 
         # Pool snapshots (our own history)
         snapshots = get_pool_snapshots(asset_id, hours=720)

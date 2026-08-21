@@ -2240,6 +2240,8 @@ class FillTracker:
                 sell_fill_id=sell_fill["fill_id"],
                 pnl_xch=pnl_xch,
             )
+            if type(rt_id) is not int or rt_id <= 0:
+                raise ValueError("round-trip authority rejected receipt pairing")
 
             buy_tier = buy_fill.get("tier", "?")
             sell_tier = sell_fill.get("tier", "?")

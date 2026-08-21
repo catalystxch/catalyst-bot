@@ -295,6 +295,28 @@ class FillPnlMatchingTests(unittest.TestCase):
         # Pass 4 must NOT appear
         self.assertNotIn("pass=4", match_log[2])
 
+    def test_rejected_canonical_round_trip_is_not_reported_as_matched(self):
+        """A DB authority rejection must propagate as a failed match."""
+        self.ft_mod.match_round_trip = lambda **_kwargs: -1
+        tracker = self._make_tracker()
+
+        result = tracker._create_round_trip(
+            _make_fill("b1", "buy", "1", "0.25", "4", "inner"),
+            _make_fill("s1", "sell", "1", "0.30", "4", "inner"),
+            pass_num=1,
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(
+            any(event_type == "round_trip_matched" for _, event_type, _ in self.logged)
+        )
+        self.assertTrue(
+            any(
+                event_type == "round_trip_match_failed"
+                for _, event_type, _ in self.logged
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

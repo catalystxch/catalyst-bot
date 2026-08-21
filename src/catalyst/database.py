@@ -52,6 +52,112 @@ def norm_coin_id(cid: str) -> str:
     return cid
 
 
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Return one non-exponent Decimal spelling for durable authority values."""
+
+    if not value.is_finite():
+        raise ValueError("authority Decimal must be finite")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def _canonical_round_trip_pnl_text(
+    buy_price_xch: Any,
+    buy_size_xch: Any,
+    buy_size_cat: Any,
+    buy_fee_mojos_xch: Any,
+    sell_price_xch: Any,
+    sell_size_xch: Any,
+    sell_size_cat: Any,
+    sell_fee_mojos_xch: Any,
+) -> str:
+    """Derive exact realised XCH PnL solely from two fill receipts."""
+
+    buy_price = Decimal(str(buy_price_xch))
+    buy_xch = Decimal(str(buy_size_xch))
+    buy_cat = Decimal(str(buy_size_cat))
+    sell_price = Decimal(str(sell_price_xch))
+    sell_xch = Decimal(str(sell_size_xch))
+    sell_cat = Decimal(str(sell_size_cat))
+    values = (buy_price, buy_xch, buy_cat, sell_price, sell_xch, sell_cat)
+    if any(not value.is_finite() or value < 0 for value in values):
+        raise ValueError("round-trip receipt economics are invalid")
+    if any(
+        type(fee) is not int or fee < 0
+        for fee in (buy_fee_mojos_xch, sell_fee_mojos_xch)
+    ):
+        raise ValueError("round-trip receipt fees are invalid")
+    mid_price = (buy_price + sell_price) / Decimal("2")
+    realised = (
+        sell_xch
+        - buy_xch
+        + ((buy_cat - sell_cat) * mid_price)
+        - (Decimal(buy_fee_mojos_xch + sell_fee_mojos_xch) / Decimal("1000000000000"))
+    )
+    return _canonical_decimal_text(realised)
+
+
+def _canonical_round_trip_authority_token(
+    round_trip_id: Any,
+    buy_fill_id: Any,
+    sell_fill_id: Any,
+    buy_authority_token: Any,
+    sell_authority_token: Any,
+    realised_pnl_xch: Any,
+) -> str:
+    """Hash the complete immutable round-trip authority material."""
+
+    if (
+        type(round_trip_id) is not int
+        or type(buy_fill_id) is not int
+        or type(sell_fill_id) is not int
+        or round_trip_id != buy_fill_id
+        or buy_fill_id <= 0
+        or sell_fill_id <= 0
+        or buy_fill_id == sell_fill_id
+        or type(buy_authority_token) is not str
+        or len(buy_authority_token) != 64
+        or type(sell_authority_token) is not str
+        or len(sell_authority_token) != 64
+    ):
+        raise ValueError("round-trip authority identity is invalid")
+    pnl = _canonical_decimal_text(Decimal(str(realised_pnl_xch)))
+    material = json.dumps(
+        {
+            "schema_version": 1,
+            "round_trip_id": round_trip_id,
+            "buy_fill_id": buy_fill_id,
+            "sell_fill_id": sell_fill_id,
+            "buy_authority_token": buy_authority_token,
+            "sell_authority_token": sell_authority_token,
+            "realised_pnl_xch": pnl,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _register_authority_sql_functions(conn: sqlite3.Connection) -> None:
+    """Register deterministic functions used by guarded authority triggers."""
+
+    conn.create_function(
+        "catalyst_round_trip_pnl",
+        8,
+        _canonical_round_trip_pnl_text,
+        deterministic=True,
+    )
+    conn.create_function(
+        "catalyst_round_trip_token",
+        6,
+        _canonical_round_trip_authority_token,
+        deterministic=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Database path — lives under the per-user data directory so the app works
 # when installed to a read-only location (e.g. C:\Program Files).
@@ -119,6 +225,7 @@ def get_connection() -> sqlite3.Connection:
     if not hasattr(_local, "conn") or _local.conn is None:
         _new_db = not os.path.exists(DB_PATH)
         _local.conn = sqlite3.connect(DB_PATH, timeout=10)
+        _register_authority_sql_functions(_local.conn)
         if _new_db:
             # Restrict database file to owner-only access
             try:
@@ -758,6 +865,262 @@ CREATE TRIGGER IF NOT EXISTS authoritative_fill_receipts_no_delete
 BEFORE DELETE ON authoritative_fill_receipts
 BEGIN
     SELECT RAISE(ABORT, 'authoritative_fill_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS authoritative_fill_receipts_proof_guard
+BEFORE INSERT ON authoritative_fill_receipts
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM fills AS guarded_fill
+      JOIN offer_operation_journal AS guarded_event
+        ON guarded_event.event_id=NEW.terminal_event_id
+      JOIN offer_intents AS guarded_intent
+        ON guarded_intent.intent_id=NEW.intent_id
+     WHERE guarded_fill.fill_id=NEW.fill_id
+       AND NEW.authority_token=NEW.evidence_sha256
+       AND NEW.evidence_sha256=guarded_event.evidence_sha256
+       AND NEW.intent_id=guarded_event.intent_id
+       AND NEW.trade_id=guarded_intent.sage_trade_id
+       AND guarded_event.operation_id='reconcile:' || NEW.intent_id
+       AND guarded_event.operation_type='RECONCILE'
+       AND guarded_event.attempt=1
+       AND guarded_event.phase='FINALIZED'
+       AND guarded_event.outcome='FILLED_PROVEN'
+       AND guarded_event.blocks_mutation=0
+       AND guarded_event.transaction_id IS NEW.transaction_id
+       AND guarded_event.spend_identity IS NEW.spend_identity
+       AND guarded_event.created_at=NEW.recorded_at
+       AND guarded_intent.lifecycle_state='terminal'
+       AND guarded_intent.side=NEW.side
+       AND guarded_intent.asset_id=NEW.cat_asset_id
+       AND guarded_intent.tier=NEW.tier
+       AND guarded_fill.trade_id=NEW.trade_id
+       AND guarded_fill.side=NEW.side
+       AND guarded_fill.price_xch=NEW.price_xch
+       AND guarded_fill.size_xch=NEW.size_xch
+       AND guarded_fill.size_cat=NEW.size_cat
+       AND guarded_fill.cat_asset_id=NEW.cat_asset_id
+       AND guarded_fill.tier=NEW.tier
+       AND guarded_fill.filled_at=NEW.filled_at
+       AND guarded_fill.fee_mojos_xch=NEW.fee_mojos_xch
+       AND guarded_fill.spent_block_index=NEW.spent_block_height
+       AND guarded_fill.spent_block_height=NEW.spent_block_height
+       AND guarded_fill.receive_coin_id=NEW.receive_coin_id
+       AND guarded_fill.receive_amount_mojos=NEW.receive_amount_mojos
+       AND json_valid(guarded_event.evidence_json)
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.classification'
+           )='FILLED_PROVEN'
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.transaction_id'
+           ) IS NEW.transaction_id
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.spend_identity'
+           ) IS NEW.spend_identity
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.block_height'
+           )=NEW.spent_block_height
+       AND LOWER(REPLACE(json_extract(
+               guarded_event.evidence_json,
+               '$.classification.receive_coin_id'
+           ), '0x', ''))=LOWER(REPLACE(NEW.receive_coin_id, '0x', ''))
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.receive_amount_mojos'
+           )=NEW.receive_amount_mojos
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.classification.filled_at'
+           )=NEW.filled_at
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.schema_version'
+           )=1
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.intent_id'
+           )=NEW.intent_id
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.trade_id'
+           )=NEW.trade_id
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.side'
+           )=NEW.side
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.price_xch'
+           )=NEW.price_xch
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.size_xch'
+           )=NEW.size_xch
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.size_cat'
+           )=NEW.size_cat
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.cat_asset_id'
+           )=NEW.cat_asset_id
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.tier'
+           )=NEW.tier
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.fee_mojos_xch'
+           )=NEW.fee_mojos_xch
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.spent_block_height'
+           )=NEW.spent_block_height
+       AND LOWER(REPLACE(json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.receive_coin_id'
+           ), '0x', ''))=LOWER(REPLACE(NEW.receive_coin_id, '0x', ''))
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.receive_amount_mojos'
+           )=NEW.receive_amount_mojos
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.filled_at'
+           )=NEW.filled_at
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.transaction_id'
+           ) IS NEW.transaction_id
+       AND json_extract(
+               guarded_event.evidence_json,
+               '$.fill_authority.spend_identity'
+           ) IS NEW.spend_identity
+       AND json_valid(guarded_intent.selected_coin_ids_json)
+       AND json_type(guarded_intent.selected_coin_ids_json)='array'
+       AND json_array_length(guarded_intent.selected_coin_ids_json)>0
+       AND (
+            SELECT COUNT(*)
+              FROM offer_reconciliation_coin_outcomes AS guarded_outcome
+             WHERE guarded_outcome.terminal_event_id=NEW.terminal_event_id
+       )=json_array_length(guarded_intent.selected_coin_ids_json)
+       AND NOT EXISTS (
+            SELECT 1
+              FROM json_each(guarded_intent.selected_coin_ids_json) AS selected
+             WHERE NOT EXISTS (
+                SELECT 1
+                  FROM offer_reconciliation_coin_outcomes AS guarded_outcome
+                 WHERE guarded_outcome.terminal_event_id=NEW.terminal_event_id
+                   AND LOWER(REPLACE(guarded_outcome.coin_id, '0x', ''))=
+                       LOWER(REPLACE(CAST(selected.value AS TEXT), '0x', ''))
+                   AND guarded_outcome.intent_id=NEW.intent_id
+                   AND guarded_outcome.trade_id=NEW.trade_id
+                   AND guarded_outcome.outcome='FILLED_PROVEN'
+                   AND guarded_outcome.disposition='spent'
+                   AND guarded_outcome.evidence_sha256=NEW.evidence_sha256
+                   AND guarded_outcome.recorded_at=NEW.recorded_at
+             )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'authoritative receipt requires exact terminal fill proof');
+END;
+
+-- Immutable realised-PnL authority.  The guarded insert recomputes both the
+-- Decimal economic result and its token from the two current fill receipts.
+CREATE TABLE IF NOT EXISTS authoritative_round_trip_receipts (
+    round_trip_id               INTEGER PRIMARY KEY,
+    buy_fill_id                 INTEGER NOT NULL UNIQUE,
+    sell_fill_id                INTEGER NOT NULL UNIQUE,
+    buy_authority_token         TEXT NOT NULL CHECK(length(buy_authority_token) = 64),
+    sell_authority_token        TEXT NOT NULL CHECK(length(sell_authority_token) = 64),
+    authority_token             TEXT NOT NULL UNIQUE CHECK(length(authority_token) = 64),
+    realised_pnl_xch            TEXT NOT NULL,
+    created_at                  TEXT NOT NULL,
+    CHECK(round_trip_id=buy_fill_id AND buy_fill_id<>sell_fill_id),
+    FOREIGN KEY(buy_fill_id) REFERENCES authoritative_fill_receipts(fill_id),
+    FOREIGN KEY(sell_fill_id) REFERENCES authoritative_fill_receipts(fill_id)
+);
+CREATE INDEX IF NOT EXISTS idx_authoritative_round_trip_receipts_created
+    ON authoritative_round_trip_receipts(created_at, round_trip_id);
+CREATE TRIGGER IF NOT EXISTS authoritative_round_trip_receipts_no_update
+BEFORE UPDATE ON authoritative_round_trip_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'authoritative_round_trip_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS authoritative_round_trip_receipts_no_delete
+BEFORE DELETE ON authoritative_round_trip_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'authoritative_round_trip_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS authoritative_round_trip_receipts_proof_guard
+BEFORE INSERT ON authoritative_round_trip_receipts
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM authoritative_fill_receipts AS buy_receipt
+      JOIN fills AS buy_fill ON buy_fill.fill_id=buy_receipt.fill_id
+      JOIN authoritative_fill_receipts AS sell_receipt
+        ON sell_receipt.fill_id=NEW.sell_fill_id
+      JOIN fills AS sell_fill ON sell_fill.fill_id=sell_receipt.fill_id
+     WHERE buy_receipt.fill_id=NEW.buy_fill_id
+       AND NEW.round_trip_id=NEW.buy_fill_id
+       AND NEW.buy_fill_id<>NEW.sell_fill_id
+       AND buy_receipt.authority_token=NEW.buy_authority_token
+       AND sell_receipt.authority_token=NEW.sell_authority_token
+       AND buy_receipt.authority_token=buy_receipt.evidence_sha256
+       AND sell_receipt.authority_token=sell_receipt.evidence_sha256
+       AND buy_receipt.side='buy'
+       AND sell_receipt.side='sell'
+       AND buy_receipt.cat_asset_id=sell_receipt.cat_asset_id
+       AND buy_receipt.filled_at<=sell_receipt.filled_at
+       AND buy_fill.trade_id=buy_receipt.trade_id
+       AND buy_fill.side=buy_receipt.side
+       AND buy_fill.price_xch=buy_receipt.price_xch
+       AND buy_fill.size_xch=buy_receipt.size_xch
+       AND buy_fill.size_cat=buy_receipt.size_cat
+       AND buy_fill.cat_asset_id=buy_receipt.cat_asset_id
+       AND buy_fill.tier=buy_receipt.tier
+       AND buy_fill.filled_at=buy_receipt.filled_at
+       AND buy_fill.fee_mojos_xch=buy_receipt.fee_mojos_xch
+       AND buy_fill.spent_block_height=buy_receipt.spent_block_height
+       AND buy_fill.receive_coin_id=buy_receipt.receive_coin_id
+       AND buy_fill.receive_amount_mojos=buy_receipt.receive_amount_mojos
+       AND sell_fill.trade_id=sell_receipt.trade_id
+       AND sell_fill.side=sell_receipt.side
+       AND sell_fill.price_xch=sell_receipt.price_xch
+       AND sell_fill.size_xch=sell_receipt.size_xch
+       AND sell_fill.size_cat=sell_receipt.size_cat
+       AND sell_fill.cat_asset_id=sell_receipt.cat_asset_id
+       AND sell_fill.tier=sell_receipt.tier
+       AND sell_fill.filled_at=sell_receipt.filled_at
+       AND sell_fill.fee_mojos_xch=sell_receipt.fee_mojos_xch
+       AND sell_fill.spent_block_height=sell_receipt.spent_block_height
+       AND sell_fill.receive_coin_id=sell_receipt.receive_coin_id
+       AND sell_fill.receive_amount_mojos=sell_receipt.receive_amount_mojos
+       AND NEW.realised_pnl_xch=catalyst_round_trip_pnl(
+               buy_receipt.price_xch,
+               buy_receipt.size_xch,
+               buy_receipt.size_cat,
+               buy_receipt.fee_mojos_xch,
+               sell_receipt.price_xch,
+               sell_receipt.size_xch,
+               sell_receipt.size_cat,
+               sell_receipt.fee_mojos_xch
+           )
+       AND NEW.authority_token=catalyst_round_trip_token(
+               NEW.round_trip_id,
+               NEW.buy_fill_id,
+               NEW.sell_fill_id,
+               NEW.buy_authority_token,
+               NEW.sell_authority_token,
+               NEW.realised_pnl_xch
+           )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'round-trip receipt requires exact fill authority');
 END;
 
 -- One bounded, append-only migration/audit stream for authority conflicts.
@@ -1533,6 +1896,16 @@ _STABILITY_REQUIRED_COLUMNS = {
         "evidence_sha256",
         "recorded_at",
     },
+    "authoritative_round_trip_receipts": {
+        "round_trip_id",
+        "buy_fill_id",
+        "sell_fill_id",
+        "buy_authority_token",
+        "sell_authority_token",
+        "authority_token",
+        "realised_pnl_xch",
+        "created_at",
+    },
     "offer_authority_migration_audit": {
         "audit_id",
         "authority_type",
@@ -1853,6 +2226,13 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("cat_asset_id", "filled_at", "fill_id"),
+        None,
+    ),
+    "idx_authoritative_round_trip_receipts_created": (
+        "authoritative_round_trip_receipts",
+        False,
+        False,
+        ("created_at", "round_trip_id"),
         None,
     ),
     "idx_offer_authority_migration_audit_subject": (
@@ -2714,10 +3094,10 @@ def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
     return True
 
 
-_FILL_AUTHORITY_CLOSURE_MIGRATION_KEY = "task9-fill-authority-closure"
+_FILL_AUTHORITY_CLOSURE_MIGRATION_KEY = "task9-fill-proof-effect-closure"
 _FILL_AUTHORITY_CLOSURE_SCHEMA_VERSION = 1
 _FILL_AUTHORITY_CLOSURE_POLICY_SHA256 = hashlib.sha256(
-    b"task9-fill-authority-closure:v1:receipt-permanent-spend-dominance"
+    b"task9-fill-proof-effect-closure:v1:journal-bound-receipt-pnl-effects"
 ).hexdigest()
 _MAX_FILL_AUTHORITY_CLOSURE_ROWS = 4096
 
@@ -2749,8 +3129,10 @@ def _migrate_fill_authority_closure(conn: sqlite3.Connection) -> None:
     try:
         audited_at = _stability_wall_clock()
         fill_rows = conn.execute(
-            "SELECT * FROM fills WHERE "
+            "SELECT * FROM fills AS audited_fill WHERE "
             "COALESCE(verification_status, 'legacy') LIKE 'verified%' "
+            "OR EXISTS (SELECT 1 FROM authoritative_fill_receipts AS receipt "
+            "           WHERE receipt.fill_id=audited_fill.fill_id) "
             "ORDER BY fill_id LIMIT ?",
             (_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1,),
         ).fetchall()
@@ -2960,6 +3342,7 @@ def _migrate_stability_schema() -> None:
         legacy_missing_tables = missing_stability_tables - {
             "offer_reconciliation_coin_outcomes",
             "authoritative_fill_receipts",
+            "authoritative_round_trip_receipts",
             "offer_authority_migration_audit",
         }
         if backfills_completed and legacy_missing_tables:
@@ -5773,6 +6156,68 @@ def _authoritative_coin_available_predicate(alias: str = "coins") -> str:
     )
 
 
+_MAX_WALLET_EFFECT_COIN_IDS = 256
+
+
+def authorize_wallet_effect_coin_ids(coin_ids: Any) -> Optional[List[str]]:
+    """Recheck one exact wallet-effect cohort against durable coin authority.
+
+    The raw wallet's selectable view is only an observation.  Immediately
+    before a split/combine/top-up effect, callers pass the complete input
+    cohort here.  A permanent Task 9 spend, a nonterminal intent reservation,
+    or a mutable lock/trade attribution denies the *whole* cohort.  Missing
+    mutable coin rows are permitted because the durable journal/outcome and
+    intent registries are independently checked first.
+    """
+
+    if (
+        type(coin_ids) is not list
+        or not coin_ids
+        or len(coin_ids) > _MAX_WALLET_EFFECT_COIN_IDS
+    ):
+        return None
+    try:
+        normalized = [
+            _reconciliation_coin_identity(value, "wallet effect coin id")[1]
+            for value in coin_ids
+        ]
+    except (TypeError, ValueError):
+        return None
+    if len(set(normalized)) != len(normalized):
+        return None
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        protected = _nonterminal_registry_coin_ids(conn)
+        if any(coin_id in protected for coin_id in normalized):
+            conn.rollback()
+            return None
+        for coin_id in normalized:
+            outcome = _authoritative_coin_outcome(conn, coin_id)
+            if outcome is not None and outcome["disposition"] == "spent":
+                conn.rollback()
+                return None
+        placeholders = ",".join("?" for _coin_id in normalized)
+        rows = conn.execute(
+            f"SELECT coin_id, status, trade_id FROM coins "
+            f"WHERE coin_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        for row in rows:
+            if row["status"] not in {"free", "gone"} or row["trade_id"] is not None:
+                conn.rollback()
+                return None
+        conn.commit()
+        return normalized
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+
 _MAX_RECENT_AVAILABLE_DEPOSIT_COINS = 256
 
 
@@ -7886,6 +8331,23 @@ def get_fill_by_id(fill_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
+def get_authoritative_fill_by_id(fill_id: int) -> Optional[Dict[str, Any]]:
+    """Return a fill only while its exact Task 9 authority remains current."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    row = (
+        get_connection()
+        .execute(
+            "SELECT f.* FROM fills AS f "
+            + _economic_fill_authority_join()
+            + " WHERE f.fill_id=?",
+            (safe_fill_id,),
+        )
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
 def get_offer_fill_hook_receipts(fill_id: int) -> List[str]:
     """Return completed post-fill hook names in canonical execution order."""
 
@@ -7904,7 +8366,7 @@ def get_offer_fill_hook_receipts(fill_id: int) -> List[str]:
 
 
 def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
-    """Return fills with pending or abandoned post-fill work."""
+    """Return proven work and durably block any selected proof loss."""
 
     safe_limit = _exact_integer(limit, "limit", minimum=1)
     if safe_limit > 512:
@@ -7915,23 +8377,52 @@ def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
     abandoned_before = (
         now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
     ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    rows = (
-        get_connection()
-        .execute(
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidates = conn.execute(
             """
-        SELECT fill_id, MIN(CASE WHEN state='pending' THEN 0 ELSE 1 END) AS priority
-          FROM offer_fill_hook_outbox
-         WHERE state='pending'
-            OR (state='running' AND claimed_at<=?)
-         GROUP BY fill_id
-         ORDER BY priority, fill_id
+            SELECT outbox.fill_id
+              FROM offer_fill_hook_outbox AS outbox
+             WHERE outbox.last_error_code IS NOT
+                   'AUTHORITATIVE_FILL_PROOF_LOST'
+               AND (outbox.state='pending'
+                OR (outbox.state='running' AND outbox.claimed_at<=?))
+             GROUP BY outbox.fill_id
+             ORDER BY outbox.fill_id
+             LIMIT ?
+            """,
+            (abandoned_before, safe_limit),
+        ).fetchall()
+        for candidate in candidates:
+            fill_id = int(candidate["fill_id"])
+            if _current_authoritative_fill_receipt(conn, fill_id) is None:
+                _block_offer_fill_hook_authority_loss(conn, fill_id)
+        rows = conn.execute(
+            """
+        SELECT outbox.fill_id,
+               MIN(CASE WHEN outbox.state='pending' THEN 0 ELSE 1 END) AS priority
+          FROM offer_fill_hook_outbox AS outbox
+          JOIN fills AS f ON f.fill_id=outbox.fill_id
+        """
+            + _economic_fill_authority_join()
+            + """
+         WHERE outbox.last_error_code IS NOT 'AUTHORITATIVE_FILL_PROOF_LOST'
+           AND (outbox.state='pending'
+            OR (outbox.state='running' AND outbox.claimed_at<=?))
+         GROUP BY outbox.fill_id
+         ORDER BY priority, outbox.fill_id
          LIMIT ?
         """,
             (abandoned_before, safe_limit),
-        )
-        .fetchall()
-    )
-    return [int(row["fill_id"]) for row in rows]
+        ).fetchall()
+        conn.commit()
+        return [int(row["fill_id"]) for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _offer_fill_hook_acknowledgement(
@@ -7975,7 +8466,72 @@ def _require_current_offer_fill_hook_claim(
         or int(item["attempt"]) != claim_generation
     ):
         raise ValueError("post-fill hook claim is not the current owner")
+    if _current_authoritative_fill_receipt(conn, fill_id) is None:
+        raise ValueError("post-fill hook fill authority is no longer current")
     return item
+
+
+def _current_authoritative_fill_receipt(
+    conn: sqlite3.Connection, fill_id: int
+) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT fill_authority.* FROM fills AS f "
+        + _economic_fill_authority_join()
+        + " WHERE f.fill_id=?",
+        (fill_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _block_offer_fill_hook_authority_loss(
+    conn: sqlite3.Connection, fill_id: int
+) -> None:
+    """Durably stop every undelivered hook for a no-longer-proven fill."""
+
+    conn.execute(
+        "UPDATE offer_fill_hook_outbox SET state='pending', claim_token=NULL, "
+        "claimed_at=NULL, last_error_code='AUTHORITATIVE_FILL_PROOF_LOST' "
+        "WHERE fill_id=? AND state<>'completed'",
+        (fill_id,),
+    )
+    binding = conn.execute(
+        "SELECT i.wallet_fingerprint_hash, i.network "
+        "FROM authoritative_fill_receipts AS receipt "
+        "JOIN offer_intents AS i ON i.intent_id=receipt.intent_id "
+        "WHERE receipt.fill_id=?",
+        (fill_id,),
+    ).fetchone()
+    if binding is not None:
+        _reconciliation_latch_update(
+            conn,
+            operation_id=f"fill-effect:{fill_id}",
+            wallet_fingerprint_hash=str(binding["wallet_fingerprint_hash"]),
+            network=str(binding["network"]),
+            reason_code="AUTHORITATIVE_FILL_PROOF_LOST",
+            reason="post-fill effect stopped because fill proof no longer matches",
+            reconciled_at=_stability_wall_clock(),
+            blocking=True,
+        )
+
+
+def block_offer_fill_hook_authority_loss(fill_id: int) -> bool:
+    """Durably block undelivered effects after an authoritative reload fails."""
+
+    safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if _current_authoritative_fill_receipt(conn, safe_fill_id) is not None:
+            conn.rollback()
+            return False
+        _block_offer_fill_hook_authority_loss(conn, safe_fill_id)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _insert_offer_fill_hook_sink_ack(
@@ -8202,7 +8758,8 @@ def validate_offer_fill_hook_sink_ack(
         (safe_fill_id, safe_hook, safe_generation, safe_token),
     ).fetchone()
     return bool(
-        owner is not None
+        _current_authoritative_fill_receipt(conn, safe_fill_id) is not None
+        and owner is not None
         and owner["state"] == "running"
         and owner["claim_token"] == safe_token
         and int(owner["attempt"]) == safe_generation
@@ -8237,12 +8794,6 @@ def store_authoritative_fill_classification_ack(
     safe_group = classification.get("sweep_group_id")
     if safe_group is not None:
         safe_group = _required_stability_text(safe_group, "sweep_group_id")
-    detail = {
-        "classification": safe_classification,
-        "spent_block_index": safe_block,
-        "taker_puzzle_hash": safe_taker,
-        "sweep_group_id": safe_group,
-    }
     when = _stability_wall_clock()
     conn = _stability_connection()
     try:
@@ -8254,18 +8805,28 @@ def store_authoritative_fill_classification_ack(
             safe_token,
             safe_generation,
         )
+        receipt = _current_authoritative_fill_receipt(conn, safe_fill_id)
+        if receipt is None:
+            raise ValueError("fill classification authority is no longer current")
+        receipt_height = int(receipt["spent_block_height"])
+        if safe_block is not None and safe_block != receipt_height:
+            raise ValueError("fill classification differs from receipt height")
+        detail = {
+            "classification": safe_classification,
+            "spent_block_index": receipt_height,
+            "taker_puzzle_hash": safe_taker,
+            "sweep_group_id": safe_group,
+        }
         cursor = conn.execute(
             """
             UPDATE fills
                SET fill_classification=?, taker_puzzle_hash=?,
-                   spent_block_index=COALESCE(?, spent_block_index),
                    sweep_group_id=?
              WHERE fill_id=?
             """,
             (
                 safe_classification,
                 safe_taker,
-                safe_block,
                 safe_group,
                 safe_fill_id,
             ),
@@ -8445,7 +9006,7 @@ def _canonical_authoritative_boost_materialization(
 ) -> tuple[Dict[str, Any], str, str]:
     """Validate the exact pre-effect state bound to one Boost command."""
 
-    expected_fields = {
+    base_fields = {
         "schema_version",
         "fill_id",
         "trade_id",
@@ -8457,11 +9018,24 @@ def _canonical_authoritative_boost_materialization(
         "floor_bps",
         "last_safe_offset_bps",
     }
-    if type(materialization) is not dict or set(materialization) != expected_fields:
+    authority_fields = {"authority_token", "tier", "spent_block_height"}
+    materialization_fields = (
+        frozenset(materialization) if type(materialization) is dict else frozenset()
+    )
+    if type(materialization) is not dict or materialization_fields not in {
+        frozenset(base_fields),
+        frozenset(base_fields | authority_fields),
+    }:
         raise ValueError("Boost command materialization has an invalid schema")
+    schema_version = materialization.get("schema_version")
     if (
-        type(materialization["schema_version"]) is not int
-        or materialization["schema_version"] != 1
+        type(schema_version) is not int
+        or schema_version not in {1, 2}
+        or (schema_version == 1 and set(materialization) != base_fields)
+        or (
+            schema_version == 2
+            and set(materialization) != base_fields | authority_fields
+        )
         or type(materialization["fill_id"]) is not int
         or materialization["fill_id"] != fill_id
         or type(materialization["trade_id"]) is not str
@@ -8474,6 +9048,15 @@ def _canonical_authoritative_boost_materialization(
         or type(materialization["settled_before"]) is not bool
     ):
         raise ValueError("Boost command materialization differs from its command")
+    if schema_version == 2 and (
+        type(materialization["authority_token"]) is not str
+        or len(materialization["authority_token"]) != 64
+        or type(materialization["tier"]) is not str
+        or not materialization["tier"]
+        or type(materialization["spent_block_height"]) is not int
+        or materialization["spent_block_height"] <= 0
+    ):
+        raise ValueError("Boost command fill authority binding is invalid")
     for field in ("offset_bps", "floor_bps", "last_safe_offset_bps"):
         _exact_integer(materialization[field], field, minimum=0)
     if (
@@ -8491,13 +9074,43 @@ def _canonical_authoritative_boost_materialization(
     return payload, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _require_authoritative_boost_materialization_binding(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    trade_id: str,
+    side: str,
+    materialization: Dict[str, Any],
+) -> sqlite3.Row:
+    """Require a stored Boost command to remain bound to exact fill authority."""
+
+    receipt = _current_authoritative_fill_receipt(conn, fill_id)
+    if (
+        receipt is None
+        or materialization.get("schema_version") != 2
+        or materialization.get("authority_token") != str(receipt["authority_token"])
+        or materialization.get("tier") != str(receipt["tier"])
+        or materialization.get("spent_block_height")
+        != int(receipt["spent_block_height"])
+        or materialization.get("trade_id") != trade_id
+        or materialization.get("side") != side
+        or str(receipt["trade_id"]) != trade_id
+        or str(receipt["side"]).lower() != side
+        or str(receipt["tier"]).lower() != "boost"
+    ):
+        raise ValueError("Boost command fill authority binding is no longer current")
+    return receipt
+
+
 def get_authoritative_boost_fill_command(fill_id: int) -> Optional[Dict[str, Any]]:
     """Read and verify one registered command and its immutable materialization."""
 
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
-    row = (
-        get_connection()
-        .execute(
+    # This read needs several exact cross-table checks.  Use a private
+    # connection because the function closes it below; closing the module's
+    # thread-local connection would poison every later DB read in this thread.
+    conn = _stability_connection()
+    try:
+        row = conn.execute(
             "SELECT command.*, materialization.materialization_json, "
             "       materialization.materialization_sha256 "
             "FROM offer_fill_boost_commands AS command "
@@ -8505,38 +9118,47 @@ def get_authoritative_boost_fill_command(fill_id: int) -> Optional[Dict[str, Any
             "  ON materialization.fill_id=command.fill_id "
             "WHERE command.fill_id=?",
             (safe_fill_id,),
-        )
-        .fetchone()
-    )
-    if row is None:
-        return None
-    result = {
-        "fill_id": safe_fill_id,
-        "trade_id": str(row["trade_id"]),
-        "side": str(row["side"]),
-        "state": str(row["state"]),
-        "registered_at": str(row["registered_at"]),
-        "applied_at": row["applied_at"],
-        "materialization": None,
-    }
-    if row["materialization_json"] is None:
+        ).fetchone()
+        if row is None:
+            return None
+        result = {
+            "fill_id": safe_fill_id,
+            "trade_id": str(row["trade_id"]),
+            "side": str(row["side"]),
+            "state": str(row["state"]),
+            "registered_at": str(row["registered_at"]),
+            "applied_at": row["applied_at"],
+            "materialization": None,
+        }
+        if row["materialization_json"] is None:
+            return result
+        try:
+            decoded = json.loads(str(row["materialization_json"]))
+            payload, encoded, digest = _canonical_authoritative_boost_materialization(
+                decoded,
+                safe_fill_id,
+                result["trade_id"],
+                result["side"],
+            )
+            if encoded != str(row["materialization_json"]) or digest != str(
+                row["materialization_sha256"]
+            ):
+                raise ValueError("Boost command materialization digest differs")
+            _require_authoritative_boost_materialization_binding(
+                conn,
+                safe_fill_id,
+                result["trade_id"],
+                result["side"],
+                payload,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "stored Boost command materialization is invalid"
+            ) from exc
+        result["materialization"] = payload
         return result
-    try:
-        decoded = json.loads(str(row["materialization_json"]))
-        payload, encoded, digest = _canonical_authoritative_boost_materialization(
-            decoded,
-            safe_fill_id,
-            result["trade_id"],
-            result["side"],
-        )
-        if encoded != str(row["materialization_json"]) or digest != str(
-            row["materialization_sha256"]
-        ):
-            raise ValueError("Boost command materialization digest differs")
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("stored Boost command materialization is invalid") from exc
-    result["materialization"] = payload
-    return result
+    finally:
+        conn.close()
 
 
 def register_authoritative_boost_fill_command(
@@ -8557,7 +9179,7 @@ def register_authoritative_boost_fill_command(
     safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     if safe_side not in {"buy", "sell"}:
         raise ValueError("side must be buy or sell")
-    payload, encoded_materialization, materialization_digest = (
+    payload, _encoded_materialization, _materialization_digest = (
         _canonical_authoritative_boost_materialization(
             materialization, safe_fill_id, safe_trade_id, safe_side
         )
@@ -8572,6 +9194,23 @@ def register_authoritative_boost_fill_command(
             "boost_notification",
             safe_token,
             safe_generation,
+        )
+        receipt = _current_authoritative_fill_receipt(conn, safe_fill_id)
+        if receipt is None:
+            raise ValueError("Boost fill authority is no longer current")
+        if str(receipt["tier"]).lower() != "boost":
+            raise ValueError("Boost command requires a receipt-bound boost tier")
+        payload = {
+            **payload,
+            "schema_version": 2,
+            "authority_token": str(receipt["authority_token"]),
+            "tier": str(receipt["tier"]),
+            "spent_block_height": int(receipt["spent_block_height"]),
+        }
+        payload, encoded_materialization, materialization_digest = (
+            _canonical_authoritative_boost_materialization(
+                payload, safe_fill_id, safe_trade_id, safe_side
+            )
         )
         fill = conn.execute(
             "SELECT trade_id, side FROM fills WHERE fill_id=?", (safe_fill_id,)
@@ -8721,6 +9360,9 @@ def _load_authoritative_boost_materialization(
         stored["materialization_sha256"]
     ):
         raise ValueError("Boost command materialization is invalid")
+    _require_authoritative_boost_materialization_binding(
+        conn, fill_id, trade_id, side, materialization
+    )
     return command, materialization
 
 
@@ -9120,6 +9762,21 @@ def _canonical_authoritative_sweep_classification(
 ) -> tuple[Dict[str, Any], str]:
     if type(classification) is not dict:
         raise ValueError("authoritative sweep classification must be a dict")
+    base_fields = {
+        "trade_id",
+        "classification",
+        "spent_block_index",
+        "taker_puzzle_hash",
+        "sweep_group_id",
+        "side",
+    }
+    authority_fields = {"authority_token", "tier"}
+    fields = frozenset(classification)
+    if fields not in {
+        frozenset(base_fields),
+        frozenset(base_fields | authority_fields),
+    }:
+        raise ValueError("authoritative sweep classification has an invalid schema")
     trade_id = _required_stability_text(classification.get("trade_id"), "trade_id")
     classification_name = _required_stability_text(
         classification.get("classification"), "fill classification"
@@ -9142,6 +9799,16 @@ def _canonical_authoritative_sweep_classification(
         side = _required_stability_text(side, "side").lower()
         if side not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
+    authority_token = classification.get("authority_token")
+    tier = classification.get("tier")
+    if fields == base_fields | authority_fields:
+        if (
+            type(authority_token) is not str
+            or len(authority_token) != 64
+            or type(tier) is not str
+            or not tier
+        ):
+            raise ValueError("sweep fill authority binding is invalid")
     payload = {
         "trade_id": trade_id,
         "classification": classification_name,
@@ -9150,6 +9817,8 @@ def _canonical_authoritative_sweep_classification(
         "sweep_group_id": sweep_group_id,
         "side": side,
     }
+    if fields == base_fields | authority_fields:
+        payload.update({"authority_token": authority_token, "tier": tier})
     encoded = _canonical_json_text(
         payload,
         "authoritative sweep classification",
@@ -9157,6 +9826,28 @@ def _canonical_authoritative_sweep_classification(
         max_bytes=16384,
     )
     return payload, encoded
+
+
+def _require_authoritative_sweep_registration_binding(
+    conn: sqlite3.Connection,
+    fill_id: int,
+    payload: Dict[str, Any],
+) -> sqlite3.Row:
+    """Require one sweep registration to match its current fill receipt exactly."""
+
+    receipt = _current_authoritative_fill_receipt(conn, fill_id)
+    if (
+        receipt is None
+        or payload.get("authority_token") != str(receipt["authority_token"])
+        or payload.get("tier") != str(receipt["tier"])
+        or payload.get("spent_block_index") != int(receipt["spent_block_height"])
+        or payload.get("trade_id") != str(receipt["trade_id"])
+        or payload.get("side") != str(receipt["side"]).lower()
+    ):
+        raise ValueError(
+            "sweep registration fill authority binding is no longer current"
+        )
+    return receipt
 
 
 def register_authoritative_sweep_fill(
@@ -9171,7 +9862,7 @@ def register_authoritative_sweep_fill(
     safe_fill_id = _exact_integer(fill_id, "fill_id", minimum=1)
     safe_token = _required_stability_text(claim_token, "claim_token")
     safe_generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
-    payload, encoded = _canonical_authoritative_sweep_classification(classification)
+    payload, _encoded = _canonical_authoritative_sweep_classification(classification)
     when = _stability_wall_clock()
     conn = _stability_connection()
     try:
@@ -9183,6 +9874,32 @@ def register_authoritative_sweep_fill(
             safe_token,
             safe_generation,
         )
+        receipt = _current_authoritative_fill_receipt(conn, safe_fill_id)
+        if receipt is None:
+            raise ValueError("sweep fill authority is no longer current")
+        receipt_height = int(receipt["spent_block_height"])
+        if (
+            payload["spent_block_index"] is not None
+            and payload["spent_block_index"] != receipt_height
+        ):
+            raise ValueError(
+                "sweep spent_block_index differs from authoritative receipt height"
+            )
+        if (
+            payload["side"] is not None
+            and payload["side"] != str(receipt["side"]).lower()
+        ):
+            raise ValueError("sweep side differs from authoritative fill receipt")
+        payload = {
+            **payload,
+            "trade_id": str(receipt["trade_id"]),
+            "spent_block_index": receipt_height,
+            "side": str(receipt["side"]).lower(),
+            "authority_token": str(receipt["authority_token"]),
+            "tier": str(receipt["tier"]),
+        }
+        payload, encoded = _canonical_authoritative_sweep_classification(payload)
+        _require_authoritative_sweep_registration_binding(conn, safe_fill_id, payload)
         fill = conn.execute(
             "SELECT trade_id, side FROM fills WHERE fill_id=?", (safe_fill_id,)
         ).fetchone()
@@ -9278,6 +9995,8 @@ def acknowledge_authoritative_sweep_registration(
         if registration is None:
             raise ValueError("sweep fill is not durably registered")
         payload = json.loads(str(registration["classification_json"]))
+        payload, _encoded = _canonical_authoritative_sweep_classification(payload)
+        _require_authoritative_sweep_registration_binding(conn, safe_fill_id, payload)
         detail = {
             "trade_id": str(registration["trade_id"]),
             "spent_block_index": payload.get("spent_block_index"),
@@ -9311,9 +10030,11 @@ def acknowledge_authoritative_sweep_registration(
 def get_authoritative_sweep_registrations() -> List[Dict[str, Any]]:
     """Return the bounded set of immutable, not-yet-finalized sweep sources."""
 
-    rows = (
-        get_connection()
-        .execute(
+    # Keep restoration reads isolated from the caller's thread-local
+    # connection because the exact binding pass owns and closes this handle.
+    conn = _stability_connection()
+    try:
+        rows = conn.execute(
             "SELECT registration.fill_id, registration.trade_id, "
             "       registration.classification_json "
             "FROM offer_fill_sweep_registration_queue AS queue "
@@ -9322,26 +10043,31 @@ def get_authoritative_sweep_registrations() -> List[Dict[str, Any]]:
             "WHERE queue.state='active' "
             "ORDER BY queue.fill_id LIMIT ?",
             (_MAX_AUTHORITATIVE_SWEEP_RESTORE + 1,),
-        )
-        .fetchall()
-    )
-    if len(rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
-        raise RuntimeError("authoritative sweep restore exceeds its hard limit")
-    registrations: List[Dict[str, Any]] = []
-    for row in rows:
-        try:
-            payload = json.loads(str(row["classification_json"]))
-            payload, encoded = _canonical_authoritative_sweep_classification(payload)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "stored authoritative sweep registration is invalid"
-            ) from exc
-        if payload["trade_id"] != row["trade_id"] or encoded != str(
-            row["classification_json"]
-        ):
-            raise RuntimeError("stored authoritative sweep registration is invalid")
-        registrations.append({"fill_id": int(row["fill_id"]), **payload})
-    return registrations
+        ).fetchall()
+        if len(rows) > _MAX_AUTHORITATIVE_SWEEP_RESTORE:
+            raise RuntimeError("authoritative sweep restore exceeds its hard limit")
+        registrations: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["classification_json"]))
+                payload, encoded = _canonical_authoritative_sweep_classification(
+                    payload
+                )
+                _require_authoritative_sweep_registration_binding(
+                    conn, int(row["fill_id"]), payload
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "stored authoritative sweep registration is invalid"
+                ) from exc
+            if payload["trade_id"] != row["trade_id"] or encoded != str(
+                row["classification_json"]
+            ):
+                raise RuntimeError("stored authoritative sweep registration is invalid")
+            registrations.append({"fill_id": int(row["fill_id"]), **payload})
+        return registrations
+    finally:
+        conn.close()
 
 
 _MAX_AUTHORITATIVE_SWEEP_RESTORE = 4096
@@ -9461,6 +10187,9 @@ def _load_authoritative_sweep_event_fills(
             registration = json.loads(str(row["classification_json"]))
             registration, encoded = _canonical_authoritative_sweep_classification(
                 registration
+            )
+            _require_authoritative_sweep_registration_binding(
+                conn, int(row["fill_id"]), registration
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -10356,6 +11085,14 @@ def claim_offer_fill_hook(
         if row is None:
             raise ValueError("post-fill hook outbox item is missing")
         item = dict(row)
+        if _current_authoritative_fill_receipt(conn, safe_fill_id) is None:
+            _block_offer_fill_hook_authority_loss(conn, safe_fill_id)
+            conn.commit()
+            return {
+                "status": "blocked",
+                "claim_token": None,
+                "claim_generation": int(item["attempt"]),
+            }
         if item["state"] == "completed":
             conn.commit()
             return {
@@ -10608,6 +11345,10 @@ def complete_offer_fill_hook(
         if item["state"] == "completed":
             conn.commit()
             return False
+        if _current_authoritative_fill_receipt(conn, safe_fill_id) is None:
+            _block_offer_fill_hook_authority_loss(conn, safe_fill_id)
+            conn.commit()
+            raise ValueError("post-fill hook fill authority is no longer current")
         if (
             item["state"] != "running"
             or item["claim_token"] != safe_token
@@ -10983,6 +11724,25 @@ _AUTHORITATIVE_FILL_RECEIPT_COLUMNS = (
     "recorded_at",
 )
 
+_TERMINAL_FILL_AUTHORITY_EVIDENCE_FIELDS = {
+    "schema_version",
+    "intent_id",
+    "trade_id",
+    "side",
+    "price_xch",
+    "size_xch",
+    "size_cat",
+    "cat_asset_id",
+    "tier",
+    "fee_mojos_xch",
+    "spent_block_height",
+    "receive_coin_id",
+    "receive_amount_mojos",
+    "filled_at",
+    "transaction_id",
+    "spend_identity",
+}
+
 
 def _insert_offer_authority_audit(
     conn: sqlite3.Connection,
@@ -11052,10 +11812,40 @@ def _authoritative_fill_receipt_values(
     }
     if values["side"] not in {"buy", "sell"}:
         raise ValueError("fill side is invalid")
-    token_json = _canonical_json_text(
-        values, "authoritative fill receipt", expected_type=dict, max_bytes=65536
-    )
-    values["authority_token"] = hashlib.sha256(token_json.encode("utf-8")).hexdigest()
+    try:
+        proof = json.loads(event["evidence_json"])
+        authority = proof["fill_authority"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("terminal fill evidence lacks economic authority") from exc
+    if type(authority) is not dict or set(authority) != (
+        _TERMINAL_FILL_AUTHORITY_EVIDENCE_FIELDS
+    ):
+        raise ValueError("terminal fill economic authority fields are invalid")
+    expected_authority = {
+        "schema_version": 1,
+        "intent_id": values["intent_id"],
+        "trade_id": values["trade_id"],
+        "side": values["side"],
+        "price_xch": values["price_xch"],
+        "size_xch": values["size_xch"],
+        "size_cat": values["size_cat"],
+        "cat_asset_id": values["cat_asset_id"],
+        "tier": values["tier"],
+        "fee_mojos_xch": values["fee_mojos_xch"],
+        "spent_block_height": values["spent_block_height"],
+        "receive_coin_id": values["receive_coin_id"],
+        "receive_amount_mojos": values["receive_amount_mojos"],
+        "filled_at": values["filled_at"],
+        "transaction_id": values["transaction_id"],
+        "spend_identity": values["spend_identity"],
+    }
+    if authority != expected_authority:
+        raise ValueError("terminal fill economic authority differs from receipt")
+    # The capability token is deliberately SQL-verifiable.  The guarded
+    # insert and every economic reader can compare it directly with the
+    # immutable terminal journal evidence rather than trusting a Python-only
+    # digest of caller-controlled receipt columns.
+    values["authority_token"] = values["evidence_sha256"]
     return values
 
 
@@ -11524,7 +12314,15 @@ def _economic_fill_authority_predicate(
 ) -> str:
     """Return the sole full-field predicate for economic fill authority."""
 
-    if fill_alias not in {"f", "fills", "f1", "f2", "f3"} or receipt_alias not in {
+    if fill_alias not in {
+        "f",
+        "fills",
+        "f1",
+        "f2",
+        "f3",
+        "buy_fill",
+        "sell_fill",
+    } or receipt_alias not in {
         "fill_authority",
         "afr",
         "buy_authority",
@@ -11546,6 +12344,167 @@ def _economic_fill_authority_predicate(
          AND {receipt_alias}.spent_block_height={fill_alias}.spent_block_height
          AND {receipt_alias}.receive_coin_id={fill_alias}.receive_coin_id
          AND {receipt_alias}.receive_amount_mojos={fill_alias}.receive_amount_mojos
+         AND {receipt_alias}.authority_token={receipt_alias}.evidence_sha256
+         AND EXISTS (
+             SELECT 1
+               FROM offer_operation_journal AS authority_event
+               JOIN offer_intents AS authority_intent
+                 ON authority_intent.intent_id={receipt_alias}.intent_id
+              WHERE authority_event.event_id={receipt_alias}.terminal_event_id
+                AND authority_event.intent_id={receipt_alias}.intent_id
+                AND authority_event.operation_id=
+                    'reconcile:' || {receipt_alias}.intent_id
+                AND authority_event.operation_type='RECONCILE'
+                AND authority_event.attempt=1
+                AND authority_event.phase='FINALIZED'
+                AND authority_event.outcome='FILLED_PROVEN'
+                AND authority_event.blocks_mutation=0
+                AND authority_event.transaction_id IS {receipt_alias}.transaction_id
+                AND authority_event.spend_identity IS {receipt_alias}.spend_identity
+                AND authority_event.evidence_sha256={receipt_alias}.evidence_sha256
+                AND authority_event.created_at={receipt_alias}.recorded_at
+                AND authority_intent.lifecycle_state='terminal'
+                AND authority_intent.sage_trade_id={receipt_alias}.trade_id
+                AND authority_intent.side={receipt_alias}.side
+                AND authority_intent.asset_id={receipt_alias}.cat_asset_id
+                AND authority_intent.tier={receipt_alias}.tier
+                AND json_valid(authority_event.evidence_json)
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.classification'
+                    )='FILLED_PROVEN'
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.transaction_id'
+                    ) IS {receipt_alias}.transaction_id
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.spend_identity'
+                    ) IS {receipt_alias}.spend_identity
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.block_height'
+                    )={receipt_alias}.spent_block_height
+                AND LOWER(REPLACE(json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.receive_coin_id'
+                    ), '0x', ''))=LOWER(REPLACE(
+                        {receipt_alias}.receive_coin_id, '0x', ''
+                    ))
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.receive_amount_mojos'
+                    )={receipt_alias}.receive_amount_mojos
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.classification.filled_at'
+                    )={receipt_alias}.filled_at
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.schema_version'
+                    )=1
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.intent_id'
+                    )={receipt_alias}.intent_id
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.trade_id'
+                    )={receipt_alias}.trade_id
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.side'
+                    )={receipt_alias}.side
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.price_xch'
+                    )={receipt_alias}.price_xch
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.size_xch'
+                    )={receipt_alias}.size_xch
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.size_cat'
+                    )={receipt_alias}.size_cat
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.cat_asset_id'
+                    )={receipt_alias}.cat_asset_id
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.tier'
+                    )={receipt_alias}.tier
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.fee_mojos_xch'
+                    )={receipt_alias}.fee_mojos_xch
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.spent_block_height'
+                    )={receipt_alias}.spent_block_height
+                AND LOWER(REPLACE(json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.receive_coin_id'
+                    ), '0x', ''))=LOWER(REPLACE(
+                        {receipt_alias}.receive_coin_id, '0x', ''
+                    ))
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.receive_amount_mojos'
+                    )={receipt_alias}.receive_amount_mojos
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.filled_at'
+                    )={receipt_alias}.filled_at
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.transaction_id'
+                    ) IS {receipt_alias}.transaction_id
+                AND json_extract(
+                        authority_event.evidence_json,
+                        '$.fill_authority.spend_identity'
+                    ) IS {receipt_alias}.spend_identity
+                AND json_valid(authority_intent.selected_coin_ids_json)
+                AND json_type(authority_intent.selected_coin_ids_json)='array'
+                AND json_array_length(
+                        authority_intent.selected_coin_ids_json
+                    )>0
+                AND (
+                    SELECT COUNT(*)
+                      FROM offer_reconciliation_coin_outcomes AS authority_outcome
+                     WHERE authority_outcome.terminal_event_id=
+                           {receipt_alias}.terminal_event_id
+                )=json_array_length(authority_intent.selected_coin_ids_json)
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM json_each(
+                               authority_intent.selected_coin_ids_json
+                           ) AS selected
+                     WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM offer_reconciliation_coin_outcomes
+                               AS authority_outcome
+                         WHERE authority_outcome.terminal_event_id=
+                               {receipt_alias}.terminal_event_id
+                           AND LOWER(REPLACE(
+                                   authority_outcome.coin_id, '0x', ''
+                               ))=LOWER(REPLACE(
+                                   CAST(selected.value AS TEXT), '0x', ''
+                               ))
+                           AND authority_outcome.intent_id=
+                               {receipt_alias}.intent_id
+                           AND authority_outcome.trade_id=
+                               {receipt_alias}.trade_id
+                           AND authority_outcome.outcome='FILLED_PROVEN'
+                           AND authority_outcome.disposition='spent'
+                           AND authority_outcome.evidence_sha256=
+                               {receipt_alias}.evidence_sha256
+                           AND authority_outcome.recorded_at=
+                               {receipt_alias}.recorded_at
+                    )
+                )
+         )
     """
 
 
@@ -11609,10 +12568,18 @@ def get_unmatched_fills(cat_asset_id: str, side: str, since: str = None) -> List
     """
     conn = get_connection()
     economic_fill_ids = _get_economic_verified_fill_ids(conn, cat_asset_id, since)
-    fill_scope_sql, fill_scope_params = _fill_id_scope(economic_fill_ids)
+    matched_fill_ids = {
+        int(row[column])
+        for row in _get_economic_round_trip_receipts(conn, economic_fill_ids)
+        for column in ("buy_fill_id", "sell_fill_id")
+    }
+    unmatched_fill_ids = [
+        fill_id for fill_id in economic_fill_ids if fill_id not in matched_fill_ids
+    ]
+    fill_scope_sql, fill_scope_params = _fill_id_scope(unmatched_fill_ids)
     params = [cat_asset_id, side]
     query = """SELECT * FROM fills
-           WHERE cat_asset_id=? AND side=? AND round_trip_id IS NULL"""
+           WHERE cat_asset_id=? AND side=?"""
     query += fill_scope_sql
     params.extend(fill_scope_params)
     query += " ORDER BY filled_at ASC"
@@ -11621,12 +12588,12 @@ def get_unmatched_fills(cat_asset_id: str, side: str, since: str = None) -> List
 
 
 def match_round_trip(buy_fill_id: int, sell_fill_id: int, pnl_xch: Decimal) -> int:
-    """Link a buy fill and sell fill as a completed round-trip.
+    """Append one receipt-derived realised-PnL round trip.
 
     Args:
         buy_fill_id: The buy fill's ID
         sell_fill_id: The sell fill's ID
-        pnl_xch: Profit/loss in XCH for this round-trip
+        pnl_xch: Exact caller cross-check; never persisted as authority
 
     Returns a round_trip_id (just uses the buy_fill_id as the ID).
     """
@@ -11639,29 +12606,103 @@ def match_round_trip(buy_fill_id: int, sell_fill_id: int, pnl_xch: Decimal) -> i
         or type(pnl_xch) is not Decimal
     ):
         return -1
-    round_trip_id = buy_fill_id  # Simple: use the buy fill's ID
+    round_trip_id = buy_fill_id
+    conn = get_connection()
     try:
-        conn = get_connection()
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
-            "SELECT f.fill_id, f.side FROM fills AS f "
+            "SELECT f.fill_id, f.side, fill_authority.authority_token, "
+            "       fill_authority.price_xch, fill_authority.size_xch, "
+            "       fill_authority.size_cat, fill_authority.cat_asset_id, "
+            "       fill_authority.fee_mojos_xch, fill_authority.filled_at "
+            "FROM fills AS f "
             + _economic_fill_authority_join()
             + " WHERE f.fill_id IN (?, ?)",
             (buy_fill_id, sell_fill_id),
         ).fetchall()
-        exact_sides = {int(row["fill_id"]): str(row["side"]) for row in rows}
-        if exact_sides != {buy_fill_id: "buy", sell_fill_id: "sell"}:
+        receipts = {int(row["fill_id"]): dict(row) for row in rows}
+        if set(receipts) != {buy_fill_id, sell_fill_id}:
             conn.rollback()
             return -1
-        buy_cursor = conn.execute(
-            "UPDATE fills SET round_trip_id=?, pnl_xch=? WHERE fill_id=?",
-            (round_trip_id, str(pnl_xch), buy_fill_id),
+        buy = receipts[buy_fill_id]
+        sell = receipts[sell_fill_id]
+        if (
+            buy["side"] != "buy"
+            or sell["side"] != "sell"
+            or buy["cat_asset_id"] != sell["cat_asset_id"]
+            or _parse_iso_timestamp(
+                buy["filled_at"], "buy receipt filled_at", require_timezone=True
+            )
+            > _parse_iso_timestamp(
+                sell["filled_at"], "sell receipt filled_at", require_timezone=True
+            )
+        ):
+            conn.rollback()
+            return -1
+        canonical_pnl = _canonical_round_trip_pnl_text(
+            buy["price_xch"],
+            buy["size_xch"],
+            buy["size_cat"],
+            buy["fee_mojos_xch"],
+            sell["price_xch"],
+            sell["size_xch"],
+            sell["size_cat"],
+            sell["fee_mojos_xch"],
         )
-        sell_cursor = conn.execute(
-            "UPDATE fills SET round_trip_id=?, pnl_xch=? WHERE fill_id=?",
-            (round_trip_id, str(pnl_xch), sell_fill_id),
+        if pnl_xch != Decimal(canonical_pnl):
+            conn.rollback()
+            return -1
+        authority_token = _canonical_round_trip_authority_token(
+            round_trip_id,
+            buy_fill_id,
+            sell_fill_id,
+            buy["authority_token"],
+            sell["authority_token"],
+            canonical_pnl,
         )
-        if buy_cursor.rowcount != 1 or sell_cursor.rowcount != 1:
+        existing_rows = conn.execute(
+            "SELECT * FROM authoritative_round_trip_receipts "
+            "WHERE buy_fill_id IN (?, ?) OR sell_fill_id IN (?, ?)",
+            (buy_fill_id, sell_fill_id, buy_fill_id, sell_fill_id),
+        ).fetchall()
+        if existing_rows:
+            if len(existing_rows) != 1:
+                raise RuntimeError("round-trip fill has conflicting authority receipts")
+            existing = existing_rows[0]
+            if (
+                int(existing["round_trip_id"]) != round_trip_id
+                or int(existing["buy_fill_id"]) != buy_fill_id
+                or int(existing["sell_fill_id"]) != sell_fill_id
+                or str(existing["buy_authority_token"]) != buy["authority_token"]
+                or str(existing["sell_authority_token"]) != sell["authority_token"]
+                or str(existing["authority_token"]) != authority_token
+                or str(existing["realised_pnl_xch"]) != canonical_pnl
+            ):
+                conn.rollback()
+                return -1
+            conn.commit()
+            return round_trip_id
+        conn.execute(
+            "INSERT INTO authoritative_round_trip_receipts "
+            "(round_trip_id, buy_fill_id, sell_fill_id, buy_authority_token, "
+            " sell_authority_token, authority_token, realised_pnl_xch, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                round_trip_id,
+                buy_fill_id,
+                sell_fill_id,
+                buy["authority_token"],
+                sell["authority_token"],
+                authority_token,
+                canonical_pnl,
+                _stability_wall_clock(),
+            ),
+        )
+        cursor = conn.execute(
+            "UPDATE fills SET round_trip_id=?, pnl_xch=? WHERE fill_id IN (?, ?)",
+            (round_trip_id, canonical_pnl, buy_fill_id, sell_fill_id),
+        )
+        if cursor.rowcount != 2:
             raise RuntimeError("authoritative round-trip fill changed")
         conn.commit()
         return round_trip_id
@@ -12116,24 +13157,55 @@ def _fill_id_scope(fill_ids: List[int], alias: str = "") -> tuple[str, List[int]
 def _get_economic_round_trip_buy_ids(
     conn: sqlite3.Connection, economic_fill_ids: List[int]
 ) -> List[int]:
-    """Return buy legs whose one opposite leg has the same exact authority."""
+    """Return buy legs from exact append-only round-trip authority receipts."""
 
-    scope_sql, scope_params = _fill_id_scope(economic_fill_ids, alias="f1")
+    return [
+        int(row["buy_fill_id"])
+        for row in _get_economic_round_trip_receipts(conn, economic_fill_ids)
+    ]
+
+
+def _get_economic_round_trip_receipts(
+    conn: sqlite3.Connection, economic_fill_ids: List[int]
+) -> List[sqlite3.Row]:
+    """Project only receipts whose two immutable fill proofs remain current."""
+
+    if not economic_fill_ids:
+        return []
+    placeholders = ",".join("?" for _fill_id in economic_fill_ids)
     query = (
-        "SELECT f1.fill_id FROM fills AS f1 "
-        + _economic_fill_authority_join("f1", "buy_authority")
-        + " JOIN fills AS f2 ON f2.round_trip_id=f1.round_trip_id "
-        "AND f2.side='sell' AND f2.cat_asset_id=f1.cat_asset_id "
-        + _economic_fill_authority_join("f2", "sell_authority")
-        + " WHERE f1.side='buy' AND f1.round_trip_id IS NOT NULL "
-        + scope_sql
-        + " AND (SELECT COUNT(*) FROM fills AS f3 "
-        + _economic_fill_authority_join("f3", "round_authority")
-        + " WHERE f3.round_trip_id=f1.round_trip_id)=2 "
-        "GROUP BY f1.fill_id HAVING COUNT(DISTINCT f2.fill_id)=1"
+        "SELECT round_authority.*, "
+        "       buy_fill.filled_at AS buy_filled_at, "
+        "       sell_fill.filled_at AS sell_filled_at "
+        "FROM authoritative_round_trip_receipts AS round_authority "
+        "JOIN fills AS buy_fill "
+        "  ON buy_fill.fill_id=round_authority.buy_fill_id "
+        + _economic_fill_authority_join("buy_fill", "buy_authority")
+        + " JOIN fills AS sell_fill "
+        "  ON sell_fill.fill_id=round_authority.sell_fill_id "
+        + _economic_fill_authority_join("sell_fill", "sell_authority")
+        + f" WHERE buy_fill.fill_id IN ({placeholders}) "
+        + f"AND sell_fill.fill_id IN ({placeholders}) "
+        "AND buy_fill.side='buy' AND sell_fill.side='sell' "
+        "AND buy_fill.cat_asset_id=sell_fill.cat_asset_id "
+        "AND buy_authority.filled_at<=sell_authority.filled_at "
+        "AND round_authority.round_trip_id=round_authority.buy_fill_id "
+        "AND round_authority.buy_authority_token=buy_authority.authority_token "
+        "AND round_authority.sell_authority_token=sell_authority.authority_token "
+        "AND round_authority.realised_pnl_xch=catalyst_round_trip_pnl("
+        "buy_authority.price_xch, buy_authority.size_xch, "
+        "buy_authority.size_cat, buy_authority.fee_mojos_xch, "
+        "sell_authority.price_xch, sell_authority.size_xch, "
+        "sell_authority.size_cat, sell_authority.fee_mojos_xch) "
+        "AND round_authority.authority_token=catalyst_round_trip_token("
+        "round_authority.round_trip_id, round_authority.buy_fill_id, "
+        "round_authority.sell_fill_id, round_authority.buy_authority_token, "
+        "round_authority.sell_authority_token, "
+        "round_authority.realised_pnl_xch) "
+        "ORDER BY round_authority.created_at, round_authority.round_trip_id"
     )
-    rows = conn.execute(query, scope_params).fetchall()
-    return [int(row["fill_id"]) for row in rows]
+    params = [*economic_fill_ids, *economic_fill_ids]
+    return conn.execute(query, params).fetchall()
 
 
 def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
@@ -12155,9 +13227,12 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     )
 
     economic_fill_ids = _get_economic_verified_fill_ids(conn, cat_asset_id, since)
-    economic_round_trip_buy_ids = _get_economic_round_trip_buy_ids(
+    economic_round_trip_receipts = _get_economic_round_trip_receipts(
         conn, economic_fill_ids
     )
+    economic_round_trip_buy_ids = [
+        int(row["buy_fill_id"]) for row in economic_round_trip_receipts
+    ]
 
     # Total fills. raw_total_fills preserves the DB row count for diagnostics;
     # total_fills reports economic fills after collapsing impossible duplicate
@@ -12182,14 +13257,14 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     )
 
     # Realised PnL (from matched round-trips)
-    query_base = """SELECT pnl_xch FROM fills
-                    WHERE round_trip_id IS NOT NULL AND side='buy'
-                      AND pnl_xch IS NOT NULL"""
-    scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids)
-    query_base += scope_sql
-    rows = conn.execute(query_base, params).fetchall()
     stats["realised_pnl_xch"] = str(
-        sum((Decimal(str(r["pnl_xch"])) for r in rows), Decimal("0"))
+        sum(
+            (
+                Decimal(str(row["realised_pnl_xch"]))
+                for row in economic_round_trip_receipts
+            ),
+            Decimal("0"),
+        )
     )
 
     # Round-trip stats
@@ -12197,13 +13272,11 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
 
     # Win rate (profitable round-trips / total round-trips)
     if stats["round_trips"] > 0:
-        query_base = """SELECT COUNT(*) as cnt FROM fills
-                        WHERE round_trip_id IS NOT NULL AND side='buy'
-                        AND CAST(pnl_xch AS REAL) > 0"""
-        scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids)
-        query_base += scope_sql
-        row = conn.execute(query_base, params).fetchone()
-        stats["win_rate"] = round(row["cnt"] / stats["round_trips"] * 100, 1)
+        wins = sum(
+            Decimal(str(row["realised_pnl_xch"])) > 0
+            for row in economic_round_trip_receipts
+        )
+        stats["win_rate"] = round(wins / stats["round_trips"] * 100, 1)
     else:
         stats["win_rate"] = 0
 
@@ -12238,12 +13311,18 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
         stats["net_position"] = "0"
 
     # Unmatched fills by side (open legs waiting for a round-trip partner)
+    matched_fill_ids = {
+        int(row[column])
+        for row in economic_round_trip_receipts
+        for column in ("buy_fill_id", "sell_fill_id")
+    }
+    unmatched_economic_fill_ids = [
+        fill_id for fill_id in economic_fill_ids if fill_id not in matched_fill_ids
+    ]
     for side in ["buy", "sell"]:
-        query_base = """SELECT COUNT(*) as cnt FROM fills
-                        WHERE side=? AND round_trip_id IS NULL
-                        """
+        query_base = "SELECT COUNT(*) as cnt FROM fills WHERE side=?"
         params = [side]
-        scope_sql, scope_params = _fill_id_scope(economic_fill_ids)
+        scope_sql, scope_params = _fill_id_scope(unmatched_economic_fill_ids)
         query_base += scope_sql
         params.extend(scope_params)
         row = conn.execute(query_base, params).fetchone()
@@ -12316,21 +13395,24 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     # Average round trip time (seconds between buy and sell legs of a matched pair)
     if stats["round_trips"] > 0:
         try:
-            query_base = (
-                """SELECT ABS(AVG((julianday(f2.filled_at) - julianday(f1.filled_at)) * 86400)) AS avg_secs
-                            FROM fills f1
-                            JOIN fills f2 ON f1.round_trip_id = f2.round_trip_id
-                                         AND f1.side != f2.side
-                            """
-                + _economic_fill_authority_join("f2", "sell_authority")
-                + """
-                            WHERE f1.side = 'buy' AND f1.round_trip_id IS NOT NULL
-                              """
+            elapsed = [
+                (
+                    _parse_iso_timestamp(
+                        row["sell_filled_at"],
+                        "sell round-trip filled_at",
+                        require_timezone=True,
+                    )
+                    - _parse_iso_timestamp(
+                        row["buy_filled_at"],
+                        "buy round-trip filled_at",
+                        require_timezone=True,
+                    )
+                ).total_seconds()
+                for row in economic_round_trip_receipts
+            ]
+            stats["avg_round_trip_secs"] = float(
+                sum(elapsed) / len(elapsed) if elapsed else 0
             )
-            scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids, alias="f1")
-            query_base += scope_sql
-            row = conn.execute(query_base, params).fetchone()
-            stats["avg_round_trip_secs"] = float(row["avg_secs"] or 0)
         except Exception:
             stats["avg_round_trip_secs"] = 0
     else:
@@ -13346,17 +14428,19 @@ def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
     )
     parsed_evidence = json.loads(safe_evidence)
     if type(parsed_evidence) is dict and parsed_evidence.get("bounded") is True:
+        envelope_fields = {
+            "bounded",
+            "exact_subset",
+            "exact_subset_sha256",
+            "full_evidence_sha256",
+            "redacted",
+        }
+        authority_fields = {"classification", "fill_authority"}
+        actual_fields = set(parsed_evidence)
         if (
-            set(parsed_evidence)
-            != {
-                "bounded",
-                "exact_subset",
-                "exact_subset_sha256",
-                "full_evidence_sha256",
-                "redacted",
-            }
-            or parsed_evidence.get("redacted") is not True
-        ):
+            actual_fields != envelope_fields
+            and actual_fields != envelope_fields | authority_fields
+        ) or parsed_evidence.get("redacted") is not True:
             raise ValueError("bounded evidence envelope fields are invalid")
         subset_text = _canonical_json_text(
             parsed_evidence["exact_subset"],
@@ -13367,6 +14451,13 @@ def _evidence_digest_from_canonical_json(canonical_evidence: str) -> str:
         subset_digest = hashlib.sha256(subset_text.encode("utf-8")).hexdigest()
         if parsed_evidence.get("exact_subset_sha256") != subset_digest:
             raise ValueError("bounded evidence exact subset digest is invalid")
+        if actual_fields == envelope_fields | authority_fields:
+            exact_subset = parsed_evidence.get("exact_subset")
+            if type(exact_subset) is not dict or any(
+                parsed_evidence[field] != exact_subset.get(field)
+                for field in authority_fields
+            ):
+                raise ValueError("bounded fill authority differs from exact subset")
         full_digest = parsed_evidence.get("full_evidence_sha256")
         if (
             type(full_digest) is not str

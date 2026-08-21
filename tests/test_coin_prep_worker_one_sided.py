@@ -93,6 +93,10 @@ def test_sage_tiered_prep_handles_buy_only_without_cat_tiers():
             sys.modules,
             {"wallet_sage": fake_wallet_sage, "wallet": fake_wallet},
         ),
+        patch(
+            "coin_prep_worker.authorize_wallet_effect_coin_ids",
+            side_effect=lambda coin_ids: tuple(coin_ids),
+        ),
         patch("coin_prep_worker.time.sleep", return_value=None),
     ):
         assert (

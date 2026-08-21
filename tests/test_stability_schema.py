@@ -304,11 +304,6 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         "wallet_fingerprint_hash": wallet_hash,
         "network": "mainnet",
     }
-    evidence = {"migration": "exact terminal coin outcome"}
-    evidence_text = json.dumps(
-        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    )
-
     assert database.upsert_coin(
         coin_id,
         "xch",
@@ -361,6 +356,43 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         tier="inner",
         coin_id=database.norm_coin_id(coin_id),
     )
+    transaction_id = _sha("migration-terminal-transaction")
+    receive_coin_id = _sha("migration-terminal-receive")
+    filled_at = "2026-08-15T12:01:30.000000Z"
+    stored_offer = database.get_offer(trade_id)
+    evidence = {
+        "migration": "exact terminal coin outcome",
+        "classification": {
+            "classification": "FILLED_PROVEN",
+            "transaction_id": transaction_id,
+            "spend_identity": None,
+            "block_height": 42,
+            "receive_coin_id": receive_coin_id,
+            "receive_amount_mojos": 2000,
+            "filled_at": filled_at,
+        },
+        "fill_authority": {
+            "schema_version": 1,
+            "intent_id": intent_id,
+            "trade_id": trade_id,
+            "side": stored_offer["side"],
+            "price_xch": stored_offer["price_xch"],
+            "size_xch": stored_offer["size_xch"],
+            "size_cat": stored_offer["size_cat"],
+            "cat_asset_id": stored_offer["cat_asset_id"],
+            "tier": stored_offer["tier"],
+            "fee_mojos_xch": stored_offer["fee_mojos_xch"],
+            "spent_block_height": 42,
+            "receive_coin_id": database.norm_coin_id(receive_coin_id),
+            "receive_amount_mojos": 2000,
+            "filled_at": filled_at,
+            "transaction_id": transaction_id,
+            "spend_identity": None,
+        },
+    }
+    evidence_text = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
     result = database.commit_offer_reconciliation(
         intent_id=intent_id,
         operation_id=f"reconcile:{intent_id}",
@@ -369,11 +401,11 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         wallet_identity_json=wallet_identity,
         evidence_json=evidence,
         evidence_sha256=hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
-        transaction_id=_sha("migration-terminal-transaction"),
+        transaction_id=transaction_id,
         block_height=42,
-        receive_coin_id=_sha("migration-terminal-receive"),
+        receive_coin_id=receive_coin_id,
         receive_amount_mojos=2000,
-        filled_at="2026-08-15T12:01:30.000000Z",
+        filled_at=filled_at,
         reconciled_at="2026-08-15T12:02:00.000000Z",
     )
     terminal_event_id = result["event"]["event_id"]

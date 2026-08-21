@@ -3637,8 +3637,8 @@ def test_future_cancel_becomes_durable_unknown_without_resolving_task8(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
-def _commit_fill_without_draining_hooks(monkeypatch) -> dict:
-    _persist_created_offer()
+def _commit_fill_without_draining_hooks(monkeypatch, *, tier: str = "inner") -> dict:
+    _persist_created_offer(tier=tier)
     monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", lambda *_a, **_k: {})
     committed = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
     fill = database.get_fill_by_trade_id(TRADE)
@@ -3647,7 +3647,61 @@ def _commit_fill_without_draining_hooks(monkeypatch) -> dict:
 
 
 def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) -> dict:
-    fill_id = database.record_fill(
+    identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
+    intent_id = f"authoritative-test-fill:{identity}"
+    selected_coin_id = hashlib.sha256(
+        f"selected:{trade_id}".encode("utf-8")
+    ).hexdigest()
+    receive_coin_id = hashlib.sha256(f"receive:{trade_id}".encode("utf-8")).hexdigest()
+    transaction_id = hashlib.sha256(
+        f"transaction:{trade_id}".encode("utf-8")
+    ).hexdigest()
+    wallet_identity = {"wallet_fingerprint_hash": WALLET, "network": NETWORK}
+    assert database.upsert_coin(
+        selected_coin_id,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+    )
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id="authoritative-test-fill",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="authoritative_test_fill",
+        slot_key=f"slot:{intent_id}",
+        generation=0,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[selected_coin_id],
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "prepared"},
+        prepared_at=AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=hashlib.sha256(
+            f"offer:{trade_id}".encode("utf-8")
+        ).hexdigest(),
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "created"},
+        finalized_at=AT,
+        finalize_selected_coin_reservations=True,
+    )
+    assert database.add_offer(
         trade_id,
         "buy",
         price_xch=database.Decimal("0.0000005"),
@@ -3655,18 +3709,57 @@ def _insert_authoritative_test_fill(trade_id: str, *, block_height: int = 42) ->
         size_cat=database.Decimal("2"),
         cat_asset_id=ASSET,
         tier="inner",
-        verification_status="verified_authoritative",
+        coin_id=database.norm_coin_id(selected_coin_id),
+    )
+    offer = database.get_offer(trade_id)
+    authority = {
+        "schema_version": 1,
+        "intent_id": intent_id,
+        "trade_id": trade_id,
+        "side": offer["side"],
+        "price_xch": offer["price_xch"],
+        "size_xch": offer["size_xch"],
+        "size_cat": offer["size_cat"],
+        "cat_asset_id": offer["cat_asset_id"],
+        "tier": offer["tier"],
+        "fee_mojos_xch": offer["fee_mojos_xch"],
+        "spent_block_height": block_height,
+        "receive_coin_id": database.norm_coin_id(receive_coin_id),
+        "receive_amount_mojos": 2000,
+        "filled_at": AFTER,
+        "transaction_id": transaction_id,
+        "spend_identity": None,
+    }
+    evidence = {
+        "fixture": "authoritative test fill",
+        "classification": {
+            "classification": "FILLED_PROVEN",
+            "transaction_id": transaction_id,
+            "spend_identity": None,
+            "block_height": block_height,
+            "receive_coin_id": receive_coin_id,
+            "receive_amount_mojos": 2000,
+            "filled_at": AFTER,
+        },
+        "fill_authority": authority,
+    }
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    committed = database.commit_offer_reconciliation(
+        intent_id=intent_id,
+        operation_id=f"reconcile:{intent_id}",
+        classification="FILLED_PROVEN",
+        reason_code="AUTHORITATIVE_TEST_PROOF",
+        wallet_identity_json=wallet_identity,
+        evidence_json=evidence,
+        evidence_sha256=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        transaction_id=transaction_id,
+        block_height=block_height,
+        receive_coin_id=receive_coin_id,
+        receive_amount_mojos=2000,
         filled_at=AFTER,
+        reconciled_at=AFTER,
     )
-    assert fill_id > 0
-    conn = database.get_connection()
-    conn.execute(
-        "UPDATE fills SET spent_block_index=?, spent_block_height=? WHERE fill_id=?",
-        (block_height, block_height, fill_id),
-    )
-    database._ensure_authoritative_fill_hook_outbox(conn, fill_id)
-    conn.commit()
-    fill = database.get_fill_by_id(fill_id)
+    fill = database.get_fill_by_id(committed["fill_id"])
     assert fill is not None
     return fill
 
@@ -3897,10 +3990,14 @@ def test_boost_false_result_is_retryable_failure_not_positive_acknowledgement(
     monkeypatch,
 ):
     original_runner = reconciliation._run_post_fill_hooks
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
-    fill["tier"] = "boost"
-    manager = SimpleNamespace(notify_boost_fill=lambda _trade_id: False)
+    manager = SimpleNamespace(
+        capture_authoritative_boost_fill_materialization=lambda *_args: (
+            _boost_materialization(fill["fill_id"])
+        ),
+        notify_authoritative_boost_fill=lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setitem(
         sys.modules,
         "api_server",
@@ -4052,6 +4149,14 @@ def test_production_classification_and_sweep_preserve_authoritative_block_42(
 
     stored_fill = database.get_fill_by_id(fill["fill_id"])
     registrations = database.get_authoritative_sweep_registrations()
+    receipt_token = (
+        database.get_connection()
+        .execute(
+            "SELECT authority_token FROM authoritative_fill_receipts WHERE fill_id=?",
+            (fill["fill_id"],),
+        )
+        .fetchone()[0]
+    )
     coordinator = sweep_coordinator.get_coordinator()
     assert stored_fill["spent_block_index"] == 42
     assert registrations == [
@@ -4063,6 +4168,8 @@ def test_production_classification_and_sweep_preserve_authoritative_block_42(
             "taker_puzzle_hash": None,
             "sweep_group_id": None,
             "side": "buy",
+            "authority_token": receipt_token,
+            "tier": "inner",
         }
     ]
     assert coordinator.get_pending_summary()["pending_fill_count"] == 1
@@ -4074,8 +4181,7 @@ def test_recreated_production_boost_manager_uses_durable_fill_command(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     clock = {"now": "2026-08-20T12:10:00.000000Z"}
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
     first_manager = BoostManager()
@@ -4134,8 +4240,7 @@ def test_recreated_production_boost_manager_materializes_settlement_and_floor(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     first_manager = BoostManager()
     first_manager._buy_offset_bps = 137
     first_manager._buy_last_safe_offset_bps = 121
@@ -4165,7 +4270,7 @@ def test_boost_command_primary_identity_cannot_rebind_during_apply_transition(
     isolated_database,
     monkeypatch,
 ):
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     other_fill = _insert_authoritative_test_fill(OTHER_TRADE)
     claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
     database.register_authoritative_boost_fill_command(
@@ -4198,8 +4303,7 @@ def test_recreated_boost_manager_consumes_registered_command_after_crash(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     clock = {"now": "2026-08-20T12:10:00.000000Z"}
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
     abandoned = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
@@ -4236,8 +4340,7 @@ def test_registered_boost_crash_replays_exact_pre_effect_materialization(
 
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     clock = {"now": "2026-08-20T12:10:00.000000Z"}
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
     first_manager = BoostManager()
@@ -4301,8 +4404,7 @@ def test_boost_command_rejects_changed_materialization_replay(
     isolated_database,
     monkeypatch,
 ):
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
     materialization = _boost_materialization(fill["fill_id"])
     database.register_authoritative_boost_fill_command(
@@ -4365,8 +4467,7 @@ def test_legacy_boost_command_without_materialization_is_blocked_not_recaptured(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     conn = database.get_connection()
     conn.execute(
         "INSERT INTO offer_fill_boost_commands "
@@ -4437,8 +4538,7 @@ def test_boost_effect_and_log_are_durable_before_process_apply_and_replay_once(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     clock = {"now": "2026-08-20T12:10:00.000000Z"}
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
     first = BoostManager()
@@ -4533,8 +4633,7 @@ def test_boost_crash_after_process_apply_replays_without_duplicate_log(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
-    fill["tier"] = "boost"
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     clock = {"now": "2026-08-20T12:10:00.000000Z"}
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: clock["now"])
     manager = BoostManager()
@@ -4613,7 +4712,7 @@ def test_migration_backfills_prior_boost_effect_log_sink(
 ):
     from boost_manager import BoostManager
 
-    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    fill = _commit_fill_without_draining_hooks(monkeypatch, tier="boost")
     claim = database.claim_offer_fill_hook(fill["fill_id"], "boost_notification")
     database.register_authoritative_boost_fill_command(
         fill["fill_id"],
