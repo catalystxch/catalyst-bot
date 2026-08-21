@@ -3204,6 +3204,16 @@ CREATE INDEX IF NOT EXISTS idx_publication_outbox_ready
     ON publication_outbox(state, next_attempt_at, queued_at);
 CREATE INDEX IF NOT EXISTS idx_publication_outbox_intent
     ON publication_outbox(intent_id, state);
+
+-- Task 11's durable completion boundary.  A parent may be reused only after
+-- this exact parent/child/cancel/terminal tuple has been committed.
+CREATE TABLE IF NOT EXISTS offer_refresh_lineage_commits (
+    parent_intent_id           TEXT PRIMARY KEY,
+    child_intent_id            TEXT NOT NULL UNIQUE,
+    cancel_event_id            TEXT NOT NULL UNIQUE,
+    terminal_event_id          TEXT NOT NULL UNIQUE,
+    committed_at               TEXT NOT NULL
+);
 """
 
 
@@ -3626,6 +3636,13 @@ _STABILITY_REQUIRED_COLUMNS = {
         "succeeded_at",
         "terminal_at",
         "updated_at",
+    },
+    "offer_refresh_lineage_commits": {
+        "parent_intent_id",
+        "child_intent_id",
+        "cancel_event_id",
+        "terminal_event_id",
+        "committed_at",
     },
 }
 
@@ -4160,6 +4177,9 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         "publication_outbox",
         ("network", "offer_fingerprint", "publication_epoch"),
     )
+    _require_unique_key(conn, "offer_refresh_lineage_commits", ("child_intent_id",))
+    _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
+    _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -5030,6 +5050,7 @@ def _migrate_stability_schema() -> None:
             "offer_authority_revocations",
             "offer_fill_hook_claim_attestations",
             "offer_fill_sweep_delivery_claim_attestations",
+            "offer_refresh_lineage_commits",
         }
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -21440,6 +21461,128 @@ def refresh_lineage_completion(
     return {"complete": True, "reason": "complete", "terminal": terminal}
 
 
+def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
+    """Durably commit the exact Task 8/9 closure of one refresh parent.
+
+    This transaction only consumes already-durable cancellation and terminal
+    evidence.  It neither performs nor infers a wallet/network effect.
+    """
+
+    parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM offer_refresh_lineage_commits WHERE parent_intent_id=?",
+            (parent_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return {"committed": True, "idempotent": True, "commit": dict(existing)}
+        parent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (parent_id,)
+        ).fetchone()
+        if parent_row is None:
+            conn.commit()
+            return {"committed": False, "reason": "parent_missing"}
+        parent = dict(parent_row)
+        child_id = parent.get("child_intent_id")
+        if not child_id:
+            conn.commit()
+            return {"committed": False, "reason": "child_not_bound"}
+        try:
+            _parent, child = _refresh_lineage_rows(conn, parent_id, str(child_id))
+        except ValueError:
+            conn.commit()
+            return {"committed": False, "reason": "invalid_lineage"}
+        if (
+            child["lifecycle_state"] != "visible"
+            or not child["publication_identity"]
+            or not child["first_visible_at"]
+        ):
+            conn.commit()
+            return {"committed": False, "reason": "child_not_visible"}
+        trade_id = parent.get("sage_trade_id")
+        if not trade_id:
+            conn.commit()
+            return {"committed": False, "reason": "parent_identity_missing"}
+        terminal_row = conn.execute(
+            """
+            SELECT j.* FROM offer_operation_journal AS j
+            JOIN offer_intents AS i ON i.intent_id=j.intent_id
+            WHERE i.intent_id=? AND i.sage_trade_id=? AND i.lifecycle_state='terminal'
+              AND j.operation_type='RECONCILE' AND j.phase='FINALIZED'
+            ORDER BY j.sequence DESC LIMIT 1
+            """,
+            (parent_id, trade_id),
+        ).fetchone()
+        if terminal_row is None:
+            conn.commit()
+            return {"committed": False, "reason": "terminal_proof_missing"}
+        terminal = validate_offer_operation_event(dict(terminal_row))
+        if terminal["outcome"] not in _RECONCILE_TERMINAL_OUTCOMES:
+            raise RuntimeError("refresh terminal evidence is invalid")
+        cancel_row = conn.execute(
+            """
+            SELECT * FROM offer_operation_journal
+            WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+            """,
+            (f"cancel:{trade_id}",),
+        ).fetchone()
+        if cancel_row is None:
+            conn.commit()
+            return {"committed": False, "reason": "cancel_resolution_missing"}
+        cancel = validate_offer_operation_event(dict(cancel_row))
+        if (
+            cancel["intent_id"] != parent_id
+            or cancel["phase"] != "RECONCILED"
+            or cancel["outcome"] != "CANCEL_CONFIRMED"
+            or cancel["blocks_mutation"] != 0
+        ):
+            conn.commit()
+            return {"committed": False, "reason": "cancel_resolution_missing"}
+        committed_at = _stability_wall_clock()
+        conn.execute(
+            """
+            INSERT INTO offer_refresh_lineage_commits (
+                parent_intent_id, child_intent_id, cancel_event_id,
+                terminal_event_id, committed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                parent_id,
+                child_id,
+                cancel["event_id"],
+                terminal["event_id"],
+                committed_at,
+            ),
+        )
+        commit = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_lineage_commits WHERE parent_intent_id=?",
+                (parent_id,),
+            ).fetchone()
+        )
+        conn.commit()
+        return {"committed": True, "idempotent": False, "commit": commit}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_refresh_lineage_commit_for_child(child_intent_id: str) -> Optional[Dict[str, Any]]:
+    """Return the one durable completed incoming edge for a child, if any."""
+
+    child_id = _required_stability_text(child_intent_id, "child_intent_id")
+    row = get_connection().execute(
+        "SELECT * FROM offer_refresh_lineage_commits WHERE child_intent_id=?",
+        (child_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def get_offer_intents_for_registry() -> List[Dict[str, Any]]:
     """Return every durable intent row for one immutable Task 4 snapshot."""
 
@@ -21465,6 +21608,7 @@ def select_offer_creation_generation(*, slot_key: str) -> Dict[str, Any]:
         "submitted_unconfirmed",
         "creation_unknown",
         "created",
+        "visible",
         "unknown",
         "conflicted",
     }

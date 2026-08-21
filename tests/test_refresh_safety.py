@@ -228,3 +228,82 @@ def test_lineage_recovery_is_safe_at_each_durable_crash_boundary(isolated_databa
     database.record_offer_intent_visibility("child", publication_identity="registry:child")  # publication crash
     assert database.refresh_parent_cancel_eligibility("parent", require_visible=True)["eligible"] is True
     assert database.record_offer_intent_visibility("child", publication_identity="registry:child")["idempotent"] is True
+
+
+def test_visible_parent_selects_exact_next_generation_for_a_replacement_child(isolated_database):
+    """Catches visible registry rows being rejected as an unknown generation state."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    database.record_offer_intent_visibility("parent", publication_identity="registry:parent")
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+
+    from offer_manager import OfferManager
+
+    resolved = OfferManager._resolve_creation_context_generation(
+        {
+            "select_next_generation": True,
+            "slot_key": "asset-a:buy:inner",
+            "parent_intent_id": "parent",
+        }
+    )
+    assert resolved["generation"] == 1
+    assert resolved["_authority_run_id"] == "run-a"
+    _prepare("visible-child", parent_intent_id="parent", generation=resolved["generation"])
+    _confirm("visible-child")
+    bound = database.bind_refresh_lineage("parent", "visible-child")
+    assert bound["child"]["sage_trade_id"] == _sha("trade:visible-child")
+
+
+def test_lineage_completion_requires_cancel_resolution_and_terminal_proof(isolated_database):
+    """Catches a staged parent being retired from absence or a local status string."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    database.record_offer_intent_visibility("child", publication_identity="registry:child")
+
+    pending = database.commit_refresh_lineage_completion("parent")
+    assert pending == {"committed": False, "reason": "terminal_proof_missing"}
+
+
+def test_incomplete_refresh_parent_coverage_trips_the_durable_mutation_latch(
+    isolated_database, monkeypatch
+):
+    """Catches a requote staging known parents while silently skipping an open row."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    manager = OfferManager.__new__(OfferManager)
+    parents, pause = manager._collect_staged_refresh_parents(
+        [{"trade_id": _sha("unregistered-open-offer")}], "buy"
+    )
+
+    assert parents == {}
+    assert pause == "registry_parent_missing"
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert "refresh-lineage:buy:coverage" in latch["blocking_operation_ids_json"]

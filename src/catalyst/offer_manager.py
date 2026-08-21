@@ -183,6 +183,126 @@ class OfferManager:
             operator_mass_cancel=operator_mass_cancel,
         )
 
+    @staticmethod
+    def _trip_refresh_lineage_latch(
+        *, operation_id: str, parent: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Latch any malformed refresh boundary before another mutation."""
+
+        wallet_hash = parent.get("wallet_fingerprint_hash") if parent else None
+        network = parent.get("network") if parent else None
+        if not isinstance(wallet_hash, str) or not isinstance(network, str):
+            lease = database.get_runtime_mutation_lease()
+            wallet_hash = lease.get("wallet_fingerprint_hash")
+            network = lease.get("network")
+        if not isinstance(wallet_hash, str) or not wallet_hash or not isinstance(network, str) or not network:
+            raise RuntimeError("refresh lineage cannot bind the runtime safety latch")
+        database.trip_runtime_safety_latch(
+            reason_code="REFRESH_LINEAGE_INCONSISTENT",
+            reason="Refresh lineage requires authoritative reconciliation",
+            blocking_operation_ids=[operation_id],
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+
+    def _collect_staged_refresh_parents(
+        self, open_offers: List[Dict[str, Any]], side: str
+    ) -> tuple[Dict[str, tuple[Dict[str, Any], Dict[str, Any], int]], Optional[str]]:
+        """Resume pending edges, then return the exact complete parent cohort.
+
+        A return pause reason always means no child creation or cancellation
+        will be attempted by the caller in this cycle.
+        """
+
+        candidates = {}
+        slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
+        for offer in open_offers:
+            trade_id = offer.get("trade_id")
+            intent = (
+                database.get_offer_intent_by_trade_id(trade_id)
+                if isinstance(trade_id, str) and trade_id
+                else None
+            )
+            if type(intent) is not dict:
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{side}:coverage"
+                )
+                return {}, "registry_parent_missing"
+            if intent.get("asset_id") != cfg.CAT_ASSET_ID or intent.get("side") != side:
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{intent['intent_id']}:coverage",
+                    parent=intent,
+                )
+                return {}, "registry_parent_conflict"
+            if intent.get("child_intent_id"):
+                completion = database.commit_refresh_lineage_completion(
+                    intent["intent_id"]
+                )
+                if completion.get("committed"):
+                    # Parent is terminal/reconciled and will be removed by its
+                    # Task 9 legacy projection; never stage it again.
+                    return {}, "awaiting_terminal_projection"
+                reason = completion.get("reason")
+                if reason in {"invalid_lineage", "parent_missing", "parent_identity_missing"}:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{intent['intent_id']}:resume",
+                        parent=intent,
+                    )
+                    return {}, "lineage_resume_inconsistent"
+                eligibility = database.refresh_parent_cancel_eligibility(
+                    intent["intent_id"], require_visible=True
+                )
+                if eligibility.get("eligible"):
+                    events = database.get_offer_operation_events(f"cancel:{trade_id}")
+                    if events and int(events[-1].get("blocks_mutation") or 0) == 1:
+                        return {}, "awaiting_task8_task9"
+                    # This is the existing Task 8 authority; its durable
+                    # prepare/effect/finalization path owns the wallet call.
+                    self.cancel_offers(
+                        [trade_id], reason="refresh_lineage", skip_confirmation=False
+                    )
+                    return {}, "awaiting_task8_task9"
+                if eligibility.get("reason") in {"invalid_lineage", "parent_missing"}:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{intent['intent_id']}:resume",
+                        parent=intent,
+                    )
+                    return {}, "lineage_resume_inconsistent"
+                return {}, "awaiting_visibility_or_terminal_proof"
+            if intent.get("parent_intent_id"):
+                if database.get_refresh_lineage_commit_for_child(intent["intent_id"]) is None:
+                    return {}, "awaiting_parent_completion"
+            if intent.get("lifecycle_state") not in {"created", "visible"}:
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{intent['intent_id']}:coverage",
+                    parent=intent,
+                )
+                return {}, "registry_parent_conflict"
+            slot_key = intent.get("slot_key")
+            if not isinstance(slot_key, str) or not slot_key.startswith(slot_prefix):
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{intent['intent_id']}:coverage",
+                    parent=intent,
+                )
+                return {}, "registry_parent_conflict"
+            try:
+                slot = int(slot_key[len(slot_prefix) :])
+            except ValueError:
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{intent['intent_id']}:coverage",
+                    parent=intent,
+                )
+                return {}, "registry_parent_conflict"
+            candidates[intent["intent_id"]] = (offer, intent, slot)
+        slots = [slot for _offer, _intent, slot in candidates.values()]
+        if len(candidates) != len(open_offers) or len(slots) != len(set(slots)):
+            parent = next((item[1] for item in candidates.values()), None)
+            self._trip_refresh_lineage_latch(
+                operation_id=f"refresh-lineage:{side}:coverage", parent=parent
+            )
+            return {}, "registry_parent_coverage_incomplete"
+        return candidates, None
+
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
         # Used by fill_tracker to distinguish own-cancel from counterparty fill.
@@ -3784,7 +3904,9 @@ class OfferManager:
         # BAD_AGGREGATE_SIGNATURE when multiple concurrent make_offer RPCs
         # contend for the same fee coin.  Full ladder creates (startup/cold)
         # still benefit from parallelism since they run before any cancels.
-        _is_requote_batch = num is not None and num < total_slots
+        _is_requote_batch = refresh_parent_ids is not None or (
+            num is not None and num < total_slots
+        )
         if _is_requote_batch:
             max_parallel = 1
         else:
@@ -3852,6 +3974,28 @@ class OfferManager:
                     },
                 },
             )
+            if parent_intent_id is not None and res and res.get("success"):
+                child_intent_id = res.get("_catalyst_intent_id")
+                if type(child_intent_id) is not str or not child_intent_id:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:child-identity",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    return spec["i"], {
+                        "success": False,
+                        "error": "refresh_child_identity_missing",
+                    }
+                try:
+                    database.bind_refresh_lineage(parent_intent_id, child_intent_id)
+                except Exception:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:bind",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    return spec["i"], {
+                        "success": False,
+                        "error": "refresh_lineage_bind_failed",
+                    }
             if res and res.get("success"):
                 locked_coin_id = res.get("locked_coin_id")
                 if locked_coin_id:
@@ -3930,6 +4074,10 @@ class OfferManager:
             child_intent_id = res.get("_catalyst_intent_id")
             if parent_intent_id is not None:
                 if type(child_intent_id) is not str or not child_intent_id:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:child-identity",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
                     log_event(
                         "error",
                         "refresh_child_identity_missing",
@@ -3941,6 +4089,10 @@ class OfferManager:
                 except Exception as exc:
                     # The child is durable and remains a recovery boundary;
                     # do not cancel the parent when the reverse edge is not.
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:bind",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
                     log_event(
                         "error",
                         "refresh_lineage_bind_failed",
@@ -4699,34 +4851,14 @@ class OfferManager:
         # guessing lineage would make a later cancel unsafe.  Task 12 owns
         # the capacity accounting; this routine only consumes the authoritative
         # spare count it already calculated for the current bounded batch.
-        refresh_by_parent = {}
-        for offer in open_offers:
-            trade_id = offer.get("trade_id")
-            if not isinstance(trade_id, str) or not trade_id:
-                continue
-            parent = database.get_offer_intent_by_trade_id(trade_id)
-            if (
-                type(parent) is not dict
-                or parent.get("parent_intent_id") is not None
-                or parent.get("child_intent_id") is not None
-                or parent.get("lifecycle_state") not in {"created", "visible"}
-            ):
-                continue
-            slot_key = parent.get("slot_key")
-            slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
-            if not isinstance(slot_key, str) or not slot_key.startswith(slot_prefix):
-                continue
-            try:
-                slot = int(slot_key[len(slot_prefix) :])
-            except ValueError:
-                continue
-            refresh_by_parent[parent["intent_id"]] = (offer, parent, slot)
-        slots = [slot for _offer, _parent, slot in refresh_by_parent.values()]
-        if not refresh_by_parent or len(slots) != len(set(slots)):
+        refresh_by_parent, refresh_pause = self._collect_staged_refresh_parents(
+            open_offers, side
+        )
+        if refresh_pause is not None:
             log_event(
                 "info",
                 "requote_staged_refresh_paused",
-                f"Requote {side}: missing or conflicting registry parents; holding cancels",
+                f"Requote {side}: {refresh_pause}; holding cancels",
             )
             return {
                 "offers": [], "fully_replaced": False, "replaced_count": 0,
