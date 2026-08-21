@@ -187,6 +187,7 @@ class OfferManager:
     def _trip_refresh_lineage_latch(
         *, operation_id: str, parent: Optional[Dict[str, Any]] = None,
         cohort_trade_ids: Optional[List[str]] = None, side: Optional[str] = None,
+        malformed_snapshot_entries: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Latch any malformed refresh boundary before another mutation."""
 
@@ -199,17 +200,63 @@ class OfferManager:
         if not isinstance(wallet_hash, str) or not wallet_hash or not isinstance(network, str) or not network:
             raise RuntimeError("refresh lineage cannot bind the runtime safety latch")
         cohort = cohort_trade_ids or ([parent.get("sage_trade_id")] if parent else [])
-        if not cohort or not all(isinstance(value, str) and value for value in cohort):
-            raise RuntimeError("refresh lineage blocker lacks exact cohort identity")
+        malformed = malformed_snapshot_entries or []
+        if not cohort and not malformed:
+            raise RuntimeError("refresh lineage blocker lacks exact snapshot authority")
+        incident_id = database.refresh_lineage_blocker_operation_id(
+            reason_code=operation_id,
+            cohort_trade_ids=cohort,
+            malformed_snapshot_entries=malformed,
+        )
         database.record_refresh_lineage_blocker(
-            operation_id=operation_id,
+            operation_id=incident_id,
             wallet_fingerprint_hash=wallet_hash,
             network=network,
             side=side or (parent.get("side") if parent else ""),
             asset_id=parent.get("asset_id") if parent else cfg.CAT_ASSET_ID,
             cohort_trade_ids=cohort,
-            reason_code="REFRESH_LINEAGE_INCONSISTENT",
+            malformed_snapshot_entries=malformed,
+            reason_code=operation_id,
         )
+
+    def _resume_pending_refresh_lineage_completions(self, side: str) -> Optional[str]:
+        """Commit one proof-complete lineage even when its parent left open offers.
+
+        The query and completion check are durable/read-only until the final
+        database commit; neither branch performs a wallet or network effect.
+        """
+
+        parent_ids = database.get_pending_refresh_lineage_parent_ids(
+            asset_id=cfg.CAT_ASSET_ID, side=side, limit=64
+        )
+        for parent_id in parent_ids:
+            completion = database.refresh_lineage_completion(
+                parent_id, require_visible=True
+            )
+            if completion.get("complete"):
+                committed = database.commit_refresh_lineage_completion(parent_id)
+                if committed.get("committed"):
+                    return "awaiting_terminal_projection"
+                if committed.get("reason") in {
+                    "invalid_lineage", "parent_missing", "parent_identity_missing",
+                }:
+                    parent = database.get_offer_intent(parent_id)
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_id}:resume",
+                        parent=parent,
+                    )
+                    return "lineage_resume_inconsistent"
+                return "awaiting_task8_task9"
+            if completion.get("reason") in {
+                "invalid_lineage", "parent_missing", "parent_identity_missing",
+            }:
+                parent = database.get_offer_intent(parent_id)
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{parent_id}:resume",
+                    parent=parent,
+                )
+                return "lineage_resume_inconsistent"
+        return None
 
     def _collect_staged_refresh_parents(
         self, open_offers: List[Dict[str, Any]], side: str
@@ -227,6 +274,11 @@ class OfferManager:
         cohort_trade_ids = [
             offer.get("trade_id") for offer in open_offers
             if isinstance(offer.get("trade_id"), str) and offer.get("trade_id")
+        ]
+        malformed_snapshot_entries = [
+            {"entry_index": index, "trade_id": offer.get("trade_id"), "tier": offer.get("tier")}
+            for index, offer in enumerate(open_offers)
+            if not isinstance(offer.get("trade_id"), str) or not offer.get("trade_id")
         ]
         slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
         for offer in open_offers:
@@ -317,6 +369,7 @@ class OfferManager:
                 parent=parent,
                 cohort_trade_ids=cohort_trade_ids,
                 side=side,
+                malformed_snapshot_entries=malformed_snapshot_entries,
             )
             return {}, pause
         # Phase two begins only after the whole selected/open cohort passed
@@ -4851,6 +4904,21 @@ class OfferManager:
                 "target_count": 0,
                 "original_target_count": 0,
                 "tier_filter_drained": False,
+            }
+
+        pending_lineage_pause = self._resume_pending_refresh_lineage_completions(side)
+        if pending_lineage_pause is not None:
+            log_event(
+                "info",
+                "requote_pending_lineage_paused",
+                f"Requote {side}: {pending_lineage_pause}; holding new children",
+            )
+            return {
+                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "pending_cancel_count": 0, "failed_cancel_count": 0,
+                "tier_filter_drained": False, "refresh_paused": True,
             }
 
         # Pending children normally consume the overlap coin that makes the

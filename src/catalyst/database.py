@@ -3221,6 +3221,7 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
     side                       TEXT NOT NULL CHECK(side IN ('buy','sell')),
     asset_id                   TEXT NOT NULL,
     cohort_trade_ids_json      TEXT NOT NULL,
+    snapshot_material_json     TEXT NOT NULL DEFAULT '[]',
     reason_code                TEXT NOT NULL,
     state                      TEXT NOT NULL CHECK(state IN ('blocking','resolved')),
     recorded_at                TEXT NOT NULL,
@@ -3658,7 +3659,7 @@ _STABILITY_REQUIRED_COLUMNS = {
     },
     "offer_refresh_lineage_blockers": {
         "operation_id", "wallet_fingerprint_hash", "network", "side",
-        "asset_id", "cohort_trade_ids_json", "reason_code", "state",
+        "asset_id", "cohort_trade_ids_json", "snapshot_material_json", "reason_code", "state",
         "recorded_at", "resolved_at",
     },
 }
@@ -5047,6 +5048,17 @@ def _migrate_stability_schema() -> None:
             "offer_reconciliation_coin_outcomes" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        blocker_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(offer_refresh_lineage_blockers)"
+            ).fetchall()
+        }
+        if "snapshot_material_json" not in blocker_columns:
+            conn.execute(
+                "ALTER TABLE offer_refresh_lineage_blockers "
+                "ADD COLUMN snapshot_material_json TEXT NOT NULL DEFAULT '[]'"
+            )
         _upgrade_offer_fill_boost_command_guard(conn)
         _upgrade_offer_intent_slot_indexes(conn)
         _validate_stability_schema(conn)
@@ -21590,6 +21602,93 @@ def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def get_pending_refresh_lineage_parent_ids(
+    *, asset_id: str, side: str, limit: int = 64
+) -> List[str]:
+    """Read a bounded, deterministic set of incomplete refresh parents.
+
+    This deliberately reads durable lineage rather than the transient open
+    offer projection: Task 9 may remove a terminal parent before its live
+    child is considered for a later requote cycle.
+    """
+
+    safe_asset = _required_stability_text(asset_id, "refresh asset_id")
+    safe_side = _required_stability_text(side, "refresh side")
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("refresh side is invalid")
+    safe_limit = _exact_integer(limit, "refresh lineage limit", minimum=1)
+    if safe_limit > 128:
+        raise ValueError("refresh lineage limit is bounded")
+    rows = get_connection().execute(
+        """
+        SELECT parent.intent_id
+        FROM offer_intents AS parent
+        LEFT JOIN offer_refresh_lineage_commits AS committed
+          ON committed.parent_intent_id=parent.intent_id
+        WHERE parent.asset_id=? AND parent.side=?
+          AND parent.child_intent_id IS NOT NULL
+          AND committed.parent_intent_id IS NULL
+        ORDER BY parent.updated_at, parent.intent_id
+        LIMIT ?
+        """,
+        (safe_asset, safe_side, safe_limit),
+    ).fetchall()
+    return [str(row["intent_id"]) for row in rows]
+
+
+def _canonical_refresh_malformed_snapshot_entries(value: Any) -> List[Dict[str, Any]]:
+    """Redact malformed wallet rows to bounded, replayable snapshot material."""
+
+    if value is None:
+        return []
+    if type(value) is not list or len(value) > 64:
+        raise ValueError("malformed refresh snapshot entries are invalid")
+    normalized: List[Dict[str, Any]] = []
+    for entry in value:
+        if type(entry) is not dict:
+            raise ValueError("malformed refresh snapshot entry is invalid")
+        index = _exact_integer(entry.get("entry_index"), "malformed entry_index", minimum=0)
+        if set(entry) == {"entry_index", "entry_sha256"}:
+            digest = _reconciliation_coin_identity(
+                entry["entry_sha256"], "malformed entry_sha256"
+            )[0]
+            normalized.append({"entry_index": index, "entry_sha256": digest})
+            continue
+        # A malformed identity is recorded only as a digest; it is never
+        # upgraded to a made-up trade identifier or persisted raw.
+        digest_source = _canonical_json_text(
+            entry, "malformed refresh snapshot entry", expected_type=dict, max_bytes=4096
+        )
+        normalized.append({"entry_index": index, "entry_sha256": hashlib.sha256(
+            digest_source.encode("utf-8")).hexdigest()})
+    if len({item["entry_index"] for item in normalized}) != len(normalized):
+        raise ValueError("malformed refresh snapshot entries are ambiguous")
+    return sorted(normalized, key=lambda item: item["entry_index"])
+
+
+def refresh_lineage_blocker_operation_id(
+    *, reason_code: str, cohort_trade_ids: Any,
+    malformed_snapshot_entries: Any = None,
+) -> str:
+    """Return the deterministic incident identity for one bounded snapshot."""
+
+    safe_reason = _required_stability_text(reason_code, "refresh reason_code").upper()
+    trades = sorted(
+        _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
+        for value in cohort_trade_ids
+    )
+    if len(trades) != len(set(trades)):
+        raise ValueError("refresh cohort trade identities are invalid")
+    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
+    if not trades and not malformed:
+        raise ValueError("refresh incident has no authoritative snapshot material")
+    material = _canonical_json_text(
+        {"reason_code": safe_reason, "trade_ids": trades, "malformed": malformed},
+        "refresh incident material", expected_type=dict,
+    )
+    return f"refresh-lineage:{safe_reason.lower()}:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
+
+
 def record_refresh_lineage_blocker(
     *,
     operation_id: str,
@@ -21598,13 +21697,12 @@ def record_refresh_lineage_blocker(
     side: str,
     asset_id: str,
     cohort_trade_ids: Any,
+    malformed_snapshot_entries: Any = None,
     reason_code: str,
 ) -> Dict[str, Any]:
     """Persist one refresh inconsistency and trip its durable latch blocker."""
 
     op = _required_stability_text(operation_id, "refresh operation_id")
-    if not op.startswith("refresh-lineage:"):
-        raise ValueError("refresh operation_id is invalid")
     safe_side = _required_stability_text(side, "refresh side")
     if safe_side not in {"buy", "sell"}:
         raise ValueError("refresh side is invalid")
@@ -21612,7 +21710,14 @@ def record_refresh_lineage_blocker(
         _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
         for value in cohort_trade_ids
     )
-    if not trades or len(trades) != len(set(trades)):
+    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
+    expected_op = refresh_lineage_blocker_operation_id(
+        reason_code=reason_code, cohort_trade_ids=trades,
+        malformed_snapshot_entries=malformed,
+    )
+    if op != expected_op:
+        raise ValueError("refresh operation_id does not match exact incident material")
+    if len(trades) != len(set(trades)):
         raise ValueError("refresh cohort trade identities are invalid")
     values = {
         "operation_id": op,
@@ -21624,6 +21729,9 @@ def record_refresh_lineage_blocker(
         "asset_id": _required_stability_text(asset_id, "asset_id"),
         "cohort_trade_ids_json": _canonical_json_text(
             trades, "refresh cohort_trade_ids", expected_type=list
+        ),
+        "snapshot_material_json": _canonical_json_text(
+            malformed, "refresh malformed snapshot material", expected_type=list
         ),
         "reason_code": _required_stability_text(reason_code, "reason_code").upper(),
         "recorded_at": _stability_wall_clock(),
@@ -21638,11 +21746,11 @@ def record_refresh_lineage_blocker(
             conn.execute(
                 """INSERT INTO offer_refresh_lineage_blockers (
                     operation_id, wallet_fingerprint_hash, network, side, asset_id,
-                    cohort_trade_ids_json, reason_code, state, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'blocking', ?)""",
+                    cohort_trade_ids_json, snapshot_material_json, reason_code, state, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'blocking', ?)""",
                 tuple(values[key] for key in (
                     "operation_id", "wallet_fingerprint_hash", "network", "side",
-                    "asset_id", "cohort_trade_ids_json", "reason_code", "recorded_at"
+                    "asset_id", "cohort_trade_ids_json", "snapshot_material_json", "reason_code", "recorded_at"
                 )),
             )
         else:
@@ -21670,7 +21778,9 @@ def record_refresh_lineage_blocker(
 
 
 def resolve_refresh_lineage_blocker(
-    *, operation_id: str, cohort_trade_ids: Any
+    *, operation_id: str, cohort_trade_ids: Any,
+    malformed_snapshot_entries: Any = None,
+    repaired_snapshot_entries: Any = None,
 ) -> Dict[str, Any]:
     """Resolve a blocker only when every recorded cohort trade is now exact."""
 
@@ -21679,6 +21789,7 @@ def resolve_refresh_lineage_blocker(
         _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
         for value in cohort_trade_ids
     )
+    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -21690,11 +21801,33 @@ def resolve_refresh_lineage_blocker(
         blocker = dict(row)
         if trades != json.loads(blocker["cohort_trade_ids_json"]):
             raise ValueError("refresh repair cohort is not exact")
+        if malformed != json.loads(blocker["snapshot_material_json"]):
+            raise ValueError("refresh repair snapshot material is not exact")
         if blocker["state"] == "resolved":
             conn.commit()
             return {"resolved": True, "idempotent": True, "blocker": blocker}
+        repaired_trades = list(trades)
+        if malformed:
+            if type(repaired_snapshot_entries) is not list:
+                conn.commit()
+                return {"resolved": False, "reason": "malformed_snapshot_unrepaired", "blocker": blocker}
+            repair_by_index: Dict[int, str] = {}
+            for entry in repaired_snapshot_entries:
+                if type(entry) is not dict:
+                    raise ValueError("repaired refresh snapshot entry is invalid")
+                index = _exact_integer(entry.get("entry_index"), "repaired entry_index", minimum=0)
+                trade_id = _reconciliation_coin_identity(
+                    entry.get("trade_id"), "repaired refresh trade_id"
+                )[0]
+                if index in repair_by_index:
+                    raise ValueError("repaired refresh snapshot entries are ambiguous")
+                repair_by_index[index] = trade_id
+            if set(repair_by_index) != {item["entry_index"] for item in malformed}:
+                conn.commit()
+                return {"resolved": False, "reason": "malformed_snapshot_unrepaired", "blocker": blocker}
+            repaired_trades.extend(repair_by_index.values())
         repaired = True
-        for trade_id in trades:
+        for trade_id in repaired_trades:
             intent_row = conn.execute(
                 "SELECT * FROM offer_intents WHERE sage_trade_id=?", (trade_id,)
             ).fetchone()
