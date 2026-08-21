@@ -389,22 +389,15 @@ class TestExternalLockedCount(_PatchedCfg):
 
 class TestPositionSanityDepositDetection(_PatchedCfg):
     def test_delta_matching_recent_unknown_cat_deposit_is_recognized(self):
-        class _Conn:
-            def execute(self, *_args, **_kwargs):
-                return self
-
-            def fetchall(self):
-                return [
-                    {
-                        "coin_id": "0x65119c25b5bc049c2496a5791349c552269ff51483ada6bcb2bc68ae51ed08be",
-                        "amount_mojos": 193_886_291,
-                        "designation": "unknown",
-                        "first_seen": "2026-05-02 14:40:07",
-                    }
-                ]
-
         fake_db = types.ModuleType("database")
-        fake_db.get_connection = lambda: _Conn()
+        fake_db.get_recent_available_deposit_coins = lambda *_args, **_kwargs: [
+            {
+                "coin_id": "0x65119c25b5bc049c2496a5791349c552269ff51483ada6bcb2bc68ae51ed08be",
+                "amount_mojos": 193_886_291,
+                "designation": "unknown",
+                "first_seen": "2026-05-02 14:40:07",
+            }
+        ]
         fake_db.get_setting = lambda *_args, **_kwargs: ""
 
         with patch.dict(sys.modules, {"database": fake_db}):
@@ -418,22 +411,15 @@ class TestPositionSanityDepositDetection(_PatchedCfg):
         self.assertEqual(match["amount_mojos"], 193_886_291)
 
     def test_delta_matching_old_cat_deposit_before_baseline_is_ignored(self):
-        class _Conn:
-            def execute(self, *_args, **_kwargs):
-                return self
-
-            def fetchall(self):
-                return [
-                    {
-                        "coin_id": "0xolddeposit",
-                        "amount_mojos": 193_886_291,
-                        "designation": "unknown",
-                        "first_seen": "2026-05-02 14:40:07",
-                    }
-                ]
-
         fake_db = types.ModuleType("database")
-        fake_db.get_connection = lambda: _Conn()
+        fake_db.get_recent_available_deposit_coins = lambda *_args, **_kwargs: [
+            {
+                "coin_id": "0xolddeposit",
+                "amount_mojos": 193_886_291,
+                "designation": "unknown",
+                "first_seen": "2026-05-02 14:40:07",
+            }
+        ]
         fake_db.get_setting = lambda *_args, **_kwargs: ""
         baseline_at = datetime(2026, 5, 2, 14, 45, 0, tzinfo=timezone.utc).timestamp()
 

@@ -171,19 +171,13 @@ def _find_cat_deposit_for_position_delta(delta_cat, scale, baseline_at=0):
     upper = target_mojos + tolerance_mojos
 
     try:
-        from database import get_connection
+        from database import get_recent_available_deposit_coins
 
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT coin_id, amount_mojos, designation, first_seen "
-            "FROM coins "
-            "WHERE wallet_type='cat' "
-            "  AND status IN ('free', 'gone') "
-            "  AND COALESCE(designation, 'unknown') IN ('unknown', 'reserve') "
-            "  AND amount_mojos BETWEEN ? AND ? "
-            "ORDER BY first_seen DESC",
-            (int(lower), int(upper)),
-        ).fetchall()
+        rows = get_recent_available_deposit_coins(
+            "cat",
+            minimum_amount_mojos=int(lower),
+            maximum_amount_mojos=int(upper),
+        )
     except Exception:
         return None
 
@@ -13578,14 +13572,14 @@ class BotLoop:
     def _spot_check_recent_fills(self) -> None:
         """F24 (2026-04-08): random Spacescan re-verification of recent fills.
 
-        Picks a random sample of 5 fills from the last 24h that were
-        recorded with verification_status='verified', then asks Spacescan
-        to confirm them again. If any disagree (Spacescan says the coin
+        Picks a random sample of 5 fills from the last 24h that retain exact
+        Task 9 authority receipts, then asks Spacescan to confirm them again.
+        If any disagree (Spacescan says the coin
         wasn't actually spent, or was spent to ourselves), it's a phantom
         fill that slipped past the original verification gate.
         """
         try:
-            from database import get_connection
+            from database import get_connection, _economic_fill_authority_join
             from spacescan import verify_fill as _verify_fill
             from wallet import get_first_address
             import random as _random
@@ -13595,12 +13589,12 @@ class BotLoop:
         try:
             conn = get_connection()
             rows = conn.execute(
-                """
+                f"""
                 SELECT f.fill_id, f.trade_id, f.side, f.price_xch
                 FROM fills f
+                {_economic_fill_authority_join()}
                 LEFT JOIN offers o ON f.trade_id = o.trade_id
-                WHERE f.verification_status = 'verified'
-                  AND f.filled_at > datetime('now', '-1 day')
+                WHERE f.filled_at > datetime('now', '-1 day')
                   AND o.coin_id IS NOT NULL
                 ORDER BY f.fill_id DESC
                 LIMIT 100

@@ -7,6 +7,8 @@ Uses a real SQLite temp DB (identical to what the bot uses at runtime).
 No Flask server or wallet calls needed — all logic is in the database layer.
 """
 
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -48,6 +50,8 @@ class _TempDB(unittest.TestCase):
                 pass
         _db._local.conn = None
         _db.init_database()
+        self._fill_commits = {}
+        self._fill_sequence = 0
 
     def tearDown(self):
         if hasattr(_db._local, "conn") and _db._local.conn:
@@ -72,7 +76,76 @@ class _TempDB(unittest.TestCase):
         size_cat=Decimal("100"),
         asset="testcat",
     ):
-        return _db.add_offer(trade_id, side, price, size_xch, size_cat, asset)
+        intent_id = f"intent:{trade_id}"
+        coin_id = hashlib.sha256(f"coin:{trade_id}".encode()).hexdigest()
+        wallet_type = "xch" if side == "buy" else "cat"
+        wallet_identity = {
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+        }
+        offered_atomic = (
+            int(size_xch * Decimal("1000000000000"))
+            if side == "buy"
+            else int(size_cat * Decimal("1000"))
+        )
+        requested_atomic = (
+            int(size_cat * Decimal("1000"))
+            if side == "buy"
+            else int(size_xch * Decimal("1000000000000"))
+        )
+        self.assertTrue(
+            _db.upsert_coin(
+                coin_id,
+                wallet_type,
+                max(offered_atomic, 1),
+                designation="tier_active",
+                tier="inner",
+            )
+        )
+        _db.prepare_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:prepared",
+            run_id="plan-03-09-authoritative",
+            wallet_fingerprint_hash="f" * 64,
+            network="mainnet",
+            asset_id=asset,
+            side=side,
+            tier="inner",
+            purpose="pnl_integration_test",
+            slot_key=f"slot:{trade_id}",
+            generation=0,
+            offered_amount_atomic=str(offered_atomic),
+            requested_amount_atomic=str(requested_atomic),
+            selected_coin_ids_json=[coin_id],
+            wallet_identity_json=wallet_identity,
+            evidence_json={"fixture": "pnl intent"},
+            prepared_at="2026-08-20T12:00:00.000000Z",
+            reserve_selected_coins=True,
+        )
+        _db.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:finalized",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=trade_id,
+            offer_text_sha256=hashlib.sha256(f"offer:{trade_id}".encode()).hexdigest(),
+            wallet_identity_json=wallet_identity,
+            evidence_json={"fixture": "pnl creation"},
+            finalized_at="2026-08-20T12:00:00.000000Z",
+            finalize_selected_coin_reservations=True,
+        )
+        return _db.add_offer(
+            trade_id,
+            side,
+            price,
+            size_xch,
+            size_cat,
+            asset,
+            tier="inner",
+            coin_id=_db.norm_coin_id(coin_id),
+        )
 
     def _record_fill(
         self,
@@ -83,7 +156,42 @@ class _TempDB(unittest.TestCase):
         size_cat=Decimal("100"),
         asset="testcat",
     ):
-        return _db.record_fill(trade_id, side, price, size_xch, size_cat, asset)
+        existing = self._fill_commits.get(trade_id)
+        if existing is not None:
+            return _db.commit_offer_reconciliation(**existing)["fill_id"]
+        self._fill_sequence += 1
+        fill_second = self._fill_sequence * 2
+        filled_at = f"2026-08-20T12:00:{fill_second:02d}.000000Z"
+        reconciled_at = f"2026-08-20T12:00:{fill_second + 1:02d}.000000Z"
+        intent_id = f"intent:{trade_id}"
+        evidence = {"fixture": "pnl terminal", "trade_id": trade_id}
+        evidence_json = json.dumps(
+            evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        kwargs = {
+            "intent_id": intent_id,
+            "operation_id": f"reconcile:{intent_id}",
+            "classification": "FILLED_PROVEN",
+            "reason_code": "TEST_AUTHORITATIVE_PROOF",
+            "wallet_identity_json": {
+                "wallet_fingerprint_hash": "f" * 64,
+                "network": "mainnet",
+            },
+            "evidence_json": evidence,
+            "evidence_sha256": hashlib.sha256(evidence_json.encode()).hexdigest(),
+            "transaction_id": hashlib.sha256(
+                f"transaction:{trade_id}".encode()
+            ).hexdigest(),
+            "block_height": self._fill_sequence,
+            "receive_coin_id": hashlib.sha256(
+                f"receive:{trade_id}".encode()
+            ).hexdigest(),
+            "receive_amount_mojos": 100,
+            "filled_at": filled_at,
+            "reconciled_at": reconciled_at,
+        }
+        self._fill_commits[trade_id] = kwargs
+        return _db.commit_offer_reconciliation(**kwargs)["fill_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +263,11 @@ class TestGetUnmatchedFills(_TempDB):
 
     def test_filters_by_asset_id(self):
         self._add_offer("ba", "buy", Decimal("0.001"), asset="assetA")
-        _db.record_fill(
+        self._record_fill(
             "ba", "buy", Decimal("0.001"), Decimal("0.1"), Decimal("100"), "assetA"
         )
         self._add_offer("bb", "buy", Decimal("0.001"), asset="assetB")
-        _db.record_fill(
+        self._record_fill(
             "bb", "buy", Decimal("0.001"), Decimal("0.1"), Decimal("100"), "assetB"
         )
         ua = _db.get_unmatched_fills("assetA", "buy")
@@ -350,13 +458,13 @@ class TestNetPosition(_TempDB):
         self._add_offer(
             "ba", "buy", Decimal("0.001"), size_cat=Decimal("100"), asset="catA"
         )
-        _db.record_fill(
+        self._record_fill(
             "ba", "buy", Decimal("0.001"), Decimal("0.1"), Decimal("100"), "catA"
         )
         self._add_offer(
             "bb", "buy", Decimal("0.001"), size_cat=Decimal("200"), asset="catB"
         )
-        _db.record_fill(
+        self._record_fill(
             "bb", "buy", Decimal("0.001"), Decimal("0.2"), Decimal("200"), "catB"
         )
         self.assertEqual(_db.get_net_position("catA"), Decimal("100"))

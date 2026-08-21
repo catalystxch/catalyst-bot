@@ -681,8 +681,8 @@ BEGIN
 END;
 
 -- Immutable selected-input outcomes materialized in the exact terminal proof
--- transaction. Multiple rows per coin preserve release/reuse history while
--- the indexed highest sequence is the current authoritative disposition.
+-- transaction. Multiple release rows preserve clean expiry/reuse history, but
+-- the first spent row is permanent and dominates every later projection.
 CREATE TABLE IF NOT EXISTS offer_reconciliation_coin_outcomes (
     outcome_sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
     coin_id                     TEXT NOT NULL,
@@ -703,6 +703,9 @@ CREATE TABLE IF NOT EXISTS offer_reconciliation_coin_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_offer_reconciliation_coin_outcomes_latest
     ON offer_reconciliation_coin_outcomes(coin_id, outcome_sequence);
+CREATE INDEX IF NOT EXISTS idx_offer_reconciliation_coin_outcomes_permanent
+    ON offer_reconciliation_coin_outcomes(coin_id, outcome_sequence)
+    WHERE disposition='spent';
 CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_no_update
 BEFORE UPDATE ON offer_reconciliation_coin_outcomes
 BEGIN
@@ -712,6 +715,74 @@ CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_no_delete
 BEFORE DELETE ON offer_reconciliation_coin_outcomes
 BEGIN
     SELECT RAISE(ABORT, 'offer_reconciliation_coin_outcomes is append-only');
+END;
+
+-- The sole economic-fill capability.  A fills.verification_status value is
+-- compatibility metadata only; readers must join this immutable projection
+-- and compare every economic/receipt field before treating a row as real.
+CREATE TABLE IF NOT EXISTS authoritative_fill_receipts (
+    fill_id                     INTEGER PRIMARY KEY,
+    authority_token             TEXT NOT NULL UNIQUE
+        CHECK(length(authority_token) = 64),
+    terminal_event_id           TEXT NOT NULL UNIQUE,
+    intent_id                   TEXT NOT NULL,
+    trade_id                    TEXT NOT NULL UNIQUE,
+    side                        TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    price_xch                   TEXT NOT NULL,
+    size_xch                    TEXT NOT NULL,
+    size_cat                    TEXT NOT NULL,
+    cat_asset_id                TEXT NOT NULL,
+    tier                        TEXT NOT NULL,
+    filled_at                   TEXT NOT NULL,
+    fee_mojos_xch               INTEGER NOT NULL CHECK(fee_mojos_xch >= 0),
+    spent_block_height          INTEGER NOT NULL CHECK(spent_block_height > 0),
+    receive_coin_id             TEXT NOT NULL,
+    receive_amount_mojos        INTEGER NOT NULL CHECK(receive_amount_mojos > 0),
+    transaction_id              TEXT,
+    spend_identity              TEXT,
+    evidence_sha256             TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+    recorded_at                 TEXT NOT NULL,
+    CHECK(transaction_id IS NOT NULL OR spend_identity IS NOT NULL),
+    FOREIGN KEY(fill_id) REFERENCES fills(fill_id),
+    FOREIGN KEY(terminal_event_id) REFERENCES offer_operation_journal(event_id),
+    FOREIGN KEY(intent_id) REFERENCES offer_intents(intent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_authoritative_fill_receipts_asset_time
+    ON authoritative_fill_receipts(cat_asset_id, filled_at, fill_id);
+CREATE TRIGGER IF NOT EXISTS authoritative_fill_receipts_no_update
+BEFORE UPDATE ON authoritative_fill_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'authoritative_fill_receipts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS authoritative_fill_receipts_no_delete
+BEFORE DELETE ON authoritative_fill_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'authoritative_fill_receipts is append-only');
+END;
+
+-- One bounded, append-only migration/audit stream for authority conflicts.
+CREATE TABLE IF NOT EXISTS offer_authority_migration_audit (
+    audit_id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    authority_type              TEXT NOT NULL
+        CHECK(authority_type IN ('fill', 'coin')),
+    subject_id                  TEXT NOT NULL,
+    reason_code                 TEXT NOT NULL,
+    details_json                TEXT NOT NULL,
+    details_sha256              TEXT NOT NULL CHECK(length(details_sha256) = 64),
+    audited_at                  TEXT NOT NULL,
+    UNIQUE(authority_type, subject_id, reason_code, details_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_authority_migration_audit_subject
+    ON offer_authority_migration_audit(authority_type, subject_id, audit_id);
+CREATE TRIGGER IF NOT EXISTS offer_authority_migration_audit_no_update
+BEFORE UPDATE ON offer_authority_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_authority_migration_audit is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_authority_migration_audit_no_delete
+BEFORE DELETE ON offer_authority_migration_audit
+BEGIN
+    SELECT RAISE(ABORT, 'offer_authority_migration_audit is append-only');
 END;
 
 -- Durable post-fill work is claimed before any callback crosses its effect
@@ -1440,6 +1511,37 @@ _STABILITY_REQUIRED_COLUMNS = {
         "evidence_sha256",
         "recorded_at",
     },
+    "authoritative_fill_receipts": {
+        "fill_id",
+        "authority_token",
+        "terminal_event_id",
+        "intent_id",
+        "trade_id",
+        "side",
+        "price_xch",
+        "size_xch",
+        "size_cat",
+        "cat_asset_id",
+        "tier",
+        "filled_at",
+        "fee_mojos_xch",
+        "spent_block_height",
+        "receive_coin_id",
+        "receive_amount_mojos",
+        "transaction_id",
+        "spend_identity",
+        "evidence_sha256",
+        "recorded_at",
+    },
+    "offer_authority_migration_audit": {
+        "audit_id",
+        "authority_type",
+        "subject_id",
+        "reason_code",
+        "details_json",
+        "details_sha256",
+        "audited_at",
+    },
     "offer_fill_hook_outbox": {
         "fill_id",
         "hook_name",
@@ -1737,6 +1839,27 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("coin_id", "outcome_sequence"),
+        None,
+    ),
+    "idx_offer_reconciliation_coin_outcomes_permanent": (
+        "offer_reconciliation_coin_outcomes",
+        False,
+        True,
+        ("coin_id", "outcome_sequence"),
+        "disposition='spent'",
+    ),
+    "idx_authoritative_fill_receipts_asset_time": (
+        "authoritative_fill_receipts",
+        False,
+        False,
+        ("cat_asset_id", "filled_at", "fill_id"),
+        None,
+    ),
+    "idx_offer_authority_migration_audit_subject": (
+        "offer_authority_migration_audit",
+        False,
+        False,
+        ("authority_type", "subject_id", "audit_id"),
         None,
     ),
     "idx_offer_fill_sweep_finalizations_event": (
@@ -2102,6 +2225,9 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         "offer_reconciliation_coin_outcomes",
         ("terminal_event_id", "coin_id"),
     )
+    _require_unique_key(conn, "authoritative_fill_receipts", ("authority_token",))
+    _require_unique_key(conn, "authoritative_fill_receipts", ("terminal_event_id",))
+    _require_unique_key(conn, "authoritative_fill_receipts", ("trade_id",))
     _require_unique_key(conn, "offer_cancel_cohort_manifests", ("cohort_id",))
     _require_unique_key(conn, "offer_cancel_cohort_manifests", ("manifest_sha256",))
     _require_unique_key(conn, "offer_cancel_effect_claims", ("operation_id", "attempt"))
@@ -2439,6 +2565,7 @@ def _insert_authoritative_coin_outcomes(
     selected_coin_ids: list[str],
     event: Dict[str, Any],
     recorded_at: str,
+    allow_historical_conflict: bool = False,
 ) -> None:
     """Materialize immutable selected-input disposition in the proof transaction."""
 
@@ -2478,6 +2605,17 @@ def _insert_authoritative_coin_outcomes(
             if tuple(existing) != values:
                 raise RuntimeError("authoritative coin outcome identity differs")
             continue
+        permanent = conn.execute(
+            "SELECT terminal_event_id, intent_id, trade_id FROM "
+            "offer_reconciliation_coin_outcomes "
+            "WHERE coin_id=? AND disposition='spent' "
+            "ORDER BY outcome_sequence DESC LIMIT 1",
+            (coin_id,),
+        ).fetchone()
+        if permanent is not None and not allow_historical_conflict:
+            raise RuntimeError(
+                "permanent authoritative coin spend cannot be superseded"
+            )
         conn.execute(
             "INSERT INTO offer_reconciliation_coin_outcomes "
             "(coin_id, intent_id, trade_id, outcome, disposition, "
@@ -2547,6 +2685,7 @@ def _backfill_authoritative_coin_outcomes(
             selected_coin_ids=selected,
             event=event,
             recorded_at=event["created_at"],
+            allow_historical_conflict=True,
         )
 
 
@@ -2573,6 +2712,210 @@ def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
     ):
         raise RuntimeError("stability migration watermark contradicts schema policy")
     return True
+
+
+_FILL_AUTHORITY_CLOSURE_MIGRATION_KEY = "task9-fill-authority-closure"
+_FILL_AUTHORITY_CLOSURE_SCHEMA_VERSION = 1
+_FILL_AUTHORITY_CLOSURE_POLICY_SHA256 = hashlib.sha256(
+    b"task9-fill-authority-closure:v1:receipt-permanent-spend-dominance"
+).hexdigest()
+_MAX_FILL_AUTHORITY_CLOSURE_ROWS = 4096
+
+
+def _fill_authority_closure_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?",
+        (_FILL_AUTHORITY_CLOSURE_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        type(row["schema_version"]) is not int
+        or row["schema_version"] != _FILL_AUTHORITY_CLOSURE_SCHEMA_VERSION
+        or type(row["policy_sha256"]) is not str
+        or row["policy_sha256"] != _FILL_AUTHORITY_CLOSURE_POLICY_SHA256
+    ):
+        raise RuntimeError("fill authority migration watermark contradicts policy")
+    return True
+
+
+def _migrate_fill_authority_closure(conn: sqlite3.Connection) -> None:
+    """Audit legacy economic fills and preserve first permanent coin spends."""
+
+    if _fill_authority_closure_completed(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        audited_at = _stability_wall_clock()
+        fill_rows = conn.execute(
+            "SELECT * FROM fills WHERE "
+            "COALESCE(verification_status, 'legacy') LIKE 'verified%' "
+            "ORDER BY fill_id LIMIT ?",
+            (_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1,),
+        ).fetchall()
+        if len(fill_rows) > _MAX_FILL_AUTHORITY_CLOSURE_ROWS:
+            raise RuntimeError("historical verified fill audit exceeds hard limit")
+        for raw_fill in fill_rows:
+            fill = dict(raw_fill)
+            authoritative = _fill_has_exact_authoritative_terminal_proof(
+                conn,
+                fill,
+                allow_historical_receipt_materialization=True,
+            )
+            next_status = (
+                "verified_authoritative"
+                if authoritative
+                else _UNPROVEN_FILL_BACKFILL_STATUS
+            )
+            conn.execute(
+                "UPDATE fills SET verification_status=? WHERE fill_id=?",
+                (next_status, fill["fill_id"]),
+            )
+            if authoritative:
+                _ensure_authoritative_fill_hook_outbox(conn, int(fill["fill_id"]))
+            else:
+                _insert_offer_authority_audit(
+                    conn,
+                    authority_type="fill",
+                    subject_id=str(fill["fill_id"]),
+                    reason_code="UNPROVEN_ECONOMIC_FILL_DEMOTED",
+                    details={
+                        "trade_id": str(fill["trade_id"]),
+                        "prior_verification_status": str(
+                            fill["verification_status"] or "legacy"
+                        ),
+                    },
+                    audited_at=audited_at,
+                )
+
+        outcome_rows = conn.execute(
+            "SELECT * FROM offer_reconciliation_coin_outcomes "
+            "ORDER BY outcome_sequence LIMIT ?",
+            (_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1,),
+        ).fetchall()
+        if len(outcome_rows) > _MAX_FILL_AUTHORITY_CLOSURE_ROWS:
+            raise RuntimeError("historical coin outcome audit exceeds hard limit")
+        by_coin: Dict[str, List[Dict[str, Any]]] = {}
+        for row in outcome_rows:
+            by_coin.setdefault(str(row["coin_id"]), []).append(dict(row))
+
+        terminal_states = (
+            "terminal",
+            "creation_failed",
+            "rejected",
+            "cancelled",
+            "filled",
+            "expired",
+        )
+        placeholders = ",".join("?" for _state in terminal_states)
+        active_rows = conn.execute(
+            f"SELECT intent_id, lifecycle_state, selected_coin_ids_json "
+            f"FROM offer_intents WHERE lifecycle_state NOT IN ({placeholders}) "
+            "ORDER BY intent_id LIMIT ?",
+            (*terminal_states, _MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1),
+        ).fetchall()
+        if len(active_rows) > _MAX_FILL_AUTHORITY_CLOSURE_ROWS:
+            raise RuntimeError("active coin ownership audit exceeds hard limit")
+        active_owners: Dict[str, List[str]] = {}
+        selected_count = 0
+        for row in active_rows:
+            try:
+                selected = json.loads(row["selected_coin_ids_json"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("active coin ownership identity is corrupt") from exc
+            if type(selected) is not list or not selected:
+                raise RuntimeError("active coin ownership identity is corrupt")
+            selected_count += len(selected)
+            if selected_count > _MAX_FILL_AUTHORITY_CLOSURE_ROWS:
+                raise RuntimeError("active coin ownership audit exceeds hard limit")
+            for raw_coin_id in selected:
+                coin_id = _reconciliation_coin_identity(
+                    raw_coin_id, "active selected coin id"
+                )[1]
+                active_owners.setdefault(coin_id, []).append(str(row["intent_id"]))
+
+        for coin_id, history in by_coin.items():
+            spent = [row for row in history if row["disposition"] == "spent"]
+            if not spent:
+                continue
+            first_spent = spent[0]
+            first_sequence = int(first_spent["outcome_sequence"])
+            later_releases = [
+                int(row["outcome_sequence"])
+                for row in history
+                if row["disposition"] == "released"
+                and int(row["outcome_sequence"]) > first_sequence
+            ]
+            later_spends = [
+                int(row["outcome_sequence"])
+                for row in spent[1:]
+                if row["terminal_event_id"] != first_spent["terminal_event_id"]
+            ]
+            coin_row = conn.execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?", (coin_id,)
+            ).fetchone()
+            projection_conflict = coin_row is None or coin_row["status"] != "spent"
+            owners = sorted(set(active_owners.get(coin_id, [])))
+            if not (later_releases or later_spends or projection_conflict or owners):
+                continue
+            details = {
+                "first_spent_sequence": first_sequence,
+                "first_spent_event_id": str(first_spent["terminal_event_id"]),
+                "later_release_sequences": later_releases,
+                "later_spent_sequences": later_spends,
+                "active_intent_ids": owners,
+                "mutable_status": None if coin_row is None else coin_row["status"],
+                "mutable_trade_id": None if coin_row is None else coin_row["trade_id"],
+            }
+            _insert_offer_authority_audit(
+                conn,
+                authority_type="coin",
+                subject_id=coin_id,
+                reason_code="PERMANENT_SPEND_AUTHORITY_CONFLICT",
+                details=details,
+                audited_at=audited_at,
+            )
+            if coin_row is not None:
+                conn.execute(
+                    "UPDATE coins SET status='spent', trade_id=?, "
+                    "designation='unknown', assigned_tier='none', last_seen=? "
+                    "WHERE coin_id=?",
+                    (first_spent["trade_id"], audited_at, coin_id),
+                )
+            intent = conn.execute(
+                "SELECT wallet_fingerprint_hash, network FROM offer_intents "
+                "WHERE intent_id=?",
+                (first_spent["intent_id"],),
+            ).fetchone()
+            if intent is None:
+                raise RuntimeError("permanent spend intent identity is missing")
+            _reconciliation_latch_update(
+                conn,
+                operation_id=f"authority:coin:{coin_id}",
+                wallet_fingerprint_hash=str(intent["wallet_fingerprint_hash"]),
+                network=str(intent["network"]),
+                reason_code="PERMANENT_SPEND_AUTHORITY_CONFLICT",
+                reason="migrated coin authority history contradicts permanent spend",
+                reconciled_at=audited_at,
+                blocking=True,
+            )
+
+        conn.execute(
+            "INSERT INTO stability_migration_watermarks "
+            "(migration_key, schema_version, policy_sha256, completed_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                _FILL_AUTHORITY_CLOSURE_MIGRATION_KEY,
+                _FILL_AUTHORITY_CLOSURE_SCHEMA_VERSION,
+                _FILL_AUTHORITY_CLOSURE_POLICY_SHA256,
+                audited_at,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migrate_stability_schema() -> None:
@@ -2615,7 +2958,9 @@ def _migrate_stability_schema() -> None:
         _normalize_existing_stability_timestamps(conn)
         backfills_completed = _stability_backfills_completed(conn)
         legacy_missing_tables = missing_stability_tables - {
-            "offer_reconciliation_coin_outcomes"
+            "offer_reconciliation_coin_outcomes",
+            "authoritative_fill_receipts",
+            "offer_authority_migration_audit",
         }
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -2854,8 +3199,9 @@ def _init_database_impl():
                 "Added 'tier' column to fills but backfill failed: %s" % backfill_e,
             )
 
-    # Migration: mark pre-verification-era fills as legacy so GUI/PnL can
-    # exclude them by default. New fills are inserted as verification_status='verified'.
+    # Migration: preserve pre-verification-era fills for compatibility history.
+    # Economic readers use the immutable Task 9 receipt projection, never this
+    # textual compatibility status.
     try:
         conn.execute("SELECT verification_status FROM fills LIMIT 1")
     except sqlite3.OperationalError:
@@ -3256,6 +3602,7 @@ def _init_database_impl():
         )
 
     conn.commit()
+    _migrate_fill_authority_closure(conn)
     log_event("info", "database_init", "Database initialized successfully")
 
     # Startup integrity check — surface DB corruption immediately rather
@@ -4843,12 +5190,17 @@ def get_offer_coin_usage_summary(
     try:
         conn = get_connection()
         params = [norm_lookup]
-        query = """SELECT o.trade_id, f.fill_id
+        query = (
+            """SELECT o.trade_id, fill_authority.fill_id
                    FROM offers o
                    LEFT JOIN fills f
                      ON f.trade_id = o.trade_id
-                    AND COALESCE(f.verification_status, 'legacy') LIKE 'verified%'
+                   LEFT JOIN authoritative_fill_receipts AS fill_authority
+                     ON """
+            + _economic_fill_authority_predicate()
+            + """
                    WHERE REPLACE(LOWER(COALESCE(o.coin_id, '')), '0x', '') = ?"""
+        )
         if cat_asset_id:
             query += " AND o.cat_asset_id=?"
             params.append(cat_asset_id)
@@ -5346,16 +5698,13 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         rows = conn.execute(
             f"SELECT coin_id, wallet_type, amount_mojos, designation, "
             f"assigned_tier, trade_id "
-            f"FROM coins WHERE coin_id IN ({placeholders}) AND status='free'",
+            f"FROM coins WHERE coin_id IN ({placeholders}) AND status='free' "
+            f"AND {_authoritative_coin_available_predicate()}",
             coin_list,
         ).fetchall()
         for row in rows:
             normalized = norm_coin_id(row["coin_id"])
-            if (
-                row["trade_id"]
-                or normalized in registry_protected
-                or _authoritative_coin_outcome(conn, normalized) is not None
-            ):
+            if row["trade_id"] or normalized in registry_protected:
                 continue
             gone_details.append((row["coin_id"], dict(row)))
 
@@ -5412,6 +5761,58 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         return 0
 
 
+def _authoritative_coin_available_predicate(alias: str = "coins") -> str:
+    """Return the indexed SQL predicate for mutable availability projections."""
+
+    if alias not in {"coins", "c"}:
+        raise ValueError("coin availability SQL alias is not allowed")
+    return (
+        "NOT EXISTS (SELECT 1 FROM offer_reconciliation_coin_outcomes AS "
+        f"permanent_outcome WHERE permanent_outcome.coin_id={alias}.coin_id "
+        "AND permanent_outcome.disposition='spent')"
+    )
+
+
+_MAX_RECENT_AVAILABLE_DEPOSIT_COINS = 256
+
+
+def get_recent_available_deposit_coins(
+    wallet_type: str,
+    minimum_amount_mojos: int,
+    maximum_amount_mojos: int,
+    *,
+    limit: int = _MAX_RECENT_AVAILABLE_DEPOSIT_COINS,
+) -> List[Dict]:
+    """Return bounded recent deposit candidates that remain authority-available."""
+
+    if type(wallet_type) is not str or wallet_type not in {"xch", "cat"}:
+        raise ValueError("wallet_type must be xch or cat")
+    minimum = _exact_integer(minimum_amount_mojos, "minimum_amount_mojos", minimum=1)
+    maximum = _exact_integer(
+        maximum_amount_mojos, "maximum_amount_mojos", minimum=minimum
+    )
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    if safe_limit > _MAX_RECENT_AVAILABLE_DEPOSIT_COINS:
+        raise ValueError("recent deposit candidate limit exceeds hard limit")
+    rows = (
+        get_connection()
+        .execute(
+            f"""SELECT coin_id, amount_mojos, designation, first_seen
+              FROM coins
+             WHERE wallet_type=?
+               AND status IN ('free', 'gone')
+               AND COALESCE(designation, 'unknown') IN ('unknown', 'reserve')
+               AND amount_mojos BETWEEN ? AND ?
+               AND {_authoritative_coin_available_predicate()}
+             ORDER BY first_seen DESC
+             LIMIT ?""",
+            (wallet_type, minimum, maximum, safe_limit),
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
 def get_free_coins(wallet_type: str) -> List[Dict]:
     """Get all free (available) coins for a wallet type.
 
@@ -5423,8 +5824,9 @@ def get_free_coins(wallet_type: str) -> List[Dict]:
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM coins WHERE status='free' AND wallet_type=? "
-        "ORDER BY amount_mojos DESC",
+        "SELECT * FROM coins WHERE status='free' AND wallet_type=? AND "
+        + _authoritative_coin_available_predicate()
+        + " ORDER BY amount_mojos DESC",
         [wallet_type],
     ).fetchall()
     protected = _nonterminal_registry_coin_ids(conn)
@@ -5439,12 +5841,13 @@ def get_smallest_free_tier_spare(wallet_type: str) -> Optional[Dict]:
     """Return the smallest free tier-spare coin for a wallet type."""
     conn = get_connection()
     rows = conn.execute(
-        """
+        f"""
         SELECT coin_id, amount_mojos, assigned_tier
         FROM coins
         WHERE status='free'
           AND designation='tier_spare'
           AND wallet_type=?
+          AND {_authoritative_coin_available_predicate()}
         ORDER BY amount_mojos ASC, coin_id ASC
         """,
         (wallet_type,),
@@ -5480,7 +5883,10 @@ def get_locked_coins(wallet_type: str = None) -> List[Dict]:
         List of locked coin dicts with coin_id, trade_id, amount_mojos, etc.
     """
     conn = get_connection()
-    query = "SELECT * FROM coins WHERE status='locked'"
+    query = (
+        "SELECT * FROM coins WHERE status='locked' AND "
+        + _authoritative_coin_available_predicate()
+    )
     params = []
 
     if wallet_type:
@@ -5504,7 +5910,7 @@ def get_oversized_locked_offers(
     """
     conn = get_connection()
     rows = conn.execute(
-        """
+        f"""
         SELECT
             o.trade_id, o.side, o.size_xch, o.size_cat, o.tier,
             o.lifecycle_state, o.coin_id,
@@ -5515,6 +5921,7 @@ def get_oversized_locked_offers(
           AND (o.lifecycle_state IS NULL
                OR o.lifecycle_state NOT IN ('cancel_requested', 'cancel_sent', 'mempool_observed'))
           AND c.status='locked'
+          AND {_authoritative_coin_available_predicate("c")}
         """,
     ).fetchall()
 
@@ -5586,10 +5993,11 @@ def get_coin_summary() -> Dict:
     }
 
     rows = conn.execute(
-        """SELECT wallet_type, status, COUNT(*) as cnt,
+        f"""SELECT wallet_type, status, COUNT(*) as cnt,
                   COALESCE(SUM(amount_mojos), 0) as total_mojos
            FROM coins
            WHERE status IN ('free', 'locked')
+             AND {_authoritative_coin_available_predicate()}
            GROUP BY wallet_type, status"""
     ).fetchall()
 
@@ -5621,9 +6029,10 @@ def get_all_coins_state() -> Dict[str, Dict]:
     try:
         conn = get_connection()
         rows = conn.execute(
-            """SELECT coin_id, status, amount_mojos, wallet_type,
+            f"""SELECT coin_id, status, amount_mojos, wallet_type,
                       designation, assigned_tier, trade_id
-               FROM coins WHERE status IN ('free', 'locked')"""
+               FROM coins WHERE status IN ('free', 'locked')
+                 AND {_authoritative_coin_available_predicate()}"""
         ).fetchall()
         return {row["coin_id"]: dict(row) for row in rows}
     except Exception:
@@ -5753,7 +6162,9 @@ def mark_unreserved_free_coins_gone_for_preparation() -> int:
     rows = (
         get_connection()
         .execute(
-            "SELECT coin_id FROM coins WHERE status='free' ORDER BY coin_id LIMIT ?",
+            "SELECT coin_id FROM coins WHERE status='free' AND "
+            + _authoritative_coin_available_predicate()
+            + " ORDER BY coin_id LIMIT ?",
             (_MAX_PREPARATION_FREE_COIN_CLEANUP + 1,),
         )
         .fetchall()
@@ -5824,14 +6235,21 @@ def _offer_terminal_mutation_is_protected(
 def _authoritative_coin_outcome(
     conn: sqlite3.Connection, coin_id: str
 ) -> Optional[Dict[str, Any]]:
-    """Return and validate the latest permanent Task 9 selected-input outcome."""
+    """Return and validate Task 9 disposition with permanent-spend dominance."""
 
     normalized = norm_coin_id(coin_id)
     row = conn.execute(
         "SELECT * FROM offer_reconciliation_coin_outcomes "
-        "WHERE coin_id=? ORDER BY outcome_sequence DESC LIMIT 1",
+        "WHERE coin_id=? AND disposition='spent' "
+        "ORDER BY outcome_sequence ASC LIMIT 1",
         (normalized,),
     ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM offer_reconciliation_coin_outcomes "
+            "WHERE coin_id=? ORDER BY outcome_sequence DESC LIMIT 1",
+            (normalized,),
+        ).fetchone()
     if row is None:
         return None
     outcome = dict(row)
@@ -6589,7 +7007,8 @@ def get_coins_by_designation(
     conn = get_connection()
     query = (
         "SELECT * FROM coins WHERE wallet_type=? AND designation=? "
-        "AND status IN ('free', 'locked')"
+        "AND status IN ('free', 'locked') AND "
+        + _authoritative_coin_available_predicate()
     )
     params: list = [wallet_type, designation]
 
@@ -6803,7 +7222,8 @@ def coin_sanity_check(open_offer_count: int) -> dict:
 
         # Count locked coins in DB
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM coins WHERE status='locked'"
+            "SELECT COUNT(*) as cnt FROM coins WHERE status='locked' AND "
+            + _authoritative_coin_available_predicate()
         ).fetchone()
         locked_count = row["cnt"] if row else 0
         stats["locked_count"] = locked_count
@@ -6826,7 +7246,8 @@ def coin_sanity_check(open_offer_count: int) -> dict:
         stale_rows = conn.execute(
             "SELECT COUNT(*) as cnt FROM coins "
             "WHERE status='locked' AND (trade_id IS NULL OR trade_id='') "
-            "AND last_seen < datetime(?, '-1 hour')",
+            "AND last_seen < datetime(?, '-1 hour') AND "
+            + _authoritative_coin_available_predicate(),
             (now,),
         ).fetchone()
         stale_count = stale_rows["cnt"] if stale_rows else 0
@@ -6910,9 +7331,9 @@ def count_recent_fills(hours: int = 1) -> int:
 
     cutoff = _sqlite_ts(datetime.now(timezone.utc) - timedelta(hours=hours))
     row = conn.execute(
-        """SELECT COUNT(*) as cnt FROM fills
-           WHERE filled_at > ?
-             AND COALESCE(verification_status, 'legacy') LIKE 'verified%'""",
+        "SELECT COUNT(*) as cnt FROM fills AS f "
+        + _economic_fill_authority_join()
+        + " WHERE f.filled_at > ?",
         (cutoff,),
     ).fetchone()
     return row["cnt"] if row else 0
@@ -6932,11 +7353,12 @@ def get_designation_summary(wallet_type: str) -> Dict:
     """
     conn = get_connection()
     rows = conn.execute(
-        """SELECT designation,
+        f"""SELECT designation,
                   COUNT(*) as cnt,
                   COALESCE(SUM(amount_mojos), 0) as total_mojos
            FROM coins
            WHERE wallet_type=? AND status IN ('free', 'locked')
+             AND {_authoritative_coin_available_predicate()}
            GROUP BY designation""",
         (wallet_type,),
     ).fetchall()
@@ -6960,10 +7382,11 @@ def get_tier_spare_counts(wallet_type: str) -> Dict[str, int]:
     """
     conn = get_connection()
     rows = conn.execute(
-        """SELECT assigned_tier, COUNT(*) as cnt
+        f"""SELECT assigned_tier, COUNT(*) as cnt
            FROM coins
            WHERE wallet_type=? AND designation='tier_spare'
                  AND status='free'
+                 AND {_authoritative_coin_available_predicate()}
            GROUP BY assigned_tier""",
         (wallet_type,),
     ).fetchall()
@@ -7017,10 +7440,11 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
     }
 
     rows = conn.execute(
-        """SELECT wallet_type, designation, assigned_tier, COUNT(*) as cnt
+        f"""SELECT wallet_type, designation, assigned_tier, COUNT(*) as cnt
            FROM coins
            WHERE status='free'
              AND designation IN ('tier_spare', 'reserve', 'dust')
+             AND {_authoritative_coin_available_predicate()}
            GROUP BY wallet_type, designation, assigned_tier"""
     ).fetchall()
 
@@ -7418,22 +7842,20 @@ def _backfill_authoritative_fill_hook_outbox(conn: sqlite3.Connection) -> None:
     fill_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(fills)").fetchall()
     }
-    if "verification_status" not in fill_columns:
+    required_receipt_columns = {
+        "verification_status",
+        "tier",
+        "fee_mojos_xch",
+        "spent_block_index",
+        "spent_block_height",
+        "receive_coin_id",
+        "receive_amount_mojos",
+    }
+    if not required_receipt_columns.issubset(fill_columns):
         return
     rows = conn.execute(
-        """
-        SELECT DISTINCT fills.fill_id
-          FROM fills
-          LEFT JOIN offer_intents
-            ON offer_intents.sage_trade_id=fills.trade_id
-          LEFT JOIN offer_operation_journal
-            ON offer_operation_journal.intent_id=offer_intents.intent_id
-           AND offer_operation_journal.operation_type='RECONCILE'
-           AND offer_operation_journal.phase='FINALIZED'
-           AND offer_operation_journal.outcome='FILLED_PROVEN'
-         WHERE fills.verification_status='verified_authoritative'
-            OR offer_operation_journal.sequence IS NOT NULL
-        """
+        "SELECT fills.fill_id FROM fills AS fills "
+        + _economic_fill_authority_join(fill_alias="fills")
     ).fetchall()
     for row in rows:
         _ensure_authoritative_fill_hook_outbox(conn, int(row[0]))
@@ -10240,11 +10662,15 @@ def record_fill(
     size_cat: Decimal,
     cat_asset_id: str,
     tier: str = "unknown",
-    verification_status: str = "verified",
+    verification_status: str = "legacy_unproven_filled",
     filled_at: str = None,
     fee_mojos_xch: int = 0,
 ) -> int:
-    """Record a detected fill.
+    """Record a compatibility-only, non-economic detected fill.
+
+    ``verification_status`` is retained for call compatibility but can never
+    grant authority.  Only :func:`commit_offer_reconciliation` may create the
+    immutable receipt consumed by economic readers.
 
     Returns the fill_id of the new record, or -1 on error.
     """
@@ -10340,7 +10766,7 @@ def record_fill(
                 now,
                 cat_asset_id,
                 tier,
-                verification_status,
+                _UNPROVEN_FILL_BACKFILL_STATUS,
                 int(fee_mojos_xch),
             ),
         )
@@ -10464,34 +10890,64 @@ def update_fill_enrichment(
 
     Returns True if at least one column was written, False otherwise.
     """
-    if not fill_id or fill_id <= 0:
+    if type(fill_id) is not int or fill_id <= 0:
         return False
 
-    updates: List[str] = []
-    params: List = []
+    supplied: Dict[str, Any] = {}
     if spent_block_height is not None:
-        updates.append("spent_block_height = ?")
-        params.append(int(spent_block_height))
+        if type(spent_block_height) is not int or spent_block_height <= 0:
+            return False
+        supplied["spent_block_height"] = spent_block_height
     if header_hash is not None:
-        updates.append("header_hash = ?")
-        params.append(str(header_hash))
+        if (
+            type(header_hash) is not str
+            or not header_hash
+            or header_hash != header_hash.strip()
+            or len(header_hash) > _MAX_STABILITY_TEXT_CHARS
+        ):
+            return False
+        supplied["header_hash"] = header_hash
     if receive_coin_id is not None:
-        updates.append("receive_coin_id = ?")
-        params.append(str(receive_coin_id))
+        try:
+            supplied["receive_coin_id"] = _reconciliation_coin_identity(
+                receive_coin_id, "receive_coin_id"
+            )[1]
+        except ValueError:
+            return False
     if receive_amount_mojos is not None:
-        updates.append("receive_amount_mojos = ?")
-        params.append(int(receive_amount_mojos))
+        if type(receive_amount_mojos) is not int or receive_amount_mojos <= 0:
+            return False
+        supplied["receive_amount_mojos"] = receive_amount_mojos
 
-    if not updates:
+    if not supplied:
         return False
 
-    params.append(int(fill_id))
-    sql = f"UPDATE fills SET {', '.join(updates)} WHERE fill_id = ?"
     try:
         conn = get_connection()
-        conn.execute(sql, params)
+        row = conn.execute(
+            "SELECT spent_block_height, header_hash, receive_coin_id, "
+            "receive_amount_mojos FROM fills WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM authoritative_fill_receipts WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone():
+            return False
+        if any(row[column] is not None for column in supplied):
+            return False
+        updates = [f"{column} = ?" for column in supplied]
+        params = [*supplied.values(), fill_id]
+        cursor = conn.execute(
+            f"UPDATE fills SET {', '.join(updates)} WHERE fill_id = ? "
+            "AND NOT EXISTS (SELECT 1 FROM authoritative_fill_receipts "
+            "WHERE authoritative_fill_receipts.fill_id=fills.fill_id)",
+            params,
+        )
         conn.commit()
-        return True
+        return cursor.rowcount == 1
     except Exception as e:
         log_event(
             "warning",
@@ -10504,18 +10960,243 @@ def update_fill_enrichment(
 _UNPROVEN_FILL_BACKFILL_STATUS = "legacy_unproven_filled"
 
 
+_AUTHORITATIVE_FILL_RECEIPT_COLUMNS = (
+    "fill_id",
+    "authority_token",
+    "terminal_event_id",
+    "intent_id",
+    "trade_id",
+    "side",
+    "price_xch",
+    "size_xch",
+    "size_cat",
+    "cat_asset_id",
+    "tier",
+    "filled_at",
+    "fee_mojos_xch",
+    "spent_block_height",
+    "receive_coin_id",
+    "receive_amount_mojos",
+    "transaction_id",
+    "spend_identity",
+    "evidence_sha256",
+    "recorded_at",
+)
+
+
+def _insert_offer_authority_audit(
+    conn: sqlite3.Connection,
+    *,
+    authority_type: str,
+    subject_id: str,
+    reason_code: str,
+    details: Dict[str, Any],
+    audited_at: str,
+) -> None:
+    details_json = _canonical_json_text(
+        details, "authority migration audit", expected_type=dict, max_bytes=65536
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO offer_authority_migration_audit "
+        "(authority_type, subject_id, reason_code, details_json, "
+        " details_sha256, audited_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            authority_type,
+            subject_id,
+            reason_code,
+            details_json,
+            hashlib.sha256(details_json.encode("utf-8")).hexdigest(),
+            audited_at,
+        ),
+    )
+
+
+def _authoritative_fill_receipt_values(
+    fill: Dict[str, Any], event: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build the immutable full economic identity for one Task 9 fill."""
+
+    receive_coin_id = _reconciliation_coin_identity(
+        fill["receive_coin_id"], "fill receive_coin_id"
+    )[1]
+    if receive_coin_id != fill["receive_coin_id"]:
+        raise ValueError("fill receive coin identity is not canonical")
+    values: Dict[str, Any] = {
+        "fill_id": _exact_integer(fill["fill_id"], "fill_id", minimum=1),
+        "terminal_event_id": _required_stability_text(
+            event["event_id"], "terminal_event_id"
+        ),
+        "intent_id": _required_stability_text(event["intent_id"], "intent_id"),
+        "trade_id": _required_stability_text(fill["trade_id"], "trade_id"),
+        "side": _required_stability_text(fill["side"], "side"),
+        "price_xch": _required_stability_text(fill["price_xch"], "price_xch"),
+        "size_xch": _required_stability_text(fill["size_xch"], "size_xch"),
+        "size_cat": _required_stability_text(fill["size_cat"], "size_cat"),
+        "cat_asset_id": _required_stability_text(fill["cat_asset_id"], "cat_asset_id"),
+        "tier": _required_stability_text(fill["tier"], "tier"),
+        "filled_at": _stability_timestamp(fill["filled_at"], "fill filled_at"),
+        "fee_mojos_xch": _exact_integer(fill["fee_mojos_xch"], "fill fee_mojos_xch"),
+        "spent_block_height": _exact_integer(
+            fill["spent_block_height"], "fill spent_block_height", minimum=1
+        ),
+        "receive_coin_id": receive_coin_id,
+        "receive_amount_mojos": _exact_integer(
+            fill["receive_amount_mojos"], "fill receive_amount_mojos", minimum=1
+        ),
+        "transaction_id": event["transaction_id"],
+        "spend_identity": event["spend_identity"],
+        "evidence_sha256": _required_stability_text(
+            event["evidence_sha256"], "evidence_sha256"
+        ),
+        "recorded_at": _stability_timestamp(event["created_at"], "recorded_at"),
+    }
+    if values["side"] not in {"buy", "sell"}:
+        raise ValueError("fill side is invalid")
+    token_json = _canonical_json_text(
+        values, "authoritative fill receipt", expected_type=dict, max_bytes=65536
+    )
+    values["authority_token"] = hashlib.sha256(token_json.encode("utf-8")).hexdigest()
+    return values
+
+
+def _authoritative_fill_receipt_matches(
+    conn: sqlite3.Connection, fill: Dict[str, Any], event: Dict[str, Any]
+) -> bool:
+    expected = _authoritative_fill_receipt_values(fill, event)
+    row = conn.execute(
+        "SELECT * FROM authoritative_fill_receipts WHERE fill_id=?",
+        (expected["fill_id"],),
+    ).fetchone()
+    return row is not None and all(
+        row[column] == expected[column]
+        for column in _AUTHORITATIVE_FILL_RECEIPT_COLUMNS
+    )
+
+
+def _insert_authoritative_fill_receipt(
+    conn: sqlite3.Connection, fill: Dict[str, Any], event: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Insert or exactly replay Task 9's sole economic-fill capability."""
+
+    values = _authoritative_fill_receipt_values(fill, event)
+    existing = conn.execute(
+        "SELECT * FROM authoritative_fill_receipts WHERE fill_id=? "
+        "OR terminal_event_id=? OR trade_id=? OR authority_token=?",
+        (
+            values["fill_id"],
+            values["terminal_event_id"],
+            values["trade_id"],
+            values["authority_token"],
+        ),
+    ).fetchall()
+    if existing:
+        if len(existing) != 1 or any(
+            existing[0][column] != values[column]
+            for column in _AUTHORITATIVE_FILL_RECEIPT_COLUMNS
+        ):
+            raise ValueError("authoritative fill receipt identity differs")
+        return values
+    columns = ", ".join(_AUTHORITATIVE_FILL_RECEIPT_COLUMNS)
+    placeholders = ", ".join("?" for _column in _AUTHORITATIVE_FILL_RECEIPT_COLUMNS)
+    conn.execute(
+        f"INSERT INTO authoritative_fill_receipts ({columns}) VALUES ({placeholders})",
+        tuple(values[column] for column in _AUTHORITATIVE_FILL_RECEIPT_COLUMNS),
+    )
+    return values
+
+
+def _historical_journal_binds_fill_receipt(
+    event: Dict[str, Any], fill: Dict[str, Any], intent: Dict[str, Any]
+) -> bool:
+    """Validate pre-receipt Task 9 evidence before one-time materialization.
+
+    The legacy ``offers`` and ``fills`` economics are mutable projections, so
+    agreement between those rows is not proof.  Historical materialization is
+    permitted only when the receipt is the exact requested atomic amount and
+    price/size derive from Task 4's durable atomic intent.  Task 9 fill proof
+    never carried a creation fee, so a historical non-zero fee cannot be
+    reconstructed and must remain non-economic.
+    """
+
+    try:
+        from config import cfg as _cfg
+
+        proof = json.loads(event["evidence_json"])
+        classification = proof["classification"]
+        if type(classification) is not dict:
+            return False
+        cat_decimals = getattr(_cfg, "CAT_DECIMALS", 3)
+        if type(cat_decimals) is not int or not 0 <= cat_decimals <= 18:
+            return False
+        offered = _exact_integer(
+            int(intent["offered_amount_atomic"]),
+            "historical offered amount",
+            minimum=1,
+        )
+        requested = _exact_integer(
+            int(intent["requested_amount_atomic"]),
+            "historical requested amount",
+            minimum=1,
+        )
+        xch_atomic = offered if intent["side"] == "buy" else requested
+        cat_atomic = requested if intent["side"] == "buy" else offered
+        expected_size_xch = Decimal(xch_atomic) / Decimal("1000000000000")
+        expected_size_cat = Decimal(cat_atomic) / (Decimal(10) ** cat_decimals)
+        expected_price_xch = expected_size_xch / expected_size_cat
+        fill_size_xch = Decimal(fill["size_xch"])
+        fill_size_cat = Decimal(fill["size_cat"])
+        fill_price_xch = Decimal(fill["price_xch"])
+        if (
+            not fill_size_xch.is_finite()
+            or not fill_size_cat.is_finite()
+            or not fill_price_xch.is_finite()
+            or fill_size_xch != expected_size_xch
+            or fill_size_cat != expected_size_cat
+            or fill_price_xch != expected_price_xch
+            or type(fill["fee_mojos_xch"]) is not int
+            or fill["fee_mojos_xch"] != 0
+            or fill["receive_amount_mojos"] != requested
+        ):
+            return False
+        event_receive = _reconciliation_coin_identity(
+            classification["receive_coin_id"], "evidence receive_coin_id"
+        )[1]
+        return (
+            classification.get("classification") == "FILLED_PROVEN"
+            and classification.get("transaction_id") == event["transaction_id"]
+            and classification.get("spend_identity") == event["spend_identity"]
+            and type(classification.get("block_height")) is int
+            and classification["block_height"] == fill["spent_block_height"]
+            and fill["spent_block_index"] == fill["spent_block_height"]
+            and event_receive == fill["receive_coin_id"]
+            and type(classification.get("receive_amount_mojos")) is int
+            and classification["receive_amount_mojos"] == fill["receive_amount_mojos"]
+            and classification.get("filled_at") == fill["filled_at"]
+        )
+    except (ArithmeticError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _fill_has_exact_authoritative_terminal_proof(
-    conn: sqlite3.Connection, fill: Dict[str, Any]
+    conn: sqlite3.Connection,
+    fill: Dict[str, Any],
+    *,
+    allow_historical_receipt_materialization: bool = False,
 ) -> bool:
     """Prove that one existing fill identity crossed Task 9's exact boundary."""
 
     try:
-        fill_id = _exact_integer(fill["fill_id"], "fill_id", minimum=1)
+        _exact_integer(fill["fill_id"], "fill_id", minimum=1)
         trade_id = _required_stability_text(fill["trade_id"], "trade_id")
         proof_rows = conn.execute(
             """
             SELECT j.*, i.sage_trade_id AS intent_trade_id,
                    i.lifecycle_state AS intent_lifecycle_state,
+                   i.side AS intent_side,
+                   i.asset_id AS intent_asset_id,
+                   i.tier AS intent_tier,
+                   i.offered_amount_atomic AS intent_offered_amount_atomic,
+                   i.requested_amount_atomic AS intent_requested_amount_atomic,
                    i.selected_coin_ids_json AS intent_selected_coin_ids_json,
                    i.selected_coin_ids_sha256 AS intent_selected_coin_ids_sha256
               FROM offer_operation_journal AS j
@@ -10544,6 +11225,9 @@ def _fill_has_exact_authoritative_terminal_proof(
             or (event["transaction_id"] is None and event["spend_identity"] is None)
             or proof["intent_trade_id"] != trade_id
             or proof["intent_lifecycle_state"] != "terminal"
+            or proof["intent_side"] != fill["side"]
+            or proof["intent_asset_id"] != fill["cat_asset_id"]
+            or proof["intent_tier"] != fill["tier"]
         ):
             return False
 
@@ -10634,15 +11318,23 @@ def _fill_has_exact_authoritative_terminal_proof(
         ):
             return False
 
-        outbox_rows = conn.execute(
-            "SELECT hook_name FROM offer_fill_hook_outbox "
-            "WHERE fill_id=? ORDER BY hook_name LIMIT ?",
-            (fill_id, len(_AUTHORITATIVE_FILL_HOOKS) + 1),
-        ).fetchall()
-        return len(outbox_rows) == len(_AUTHORITATIVE_FILL_HOOKS) and {
-            str(row["hook_name"]) for row in outbox_rows
-        } == set(_AUTHORITATIVE_FILL_HOOKS)
-    except (KeyError, TypeError, ValueError):
+        if _authoritative_fill_receipt_matches(conn, fill, event):
+            return True
+        if not allow_historical_receipt_materialization:
+            return False
+        if not _historical_journal_binds_fill_receipt(
+            event,
+            fill,
+            {
+                "side": proof["intent_side"],
+                "offered_amount_atomic": proof["intent_offered_amount_atomic"],
+                "requested_amount_atomic": proof["intent_requested_amount_atomic"],
+            },
+        ):
+            return False
+        _insert_authoritative_fill_receipt(conn, fill, event)
+        return True
+    except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
         return False
 
 
@@ -10655,7 +11347,7 @@ def backfill_verified_fills_from_offers(
     Missing rows are therefore materialized only as non-economic audit records.
     An existing row may regain ``verified_authoritative`` solely when its exact
     fill identity, immutable terminal journal, selected-input outcomes, and
-    post-fill outbox identity are all present and mutually consistent.
+    receipt evidence are all present and mutually consistent.
     """
     if limit <= 0:
         return []
@@ -10729,8 +11421,28 @@ def backfill_verified_fills_from_offers(
                    FROM fills f
                    JOIN offers o ON o.trade_id = f.trade_id
                    WHERE o.status='filled'
-                     AND COALESCE(f.verification_status, 'legacy') NOT LIKE 'verified%'
                      AND COALESCE(f.verification_status, 'legacy')<>?
+                     AND (
+                         COALESCE(f.verification_status, 'legacy')
+                             <> 'verified_authoritative'
+                         OR NOT EXISTS (
+                             SELECT 1 FROM authoritative_fill_receipts AS afr
+                             WHERE afr.fill_id=f.fill_id
+                               AND afr.trade_id=f.trade_id
+                               AND afr.side=f.side
+                               AND afr.price_xch=f.price_xch
+                               AND afr.size_xch=f.size_xch
+                               AND afr.size_cat=f.size_cat
+                               AND afr.cat_asset_id=f.cat_asset_id
+                               AND afr.tier=f.tier
+                               AND afr.filled_at=f.filled_at
+                               AND afr.fee_mojos_xch=f.fee_mojos_xch
+                               AND afr.spent_block_height=f.spent_block_index
+                               AND afr.spent_block_height=f.spent_block_height
+                               AND afr.receive_coin_id=f.receive_coin_id
+                               AND afr.receive_amount_mojos=f.receive_amount_mojos
+                         )
+                     )
                    ORDER BY COALESCE(o.filled_at, f.filled_at) ASC
                    LIMIT ?""",
                 (_UNPROVEN_FILL_BACKFILL_STATUS, remaining),
@@ -10738,7 +11450,11 @@ def backfill_verified_fills_from_offers(
 
             for row in legacy_rows:
                 fill = dict(row)
-                authoritative = _fill_has_exact_authoritative_terminal_proof(conn, fill)
+                authoritative = _fill_has_exact_authoritative_terminal_proof(
+                    conn,
+                    fill,
+                    allow_historical_receipt_materialization=True,
+                )
                 next_status = (
                     "verified_authoritative"
                     if authoritative
@@ -10751,6 +11467,22 @@ def backfill_verified_fills_from_offers(
                        WHERE fill_id=?""",
                     (next_status, row["effective_filled_at"], row["fill_id"]),
                 )
+                if authoritative:
+                    _ensure_authoritative_fill_hook_outbox(conn, int(row["fill_id"]))
+                else:
+                    _insert_offer_authority_audit(
+                        conn,
+                        authority_type="fill",
+                        subject_id=str(row["fill_id"]),
+                        reason_code="UNPROVEN_ECONOMIC_FILL_DEMOTED",
+                        details={
+                            "trade_id": str(row["trade_id"]),
+                            "prior_verification_status": str(
+                                row["verification_status"] or "legacy"
+                            ),
+                        },
+                        audited_at=_stability_wall_clock(),
+                    )
                 repaired.append(
                     {
                         "fill_id": int(row["fill_id"]),
@@ -10787,6 +11519,47 @@ def backfill_verified_fills_from_offers(
         return []
 
 
+def _economic_fill_authority_predicate(
+    fill_alias: str = "f", receipt_alias: str = "fill_authority"
+) -> str:
+    """Return the sole full-field predicate for economic fill authority."""
+
+    if fill_alias not in {"f", "fills", "f1", "f2", "f3"} or receipt_alias not in {
+        "fill_authority",
+        "afr",
+        "buy_authority",
+        "sell_authority",
+        "round_authority",
+    }:
+        raise ValueError("economic fill authority SQL alias is not allowed")
+    return f"""{receipt_alias}.fill_id={fill_alias}.fill_id
+         AND {receipt_alias}.trade_id={fill_alias}.trade_id
+         AND {receipt_alias}.side={fill_alias}.side
+         AND {receipt_alias}.price_xch={fill_alias}.price_xch
+         AND {receipt_alias}.size_xch={fill_alias}.size_xch
+         AND {receipt_alias}.size_cat={fill_alias}.size_cat
+         AND {receipt_alias}.cat_asset_id={fill_alias}.cat_asset_id
+         AND {receipt_alias}.tier={fill_alias}.tier
+         AND {receipt_alias}.filled_at={fill_alias}.filled_at
+         AND {receipt_alias}.fee_mojos_xch={fill_alias}.fee_mojos_xch
+         AND {receipt_alias}.spent_block_height={fill_alias}.spent_block_index
+         AND {receipt_alias}.spent_block_height={fill_alias}.spent_block_height
+         AND {receipt_alias}.receive_coin_id={fill_alias}.receive_coin_id
+         AND {receipt_alias}.receive_amount_mojos={fill_alias}.receive_amount_mojos
+    """
+
+
+def _economic_fill_authority_join(
+    fill_alias: str = "f", receipt_alias: str = "fill_authority"
+) -> str:
+    """Return the one exact SQL projection used by every economic reader."""
+
+    return (
+        f"\n        JOIN authoritative_fill_receipts AS {receipt_alias}\n"
+        "          ON " + _economic_fill_authority_predicate(fill_alias, receipt_alias)
+    )
+
+
 def get_fills(
     cat_asset_id: str = None,
     side: str = None,
@@ -10805,23 +11578,24 @@ def get_fills(
     Returns list of fill dicts, newest first.
     """
     conn = get_connection()
-    query = "SELECT * FROM fills WHERE 1=1"
+    query = "SELECT f.* FROM fills AS f"
     params = []
 
     if not include_legacy:
-        query += " AND COALESCE(verification_status, 'legacy') LIKE 'verified%'"
+        query += _economic_fill_authority_join()
+    query += " WHERE 1=1"
 
     if cat_asset_id:
-        query += " AND cat_asset_id=?"
+        query += " AND f.cat_asset_id=?"
         params.append(cat_asset_id)
     if side:
-        query += " AND side=?"
+        query += " AND f.side=?"
         params.append(side)
     if since:
-        query += " AND filled_at>=?"
+        query += " AND f.filled_at>=?"
         params.append(since)
 
-    query += " ORDER BY filled_at DESC LIMIT ?"
+    query += " ORDER BY f.filled_at DESC LIMIT ?"
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
@@ -10856,17 +11630,39 @@ def match_round_trip(buy_fill_id: int, sell_fill_id: int, pnl_xch: Decimal) -> i
 
     Returns a round_trip_id (just uses the buy_fill_id as the ID).
     """
+    if (
+        type(buy_fill_id) is not int
+        or buy_fill_id <= 0
+        or type(sell_fill_id) is not int
+        or sell_fill_id <= 0
+        or buy_fill_id == sell_fill_id
+        or type(pnl_xch) is not Decimal
+    ):
+        return -1
     round_trip_id = buy_fill_id  # Simple: use the buy fill's ID
     try:
         conn = get_connection()
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT f.fill_id, f.side FROM fills AS f "
+            + _economic_fill_authority_join()
+            + " WHERE f.fill_id IN (?, ?)",
+            (buy_fill_id, sell_fill_id),
+        ).fetchall()
+        exact_sides = {int(row["fill_id"]): str(row["side"]) for row in rows}
+        if exact_sides != {buy_fill_id: "buy", sell_fill_id: "sell"}:
+            conn.rollback()
+            return -1
+        buy_cursor = conn.execute(
             "UPDATE fills SET round_trip_id=?, pnl_xch=? WHERE fill_id=?",
             (round_trip_id, str(pnl_xch), buy_fill_id),
         )
-        conn.execute(
+        sell_cursor = conn.execute(
             "UPDATE fills SET round_trip_id=?, pnl_xch=? WHERE fill_id=?",
             (round_trip_id, str(pnl_xch), sell_fill_id),
         )
+        if buy_cursor.rowcount != 1 or sell_cursor.rowcount != 1:
+            raise RuntimeError("authoritative round-trip fill changed")
         conn.commit()
         return round_trip_id
     except Exception as e:
@@ -10932,12 +11728,13 @@ def get_net_position(cat_asset_id: str, since: str = None) -> Decimal:
     conn = get_connection()
 
     query = (
-        "SELECT side, size_cat FROM fills WHERE cat_asset_id=? "
-        "AND COALESCE(verification_status, 'legacy') != 'phantom'"
+        "SELECT f.side, f.size_cat FROM fills AS f "
+        + _economic_fill_authority_join()
+        + " WHERE f.cat_asset_id=?"
     )
     params = [cat_asset_id]
     if since:
-        query += " AND filled_at>=?"
+        query += " AND f.filled_at>=?"
         params.append(_sqlite_ts(since))
 
     rows = conn.execute(
@@ -11279,19 +12076,22 @@ def _get_economic_verified_fill_ids(
 ) -> List[int]:
     """Return one verified fill row per source coin/trade for dashboard stats."""
     params = []
-    query = """SELECT MAX(fill_id) AS fill_id
+    query = (
+        """SELECT MAX(fill_id) AS fill_id
                FROM (
                    SELECT f.fill_id,
                           CASE
-                            WHEN COALESCE(f.verification_status, 'legacy') LIKE 'verified_exact%'
-                              THEN 'trade:' || f.trade_id
                             WHEN COALESCE(o.coin_id, '') != ''
                               THEN 'coin:' || REPLACE(LOWER(o.coin_id), '0x', '')
                             ELSE 'trade:' || f.trade_id
                           END AS source_key
                    FROM fills f
+                   """
+        + _economic_fill_authority_join()
+        + """
                    LEFT JOIN offers o ON o.trade_id = f.trade_id
-                   WHERE COALESCE(f.verification_status, 'legacy') LIKE 'verified%'"""
+                   WHERE 1=1"""
+    )
     if cat_asset_id:
         query += " AND f.cat_asset_id=?"
         params.append(cat_asset_id)
@@ -11313,6 +12113,29 @@ def _fill_id_scope(fill_ids: List[int], alias: str = "") -> tuple[str, List[int]
     return f" AND {column} IN ({placeholders})", list(fill_ids)
 
 
+def _get_economic_round_trip_buy_ids(
+    conn: sqlite3.Connection, economic_fill_ids: List[int]
+) -> List[int]:
+    """Return buy legs whose one opposite leg has the same exact authority."""
+
+    scope_sql, scope_params = _fill_id_scope(economic_fill_ids, alias="f1")
+    query = (
+        "SELECT f1.fill_id FROM fills AS f1 "
+        + _economic_fill_authority_join("f1", "buy_authority")
+        + " JOIN fills AS f2 ON f2.round_trip_id=f1.round_trip_id "
+        "AND f2.side='sell' AND f2.cat_asset_id=f1.cat_asset_id "
+        + _economic_fill_authority_join("f2", "sell_authority")
+        + " WHERE f1.side='buy' AND f1.round_trip_id IS NOT NULL "
+        + scope_sql
+        + " AND (SELECT COUNT(*) FROM fills AS f3 "
+        + _economic_fill_authority_join("f3", "round_authority")
+        + " WHERE f3.round_trip_id=f1.round_trip_id)=2 "
+        "GROUP BY f1.fill_id HAVING COUNT(DISTINCT f2.fill_id)=1"
+    )
+    rows = conn.execute(query, scope_params).fetchall()
+    return [int(row["fill_id"]) for row in rows]
+
+
 def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     """Get summary statistics for the dashboard.
 
@@ -11332,17 +12155,24 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     )
 
     economic_fill_ids = _get_economic_verified_fill_ids(conn, cat_asset_id, since)
+    economic_round_trip_buy_ids = _get_economic_round_trip_buy_ids(
+        conn, economic_fill_ids
+    )
 
     # Total fills. raw_total_fills preserves the DB row count for diagnostics;
     # total_fills reports economic fills after collapsing impossible duplicate
     # attributions where one source coin was counted against several re-quotes.
-    query_base = "SELECT COUNT(*) as cnt FROM fills WHERE COALESCE(verification_status, 'legacy') LIKE 'verified%'"
+    query_base = (
+        "SELECT COUNT(*) as cnt FROM fills AS f "
+        + _economic_fill_authority_join()
+        + " WHERE 1=1"
+    )
     params = []
     if cat_asset_id:
-        query_base += " AND cat_asset_id=?"
+        query_base += " AND f.cat_asset_id=?"
         params.append(cat_asset_id)
     if since:
-        query_base += " AND filled_at>=?"
+        query_base += " AND f.filled_at>=?"
         params.append(_sqlite_ts(since))
     row = conn.execute(query_base, params).fetchone()
     stats["raw_total_fills"] = row["cnt"]
@@ -11355,7 +12185,7 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     query_base = """SELECT pnl_xch FROM fills
                     WHERE round_trip_id IS NOT NULL AND side='buy'
                       AND pnl_xch IS NOT NULL"""
-    scope_sql, params = _fill_id_scope(economic_fill_ids)
+    scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids)
     query_base += scope_sql
     rows = conn.execute(query_base, params).fetchall()
     stats["realised_pnl_xch"] = str(
@@ -11363,19 +12193,14 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     )
 
     # Round-trip stats
-    query_base = """SELECT COUNT(*) as cnt FROM fills
-                    WHERE round_trip_id IS NOT NULL AND side='buy'"""
-    scope_sql, params = _fill_id_scope(economic_fill_ids)
-    query_base += scope_sql
-    row = conn.execute(query_base, params).fetchone()
-    stats["round_trips"] = row["cnt"]
+    stats["round_trips"] = len(economic_round_trip_buy_ids)
 
     # Win rate (profitable round-trips / total round-trips)
     if stats["round_trips"] > 0:
         query_base = """SELECT COUNT(*) as cnt FROM fills
                         WHERE round_trip_id IS NOT NULL AND side='buy'
                         AND CAST(pnl_xch AS REAL) > 0"""
-        scope_sql, params = _fill_id_scope(economic_fill_ids)
+        scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids)
         query_base += scope_sql
         row = conn.execute(query_base, params).fetchone()
         stats["win_rate"] = round(row["cnt"] / stats["round_trips"] * 100, 1)
@@ -11491,13 +12316,18 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     # Average round trip time (seconds between buy and sell legs of a matched pair)
     if stats["round_trips"] > 0:
         try:
-            query_base = """SELECT ABS(AVG((julianday(f2.filled_at) - julianday(f1.filled_at)) * 86400)) AS avg_secs
+            query_base = (
+                """SELECT ABS(AVG((julianday(f2.filled_at) - julianday(f1.filled_at)) * 86400)) AS avg_secs
                             FROM fills f1
                             JOIN fills f2 ON f1.round_trip_id = f2.round_trip_id
                                          AND f1.side != f2.side
+                            """
+                + _economic_fill_authority_join("f2", "sell_authority")
+                + """
                             WHERE f1.side = 'buy' AND f1.round_trip_id IS NOT NULL
                               """
-            scope_sql, params = _fill_id_scope(economic_fill_ids, alias="f1")
+            )
+            scope_sql, params = _fill_id_scope(economic_round_trip_buy_ids, alias="f1")
             query_base += scope_sql
             row = conn.execute(query_base, params).fetchone()
             stats["avg_round_trip_secs"] = float(row["avg_secs"] or 0)
@@ -15069,11 +15899,24 @@ def commit_offer_reconciliation(
             fill_id = None
             if safe_classification == "FILLED_PROVEN":
                 fill_row = conn.execute(
-                    "SELECT fill_id, filled_at FROM fills WHERE trade_id=?",
+                    "SELECT * FROM fills WHERE trade_id=?",
                     (intent["sage_trade_id"],),
                 ).fetchone()
-                if fill_row is None or fill_row["filled_at"] != safe_filled_at:
-                    raise ValueError("authoritative fill timestamp replay differs")
+                if fill_row is None:
+                    raise ValueError("authoritative fill replay is missing")
+                replay_fill = dict(fill_row)
+                if (
+                    replay_fill["filled_at"] != safe_filled_at
+                    or replay_fill["spent_block_index"] != safe_height
+                    or replay_fill["spent_block_height"] != safe_height
+                    or replay_fill["receive_coin_id"]
+                    != norm_coin_id(safe_receive_coin_id)
+                    or replay_fill["receive_amount_mojos"] != safe_receive_amount
+                    or not _fill_has_exact_authoritative_terminal_proof(
+                        conn, replay_fill
+                    )
+                ):
+                    raise ValueError("authoritative fill receipt replay differs")
                 fill_id = int(fill_row["fill_id"])
                 _ensure_authoritative_fill_hook_outbox(conn, fill_id)
             conn.commit()
@@ -15286,28 +16129,26 @@ def commit_offer_reconciliation(
                         "size_xch",
                         "size_cat",
                         "cat_asset_id",
+                        "tier",
+                        "fee_mojos_xch",
                     )
                 ):
                     raise ValueError("existing fill identity differs from offer")
-                if existing["filled_at"] != safe_filled_at:
-                    raise ValueError("existing fill timestamp differs from proof")
+                if (
+                    existing["filled_at"] != safe_filled_at
+                    or existing["spent_block_index"] != safe_height
+                    or existing["spent_block_height"] != safe_height
+                    or existing["receive_coin_id"] != norm_coin_id(safe_receive_coin_id)
+                    or existing["receive_amount_mojos"] != safe_receive_amount
+                ):
+                    raise ValueError("existing authoritative fill receipt differs")
                 fill_id = int(existing["fill_id"])
+            authoritative_fill = dict(
                 conn.execute(
-                    """
-                    UPDATE fills
-                    SET verification_status='verified_authoritative',
-                        spent_block_index=?, spent_block_height=?,
-                        receive_coin_id=?, receive_amount_mojos=?
-                    WHERE trade_id=?
-                    """,
-                    (
-                        safe_height,
-                        safe_height,
-                        norm_coin_id(safe_receive_coin_id),
-                        safe_receive_amount,
-                        trade_id,
-                    ),
-                )
+                    "SELECT * FROM fills WHERE fill_id=?", (fill_id,)
+                ).fetchone()
+            )
+            _insert_authoritative_fill_receipt(conn, authoritative_fill, event)
             _ensure_authoritative_fill_hook_outbox(conn, fill_id)
             conn.execute(
                 f"""

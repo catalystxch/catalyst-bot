@@ -24,6 +24,7 @@ from typing import Optional, Dict, List, Any
 
 from config import cfg
 from database import (
+    _economic_fill_authority_join,
     get_connection,
     get_market_analysis_cache,
     set_market_analysis_cache,
@@ -1735,11 +1736,14 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         # Fill history (30 days)
         row = conn.execute(
             "SELECT COUNT(*) as cnt, "
-            "SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END) as buys, "
-            "SUM(CASE WHEN side='sell' THEN 1 ELSE 0 END) as sells, "
-            "SUM(CAST(size_xch AS REAL)) as total_vol, "
-            "AVG(CAST(size_xch AS REAL)) as avg_size "
-            "FROM fills WHERE cat_asset_id = ? AND filled_at >= datetime('now', '-30 days')",
+            "SUM(CASE WHEN f.side='buy' THEN 1 ELSE 0 END) as buys, "
+            "SUM(CASE WHEN f.side='sell' THEN 1 ELSE 0 END) as sells, "
+            "SUM(CAST(f.size_xch AS REAL)) as total_vol, "
+            "AVG(CAST(f.size_xch AS REAL)) as avg_size "
+            "FROM fills AS f "
+            + _economic_fill_authority_join()
+            + " WHERE f.cat_asset_id = ? "
+            "AND f.filled_at >= datetime('now', '-30 days')",
             (asset_id,),
         ).fetchone()
         if row and row["cnt"]:
@@ -1791,11 +1795,13 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         # skipped; we emit the raw sigma so downstream can pick a window.
         try:
             rows = conn.execute(
-                "SELECT CAST(price_xch AS REAL) AS price, filled_at "
-                "FROM fills WHERE cat_asset_id = ? "
-                "AND filled_at >= datetime('now', '-30 days') "
-                "AND price_xch IS NOT NULL "
-                "ORDER BY filled_at ASC",
+                "SELECT CAST(f.price_xch AS REAL) AS price, f.filled_at "
+                "FROM fills AS f "
+                + _economic_fill_authority_join()
+                + " WHERE f.cat_asset_id = ? "
+                "AND f.filled_at >= datetime('now', '-30 days') "
+                "AND f.price_xch IS NOT NULL "
+                "ORDER BY f.filled_at ASC",
                 (asset_id,),
             ).fetchall()
             prices = [r["price"] for r in rows if r["price"] and r["price"] > 0]

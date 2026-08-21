@@ -175,22 +175,17 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
         position = database.get_net_position(asset_id)
 
-        self.assertEqual(stats["total_fills"], 1)
-        self.assertEqual(stats["fill_rate_per_hour"], 1.0)
+        self.assertEqual(stats["total_fills"], 0)
+        self.assertEqual(stats["fill_rate_per_hour"], 0.0)
         self.assertEqual(stats["buy_fills"], 0)
-        self.assertEqual(stats["sell_fills"], 1)
-        self.assertEqual(len(fills), 1)
-        self.assertEqual(fills[0]["trade_id"], "verified-fill")
-        # get_net_position() intentionally includes legacy fills — they represent
-        # real accumulated inventory from before the verification system was added.
-        # Stats (total_fills, buy_fills, sell_fills) exclude legacy; position does not.
-        # Net = legacy buy +1000 + verified sell -2000 = -1000.
-        self.assertEqual(position, Decimal("-1000"))
+        self.assertEqual(stats["sell_fills"], 0)
+        self.assertEqual(fills, [])
+        self.assertEqual(position, Decimal("0"))
 
     def test_stats_report_fee_adjusted_net_xch_flow(self):
         asset_id = "asset-fee-flow"
 
-        database.record_fill(
+        database.add_offer(
             trade_id="fee-buy",
             side="buy",
             price_xch=Decimal("0.001"),
@@ -200,7 +195,8 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             fee_mojos_xch=1_000_000_000,
         )
-        database.record_fill(
+        _authoritatively_terminalize_offer("fee-buy")
+        database.add_offer(
             trade_id="fee-sell",
             side="sell",
             price_xch=Decimal("0.0011"),
@@ -210,6 +206,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             fee_mojos_xch=1_000_000_000,
         )
+        _authoritatively_terminalize_offer("fee-sell")
 
         stats = database.get_stats(asset_id)
 
@@ -275,7 +272,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         self.assertEqual(stats["sell_fills"], 1)
         self.assertEqual(stats["volume_xch"], "0.1")
 
-    def test_stats_count_exact_verified_reused_source_coin_fills_by_trade(self):
+    def test_status_text_cannot_override_source_coin_authority_deduplication(self):
         asset_id = "asset-requote-exact-stats"
         coin_id = "0xcoin-reused-exact-stats"
 
@@ -303,10 +300,10 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         stats = database.get_stats(asset_id)
 
         self.assertEqual(stats["raw_total_fills"], 2)
-        self.assertEqual(stats["duplicate_fill_rows"], 0)
-        self.assertEqual(stats["total_fills"], 2)
-        self.assertEqual(stats["sell_fills"], 2)
-        self.assertEqual(stats["volume_xch"], "0.2")
+        self.assertEqual(stats["duplicate_fill_rows"], 1)
+        self.assertEqual(stats["total_fills"], 1)
+        self.assertEqual(stats["sell_fills"], 1)
+        self.assertEqual(stats["volume_xch"], "0.1")
 
     def test_unmatched_fills_deduplicate_verified_fills_for_reused_source_coin(self):
         asset_id = "asset-requote-unmatched"
@@ -407,7 +404,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
     def test_stats_net_position_honors_fresh_run_cutoff(self):
         asset_id = "asset-test"
 
-        database.record_fill(
+        database.add_offer(
             trade_id="old-run-buy",
             side="buy",
             price_xch=Decimal("0.1"),
@@ -415,9 +412,11 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("1000"),
             cat_asset_id=asset_id,
             tier="mid",
-            filled_at="2026-03-27T20:00:00+00:00",
         )
-        database.record_fill(
+        _authoritatively_terminalize_offer(
+            "old-run-buy", filled_at="2026-03-27T20:00:00+00:00"
+        )
+        database.add_offer(
             trade_id="fresh-run-sell",
             side="sell",
             price_xch=Decimal("0.1"),
@@ -425,7 +424,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("200"),
             cat_asset_id=asset_id,
             tier="mid",
-            filled_at="2026-03-28T22:10:00+00:00",
+        )
+        _authoritatively_terminalize_offer(
+            "fresh-run-sell", filled_at="2026-03-28T22:10:00+00:00"
         )
 
         stats = database.get_stats(asset_id, since="2026-03-28T22:07:28+00:00")

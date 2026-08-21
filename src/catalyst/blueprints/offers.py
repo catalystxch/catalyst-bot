@@ -769,7 +769,7 @@ def api_fills_classified():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
         from fill_classifier import FillType
 
         classification_filter = request.args.get("type") or None
@@ -784,44 +784,47 @@ def api_fills_classified():
         cat_asset_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
 
         params = [cat_asset_id]
-        where = [
-            "cat_asset_id = ?",
-            "COALESCE(verification_status, 'legacy') LIKE 'verified%'",
-        ]
+        where = ["f.cat_asset_id = ?"]
 
         if classification_filter:
             if classification_filter == "arb":
                 # Any arb-flavoured classification
                 where.append(
-                    "fill_classification IN ('arb_sweep_buy','arb_sweep_sell','dexie_combined')"
+                    "f.fill_classification IN "
+                    "('arb_sweep_buy','arb_sweep_sell','dexie_combined')"
                 )
             else:
-                where.append("COALESCE(fill_classification,'unknown') = ?")
+                where.append("COALESCE(f.fill_classification,'unknown') = ?")
                 params.append(classification_filter)
 
         if side_filter in ("buy", "sell"):
-            where.append("side = ?")
+            where.append("f.side = ?")
             params.append(side_filter)
 
         if since:
-            where.append("filled_at >= ?")
+            where.append("f.filled_at >= ?")
             params.append(since)
 
         where_clause = " AND ".join(where)
 
         # Total count for pagination metadata
         count_row = conn.execute(
-            f"SELECT COUNT(*) FROM fills WHERE {where_clause}", params
+            "SELECT COUNT(*) FROM fills AS f "
+            + _economic_fill_authority_join()
+            + f" WHERE {where_clause}",
+            params,
         ).fetchone()
         total = count_row[0] if count_row else 0
 
         rows = conn.execute(
-            f"""SELECT fill_id, trade_id, side, price_xch, size_xch, size_cat,
-                       tier, filled_at, fill_classification, taker_puzzle_hash,
-                       spent_block_index, sweep_group_id, round_trip_id
-                FROM fills
+            f"""SELECT f.fill_id, f.trade_id, f.side, f.price_xch,
+                       f.size_xch, f.size_cat, f.tier, f.filled_at,
+                       f.fill_classification, f.taker_puzzle_hash,
+                       f.spent_block_index, f.sweep_group_id, f.round_trip_id
+                FROM fills AS f
+                {_economic_fill_authority_join()}
                 WHERE {where_clause}
-                ORDER BY filled_at DESC
+                ORDER BY f.filled_at DESC
                 LIMIT ? OFFSET ?""",
             params + [limit, offset],
         ).fetchall()
@@ -887,21 +890,21 @@ def api_fills_arb_wallets():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
 
         conn = get_connection()
         cat_asset_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
 
         # Fetch all fills that have a taker_puzzle_hash recorded
         rows = conn.execute(
-            """SELECT taker_puzzle_hash, fill_classification, sweep_group_id,
-                      side, filled_at
-               FROM fills
-               WHERE taker_puzzle_hash IS NOT NULL
-                 AND taker_puzzle_hash != ''
-                 AND cat_asset_id = ?
-                 AND COALESCE(verification_status, 'legacy') LIKE 'verified%'
-               ORDER BY filled_at DESC""",
+            """SELECT f.taker_puzzle_hash, f.fill_classification,
+                      f.sweep_group_id, f.side, f.filled_at
+               FROM fills AS f """
+            + _economic_fill_authority_join()
+            + """ WHERE f.taker_puzzle_hash IS NOT NULL
+                 AND f.taker_puzzle_hash != ''
+                 AND f.cat_asset_id = ?
+               ORDER BY f.filled_at DESC""",
             (cat_asset_id,),
         ).fetchall()
 
@@ -1034,7 +1037,7 @@ def api_market_fill_intel():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
 
         days = min(int(request.args.get("days", 7)), 90)
         tz_offset = float(request.args.get("tz_offset_hours", 0))
@@ -1044,12 +1047,12 @@ def api_market_fill_intel():
 
         # ── Fetch fills within window ──────────────────────────────────────────
         rows = conn.execute(
-            """SELECT fill_classification, sweep_group_id, side, filled_at
-               FROM fills
-               WHERE cat_asset_id = ?
-                 AND COALESCE(verification_status, 'legacy') LIKE 'verified%'
-                 AND filled_at >= datetime('now', ? || ' days')
-               ORDER BY filled_at ASC""",
+            """SELECT f.fill_classification, f.sweep_group_id, f.side, f.filled_at
+               FROM fills AS f """
+            + _economic_fill_authority_join()
+            + """ WHERE f.cat_asset_id = ?
+                 AND f.filled_at >= datetime('now', ? || ' days')
+               ORDER BY f.filled_at ASC""",
             (cat_asset_id, f"-{days}"),
         ).fetchall()
 

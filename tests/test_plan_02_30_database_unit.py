@@ -530,13 +530,14 @@ class TestRecordFill(_TempDB):
         self.assertIsNotNone(fill_id)
         self.assertGreater(fill_id, 0)
 
-    def test_get_fills_returns_recorded_fill(self):
+    def test_get_fills_hides_unproven_record_from_economics(self):
         _db.record_fill(
             "t2", "sell", Decimal("1.10"), Decimal("0.3"), Decimal("300"), "assetA"
         )
         fills = _db.get_fills(cat_asset_id="assetA")
-        trade_ids = [f["trade_id"] for f in fills]
-        self.assertIn("t2", trade_ids)
+        self.assertEqual(fills, [])
+        history = _db.get_fills(cat_asset_id="assetA", include_legacy=True)
+        self.assertEqual([fill["trade_id"] for fill in history], ["t2"])
 
     def test_get_fills_filters_by_side(self):
         _db.record_fill(
@@ -557,19 +558,19 @@ class TestGetNetPosition(_TempDB):
         pos = _db.get_net_position("assetA")
         self.assertEqual(pos, Decimal("0"))
 
-    def test_buy_fill_adds_to_position(self):
+    def test_unproven_buy_fill_does_not_change_position(self):
         _db.record_fill(
             "t1", "buy", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetA"
         )
         pos = _db.get_net_position("assetA")
-        self.assertGreater(pos, Decimal("0"))
+        self.assertEqual(pos, Decimal("0"))
 
-    def test_sell_fill_subtracts_from_position(self):
+    def test_unproven_sell_fill_does_not_change_position(self):
         _db.record_fill(
             "t1", "sell", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetA"
         )
         pos = _db.get_net_position("assetA")
-        self.assertLess(pos, Decimal("0"))
+        self.assertEqual(pos, Decimal("0"))
 
     def test_balanced_buys_and_sells_near_zero(self):
         _db.record_fill(

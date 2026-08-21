@@ -2843,12 +2843,14 @@ def test_terminal_journal_accepts_bounded_full_proof_digest_and_rejects_tail_cha
         reconcile_offer("intent-task9", evidence=changed, now=AFTER)
 
 
-def _persist_created_offer(*, coin_id: str = COIN, offered: str = "1000") -> dict:
+def _persist_created_offer(
+    *, coin_id: str = COIN, offered: str = "1000", tier: str = "inner"
+) -> dict:
     assert database.upsert_coin(
         coin_id,
         "xch",
         int(offered),
-        tier="inner",
+        tier=tier,
         designation="tier_active",
         assigned_tier="inner",
     )
@@ -2861,7 +2863,7 @@ def _persist_created_offer(*, coin_id: str = COIN, offered: str = "1000") -> dic
         network=NETWORK,
         asset_id=ASSET,
         side="buy",
-        tier="inner",
+        tier=tier,
         purpose="normal_lifecycle",
         slot_key="slot:intent-task9",
         generation=0,
@@ -2893,7 +2895,7 @@ def _persist_created_offer(*, coin_id: str = COIN, offered: str = "1000") -> dic
         size_xch=database.Decimal(offered) / database.Decimal("1000000000000"),
         size_cat=database.Decimal("2"),
         cat_asset_id=ASSET,
-        tier="inner",
+        tier=tier,
         coin_id=database.norm_coin_id(coin_id),
     )
     return database.get_offer_intent("intent-task9")
@@ -6254,10 +6256,8 @@ def test_production_boost_sink_waits_for_exact_manager_state_before_registration
 ):
     from boost_manager import BoostManager
 
-    _persist_created_offer()
+    _persist_created_offer(tier="boost")
     conn = database.get_connection()
-    conn.execute("UPDATE offers SET tier='boost' WHERE trade_id=?", (TRADE,))
-    conn.commit()
     monkeypatch.setitem(
         sys.modules, "api_server", SimpleNamespace(bot=SimpleNamespace())
     )

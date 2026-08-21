@@ -4050,7 +4050,7 @@ class CoinManager:
                 f"classify_coin import failed: {_imp_err}",
             )
             return {"relabeled": 0, "demoted": 0}
-        from database import get_connection, _now
+        from database import get_connection, get_free_coins, _now
 
         summary = {"relabeled": 0, "demoted_reserve": 0, "demoted_unknown": 0}
         # Diagnostic counters so we can see why nothing fires even
@@ -4075,15 +4075,12 @@ class CoinManager:
                     f"No tier sizes available for {wt} — skipping",
                 )
                 continue
-            rows = conn.execute(
-                "SELECT coin_id, amount_mojos, assigned_tier "
-                "FROM coins "
-                "WHERE wallet_type=? "
-                "  AND status='free' "
-                "  AND designation='tier_spare' "
-                "  AND assigned_tier IN ('inner','mid','outer','extreme')",
-                (wt,),
-            ).fetchall()
+            rows = [
+                row
+                for row in get_free_coins(wt)
+                if row.get("designation") == "tier_spare"
+                and row.get("assigned_tier") in ("inner", "mid", "outer", "extreme")
+            ]
             scanned[wt] = len(rows)
 
             for r in rows:
@@ -4150,14 +4147,12 @@ class CoinManager:
                 target = int(targets.get(tier, 0) or 0)
                 if target <= 0:
                     continue
-                rows = conn.execute(
-                    "SELECT coin_id, amount_mojos FROM coins "
-                    "WHERE wallet_type=? AND status='free' "
-                    "  AND designation='tier_spare' "
-                    "  AND assigned_tier=? "
-                    "ORDER BY amount_mojos DESC",
-                    (wt, tier),
-                ).fetchall()
+                rows = [
+                    row
+                    for row in get_free_coins(wt)
+                    if row.get("designation") == "tier_spare"
+                    and row.get("assigned_tier") == tier
+                ]
                 if len(rows) <= target:
                     continue
                 # Excess = rows.length - target. Demote the LARGEST
@@ -4471,19 +4466,18 @@ class CoinManager:
         # instead of flagging EMPTY. Without this, the startup re-check
         # fires CRITICAL the moment the first ladder goes out.
         _locked_by_tier: Dict[str, Dict[str, int]] = {"xch": {}, "cat": {}}
+        _locked_rows: List[Dict] = []
         try:
-            from database import get_connection as _get_conn
+            from database import get_locked_coins
 
-            _conn = _get_conn()
+            _locked_rows = get_locked_coins()
             for _wt in ("xch", "cat"):
                 for _tn in ("inner", "mid", "outer", "extreme"):
-                    _locked_by_tier[_wt][_tn] = int(
-                        _conn.execute(
-                            "SELECT COUNT(*) FROM coins "
-                            "WHERE status='locked' AND wallet_type=? AND assigned_tier=?",
-                            (_wt, _tn),
-                        ).fetchone()[0]
-                        or 0
+                    _locked_by_tier[_wt][_tn] = sum(
+                        1
+                        for _row in _locked_rows
+                        if _row.get("wallet_type") == _wt
+                        and _row.get("assigned_tier") == _tn
                     )
         except Exception:
             pass
@@ -4606,19 +4600,18 @@ class CoinManager:
             # active offer is still part of the pool (just doing its job). The
             # old check only counted FREE coins, so firing 1 probe dropped the
             # count to SNIPER_PREP_COUNT-1 and triggered a false LOW_SPARES.
-            try:
-                from database import get_connection as _get_conn
-
-                _conn = _get_conn()
-                _locked_sniper_xch = _conn.execute(
-                    "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='sniper' AND wallet_type='xch'"
-                ).fetchone()[0]
-                _locked_sniper_cat = _conn.execute(
-                    "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='sniper' AND wallet_type='cat'"
-                ).fetchone()[0]
-            except Exception:
-                _locked_sniper_xch = 0
-                _locked_sniper_cat = 0
+            _locked_sniper_xch = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "xch"
+                and _row.get("assigned_tier") == "sniper"
+            )
+            _locked_sniper_cat = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "cat"
+                and _row.get("assigned_tier") == "sniper"
+            )
             sniper_xch_have += int(_locked_sniper_xch or 0)
             sniper_cat_have += int(_locked_sniper_cat or 0)
             sniper_xch_needed = sniper_target if cfg.ENABLE_BUY else 0
@@ -4670,18 +4663,12 @@ class CoinManager:
             fee_have = len(self._xch_inventory.get("fees", []))
             # F67: Count locked fee coins too — same as snipers, a fee coin
             # locked in an active offer is still part of the pool.
-            try:
-                from database import get_connection as _get_conn
-
-                _locked_fees = (
-                    _get_conn()
-                    .execute(
-                        "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='fees' AND wallet_type='xch'"
-                    )
-                    .fetchone()[0]
-                )
-            except Exception:
-                _locked_fees = 0
+            _locked_fees = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "xch"
+                and _row.get("assigned_tier") == "fees"
+            )
             fee_have += int(_locked_fees or 0)
             fee_status = (
                 "READY"
@@ -6991,18 +6978,14 @@ class CoinManager:
             # source. Fall back to raw classification if the DB query
             # fails (fail-open) so a DB blip can't block every topup.
             try:
-                from database import get_connection as _db_conn_fresh
+                from database import get_all_coins_state
 
                 _wallet_type_str = "cat" if is_cat else "xch"
-                _rows_fresh = (
-                    _db_conn_fresh()
-                    .execute(
-                        "SELECT coin_id, designation, assigned_tier FROM coins "
-                        "WHERE wallet_type=? AND status IN ('free', 'locked')",
-                        (_wallet_type_str,),
-                    )
-                    .fetchall()
-                )
+                _rows_fresh = [
+                    _row
+                    for _row in get_all_coins_state().values()
+                    if _row.get("wallet_type") == _wallet_type_str
+                ]
                 _db_designations = {
                     str(_r["coin_id"]).lower(): str(
                         _r["designation"] or "unknown"

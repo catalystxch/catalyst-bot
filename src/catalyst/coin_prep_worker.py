@@ -1788,16 +1788,13 @@ class CoinPrepWorker:
             )
 
             try:
-                from database import get_connection
+                from database import get_free_coins
 
-                vconn = get_connection()
-                rows = vconn.execute(
-                    "SELECT designation, COUNT(*) as cnt FROM coins WHERE wallet_type=? AND status='free' GROUP BY designation",
-                    (wallet_type,),
-                ).fetchall()
-                verify_parts = [
-                    f"{dict(r)['designation']}={dict(r)['cnt']}" for r in rows
-                ]
+                counts = {}
+                for row in get_free_coins(wallet_type):
+                    designation = row.get("designation") or "unknown"
+                    counts[designation] = counts.get(designation, 0) + 1
+                verify_parts = [f"{key}={value}" for key, value in counts.items()]
                 self.log(f"   DB VERIFY {wallet_type}: {', '.join(verify_parts)}")
             except Exception as ve:
                 self.log(f"   DB VERIFY {wallet_type}: query failed: {ve}")
@@ -1811,16 +1808,15 @@ class CoinPrepWorker:
                 debug_path = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), "designation_debug.json"
                 )
-            from database import get_connection
+            from database import get_free_coins
 
-            dconn = get_connection()
             debug_data = {"timestamp": datetime.now().isoformat()}
             for wt in ["xch", "cat"]:
-                rows = dconn.execute(
-                    "SELECT designation, COUNT(*) as cnt FROM coins WHERE wallet_type=? AND status='free' GROUP BY designation",
-                    (wt,),
-                ).fetchall()
-                debug_data[wt] = {dict(r)["designation"]: dict(r)["cnt"] for r in rows}
+                counts = {}
+                for row in get_free_coins(wt):
+                    designation = row.get("designation") or "unknown"
+                    counts[designation] = counts.get(designation, 0) + 1
+                debug_data[wt] = counts
             with open(debug_path, "w") as f:
                 json.dump(debug_data, f, indent=2)
             self.log("   DB: debug summary written to designation_debug.json")

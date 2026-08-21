@@ -2103,22 +2103,22 @@ def check_unclaimed_deposits(auto_repair: bool = True) -> HealthCheck:
             continue
 
         try:
-            conn = get_connection()
-            rows = conn.execute(
-                "SELECT coin_id, amount_mojos, first_seen, designation "
-                "FROM coins "
-                "WHERE wallet_type=? AND status='free' "
-                "  AND ("
-                "    (designation='unknown' AND amount_mojos >= ?) "
-                "    OR (designation='reserve' AND amount_mojos >= ?)"
-                "  ) "
-                "ORDER BY amount_mojos DESC",
-                (
-                    wallet_type,
-                    int(deposit_threshold_mojos),
-                    int(reserve_threshold_mojos),
-                ),
-            ).fetchall()
+            from database import get_free_coins
+
+            rows = [
+                row
+                for row in get_free_coins(wallet_type)
+                if (
+                    row.get("designation") == "unknown"
+                    and int(row.get("amount_mojos") or 0)
+                    >= int(deposit_threshold_mojos)
+                )
+                or (
+                    row.get("designation") == "reserve"
+                    and int(row.get("amount_mojos") or 0)
+                    >= int(reserve_threshold_mojos)
+                )
+            ]
         except Exception as e:
             slog(
                 "BOT_HEALTH",
