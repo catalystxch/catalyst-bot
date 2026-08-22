@@ -318,6 +318,13 @@ _COMPOUND_MUTATION_EXPORTS = frozenset(
         "split_coins_bulk",
     }
 )
+_LEGACY_BOOLEAN_MUTATION_EXPORTS = frozenset(
+    {
+        "delete_offer",
+        "sage_initialize",
+        "sage_login",
+    }
+)
 
 
 def _blocked_mutation(reason: str) -> dict:
@@ -977,7 +984,9 @@ def _run_wallet_mutation_with_authority(
     wallet_authority = None
 
     def authoritative_result(value):
-        if type(value) is not dict:
+        if export_name in _LEGACY_BOOLEAN_MUTATION_EXPORTS and value is True:
+            value = {"success": True}
+        elif type(value) is not dict:
             value = _blocked_mutation("WALLET_MUTATION_FAILED")
         value = dict(value)
         value["_catalyst_effect_attempted"] = effect_attempted

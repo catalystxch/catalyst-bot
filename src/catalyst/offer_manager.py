@@ -4294,7 +4294,15 @@ class OfferManager:
             # it appears in the verified list — this prevents the fee coin from
             # being recorded as the offer's trade coin (bug: fee-coin backed offers).
             if verified_locked_coin_ids:
-                if locked_coin_id and locked_coin_id in verified_locked_coin_ids:
+                normalized_locked_coin_id = self._normalize_coin_ref(locked_coin_id)
+                normalized_verified_coin_ids = {
+                    self._normalize_coin_ref(coin_id)
+                    for coin_id in verified_locked_coin_ids
+                }
+                if (
+                    normalized_locked_coin_id
+                    and normalized_locked_coin_id in normalized_verified_coin_ids
+                ):
                     db_coin_id = locked_coin_id  # pre-selected trade coin confirmed ✓
                 else:
                     # Pre-selected coin not verified (Sage used different coin).

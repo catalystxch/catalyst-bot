@@ -1599,6 +1599,85 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             )
         )
 
+    def test_create_ladder_matches_sage_prefixed_selected_coin_without_warning(self):
+        """Sage's 0x prefix must not turn the selected coin into a false mismatch."""
+
+        manager = offer_manager.OfferManager()
+
+        def fake_create_offer_with_retry(
+            self,
+            offer_dict,
+            max_retries=2,
+            expiry_offset=0,
+            expiry_secs=None,
+            used_coins=None,
+            coin_ids_enabled=False,
+            selected_coin_id=None,
+            preferred_tier=None,
+            strict_preferred_tier=False,
+            creation_context=None,
+        ):
+            return {
+                "success": True,
+                "trade_id": "trade-prefixed-coin",
+                "trade_record": {"trade_id": "trade-prefixed-coin"},
+                "locked_coin_id": selected_coin_id,
+                "offer": "offer-prefixed-coin",
+            }
+
+        locked_map = {
+            "0xcoin-mid": {
+                "amount": 10_000_000_000,
+                "offer_id": "trade-prefixed-coin",
+            }
+        }
+
+        with (
+            patch.object(
+                offer_manager.OfferManager,
+                "_select_coin_for_offer",
+                return_value="coin-mid",
+            ),
+            patch.object(
+                offer_manager.OfferManager,
+                "create_offer_with_retry",
+                new=fake_create_offer_with_retry,
+            ),
+            patch.object(
+                offer_manager, "get_owned_coins_detailed", return_value=locked_map
+            ),
+            patch.object(
+                offer_manager,
+                "get_exact_spendable_coins_rpc",
+                return_value={
+                    "success": True,
+                    "confirmed_records": [
+                        {"coin_id": "coin-mid", "coin": {"amount": 10_000_000_000}}
+                    ],
+                },
+            ),
+            patch.object(offer_manager, "add_offer"),
+            patch.object(offer_manager, "lock_coin"),
+            patch.object(offer_manager, "log_event") as mock_log_event,
+            patch.object(offer_manager, "get_offer_bech32", return_value=""),
+            patch("builtins.print"),
+        ):
+            created = manager.create_ladder(
+                mid_price=Decimal("0.001"),
+                side="buy",
+                num_offers=1,
+                coin_ids_enabled=True,
+            )
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["coin_id"], "coin-mid")
+        self.assertFalse(
+            any(
+                args[1] == "trade_coin_not_verified"
+                for args, _ in mock_log_event.call_args_list
+            )
+        )
+
     def test_get_replenishment_slots_heals_tier_shortage_instead_of_mini_ladder(self):
         # Scenario: only the extreme tier has a shortage (3 slots short).
         # With the current tier config (INNER=10, MID=7, OUTER=5, EXTREME=28

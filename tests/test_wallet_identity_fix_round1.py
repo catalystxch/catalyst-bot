@@ -336,6 +336,50 @@ def test_sage_login_target_must_be_exact_frozen_fingerprint(monkeypatch, target)
     assert adapter_calls == []
 
 
+def test_sage_login_legacy_true_is_normalized_after_guarded_dispatch(monkeypatch):
+    """The bool success contract from wallet_sage must survive the facade."""
+
+    adapter_calls = []
+
+    def sage_login(fingerprint, force_resync, *, _identity_recheck=None):
+        adapter_calls.append((fingerprint, force_resync, _identity_recheck))
+        return True
+
+    _authorize_wallet(monkeypatch, SimpleNamespace(sage_login=sage_login))
+
+    result = wallet.sage_login(123456)
+
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
+    assert len(adapter_calls) == 1
+    assert adapter_calls[0][:2] == (123456, False)
+    assert callable(adapter_calls[0][2])
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "facade_name", "facade_args"),
+    [
+        ("sage_initialize", "sage_initialize", ()),
+        ("delete_offer", "sage_delete_offer", ("offer-id",)),
+    ],
+)
+def test_other_legacy_true_mutations_are_normalized_after_guarded_dispatch(
+    monkeypatch, adapter_name, facade_name, facade_args
+):
+    adapter_calls = []
+
+    def legacy_mutation(*args, **kwargs):
+        adapter_calls.append((args, kwargs))
+        return True
+
+    adapter = SimpleNamespace(**{adapter_name: legacy_mutation})
+    _authorize_wallet(monkeypatch, adapter)
+
+    result = getattr(wallet, facade_name)(*facade_args)
+
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
+    assert len(adapter_calls) == 1
+
+
 def test_set_change_address_none_binds_frozen_fingerprint(monkeypatch):
     """The adapter must not rediscover a potentially switched active key."""
 

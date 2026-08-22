@@ -166,6 +166,72 @@ tests pass.
 No test invariant, production safety gate, or external-network guard was
 weakened to obtain a passing result.
 
+## Local Sage full-app acceptance
+
+The final Windows build was exercised end to end on this PC against the
+authorised Sage `TEST 7` wallet on 2026-08-22. The run used the isolated
+`.superpowers/test7-mainnet-lab` data directory and left the user's normal
+CATalyst data directory untouched.
+
+The packaged Flask/API pass checked 76 read and control endpoints with no HTTP
+5xx responses or secret findings. Health, self-test, configuration validation,
+wallet identity, Sage startup, balances, CAT discovery, market data, offers,
+reservations, diagnostics, and all six stability blocker categories returned
+valid state. A dry-run cycle completed without an offer or transaction.
+
+The browser UI rendered Dashboard, Offers, P&L, Market Intelligence, both
+Settings views, Logs, Data Reset, Help, and About with no console errors. Theme,
+keyboard focus, local presets, and Smart Settings form behavior were also
+checked and restored. The native PyWebView build completed risk disclosure and
+Sage onboarding, displayed fingerprint `736588221` and the exact XCH/SBX
+balances, rendered the principal screens, passed its Doctor check with 9 passes
+and one non-blocking Spacescan free-tier warning, and completed a clean
+close/restart/close cycle.
+
+Two real packaged boundaries exposed regressions that are now covered by tests:
+
+- Sage 0.12.10's successful legacy boolean return from `login` was rejected by
+  the guarded wallet facade. The facade now normalizes `True` only for the three
+  documented legacy boolean mutation exports (`sage_login`, `sage_initialize`,
+  and `delete_offer`); all other malformed mutation results remain blocked.
+- Sage returned the selected offer coin with a `0x` prefix while CATalyst held
+  the same id without it, producing a false unexpected-coin warning. Locked
+  inputs are now compared in canonical lowercase `0x` form.
+
+The bounded live package test created exactly one buy offer for `0.001 XCH` and
+stopped the bot before a second cycle. Coin preparation, sniper, Dexie posting,
+and Splash remained disabled; the sell side was disabled because the wallet had
+no prepared SBX trading coin. The cancellation RPC was conservatively journaled
+as ambiguous, the restart correctly entered read-only diagnostics, and the
+authoritative reconciliation boundary then found Sage's exact cancelled row and
+returned `CANCELLED_PROVEN` with `EXACT_CANCEL_RETURN_PROOF`. The only balance
+change was the expected `0.000001 XCH` cancellation fee; SBX was unchanged.
+
+Final reconciliation reported a stopped bot, `DRY_RUN=true`, zero Sage pending
+transactions, zero Sage/CATalyst open offers, zero pending cancellations, zero
+locks or reservations, and zero blockers in operations, submitted cancels,
+prepared creations, contradictory history, reservations, and publication
+claims. All XCH and SBX balances were spendable.
+
+Fresh post-fix gates were:
+
+- Wallet identity/login slice: 91 passed.
+- Offer manager and creation journal slice: 114 passed.
+- Whole repository in CI file-isolated mode: 5,095 passed, 13 skipped, 413
+  subtests passed in 307.52s.
+- Ruff, Vulture, Bandit (zero medium/high findings), and `git diff --check`:
+  passed.
+- `python build.py --no-clean`: passed; packaged post-build Sage/Doctor smoke:
+  passed.
+
+Final local artifact:
+
+- Executable: `dist/Catalyst/Catalyst.exe`
+- Size: 10,586,545 bytes
+- SHA-256: `48C28B93B93737ADE776D502FD2F748CA99F99FD1A132884F0EF4CBE7A9EA451`
+- Detailed redacted report:
+  `.superpowers/local-sage-acceptance/acceptance-report.json`
+
 ## Known limitations
 
 - `python -m ruff format --check .` reports accumulated branch-wide formatting
