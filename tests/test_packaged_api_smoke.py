@@ -36,6 +36,10 @@ def test_build_env_uses_isolated_packaged_runtime_paths(tmp_path):
     assert env["BOT_LOCAL_WRITE_TOKEN"] == "test-token"
     assert env["_CATALYST_PRESERVE_PROCESS_ENV"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["SAGE_FINGERPRINT"] == "123456789"
+    assert env["WALLET_EXPECTED_NAME"] == "Packaged Smoke Sage"
+    assert env["WALLET_EXPECTED_KEY_KIND"] == "bls"
+    assert env["CATALYST_NETWORK_ID"] == "mainnet"
 
 
 def test_endpoint_contract_includes_core_release_surfaces():

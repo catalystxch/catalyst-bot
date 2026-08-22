@@ -32,7 +32,6 @@ from database import (
     add_offer,
     update_offer_status,
     transition_offer,
-    mark_cancel_attempted,
     get_open_offers,
     log_event,
     lock_coin,
@@ -4779,6 +4778,7 @@ class OfferManager:
 
         Returns dict with offers, fully_replaced, replaced_count, target_count.
         """
+        del force_cancel_storm
         # NOTE: _last_requote_time is set only when we actually do work (create or cancel).
         # Early returns (no spares, create failed) intentionally leave it unchanged so the
         # next cycle's cooldown check doesn't see a false "just requoted" timestamp and
@@ -5096,175 +5096,6 @@ class OfferManager:
             "pending_cancel_count": 0,
             "failed_cancel_count": 0,
             "lineage_pending_count": len(new_offers),
-            "tier_filter_drained": False,
-        }
-
-        # Cancel old offers first. Creating before cancellation briefly
-        # over-stacks the side whenever Sage keeps cancelled offers
-        # wallet-active for another cycle.
-        create_count = min(target_count, spare_count)
-        log_event(
-            "info",
-            "requote_cancel_first",
-            f"Requote {side}: cancelling {create_count} old offers "
-            f"({spare_count} spares, target {target_count})",
-        )
-
-        cancel_targets = self._select_requote_cancel_targets(
-            open_offers, create_count, mid_price=current_price
-        )
-        if cancel_targets != open_offers[:create_count]:
-            log_event(
-                "info",
-                "requote_stale_survivor_targets",
-                f"Requote {side}: included "
-                f"{len([o for o in cancel_targets if o not in open_offers[:create_count]])} "
-                "old/far survivor offer(s) in this partial pass",
-            )
-
-        cancel_ids = [o["trade_id"] for o in cancel_targets if o.get("trade_id")]
-        if not cancel_ids:
-            log_event(
-                "info",
-                "requote_no_cancel_ids",
-                f"Requote {side}: no cancellable trade IDs found",
-            )
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": 0,
-                "failed_cancel_count": 0,
-                "tier_filter_drained": False,
-            }
-
-        cancel_results = self.cancel_offers(
-            cancel_ids,
-            reason="requote",
-            skip_confirmation=False,
-            force_storm=force_cancel_storm,
-        )
-        confirmed_cancel_ids = []
-        pending_cancel_ids = []
-        failed_cancel_ids = []
-        for tid in cancel_ids:
-            result = (cancel_results or {}).get(tid) or {}
-            if result.get("outcome") == CANCEL_FAILED:
-                failed_cancel_ids.append(tid)
-            else:
-                # Cancellation never becomes terminal on a wallet response.
-                # Task 9's reconciler must prove the terminal outcome before
-                # requote is allowed to publish a replacement.
-                pending_cancel_ids.append(tid)
-
-        if not confirmed_cancel_ids:
-            log_event(
-                "info",
-                "requote_waiting_for_cancel_settle",
-                f"Requote {side}: {len(pending_cancel_ids)} cancel(s) "
-                f"still pending, {len(failed_cancel_ids)} failed; "
-                "replacement creation held to avoid over-stacking",
-            )
-            with self._lock:
-                self._last_requote_time[side] = time.time()
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": len(pending_cancel_ids),
-                "failed_cancel_count": len(failed_cancel_ids),
-                "tier_filter_drained": False,
-            }
-
-        create_count = len(confirmed_cancel_ids)
-        log_event(
-            "info",
-            "requote_creating",
-            f"Requote {side}: creating {create_count} replacement "
-            f"offers after confirmed cancels",
-        )
-
-        # Use the full ladder size for tier classification so that
-        # each replacement offer lands in the correct tier (inner/mid/outer/
-        # extreme) with the right coin-size cap.  Using target_count (the
-        # number of offers being replaced) caused all slots to classify as
-        # "inner" whenever target_count ≤ BUY_INNER_TIER_COUNT, which forced
-        # an inner-sized coin cap on every offer regardless of its real
-        # position — rejecting all available larger coins and returning 0.
-        _full_slots = (
-            cfg.MAX_ACTIVE_BUY_OFFERS if side == "buy" else cfg.MAX_ACTIVE_SELL_OFFERS
-        )
-        new_offers = self.create_ladder(
-            current_price,
-            side,
-            num_offers=create_count,
-            slot_start=0,
-            total_slots=_full_slots,
-            risk_manager=risk_manager,
-            spread_fraction=spread_fraction,
-            coin_ids_enabled=cfg.COIN_IDS_ENABLED,
-            price_cap=price_cap,
-            price_floor=price_floor,
-        )
-
-        if not new_offers:
-            log_event(
-                "info",
-                "requote_create_failed",
-                f"Requote {side}: create_ladder returned 0 offers "
-                f"— keeping old offers in place",
-            )
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": len(pending_cancel_ids),
-                "failed_cancel_count": len(failed_cancel_ids),
-                "tier_filter_drained": False,
-            }
-
-        # ── Step 2: Post new offers to Dexie ──
-        if dexie_manager:
-            for offer in new_offers:
-                bech32 = offer.get("offer_bech32", "")
-                trade_id = offer.get("trade_id", "")
-                if bech32 and trade_id:
-                    dexie_manager.queue_post(bech32, trade_id)
-
-        log_event(
-            "info",
-            "requote_done",
-            f"Requote {side} complete: created {len(new_offers)} new, "
-            f"confirmed {len(confirmed_cancel_ids)} old cancel(s), "
-            f"pending {len(pending_cancel_ids)}, "
-            f"failed {len(failed_cancel_ids)}",
-        )
-        # Requote did real work — stamp the cooldown timer now (not at entry)
-        with self._lock:
-            self._last_requote_time[side] = time.time()
-        # fully_replaced is True only when we replaced every offer we
-        # INTENDED to replace BEFORE the per-cycle budget cap truncated
-        # the list. Using the truncated target_count here used to mark a
-        # capped FULL requote as "fully replaced" while 20+ old offers
-        # sat exposed at the stale mid — the caller then advanced its
-        # drift baseline and skipped them until another trigger fired.
-        return {
-            "offers": new_offers,
-            "fully_replaced": (
-                len(new_offers) >= original_target_count
-                and len(confirmed_cancel_ids) >= original_target_count
-            ),
-            "replaced_count": len(new_offers),
-            "target_count": target_count,
-            "original_target_count": original_target_count,
-            "pending_cancel_count": len(pending_cancel_ids),
-            "failed_cancel_count": len(failed_cancel_ids),
             "tier_filter_drained": False,
         }
 
@@ -6292,6 +6123,7 @@ class OfferManager:
         Routine requote/expiry/sniper paths do NOT — so a bug there
         that tries to nuke the book gets caught here instead of executing.
         """
+        del skip_confirmation
         if not trade_ids:
             return {}
 
@@ -6526,10 +6358,27 @@ class OfferManager:
                                 ),
                             }
                         )
-                    database.prepare_offer_cancel_cohort(
+                    cohort_prepare = database.prepare_offer_cancel_cohort(
                         manifest_json=manifest,
                         member_requests_json=requests,
                     )
+                    if cohort_prepare["inserted"] is False:
+                        replay_results = {}
+                        for replay_intent, replay_attempt, _member_id in ordered_members:
+                            replay_result = existing_results[replay_intent.trade_id]
+                            if replay_result is None:
+                                replay_result = self._read_existing_cancel_result(
+                                    replay_intent
+                                ).result
+                            if replay_result is None:
+                                replay_result = self._cancel_reconciliation_result(
+                                    replay_intent,
+                                    idempotent_replay=True,
+                                    effect_attempted=False,
+                                    attempt=replay_attempt,
+                                )
+                            replay_results[replay_intent.trade_id] = replay_result
+                        return replay_results
                 else:
                     for intent, attempt, member_id in members:
                         authority = authorities.get(intent.trade_id)

@@ -105,6 +105,7 @@ class _TempDB(unittest.TestCase):
                 max(offered_atomic, 1),
                 designation="tier_active",
                 tier="inner",
+                purpose="lifecycle",
             )
         )
         _db.prepare_offer_intent(

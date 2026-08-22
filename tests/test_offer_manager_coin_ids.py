@@ -75,6 +75,15 @@ fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
 fake_database.transition_offer = lambda *args, **kwargs: None
 fake_database.mark_cancel_attempted = lambda *args, **kwargs: None
 fake_database.get_retryable_failed_offer_cancels = lambda: []
+fake_database.get_pending_refresh_lineage_parent_ids = lambda **kwargs: []
+fake_database.get_runtime_mutation_lease = lambda: {
+    "wallet_fingerprint_hash": "f" * 64,
+    "network": "mainnet",
+}
+fake_database.refresh_lineage_blocker_operation_id = (
+    lambda **kwargs: "refresh-lineage:test-blocker"
+)
+fake_database.record_refresh_lineage_blocker = lambda **kwargs: {"state": "blocking"}
 sys.modules["database"] = fake_database
 
 fake_wallet = types.ModuleType("wallet")
@@ -231,18 +240,16 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("buy", Decimal("0.1200"))
 
-        # Single pass: journal the two most-at-risk without publishing replacements.
+        # Legacy, non-canonical wallet rows have no durable parent authority.
         self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 4)
         self.assertFalse(result["fully_replaced"])
         self.assertEqual(result["offers"], [])
-        self.assertEqual(result["pending_cancel_count"], 2)
+        self.assertEqual(result["pending_cancel_count"], 0)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertEqual(create_batches, [])
-        # Only one cancel batch (single pass, no rolling waves)
-        self.assertEqual(len(cancel_batches), 1)
-        # Most-at-risk first: inner (closest to mid), then mid
-        self.assertEqual(cancel_batches[0], ["inner-trade", "mid-trade"])
+        self.assertEqual(cancel_batches, [])
 
     def test_requote_side_large_partial_retires_stale_survivor(self):
         """Larger partial requotes blend stale/far survivors into cancel targets."""
@@ -318,24 +325,12 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 10)
         self.assertFalse(result["fully_replaced"])
-        self.assertEqual(result["pending_cancel_count"], 8)
+        self.assertEqual(result["pending_cancel_count"], 0)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertEqual(create_batches, [])
-        self.assertEqual(len(cancel_batches), 1)
-        self.assertEqual(
-            cancel_batches[0][:6],
-            [
-                "risk-1",
-                "risk-2",
-                "risk-3",
-                "risk-4",
-                "risk-5",
-                "risk-6",
-            ],
-        )
-        self.assertIn("stale-old-far", cancel_batches[0][6:])
-        self.assertNotIn("risk-7", cancel_batches[0])
-        self.assertEqual(force_flags, [False])
+        self.assertEqual(cancel_batches, [])
+        self.assertEqual(force_flags, [])
 
     def test_requote_side_can_force_intentional_cancel_storm(self):
         manager = offer_manager.OfferManager()
@@ -382,10 +377,11 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             )
 
         self.assertEqual(result["replaced_count"], 0)
-        self.assertEqual(result["pending_cancel_count"], 6)
+        self.assertEqual(result["pending_cancel_count"], 0)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertEqual(create_batches, [])
-        self.assertEqual(force_flags, [True])
+        self.assertEqual(force_flags, [])
 
     def test_requote_side_does_not_create_when_cancel_is_pending(self):
         manager = offer_manager.OfferManager()
@@ -426,11 +422,12 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("sell", Decimal("0.1200"))
 
-        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(calls, [])
         self.assertEqual(result["offers"], [])
         self.assertEqual(result["replaced_count"], 0)
-        self.assertEqual(result["pending_cancel_count"], 1)
+        self.assertEqual(result["pending_cancel_count"], 0)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertFalse(result["fully_replaced"])
 
     def test_requote_side_does_not_overstack_after_typed_cancel_failure(self):
@@ -469,11 +466,12 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("sell", Decimal("0.1200"))
 
-        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(calls, [])
         self.assertEqual(result["offers"], [])
         self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["pending_cancel_count"], 0)
-        self.assertEqual(result["failed_cancel_count"], 1)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertFalse(result["fully_replaced"])
 
     def test_retry_failed_cancels_exhaustion_does_not_mark_cancelled(self):

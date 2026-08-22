@@ -2857,6 +2857,7 @@ def _persist_created_offer(
         tier=tier,
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id="intent-task9",
@@ -2973,6 +2974,7 @@ def _persist_prepared_offer_with_unlinked_reservation() -> dict:
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id="intent-task9",
@@ -3186,6 +3188,7 @@ def test_chia_reconcile_atomic_release_cannot_cross_new_task4_reservation(
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     conn = database.get_connection()
     conn.execute(
@@ -3312,6 +3315,7 @@ def test_task4_registry_write_cannot_cross_legacy_reconciliation_snapshot(
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     if legacy_writer == "orphan_cleanup":
         conn = database.get_connection()
@@ -3733,6 +3737,7 @@ def _insert_authoritative_test_fill(
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=intent_id,
@@ -5178,7 +5183,10 @@ def test_normal_bot_start_restores_sweep_safety_after_runtime_reset(
         checks=[failed_check],
         to_dict=lambda: {"can_start": False},
     )
-    monkeypatch.setattr(cfg, "reload", lambda: None)
+    # Patch the class descriptor so monkeypatch removes it cleanly. Patching
+    # the instance restores a bound method into cfg.__dict__, which then leaks
+    # into Config.to_dict() and breaks later JSON endpoint tests.
+    monkeypatch.setattr(type(cfg), "reload", lambda _self: None)
     monkeypatch.setitem(
         sys.modules,
         "doctor",
@@ -7468,6 +7476,7 @@ def _persist_grouped_cancel_case(
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id="intent-task9-other",

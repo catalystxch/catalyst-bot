@@ -3,7 +3,7 @@ from unittest.mock import patch
 import sys
 import types
 from decimal import Decimal
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 
 # Track which stub modules we installed so we can clean them up after the
 # test class runs.  Other test files (test_amm_monitor.py) import the real
@@ -109,6 +109,13 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self._wallet_effect_authority.enter_context(
             patch.object(
                 coin_manager, "begin_wallet_effect_dispatch", return_value=object()
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager,
+                "wallet_effect_adapter_dispatch_authority",
+                side_effect=nullcontext,
             )
         )
         self._wallet_effect_authority.enter_context(

@@ -1,4 +1,5 @@
 import importlib
+import contextlib
 import sys
 import types
 import unittest
@@ -48,6 +49,14 @@ def _load_coin_manager_with_fakes():
     fake_database.log_event = lambda *args, **kwargs: None
     fake_database.get_connection = lambda: _FakeConnection()
     fake_database.get_tier_spare_counts = lambda wallet_type: {}
+    fake_database.claim_wallet_effect = lambda *args, **kwargs: None
+    fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: None
+    fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: None
+    fake_database.retain_wallet_effect_claim_for_reconciliation = (
+        lambda *args, **kwargs: None
+    )
+    fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
+    fake_database.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
     sys.modules["database"] = fake_database
 
     fake_wallet = types.ModuleType("wallet")

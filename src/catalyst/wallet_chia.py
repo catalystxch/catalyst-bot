@@ -1319,6 +1319,7 @@ def cancel_offers_batch(
     (e.g. after creating many new offers in overlap strategy). Sequential with
     brief delays is more reliable and the speed difference is negligible.
     """
+    del max_workers, skip_confirmation
     results = {}
 
     if not trade_ids:

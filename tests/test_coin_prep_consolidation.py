@@ -1,8 +1,10 @@
 import importlib
+import json
 import os
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from decimal import Decimal
 from unittest.mock import patch
 from pathlib import Path
@@ -88,12 +90,14 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         }
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
         fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: object()
+        fake_database.wallet_effect_adapter_dispatch_authority = nullcontext
         fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
             "SUBMITTED"
         )
         fake_database.retain_wallet_effect_claim_for_reconciliation = (
             lambda *args, **kwargs: True
         )
+        fake_database.get_recoverable_coin_prep_operations = lambda: []
         fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
         sys.modules["database"] = fake_database
 
@@ -309,7 +313,6 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "success": True,
             "confirmed_records": list(records),
         }
-
         def send_transaction(
             wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
         ):
@@ -599,10 +602,17 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "success": True,
             "confirmed_records": list(records),
         }
+        fake_wallet_sage.get_owned_coins = lambda wallet_id: {
+            record["coin_id"]: record["amount"] for record in records
+        }
 
         def combine_coins(coin_ids, fee_mojos=0):
             calls.append(list(coin_ids))
-            return {"success": True, "submitted": True}
+            return {
+                "success": True,
+                "submitted": True,
+                "transaction_id": f"{len(calls):064x}",
+            }
 
         fake_wallet_sage.combine_coins = combine_coins
         sys.modules["wallet_sage"] = fake_wallet_sage
@@ -610,6 +620,38 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker = self.coin_prep_worker.CoinPrepWorker()
         worker._consolidate_wallet_sage_fallback = lambda wallet_id, name: False
         worker._tx_fee_mojos = lambda: 0
+        identity = {
+            "backend": "sage",
+            "name": "Task 16 Synthetic Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": "2026-08-22T00:00:00.000000Z",
+            "maximum_age_seconds": 300,
+        }
+        worker._current_coin_prep_wallet_identity = lambda: identity
+
+        def prepare_coin_prep_operation(**kwargs):
+            return {
+                "operation": {
+                    "operation_id": "coin-prep:" + f"{len(calls):064x}",
+                    "outcome": "PREPARED",
+                    "source_coin_ids_json": json.dumps(kwargs["source_coin_ids"]),
+                    "target_contract_json": json.dumps(kwargs["target_contract"]),
+                    "wallet_identity_json": json.dumps(kwargs["wallet_identity_json"]),
+                    "prepared_evidence_json": json.dumps(kwargs["evidence_json"]),
+                    "effect_claim_token": kwargs["effect_claim_token"],
+                    "effect_claim_generation": kwargs["effect_claim_generation"],
+                }
+            }
+
+        self.coin_prep_worker.prepare_coin_prep_operation = (
+            prepare_coin_prep_operation
+        )
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda *args, **kwargs: {"operation": {"outcome": kwargs["outcome"]}}
+        )
 
         self.assertTrue(worker._consolidate_wallet_sage_combine(2, "CAT"))
 

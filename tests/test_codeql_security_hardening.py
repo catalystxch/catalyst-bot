@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import api_server
+from api_test_support import api_mutations_permitted
 import sage_node
 from blueprints import bot as bot_routes
 from blueprints import coin_prep as coin_prep_routes
@@ -182,6 +183,7 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
     monkeypatch.setattr(api_server, "_get_sage_signing_block_reason", lambda: None)
 
     with (
+        api_mutations_permitted(api_server),
         patch(
             "wallet.get_wallet_sync_status",
             side_effect=RuntimeError("secret wallet traceback"),
@@ -220,6 +222,7 @@ def test_bot_start_coin_prep_gate_hides_worker_exception_details(monkeypatch):
         "error": "secret coin prep traceback",
     }
     with (
+        api_mutations_permitted(api_server),
         patch(
             "wallet.get_wallet_sync_status",
             return_value={"reachable": True, "sync_state": "synced"},
@@ -244,9 +247,12 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
     client, loopback = _api_client()
     auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
 
-    with patch(
-        "sage_node.start_chia",
-        return_value={"success": False, "error": "secret daemon traceback"},
+    with (
+        api_mutations_permitted(api_server),
+        patch(
+            "sage_node.start_chia",
+            return_value={"success": False, "error": "secret daemon traceback"},
+        ),
     ):
         resp = client.post(
             "/api/sage/daemon/start",
@@ -265,9 +271,16 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
     assert resp.status_code == 200
     assert "secret startup traceback" not in resp.get_data(as_text=True).lower()
 
-    with patch(
-        "chia_node.trigger_start",
-        return_value={"success": False, "error": "secret trigger traceback"},
+    with (
+        api_mutations_permitted(api_server),
+        patch(
+            "chia_node.trigger_start",
+            return_value={"success": False, "error": "secret trigger traceback"},
+        ),
+        patch(
+            "blueprints.sage._runtime_fingerprint_decision",
+            return_value={"success": True},
+        ),
     ):
         resp = client.post(
             "/api/sage/start-with-fingerprint",
@@ -280,6 +293,7 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
 
     fake_cfg = SimpleNamespace(update=lambda *args, **kwargs: True)
     with (
+        api_mutations_permitted(api_server),
         patch.object(api_server, "bot", None),
         patch.object(api_server, "cfg", fake_cfg),
         patch(
@@ -289,6 +303,10 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
         patch(
             "chia_node.trigger_start",
             return_value={"success": False, "error": "secret persist traceback"},
+        ),
+        patch(
+            "blueprints.sage._runtime_fingerprint_decision",
+            return_value={"success": True},
         ),
     ):
         resp = client.post(
@@ -313,6 +331,7 @@ def test_config_change_address_result_hides_wallet_exception_details(monkeypatch
     monkeypatch.setattr(config_bp, "cfg", fake_cfg)
 
     with (
+        api_mutations_permitted(api_server),
         patch("wallet.get_wallet_type", return_value="sage"),
         patch(
             "wallet.get_next_address",
@@ -352,12 +371,13 @@ def test_splash_receive_node_action_hides_exception_details(monkeypatch):
     monkeypatch.setattr(api_server, "bot", bot)
     monkeypatch.setattr(api_server, "cfg", fake_cfg)
 
-    resp = client.post(
-        "/api/splash/receive",
-        json={"enabled": True},
-        headers=auth,
-        environ_base=loopback,
-    )
+    with api_mutations_permitted(api_server):
+        resp = client.post(
+            "/api/splash/receive",
+            json={"enabled": True},
+            headers=auth,
+            environ_base=loopback,
+        )
 
     assert resp.status_code == 200
     assert "secret splash traceback" not in resp.get_data(as_text=True).lower()

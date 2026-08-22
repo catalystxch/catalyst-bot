@@ -63,6 +63,11 @@ def _configure_runtime(monkeypatch, adapter):
     )
     monkeypatch.setattr(
         mutation_gate,
+        "wallet_mutation_permit_journal_authority",
+        lambda permit, operation: {"owner_run_id": "wallet-identity-round2"},
+    )
+    monkeypatch.setattr(
+        mutation_gate,
         "require_fresh_wallet_identity",
         lambda binding, snapshot, operation: {"allowed": True},
     )
@@ -97,7 +102,11 @@ def test_owner_effect_uses_acquired_adapter_when_identity_read_swaps_all_globals
     finally:
         mutation_gate.shutdown_runtime()
 
-    assert result == {"success": True, "source": "original"}
+    assert result == {
+        "success": True,
+        "source": "original",
+        "_catalyst_effect_attempted": True,
+    }
     assert events == ["identity", "original_effect"]
 
 
@@ -163,7 +172,11 @@ def test_owner_effect_keeps_acquired_adapter_during_threaded_identity_race(
     finally:
         mutation_gate.shutdown_runtime()
 
-    assert result == {"success": True, "source": "original"}
+    assert result == {
+        "success": True,
+        "source": "original",
+        "_catalyst_effect_attempted": True,
+    }
     assert events == ["identity", "original_effect"]
 
 
@@ -200,7 +213,11 @@ def test_nested_identity_callback_keeps_acquired_adapter(monkeypatch):
     finally:
         mutation_gate.shutdown_runtime()
 
-    assert result == {"success": True, "source": "original"}
+    assert result == {
+        "success": True,
+        "source": "original",
+        "_catalyst_effect_attempted": True,
+    }
     assert events == [
         "identity:1",
         "nested:before",
@@ -305,6 +322,11 @@ def test_worker_effect_keeps_installed_adapter_during_identity_read_swap(monkeyp
     )
     monkeypatch.setattr(
         mutation_gate,
+        "wallet_mutation_permit_journal_authority",
+        lambda permit, operation: {"owner_run_id": "wallet-identity-round2"},
+    )
+    monkeypatch.setattr(
+        mutation_gate,
         "require_fresh_wallet_identity",
         lambda binding, snapshot, operation: {"allowed": True},
     )
@@ -312,6 +334,7 @@ def test_worker_effect_keeps_installed_adapter_during_identity_read_swap(monkeyp
     assert wallet.create_offer({1: -1}) == {
         "success": True,
         "source": "original",
+        "_catalyst_effect_attempted": True,
     }
     assert events == ["identity", "original_effect"]
 

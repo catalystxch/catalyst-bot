@@ -100,6 +100,7 @@ _mod(
     get_stats=lambda: {},
     get_offer=lambda *a, **kw: None,
     get_offers_by_trade_ids=lambda *a, **kw: [],
+    get_runtime_mutation_lease=lambda: {"network": "testnet11"},
     update_offer_status=lambda *a, **kw: True,
     backfill_verified_fills_from_offers=lambda *a, **kw: 0,
 )

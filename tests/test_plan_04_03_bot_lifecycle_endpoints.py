@@ -40,6 +40,22 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        self._mutation_runtime = patch.object(
+            api_server, "_ensure_mutation_runtime", return_value=None
+        )
+        self._mutation_enter = patch.object(
+            api_server.mutation_gate, "enter_mutation", return_value="permit"
+        )
+        self._mutation_exit = patch.object(
+            api_server.mutation_gate, "exit_mutation", return_value=True
+        )
+        for mutation_patch in (
+            self._mutation_runtime,
+            self._mutation_enter,
+            self._mutation_exit,
+        ):
+            mutation_patch.start()
+            self.addCleanup(mutation_patch.stop)
         self._wallet_identity_preflight = patch(
             "wallet.preflight_wallet_identity",
             return_value={"success": True, "reason": "identity_verified"},

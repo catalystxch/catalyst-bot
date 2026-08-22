@@ -19,6 +19,10 @@ class ConfigWorkerEnvTests(unittest.TestCase):
                         "SAGE_CERT_PATH=C:/stale/wallet.crt",
                         "SAGE_KEY_PATH=C:/stale/wallet.key",
                         "SAGE_DATA_DIR=C:/stale",
+                        "SAGE_FINGERPRINT=111111111",
+                        "WALLET_EXPECTED_NAME=Stale Wallet",
+                        "WALLET_EXPECTED_KEY_KIND=legacy",
+                        "CATALYST_NETWORK_ID=testnet11",
                     ]
                 ),
                 encoding="utf-8",
@@ -30,6 +34,10 @@ class ConfigWorkerEnvTests(unittest.TestCase):
                 "SAGE_CERT_PATH": "C:/runtime/wallet.crt",
                 "SAGE_KEY_PATH": "C:/runtime/wallet.key",
                 "SAGE_DATA_DIR": "C:/runtime",
+                "SAGE_FINGERPRINT": "123456789",
+                "WALLET_EXPECTED_NAME": "Packaged Smoke Sage",
+                "WALLET_EXPECTED_KEY_KIND": "bls",
+                "CATALYST_NETWORK_ID": "mainnet",
             }
 
             with (
@@ -43,7 +51,11 @@ class ConfigWorkerEnvTests(unittest.TestCase):
                 self.assertEqual(cfg.SAGE_CERT_PATH, "C:/runtime/wallet.crt")
                 self.assertEqual(cfg.SAGE_KEY_PATH, "C:/runtime/wallet.key")
                 self.assertEqual(cfg.SAGE_DATA_DIR, "C:/runtime")
+                self.assertEqual(cfg.SAGE_FINGERPRINT, "123456789")
+                self.assertEqual(cfg.WALLET_EXPECTED_NAME, "Packaged Smoke Sage")
+                self.assertEqual(cfg.WALLET_EXPECTED_KEY_KIND, "bls")
                 self.assertEqual(os.environ["SAGE_RPC_URL"], "https://127.0.0.1:43210")
+                self.assertEqual(os.environ["CATALYST_NETWORK_ID"], "mainnet")
 
 
 if __name__ == "__main__":

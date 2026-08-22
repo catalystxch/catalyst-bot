@@ -22,6 +22,7 @@ Reversed (BUY_LADDER_REVERSED=True):
 """
 
 import importlib
+import contextlib
 import sys
 import time
 import types
@@ -136,6 +137,7 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         fake_db.wallet_effect_claim_is_current = lambda *a, **kw: True
         fake_db.resolve_wallet_effect_claim = lambda *a, **kw: True
         fake_db.begin_wallet_effect_dispatch = lambda *a, **kw: object()
+        fake_db.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
         fake_db.complete_wallet_effect_dispatch = lambda *a, **kw: "SUBMITTED"
         fake_db.retain_wallet_effect_claim_for_reconciliation = lambda *a, **kw: True
         sys.modules["database"] = fake_db

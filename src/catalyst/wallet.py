@@ -1328,6 +1328,7 @@ def cancel_offers_batch(
     fee_mojos: int = None,
     skip_confirmation: bool = False,
 ):
+    del max_workers, skip_confirmation
     if type(trade_ids) is not list:
         return _blocked_offer_cancel_continuation(
             "OFFER_CANCEL_JOURNAL_REQUIRED",

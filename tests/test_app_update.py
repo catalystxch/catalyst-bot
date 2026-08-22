@@ -372,6 +372,8 @@ class TestAppUpdateApi(unittest.TestCase):
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
 
     def test_update_install_allows_running_bot_and_requests_post_update_restart(self):
+        from api_test_support import api_mutations_permitted
+
         class RunningBot:
             def is_running(self):
                 return True
@@ -379,6 +381,7 @@ class TestAppUpdateApi(unittest.TestCase):
         running_bot = RunningBot()
 
         with (
+            api_mutations_permitted(self.api_server),
             patch.object(self.api_server, "bot", running_bot),
             patch(
                 "app_update.start_update_install",

@@ -20,6 +20,9 @@ def _blocked_socket(*args, **kwargs):
     raise AssertionError("network access is forbidden in boost manager tests")
 
 
+_ORIGINAL_SOCKET_CONNECT = socket.socket.connect
+_ORIGINAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_ORIGINAL_CREATE_CONNECTION = socket.create_connection
 socket.socket.connect = _blocked_socket
 socket.socket.connect_ex = _blocked_socket
 socket.create_connection = _blocked_socket
@@ -38,6 +41,10 @@ try:
     _SKIP = None
 except ModuleNotFoundError as exc:
     _SKIP = str(exc)
+finally:
+    socket.socket.connect = _ORIGINAL_SOCKET_CONNECT
+    socket.socket.connect_ex = _ORIGINAL_SOCKET_CONNECT_EX
+    socket.create_connection = _ORIGINAL_CREATE_CONNECTION
 
 _SKIP_MSG = f"boost_manager unavailable: {_SKIP}"
 
@@ -668,8 +675,13 @@ class TestReplacementCancellationBoundary(unittest.TestCase):
         malformed.append({**canonical, "_catalyst_attempt": 0})
         malformed.append({**canonical, "_catalyst_idempotent_replay": True})
         malformed.append(HostileDict(canonical))
-        for result in malformed:
-            with self.subTest(result=result):
+        for case_index, result in enumerate(malformed):
+            # xdist must serialize subtest metadata back to the controller;
+            # never include the deliberately hostile mapping itself.
+            with self.subTest(
+                case_index=case_index,
+                result_type=type(result).__name__,
+            ):
                 offer_manager = _ReplacementOfferManager(
                     result,
                     intent_ids={trade_id: intent_id},

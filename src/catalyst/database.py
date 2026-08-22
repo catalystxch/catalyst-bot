@@ -15530,6 +15530,7 @@ def record_fill(
 
     Returns the fill_id of the new record, or -1 on error.
     """
+    del verification_status
     conn = None
     started_transaction = False
     nested_savepoint = False

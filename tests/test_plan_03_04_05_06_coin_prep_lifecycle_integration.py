@@ -76,6 +76,18 @@ class _TempDB(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._fresh_start_clear()
+        self._mutation_patches = (
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate, "enter_mutation", return_value="permit"
+            ),
+            patch.object(
+                api_server.mutation_gate, "exit_mutation", return_value=True
+            ),
+        )
+        for mutation_patch in self._mutation_patches:
+            mutation_patch.start()
+            self.addCleanup(mutation_patch.stop)
 
         self._orig_session_start_time = api_server._session_start_time
         self._orig_run_history_cutoff = api_server._run_history_cutoff

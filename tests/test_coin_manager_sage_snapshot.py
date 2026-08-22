@@ -1,4 +1,5 @@
 import importlib
+import contextlib
 import os
 import sys
 import types
@@ -51,6 +52,9 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
             _ for _ in ()
         ).throw(
             AssertionError("wallet snapshot refresh must not dispatch a wallet effect")
+        )
+        fake_database.wallet_effect_adapter_dispatch_authority = (
+            contextlib.nullcontext
         )
         fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
             _ for _ in ()

@@ -229,6 +229,13 @@ def _fail_closed_network_guard(monkeypatch):
 @pytest.fixture
 def isolated_database(tmp_path, monkeypatch):
     path = tmp_path / "task7.db"
+    original_upsert_coin = database.upsert_coin
+
+    def upsert_lifecycle_coin(*args, **kwargs):
+        kwargs.setdefault("purpose", "lifecycle")
+        return original_upsert_coin(*args, **kwargs)
+
+    monkeypatch.setattr(database, "upsert_coin", upsert_lifecycle_coin)
     database.close_connection()
     monkeypatch.setattr(database, "DB_PATH", str(path))
     monkeypatch.setattr(database, "_db_initialized_path", "")
@@ -285,6 +292,7 @@ def test_prepare_atomically_reserves_exact_selected_coin_and_replay_is_idempoten
             "reservation_identity": "intent:intent-a",
             "status": "reserved",
             "trade_id": None,
+            "purpose": "lifecycle",
         }
     ]
 
@@ -956,6 +964,7 @@ def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(
             "reservation_identity": f"intent:{intent['intent_id']}",
             "status": "bound",
             "trade_id": "3" * 64,
+            "purpose": "lifecycle",
         }
     ]
     events = database.get_offer_operation_events(begun[0]["operation_id"])

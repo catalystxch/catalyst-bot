@@ -61,6 +61,7 @@ def _seed_prepared_creation(*, coin_id="1" * 64, intent_id="intent-prepared"):
         1_000_000,
         designation="tier_spare",
         tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=intent_id,
@@ -312,7 +313,7 @@ def test_nonterminal_intent_without_exact_selected_coin_lock_blocks_restart(
 def test_claimed_publication_is_retained_as_restart_blocker(isolated_database):
     database.enqueue_publication_outbox(
         publication_id="publication-task10",
-        idempotency_key="publication-task10-key",
+        idempotency_key=f"mainnet:{'7' * 64}:task10-epoch",
         network="mainnet",
         offer_fingerprint="7" * 64,
         publication_epoch="task10-epoch",
@@ -639,6 +640,7 @@ def test_snapshot_blocks_complete_coin_and_publication_authority_gaps(
         1_000_000,
         designation="tier_spare",
         tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=source_intent_id,
@@ -763,7 +765,7 @@ def test_snapshot_blocks_complete_coin_and_publication_authority_gaps(
     conn.commit()
     database.enqueue_publication_outbox(
         publication_id="publication-malformed-queued",
-        idempotency_key="mainnet:task10-malformed:epoch-1",
+        idempotency_key=f"mainnet:{'d' * 64}:epoch-1",
         network="mainnet",
         offer_fingerprint="d" * 64,
         publication_epoch="epoch-1",

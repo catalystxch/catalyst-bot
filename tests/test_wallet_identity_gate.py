@@ -46,6 +46,15 @@ def _identity(**overrides):
     return values
 
 
+@pytest.fixture(autouse=True)
+def _wallet_effect_journal_authority(monkeypatch):
+    monkeypatch.setattr(
+        mutation_gate,
+        "wallet_mutation_permit_journal_authority",
+        lambda permit, operation: {"owner_run_id": "wallet-identity-gate"},
+    )
+
+
 @pytest.mark.parametrize(
     ("identity", "reason"),
     [
@@ -214,6 +223,7 @@ def test_exported_mutation_reads_identity_again_after_preflight(monkeypatch):
         "success": False,
         "error": "Wallet mutation blocked by identity safety check",
         "reason": "WALLET_IDENTITY_MISMATCH",
+        "_catalyst_effect_attempted": False,
     }
     assert checked == ["wallet:create_offer"]
     assert adapter_calls == []
@@ -448,6 +458,7 @@ def test_mutation_exceptions_preserve_stable_dict_and_release_permit(monkeypatch
         "success": False,
         "error": "Wallet mutation failed after authorization",
         "reason": "WALLET_MUTATION_FAILED",
+        "_catalyst_effect_attempted": True,
     }
     assert "private remote text" not in str(result)
     assert exits == ["permit"]
@@ -489,7 +500,10 @@ def test_exit_failure_never_raises_through_wallet_boundary(monkeypatch):
         lambda permit, operation: (_binding(), fake_adapter),
     )
 
-    assert wallet.send_transaction(1, 1, "xch1destination") == {"success": True}
+    assert wallet.send_transaction(1, 1, "xch1destination") == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
 
 
 def test_async_adapter_callback_is_not_returned_outside_permit(monkeypatch):
@@ -533,6 +547,7 @@ def test_async_adapter_callback_is_not_returned_outside_permit(monkeypatch):
 
     assert result["success"] is False
     assert result["reason"] == "WALLET_BACKEND_UNSUPPORTED"
+    assert result["_catalyst_effect_attempted"] is True
     assert closed == [True]
 
 
@@ -631,7 +646,7 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
 
     result = wallet.split_coins_bulk(1, 2, 100)
 
-    assert result == {"success": True}
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
     assert identity_calls == [True, True, True]
     assert authorization_calls == [
         "wallet:split_coins_bulk",

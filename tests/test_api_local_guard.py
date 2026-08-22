@@ -3,6 +3,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
     import sage_node
@@ -27,6 +29,7 @@ class TestApiLocalGuard(unittest.TestCase):
         api_server._SPLASH_RATE_LIMIT["hits"].clear()
         api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
         api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
+        permit_api_mutations(self, api_server)
 
     def test_root_sets_http_only_local_session_cookie_without_injecting_token(self):
         resp = self.client.get("/", environ_base=self.loopback)

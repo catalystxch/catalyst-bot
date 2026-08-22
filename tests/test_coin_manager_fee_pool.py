@@ -1,4 +1,5 @@
 import importlib
+import contextlib
 import os
 import sys
 import types
@@ -93,6 +94,9 @@ class CoinManagerFeePoolTests(unittest.TestCase):
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("fee classification must not retain a wallet effect")
             )
+        )
+        fake_database.wallet_effect_adapter_dispatch_authority = (
+            contextlib.nullcontext
         )
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: (
             _ for _ in ()

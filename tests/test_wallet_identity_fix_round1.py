@@ -57,6 +57,11 @@ def _authorize_wallet(monkeypatch, adapter, *, fingerprint: int = 123456):
         lambda permit, operation: (binding, adapter),
     )
     monkeypatch.setattr(
+        mutation_gate,
+        "wallet_mutation_permit_journal_authority",
+        lambda permit, operation: {"owner_run_id": "wallet-identity-round1"},
+    )
+    monkeypatch.setattr(
         wallet,
         "_identity_from_adapter",
         lambda received: {
@@ -131,6 +136,8 @@ def test_sage_nominal_reads_never_initialize(monkeypatch, read_call, expected):
 def test_sage_wallet_discovery_never_initializes(monkeypatch):
     """Wallet discovery is a read even when Sage has not been initialized."""
 
+    monkeypatch.setattr(wallet_sage, "_CAT_ASSET_ID", "")
+    monkeypatch.setattr(wallet_sage, "_wallet_id_to_asset_id", {})
     monkeypatch.setattr(
         wallet_sage,
         "ensure_initialized",
@@ -177,6 +184,7 @@ def test_explicit_sage_initialize_is_a_guarded_wallet_export(monkeypatch):
         "success": False,
         "error": "Wallet mutation blocked by identity safety check",
         "reason": "LEASE_LOST",
+        "_catalyst_effect_attempted": False,
     }
     assert adapter_calls == []
 
@@ -324,6 +332,7 @@ def test_sage_login_target_must_be_exact_frozen_fingerprint(monkeypatch, target)
         "WALLET_IDENTITY_MALFORMED",
         "WALLET_IDENTITY_MISMATCH",
     }
+    assert result["_catalyst_effect_attempted"] is False
     assert adapter_calls == []
 
 
@@ -343,7 +352,7 @@ def test_set_change_address_none_binds_frozen_fingerprint(monkeypatch):
 
     result = wallet.set_change_address("xch1safe", None)
 
-    assert result == {"success": True}
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
     assert adapter_calls == [("xch1safe", 123456)]
 
 
@@ -372,11 +381,14 @@ def test_generic_identity_switch_rpc_requires_exact_frozen_target(
 
     result = wallet.rpc(endpoint, payload)
 
-    assert result == {
+    expected = {
         "success": False,
         "error": "Wallet mutation blocked by identity safety check",
         "reason": reason,
     }
+    if type(payload) is dict:
+        expected["_catalyst_effect_attempted"] = False
+    assert result == expected
     assert adapter_calls == []
 
 
@@ -396,7 +408,7 @@ def test_matching_generic_login_rechecks_at_raw_rpc_effect(monkeypatch):
 
     result = wallet.rpc("login", {"fingerprint": 123456})
 
-    assert result == {"success": True}
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
     assert events == ["adapter", "effect"]
 
 
@@ -431,7 +443,7 @@ def test_generic_login_freezes_validated_target_across_identity_read(monkeypatch
 
     result = wallet.rpc("login", payload)
 
-    assert result == {"success": True}
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
     assert payload == {"fingerprint": 654321}
     assert adapter_calls[0][0:2] == ("login", {"fingerprint": 123456})
     assert adapter_calls[0][2] is not payload
@@ -514,6 +526,7 @@ def test_sage_login_requires_exact_resync_flag(monkeypatch, force_resync):
 
     assert result["success"] is False
     assert result["reason"] == "WALLET_IDENTITY_MALFORMED"
+    assert result["_catalyst_effect_attempted"] is False
     assert adapter_calls == []
 
 

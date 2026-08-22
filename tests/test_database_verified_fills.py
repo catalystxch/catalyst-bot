@@ -62,6 +62,7 @@ def _authoritatively_terminalize_offer(
             "xch" if offer["side"] == "buy" else "cat",
             offered_atomic,
             tier=offer.get("tier") or "unknown",
+            purpose="lifecycle",
         )
     wallet_identity = {
         "wallet_fingerprint_hash": _TEST_WALLET,
@@ -336,7 +337,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
     def test_stats_deduplicate_verified_fills_for_reused_source_coin(self):
         asset_id = "asset-requote-stats"
-        coin_id = "0xcoin-reused-stats"
+        coin_id = hashlib.sha256(b"coin-reused-stats").hexdigest()
 
         for trade_id in ("trade-old", "trade-new"):
             database.add_offer(
@@ -349,52 +350,27 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            _authoritatively_terminalize_offer(trade_id)
+        _authoritatively_terminalize_offer(
+            "trade-old", selected_coin_ids=[coin_id]
+        )
+        with self.assertRaisesRegex(
+            ValueError, "authoritative terminal coin outcome"
+        ):
+            _authoritatively_terminalize_offer(
+                "trade-new", selected_coin_ids=[coin_id]
+            )
 
         stats = database.get_stats(asset_id)
 
-        self.assertEqual(stats["raw_total_fills"], 2)
-        self.assertEqual(stats["duplicate_fill_rows"], 1)
+        self.assertEqual(stats["raw_total_fills"], 1)
+        self.assertEqual(stats["duplicate_fill_rows"], 0)
         self.assertEqual(stats["total_fills"], 1)
         self.assertEqual(stats["sell_fills"], 1)
         self.assertEqual(stats["volume_xch"], "0.1")
 
     def test_status_text_cannot_override_source_coin_authority_deduplication(self):
         asset_id = "asset-requote-exact-stats"
-        coin_id = "0xcoin-reused-exact-stats"
-
-        for trade_id, status in (
-            ("trade-old", "verified"),
-            ("trade-new", "verified_exact"),
-        ):
-            database.add_offer(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-                coin_id=coin_id,
-            )
-            result = _authoritatively_terminalize_offer(trade_id)
-            database.get_connection().execute(
-                "UPDATE fills SET verification_status=? WHERE fill_id=?",
-                (status, result["fill_id"]),
-            )
-            database.get_connection().commit()
-
-        stats = database.get_stats(asset_id)
-
-        self.assertEqual(stats["raw_total_fills"], 2)
-        self.assertEqual(stats["duplicate_fill_rows"], 1)
-        self.assertEqual(stats["total_fills"], 1)
-        self.assertEqual(stats["sell_fills"], 1)
-        self.assertEqual(stats["volume_xch"], "0.1")
-
-    def test_unmatched_fills_deduplicate_verified_fills_for_reused_source_coin(self):
-        asset_id = "asset-requote-unmatched"
-        coin_id = "0xcoin-reused-unmatched"
+        coin_id = hashlib.sha256(b"coin-reused-exact-stats").hexdigest()
 
         for trade_id in ("trade-old", "trade-new"):
             database.add_offer(
@@ -407,12 +383,58 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            _authoritatively_terminalize_offer(trade_id)
+        result = _authoritatively_terminalize_offer(
+            "trade-old", selected_coin_ids=[coin_id]
+        )
+        database.get_connection().execute(
+            "UPDATE fills SET verification_status=? WHERE fill_id=?",
+            ("verified_exact", result["fill_id"]),
+        )
+        database.get_connection().commit()
+        with self.assertRaisesRegex(
+            ValueError, "authoritative terminal coin outcome"
+        ):
+            _authoritatively_terminalize_offer(
+                "trade-new", selected_coin_ids=[coin_id]
+            )
+
+        stats = database.get_stats(asset_id)
+
+        self.assertEqual(stats["raw_total_fills"], 1)
+        self.assertEqual(stats["duplicate_fill_rows"], 0)
+        self.assertEqual(stats["total_fills"], 1)
+        self.assertEqual(stats["sell_fills"], 1)
+        self.assertEqual(stats["volume_xch"], "0.1")
+
+    def test_unmatched_fills_deduplicate_verified_fills_for_reused_source_coin(self):
+        asset_id = "asset-requote-unmatched"
+        coin_id = hashlib.sha256(b"coin-reused-unmatched").hexdigest()
+
+        for trade_id in ("trade-old", "trade-new"):
+            database.add_offer(
+                trade_id=trade_id,
+                side="sell",
+                price_xch=Decimal("0.001"),
+                size_xch=Decimal("0.1"),
+                size_cat=Decimal("100"),
+                cat_asset_id=asset_id,
+                tier="inner",
+                coin_id=coin_id,
+            )
+        _authoritatively_terminalize_offer(
+            "trade-old", selected_coin_ids=[coin_id]
+        )
+        with self.assertRaisesRegex(
+            ValueError, "authoritative terminal coin outcome"
+        ):
+            _authoritatively_terminalize_offer(
+                "trade-new", selected_coin_ids=[coin_id]
+            )
 
         unmatched = database.get_unmatched_fills(asset_id, "sell")
 
         self.assertEqual(len(unmatched), 1)
-        self.assertEqual(unmatched[0]["trade_id"], "trade-new")
+        self.assertEqual(unmatched[0]["trade_id"], "trade-old")
 
     def test_fill_and_expiry_update_all_locked_coins_for_trade(self):
         conn = database.get_connection()

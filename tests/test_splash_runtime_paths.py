@@ -57,7 +57,7 @@ def test_splash_download_refuses_release_without_checksum(monkeypatch):
         requested_urls.append(url)
         raise AssertionError("binary download should not start without checksum")
 
-    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get, raising=False)
 
     result = splash_setup.download_splash()
 

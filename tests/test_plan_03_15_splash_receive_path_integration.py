@@ -66,6 +66,18 @@ class _TempDB(unittest.TestCase):
         api_server._SPLASH_RATE_LIMIT["hits"].clear()
         api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
         api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
+        self._mutation_patches = (
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate, "enter_mutation", return_value="permit"
+            ),
+            patch.object(
+                api_server.mutation_gate, "exit_mutation", return_value=True
+            ),
+        )
+        for mutation_patch in self._mutation_patches:
+            mutation_patch.start()
+            self.addCleanup(mutation_patch.stop)
 
     def tearDown(self):
         if hasattr(_db._local, "conn") and _db._local.conn:

@@ -185,6 +185,10 @@ def _build_env(
             "BOT_LOCAL_WRITE_TOKEN": local_token,
             "_CATALYST_PRESERVE_PROCESS_ENV": "1",
             "PYTHONIOENCODING": "utf-8",
+            "SAGE_FINGERPRINT": "123456789",
+            "WALLET_EXPECTED_NAME": "Packaged Smoke Sage",
+            "WALLET_EXPECTED_KEY_KIND": "bls",
+            "CATALYST_NETWORK_ID": "mainnet",
             # Keep the smoke deterministic when no user .env exists.
             "CAT_ASSET_ID": "0" * 64,
             "CAT_NAME": "Packaged Smoke Token",

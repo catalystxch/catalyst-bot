@@ -13,12 +13,33 @@ import pytest
 _SOCKET_ATTEMPTS = []
 
 
+@pytest.fixture(autouse=True)
+def _complete_requests_test_interface(monkeypatch):
+    """Normalize legacy import stubs without enabling real network access."""
+
+    def unexpected_post(*_args, **_kwargs):
+        raise AssertionError("publication transport must be explicitly mocked")
+
+    for module in (dexie_manager, splash_manager):
+        monkeypatch.setattr(module.requests, "post", unexpected_post, raising=False)
+        monkeypatch.setattr(module.requests, "Timeout", TimeoutError, raising=False)
+        monkeypatch.setattr(
+            module.requests,
+            "ConnectionError",
+            ConnectionError,
+            raising=False,
+        )
+
+
 def _block_socket(*args, **kwargs):
     _SOCKET_ATTEMPTS.append((args, kwargs))
     raise AssertionError("publication outbox tests prohibit network access")
 
 
 # Install the network tripwire before importing any CATalyst module.
+_ORIGINAL_SOCKET_CONNECT = socket.socket.connect
+_ORIGINAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_ORIGINAL_CREATE_CONNECTION = socket.create_connection
 socket.socket.connect = _block_socket
 socket.socket.connect_ex = _block_socket
 socket.create_connection = _block_socket
@@ -28,18 +49,23 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "catalyst")),
 )
 
-from publication_outbox import (  # noqa: E402
-    PublicationState,
-    canonical_publication_identity,
-    deterministic_retry_delay,
-    redact_publication_evidence,
-    transition_publication,
-)
-import publication_outbox as publication_policy  # noqa: E402
-import database  # noqa: E402
-import bot_loop  # noqa: E402
-import dexie_manager  # noqa: E402
-import splash_manager  # noqa: E402
+try:
+    from publication_outbox import (  # noqa: E402
+        PublicationState,
+        canonical_publication_identity,
+        deterministic_retry_delay,
+        redact_publication_evidence,
+        transition_publication,
+    )
+    import publication_outbox as publication_policy  # noqa: E402
+    import database  # noqa: E402
+    import bot_loop  # noqa: E402
+    import dexie_manager  # noqa: E402
+    import splash_manager  # noqa: E402
+finally:
+    socket.socket.connect = _ORIGINAL_SOCKET_CONNECT
+    socket.socket.connect_ex = _ORIGINAL_SOCKET_CONNECT_EX
+    socket.create_connection = _ORIGINAL_CREATE_CONNECTION
 
 
 def _sha(value: str) -> str:
@@ -138,8 +164,11 @@ def _claim(db, publisher="dexie", *, owner="worker-a", token="claim-a", at=LATER
 
 
 @pytest.fixture(autouse=True)
-def _zero_socket_attempts():
+def _zero_socket_attempts(monkeypatch):
     before = len(_SOCKET_ATTEMPTS)
+    monkeypatch.setattr(socket.socket, "connect", _block_socket)
+    monkeypatch.setattr(socket.socket, "connect_ex", _block_socket)
+    monkeypatch.setattr(socket, "create_connection", _block_socket)
     yield
     assert len(_SOCKET_ATTEMPTS) == before
 

@@ -481,6 +481,7 @@ class TestDiskFull(unittest.TestCase):
         import database as db
 
         mock_conn = MagicMock()
+        mock_conn.in_transaction = False
         mock_conn.execute.return_value.fetchone.return_value = None
         mock_conn.commit.side_effect = self._disk_full()
 
@@ -503,6 +504,7 @@ class TestDiskFull(unittest.TestCase):
         import database as db
 
         mock_conn = MagicMock()
+        mock_conn.in_transaction = False
         mock_conn.execute.return_value.fetchone.return_value = None
         mock_conn.commit.side_effect = self._disk_full()
 

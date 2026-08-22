@@ -3269,7 +3269,6 @@ class CoinManager:
                         get_free_coins,
                         get_locked_coins,
                         mark_coins_gone,
-                        free_coin,
                         upsert_coin,
                         get_open_offers,
                     )
@@ -3621,57 +3620,6 @@ class CoinManager:
                 "disabled pending Task 12.",
             )
             return False
-            # Chia CLI split (reliable — broadcasts to network every time)
-            # NOTE: CLI `-a` takes DISPLAY UNITS (XCH or CAT tokens), NOT mojos.
-            bare_coin_id = coin_id.replace("0x", "")
-
-            # Lazy-resolve fingerprint if it was empty at init time
-            if not self._fingerprint or not self._fingerprint.strip():
-                self._fingerprint = self._resolve_fingerprint()
-
-            cmd = [
-                "chia",
-                "wallet",
-                "coins",
-                "split",
-                "-f",
-                self._fingerprint,
-                "-i",
-                str(wallet_id),
-                "-n",
-                str(num_coins),
-                "-a",
-                str(coin_size),
-                "-t",
-                bare_coin_id,
-                "-m",
-                "0",
-            ]
-
-            try:
-                import subprocess as sp
-
-                process = sp.Popen(
-                    cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True
-                )
-                stdout, stderr = process.communicate(input="y\n", timeout=60)
-                output = stdout + stderr
-
-                if "submitted to" in output.lower() or "transaction" in output.lower():
-                    log_event(
-                        "info", f"split_cli_{name}", "CLI split submitted successfully"
-                    )
-                else:
-                    log_event(
-                        "warning",
-                        f"split_cli_{name}_fail",
-                        f"CLI split failed: {output[:200]}",
-                    )
-                    return False
-
-            except Exception as e:
-                log_event("warning", f"split_cli_{name}_error", f"CLI split error: {e}")
-                return False
 
         # --- Wait for confirmation via coin count polling ---
         expected_count = start_count + num_coins

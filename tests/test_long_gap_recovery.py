@@ -20,12 +20,20 @@ def _blocked_socket(*args, **kwargs):
     raise AssertionError("long-gap recovery tests prohibit network access")
 
 
+_ORIGINAL_SOCKET_CONNECT = socket.socket.connect
+_ORIGINAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_ORIGINAL_CREATE_CONNECTION = socket.create_connection
 socket.socket.connect = _blocked_socket
 socket.socket.connect_ex = _blocked_socket
 socket.create_connection = _blocked_socket
 
-import database  # noqa: E402
-import mutation_gate  # noqa: E402
+try:
+    import database  # noqa: E402
+    import mutation_gate  # noqa: E402
+finally:
+    socket.socket.connect = _ORIGINAL_SOCKET_CONNECT
+    socket.socket.connect_ex = _ORIGINAL_SOCKET_CONNECT_EX
+    socket.create_connection = _ORIGINAL_CREATE_CONNECTION
 
 
 UTC = timezone.utc
@@ -34,9 +42,20 @@ WALLET_HASH = "f" * 64
 NETWORK = "mainnet"
 
 
+def _future_lease_expiry() -> str:
+    return (
+        (datetime.now(timezone.utc) + timedelta(days=1))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 @pytest.fixture(autouse=True)
-def no_network_attempts():
+def no_network_attempts(monkeypatch):
     before = len(_SOCKET_ATTEMPTS)
+    monkeypatch.setattr(socket.socket, "connect", _blocked_socket)
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked_socket)
+    monkeypatch.setattr(socket, "create_connection", _blocked_socket)
     yield
     assert len(_SOCKET_ATTEMPTS) == before
 
@@ -67,7 +86,7 @@ def _acquire_runtime_lease(db, *, owner="run-gap"):
         wallet_fingerprint_hash=WALLET_HASH,
         network=NETWORK,
         now="2026-08-21T12:00:00.000000Z",
-        lease_expires_at="2026-08-21T23:59:00.000000Z",
+        lease_expires_at=_future_lease_expiry(),
     )
     assert result["acquired"] is True
     return result["lease"]
@@ -906,7 +925,7 @@ def test_recovery_epoch_accepts_monotonic_heartbeat_renewal_for_every_transition
         owner_run_id="run-gap",
         expected_lease_version=lease["lease_version"],
         heartbeat_at="2026-08-21T12:01:00.000000Z",
-        lease_expires_at="2026-08-22T23:59:00.000000Z",
+        lease_expires_at=_future_lease_expiry(),
     )
 
     assert heartbeat["heartbeat"] is True
@@ -1006,7 +1025,7 @@ def test_recovery_epoch_rejects_same_owner_release_and_reacquire_aba(
         wallet_fingerprint_hash=WALLET_HASH,
         network=NETWORK,
         now="2026-08-21T12:03:00.000000Z",
-        lease_expires_at="2026-08-22T23:59:00.000000Z",
+        lease_expires_at=_future_lease_expiry(),
     )
 
     assert released["released"] is True

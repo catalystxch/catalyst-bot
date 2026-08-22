@@ -4766,6 +4766,7 @@ def cancel_offers_batch(
 
     Returns dict of {trade_id: {"success": bool, ...}}.
     """
+    del max_workers, skip_confirmation
     results = {}
     if not trade_ids:
         return results

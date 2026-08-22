@@ -278,6 +278,7 @@ def _seed_task7_created_offer(
         1_000,
         designation="tier_spare",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=intent_id,

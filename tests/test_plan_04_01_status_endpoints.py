@@ -369,6 +369,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
                 patch("database.get_events_since", return_value=[]),
                 patch("database.get_coin_summary", return_value={}),
                 patch("database.get_offer_lifecycle_summary", return_value={}),
+                patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
             ):
                 resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
         finally:

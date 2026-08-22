@@ -33,6 +33,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from api_test_support import permit_api_mutations
+
 try:
     import database as _db
     import api_server
@@ -74,6 +76,7 @@ class _TempDB(unittest.TestCase):
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
         api_server._fresh_start_clear()
 
         self._orig_session_start_time = api_server._session_start_time

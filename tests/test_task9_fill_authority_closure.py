@@ -105,6 +105,33 @@ def _canonical_digest(value: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _task12_split_prep_contract(source_coin_id: str) -> dict:
+    return {
+        "operation_kind": "split",
+        "purpose": "operator_recovery",
+        "target_contract": {
+            "wallet_type": "xch",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 199_999,
+                    "purpose": "operator_recovery",
+                }
+            ],
+        },
+        "pre_view_coin_ids": [source_coin_id],
+    }
+
+
+def _bind_task12_worker_identity(worker, runtime) -> None:
+    import mutation_gate
+
+    identity = mutation_gate.wallet_identity_binding_payload(
+        runtime.wallet_identity_binding
+    )
+    worker._current_coin_prep_wallet_identity = lambda: identity
+
+
 def _wallet_effect_result_marker(claim_token: str, *, attempted: bool) -> dict:
     row = (
         database.get_connection()
@@ -195,6 +222,7 @@ def _seed_authoritative_fill(
         offered_amount_atomic,
         designation="tier_spare",
         tier=tier,
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=intent_id,
@@ -1008,7 +1036,9 @@ def test_authority_projections_are_indexed_and_migration_is_hard_bounded(
     detail = " ".join(str(row["detail"]) for row in plan)
     assert "idx_offer_reconciliation_coin_outcomes_permanent" in detail
     assert "idx_wallet_effect_claim_coins_coin" in detail
-    assert "VIRTUAL TABLE" not in detail
+    assert "idx_coin_prep_operations_recovery" in detail
+    assert detail.count("VIRTUAL TABLE") == 1
+    assert "SCAN prep_source VIRTUAL TABLE INDEX 1:" in detail
     assert database._MAX_FILL_AUTHORITY_CLOSURE_ROWS == 4096
     source = inspect.getsource(database._migrate_fill_authority_closure)
     assert source.count("_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1") >= 2
@@ -2232,7 +2262,8 @@ def test_worker_denies_auto_selected_source_and_fee_inputs(
 
     source_coin_id = hashlib.sha256(b"explicit-worker-source").hexdigest()
     assert database.upsert_coin(
-        source_coin_id, "xch", 200_000, designation="reserve", tier="none"
+        source_coin_id, "xch", 200_000, designation="reserve", tier="none",
+        purpose="lifecycle",
     )
     calls: list[str] = []
     worker = object.__new__(coin_prep_worker.CoinPrepWorker)
@@ -2274,11 +2305,35 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     monkeypatch,
 ):
     import coin_prep_worker
+    import replacement_capacity
 
     source_coin_ids = [
         hashlib.sha256(b"worker-combine-source-one").hexdigest(),
         hashlib.sha256(b"worker-combine-source-two").hexdigest(),
     ]
+    target_contract = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": 0,
+                "amount_mojos": 399_999,
+                "purpose": "top_up",
+            }
+        ],
+    }
+    prep_contract = {
+        "operation_kind": "combine",
+        "purpose": "top_up",
+        "target_contract": target_contract,
+        "pre_view_coin_ids": source_coin_ids,
+    }
+    canonical_prep = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="combine",
+        purpose="top_up",
+        source_coin_ids=source_coin_ids,
+        target_contract=target_contract,
+    )
+    wallet_identity = {"backend": "sage", "fingerprint": 161616161}
     for coin_id in source_coin_ids:
         assert database.upsert_coin(
             coin_id, "xch", 200_000, designation="reserve", tier="none"
@@ -2306,11 +2361,37 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     monkeypatch.setattr(
         coin_prep_worker,
         "complete_wallet_effect_dispatch",
-        lambda capability, **_kwargs: capability is dispatch,
+        lambda capability, **_kwargs: "SUBMITTED" if capability is dispatch else None,
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "prepare_coin_prep_operation",
+        lambda **_kwargs: {
+            "operation": {
+                "operation_id": canonical_prep["operation_id"],
+                "source_coin_ids_json": json.dumps(source_coin_ids),
+                "wallet_identity_json": json.dumps(wallet_identity),
+                "effect_claim_token": "b" * 64,
+                "effect_claim_generation": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "record_coin_prep_operation_outcome",
+        lambda operation_id, **kwargs: {
+            "operation": {"operation_id": operation_id, **kwargs}
+        },
     )
     worker = object.__new__(coin_prep_worker.CoinPrepWorker)
     worker._is_subprocess = False
     worker.log = lambda _message: None
+    worker._current_coin_prep_wallet_identity = lambda: wallet_identity
+    worker._observe_coin_prep_post_effect = lambda _operation: {
+        "expected_outputs": [],
+        "authoritative_view": {},
+    }
+    worker._verify_authoritative_post_operation_view = lambda **_kwargs: True
     calls: list[tuple[list[str], int]] = []
 
     subset = worker._call_wallet_mutation(
@@ -2319,6 +2400,7 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
         coin_ids=source_coin_ids,
         fee_mojos=1,
         _authority_fee_coin_ids=source_coin_ids[:1],
+        _prep_contract=prep_contract,
     )
     exact = worker._call_wallet_mutation(
         "coin_prep.combine",
@@ -2328,6 +2410,7 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
         coin_ids=source_coin_ids,
         fee_mojos=1,
         _authority_fee_coin_ids=source_coin_ids,
+        _prep_contract=prep_contract,
     )
 
     assert subset is None
@@ -2335,7 +2418,7 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     assert calls == [(source_coin_ids, 1)]
     assert claims == [
         {
-            "operation_id": "coin_prep.combine",
+            "operation_id": canonical_prep["operation_id"],
             "source_coin_ids": source_coin_ids,
             "fee_coin_ids": source_coin_ids,
         }
@@ -2431,6 +2514,12 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
     worker.log = lambda _message: None
     task4_denied: list[bool] = []
     runtime, _clock, wallet_hash = active_wallet_effect_runtime
+    _bind_task12_worker_identity(worker, runtime)
+    worker._observe_coin_prep_post_effect = lambda _operation: {
+        "expected_outputs": [],
+        "authoritative_view": {},
+    }
+    worker._verify_authoritative_post_operation_view = lambda **_kwargs: True
 
     def effect(**_kwargs):
         try:
@@ -2473,6 +2562,7 @@ def test_wallet_effect_claim_blocks_interleaved_task4_prepare(
         effect,
         target_coin_id=source_coin_id,
         fee_mojos=0,
+        _prep_contract=_task12_split_prep_contract(source_coin_id),
     )
 
     assert result["success"] is True
@@ -2536,7 +2626,8 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
     worker = object.__new__(coin_prep_worker.CoinPrepWorker)
     worker._is_subprocess = False
     worker.log = lambda _message: None
-    _runtime, _clock, wallet_hash = active_wallet_effect_runtime
+    runtime, _clock, wallet_hash = active_wallet_effect_runtime
+    _bind_task12_worker_identity(worker, runtime)
 
     with pytest.raises(SystemExit):
         worker._call_wallet_mutation(
@@ -2544,6 +2635,7 @@ def test_unresolved_wallet_effect_claim_survives_restart_and_fences_task4(
             lambda **_kwargs: (_ for _ in ()).throw(SystemExit("crash boundary")),
             target_coin_id=source_coin_id,
             fee_mojos=0,
+            _prep_contract=_task12_split_prep_contract(source_coin_id),
         )
 
     import mutation_gate
@@ -2738,7 +2830,9 @@ def test_raw_sqlite_without_authority_helpers_cannot_insert_forged_journal(
     isolated_database,
 ):
     selected_coin_id = hashlib.sha256(b"raw-journal-source").hexdigest()
-    assert database.upsert_coin(selected_coin_id, "xch", 1000, tier="inner")
+    assert database.upsert_coin(
+        selected_coin_id, "xch", 1000, tier="inner", purpose="lifecycle"
+    )
     database.prepare_offer_intent(
         intent_id="raw-journal-intent",
         operation_id="create:raw-journal-intent",
@@ -3323,7 +3417,9 @@ def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
     source_coin_id = hashlib.sha256(
         f"dispatch-fence:{boundary}:{authority_change}".encode()
     ).hexdigest()
-    assert database.upsert_coin(source_coin_id, "xch", 200_000, tier="none")
+    assert database.upsert_coin(
+        source_coin_id, "xch", 200_000, tier="none", purpose="lifecycle"
+    )
     task4_denials: list[str] = []
 
     def prepare_after_dispatch(suffix: str) -> bool:
@@ -3389,14 +3485,22 @@ def test_wallet_dispatch_fences_task4_until_exact_runtime_outcome(
         worker = object.__new__(coin_prep_worker.CoinPrepWorker)
         worker._is_subprocess = False
         worker.log = lambda _message: None
+        _bind_task12_worker_identity(worker, runtime)
         result = worker._call_wallet_mutation(
             "coin_prep.split_single_sage",
             adapter_result,
             target_coin_id=source_coin_id,
             fee_mojos=0,
+            _prep_contract=_task12_split_prep_contract(source_coin_id),
         )
 
-    assert result["_catalyst_effect_attempted"] is False
+    if boundary == "coin_manager":
+        assert result["_catalyst_effect_attempted"] is False
+    elif authority_change == "heartbeat":
+        assert result is None
+    else:
+        assert isinstance(result, coin_prep_worker.CoinPrepSubmittedUnknown)
+        assert result.dispatch_outcome == "UNKNOWN"
     outcome = (
         database.get_connection()
         .execute("SELECT outcome FROM wallet_effect_claim_resolutions")

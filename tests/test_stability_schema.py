@@ -312,6 +312,7 @@ def test_prior_task9_schema_backfills_exact_terminal_coin_outcome_once(
         tier="inner",
         designation="tier_active",
         assigned_tier="inner",
+        purpose="lifecycle",
     )
     database.prepare_offer_intent(
         intent_id=intent_id,
@@ -1431,7 +1432,9 @@ def test_migration_normalizes_existing_mutable_stability_timestamps(
     _prepare_intent("intent-legacy-time")
     database.enqueue_publication_outbox(
         publication_id="publication-legacy-time",
-        idempotency_key="publish:legacy-time",
+        idempotency_key=(
+            f"mainnet:{_sha('offer-legacy-time')}:epoch-legacy-time"
+        ),
         intent_id="intent-legacy-time",
         network="mainnet",
         offer_fingerprint=_sha("offer-legacy-time"),
@@ -2261,25 +2264,26 @@ def test_finalize_exact_replay_includes_publication_and_child_identity(
 ):
     database.init_database()
     _prepare_intent()
+    publication_identity = f"mainnet:{_sha('offer:intent-1')}:7"
     first = _finalize_intent(
-        publication_identity="publication:1",
+        publication_identity=publication_identity,
         child_intent_id="intent-child-1",
     )
 
     replay = _finalize_intent(
-        publication_identity="publication:1",
+        publication_identity=publication_identity,
         child_intent_id="intent-child-1",
     )
     assert replay == first
 
     with pytest.raises(ValueError, match="different intent state"):
         _finalize_intent(
-            publication_identity="publication:other",
+            publication_identity=publication_identity,
             child_intent_id="intent-child-other",
         )
 
     persisted = database.get_offer_intent("intent-1")
-    assert persisted["publication_identity"] == "publication:1"
+    assert persisted["publication_identity"] == publication_identity
     assert persisted["child_intent_id"] == "intent-child-1"
     assert len(database.get_offer_operation_events("create:intent-1")) == 2
 
@@ -2343,7 +2347,7 @@ def test_terminal_failure_releases_slot_until_replacement_becomes_active(
     )
 
     replacement = _prepare_intent("intent-failed-b")
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(ValueError, match="selected coin is not free"):
         _prepare_intent("intent-next-generation", generation=8)
 
     assert replacement["lifecycle_state"] == "prepared"
@@ -3155,9 +3159,10 @@ def test_publication_outbox_enforces_exact_idempotency_and_valid_json(
     isolated_database,
 ):
     database.init_database()
+    identity_key = f"mainnet:{_sha('offer-a')}:epoch-1"
     queued = database.enqueue_publication_outbox(
         publication_id="publication-1",
-        idempotency_key="mainnet:offer-a:epoch-1",
+        idempotency_key=identity_key,
         intent_id="intent-not-yet-required",
         network="mainnet",
         offer_fingerprint=_sha("offer-a"),
@@ -3171,7 +3176,7 @@ def test_publication_outbox_enforces_exact_idempotency_and_valid_json(
 
     repeated = database.enqueue_publication_outbox(
         publication_id="publication-1",
-        idempotency_key="mainnet:offer-a:epoch-1",
+        idempotency_key=identity_key,
         intent_id="intent-not-yet-required",
         network="mainnet",
         offer_fingerprint=_sha("offer-a"),
@@ -3186,7 +3191,7 @@ def test_publication_outbox_enforces_exact_idempotency_and_valid_json(
 
     restarted_retry = database.enqueue_publication_outbox(
         publication_id="publication-new-local-id",
-        idempotency_key="mainnet:offer-a:epoch-1",
+        idempotency_key=identity_key,
         intent_id="intent-not-yet-required",
         network="mainnet",
         offer_fingerprint=_sha("offer-a"),
@@ -3214,7 +3219,7 @@ def test_publication_outbox_enforces_exact_idempotency_and_valid_json(
     with pytest.raises(ValueError, match="JSON"):
         database.enqueue_publication_outbox(
             publication_id="publication-invalid",
-            idempotency_key="mainnet:invalid:epoch-1",
+            idempotency_key=f"mainnet:{_sha('offer-invalid')}:epoch-1",
             network="mainnet",
             offer_fingerprint=_sha("offer-invalid"),
             publication_epoch="epoch-1",

@@ -66,6 +66,12 @@ class _FlaskBase(unittest.TestCase):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
+        self._fiat_price_patcher = patch(
+            "market_data_collector.get_cached_xch_usd_price",
+            return_value=None,
+        )
+        self._fiat_price_patcher.start()
+        self.addCleanup(self._fiat_price_patcher.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()

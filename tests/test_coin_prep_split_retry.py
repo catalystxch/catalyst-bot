@@ -197,7 +197,7 @@ class TestCoinPrepSplitRetry(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("sage_topup_split", source)
         self.assertIn("if is_cat:", source)
-        self.assertIn("amount_per_coin = pool_mojos // count", source)
+        self.assertIn("pool_mojos // count", source)
 
     def test_fee_paid_cat_splits_wait_for_fee_inputs(self):
         self.assertTrue(

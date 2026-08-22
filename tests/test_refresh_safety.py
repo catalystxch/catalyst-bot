@@ -305,7 +305,7 @@ def test_real_task8_task9_completion_replays_one_exact_lineage_commit(isolated_d
     spend_identity = f"sha256:{_sha('spend:parent-cancel')}"
     assert database.upsert_coin(
         parent_coin, "xch", 100, tier="inner",
-        designation="tier_active", assigned_tier="inner",
+        designation="tier_active", assigned_tier="inner", purpose="lifecycle",
     )
     _prepare("parent", reserve_selected_coins=True)
     _confirm("parent", finalize_selected_coin_reservations=True)

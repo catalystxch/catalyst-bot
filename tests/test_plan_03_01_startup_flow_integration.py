@@ -78,6 +78,19 @@ class _TempDB(unittest.TestCase):
         _db._local.conn = None
         _db.init_database()
 
+        self._mutation_patches = (
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate, "enter_mutation", return_value="permit"
+            ),
+            patch.object(
+                api_server.mutation_gate, "exit_mutation", return_value=True
+            ),
+        )
+        for mutation_patch in self._mutation_patches:
+            mutation_patch.start()
+            self.addCleanup(mutation_patch.stop)
+
         # Isolate the fresh-start flag to a per-test path. The default
         # path is a fixed file under src/catalyst/, which is shared
         # across pytest-xdist workers and causes cross-worker races
@@ -238,11 +251,15 @@ class TestStartupPhase2SessionMode(_TempDB):
     def test_fresh_start_returns_success(self):
         self.assertTrue(self._fresh_start().get_json().get("success"))
 
-    def test_fresh_start_clears_fills(self):
-        """Fresh-start path deletes all fills — user chose to start over."""
+    def test_fresh_start_refuses_to_clear_authoritative_fills(self):
+        """Fresh-start cannot erase durable fill authority."""
         self._seed_fill()
-        self._fresh_start()
-        self.assertEqual(self._fill_count(), 0)
+        response = self._fresh_start()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.get_json().get("error"), "authoritative_state_conflict"
+        )
+        self.assertEqual(self._fill_count(), 1)
 
     def test_fresh_start_sets_session_flag(self):
         """After fresh-start, the flag prevents re-showing the resume modal."""
@@ -371,6 +388,12 @@ class TestStartupPhase5DashboardLoad(_TempDB):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": False, "synced": False},
             ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value={"enabled": False, "tier": "free", "has_data": False},
+            ),
+            patch("market_data_collector.get_cached_xch_usd_price", return_value={}),
         ):
             return self.client.get("/api/dashboard", environ_base=_LOOPBACK)
 

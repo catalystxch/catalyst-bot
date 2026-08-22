@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from api_test_support import api_mutations_permitted
+
 
 ROOT = Path(__file__).resolve().parents[1]
 GUI = ROOT / "bot_gui.html"
@@ -113,6 +115,7 @@ def test_setup_config_save_while_running_is_deferred_to_restart():
     fake_cfg.MAX_ACTIVE_SELL_OFFERS = 1
 
     with (
+        api_mutations_permitted(api_server),
         patch.object(api_server, "bot", fake_bot),
         patch.object(api_server, "cfg", fake_cfg),
     ):
@@ -150,6 +153,7 @@ def test_setup_save_while_running_allows_unchanged_liquidity_mode():
     fake_cfg.MAX_ACTIVE_SELL_OFFERS = 1
 
     with (
+        api_mutations_permitted(api_server),
         patch.object(api_server, "bot", fake_bot),
         patch.object(api_server, "cfg", fake_cfg),
     ):
@@ -197,6 +201,7 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     )
 
     with (
+        api_mutations_permitted(api_server),
         patch.object(api_server, "bot", fake_bot),
         patch.object(api_server, "cfg", fake_cfg),
         patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),

@@ -17,6 +17,8 @@ import unittest
 import tempfile
 from unittest.mock import patch
 
+from api_test_support import permit_api_mutations
+
 
 def _get_api_server():
     """Import (or return cached) api_server, handling stub contamination."""
@@ -63,6 +65,7 @@ class SessionManagementTests(unittest.TestCase):
         _api_server.app.testing = True
         self._client = _api_server.app.test_client()
         self._loopback = {"REMOTE_ADDR": "127.0.0.1"}
+        permit_api_mutations(self, _api_server)
 
     def tearDown(self):
         # Clean up the temp flag file if it was created
@@ -81,7 +84,11 @@ class SessionManagementTests(unittest.TestCase):
         """Calling /api/session/fresh-start must create the flag file on disk."""
         with (
             patch.object(_api_server, "_FRESH_START_FLAG", self._flag_path),
-            patch.object(_api_server, "_reset_fresh_run_session", return_value={}),
+            patch.object(
+                _api_server,
+                "_reset_fresh_run_session",
+                return_value={"success": True},
+            ),
         ):
             resp = self._client.post(
                 "/api/session/fresh-start",

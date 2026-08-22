@@ -1182,7 +1182,10 @@ def test_owner_wallet_effect_cannot_cross_runtime_generation_aba(
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle_results == [
         {"released": False, "reason": "active_wallet_mutations"}
@@ -1207,7 +1210,10 @@ def test_owner_wallet_effect_cannot_cross_runtime_generation_aba(
     )
     assert replacement.acquire()["acquired"] is True
     mutation_gate._runtime = replacement
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
     assert replacement.active_mutation_count() == 0
 
@@ -1217,6 +1223,7 @@ def test_owner_wallet_effect_cannot_cross_runtime_generation_aba(
     failed = wallet.create_offer({1: -1})
     assert failed["success"] is False
     assert failed["reason"] == "WALLET_MUTATION_FAILED"
+    assert failed["_catalyst_effect_attempted"] is True
     assert "private backend failure" not in str(failed)
     assert replacement.active_mutation_count() == 0
     assert replacement.active_wallet_mutation_count() == 0
@@ -1293,7 +1300,10 @@ def test_owner_wallet_effect_cannot_cross_same_runtime_reacquire_generation(
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle_results == [
         {"released": False, "reason": "active_wallet_mutations"},
@@ -1303,7 +1313,10 @@ def test_owner_wallet_effect_cannot_cross_same_runtime_reacquire_generation(
 
     assert runtime.release_lease()["released"] is True
     assert runtime.acquire()["acquired"] is True
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
     assert runtime.active_mutation_count() == 0
 
@@ -1356,7 +1369,10 @@ def test_owner_shutdown_cannot_replace_runtime_after_final_wallet_check(
         replace_after_final_check,
     )
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle["shutdown"] == {
         "released": False,
@@ -1375,7 +1391,10 @@ def test_owner_shutdown_cannot_replace_runtime_after_final_wallet_check(
     )
     assert replacement.acquire()["acquired"] is True
     mutation_gate._runtime = replacement
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
     assert replacement.active_mutation_count() == 0
 
@@ -1417,7 +1436,10 @@ def test_owner_release_and_reacquire_refuse_after_final_wallet_check(
         reacquire_after_final_check,
     )
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle["release"] == {
         "released": False,
@@ -1433,7 +1455,10 @@ def test_owner_release_and_reacquire_refuse_after_final_wallet_check(
 
     assert runtime.release_lease()["released"] is True
     assert runtime.acquire()["acquired"] is True
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
     assert runtime.active_mutation_count() == 0
 
@@ -1516,7 +1541,10 @@ def test_worker_wallet_effect_cannot_cross_install_generation_aba(
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", adapter)
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle_results == [False, "MUTATION_SHUTTING_DOWN"]
 
@@ -1525,7 +1553,10 @@ def test_worker_wallet_effect_cannot_cross_install_generation_aba(
         environment,
         wallet_adapter_authority=adapter,
     )
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
 
     adapter.create_offer = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1534,6 +1565,7 @@ def test_worker_wallet_effect_cannot_cross_install_generation_aba(
     failed = wallet.create_offer({1: -1})
     assert failed["success"] is False
     assert failed["reason"] == "WALLET_MUTATION_FAILED"
+    assert failed["_catalyst_effect_attempted"] is True
     assert "private worker failure" not in str(failed)
     assert mutation_gate.clear_worker_authority_environment() is True
 
@@ -1594,7 +1626,10 @@ def test_worker_clear_and_reinstall_refuse_after_final_wallet_check(
         reinstall_after_final_check,
     )
 
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect"]
     assert lifecycle == {"clear": False, "install": "MUTATION_SHUTTING_DOWN"}
 
@@ -1603,7 +1638,10 @@ def test_worker_clear_and_reinstall_refuse_after_final_wallet_check(
         environment,
         wallet_adapter_authority=adapter,
     )
-    assert wallet.create_offer({1: -1}) == {"success": True}
+    assert wallet.create_offer({1: -1}) == {
+        "success": True,
+        "_catalyst_effect_attempted": True,
+    }
     assert effects == ["effect", "effect"]
 
 
@@ -1891,6 +1929,36 @@ def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
     )
     monkeypatch.setattr(api_server, "bot", fake_bot)
     monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(
+        api_server,
+        "_stability_startup_status",
+        {
+            "allowed": True,
+            "reason_code": "",
+            "source": "startup_recovery",
+            "failed_check": None,
+            "checks": [],
+            "blocker_counts": {
+                "operations": 0,
+                "prepared_creations": 0,
+                "submitted_cancels": 0,
+                "contradictory_history": 0,
+                "reservations": 0,
+                "publication_claims": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_configured_mutation_binding",
+        lambda: ("a" * 64, "mainnet"),
+    )
+    monkeypatch.setattr(api_server.database, "DB_PATH", __file__)
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_diagnostic_counts",
+        lambda: {"registry": 0, "lineage": 0, "reserve": 0, "publication": 0},
+    )
     monkeypatch.setattr(api_server.mutation_gate, "status", lambda: denied)
     monkeypatch.setattr(
         api_server.mutation_gate,
@@ -6161,19 +6229,20 @@ def _wait_for_diagnostics_status(process, port: int) -> dict:
 
 def _wait_for_any_diagnostics_status(process, ports) -> tuple[int, dict]:
     deadline = time.monotonic() + 30
+    candidate_ports = tuple(ports)[:8]
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise AssertionError(
                 f"diagnostics process exited early: {process.communicate()[1]}"
             )
-        for port in ports:
+        for port in candidate_ports:
             if process.poll() is not None:
                 raise AssertionError(
                     f"diagnostics process exited early: {process.communicate()[1]}"
                 )
             try:
                 with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
+                    f"http://127.0.0.1:{port}/api/safety/status", timeout=1
                 ) as response:
                     return port, json.loads(response.read().decode("utf-8"))
             except Exception:
@@ -6190,6 +6259,15 @@ def _wait_for_any_diagnostics_status(process, ports) -> tuple[int, dict]:
 def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> dict:
     """Build an isolated process environment without starting real CAT resolution."""
 
+    data_dir.mkdir()
+    (data_dir / ".env").write_text(
+        "WALLET_TYPE=sage\n"
+        "SAGE_FINGERPRINT=161616161\n"
+        "WALLET_EXPECTED_NAME=Task 16 Synthetic Wallet\n"
+        "WALLET_EXPECTED_KEY_KIND=bls\n"
+        "WALLET_IDENTITY_MAX_AGE_SECONDS=10\n",
+        encoding="utf-8",
+    )
     support = tmp_path / "standalone-test-support"
     support.mkdir(exist_ok=True)
     (support / "sitecustomize.py").write_text(
@@ -6203,6 +6281,11 @@ def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> d
     env["CMM_DATA_DIR"] = str(data_dir)
     env["CATALYST_FLASK_PORT"] = str(port)
     env["PYTHONUNBUFFERED"] = "1"
+    # Task 14 made an immutable configured wallet identity mandatory before a
+    # fresh runtime may acquire its lease.  Give these standalone processes a
+    # deterministic, non-secret test identity instead of inheriting operator
+    # configuration (or failing closed as unconfigured).
+    env["CATALYST_NETWORK_ID"] = "mainnet"
     env["PYTHONPATH"] = os.pathsep.join(
         [
             str(support),
@@ -6231,23 +6314,35 @@ def _wait_for_safety_servers(processes, ports, count: int) -> dict[int, dict]:
     deadline = time.monotonic() + 60
     found = {}
     process_ids = {process.pid for process in processes}
+    # The supplied preferred port was confirmed free immediately before the
+    # children started.  Poll its nearest bounded alternatives repeatedly;
+    # walking the entire production search window once can consume the whole
+    # readiness deadline on Windows when an unopened port drops SYN packets.
+    candidate_ports = tuple(ports)[: max(8, count * 4)]
     while time.monotonic() < deadline:
         exited = [process for process in processes if process.poll() is not None]
         if exited:
             details = [process.communicate()[1] for process in exited]
             raise AssertionError(f"standalone process exited early: {details}")
-        for port in ports:
+        for port in candidate_ports:
             if port in found:
                 continue
             try:
                 with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/api/safety/status", timeout=0.1
+                    f"http://127.0.0.1:{port}/api/safety/status", timeout=1
                 ) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                    owner_pid = (
-                        payload.get("safety", {}).get("lease", {}).get("owner_pid")
+                    safety = payload.get("safety", {})
+                    lease = safety.get("lease", {})
+                    owner_pid = lease.get("owner_pid")
+                    # Owner diagnostics intentionally redact the process ID;
+                    # the per-process ``owned_by_this_run`` proof is the
+                    # public correlation signal for an allowed child.
+                    belongs_to_child = owner_pid in process_ids or (
+                        safety.get("allowed") is True
+                        and lease.get("owned_by_this_run") is True
                     )
-                    if owner_pid in process_ids:
+                    if belongs_to_child:
                         found[port] = payload
             except Exception:
                 continue
@@ -6430,7 +6525,10 @@ def test_simultaneous_first_run_standalone_processes_create_exactly_one_owner(
             rows = conn.execute(
                 "SELECT active, owner_pid FROM runtime_mutation_lease"
             ).fetchall()
-        assert rows == [(1, allowed[0][1]["safety"]["lease"]["owner_pid"])]
+        assert len(rows) == 1
+        assert rows[0][0] == 1
+        assert allowed[0][1]["safety"]["lease"]["owned_by_this_run"] is True
+        assert "owner_pid" not in allowed[0][1]["safety"]["lease"]
         assert rows[0][1] in {process.pid for process in processes}
     finally:
         _terminate_test_processes(processes)
@@ -6465,7 +6563,13 @@ def test_unrelated_port_occupancy_still_allows_one_full_owner_on_alternate_port(
             selected_port, payload = next(iter(servers.items()))
             assert selected_port != port
             assert payload["safety"]["allowed"] is True
-            assert payload["safety"]["lease"]["owner_pid"] == process.pid
+            assert payload["safety"]["lease"]["owned_by_this_run"] is True
+            assert "owner_pid" not in payload["safety"]["lease"]
+            with sqlite3.connect(data_dir / "bot.db") as conn:
+                durable_owner_pid = conn.execute(
+                    "SELECT owner_pid FROM runtime_mutation_lease WHERE active=1"
+                ).fetchone()[0]
+            assert durable_owner_pid == process.pid
         finally:
             _terminate_test_processes([process])
 
@@ -6639,11 +6743,48 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
         reason_code="LEASE_OWNED_BY_OTHER",
         source="lease",
         lease_active=True,
+        lease_version=9,
+        lease_expires_at="2026-08-22T23:59:00.000000Z",
         owner_run_id="owner-run",
         owner_pid=456,
     )
     monkeypatch.setattr(api_server, "_read_only_diagnostics_active", True)
     monkeypatch.setattr(api_server.mutation_gate, "status", lambda: denied)
+    monkeypatch.setattr(
+        api_server,
+        "_stability_startup_status",
+        {
+            "allowed": False,
+            "reason_code": "LEASE_OWNED_BY_OTHER",
+            "source": "startup_recovery",
+            "failed_check": "lease",
+            "checks": [
+                {
+                    "name": "lease",
+                    "ok": False,
+                    "reason_code": "LEASE_OWNED_BY_OTHER",
+                    "source_age_seconds": 0,
+                    "source": "durable_snapshot",
+                    "blocker_counts": {},
+                }
+            ],
+            "blocker_counts": {
+                "operations": 0,
+                "prepared_creations": 0,
+                "submitted_cancels": 0,
+                "contradictory_history": 0,
+                "reservations": 0,
+                "publication_claims": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(api_server, "_configured_mutation_binding", lambda: ("f" * 64, "mainnet"))
+    monkeypatch.setattr(api_server.database, "DB_PATH", __file__)
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_diagnostic_counts",
+        lambda: {"registry": 0, "lineage": 0, "reserve": 0, "publication": 0},
+    )
     client = api_server.app.test_client()
 
     safety = client.get("/api/safety/status", environ_base={"REMOTE_ADDR": "127.0.0.1"})

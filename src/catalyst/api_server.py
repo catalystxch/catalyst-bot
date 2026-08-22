@@ -106,6 +106,7 @@ if sys.platform == "win32":
             except Exception:
                 pass
 from flask import Flask, jsonify, request, send_from_directory, send_file, Response, g
+from werkzeug.exceptions import MethodNotAllowed
 
 # ---- Super Log: capture EVERYTHING to terminal + file ----
 from super_log import init_super_log, slog, intercept_log_event
@@ -3394,6 +3395,13 @@ def enforce_local_runtime_guard():
             return jsonify(
                 {"error": "rate_limited", "message": "Too many requests"}
             ), 429
+
+        # Preserve Flask's method contract once the write request has passed
+        # the local-origin and token guards.  A POST to a GET-only endpoint is
+        # not an executable mutation and must not consult or acquire a wallet
+        # mutation permit before Flask returns its authoritative 405.
+        if isinstance(request.routing_exception, MethodNotAllowed):
+            raise request.routing_exception
 
         endpoint = request.endpoint or ""
         requires_mutation = bool(
