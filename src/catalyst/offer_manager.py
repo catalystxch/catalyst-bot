@@ -5194,6 +5194,35 @@ class OfferManager:
         )
 
     @staticmethod
+    def _trip_cancel_replay_latch(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        wallet_fingerprint_hash: str,
+        network: str,
+    ) -> None:
+        """Let the durable effect owner finish before fencing a replay."""
+
+        deadline = time.monotonic() + 65.0
+        while time.monotonic() < deadline:
+            try:
+                events = database.get_offer_operation_events(intent.operation_id)
+                if any(
+                    event.get("attempt") == attempt
+                    and event.get("phase") == "FINALIZED"
+                    for event in events
+                ):
+                    break
+            except Exception:
+                break
+            time.sleep(0.01)
+        OfferManager._trip_cancel_latch(
+            intent,
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+            network=network,
+        )
+
+    @staticmethod
     def _acquire_cancel_authority(
         intent: _CanonicalOfferCancelIntent,
     ) -> tuple[Any, dict, str, str]:
@@ -5542,8 +5571,9 @@ class OfferManager:
                 journal=journal,
             )
             if not effect_claimed:
-                self._trip_cancel_latch(
+                self._trip_cancel_replay_latch(
                     intent,
+                    attempt=attempt,
                     wallet_fingerprint_hash=wallet_hash,
                     network=network,
                 )
@@ -5725,6 +5755,35 @@ class OfferManager:
                             "operation_id",
                             "attempt",
                             "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                            "prior_lifecycle_state",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
                             "cohort_size",
                             "member_id",
                             "reason",
@@ -5774,9 +5833,14 @@ class OfferManager:
                     and (
                         prepared_evidence["effect_claim_protocol"]
                         != "durable_cohort_claim_v1"
-                        or type(prepared_evidence.get("cohort_size")) is not int
-                        or isinstance(prepared_evidence["cohort_size"], bool)
-                        or prepared_evidence["cohort_size"] < 2
+                        or (
+                            prepared_evidence.get("cohort_size") is not None
+                            and (
+                                type(prepared_evidence["cohort_size"]) is not int
+                                or isinstance(prepared_evidence["cohort_size"], bool)
+                                or prepared_evidence["cohort_size"] < 2
+                            )
+                        )
                     )
                 )
             ):
@@ -5997,8 +6061,9 @@ class OfferManager:
                     raise
                 self._offer_cancel_crash_boundary("after_prepare", intent)
             if not effect_claimed:
-                self._trip_cancel_latch(
+                self._trip_cancel_replay_latch(
                     intent,
+                    attempt=attempt,
                     wallet_fingerprint_hash=wallet_hash,
                     network=network,
                 )
@@ -6293,6 +6358,17 @@ class OfferManager:
                     for member in manifest["members"]
                 ]
             else:
+                participating_trade_ids = sorted(
+                    intent.trade_id for intent, _attempt in participating
+                )
+                cohort_id = (
+                    "cancel-cohort:"
+                    + hashlib.sha256(
+                        self._canonical_creation_json(participating_trade_ids).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                )
                 members = []
                 for intent, attempt in participating:
                     member_id = (

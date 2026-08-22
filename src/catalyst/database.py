@@ -3192,6 +3192,42 @@ END;
 CREATE INDEX IF NOT EXISTS idx_runtime_recovery_epochs_binding
     ON runtime_recovery_epochs(wallet_fingerprint_hash, network, latch_generation);
 
+-- A recovery epoch may survive its process.  Each successor authority is an
+-- append-only link from the previously captured lease incarnation to the exact
+-- newly acquired lease, so process restart cannot silently rewrite the epoch.
+CREATE TABLE IF NOT EXISTS runtime_recovery_takeovers (
+    takeover_sequence           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recovery_id                 TEXT NOT NULL,
+    takeover_number             INTEGER NOT NULL CHECK(takeover_number > 0),
+    takeover_id                 TEXT NOT NULL UNIQUE,
+    predecessor_lease_snapshot_sha256 TEXT NOT NULL
+        CHECK(length(predecessor_lease_snapshot_sha256)=64),
+    owner_run_id                TEXT NOT NULL,
+    wallet_fingerprint_hash     TEXT NOT NULL,
+    network                     TEXT NOT NULL,
+    lease_version               INTEGER NOT NULL CHECK(lease_version > 0),
+    lease_active                INTEGER NOT NULL CHECK(lease_active = 1),
+    lease_owner_pid             INTEGER NOT NULL CHECK(lease_owner_pid > 0),
+    lease_owner_host            TEXT NOT NULL,
+    lease_acquired_at           TEXT NOT NULL,
+    lease_heartbeat_at          TEXT NOT NULL,
+    lease_expires_at            TEXT NOT NULL,
+    lease_updated_at            TEXT NOT NULL,
+    lease_snapshot_sha256       TEXT NOT NULL UNIQUE
+        CHECK(length(lease_snapshot_sha256)=64),
+    adopted_at                  TEXT NOT NULL,
+    UNIQUE(recovery_id, takeover_number),
+    FOREIGN KEY(recovery_id) REFERENCES runtime_recovery_epochs(recovery_id)
+);
+CREATE TRIGGER IF NOT EXISTS runtime_recovery_takeovers_no_update
+BEFORE UPDATE ON runtime_recovery_takeovers BEGIN
+    SELECT RAISE(ABORT, 'runtime_recovery_takeovers is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS runtime_recovery_takeovers_no_delete
+BEFORE DELETE ON runtime_recovery_takeovers BEGIN
+    SELECT RAISE(ABORT, 'runtime_recovery_takeovers is append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS runtime_recovery_passes (
     attempt_sequence            INTEGER PRIMARY KEY AUTOINCREMENT,
     recovery_id                 TEXT NOT NULL,
@@ -3773,6 +3809,14 @@ _STABILITY_REQUIRED_COLUMNS = {
         "lease_owner_host", "lease_acquired_at", "lease_heartbeat_at",
         "lease_expires_at", "lease_updated_at", "lease_snapshot_sha256",
         "latch_generation", "started_at",
+    },
+    "runtime_recovery_takeovers": {
+        "takeover_sequence", "recovery_id", "takeover_number", "takeover_id",
+        "predecessor_lease_snapshot_sha256", "owner_run_id",
+        "wallet_fingerprint_hash", "network", "lease_version", "lease_active",
+        "lease_owner_pid", "lease_owner_host", "lease_acquired_at",
+        "lease_heartbeat_at", "lease_expires_at", "lease_updated_at",
+        "lease_snapshot_sha256", "adopted_at",
     },
     "runtime_recovery_passes": {
         "attempt_sequence", "recovery_id", "attempt_number", "attempt_id",
@@ -4393,6 +4437,13 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_cancel_effect_claims", ("operation_id", "attempt"))
     _require_unique_key(conn, "offer_cancel_effect_claims", ("prepared_event_id",))
     _require_unique_key(conn, "runtime_recovery_epochs", ("blocker_id",))
+    _require_unique_key(
+        conn, "runtime_recovery_takeovers", ("recovery_id", "takeover_number")
+    )
+    _require_unique_key(conn, "runtime_recovery_takeovers", ("takeover_id",))
+    _require_unique_key(
+        conn, "runtime_recovery_takeovers", ("lease_snapshot_sha256",)
+    )
     _require_unique_key(
         conn, "runtime_recovery_passes", ("recovery_id", "attempt_number")
     )
@@ -5467,6 +5518,7 @@ def _migrate_stability_schema() -> None:
             "offer_refresh_lineage_commits",
             "offer_refresh_lineage_blockers",
             "runtime_recovery_epochs",
+            "runtime_recovery_takeovers",
             "runtime_recovery_passes",
             "runtime_recovery_promotions",
             "runtime_quarantine_manifests",
@@ -19284,6 +19336,11 @@ def prepare_offer_cancel(
     evidence = dict(evidence_json)
     if "prior_lifecycle_state" in evidence:
         raise ValueError("prior_lifecycle_state is repository-derived")
+    if claim_effect:
+        protocol = evidence.get("effect_claim_protocol")
+        if protocol not in (None, "durable_cohort_claim_v1"):
+            raise ValueError("cancellation effect claim protocol is invalid")
+        evidence["effect_claim_protocol"] = "durable_cohort_claim_v1"
     if evidence.get("trade_id") != safe_trade_id:
         raise ValueError("cancellation evidence must contain the exact trade_id")
     prepared = _stability_timestamp_or_now(prepared_at, "prepared_at")
@@ -19301,6 +19358,30 @@ def prepare_offer_cancel(
             evidence=evidence,
             prepared=prepared,
         )
+        if claim_effect and effect_claimed:
+            recovery_latch = conn.execute(
+                "SELECT generation,state FROM runtime_safety_latch "
+                "WHERE singleton_id=1"
+            ).fetchone()
+            if recovery_latch is None or recovery_latch["state"] != "resolved":
+                raise ValueError(
+                    "cancellation effect claim is blocked by runtime recovery"
+                )
+            conn.execute(
+                """
+                INSERT INTO offer_cancel_effect_claims (
+                    operation_id, attempt, prepared_event_id, claimed_at,
+                    recovery_generation
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    safe_attempt,
+                    event_id,
+                    prepared,
+                    int(recovery_latch["generation"]),
+                ),
+            )
         conn.commit()
         if claim_effect:
             return {
@@ -21500,29 +21581,6 @@ def _validate_reconciliation_cancel_context(
             raise ValueError("Task 8 auxiliary coins lack durable attempt binding")
         if durable_auxiliary is not None and durable_auxiliary != auxiliary_bare:
             raise ValueError("Task 8 auxiliary coin claim is not exact")
-        effect_claim_row = conn.execute(
-            """
-            SELECT operation_id, attempt, prepared_event_id, claimed_at
-            FROM offer_cancel_effect_claims
-            WHERE operation_id=? AND attempt=?
-            """,
-            (prepared["operation_id"], prepared["attempt"]),
-        ).fetchone()
-        if effect_claim_row is None:
-            raise ValueError("Task 8 effect claim is missing")
-        try:
-            effect_claim = _validated_offer_cancel_effect_claim(dict(effect_claim_row))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Task 8 effect claim is invalid") from exc
-        if (
-            effect_claim["operation_id"] != prepared["operation_id"]
-            or effect_claim["attempt"] != prepared["attempt"]
-            or effect_claim["prepared_event_id"] != prepared["event_id"]
-            or not request_timestamp
-            <= effect_claim["claimed_at"]
-            <= transaction_timestamp
-        ):
-            raise ValueError("Task 8 effect claim binding or timing is invalid")
         latest_row = conn.execute(
             """
             SELECT * FROM offer_operation_journal
@@ -21539,6 +21597,60 @@ def _validate_reconciliation_cancel_context(
             f"cancel-target:{member_trade}",
         }:
             raise ValueError("Task 8 cancellation attempt lineage is not exact")
+        latest_evidence = (
+            json.loads(latest["evidence_json"])
+            if latest["phase"] == "FINALIZED"
+            else None
+        )
+        effect_claim_row = conn.execute(
+            """
+            SELECT operation_id, attempt, prepared_event_id, claimed_at
+            FROM offer_cancel_effect_claims
+            WHERE operation_id=? AND attempt=?
+            """,
+            (prepared["operation_id"], prepared["attempt"]),
+        ).fetchone()
+        if effect_claim_row is None:
+            legacy_single_effect = bool(
+                len(context["members"]) == 1
+                and type(prepared_evidence) is dict
+                and prepared_evidence.get("effect_claim_protocol") is None
+                and prepared_evidence.get("cohort_size") in (None, 1)
+                and prepared_evidence.get("trade_id") == member_trade
+                and prepared_evidence.get("intent_id") == member_intent
+                and prepared_evidence.get("operation_id")
+                == prepared["operation_id"]
+                and latest["phase"] == "FINALIZED"
+                and latest["outcome"]
+                in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+                and latest["blocks_mutation"] == 1
+                and type(latest_evidence) is dict
+                and latest_evidence.get("effect_attempted") is True
+                and latest_evidence.get("trade_id") == member_trade
+                and latest_evidence.get("cohort_id") == context["cohort_id"]
+                and latest_evidence.get("member_id") == member_id
+                and request_timestamp
+                <= latest["request_timestamp"]
+                <= transaction_timestamp
+            )
+            if not legacy_single_effect:
+                raise ValueError("Task 8 effect claim is missing")
+        else:
+            try:
+                effect_claim = _validated_offer_cancel_effect_claim(
+                    dict(effect_claim_row)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Task 8 effect claim is invalid") from exc
+            if (
+                effect_claim["operation_id"] != prepared["operation_id"]
+                or effect_claim["attempt"] != prepared["attempt"]
+                or effect_claim["prepared_event_id"] != prepared["event_id"]
+                or not request_timestamp
+                <= effect_claim["claimed_at"]
+                <= transaction_timestamp
+            ):
+                raise ValueError("Task 8 effect claim binding or timing is invalid")
         if latest["phase"] == "PREPARED":
             if (
                 latest["event_id"] != prepared["event_id"]
@@ -21560,12 +21672,26 @@ def _validate_reconciliation_cancel_context(
                 or latest["blocks_mutation"] != 1
             ):
                 raise ValueError("Task 8 cancellation result state is invalid")
-            if (
-                latest["transaction_id"] != member_transaction_id
-                or latest["spend_identity"] != member_spend_identity
-            ):
+            if type(latest_evidence) is not dict:
+                raise ValueError("Task 8 cancellation result evidence is invalid")
+            identity_matches = (
+                latest["transaction_id"] == member_transaction_id
+                and latest["spend_identity"] == member_spend_identity
+            )
+            discovered_after_ambiguous_effect = bool(
+                latest["outcome"] == "CANCEL_UNKNOWN"
+                and latest["transaction_id"] is None
+                and latest["spend_identity"] is None
+                and (
+                    member_transaction_id is not None
+                    or member_spend_identity is not None
+                )
+            ) and (
+                type(latest_evidence) is dict
+                and latest_evidence.get("effect_attempted") is True
+            )
+            if not identity_matches and not discovered_after_ambiguous_effect:
                 raise ValueError("Task 8 cancellation result identity is not exact")
-            latest_evidence = json.loads(latest["evidence_json"])
             latest_auxiliary = latest_evidence.get("auxiliary_coin_ids")
             if (
                 latest_auxiliary is None
@@ -21861,25 +21987,32 @@ def commit_offer_reconciliation(
         raise ValueError("proven cancellation requires exact Task 8 context")
     if safe_classification != "CANCELLED_PROVEN" and safe_cancel_context is not None:
         raise ValueError("only proven cancellation may carry Task 8 context")
-    event_id = f"{safe_operation_id}:attempt:1:{phase.lower()}"
-    journal = _journal_values(
-        event_id=event_id,
-        operation_id=safe_operation_id,
-        intent_id=safe_intent_id,
-        operation_type="RECONCILE",
-        attempt=1,
-        phase=phase,
-        outcome=safe_classification,
-        request_timestamp=when,
-        wallet_identity_json=wallet_json,
-        transaction_id=safe_transaction_id,
-        spend_identity=safe_spend_identity,
-        evidence_json=canonical_evidence,
-        evidence_sha256=expected_digest,
-        reason_code=safe_reason,
-        blocks_mutation=blocking,
-        created_at=when,
-    )
+    def reconciliation_journal(attempt: int) -> Dict[str, Any]:
+        return _journal_values(
+            event_id=(
+                f"{safe_operation_id}:attempt:{attempt}:{phase.lower()}"
+            ),
+            operation_id=safe_operation_id,
+            intent_id=safe_intent_id,
+            operation_type="RECONCILE",
+            attempt=attempt,
+            phase=phase,
+            outcome=safe_classification,
+            request_timestamp=when,
+            wallet_identity_json=wallet_json,
+            transaction_id=safe_transaction_id,
+            spend_identity=safe_spend_identity,
+            evidence_json=canonical_evidence,
+            evidence_sha256=expected_digest,
+            reason_code=safe_reason,
+            blocks_mutation=blocking,
+            created_at=when,
+        )
+
+    # Terminal proof keeps the fixed attempt-1 identity required by the
+    # immutable receipt guards. Nonterminal observations may receive a later
+    # append-only attempt inside the serialized transaction below.
+    journal = reconciliation_journal(1)
 
     cancel_resolution = None
 
@@ -22028,6 +22161,31 @@ def commit_offer_reconciliation(
                 _ensure_authoritative_fill_hook_outbox(conn, fill_id)
             conn.commit()
             return {"event": existing, "idempotent": True, "fill_id": fill_id}
+        if phase != "FINALIZED":
+            prior_rows = conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? AND operation_type='RECONCILE'
+                ORDER BY sequence
+                """,
+                (safe_operation_id,),
+            ).fetchall()
+            prior_events = [
+                validate_offer_operation_event(dict(row)) for row in prior_rows
+            ]
+            latest = prior_events[-1] if prior_events else None
+            phase_attempts = [
+                event["attempt"] for event in prior_events if event["phase"] == phase
+            ]
+            if latest is not None and latest["phase"] == phase:
+                replay = reconciliation_journal(latest["attempt"])
+                if all(
+                    latest[column] == replay[column]
+                    for column in _JOURNAL_COMPARE_COLUMNS
+                ):
+                    conn.commit()
+                    return {"event": latest, "idempotent": True}
+            journal = reconciliation_journal(max(phase_attempts, default=0) + 1)
         if intent["lifecycle_state"] == "terminal":
             raise ValueError("terminal offer lacks its authoritative journal event")
         try:
@@ -24121,6 +24279,108 @@ def _assert_runtime_recovery_lease(
     return current
 
 
+def _latest_runtime_recovery_authority(
+    conn: sqlite3.Connection, epoch: Any
+) -> Dict[str, Any]:
+    """Return the immutable epoch authority or its latest successor link."""
+
+    record = dict(epoch) if type(epoch) is not dict else dict(epoch)
+    takeover = conn.execute(
+        "SELECT * FROM runtime_recovery_takeovers WHERE recovery_id=? "
+        "ORDER BY takeover_number DESC LIMIT 1",
+        (record.get("recovery_id"),),
+    ).fetchone()
+    if takeover is None:
+        return record
+    authority = dict(takeover)
+    if (
+        authority.get("recovery_id") != record.get("recovery_id")
+        or authority.get("wallet_fingerprint_hash")
+        != record.get("wallet_fingerprint_hash")
+        or authority.get("network") != record.get("network")
+    ):
+        raise ValueError("runtime recovery successor authority changed")
+    return authority
+
+
+def _assert_runtime_recovery_authority(
+    conn: sqlite3.Connection,
+    epoch: Any,
+    lease: Any,
+    *,
+    require_unexpired_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    authority = _latest_runtime_recovery_authority(conn, epoch)
+    return _assert_runtime_recovery_lease(
+        authority,
+        lease,
+        require_unexpired_at=require_unexpired_at,
+    )
+
+
+def _assert_runtime_recovery_predecessor_lease(
+    authority: Any,
+    lease: Any,
+    *,
+    takeover_at: str,
+    prior_owner_liveness_proven_dead: bool,
+) -> Dict[str, Any]:
+    """Validate the last owner even after an exact release or expiry."""
+
+    captured = dict(authority) if type(authority) is not dict else dict(authority)
+    current = dict(lease) if type(lease) is not dict else dict(lease)
+    expected_digest = captured.get("lease_snapshot_sha256")
+    captured_version = captured.get("lease_version")
+    if (
+        type(expected_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        or type(captured_version) is not int
+        or captured_version < 1
+        or type(current.get("lease_version")) is not int
+        or current["lease_version"] < captured_version
+        or captured.get("owner_run_id") != current.get("owner_run_id")
+        or captured.get("wallet_fingerprint_hash")
+        != current.get("wallet_fingerprint_hash")
+        or captured.get("network") != current.get("network")
+        or any(
+            captured.get(epoch_field) != current.get(lease_field)
+            for lease_field, epoch_field in _RECOVERY_LEASE_INCARNATION_FIELDS.items()
+            if lease_field != "active"
+        )
+    ):
+        raise ValueError("runtime recovery predecessor authority changed")
+    if current.get("active") == 1:
+        _assert_runtime_recovery_lease(captured, current)
+        if current.get("released_at") is not None:
+            raise ValueError("runtime recovery predecessor authority changed")
+        if current.get("expires_at") > takeover_at:
+            raise ValueError("runtime recovery predecessor lease is not expired")
+        if prior_owner_liveness_proven_dead is not True:
+            raise ValueError("runtime recovery predecessor liveness proof is required")
+    elif current.get("active") == 0:
+        released_at = current.get("released_at")
+        heartbeat_at = current.get("heartbeat_at")
+        updated_at = current.get("updated_at")
+        if (
+            current["lease_version"] <= captured_version
+            or current.get("expires_at") is not None
+            or type(released_at) is not str
+            or _stability_timestamp(released_at, "released_at") != released_at
+            or released_at < captured.get("lease_updated_at")
+            or type(heartbeat_at) is not str
+            or _stability_timestamp(heartbeat_at, "heartbeat_at") != heartbeat_at
+            or heartbeat_at < captured.get("lease_heartbeat_at")
+            or type(updated_at) is not str
+            or _stability_timestamp(updated_at, "updated_at") != updated_at
+            or updated_at < captured.get("lease_updated_at")
+            or updated_at != released_at
+        ):
+            raise ValueError("runtime recovery predecessor release is invalid")
+    else:
+        raise ValueError("runtime recovery predecessor authority changed")
+    return current
+
+
 def begin_runtime_recovery_epoch(
     *,
     recovery_id: str,
@@ -24327,8 +24587,11 @@ def record_runtime_recovery_pass(
         ).fetchone()
         if epoch is None or latch is None or lease is None:
             raise ValueError("runtime recovery epoch is missing")
-        _assert_runtime_recovery_lease(
-            dict(epoch), dict(lease), require_unexpired_at=_stability_wall_clock()
+        _assert_runtime_recovery_authority(
+            conn,
+            dict(epoch),
+            dict(lease),
+            require_unexpired_at=_stability_wall_clock(),
         )
         if (
             int(epoch["latch_generation"]) != generation
@@ -24455,8 +24718,11 @@ def quarantine_runtime_blockers(
         if latch_row is None or epoch_row is None or lease_row is None:
             raise ValueError("current recovery authority is missing")
         latch, epoch = dict(latch_row), dict(epoch_row)
-        _assert_runtime_recovery_lease(
-            epoch, dict(lease_row), require_unexpired_at=_stability_wall_clock()
+        _assert_runtime_recovery_authority(
+            conn,
+            epoch,
+            dict(lease_row),
+            require_unexpired_at=_stability_wall_clock(),
         )
         current_blockers = json.loads(latch["blocking_operation_ids_json"])
         unresolved_rows = conn.execute(
@@ -24662,6 +24928,214 @@ def get_current_runtime_recovery() -> Optional[Dict[str, Any]]:
     return None if row is None else dict(row)
 
 
+def adopt_runtime_recovery_epoch(
+    *,
+    recovery_id: str,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    lease_expires_at: Any,
+    expected_lease_version: int,
+    prior_owner_liveness_proven_dead: bool,
+    now: Any = None,
+) -> Dict[str, Any]:
+    """Atomically acquire and append a successor for one frozen recovery.
+
+    An inactive predecessor carries its own durable release proof.  An active
+    predecessor must be expired and the process layer must provide an exact
+    dead-owner result before this compare-and-set transition is permitted.
+    """
+
+    recovery = _runtime_identifier(recovery_id, "recovery_id", "recovery:")
+    owner = _required_stability_text(
+        successor_owner_run_id, "successor_owner_run_id"
+    )
+    pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
+    host = _required_stability_text(successor_owner_host, "successor_owner_host")
+    wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior_owner_liveness_proven_dead must be an exact bool")
+    requested_at = _stability_timestamp_or_now(now, "now timestamp")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at timestamp")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        adopted_at = max(requested_at, locked_at)
+        if expiry <= adopted_at:
+            raise ValueError("lease_expires_at must be later than adoption time")
+        epoch_row = conn.execute(
+            "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
+            (recovery,),
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if epoch_row is None or latch_row is None or lease_row is None:
+            raise ValueError("runtime recovery successor authority is missing")
+        epoch = dict(epoch_row)
+        latch = dict(latch_row)
+        current = dict(lease_row)
+        if (
+            latch.get("state") != "tripped"
+            or int(latch.get("generation") or -1)
+            != int(epoch.get("latch_generation") or -2)
+            or json.loads(latch.get("blocking_operation_ids_json") or "null")
+            != [epoch.get("blocker_id")]
+            or latch.get("wallet_fingerprint_hash") != wallet_hash
+            or latch.get("network") != safe_network
+            or epoch.get("wallet_fingerprint_hash") != wallet_hash
+            or epoch.get("network") != safe_network
+            or int(current.get("lease_version") or -1) != version
+        ):
+            raise ValueError("runtime recovery successor authority changed")
+        authority = _latest_runtime_recovery_authority(conn, epoch)
+        if (
+            current.get("active") == 1
+            and current.get("owner_run_id") == owner
+            and current.get("owner_pid") == pid
+            and current.get("owner_host") == host
+            and authority.get("owner_run_id") == owner
+        ):
+            _assert_runtime_recovery_lease(
+                authority, current, require_unexpired_at=adopted_at
+            )
+            conn.commit()
+            return {
+                "adopted": True,
+                "reason": "already_adopted",
+                "record": authority,
+                "lease": current,
+                "idempotent": True,
+            }
+        predecessor = _assert_runtime_recovery_predecessor_lease(
+            authority,
+            current,
+            takeover_at=adopted_at,
+            prior_owner_liveness_proven_dead=prior_owner_liveness_proven_dead,
+        )
+        cursor = conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=lease_version+1, active=1, owner_run_id=?,
+                owner_pid=?, owner_host=?, wallet_fingerprint_hash=?, network=?,
+                acquired_at=?, heartbeat_at=?, expires_at=?, released_at=NULL,
+                updated_at=?
+            WHERE singleton_id=1 AND lease_version=?
+            """,
+            (
+                owner,
+                pid,
+                host,
+                wallet_hash,
+                safe_network,
+                adopted_at,
+                adopted_at,
+                expiry,
+                adopted_at,
+                version,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("runtime recovery successor compare-and-set failed")
+        successor = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        lease_snapshot, lease_digest = _runtime_recovery_lease_snapshot(successor)
+        prior = conn.execute(
+            "SELECT MAX(takeover_number) AS takeover_number "
+            "FROM runtime_recovery_takeovers WHERE recovery_id=?",
+            (recovery,),
+        ).fetchone()
+        takeover_number = int(prior["takeover_number"] or 0) + 1
+        predecessor_digest = str(authority["lease_snapshot_sha256"])
+        takeover_material = _canonical_json_text(
+            {
+                "recovery_id": recovery,
+                "takeover_number": takeover_number,
+                "predecessor_lease_snapshot_sha256": predecessor_digest,
+                "successor_lease_snapshot_sha256": lease_digest,
+                "adopted_at": adopted_at,
+            },
+            "runtime recovery takeover",
+            expected_type=dict,
+            max_bytes=4096,
+        )
+        takeover_id = "recovery-takeover:" + hashlib.sha256(
+            takeover_material.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO runtime_recovery_takeovers (
+                recovery_id,takeover_number,takeover_id,
+                predecessor_lease_snapshot_sha256,owner_run_id,
+                wallet_fingerprint_hash,network,lease_version,lease_active,
+                lease_owner_pid,lease_owner_host,lease_acquired_at,
+                lease_heartbeat_at,lease_expires_at,lease_updated_at,
+                lease_snapshot_sha256,adopted_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                recovery,
+                takeover_number,
+                takeover_id,
+                predecessor_digest,
+                owner,
+                wallet_hash,
+                safe_network,
+                lease_snapshot["lease_version"],
+                lease_snapshot["active"],
+                lease_snapshot["owner_pid"],
+                lease_snapshot["owner_host"],
+                lease_snapshot["acquired_at"],
+                lease_snapshot["heartbeat_at"],
+                lease_snapshot["expires_at"],
+                lease_snapshot["updated_at"],
+                lease_digest,
+                adopted_at,
+            ),
+        )
+        if predecessor.get("owner_run_id"):
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked', "
+                "revoked_at=?, updated_at=? WHERE parent_run_id=? "
+                "AND state='active'",
+                (adopted_at, adopted_at, predecessor["owner_run_id"]),
+            )
+        record = dict(
+            conn.execute(
+                "SELECT * FROM runtime_recovery_takeovers WHERE takeover_id=?",
+                (takeover_id,),
+            ).fetchone()
+        )
+        conn.commit()
+        return {
+            "adopted": True,
+            "reason": "recovery_epoch_adopted",
+            "record": record,
+            "lease": successor,
+            "idempotent": False,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_runtime_quarantine_resolution_requirements(
     quarantine_id: str,
 ) -> Dict[str, Any]:
@@ -24805,8 +25279,11 @@ def resolve_runtime_quarantine(
         ).fetchone()
         if quarantine is None or epoch is None or latch is None or lease is None:
             raise ValueError("quarantine authority is missing")
-        _assert_runtime_recovery_lease(
-            dict(epoch), dict(lease), require_unexpired_at=_stability_wall_clock()
+        _assert_runtime_recovery_authority(
+            conn,
+            dict(epoch),
+            dict(lease),
+            require_unexpired_at=_stability_wall_clock(),
         )
         if (
             quarantine["recovery_id"] != recovery_id
@@ -25095,7 +25572,8 @@ def resolve_runtime_safety_latch(
             if recovery_rows and lease_row is None:
                 raise ValueError("runtime recovery lease authority is missing")
             for recovery_row in recovery_rows:
-                _assert_runtime_recovery_lease(
+                _assert_runtime_recovery_authority(
+                    conn,
                     dict(recovery_row),
                     dict(lease_row),
                     require_unexpired_at=_stability_wall_clock(),

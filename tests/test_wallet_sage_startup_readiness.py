@@ -16,6 +16,34 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageStartupReadiness(unittest.TestCase):
+    def test_authoritative_offer_history_marks_sage_unfiltered_snapshot_complete(self):
+        rows = [
+            {"trade_id": "a" * 64, "offer": "offer1" + "secret" * 1000},
+            {"trade_id": "b" * 64},
+        ]
+
+        with patch.object(wallet_sage, "get_all_offers", return_value=rows) as reader:
+            result = wallet_sage.get_authoritative_offer_history(
+                include_completed=True,
+                start=50,
+                end=100,
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "offers": [{"trade_id": "a" * 64}, {"trade_id": "b" * 64}],
+                "total": 2,
+                "end_of_history": True,
+            },
+        )
+        reader.assert_called_once_with(
+            include_completed=True,
+            start=50,
+            end=100,
+        )
+
     def test_reload_connection_settings_uses_canonical_cfg_values(self):
         old_cert = wallet_sage.CERT_PATH
         old_key = wallet_sage.KEY_PATH

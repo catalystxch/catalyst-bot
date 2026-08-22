@@ -682,6 +682,28 @@ def test_runtime_recovery_reuses_ordered_startup_coordinator_and_retries_same_ep
 _STABILITY_FAILURE_INDEX = 4
 
 
+def test_recovery_identity_revalidation_retries_same_windows_clock_tick(monkeypatch):
+    import api_server
+
+    snapshots = iter(
+        [
+            {"observed_at_utc": "2026-08-21T12:00:00.000000Z"},
+            {"observed_at_utc": "2026-08-21T12:00:00.000000Z"},
+            {"observed_at_utc": "2026-08-21T12:00:00.001000Z"},
+        ]
+    )
+    sleeps = []
+    monkeypatch.setattr(api_server.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    first, second = api_server._read_distinct_wallet_identity_snapshots(
+        lambda: next(snapshots)
+    )
+
+    assert first["observed_at_utc"] == "2026-08-21T12:00:00.000000Z"
+    assert second["observed_at_utc"] == "2026-08-21T12:00:00.001000Z"
+    assert sleeps == [0.002]
+
+
 @pytest.mark.parametrize("failure_stage", ["rotate", "release"])
 def test_runtime_recovery_promotion_retries_with_new_append_only_attempt(
     monkeypatch, failure_stage
@@ -1036,6 +1058,252 @@ def test_recovery_epoch_rejects_same_owner_release_and_reacquire_aba(
         db.begin_runtime_recovery_epoch(**kwargs)
 
 
+def test_released_recovery_epoch_can_be_adopted_by_exact_successor_and_promoted(
+    isolated_database,
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "a" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "successor"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=_future_lease_expiry(),
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+    )
+
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-successor"
+    assert adopted["record"]["recovery_id"] == epoch["recovery_id"]
+    assert adopted["record"]["predecessor_lease_snapshot_sha256"] == (
+        epoch["lease_snapshot_sha256"]
+    )
+    db.record_runtime_recovery_pass(
+        recovery_id=epoch["recovery_id"],
+        expected_latch_generation=epoch["latch_generation"],
+        authority_digest="a" * 64,
+        checks=[{"name": "successor", "ok": True}],
+        passed_at=datetime.now(timezone.utc),
+    )
+    resolved = db.resolve_runtime_safety_latch(
+        expected_generation=epoch["latch_generation"],
+        resolved_operation_ids=[epoch["blocker_id"]],
+    )
+
+    assert resolved["resolved"] is True
+    rows = db.get_connection().execute(
+        "SELECT * FROM runtime_recovery_takeovers WHERE recovery_id=?",
+        (epoch["recovery_id"],),
+    ).fetchall()
+    assert len(rows) == 1
+
+
+def test_active_expired_recovery_epoch_requires_dead_owner_proof_for_adoption(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    base = datetime.now(timezone.utc)
+    expires = base + timedelta(seconds=30)
+    acquired = db.acquire_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        owner_pid=4242,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        now=base,
+        lease_expires_at=expires,
+    )
+    assert acquired["acquired"] is True
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "b" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "dead-owner"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at=base + timedelta(seconds=1),
+    )["record"]
+    takeover_now = base + timedelta(seconds=40)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: takeover_now.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+    )
+    common = {
+        "recovery_id": epoch["recovery_id"],
+        "successor_owner_run_id": "run-successor",
+        "successor_owner_pid": 4343,
+        "successor_owner_host": "task14-host",
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "lease_expires_at": takeover_now + timedelta(seconds=30),
+        "now": takeover_now,
+        "expected_lease_version": acquired["lease"]["lease_version"],
+    }
+
+    with pytest.raises(ValueError, match="liveness proof"):
+        db.adopt_runtime_recovery_epoch(
+            **common,
+            prior_owner_liveness_proven_dead=False,
+        )
+
+    adopted = db.adopt_runtime_recovery_epoch(
+        **common,
+        prior_owner_liveness_proven_dead=True,
+    )
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-successor"
+
+
+def test_mutation_gate_acquires_exact_recovery_successor_authority(
+    isolated_database,
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "c" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "gate-successor"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    gate = mutation_gate.MutationGate(
+        run_id="run-successor",
+        owner_pid=4343,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_seconds=30,
+    )
+
+    result = gate.acquire_recovery_successor(epoch)
+
+    assert result["acquired"] is True
+    assert result["reason"] == "recovery_epoch_adopted"
+    assert gate.last_acquire_result["lease"]["owner_run_id"] == "run-successor"
+    assert gate.status().reason_code == "RUNTIME_DISCONTINUITY"
+
+
+def test_ordered_startup_resumes_released_frozen_recovery_epoch(
+    isolated_database, monkeypatch
+):
+    import api_server
+    import wallet
+
+    db = isolated_database
+    fingerprint = 736588221
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    base = datetime.now(timezone.utc)
+    acquired = db.acquire_runtime_mutation_lease(
+        owner_run_id="run-predecessor",
+        owner_pid=4242,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network=NETWORK,
+        now=base,
+        lease_expires_at=base + timedelta(seconds=30),
+    )
+    assert acquired["acquired"] is True
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "d" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "startup-successor"},
+        wallet_fingerprint_hash=wallet_hash,
+        network=NETWORK,
+        owner_run_id="run-predecessor",
+        started_at=base + timedelta(milliseconds=1),
+    )["record"]
+    db.release_runtime_mutation_lease(
+        owner_run_id="run-predecessor",
+        expected_lease_version=acquired["lease"]["lease_version"],
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=fingerprint,
+        network_id=NETWORK,
+        kind="BLS",
+        has_secrets=True,
+        bound_at_utc=(base - timedelta(seconds=2)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
+    )
+    observations = {"count": 0}
+
+    def identity():
+        observations["count"] += 1
+        observed = datetime.now(timezone.utc) - timedelta(
+            milliseconds=100 - observations["count"]
+        )
+        return {
+            "success": True,
+            "backend": "sage",
+            "name": "TEST 7",
+            "fingerprint": fingerprint,
+            "network_id": NETWORK,
+            "kind": "BLS",
+            "has_secrets": True,
+            "observed_at_utc": observed.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    mutation_gate.shutdown_runtime(release_owned_lease=True)
+    api_server._mutation_runtime = None
+    api_server._mutation_runtime_db_path = None
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, NETWORK)
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    adapter = object()
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", lambda: adapter)
+    monkeypatch.setattr(wallet, "get_wallet_identity", identity)
+
+    result = api_server.initialize_mutation_runtime(
+        start_heartbeat=False,
+        acquire_lease=True,
+    )
+
+    assert result["allowed"] is True
+    assert result["reason_code"] == "RECOVERY_COMPLETE"
+    assert result["failed_check"] is None
+    assert db.get_runtime_safety_latch()["state"] == "resolved"
+    takeover = db.get_connection().execute(
+        "SELECT * FROM runtime_recovery_takeovers WHERE recovery_id=?",
+        (epoch["recovery_id"],),
+    ).fetchone()
+    assert takeover is not None
+    assert takeover["owner_run_id"] == mutation_gate.current_runtime().run_id
+    api_server.release_mutation_runtime()
+
+
 def test_gap_fences_late_publication_retry_and_unresolve_callbacks(isolated_database):
     db = isolated_database
     _acquire_runtime_lease(db)
@@ -1223,7 +1491,7 @@ def test_empty_quarantine_proof_requires_actual_authoritative_history_read(monke
     )
     monkeypatch.setattr(
         wallet,
-        "get_all_offers",
+        "get_authoritative_offer_history",
         lambda **_kwargs: calls.append("history")
         or (_ for _ in ()).throw(RuntimeError("offline")),
     )
@@ -1270,7 +1538,9 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
             ),
         },
     )
-    monkeypatch.setattr(wallet, "get_all_offers", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        wallet, "get_authoritative_offer_history", lambda **_kwargs: []
+    )
     requirements = {
         "quarantine_id": "quarantine:" + "7" * 64,
         "recovery_id": "recovery:" + "7" * 64,

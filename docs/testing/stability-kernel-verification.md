@@ -6,8 +6,9 @@ Task 16 automated regression and local package verification completed on
 2026-08-22 (Europe/London) from branch `codex/stability-kernel`, based on
 `8ef30efaf196986ca68944f97cbf75a65aed4740` before the Task 16 commit.
 
-This document records automated, non-live verification only. Task 17's
-authorised TEST 7 mainnet acceptance has not been run.
+Task 17's authorised TEST 7 mainnet acceptance completed on 2026-08-22. The
+acceptance used the isolated checkpointed lab and the exact wallet identity
+gate described below; it did not use the user's normal CATalyst data directory.
 
 ## Safety envelope
 
@@ -28,6 +29,48 @@ manual trading mutation was used.
 collected, or run. The repository's existing `conftest.py` exclusions also kept
 the other live/manual API scripts out of collection.
 
+## Authorised TEST 7 mainnet acceptance
+
+Every live-effect boundary freshly verified Sage reported `TEST 7`, fingerprint
+`736588221`, `mainnet`, BLS keys, and signing enabled. The isolated lab completed
+all ten checkpoint stages in order:
+
+| Stage | Durable result |
+| --- | --- |
+| Inventory | 9 wallets; complete 1,943-record offer history |
+| Reconcile | Clean authoritative startup reconciliation |
+| Lifecycle | `CANCELLED_PROVEN` |
+| Restart | `RESTART_RECOVERED` |
+| Stale read | `STALE_READ_FROZEN` before mutation |
+| Long gap | `MONOTONIC_GAP_RECOVERED` |
+| Replacement | `REPLACEMENT_LINEAGE_PROVEN`, 3 offers over 2 waves |
+| Fill | `FILLED_PROVEN`, recovered from the exact confirmed self-take |
+| Soak | `SOAK_STABLE`, 3 invariant snapshots |
+| Final reconciliation | `FINAL_RECONCILIATION_CLEAN`, 9 lab intents |
+
+The isolated same-wallet fill consumed the exact registered XCH maker input and
+the independently verified SBX taker input in one transaction. Sage peers
+accepted transaction `dece54534082a2f717273da37c00faa54ff2d75e7d381199d55433fb17d7625f`,
+which confirmed at height `9183928`. Sage's normalized transaction row omitted
+the transaction ID but supplied deterministic spend identity
+`sha256:b751a083fc1c3d8ed64b13cfa42df1f0d066a08c1363b52e451c48b0e1e10e8d`;
+the exact selected-input and requested-receipt proof recorded the fill without
+weakening offer-absence handling.
+
+Sage 0.12.10 signs every locally owned spend during `take_offer`. Passing the
+already signed maker offer back to the same wallet therefore produced a doubled
+maker signature and peer `BAD_AGGREGATE_SIGNATURE` rejection. The lab now
+preserves the canonical maker coin-spend bytes and compression version while
+replacing only the pre-existing aggregate signature with the BLS identity before
+the guarded self-take. Exact wire tests cover this transformation. The corrected
+transaction received successful mempool acknowledgements and confirmed.
+
+The final wallet snapshot reported all XCH and SBX owned balances as selectable,
+no live offer locks, no open local offers, terminal publication state, and zero
+blockers in all six safety categories: operations, submitted cancellations,
+prepared creations, contradictory history, reservations, and publication
+claims. The checkpoint contains bounded redacted evidence only.
+
 ## Automated test results
 
 | Gate | Result | Network evidence |
@@ -36,10 +79,10 @@ the other live/manual API scripts out of collection.
 | Existing cancellation/lifecycle/wallet/offer/coin-prep/startup/Splash/database slice | 722 passed, 370 subtests passed | 0 external attempts |
 | Post-static-cleanup affected slice | 659 passed, 366 subtests passed in 167.56s | 0 external attempts |
 | Final order-reproduction and release-fix slice | 159 passed, 15 subtests passed in 9.76s | 0 external attempts |
-| Final whole repository, CI file-isolated mode | **5,027 passed, 13 skipped, 413 subtests passed in 335.29s** | 226 guard events; 174 loopback; **0 external**; 18 guard loads; 31 guarded child launches |
+| Task 16 whole repository, CI file-isolated mode | 5,027 passed, 13 skipped, 413 subtests passed in 335.29s | 226 guard events; 174 loopback; **0 external**; 18 guard loads; 31 guarded child launches |
+| Post-acceptance whole repository, CI file-isolated mode | **5,091 passed, 13 skipped, 413 subtests passed in 297.40s** | Repository loopback-only guard remained green |
 
-The final whole-repository command completed at
-`2026-08-22T05:03:17.0919190+01:00`:
+The post-acceptance whole-repository command completed on 2026-08-22:
 
 ```text
 python -m pytest tests -q -n 2 --dist=loadfile \
@@ -52,7 +95,8 @@ test file remains within one worker, while module state cannot leak between
 unrelated files. An earlier serial run on the final release-fix source reached
 `5,026 passed` with one late failure caused by an unisolated
 `wallet_sage._CAT_ASSET_ID` test precondition. The test now explicitly isolates
-that global; the 159-test reproduction and final 5,027-test run both pass.
+that global; the 159-test reproduction, Task 16's 5,027-test run, and the final
+post-acceptance 5,091-test run all pass.
 
 The four final warnings are duplicate xdist reports of two known pytest
 collection warnings: helper classes with constructors in `test_coin_prep.py`
@@ -64,7 +108,7 @@ and `test_coin_prep_v2.py` are not test classes.
 - CI-configured Vulture scan — passed:
   `python -m vulture src/catalyst scripts desktop_app.py build.py scripts/vulture_whitelist.py --min-confidence 90`.
 - `python -m bandit -r src --ini .bandit -ll` — passed with zero medium/high
-  findings across 129,136 lines of code.
+  findings across 130,361 lines of code.
 - `git diff --check` — passed.
 
 The verification fixes removed genuine unreachable Chia split and legacy
@@ -75,12 +119,12 @@ repository Vulture whitelist.
 ## Local package verification
 
 `python build.py` completed as a clean PyInstaller build at
-`2026-08-22T04:43:33+01:00`. Post-build checks found the executable and bundled
+`2026-08-22T09:02:30+01:00`. Post-build checks found the executable and bundled
 HTML assets.
 
 - Executable: `dist/Catalyst/Catalyst.exe`
-- Size: 10,573,276 bytes (reported as 10.1 MB)
-- SHA-256: `FD74CD9C51FF942A715C195BE62E14FC30A855BD6F7F5FA504A7CB53A5F11DA3`
+- Size: 10,586,303 bytes (reported as 10.1 MB)
+- SHA-256: `F4C5D7AB566B9AE9EE1E3B0C05773DCC892EE13159A4487A3D8E3369491E2F8B`
 
 The isolated packaged API harness then started that public executable in
 `--flask` mode and passed all of these surfaces:
@@ -132,6 +176,7 @@ weakened to obtain a passing result.
 - PyInstaller emits one non-fatal warning that hidden import
   `importlib_resources.trees` was not found. The build, bundled-asset check, and
   complete packaged API smoke all pass.
-- Live TEST 7 lifecycle, restart, disconnect, long-gap, replacement, genuine
-  fill, soak, and final reconciliation evidence remain Task 17 and require the
-  user's explicit live authorisation.
+- Sage can normalize confirmed transaction rows without a transaction ID and
+  can temporarily omit a consumed offer row. Terminal fill proof therefore uses
+  a unique deterministic spend identity plus exact registered input and receipt
+  flows; absence by itself remains non-terminal.

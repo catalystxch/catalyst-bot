@@ -78,6 +78,53 @@ def test_offer_wire_rejects_noncanonical_padding_and_zlib_boundaries(offer_text)
     assert sage_offer_wire.canonical_sage_offer_text(offer_text) is None
 
 
+def _encode_test_offer(payload: bytes) -> str:
+    data = sage_offer_wire._convertbits(payload, 8, 5, pad=True)
+    checksum_value = (
+        sage_offer_wire._bech32_polymod(
+            sage_offer_wire._bech32_hrp_expand("offer") + data + [0] * 6
+        )
+        ^ sage_offer_wire._BECH32M_CONSTANT
+    )
+    checksum = [(checksum_value >> (5 * (5 - index))) & 31 for index in range(6)]
+    return "offer1" + "".join(
+        sage_offer_wire._CHARSET[value] for value in data + checksum
+    )
+
+
+def test_unsigned_offer_preserves_exact_coin_spends_and_removes_only_signature():
+    from chia_rs import G2Element, SpendBundle
+
+    encoded = sage_offer_wire._decode_offer_bech32(VALID_SAGE_OFFER)
+    version = int.from_bytes(encoded[:2], "big")
+    original = SpendBundle.from_bytes(sage_offer_wire._decompress_offer(encoded))
+    signed = SpendBundle(original.coin_spends, G2Element.generator())
+    compressor = zlib.compressobj(zdict=sage_offer_wire._puzzle_dictionary(version))
+    signed_text = _encode_test_offer(
+        version.to_bytes(2, "big") + compressor.compress(bytes(signed)) + compressor.flush()
+    )
+
+    unsigned_text = sage_offer_wire.unsigned_sage_offer_text(signed_text)
+
+    assert unsigned_text is not None
+    assert unsigned_text != signed_text
+    assert sage_offer_wire.canonical_sage_offer_text(unsigned_text) == unsigned_text
+    unsigned_encoded = sage_offer_wire._decode_offer_bech32(unsigned_text)
+    unsigned = SpendBundle.from_bytes(
+        sage_offer_wire._decompress_offer(unsigned_encoded)
+    )
+    assert [bytes(spend) for spend in unsigned.coin_spends] == [
+        bytes(spend) for spend in signed.coin_spends
+    ]
+    assert bytes(unsigned.aggregated_signature) == bytes(G2Element())
+    assert int.from_bytes(unsigned_encoded[:2], "big") == version
+
+
+@pytest.mark.parametrize("value", [None, "offer1bad", VALID_SAGE_OFFER + " "])
+def test_unsigned_offer_rejects_noncanonical_input(value):
+    assert sage_offer_wire.unsigned_sage_offer_text(value) is None
+
+
 def test_genuine_offer_identity_succeeds_when_full_chia_import_is_blocked(tmp_path):
     code = f"""
 import builtins

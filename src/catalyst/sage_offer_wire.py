@@ -215,6 +215,16 @@ def _decode_offer_bech32(value: str) -> bytes:
     return bytes(_convertbits(data_with_checksum[:-6], 5, 8, pad=False))
 
 
+def _encode_offer_bech32(value: bytes) -> str:
+    data = _convertbits(value, 8, 5, pad=True)
+    checksum_value = (
+        _bech32_polymod(_bech32_hrp_expand("offer") + data + [0] * 6)
+        ^ _BECH32M_CONSTANT
+    )
+    checksum = [(checksum_value >> (5 * (5 - index))) & 31 for index in range(6)]
+    return "offer1" + "".join(_CHARSET[item] for item in data + checksum)
+
+
 def _convertbits(
     data: Iterable[int],
     from_bits: int,
@@ -284,3 +294,36 @@ def canonical_sage_offer_text(value: Any) -> str | None:
     except Exception:
         return None
     return value
+
+
+def unsigned_sage_offer_text(value: Any) -> str | None:
+    """Remove only a canonical Offer's signature for same-wallet taking.
+
+    Sage signs every locally owned spend when taking an offer. If maker and taker
+    are the same wallet, retaining the maker signature makes Sage aggregate that
+    signature twice. This preserves the exact coin-spend bytes and compression
+    version while replacing only the aggregate signature with the BLS identity.
+    Invalid or non-canonical input fails closed.
+    """
+
+    if canonical_sage_offer_text(value) is None:
+        return None
+    try:
+        encoded = _decode_offer_bech32(value)
+        version = int.from_bytes(encoded[:2], "big")
+        from chia_rs import G2Element, SpendBundle
+
+        parsed = SpendBundle.from_bytes(_decompress_offer(encoded))
+        unsigned = SpendBundle(parsed.coin_spends, G2Element())
+        compressor = zlib.compressobj(zdict=_puzzle_dictionary(version))
+        compressed = (
+            version.to_bytes(2, "big")
+            + compressor.compress(bytes(unsigned))
+            + compressor.flush()
+        )
+        result = _encode_offer_bech32(compressed)
+    except Exception:
+        return None
+    if len(result) > _MAX_ENCODED_OFFER_LENGTH:
+        return None
+    return result if canonical_sage_offer_text(result) == result else None

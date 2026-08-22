@@ -56,8 +56,8 @@ _EXPIRED_STATUSES = frozenset({5, "expired"})
 _TERMINAL_STATUSES = _FILLED_STATUSES | _CANCELLED_STATUSES | _EXPIRED_STATUSES
 _MAX_EVIDENCE_AGE_SECONDS = 300
 _MAX_SOURCE_SKEW_SECONDS = 60
-_MAX_HISTORY_RECORDS = 1000
-_MAX_HISTORY_PAGE_SIZE = 1000
+_MAX_HISTORY_RECORDS = 4096
+_MAX_HISTORY_PAGE_SIZE = 4096
 _MAX_HISTORY_PAGES = 20
 _MAX_WALLET_IDS = 64
 _MAX_SELECTED_COINS = 256
@@ -832,7 +832,14 @@ def _exact_transaction(
     ]
     if len(matches) != 1:
         return None
-    tx = matches[0]
+    return _exact_confirmed_transaction(matches[0])
+
+
+def _exact_confirmed_transaction(tx: Any) -> dict[str, Any] | None:
+    """Validate one complete confirmed transaction, including Sage ID-less rows."""
+
+    if type(tx) is not dict:
+        return None
     if (
         tx.get("confirmed") is not True
         or _positive_int(tx.get("confirmed_height")) is None
@@ -842,6 +849,8 @@ def _exact_transaction(
     if spend_identity is not None and (
         type(spend_identity) is not str or not spend_identity
     ):
+        return None
+    if not _hex_id(tx.get("transaction_id")) and spend_identity is None:
         return None
     if not _is_canonical_utc_text(tx.get("timestamp")):
         return None
@@ -901,7 +910,7 @@ def _fill_proof(
         return None
     if any(flow[1] != offered_asset for flow in selected_flows):
         return None
-    if sum(flow[2] for flow in selected_flows) != intent["offered_amount"]:
+    if sum(flow[2] for flow in selected_flows) < intent["offered_amount"]:
         return None
     for flow in selected_flows:
         record = coins.get(flow[0])
@@ -927,7 +936,7 @@ def _fill_proof(
     ):
         return None
     return {
-        "transaction_id": tx["transaction_id"],
+        "transaction_id": _hex_id(tx.get("transaction_id")) or None,
         "spend_identity": tx.get("spend_identity"),
         "block_height": tx["confirmed_height"],
         "filled_at": tx["timestamp"],
@@ -1144,13 +1153,16 @@ def _cancel_proof(
         if not _offer_summary_matches(member_intent, matching[0]):
             return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
         observed_selected = matching[0].get("selected_coin_ids")
-        if (
+        if observed_selected is not None and (
             type(observed_selected) is not list
             or len(observed_selected) > _MAX_SELECTED_COINS
             or {_hex_id(value) for value in observed_selected} != selected
         ):
             return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
-        if _hex_id(matching[0].get("transaction_id")) != _hex_id(tx["transaction_id"]):
+        observed_transaction_id = _hex_id(matching[0].get("transaction_id"))
+        if observed_transaction_id and observed_transaction_id != _hex_id(
+            tx["transaction_id"]
+        ):
             return None
     if expected_offer_inputs & set(auxiliary):
         return None
@@ -1169,7 +1181,7 @@ def _cancel_proof(
         member_flows = [spent_by_id[coin_id] for coin_id in selected]
         if any(flow[1] != offered_asset for flow in member_flows) or sum(
             flow[2] for flow in member_flows
-        ) != int(member["offered_amount_atomic"]):
+        ) < int(member["offered_amount_atomic"]):
             return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
     for coin_id, flow in spent_by_id.items():
         record = coins.get(coin_id)
@@ -1178,6 +1190,7 @@ def _cancel_proof(
         offer_id = _norm_id(record.get("offer_id"))
         if (
             coin_id in expected_offer_inputs
+            and offer_id
             and offer_id != expected_trade_by_coin[coin_id]
         ):
             return {"_conflict_reason": "CANCEL_COHORT_MEMBER_CONTRADICTION"}
@@ -1261,7 +1274,7 @@ def _cancel_proof(
             return None
     target_ids = set(intent["selected_coin_ids"])
     return {
-        "transaction_id": tx["transaction_id"],
+        "transaction_id": _hex_id(tx.get("transaction_id")) or None,
         "spend_identity": tx.get("spend_identity"),
         "block_height": tx["confirmed_height"],
         "fee_mojos": fee,
@@ -1297,7 +1310,7 @@ def _selected_inputs_are_exactly_owned_and_linked(
         ):
             return False
         selected_total += amount
-    return selected_total == intent["offered_amount"]
+    return selected_total >= intent["offered_amount"]
 
 
 def _classify_terminal_evidence(
@@ -1361,7 +1374,31 @@ def _classify_terminal_evidence(
         and _hex_id(_first_present(row, "trade_id", "offer_id"))
         == exact_intent["sage_trade_id"]
     ]
+    candidate_fills: list[dict[str, Any]] = []
+    for row in transactions:
+        candidate = _exact_confirmed_transaction(row)
+        if candidate is None:
+            continue
+        candidate_time = _parse_utc(candidate.get("timestamp"))
+        if (
+            candidate_time is None
+            or candidate_time < exact_intent["offer_created_at"]
+            or candidate_time > observed_now
+        ):
+            continue
+        proof = _fill_proof(exact_intent, {}, candidate, coins)
+        if proof is not None:
+            candidate_fills.append(proof)
+    if len(candidate_fills) > 1:
+        return _conflict("DUPLICATE_FILL_TRANSACTION_PROOF")
+    candidate_fill = candidate_fills[0] if candidate_fills else None
     if not matches:
+        if candidate_fill is not None:
+            return {
+                "classification": FILLED_PROVEN,
+                "reason_code": "EXACT_FILL_PROOF_WITHOUT_OFFER_ROW",
+                **candidate_fill,
+            }
         return _unknown("OFFER_ABSENCE_NOT_PROOF")
     if len(matches) != 1:
         return _conflict("DUPLICATE_OFFER_IDENTITY")
@@ -1390,12 +1427,47 @@ def _classify_terminal_evidence(
             return _unknown("FILL_PREDATES_OFFER")
         if tx_time is not None and tx_time > observed_now:
             return _unknown("TRANSACTION_TIME_OUTSIDE_EVIDENCE_WINDOW")
-    fill = _fill_proof(exact_intent, offer, tx, coins) if tx is not None else None
-    cancel = (
-        _cancel_proof(exact_intent, offer_rows, tx, coins, cancel_context)
-        if tx is not None and cancel_context is not None
-        else None
+    fill = (
+        _fill_proof(exact_intent, offer, tx, coins)
+        if tx is not None
+        else candidate_fill
     )
+    cancel_candidates: list[dict[str, Any]] = []
+    if cancel_context is not None:
+        candidate_transactions = (
+            [tx]
+            if tx is not None
+            else [
+                candidate
+                for row in transactions
+                if (candidate := _exact_confirmed_transaction(row)) is not None
+            ]
+        )
+        cancel_candidates = [
+            proof
+            for candidate in candidate_transactions
+            if (
+                proof := _cancel_proof(
+                    exact_intent,
+                    offer_rows,
+                    candidate,
+                    coins,
+                    cancel_context,
+                )
+            )
+            is not None
+        ]
+    conflicts = [
+        proof for proof in cancel_candidates if proof.get("_conflict_reason")
+    ]
+    exact_cancels = [
+        proof for proof in cancel_candidates if not proof.get("_conflict_reason")
+    ]
+    if conflicts:
+        return _conflict(conflicts[0]["_conflict_reason"])
+    if len(exact_cancels) > 1:
+        return _conflict("DUPLICATE_CANCEL_TRANSACTION_PROOF")
+    cancel = exact_cancels[0] if exact_cancels else None
     if cancel is not None and cancel.get("_conflict_reason"):
         return _conflict(cancel["_conflict_reason"])
     if status in _FILLED_STATUSES and cancel is not None:
@@ -1538,7 +1610,7 @@ def load_sage_offer_history(
     clock: Callable[[], Any] | None = None,
     page_size: int = 50,
     max_pages: int = 20,
-    max_records: int = 1000,
+    max_records: int = _MAX_HISTORY_RECORDS,
 ) -> dict[str, Any]:
     """Read bounded Sage offer pages and normalize ignored filters locally."""
 
@@ -1727,6 +1799,8 @@ def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
     raw_height = row.get("confirmed_height")
     if raw_height is None:
         raw_height = row.get("confirmed_at_height")
+    if raw_height is None:
+        raw_height = row.get("height")
     height_text = _atomic_text(raw_height)
     confirmed_height = int(height_text) if height_text else None
     raw_timestamp = row.get("timestamp")
@@ -1753,10 +1827,44 @@ def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
         if type(raw_created) is list
         else None
     )
+    confirmed = bool(
+        row.get("confirmed") is True
+        or (
+            "confirmed" not in row
+            and type(confirmed_height) is int
+            and confirmed_height > 0
+        )
+    )
+    if (
+        transaction_id == ""
+        and spend_identity is None
+        and confirmed
+        and type(timestamp) is str
+        and type(spent) is list
+        and spent
+        and type(created) is list
+        and all(type(flow) is dict for flow in (*spent, *created))
+    ):
+        identity_payload = {
+            "schema_version": 1,
+            "confirmed_height": confirmed_height,
+            "timestamp": timestamp,
+            "spent": sorted(spent, key=lambda flow: flow["coin_id"]),
+            "created": sorted(created, key=lambda flow: flow["coin_id"]),
+        }
+        spend_identity = "sha256:" + hashlib.sha256(
+            json.dumps(
+                identity_payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     return {
         "transaction_id": transaction_id,
         "spend_identity": spend_identity,
-        "confirmed": row.get("confirmed") is True,
+        "confirmed": confirmed,
         "confirmed_height": confirmed_height,
         "timestamp": timestamp,
         "spent": spent,
@@ -1941,7 +2049,7 @@ def load_authoritative_evidence(
     wallet_ids: tuple[int, ...] = (1,),
     page_size: int = 50,
     max_pages: int = 20,
-    max_records: int = 1000,
+    max_records: int = _MAX_HISTORY_RECORDS,
 ) -> dict[str, Any]:
     """Collect all read-only wallet evidence before any database transaction."""
 
@@ -1968,6 +2076,13 @@ def load_authoritative_evidence(
         raise ValueError("authoritative loader bounds exceed hard limits")
     if wallet_facade is None:
         import wallet as wallet_facade
+    try:
+        backend_reader = getattr(wallet_facade, "get_wallet_backend_authority")
+        wallet_backend = backend_reader()
+    except BaseException:
+        wallet_backend = None
+    if wallet_backend not in {None, "sage", "chia"}:
+        wallet_backend = None
     collection_started_at = _clock_utc(clock)
     try:
         identity_reader = getattr(wallet_facade, "get_wallet_identity")
@@ -2017,7 +2132,9 @@ def load_authoritative_evidence(
     network = identity.get("network_id") if identity_valid else None
 
     try:
-        offer_reader = getattr(wallet_facade, "get_all_offers")
+        offer_reader = getattr(wallet_facade, "get_authoritative_offer_history", None)
+        if not callable(offer_reader):
+            offer_reader = getattr(wallet_facade, "get_all_offers")
     except BaseException:
         offer_reader = None
 
@@ -2090,6 +2207,18 @@ def load_authoritative_evidence(
     else:
         raw_coins = raw_coin_result
     normalized_coins: dict[str, dict[str, Any]] = {}
+    transaction_flows_by_coin: dict[str, list[dict[str, Any]]] = {}
+    for transaction in transactions["records"]:
+        for flow_name in ("spent", "created"):
+            flows = transaction.get(flow_name)
+            if type(flows) is not list:
+                continue
+            for flow in flows:
+                if type(flow) is not dict:
+                    continue
+                coin_id = _hex_id(flow.get("coin_id"))
+                if coin_id:
+                    transaction_flows_by_coin.setdefault(coin_id, []).append(flow)
     if type(raw_coins) is not dict and coin_error is None:
         coin_error = "reader_malformed"
     elif type(raw_coins) is dict and len(raw_coins) > _MAX_COIN_RECORDS:
@@ -2119,6 +2248,22 @@ def load_authoritative_evidence(
                     continue
                 record = dict(raw_record)
                 record["coin_id"] = coin_id
+                if wallet_backend == "sage":
+                    # Sage's targeted coin endpoint is wallet-owned by
+                    # contract but omits the redundant ownership flag. Asset
+                    # identity is recovered only when every exact transaction
+                    # flow for this coin agrees with the coin's amount.
+                    record.setdefault("owned", True)
+                    if "asset_id" not in record:
+                        matching_assets = {
+                            flow.get("asset_id")
+                            for flow in transaction_flows_by_coin.get(coin_id, [])
+                            if flow.get("amount") == record.get("amount")
+                            and type(flow.get("asset_id")) is str
+                            and flow["asset_id"]
+                        }
+                        if len(matching_assets) == 1:
+                            record["asset_id"] = next(iter(matching_assets))
                 normalized_coins[coin_id] = record
         except _SourceLimitError:
             normalized_coins = {}
@@ -2759,6 +2904,158 @@ def drain_offer_fill_hook_outbox(*, limit: int = 32) -> dict[int, dict[str, str]
     return drained
 
 
+def _derive_single_cancel_context(
+    intent: dict[str, Any],
+    evidence: Any,
+    *,
+    database_module: Any,
+    observed_at: str,
+) -> dict[str, Any] | None:
+    """Bind an ID-less Sage cancel transaction to one durable Task 8 claim.
+
+    This compatibility path is intentionally limited to one cancellation
+    member. Grouped cancellation continues to require its explicit manifest.
+    Every candidate is run through the same pure exact-proof classifier before
+    it can become context for the transactional commit.
+    """
+
+    exact_intent = _exact_intent(intent)
+    if exact_intent is None or type(evidence) is not dict:
+        return None
+    operation_id = f"cancel:{exact_intent['sage_trade_id']}"
+    try:
+        events = database_module.get_offer_operation_events(operation_id)
+    except BaseException:
+        return None
+    if type(events) is not list or not events:
+        return None
+    attempts = [
+        event.get("attempt")
+        for event in events
+        if type(event) is dict and type(event.get("attempt")) is int
+    ]
+    if not attempts:
+        return None
+    attempt = max(attempts)
+    members = [
+        event
+        for event in events
+        if type(event) is dict and event.get("attempt") == attempt
+    ]
+    prepared_rows = [event for event in members if event.get("phase") == "PREPARED"]
+    finalized_rows = [event for event in members if event.get("phase") == "FINALIZED"]
+    if len(prepared_rows) != 1 or len(finalized_rows) != 1:
+        return None
+    prepared = prepared_rows[0]
+    finalized = finalized_rows[0]
+    if (
+        prepared.get("outcome") != "PREPARED"
+        or prepared.get("blocks_mutation") != 1
+        or finalized.get("outcome")
+        not in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+        or finalized.get("blocks_mutation") != 1
+    ):
+        return None
+    try:
+        prepared_evidence = json.loads(prepared["evidence_json"])
+        finalized_evidence = json.loads(finalized["evidence_json"])
+        effect_claim = database_module.get_offer_cancel_effect_claim(
+            operation_id=operation_id,
+            attempt=attempt,
+        )
+    except BaseException:
+        return None
+    if (
+        type(prepared_evidence) is not dict
+        or type(finalized_evidence) is not dict
+        or finalized_evidence.get("effect_attempted") is not True
+    ):
+        return None
+    cohort_id = prepared_evidence.get("cohort_id")
+    member_id = prepared_evidence.get("member_id")
+    if (
+        type(cohort_id) is not str
+        or not cohort_id
+        or type(member_id) is not str
+        or not member_id
+    ):
+        return None
+    exact_effect_claim = bool(
+        type(effect_claim) is dict
+        and effect_claim.get("prepared_event_id") == prepared.get("event_id")
+    )
+    legacy_single_effect = bool(
+        effect_claim is None
+        and prepared_evidence.get("effect_claim_protocol") is None
+        and prepared_evidence.get("cohort_size") in (None, 1)
+        and prepared_evidence.get("trade_id") == exact_intent["sage_trade_id"]
+        and prepared_evidence.get("intent_id") == intent.get("intent_id")
+        and prepared_evidence.get("operation_id") == operation_id
+        and finalized_evidence.get("trade_id") == exact_intent["sage_trade_id"]
+        and finalized_evidence.get("cohort_id") == cohort_id
+        and finalized_evidence.get("member_id") == member_id
+        and prepared["request_timestamp"]
+        <= finalized["request_timestamp"]
+        <= observed_at
+    )
+    if not exact_effect_claim and not legacy_single_effect:
+        return None
+    transaction_source = evidence.get("transaction_history")
+    transactions = (
+        _transaction_rows(transaction_source)
+        if type(transaction_source) is dict
+        else None
+    )
+    if transactions is None:
+        return None
+    selected = set(exact_intent["selected_coin_ids"])
+    contexts: list[dict[str, Any]] = []
+    for row in transactions:
+        transaction = _exact_confirmed_transaction(row)
+        if transaction is None:
+            continue
+        spent_ids = {
+            flow[0]
+            for entry in transaction["spent"]
+            if (flow := _flow(entry)) is not None
+        }
+        if spent_ids != selected:
+            continue
+        context = {
+            "cohort_id": cohort_id,
+            "manifest_sha256": prepared["evidence_sha256"],
+            "members": [
+                {
+                    "intent_id": intent["intent_id"],
+                    "trade_id": exact_intent["sage_trade_id"],
+                    "member_id": member_id,
+                    "prepared_event_id": prepared["event_id"],
+                    "selected_coin_ids": sorted(selected),
+                    "request_timestamp": prepared["request_timestamp"],
+                    "transaction_timestamp": transaction["timestamp"],
+                    "asset_id": exact_intent["asset_id"],
+                    "side": exact_intent["side"],
+                    "offered_amount_atomic": str(exact_intent["offered_amount"]),
+                    "requested_amount_atomic": str(exact_intent["requested_amount"]),
+                    "offer_text_sha256": exact_intent["offer_text_sha256"],
+                    "transaction_id": _hex_id(transaction.get("transaction_id"))
+                    or None,
+                    "spend_identity": transaction.get("spend_identity"),
+                }
+            ],
+            "auxiliary_coin_ids": [],
+        }
+        proof = _classify_terminal_evidence(
+            intent,
+            evidence,
+            cancel_context=context,
+            now=observed_at,
+        )
+        if proof.get("classification") == CANCELLED_PROVEN:
+            contexts.append(context)
+    return contexts[0] if len(contexts) == 1 else None
+
+
 def reconcile_offer(
     intent_id: str,
     *,
@@ -2785,6 +3082,13 @@ def reconcile_offer(
     else:
         observed_at = _canonical_utc(datetime.now(timezone.utc) if now is None else now)
         collected = evidence
+    if cancel_context is None:
+        cancel_context = _derive_single_cancel_context(
+            intent,
+            collected,
+            database_module=database,
+            observed_at=observed_at,
+        )
     result = classify_terminal_evidence(
         intent,
         collected,

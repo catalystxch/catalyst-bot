@@ -491,6 +491,15 @@ def test_failed_cancel_restores_prior_active_lifecycle_and_authorizes_next_attem
     assert coin["status"] == "locked"
     assert coin["trade_id"] == TRADE_ID
     assert first_claim["effect_claimed"] is True
+    assert database.get_offer_cancel_effect_claim(
+        operation_id=OPERATION_ID,
+        attempt=1,
+    ) == {
+        "operation_id": OPERATION_ID,
+        "attempt": 1,
+        "prepared_event_id": f"{OPERATION_ID}:attempt:1:prepared",
+        "claimed_at": "2026-08-16T12:00:00.000000Z",
+    }
 
     second_claim = _prepare_cancel(
         attempt=2,
@@ -499,6 +508,15 @@ def test_failed_cancel_restores_prior_active_lifecycle_and_authorizes_next_attem
     )
 
     assert second_claim["effect_claimed"] is True
+    assert database.get_offer_cancel_effect_claim(
+        operation_id=OPERATION_ID,
+        attempt=2,
+    ) == {
+        "operation_id": OPERATION_ID,
+        "attempt": 2,
+        "prepared_event_id": f"{OPERATION_ID}:attempt:2:prepared",
+        "claimed_at": "2026-08-16T12:00:02.000000Z",
+    }
     assert second_claim["event"]["event_id"] == (f"{OPERATION_ID}:attempt:2:prepared")
     assert [
         (event["attempt"], event["phase"], event["outcome"])

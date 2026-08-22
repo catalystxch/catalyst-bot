@@ -4448,6 +4448,52 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     return normalized
 
 
+def get_authoritative_offer_history(
+    include_completed: bool = True, start: int = 0, end: int = 50
+):
+    """Return Sage's unfiltered local offer table with explicit end authority.
+
+    Sage's ``GetOffers`` request has no pagination fields and its implementation
+    reads ``wallet.db.offers(None)``. The compatibility parameters are retained
+    for the common wallet facade, but the returned list is the complete local
+    table rather than one requested page.
+    """
+
+    offers = get_all_offers(
+        include_completed=include_completed,
+        start=start,
+        end=end,
+    )
+    if type(offers) is not list:
+        return {
+            "success": False,
+            "offers": [],
+            "total": 0,
+            "end_of_history": False,
+        }
+    if any(type(offer) is not dict for offer in offers):
+        return {
+            "success": False,
+            "offers": [],
+            "total": 0,
+            "end_of_history": False,
+        }
+    bounded_offers = [
+        {
+            key: value
+            for key, value in offer.items()
+            if key not in {"offer", "offer_bech32"}
+        }
+        for offer in offers
+    ]
+    return {
+        "success": True,
+        "offers": bounded_offers,
+        "total": len(bounded_offers),
+        "end_of_history": True,
+    }
+
+
 def _normalize_sage_summary(sage_summary: dict) -> dict:
     """Convert Sage's maker/taker summary format to Chia's offered/requested.
 

@@ -776,6 +776,67 @@ def test_exact_bidirectional_parent_child_lineage_is_required():
     assert allowed.allowed is True
 
 
+def test_create_allows_one_exact_prepared_child_before_post_create_binding():
+    """The child claims its parent before the reverse edge can be committed."""
+
+    parent = record(state=RegistryState.VISIBLE, child_intent_id=None)
+    child = record(
+        intent_id="intent-child",
+        state=RegistryState.PREPARED,
+        trade_id=None,
+        offer_hash=None,
+        parent_intent_id=parent.intent_id,
+        generation=2,
+    )
+    allowed = authorize_mutation(
+        RegistrySnapshot((parent, child)),
+        request(
+            MutationKind.CREATE,
+            ref=OfferReference(intent_id=child.intent_id),
+        ),
+    )
+
+    assert allowed.allowed is True
+
+    sibling = record(
+        intent_id="intent-sibling",
+        state=RegistryState.PREPARED,
+        trade_id=None,
+        offer_hash=None,
+        parent_intent_id=parent.intent_id,
+        generation=2,
+        selected_coin_ids=(OTHER_COIN,),
+    )
+    denied = authorize_mutation(
+        RegistrySnapshot((parent, child, sibling)),
+        request(
+            MutationKind.CREATE,
+            ref=OfferReference(intent_id=child.intent_id),
+        ),
+    )
+
+    assert denied.code is AuthorizationCode.INVALID_LINEAGE
+
+    failed_prior_child = record(
+        intent_id="intent-failed-child",
+        state=RegistryState.TERMINAL,
+        trade_id=None,
+        offer_hash=None,
+        parent_intent_id=parent.intent_id,
+        generation=2,
+        selected_coin_ids=(OTHER_COIN,),
+    )
+    recovered = authorize_mutation(
+        RegistrySnapshot((parent, failed_prior_child, child)),
+        request(
+            MutationKind.CREATE,
+            ref=OfferReference(intent_id=child.intent_id),
+        ),
+    )
+
+    assert recovered.allowed is True
+
+
 def test_lineage_rejects_unlisted_siblings_and_terminal_parents():
     """Catches a second child claim or replacement of a retired parent."""
 
@@ -806,16 +867,60 @@ def test_lineage_rejects_unlisted_siblings_and_terminal_parents():
     retired_parent = record(
         child_intent_id="intent-child", state=RegistryState.TERMINAL
     )
+    uncreated_child = record(
+        intent_id="intent-child",
+        state=RegistryState.PREPARED,
+        parent_intent_id=retired_parent.intent_id,
+        generation=2,
+        trade_id=None,
+        offer_hash=None,
+    )
     assert (
         authorize_mutation(
-            RegistrySnapshot((retired_parent, child)),
+            RegistrySnapshot((retired_parent, uncreated_child)),
             request(
                 MutationKind.CREATE,
-                ref=OfferReference(intent_id=child.intent_id),
+                ref=OfferReference(intent_id=uncreated_child.intent_id),
             ),
         ).code
         is AuthorizationCode.INVALID_LINEAGE
     )
+
+
+def test_terminal_parent_allows_recovery_of_already_created_child():
+    """A proven-retired parent must not strand its already-live successor."""
+
+    parent = record(child_intent_id="intent-child", state=RegistryState.TERMINAL)
+    child = record(
+        intent_id="intent-child",
+        state=RegistryState.VISIBLE,
+        parent_intent_id=parent.intent_id,
+        generation=2,
+        trade_id="1" * 64,
+        offer_hash="2" * 64,
+    )
+    snapshot = RegistrySnapshot((parent, child))
+    child_ref = OfferReference(intent_id=child.intent_id)
+
+    cancel = authorize_mutation(
+        snapshot,
+        request(MutationKind.CANCEL, ref=child_ref),
+    )
+    replace = authorize_mutation(
+        snapshot,
+        request(MutationKind.REPLACE, ref=child_ref),
+    )
+    checkpoint = authorize_transition(
+        snapshot,
+        child_ref,
+        RegistryState.CANCEL_REQUESTED,
+        WALLET,
+        NETWORK,
+    )
+
+    assert cancel.allowed is True
+    assert replace.allowed is True
+    assert checkpoint.allowed is True
 
 
 def test_cancel_requested_parent_remains_live_for_staged_child_reconciliation():

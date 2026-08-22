@@ -1145,6 +1145,18 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     return offers_list
 
 
+def get_authoritative_offer_history(
+    include_completed: bool = True, start: int = 0, end: int = 50
+):
+    """Use Chia's bounded offer page through the shared history-loader contract."""
+
+    return get_all_offers(
+        include_completed=include_completed,
+        start=start,
+        end=end,
+    )
+
+
 def get_offer_bech32(trade_id: str) -> str:
     """Get the bech32 offer string for a specific trade_id.
 

@@ -76,6 +76,7 @@ _ALLOWED_REASON_CODES = frozenset(
         "MUTATION_SHUTTING_DOWN",
         "OPERATION_UNKNOWN",
         "RECONCILIATION_REQUIRED",
+        "RUNTIME_DISCONTINUITY",
         "UNRESOLVED_OPERATIONS",
         "WORKER_DELEGATION_INVALID",
         "WORKER_PARENT_LEASE_INVALID",
@@ -105,6 +106,7 @@ _REASON_DESCRIPTIONS = {
     "MUTATION_SHUTTING_DOWN": "Mutation runtime is shutting down",
     "OPERATION_UNKNOWN": "Operation outcome requires reconciliation",
     "RECONCILIATION_REQUIRED": "Authoritative reconciliation is required",
+    "RUNTIME_DISCONTINUITY": "Runtime clock discontinuity requires recovery",
     "UNRESOLVED_OPERATIONS": "Unresolved operation journal entries block mutation",
     "WORKER_DELEGATION_INVALID": "Worker mutation delegation is invalid",
     "WORKER_PARENT_LEASE_INVALID": "Worker parent lease is no longer valid",
@@ -636,6 +638,106 @@ def _is_exact_prepared_operation_blocker(
             or "effect_claim_protocol" not in single_evidence
         ):
             return True
+        if "cohort_size" not in single_evidence:
+            required_single_evidence_keys = {
+                "trade_id",
+                "intent_id",
+                "operation_id",
+                "attempt",
+                "cohort_id",
+                "member_id",
+                "reason",
+                "continuation_journal_sha256",
+                "wallet_effect",
+                "effect_claim_protocol",
+            }
+            if frozenset(single_evidence) not in {
+                frozenset(required_single_evidence_keys),
+                frozenset(required_single_evidence_keys | {"prior_lifecycle_state"}),
+            }:
+                return False
+            try:
+                trade_id = single_evidence["trade_id"]
+                attempt = single_evidence["attempt"]
+                cohort_id = single_evidence["cohort_id"]
+                reason = single_evidence["reason"]
+                continuation_digest = single_evidence[
+                    "continuation_journal_sha256"
+                ]
+                wallet_identity = json.loads(blocker["wallet_identity_json"])
+                if (
+                    type(trade_id) is not str
+                    or len(trade_id) != 64
+                    or trade_id.lower() != trade_id
+                    or type(attempt) is not int
+                    or isinstance(attempt, bool)
+                    or attempt < 1
+                    or single_evidence["intent_id"] != intent_id
+                    or single_evidence["operation_id"] != operation_id
+                    or operation_id != f"cancel:{trade_id}"
+                    or blocker["attempt"] != attempt
+                    or type(reason) is not str
+                    or not 1 <= len(reason) <= 128
+                    or type(continuation_digest) is not str
+                    or len(continuation_digest) != 64
+                    or continuation_digest.lower() != continuation_digest
+                    or type(wallet_identity) is not dict
+                    or wallet_identity.get("snapshot_sha256")
+                    != continuation_digest
+                    or single_evidence["effect_claim_protocol"]
+                    != "durable_cohort_claim_v1"
+                    or single_evidence["wallet_effect"]
+                    != {"secure": True, "timeout": 60, "fee_mojos": None}
+                    or (
+                        "prior_lifecycle_state" in single_evidence
+                        and (
+                            type(single_evidence["prior_lifecycle_state"]) is not str
+                            or not single_evidence["prior_lifecycle_state"]
+                            or single_evidence["prior_lifecycle_state"]
+                            in {"cancel_requested", "cancel_sent", "mempool_observed"}
+                        )
+                    )
+                ):
+                    return False
+                bytes.fromhex(trade_id)
+                bytes.fromhex(continuation_digest)
+                expected_cohort_id = (
+                    "cancel-cohort:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            [trade_id], sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
+                expected_member_id = (
+                    "cancel-member:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            {
+                                "attempt": attempt,
+                                "cohort_id": expected_cohort_id,
+                                "operation_id": operation_id,
+                                "trade_id": trade_id,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
+                if (
+                    cohort_id != expected_cohort_id
+                    or single_evidence["member_id"] != expected_member_id
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            return (
+                database.get_offer_cancel_effect_claim(
+                    operation_id=operation_id,
+                    attempt=attempt,
+                )
+                is not None
+            )
     if operation_type != "CANCEL":
         return False
 
@@ -1285,6 +1387,98 @@ class MutationGate:
                 return result
             except Exception:
                 self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                result = {
+                    "acquired": False,
+                    "reason": "durable_state_unavailable",
+                }
+                self.last_acquire_result = result
+                return result
+
+    @_stop_callback_boundary
+    def acquire_recovery_successor(self, recovery_epoch: Any) -> dict[str, Any]:
+        """Acquire only as an append-only successor to one frozen recovery."""
+
+        with self._lock:
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                return {"acquired": False, "reason": "active_wallet_mutations"}
+            try:
+                if (
+                    type(recovery_epoch) is not dict
+                    or recovery_epoch.get("wallet_fingerprint_hash")
+                    != self.wallet_fingerprint_hash
+                    or recovery_epoch.get("network") != self.network
+                    or type(recovery_epoch.get("recovery_id")) is not str
+                ):
+                    return {
+                        "acquired": False,
+                        "reason": "recovery_binding_mismatch",
+                    }
+                authorization = self._authorization_snapshot()
+                current = authorization.get("lease")
+                latch = authorization.get("latch")
+                if type(current) is not dict or type(latch) is not dict:
+                    raise ValueError("runtime recovery authority is unavailable")
+                if (
+                    latch.get("state") != "tripped"
+                    or int(latch.get("generation") or -1)
+                    != int(recovery_epoch.get("latch_generation") or -2)
+                    or _decode_blockers(latch)
+                    != (str(recovery_epoch.get("blocker_id") or ""),)
+                ):
+                    return {
+                        "acquired": False,
+                        "reason": "recovery_latch_mismatch",
+                        "lease": current,
+                    }
+                now = self._now()
+                prior_dead = False
+                if bool(current.get("active")) and current.get(
+                    "owner_run_id"
+                ) != self.run_id:
+                    if _as_utc(current.get("expires_at")) > now:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_recovery_owner_active",
+                            "lease": current,
+                        }
+                    prior_dead = self._pid_liveness(
+                        int(current.get("owner_pid") or 0),
+                        str(current.get("owner_host") or ""),
+                    ) is False
+                    if not prior_dead:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_owner_liveness_unproven",
+                            "lease": current,
+                        }
+                adopted = database.adopt_runtime_recovery_epoch(
+                    recovery_id=recovery_epoch["recovery_id"],
+                    successor_owner_run_id=self.run_id,
+                    successor_owner_pid=self.owner_pid,
+                    successor_owner_host=self.owner_host,
+                    wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+                    network=self.network,
+                    lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    expected_lease_version=int(current["lease_version"]),
+                    prior_owner_liveness_proven_dead=prior_dead,
+                    now=now,
+                )
+                result = {
+                    "acquired": adopted.get("adopted") is True,
+                    "reason": adopted.get("reason") or "recovery_adoption_failed",
+                    "lease": adopted.get("lease"),
+                    "recovery_takeover": adopted.get("record"),
+                }
+                if result["acquired"]:
+                    lease = result["lease"]
+                    self._lease_version = int(lease["lease_version"])
+                    self._lease_acquired_at = str(lease.get("acquired_at") or "")
+                    self._read_only = False
+                    if not _rotate_owner_identity_authority(self):
+                        self._set_local_block("WALLET_IDENTITY_BINDING_INVALID")
+                self.last_acquire_result = _lease_public_result(result)
+                return self.last_acquire_result
+            except Exception:
                 result = {
                     "acquired": False,
                     "reason": "durable_state_unavailable",

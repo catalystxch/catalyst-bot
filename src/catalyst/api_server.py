@@ -1761,7 +1761,10 @@ def _run_stability_startup_check(name: str, **context) -> dict:
                 and lease.get("wallet_fingerprint_hash")
                 == recovery_epoch.get("wallet_fingerprint_hash")
                 and lease.get("network") == recovery_epoch.get("network")
-                and recovery_epoch.get("owner_run_id") == runtime.run_id
+                and context.get(
+                    "recovery_owner_run_id", recovery_epoch.get("owner_run_id")
+                )
+                == runtime.run_id
             )
             if exact_current_owner:
                 return _startup_check_result(
@@ -1958,6 +1961,114 @@ def _run_stability_startup_check(name: str, **context) -> dict:
     )
 
 
+def _read_distinct_wallet_identity_snapshots(reader: Any) -> tuple[Any, Any]:
+    """Boundedly avoid equal timestamp observations on coarse Windows clocks."""
+
+    first = reader()
+    first_observed = (
+        first.get("observed_at_utc") if type(first) is dict else None
+    )
+    second = reader()
+    for _attempt in range(4):
+        second_observed = (
+            second.get("observed_at_utc") if type(second) is dict else None
+        )
+        if (
+            type(first_observed) is not str
+            or not first_observed
+            or second_observed != first_observed
+        ):
+            break
+        time.sleep(0.002)
+        second = reader()
+    return first, second
+
+
+def _complete_runtime_recovery_epoch(
+    runtime: Any,
+    epoch: dict[str, Any],
+    *,
+    recovery_owner_run_id: Optional[str] = None,
+) -> dict:
+    """Run and promote the ordered checks for one already-frozen epoch."""
+
+    global _stability_startup_status
+    wallet_hash, network = _configured_mutation_binding()
+    binding = runtime.wallet_identity_binding
+    try:
+        from wallet import get_wallet_identity
+
+        first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
+            get_wallet_identity
+        )
+    except Exception:
+        first_identity = None
+        second_identity = None
+    state: dict[str, Any] = {}
+    checks: list[dict] = []
+    for check_name in _STABILITY_STARTUP_CHECKS:
+        check = _run_stability_startup_check(
+            check_name,
+            state=state,
+            runtime=runtime,
+            recovery_epoch=epoch,
+            recovery_owner_run_id=(
+                recovery_owner_run_id
+                if recovery_owner_run_id is not None
+                else epoch.get("owner_run_id")
+            ),
+            wallet_identity_binding=binding,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            cached_wallet_identity_snapshot=first_identity,
+            cached_wallet_identity_revalidation_snapshot=second_identity,
+        )
+        recorded = {"name": check_name, **check}
+        checks.append(recorded)
+        if check.get("ok") is not True:
+            result = _blocked_startup_recovery_status(
+                check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
+                check_name,
+                checks,
+                runtime,
+            )
+            result["blocker_counts"] = dict(check.get("blocker_counts") or {})
+            _stability_startup_status = _redacted_startup_status(result)
+            return result
+    try:
+        initial = state["initial_snapshot"]
+        database.record_runtime_recovery_pass(
+            recovery_id=epoch["recovery_id"],
+            expected_latch_generation=int(epoch["latch_generation"]),
+            authority_digest=initial["authority_digest"],
+            checks=checks,
+            passed_at=datetime.now(timezone.utc),
+        )
+        rotate = getattr(mutation_gate, "_rotate_owner_identity_authority", None)
+        if not callable(rotate) or rotate(runtime) is not True:
+            raise RuntimeError("mutation authority rotation unavailable")
+        released = runtime.release_resolved(
+            int(epoch["latch_generation"]), [epoch["blocker_id"]]
+        )
+        if released.get("released") is not True:
+            raise RuntimeError("runtime recovery latch release failed")
+    except Exception:
+        return {"allowed": False, "reason_code": "RECOVERY_PROMOTION_FAILED"}
+    result = released["status"]
+    result.update(
+        {
+            "allowed": True,
+            "reason_code": "RECOVERY_COMPLETE",
+            "source": "startup_recovery",
+            "failed_check": None,
+            "checks": checks,
+            "blocker_counts": dict(checks[-1].get("blocker_counts") or {}),
+        }
+    )
+    _stability_startup_status = _redacted_startup_status(result)
+    return result
+
+
 def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
     """Fence one discontinuity and reuse the exact ordered Task 10 checks."""
 
@@ -2039,74 +2150,13 @@ def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
         except Exception:
             return {"allowed": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
 
-        wallet_hash, network = _configured_mutation_binding()
-        binding = runtime.wallet_identity_binding
-        try:
-            from wallet import get_wallet_identity
+        return _complete_runtime_recovery_epoch(runtime, epoch)
 
-            first_identity = get_wallet_identity()
-            second_identity = get_wallet_identity()
-        except Exception:
-            first_identity = None
-            second_identity = None
-        state: dict[str, Any] = {}
-        checks: list[dict] = []
-        for check_name in _STABILITY_STARTUP_CHECKS:
-            check = _run_stability_startup_check(
-                check_name,
-                state=state,
-                runtime=runtime,
-                recovery_epoch=epoch,
-                wallet_identity_binding=binding,
-                wallet_fingerprint_hash=wallet_hash,
-                network=network,
-                cached_wallet_identity_snapshot=first_identity,
-                cached_wallet_identity_revalidation_snapshot=second_identity,
-            )
-            recorded = {"name": check_name, **check}
-            checks.append(recorded)
-            if check.get("ok") is not True:
-                result = _blocked_startup_recovery_status(
-                    check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
-                    check_name,
-                    checks,
-                    runtime,
-                )
-                result["blocker_counts"] = dict(check.get("blocker_counts") or {})
-                _stability_startup_status = _redacted_startup_status(result)
-                return result
-        try:
-            initial = state["initial_snapshot"]
-            database.record_runtime_recovery_pass(
-                recovery_id=recovery_id,
-                expected_latch_generation=int(epoch["latch_generation"]),
-                authority_digest=initial["authority_digest"],
-                checks=checks,
-                passed_at=datetime.now(timezone.utc),
-            )
-            rotate = getattr(mutation_gate, "_rotate_owner_identity_authority", None)
-            if not callable(rotate) or rotate(runtime) is not True:
-                raise RuntimeError("mutation authority rotation unavailable")
-            released = runtime.release_resolved(
-                int(epoch["latch_generation"]), [epoch["blocker_id"]]
-            )
-            if released.get("released") is not True:
-                raise RuntimeError("runtime recovery latch release failed")
-        except Exception:
-            return {"allowed": False, "reason_code": "RECOVERY_PROMOTION_FAILED"}
-        result = released["status"]
-        result.update(
-            {
-                "allowed": True,
-                "reason_code": "RECOVERY_COMPLETE",
-                "source": "startup_recovery",
-                "failed_check": None,
-                "checks": checks,
-                "blocker_counts": dict(checks[-1].get("blocker_counts") or {}),
-            }
-        )
-        _stability_startup_status = _redacted_startup_status(result)
-        return result
+
+def run_runtime_recovery(decision: Any, sample: Any) -> dict:
+    """Public coordinator boundary for a detected runtime discontinuity."""
+
+    return _run_runtime_recovery(decision, sample)
 
 
 def _blocked_startup_recovery_status(
@@ -2256,6 +2306,37 @@ def initialize_mutation_runtime(
         _mutation_runtime_db_path = os.path.normcase(os.path.abspath(database.DB_PATH))
         _mutation_runtime.register_stop_handler(_mutation_stop_handler)
         if acquire_lease:
+            try:
+                frozen_recovery = database.get_current_runtime_recovery()
+            except Exception:
+                frozen_recovery = None
+            if type(frozen_recovery) is dict:
+                adopted = _mutation_runtime.acquire_recovery_successor(
+                    frozen_recovery
+                )
+                if adopted.get("acquired") is not True:
+                    result = _blocked_startup_recovery_status(
+                        "RUNTIME_DISCONTINUITY",
+                        "lease",
+                        [],
+                        _mutation_runtime,
+                    )
+                    _discard_failed_owner_startup_runtime(_mutation_runtime)
+                    _stability_startup_status = _redacted_startup_status(result)
+                    return result
+                result = _complete_runtime_recovery_epoch(
+                    _mutation_runtime,
+                    frozen_recovery,
+                    recovery_owner_run_id=_mutation_runtime.run_id,
+                )
+                if result.get("allowed") is True:
+                    if start_heartbeat:
+                        _mutation_runtime.start_heartbeat()
+                    return result
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
             state: dict[str, Any] = {}
             checks = []
             try:
@@ -3275,7 +3356,7 @@ def create_bot() -> BotLoop:
         initialize_mutation_runtime()
     mutation_gate.require_allowed("startup:create_bot")
     bot = BotLoop()
-    bot.set_runtime_recovery_coordinator(_run_runtime_recovery)
+    bot.set_runtime_recovery_coordinator(run_runtime_recovery)
     # Wire up event bus to bot loop for push updates
     bot._event_bus = events
     # Inject spacescan getter so SSE dashboard_update events include spacescan metrics.
@@ -3716,7 +3797,11 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
             identity = None
         try:
             history = load_sage_offer_history(
-                get_all_offers=wallet.get_all_offers,
+                get_all_offers=getattr(
+                    wallet,
+                    "get_authoritative_offer_history",
+                    wallet.get_all_offers,
+                ),
                 include_completed=True,
             )
             authoritative_read_performed = True

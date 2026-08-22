@@ -726,7 +726,10 @@ def _records_by_intent(snapshot: RegistrySnapshot, intent_id: str) -> list[Offer
 
 
 def _lineage_decision(
-    snapshot: RegistrySnapshot, record: OfferRecord
+    snapshot: RegistrySnapshot,
+    record: OfferRecord,
+    *,
+    allow_terminal_parent: bool = False,
 ) -> Optional[AuthorizationDecision]:
     parent = None
     child = None
@@ -740,7 +743,22 @@ def _lineage_decision(
                 record,
             )
         parent = parents[0]
-        if parent.child_intent_id != record.intent_id:
+        provisional_children = [
+            candidate
+            for candidate in snapshot.records
+            if candidate.parent_intent_id == parent.intent_id
+            and candidate.state is not RegistryState.TERMINAL
+        ]
+        provisional_child_claim = (
+            parent.child_intent_id is None
+            and record.state is RegistryState.PREPARED
+            and len(provisional_children) == 1
+            and provisional_children[0] is record
+        )
+        if (
+            parent.child_intent_id != record.intent_id
+            and not provisional_child_claim
+        ):
             return _decision(
                 False,
                 AuthorizationCode.INVALID_LINEAGE,
@@ -754,11 +772,20 @@ def _lineage_decision(
                 "replacement generation is not consecutive",
                 record,
             )
-        if parent.state not in {
+        active_parent_states = {
             RegistryState.CREATED,
             RegistryState.VISIBLE,
             RegistryState.CANCEL_REQUESTED,
-        }:
+        }
+        terminal_parent_is_recovery_anchor = (
+            allow_terminal_parent
+            and record.state is not RegistryState.PREPARED
+            and parent.state is RegistryState.TERMINAL
+        )
+        if (
+            parent.state not in active_parent_states
+            and not terminal_parent_is_recovery_anchor
+        ):
             return _decision(
                 False,
                 AuthorizationCode.INVALID_LINEAGE,
@@ -770,7 +797,12 @@ def _lineage_decision(
         for candidate in snapshot.records
         if candidate.parent_intent_id == record.intent_id
     ]
-    if record.child_intent_id is None and claimed_children:
+    active_claimed_children = [
+        candidate
+        for candidate in claimed_children
+        if candidate.state is not RegistryState.TERMINAL
+    ]
+    if record.child_intent_id is None and active_claimed_children:
         return _decision(
             False,
             AuthorizationCode.INVALID_LINEAGE,
@@ -909,7 +941,11 @@ def authorize_mutation(snapshot: Any, request: Any) -> AuthorizationDecision:
             "selected coin identity is missing",
             record,
         )
-    lineage = _lineage_decision(snapshot, record)
+    lineage = _lineage_decision(
+        snapshot,
+        record,
+        allow_terminal_parent=request.kind is not MutationKind.CREATE,
+    )
     if lineage is not None:
         return lineage
 
@@ -1225,7 +1261,11 @@ def authorize_transition(
             "selected coin identity is missing",
             record,
         )
-    lineage = _lineage_decision(snapshot, record)
+    lineage = _lineage_decision(
+        snapshot,
+        record,
+        allow_terminal_parent=record.state is not RegistryState.PREPARED,
+    )
     if lineage is not None:
         return lineage
     if _has_duplicate_active_slot(snapshot, record):
