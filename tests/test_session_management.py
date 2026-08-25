@@ -226,13 +226,12 @@ class SessionManagementTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_check_resume_returns_no_resume_when_bot_running(self):
-        """When the bot is actively running (loop_count>0), check-resume must
+        """When the bot reports that it is running, check-resume must
         return can_resume=False with reason='bot_already_running' so the GUI
         doesn't show a spurious 'Resume session?' modal on page reload."""
         import types as _types
 
-        # Build a minimal fake bot with _loop_count > 0
-        fake_bot = _types.SimpleNamespace(_loop_count=1)
+        fake_bot = _types.SimpleNamespace(is_running=lambda: True)
 
         with (
             patch.object(_api_server, "_FRESH_START_FLAG", self._flag_path),

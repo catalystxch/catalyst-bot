@@ -74,6 +74,7 @@ fake_database.lock_coin = lambda *args, **kwargs: None
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
 fake_database.transition_offer = lambda *args, **kwargs: None
 fake_database.mark_cancel_attempted = lambda *args, **kwargs: None
+fake_database.get_unresolved_offer_operation_blockers = lambda: []
 fake_database.get_retryable_failed_offer_cancels = lambda: []
 fake_database.get_pending_refresh_lineage_parent_ids = lambda **kwargs: []
 fake_database.get_runtime_mutation_lease = lambda: {
