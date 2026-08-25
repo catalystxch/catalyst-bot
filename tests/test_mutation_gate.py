@@ -5207,6 +5207,7 @@ def test_failed_desktop_start_routes_to_native_diagnostics(monkeypatch):
     reservation = SimpleNamespace(port=6134)
     events = []
 
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
     monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
     monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
     monkeypatch.setattr(desktop_app, "_focus_existing_catalyst_window", lambda: False)
@@ -5229,6 +5230,43 @@ def test_failed_desktop_start_routes_to_native_diagnostics(monkeypatch):
 
     assert desktop_app.main(["--show-console"]) == 0
     assert events == [reservation]
+
+
+def test_non_windows_desktop_safety_fallback_uses_branded_browser(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    reservation = SimpleNamespace(port=6135)
+    events = []
+
+    monkeypatch.setattr(desktop_app.sys, "platform", "linux")
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
+    monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: True)
+    monkeypatch.setattr(desktop_app, "_focus_existing_catalyst_window", lambda: False)
+    monkeypatch.setattr(
+        desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_mode",
+        lambda supplied, *, ready_callback: (
+            events.append(("serve", supplied)),
+            ready_callback(),
+        ),
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_open_existing_instance_in_browser",
+        lambda port: events.append(("browser", port)),
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_desktop_mode",
+        lambda _reservation: (_ for _ in ()).throw(
+            AssertionError("headless non-Windows fallback must not require pywebview")
+        ),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == [("serve", reservation), ("browser", 6135)]
 
 
 @pytest.mark.parametrize(

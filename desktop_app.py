@@ -1713,7 +1713,7 @@ def main(argv=None):
         if _focus_existing_catalyst_window():
             return 0
         diagnostics_reservation = _reserve_diagnostics_server_port()
-        if args.flask:
+        if args.flask or sys.platform != "win32":
             run_read_only_diagnostics_mode(
                 diagnostics_reservation,
                 ready_callback=lambda: _open_existing_instance_in_browser(
