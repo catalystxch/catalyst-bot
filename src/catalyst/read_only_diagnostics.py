@@ -636,6 +636,79 @@ def read_safety_status(path: Path | None = None) -> dict[str, Any]:
                 pass
 
 
+_DIAGNOSTICS_HTML = b"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CATalyst startup safety</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, Segoe UI, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0b0e14; color: #eef2ff; }
+    main { width: min(680px, calc(100% - 40px)); padding: 34px;
+      border: 1px solid #283248; border-radius: 18px; background: #111722;
+      box-shadow: 0 18px 60px #0008; }
+    h1 { margin: 0 0 14px; font-size: clamp(1.6rem, 4vw, 2.3rem); }
+    p { color: #b9c2d8; line-height: 1.55; }
+    .safe { padding: 14px 16px; border-left: 4px solid #f5b942;
+      border-radius: 8px; background: #1a1e29; color: #f8df9b; }
+    dl { display: grid; grid-template-columns: 150px 1fr; gap: 10px 16px;
+      margin: 24px 0; }
+    dt { color: #8794ad; } dd { margin: 0; overflow-wrap: anywhere; }
+    code { color: #dce6ff; }
+    button { border: 0; border-radius: 9px; padding: 11px 16px; cursor: pointer;
+      color: #08111f; background: #78a9ff; font-weight: 700; }
+    small { display: block; margin-top: 18px; color: #77839b; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CATalyst could not start normally</h1>
+    <p class="safe">Trading remains blocked. No offer, coin-prep, or wallet action was started by this fallback window.</p>
+    <p id="summary">Checking the local safety state...</p>
+    <dl>
+      <dt>Safety reason</dt><dd><code id="reason">Checking...</code></dd>
+      <dt>Existing owner</dt><dd id="owner">Checking...</dd>
+      <dt>Next step</dt><dd id="action">Checking...</dd>
+    </dl>
+    <button type="button" id="retry">Check again</button>
+    <small>This page is served locally by CATalyst's read-only diagnostics mode.</small>
+  </main>
+  <script>
+    const setText = (id, value) => {
+      document.getElementById(id).textContent = value;
+    };
+    async function refresh() {
+      try {
+        const response = await fetch('/api/safety/status', {cache: 'no-store'});
+        const payload = await response.json();
+        const safety = payload && payload.safety ? payload.safety : {};
+        const lease = safety.lease && typeof safety.lease === 'object' ? safety.lease : {};
+        const reason = safety.reason_code || 'DURABLE_STATE_UNAVAILABLE';
+        setText('reason', reason);
+        setText('owner', lease.active ? 'Another CATalyst process is active' : 'No active owner was proven');
+        setText('action', lease.active
+          ? 'Return to the existing CATalyst window or system tray icon.'
+          : 'Close this page, then restart CATalyst. If this repeats, include the reason above in a bug report.');
+        setText('summary', lease.active
+          ? 'CATalyst found another process that already owns the trading session.'
+          : 'CATalyst stopped before opening the trading interface because a startup safety check failed.');
+      } catch (_error) {
+        setText('reason', 'DIAGNOSTICS_UNAVAILABLE');
+        setText('owner', 'Unknown');
+        setText('action', 'Close this page and restart CATalyst.');
+        setText('summary', 'The local safety status could not be read.');
+      }
+    }
+    document.getElementById('retry').addEventListener('click', refresh);
+    refresh();
+  </script>
+</body>
+</html>
+"""
+
+
 def _handler(database: Path):
     class Handler(BaseHTTPRequestHandler):
         server_version = "CATalystDiagnostics"
@@ -652,14 +725,37 @@ def _handler(database: Path):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _html(self, status: int, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; "
+                "base-uri 'none'; form-action 'none'",
+            )
+            self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            if self.path == "/api/safety/status":
+            request_path = self.path.partition("?")[0]
+            if request_path in {"/", "/index.html"}:
+                self._html(200, _DIAGNOSTICS_HTML)
+                return
+            if request_path == "/api/safety/status":
                 self._json(
                     200, {"success": True, "safety": read_safety_status(database)}
                 )
                 return
+            self._locked()
+
+        def _locked(self) -> None:
             self._json(
                 423,
                 {
@@ -670,11 +766,23 @@ def _handler(database: Path):
             )
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            self.do_GET()
+            self._locked()
 
         do_PUT = do_POST
         do_PATCH = do_POST
         do_DELETE = do_POST
+        do_HEAD = do_POST
+        do_OPTIONS = do_POST
+        do_TRACE = do_POST
+        do_CONNECT = do_POST
+
+        def __getattr__(self, name: str):
+            # BaseHTTPRequestHandler normally emits 501 when a do_<VERB>
+            # method is absent.  This listener is deliberately read-only, so
+            # every future or non-standard HTTP verb must fail closed too.
+            if name.startswith("do_"):
+                return self._locked
+            raise AttributeError(name)
 
     return Handler
 

@@ -616,11 +616,125 @@ def _release_instance_lock() -> bool:
     return True
 
 
-def _open_existing_instance_in_browser(port: int) -> None:
-    """Open this non-owner process's exact read-only diagnostics endpoint."""
+def _instance_lock_reported_pid() -> int | None:
+    """Read the current profile's lock owner without touching the locked byte."""
 
-    _app_url = f"http://{FLASK_HOST}:{int(port)}/api/safety/status"
-    print(f"\n  {APP_NAME} is already running — opening {_app_url}", flush=True)
+    try:
+        with open(_instance_lock_path(), "r", encoding="utf-8", errors="replace") as fh:
+            if sys.platform == "win32":
+                fh.seek(1)
+            text = fh.read(160)
+        for token in text.split():
+            if token.startswith("pid="):
+                candidate = int(token.partition("=")[2])
+                if candidate > 0 and candidate != os.getpid():
+                    return candidate
+    except Exception:
+        # A stale or partially-written lock is not owner evidence.
+        pass
+    return None
+
+
+def _current_profile_owner_pid() -> int | None:
+    """Return only an owner PID evidenced by this profile's lease or lock."""
+
+    try:
+        from read_only_diagnostics import read_safety_status
+
+        lease = read_safety_status().get("lease", {})
+        candidate = int(lease.get("owner_pid") or 0)
+        if lease.get("active") is True and candidate > 0 and candidate != os.getpid():
+            return candidate
+    except Exception:
+        # Fall back to the independently maintained instance lock below.
+        pass
+    return _instance_lock_reported_pid()
+
+
+def _focus_catalyst_window_with_user32(
+    user32, callback_factory, *, owner_pid: int
+) -> bool:
+    """Restore the exact native CATalyst window exposed by another process."""
+
+    import ctypes
+    import ctypes.wintypes
+
+    wintypes = ctypes.wintypes
+
+    target = []
+
+    @callback_factory
+    def inspect_window(handle, _context):
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(handle, ctypes.byref(owner_pid))
+        if owner_pid.value != expected_owner_pid:
+            return True
+        length = int(user32.GetWindowTextLengthW(handle) or 0)
+        if length < 1:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(handle, buffer, len(buffer))
+        if buffer.value.strip().casefold() == APP_NAME.casefold():
+            target.append(handle)
+            return False
+        return True
+
+    expected_owner_pid = int(owner_pid)
+    user32.EnumWindows(inspect_window, 0)
+    if not target:
+        return False
+    handle = target[0]
+    user32.ShowWindow(handle, 9)  # SW_RESTORE
+    user32.BringWindowToTop(handle)
+    if not user32.SetForegroundWindow(handle):
+        return False
+    return int(user32.GetForegroundWindow() or 0) == int(handle)
+
+
+def _focus_existing_catalyst_window(
+    *, owner_pid=None, timeout_seconds: float = 5.0, focus_attempt=None
+) -> bool:
+    """Bring an already-running CATalyst desktop window back to the front."""
+
+    if sys.platform != "win32":
+        return False
+    try:
+        verified_owner_pid = int(owner_pid or _current_profile_owner_pid() or 0)
+    except (TypeError, ValueError):
+        return False
+    if verified_owner_pid <= 0 or verified_owner_pid == os.getpid():
+        return False
+    try:
+        if focus_attempt is None:
+            import ctypes
+            import ctypes.wintypes
+
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.wintypes.BOOL,
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.LPARAM,
+            )
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            focus_attempt = lambda candidate: _focus_catalyst_window_with_user32(
+                user32, callback_type, owner_pid=candidate
+            )
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            if focus_attempt(verified_owner_pid):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+    except Exception:
+        return False
+
+
+def _open_existing_instance_in_browser(port: int) -> None:
+    """Open this non-owner process's branded read-only diagnostics page."""
+
+    _app_url = f"http://{FLASK_HOST}:{int(port)}/"
+    print(f"\n  {APP_NAME} could not start normally — opening {_app_url}", flush=True)
     try:
         import webbrowser
 
@@ -654,9 +768,11 @@ def _attach_to_kill_on_close_job() -> bool:
         return False
     try:
         import ctypes
-        from ctypes import wintypes
+        import ctypes.wintypes
     except Exception:
         return False
+
+    wintypes = ctypes.wintypes
 
     JobObjectExtendedLimitInformation = 9
 
@@ -1198,7 +1314,9 @@ def _reserve_diagnostics_server_port():
     )
 
 
-def run_read_only_diagnostics_mode(reservation, *, ready_callback=None) -> None:
+def run_read_only_diagnostics_mode(
+    reservation, *, ready_callback=None, lifetime_seconds=300
+) -> None:
     """Serve diagnostics without constructing the bot or acquiring a lease."""
 
     import read_only_diagnostics
@@ -1206,8 +1324,50 @@ def run_read_only_diagnostics_mode(reservation, *, ready_callback=None) -> None:
     read_only_diagnostics.serve(
         reservation=reservation,
         ready_callback=ready_callback,
-        lifetime_seconds=300,
+        lifetime_seconds=lifetime_seconds,
     )
+
+
+def run_read_only_diagnostics_desktop_mode(reservation) -> None:
+    """Show read-only startup diagnostics in a native desktop window."""
+
+    import webview
+
+    ready = threading.Event()
+    failures = []
+
+    def serve_diagnostics():
+        try:
+            run_read_only_diagnostics_mode(
+                reservation,
+                ready_callback=ready.set,
+                lifetime_seconds=None,
+            )
+        except Exception as exc:
+            failures.append(exc)
+            ready.set()
+
+    server_thread = threading.Thread(
+        target=serve_diagnostics,
+        daemon=True,
+        name="ReadOnlyDiagnostics",
+    )
+    server_thread.start()
+    if not ready.wait(timeout=10):
+        raise RuntimeError("read-only diagnostics server did not become ready")
+    if failures:
+        raise RuntimeError("read-only diagnostics server failed") from failures[0]
+
+    webview.create_window(
+        title=f"{APP_NAME} Startup Safety",
+        url=f"http://{FLASK_HOST}:{int(reservation.port)}/",
+        width=820,
+        height=680,
+        min_size=(640, 520),
+        resizable=True,
+        background_color="#0B0E14",
+    )
+    webview.start(gui=_detect_gui_backend(), http_server=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1613,13 +1773,18 @@ def main(argv=None):
     # stdlib-only preflight cannot create/migrate SQLite or import user_paths.
     if not _authorize_desktop_startup():
         _release_instance_lock()
+        if _focus_existing_catalyst_window():
+            return 0
         diagnostics_reservation = _reserve_diagnostics_server_port()
-        run_read_only_diagnostics_mode(
-            diagnostics_reservation,
-            ready_callback=lambda: _open_existing_instance_in_browser(
-                diagnostics_reservation.port
-            ),
-        )
+        if args.flask or sys.platform != "win32":
+            run_read_only_diagnostics_mode(
+                diagnostics_reservation,
+                ready_callback=lambda: _open_existing_instance_in_browser(
+                    diagnostics_reservation.port
+                ),
+            )
+        else:
+            run_read_only_diagnostics_desktop_mode(diagnostics_reservation)
         return 0
 
     # Cross-process singleton: only ONE desktop_app may run at a time.
