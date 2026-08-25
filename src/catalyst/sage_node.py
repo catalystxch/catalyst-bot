@@ -218,26 +218,68 @@ def get_available_fingerprints() -> List[Dict]:
 
 def _get_sage_fingerprints() -> List[Dict]:
     """Get fingerprints from Sage RPC — returns real wallet names."""
+    identities = get_available_wallet_identities()
+    fingerprints = [
+        {
+            "fingerprint": identity["fingerprint"],
+            "index": index,
+            "label": identity["name"],
+        }
+        for index, identity in enumerate(identities, start=1)
+    ]
+    print(f"[Sage] Found {len(fingerprints)} fingerprints", flush=True)
+    return fingerprints
+
+
+def get_available_wallet_identities() -> List[Dict]:
+    """Return exact, non-secret Sage identities eligible for first-run binding."""
+
+    if os.getenv("WALLET_TYPE", "sage").lower().strip() != "sage":
+        return []
     try:
         from wallet_sage import get_sage_keys
 
         keys = get_sage_keys()
-        fingerprints = []
-        for i, key in enumerate(keys):
-            name = key.get("name", f"Wallet {i + 1}")
-            fp = key.get("fingerprint", 0)
-            fingerprints.append(
-                {
-                    "fingerprint": str(fp),
-                    "index": i + 1,
-                    "label": name,
-                }
-            )
-        print(f"[Sage] Found {len(fingerprints)} fingerprints", flush=True)
-        return fingerprints
-    except Exception as e:
-        print(f"[Sage] Error listing fingerprints: {e}", flush=True)
+    except Exception as exc:
+        print(f"[Sage] Error listing wallet identities: {exc}", flush=True)
         return []
+    identities = []
+    for key in keys if isinstance(keys, list) else []:
+        if not isinstance(key, dict):
+            continue
+        raw_fingerprint = key.get("fingerprint")
+        fingerprint = str(raw_fingerprint or "").strip()
+        name = key.get("name")
+        kind = key.get("kind")
+        network_id = key.get("network_id")
+        if (
+            not fingerprint.isascii()
+            or not fingerprint.isdigit()
+            or fingerprint.startswith("0")
+            or str(int(fingerprint)) != fingerprint
+            or type(name) is not str
+            or not name.strip()
+            or len(name.strip()) > 128
+            or type(kind) is not str
+            or not kind.strip()
+            or len(kind.strip()) > 64
+            or key.get("has_secrets") is not True
+            or type(network_id) is not str
+            or not network_id.strip()
+            or len(network_id.strip()) > 64
+        ):
+            continue
+        identities.append(
+            {
+                "backend": "sage",
+                "fingerprint": fingerprint,
+                "name": name.strip(),
+                "kind": kind.strip().lower(),
+                "has_secrets": True,
+                "network_id": network_id.strip().lower(),
+            }
+        )
+    return identities
 
 
 def trigger_start(fingerprint: str) -> Dict:

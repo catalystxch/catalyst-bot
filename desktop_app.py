@@ -774,6 +774,8 @@ def _start_owned_runtime_services() -> None:
 
     import api_server
 
+    if api_server.wallet_setup_bootstrap_active():
+        return
     authorization = api_server.initialize_mutation_runtime()
     if not authorization.get("allowed"):
         raise RuntimeError("mutation lease was lost before server startup")
@@ -793,8 +795,11 @@ def start_flask_server(reservation):
 
     init_database()
 
-    # Create bot instance
-    api_server.create_bot()
+    # A pristine first launch serves the wallet setup shell before any exact
+    # wallet identity exists. The setup endpoint promotes this same process
+    # and constructs the bot only after binding that identity.
+    if not api_server.wallet_setup_bootstrap_active():
+        api_server.create_bot()
 
     # Wallet startup is triggered later by the GUI via POST /api/wallet/begin-startup
     # after the user accepts the disclaimer and chooses how to connect to Sage.
@@ -1557,7 +1562,14 @@ def _authorize_desktop_startup() -> bool:
         except Exception:
             pass
         authorization = _initialize_startup_ownership()
-        return bool(authorization.get("allowed"))
+        if authorization.get("allowed") is True:
+            return True
+        try:
+            import api_server
+
+            return api_server.activate_wallet_setup_bootstrap(authorization)
+        except Exception:
+            return False
     except Exception:
         return False
     finally:

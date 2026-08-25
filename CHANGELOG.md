@@ -5,6 +5,18 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.5 - 2026-08-25
+
+- Fixed the Windows clean-install startup path so an unconfigured Sage wallet
+  opens CATalyst's first-run wallet setup UI instead of a localhost safety JSON
+  response intended for read-only duplicate-instance diagnostics.
+- Added a fail-closed setup bootstrap that permits only Sage connection and
+  identity selection until the exact signing identity is persisted and normal
+  mutation ownership is established; all trading actions remain blocked.
+- Added a release-gating smoke test that installs and launches the packaged
+  Windows desktop application with an empty user profile and verifies the real
+  first-run UI rather than only testing a preconfigured Flask process.
+
 ## v1.3.4 - 2026-08-25
 
 - Corrected the Linux desktop release smoke assertion to accept CATalyst's safe
