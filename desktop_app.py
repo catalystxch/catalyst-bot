@@ -619,7 +619,7 @@ def _release_instance_lock() -> bool:
 def _open_existing_instance_in_browser(port: int) -> None:
     """Open this non-owner process's exact read-only diagnostics endpoint."""
 
-    _app_url = f"http://{FLASK_HOST}:{int(port)}/"
+    _app_url = f"http://{FLASK_HOST}:{int(port)}/api/safety/status"
     print(f"\n  {APP_NAME} is already running — opening {_app_url}", flush=True)
     try:
         import webbrowser
@@ -1198,7 +1198,11 @@ def run_read_only_diagnostics_mode(reservation, *, ready_callback=None) -> None:
 
     import read_only_diagnostics
 
-    read_only_diagnostics.serve(reservation=reservation, ready_callback=ready_callback)
+    read_only_diagnostics.serve(
+        reservation=reservation,
+        ready_callback=ready_callback,
+        lifetime_seconds=300,
+    )
 
 
 # ---------------------------------------------------------------------------

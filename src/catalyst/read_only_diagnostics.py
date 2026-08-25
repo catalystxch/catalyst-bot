@@ -685,6 +685,7 @@ def serve(
     *,
     reservation: LoopbackPortReservation | None = None,
     ready_callback=None,
+    lifetime_seconds: float | None = None,
 ) -> None:
     if reservation is None:
         if port is None:
@@ -696,11 +697,21 @@ def serve(
     except BaseException:
         reservation.release()
         raise
+    shutdown_timer = None
     try:
+        if lifetime_seconds is not None:
+            lifetime = float(lifetime_seconds)
+            if lifetime <= 0:
+                raise ValueError("diagnostics lifetime must be positive")
+            shutdown_timer = threading.Timer(lifetime, server.shutdown)
+            shutdown_timer.daemon = True
+            shutdown_timer.start()
         if ready_callback is not None:
             ready_callback()
         server.serve_forever(poll_interval=0.2)
     finally:
+        if shutdown_timer is not None:
+            shutdown_timer.cancel()
         server.server_close()
 
 

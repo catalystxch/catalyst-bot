@@ -5001,7 +5001,7 @@ def test_second_desktop_opens_exact_diagnostics_port_not_unrelated_preferred(
 
     assert desktop_app.main(["--show-console"]) == 0
     assert served == [reservation]
-    assert opened == ["http://127.0.0.1:6130/"]
+    assert opened == ["http://127.0.0.1:6130/api/safety/status"]
 
 
 def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch):
@@ -5033,7 +5033,7 @@ def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch)
     assert desktop_app.main(["--show-console"]) == 0
     assert events == [
         "handoff",
-        ("open", "http://127.0.0.1:6131/"),
+        ("open", "http://127.0.0.1:6131/api/safety/status"),
         "serve",
     ]
 
@@ -5579,6 +5579,53 @@ def test_minimal_diagnostics_serve_consumes_supplied_reservation(monkeypatch):
 
     assert events[0][0] == "handoff"
     assert events[1:] == [("serve", 0.2), "close"]
+
+
+def test_minimal_diagnostics_serve_schedules_bounded_shutdown(monkeypatch):
+    import read_only_diagnostics
+
+    events = []
+
+    class Timer:
+        def __init__(self, seconds, callback):
+            events.append(("timer", seconds, callback.__name__))
+            self.daemon = False
+
+        def start(self):
+            events.append(("timer-start", self.daemon))
+
+        def cancel(self):
+            events.append("timer-cancel")
+
+    class Server:
+        def shutdown(self):
+            events.append("shutdown")
+
+        def serve_forever(self, poll_interval):
+            events.append(("serve", poll_interval))
+
+        def server_close(self):
+            events.append("close")
+
+    class Reservation:
+        port = 6123
+
+        def into_http_server(self, _handler):
+            events.append("handoff")
+            return Server()
+
+    monkeypatch.setattr(read_only_diagnostics.threading, "Timer", Timer)
+
+    read_only_diagnostics.serve(reservation=Reservation(), lifetime_seconds=300)
+
+    assert events == [
+        "handoff",
+        ("timer", 300.0, "shutdown"),
+        ("timer-start", True),
+        ("serve", 0.2),
+        "timer-cancel",
+        "close",
+    ]
 
 
 def test_minimal_diagnostics_never_signals_ready_when_handoff_fails():
@@ -6936,7 +6983,11 @@ def test_diagnostics_server_never_constructs_bot_or_acquires_lease(monkeypatch):
     assert calls == [
         (
             "minimal-serve",
-            {"reservation": reservation, "ready_callback": None},
+            {
+                "reservation": reservation,
+                "ready_callback": None,
+                "lifetime_seconds": 300,
+            },
         )
     ]
 
