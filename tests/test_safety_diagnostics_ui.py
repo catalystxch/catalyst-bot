@@ -93,7 +93,9 @@ def _install_status_fakes(monkeypatch, api_server, *, live=None, startup=None):
     monkeypatch.setattr(api_server.database, "_db_initialized_path", str(GUI))
 
 
-def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(monkeypatch):
+def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(
+    monkeypatch,
+):
     """Catches status expansion leaking evidence instead of fixed count/provenance fields."""
     import api_server
 
@@ -130,7 +132,9 @@ def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(monk
         "provenance",
         "valid",
     }
-    observed = datetime.fromisoformat(freshness["observed_at_utc"].replace("Z", "+00:00"))
+    observed = datetime.fromisoformat(
+        freshness["observed_at_utc"].replace("Z", "+00:00")
+    )
     assert before <= observed <= after
     assert freshness == {
         "observed_at_utc": freshness["observed_at_utc"],
@@ -288,6 +292,7 @@ def test_canonical_extensible_api_reason_code_is_preserved(monkeypatch):
     assert safety["allowed"] is False
     assert safety["reason_code"] == "RUNTIME_DISCONTINUITY"
     assert safety["recommended_action"] == "REVIEW_SAFETY_DIAGNOSTICS"
+
 
 def test_app_bridge_safety_status_rejects_non_dict_route_payload(monkeypatch):
     """Catches malformed Flask results escaping the bridge's dict contract."""
@@ -460,6 +465,7 @@ def test_existing_preinit_database_never_hides_persisted_diagnostic_counts(monke
         "reserve": 6,
         "publication": 3,
     }
+
 
 class _PanelParser(HTMLParser):
     def __init__(self):

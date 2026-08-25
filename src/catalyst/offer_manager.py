@@ -184,8 +184,11 @@ class OfferManager:
 
     @staticmethod
     def _trip_refresh_lineage_latch(
-        *, operation_id: str, parent: Optional[Dict[str, Any]] = None,
-        cohort_trade_ids: Optional[List[str]] = None, side: Optional[str] = None,
+        *,
+        operation_id: str,
+        parent: Optional[Dict[str, Any]] = None,
+        cohort_trade_ids: Optional[List[str]] = None,
+        side: Optional[str] = None,
         malformed_snapshot_entries: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Latch any malformed refresh boundary before another mutation."""
@@ -196,7 +199,12 @@ class OfferManager:
             lease = database.get_runtime_mutation_lease()
             wallet_hash = lease.get("wallet_fingerprint_hash")
             network = lease.get("network")
-        if not isinstance(wallet_hash, str) or not wallet_hash or not isinstance(network, str) or not network:
+        if (
+            not isinstance(wallet_hash, str)
+            or not wallet_hash
+            or not isinstance(network, str)
+            or not network
+        ):
             raise RuntimeError("refresh lineage cannot bind the runtime safety latch")
         cohort = cohort_trade_ids or ([parent.get("sage_trade_id")] if parent else [])
         malformed = malformed_snapshot_entries or []
@@ -237,7 +245,9 @@ class OfferManager:
                 if committed.get("committed"):
                     return "awaiting_terminal_projection"
                 if committed.get("reason") in {
-                    "invalid_lineage", "parent_missing", "parent_identity_missing",
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
                 }:
                     parent = database.get_offer_intent(parent_id)
                     self._trip_refresh_lineage_latch(
@@ -247,7 +257,9 @@ class OfferManager:
                     return "lineage_resume_inconsistent"
                 return "awaiting_task8_task9"
             if completion.get("reason") in {
-                "invalid_lineage", "parent_missing", "parent_identity_missing",
+                "invalid_lineage",
+                "parent_missing",
+                "parent_identity_missing",
             }:
                 parent = database.get_offer_intent(parent_id)
                 self._trip_refresh_lineage_latch(
@@ -301,10 +313,16 @@ class OfferManager:
                     intent["intent_id"], require_visible=True
                 )
                 if completion.get("complete"):
-                    resume_actions.append(("commit", intent, "awaiting_terminal_projection"))
+                    resume_actions.append(
+                        ("commit", intent, "awaiting_terminal_projection")
+                    )
                     continue
                 reason = completion.get("reason")
-                if reason in {"invalid_lineage", "parent_missing", "parent_identity_missing"}:
+                if reason in {
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
+                }:
                     issues.append(("lineage_resume_inconsistent", intent))
                     continue
                 eligibility = database.refresh_parent_cancel_eligibility(
@@ -314,27 +332,37 @@ class OfferManager:
                     events = database.get_offer_operation_events(f"cancel:{trade_id}")
                     if events:
                         latest = events[-1]
-                        if (
-                            int(latest.get("blocks_mutation") or 0) == 1
-                            or (
-                                latest.get("phase") == "RECONCILED"
-                                and latest.get("outcome") == CANCEL_CONFIRMED
-                            )
+                        if int(latest.get("blocks_mutation") or 0) == 1 or (
+                            latest.get("phase") == "RECONCILED"
+                            and latest.get("outcome") == CANCEL_CONFIRMED
                         ):
-                            resume_actions.append(("wait", intent, "awaiting_task8_task9"))
+                            resume_actions.append(
+                                ("wait", intent, "awaiting_task8_task9")
+                            )
                         else:
-                            resume_actions.append(("cancel", intent, "awaiting_task8_task9"))
+                            resume_actions.append(
+                                ("cancel", intent, "awaiting_task8_task9")
+                            )
                     else:
-                        resume_actions.append(("cancel", intent, "awaiting_task8_task9"))
+                        resume_actions.append(
+                            ("cancel", intent, "awaiting_task8_task9")
+                        )
                     continue
                 if eligibility.get("reason") in {"invalid_lineage", "parent_missing"}:
                     issues.append(("lineage_resume_inconsistent", intent))
                     continue
-                resume_actions.append(("wait", intent, "awaiting_visibility_or_terminal_proof"))
+                resume_actions.append(
+                    ("wait", intent, "awaiting_visibility_or_terminal_proof")
+                )
                 continue
             if intent.get("parent_intent_id"):
-                if database.get_refresh_lineage_commit_for_child(intent["intent_id"]) is None:
-                    resume_actions.append(("wait", intent, "awaiting_parent_completion"))
+                if (
+                    database.get_refresh_lineage_commit_for_child(intent["intent_id"])
+                    is None
+                ):
+                    resume_actions.append(
+                        ("wait", intent, "awaiting_parent_completion")
+                    )
                     continue
             if intent.get("lifecycle_state") not in {"created", "visible"}:
                 issues.append(("registry_parent_conflict", intent))
@@ -353,7 +381,9 @@ class OfferManager:
                 continue
             candidates[intent["intent_id"]] = (offer, intent, slot)
         slots = [slot for _offer, _intent, slot in candidates.values()]
-        if len(cohort_trade_ids) != len(open_offers) or len(cohort_trade_ids) != len(set(cohort_trade_ids)):
+        if len(cohort_trade_ids) != len(open_offers) or len(cohort_trade_ids) != len(
+            set(cohort_trade_ids)
+        ):
             issues.append(("registry_parent_coverage_incomplete", None))
         if len(slots) != len(set(slots)):
             issues.append(("registry_parent_coverage_incomplete", None))
@@ -377,14 +407,22 @@ class OfferManager:
         # Phase two begins only after the whole selected/open cohort passed
         # exact identity, state, and slot validation.  Task 8 remains the
         # only cancellation authority and owns its wallet effect.
-        for action, parent, pause in sorted(resume_actions, key=lambda item: item[1]["intent_id"]):
+        for action, parent, pause in sorted(
+            resume_actions, key=lambda item: item[1]["intent_id"]
+        ):
             if action == "wait":
                 return {}, pause
             if action == "commit":
-                completion = database.commit_refresh_lineage_completion(parent["intent_id"])
+                completion = database.commit_refresh_lineage_completion(
+                    parent["intent_id"]
+                )
                 if completion.get("committed"):
                     return {}, pause
-                if completion.get("reason") in {"invalid_lineage", "parent_missing", "parent_identity_missing"}:
+                if completion.get("reason") in {
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
+                }:
                     self._trip_refresh_lineage_latch(
                         operation_id=f"refresh-lineage:{side}:coverage",
                         parent=parent,
@@ -404,12 +442,9 @@ class OfferManager:
             events = database.get_offer_operation_events(f"cancel:{trade_id}")
             if events:
                 latest = events[-1]
-                if (
-                    int(latest.get("blocks_mutation") or 0) == 1
-                    or (
-                        latest.get("phase") == "RECONCILED"
-                        and latest.get("outcome") == CANCEL_CONFIRMED
-                    )
+                if int(latest.get("blocks_mutation") or 0) == 1 or (
+                    latest.get("phase") == "RECONCILED"
+                    and latest.get("outcome") == CANCEL_CONFIRMED
                 ):
                     return {}, "awaiting_task8_task9"
             self.cancel_offers(
@@ -1524,8 +1559,7 @@ class OfferManager:
             return [
                 slot
                 for slot in tier_slots.get("mid", [])
-                if slot not in occupied_slots
-                and not self.is_slot_suspended(side, slot)
+                if slot not in occupied_slots and not self.is_slot_suspended(side, slot)
             ]
 
         live_counts = {tier: 0 for tier in tier_slots}
@@ -1748,9 +1782,7 @@ class OfferManager:
         if isinstance(value, str):
             for offset in range(0, len(value), 4096):
                 digest.update(
-                    str.encode(
-                        value[offset : offset + 4096], "utf-8", "surrogatepass"
-                    )
+                    str.encode(value[offset : offset + 4096], "utf-8", "surrogatepass")
                 )
         else:
             type_name = f"{type(value).__module__}.{type(value).__qualname__}"
@@ -5016,11 +5048,15 @@ class OfferManager:
                 f"Requote {side}: {pending_lineage_pause}; holding new children",
             )
             return {
-                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
                 "target_count": target_count,
                 "original_target_count": original_target_count,
-                "pending_cancel_count": 0, "failed_cancel_count": 0,
-                "tier_filter_drained": False, "refresh_paused": True,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
             }
 
         # Pending children normally consume the overlap coin that makes the
@@ -5037,11 +5073,15 @@ class OfferManager:
                 f"Requote {side}: {refresh_pause}; holding new children",
             )
             return {
-                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
                 "target_count": target_count,
                 "original_target_count": original_target_count,
-                "pending_cancel_count": 0, "failed_cancel_count": 0,
-                "tier_filter_drained": False, "refresh_paused": True,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
             }
 
         # ── Count spare coins ──
@@ -5121,11 +5161,15 @@ class OfferManager:
                 f"Requote {side}: {refresh_plan.reason}",
             )
             return {
-                "offers": [], "fully_replaced": False, "replaced_count": 0,
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
                 "target_count": target_count,
                 "original_target_count": original_target_count,
-                "pending_cancel_count": 0, "failed_cancel_count": 0,
-                "tier_filter_drained": False, "refresh_paused": True,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
             }
         staged = [
             refresh_by_parent[parent_id] for parent_id in refresh_plan.stage_parent_ids
@@ -6533,7 +6577,11 @@ class OfferManager:
                     )
                     if cohort_prepare["inserted"] is False:
                         replay_results = {}
-                        for replay_intent, replay_attempt, _member_id in ordered_members:
+                        for (
+                            replay_intent,
+                            replay_attempt,
+                            _member_id,
+                        ) in ordered_members:
                             replay_result = existing_results[replay_intent.trade_id]
                             if replay_result is None:
                                 replay_result = self._read_existing_cancel_result(
@@ -7472,7 +7520,10 @@ class OfferManager:
                     return True
                 return False
             result = offer_reconciliation.reconcile_offer(intent.intent_id)
-            if result.get("applied") is True and result.get("classification") in terminal:
+            if (
+                result.get("applied") is True
+                and result.get("classification") in terminal
+            ):
                 return True
             log_event(
                 "info",

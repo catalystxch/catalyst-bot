@@ -83,6 +83,7 @@ def _unsigned_self_take_offer_text(offer_text: Any) -> str | None:
         return None
     return unsigned_sage_offer_text(offer_text)
 
+
 _CHECKPOINT_EVIDENCE_KEYS = frozenset(
     {
         "success",
@@ -108,8 +109,10 @@ class LabRefusal(RuntimeError):
 def _canonical_utc(value: datetime) -> str:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise LabRefusal("IDENTITY_TIME_INVALID")
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -131,10 +134,14 @@ def _default_user_data_directories(environment: Mapping[str, str]) -> set[Path]:
     if type(appdata) is str and appdata:
         candidates.add((Path(appdata) / "Catalyst").resolve())
     if sys.platform == "darwin":
-        candidates.add((Path.home() / "Library" / "Application Support" / "Catalyst").resolve())
+        candidates.add(
+            (Path.home() / "Library" / "Application Support" / "Catalyst").resolve()
+        )
     elif sys.platform != "win32":
         xdg = environment.get("XDG_DATA_HOME")
-        base = Path(xdg) if type(xdg) is str and xdg else Path.home() / ".local" / "share"
+        base = (
+            Path(xdg) if type(xdg) is str and xdg else Path.home() / ".local" / "share"
+        )
         candidates.add((base / "Catalyst").resolve())
     return candidates
 
@@ -275,7 +282,10 @@ def validate_test7_identity(
     observed_now = observed_now.astimezone(timezone.utc)
     if type(snapshot) is not dict or snapshot.get("success") is not True:
         raise LabRefusal("IDENTITY_UNAVAILABLE")
-    if type(snapshot.get("backend")) is not str or snapshot["backend"] != EXPECTED_BACKEND:
+    if (
+        type(snapshot.get("backend")) is not str
+        or snapshot["backend"] != EXPECTED_BACKEND
+    ):
         raise LabRefusal("IDENTITY_BACKEND_MISMATCH")
     if type(snapshot.get("name")) is not str or snapshot["name"] != EXPECTED_NAME:
         raise LabRefusal("IDENTITY_NAME_MISMATCH")
@@ -374,9 +384,7 @@ class CatalystLabRuntime:
         identity = validate_test7_identity(identity_snapshot, now=identity_now)
         rows = _wallet_rows(self.wallet.get_wallets())
         xch = [
-            row
-            for row in rows
-            if type(row.get("id")) is int and row.get("type") == 0
+            row for row in rows if type(row.get("id")) is int and row.get("type") == 0
         ]
         sbx = [
             row
@@ -551,7 +559,9 @@ class CatalystLabRuntime:
                 intent_id,
                 wallet_facade=self.wallet,
             )
-            classification = result.get("classification") if type(result) is dict else None
+            classification = (
+                result.get("classification") if type(result) is dict else None
+            )
             if (
                 type(classification) is not str
                 or not classification.isascii()
@@ -696,12 +706,15 @@ class CatalystLabRuntime:
         _amount, selected_coin_id, _selected = min(
             eligible, key=lambda item: (item[0], item[1])
         )
-        if designation_writer(
-            selected_coin_id,
-            "tier_spare",
-            assigned_tier,
-            purpose="lifecycle",
-        ) is not True:
+        if (
+            designation_writer(
+                selected_coin_id,
+                "tier_spare",
+                assigned_tier,
+                purpose="lifecycle",
+            )
+            is not True
+        ):
             raise LabRefusal("COIN_PURPOSE_ASSIGNMENT_FAILED")
 
         verified = self.database.get_free_coins("xch")
@@ -729,8 +742,7 @@ class CatalystLabRuntime:
 
         asset_id = (
             inventory.get("sbx", {}).get("asset_id")
-            if type(inventory) is dict
-            and type(inventory.get("sbx")) is dict
+            if type(inventory) is dict and type(inventory.get("sbx")) is dict
             else None
         )
         if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
@@ -788,10 +800,7 @@ class CatalystLabRuntime:
             or reconciled.get("outcome") != "CANCELLED_PROVEN"
             or reconciled.get("blocks_mutation") != 0
             or cancel_identity != reconcile_identity
-            or not any(
-                type(value) is str and bool(value)
-                for value in cancel_identity
-            )
+            or not any(type(value) is str and bool(value) for value in cancel_identity)
         ):
             raise LabRefusal("LIFECYCLE_RECOVERY_AMBIGUOUS")
         self._require_zero_blockers()
@@ -874,17 +883,22 @@ class CatalystLabRuntime:
                 ),
             )
             created = (
-                guarded_create.get("result")
-                if type(guarded_create) is dict
-                else None
+                guarded_create.get("result") if type(guarded_create) is dict else None
             )
-            if type(created) is not list or len(created) != 1 or type(created[0]) is not dict:
+            if (
+                type(created) is not list
+                or len(created) != 1
+                or type(created[0]) is not dict
+            ):
                 raise LabRefusal("OFFER_CREATE_FAILED")
             offer = created[0]
             trade_id = offer.get("trade_id")
             intent_id = offer.get("intent_id")
             bech32 = offer.get("offer_bech32")
-            if type(trade_id) is not str or re.fullmatch(r"[0-9a-f]{64}", trade_id) is None:
+            if (
+                type(trade_id) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", trade_id) is None
+            ):
                 raise LabRefusal("OFFER_CREATE_FAILED")
             if type(intent_id) is not str or not intent_id:
                 lookup = getattr(self.database, "get_offer_intent_by_trade_id", None)
@@ -935,7 +949,10 @@ class CatalystLabRuntime:
                         primary_error = cancel_exc
         if primary_error is not None:
             raise primary_error
-        if type(cancel_result) is not dict or type(cancel_result.get(trade_id)) is not dict:
+        if (
+            type(cancel_result) is not dict
+            or type(cancel_result.get(trade_id)) is not dict
+        ):
             raise LabRefusal("CANCEL_FAILED")
 
         classification = None
@@ -945,9 +962,7 @@ class CatalystLabRuntime:
                 wallet_facade=self.wallet,
             )
             classification = (
-                reconciled.get("classification")
-                if type(reconciled) is dict
-                else None
+                reconciled.get("classification") if type(reconciled) is dict else None
             )
             if classification == "CANCELLED_PROVEN":
                 break
@@ -998,8 +1013,10 @@ class CatalystLabRuntime:
             self.coin_manager_module, "coin_size_tier_for_slot_position", None
         )
         designation_writer = getattr(self.database, "set_coin_designation", None)
-        if not callable(manager_type) or not callable(tier_reader) or not callable(
-            designation_writer
+        if (
+            not callable(manager_type)
+            or not callable(tier_reader)
+            or not callable(designation_writer)
         ):
             raise LabRefusal("COIN_PURPOSE_UNAVAILABLE")
         manager_type().reconcile_with_wallet()
@@ -1260,9 +1277,7 @@ class CatalystLabRuntime:
             trials.setdefault(row["slot_key"], []).append(row)
         for trial in trials.values():
             successful = [
-                row
-                for row in trial
-                if row.get("lifecycle_state") != "creation_failed"
+                row for row in trial if row.get("lifecycle_state") != "creation_failed"
             ]
             if len(successful) != 3 or any(
                 row.get("lifecycle_state") != "terminal" for row in successful
@@ -1279,8 +1294,7 @@ class CatalystLabRuntime:
                 self.database, "get_refresh_lineage_commit_for_child", None
             )
             if not callable(commit_reader) or any(
-                type(commit_reader(successful[index + 1].get("intent_id")))
-                is not dict
+                type(commit_reader(successful[index + 1].get("intent_id"))) is not dict
                 for index in range(2)
             ):
                 raise LabRefusal("REPLACEMENT_RECOVERY_AMBIGUOUS")
@@ -1307,9 +1321,7 @@ class CatalystLabRuntime:
             slot_key = row.get("slot_key")
             if slot_key == base:
                 trial_numbers.append(0)
-            elif type(slot_key) is not str or not slot_key.startswith(
-                f"{base}:trial:"
-            ):
+            elif type(slot_key) is not str or not slot_key.startswith(f"{base}:trial:"):
                 continue
             else:
                 suffix = slot_key[len(f"{base}:trial:") :]
@@ -1365,9 +1377,7 @@ class CatalystLabRuntime:
             except json.JSONDecodeError as exc:
                 raise LabRefusal("REPLACEMENT_RECOVERY_AMBIGUOUS") from exc
             legacy = (
-                self.database.get_offer(trade_id)
-                if type(trade_id) is str
-                else None
+                self.database.get_offer(trade_id) if type(trade_id) is str else None
             )
             if (
                 row.get("parent_intent_id") != expected_parent
@@ -1453,14 +1463,10 @@ class CatalystLabRuntime:
             for index, offer in enumerate(created):
                 if index:
                     parent = created[index - 1]
-                    current_parent = self.database.get_offer_intent(
-                        parent["intent_id"]
-                    )
-                    if (
-                        type(current_parent) is not dict
-                        or current_parent.get("child_intent_id")
-                        not in {None, offer["intent_id"]}
-                    ):
+                    current_parent = self.database.get_offer_intent(parent["intent_id"])
+                    if type(current_parent) is not dict or current_parent.get(
+                        "child_intent_id"
+                    ) not in {None, offer["intent_id"]}:
                         raise LabRefusal("REPLACEMENT_RECOVERY_AMBIGUOUS")
                     if current_parent.get("child_intent_id") is None:
                         self.database.bind_refresh_lineage(
@@ -1507,16 +1513,18 @@ class CatalystLabRuntime:
                 purpose = "normal_lifecycle" if parent is None else "replacement"
                 guarded = mutate(
                     f"replacement_create_{index}",
-                    lambda coin=coin, parent=parent, index=index, purpose=purpose: self._create_registered_lab_offer(
-                        manager,
-                        cfg=cfg,
-                        asset_id=asset_id,
-                        slot_key=slot_key,
-                        coin=coin,
-                        purpose=purpose,
-                        parent_intent_id=(parent["intent_id"] if parent else None),
-                        terms=terms,
-                        uniqueness_offset=index,
+                    lambda coin=coin, parent=parent, index=index, purpose=purpose: (
+                        self._create_registered_lab_offer(
+                            manager,
+                            cfg=cfg,
+                            asset_id=asset_id,
+                            slot_key=slot_key,
+                            coin=coin,
+                            purpose=purpose,
+                            parent_intent_id=(parent["intent_id"] if parent else None),
+                            terms=terms,
+                            uniqueness_offset=index,
+                        )
                     ),
                 )
                 offer = guarded.get("result") if type(guarded) is dict else None
@@ -1553,7 +1561,10 @@ class CatalystLabRuntime:
                     committed = self.database.commit_refresh_lineage_completion(
                         parent["intent_id"]
                     )
-                    if type(committed) is not dict or committed.get("committed") is not True:
+                    if (
+                        type(committed) is not dict
+                        or committed.get("committed") is not True
+                    ):
                         raise LabRefusal("REFRESH_LINEAGE_COMMIT_FAILED")
             final_offer = created[-1]
             self._cancel_and_prove_lab_offer(
@@ -1608,13 +1619,19 @@ class CatalystLabRuntime:
             for row in candidates
         ):
             return None
-        for intent in sorted(candidates, key=lambda row: row.get("generation", -1), reverse=True):
+        for intent in sorted(
+            candidates, key=lambda row: row.get("generation", -1), reverse=True
+        ):
             if intent.get("lifecycle_state") != "terminal":
                 continue
             events = self.database.get_offer_operation_events(
                 f"reconcile:{intent.get('intent_id')}"
             )
-            if type(events) is list and events and events[-1].get("outcome") == "FILLED_PROVEN":
+            if (
+                type(events) is list
+                and events
+                and events[-1].get("outcome") == "FILLED_PROVEN"
+            ):
                 self._require_zero_blockers()
                 return {
                     "success": True,
@@ -1706,9 +1723,7 @@ class CatalystLabRuntime:
                     "recovered": True,
                 }
             if classification == "ACTIVE_PROVEN":
-                pending_reader = getattr(
-                    self.wallet, "get_pending_transactions", None
-                )
+                pending_reader = getattr(self.wallet, "get_pending_transactions", None)
                 pending = pending_reader() if callable(pending_reader) else None
                 if type(pending) is not list or pending:
                     raise LabRefusal("FILL_RECOVERY_REQUIRED")
@@ -1722,8 +1737,7 @@ class CatalystLabRuntime:
                 legacy = self.database.get_offer(trade_id)
                 selected_coin_id = (
                     self._normalized_coin_id(selected_coin_ids[0])
-                    if type(selected_coin_ids) is list
-                    and len(selected_coin_ids) == 1
+                    if type(selected_coin_ids) is list and len(selected_coin_ids) == 1
                     else None
                 )
                 if (
@@ -1763,9 +1777,7 @@ class CatalystLabRuntime:
                 ),
             )
             offer = (
-                guarded_create.get("result")
-                if type(guarded_create) is dict
-                else None
+                guarded_create.get("result") if type(guarded_create) is dict else None
             )
             if type(offer) is not dict:
                 raise LabRefusal("OFFER_CREATE_FAILED")
@@ -1785,16 +1797,14 @@ class CatalystLabRuntime:
                 ),
             )
             taken = guarded_take.get("result") if type(guarded_take) is dict else None
-            transaction_id = taken.get("transaction_id") if type(taken) is dict else None
+            transaction_id = (
+                taken.get("transaction_id") if type(taken) is dict else None
+            )
             summary = taken.get("summary") if type(taken) is dict else None
             inputs = summary.get("inputs") if type(summary) is dict else None
-            spend_bundle = (
-                taken.get("spend_bundle") if type(taken) is dict else None
-            )
+            spend_bundle = taken.get("spend_bundle") if type(taken) is dict else None
             coin_spends = (
-                spend_bundle.get("coin_spends")
-                if type(spend_bundle) is dict
-                else None
+                spend_bundle.get("coin_spends") if type(spend_bundle) is dict else None
             )
             signature = (
                 spend_bundle.get("aggregated_signature")
@@ -1854,9 +1864,7 @@ class CatalystLabRuntime:
                 ),
             )
             submitted = (
-                guarded_submit.get("result")
-                if type(guarded_submit) is dict
-                else None
+                guarded_submit.get("result") if type(guarded_submit) is dict else None
             )
             if (
                 type(submitted) is not dict
@@ -1966,8 +1974,7 @@ class CatalystLabRuntime:
         lab_intents = [
             row
             for row in intents
-            if type(row.get("slot_key")) is str
-            and row["slot_key"].startswith("test7-")
+            if type(row.get("slot_key")) is str and row["slot_key"].startswith("test7-")
         ]
         if not lab_intents or any(
             row.get("lifecycle_state") not in {"terminal", "creation_failed"}
@@ -1976,8 +1983,7 @@ class CatalystLabRuntime:
             raise LabRefusal("FINAL_REGISTRY_NOT_TERMINAL")
         outbox = self.database.list_publication_outbox()
         if type(outbox) is not list or any(
-            type(row) is not dict
-            or row.get("state") not in {"succeeded", "suppressed"}
+            type(row) is not dict or row.get("state") not in {"succeeded", "suppressed"}
             for row in outbox
         ):
             raise LabRefusal("FINAL_PUBLICATION_NOT_TERMINAL")
@@ -2096,7 +2102,11 @@ class CatalystLabRuntime:
         sample_type = getattr(self.runtime_recovery_module, "ClockSample", None)
         detector = getattr(self.runtime_recovery_module, "detect_discontinuity", None)
         coordinator = getattr(self.api_server, "run_runtime_recovery", None)
-        if not callable(sample_type) or not callable(detector) or not callable(coordinator):
+        if (
+            not callable(sample_type)
+            or not callable(detector)
+            or not callable(coordinator)
+        ):
             raise LabRefusal("LONG_GAP_RECOVERY_UNAVAILABLE")
         previous = sample_type(
             monotonic_seconds=Decimal("100"),
@@ -2250,7 +2260,9 @@ class CheckpointStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
             + "\n",
             encoding="utf-8",
         )
@@ -2324,10 +2336,16 @@ def execute_stage_plan(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CATalyst TEST 7 stability lab")
-    parser.add_argument("--live", action="store_true", help="Enable guarded wallet effects")
-    parser.add_argument("--confirm", help="Required exact live mainnet confirmation token")
+    parser.add_argument(
+        "--live", action="store_true", help="Enable guarded wallet effects"
+    )
+    parser.add_argument(
+        "--confirm", help="Required exact live mainnet confirmation token"
+    )
     parser.add_argument("--data-dir", help="Explicit isolated CMM_DATA_DIR")
-    parser.add_argument("--mid-price-xch", help="Explicit positive SBX midpoint override")
+    parser.add_argument(
+        "--mid-price-xch", help="Explicit positive SBX midpoint override"
+    )
     parser.add_argument(
         "--trade-size-xch",
         default="0.001",

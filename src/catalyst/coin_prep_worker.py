@@ -1189,9 +1189,7 @@ class CoinPrepWorker:
                         operation, callback, *args, **kwargs
                     )
         except Exception as exc:
-            dispatch_outcome = complete_wallet_effect_dispatch(
-                dispatch, exception=exc
-            )
+            dispatch_outcome = complete_wallet_effect_dispatch(dispatch, exception=exc)
             if prepared_operation is not None:
                 self._record_coin_prep_dispatch_outcome(
                     prepared_operation,
@@ -1216,9 +1214,11 @@ class CoinPrepWorker:
         )
         observation = self._observe_coin_prep_post_effect(prepared_operation)
         post_effect_verify_timeout = None
-        if type(observation) is not dict and getattr(
-            self, "_is_subprocess", False
-        ) and prep_operation_kind in {"combine", "split"}:
+        if (
+            type(observation) is not dict
+            and getattr(self, "_is_subprocess", False)
+            and prep_operation_kind in {"combine", "split"}
+        ):
             post_effect_verify_timeout = (
                 self._submitted_split_verify_timeout_seconds()
                 if prep_operation_kind == "split"
@@ -1485,9 +1485,7 @@ class CoinPrepWorker:
                 return None
             pre_view_coin_ids = []
             for coin in observed:
-                coin_id = self._canonical_coin_id(
-                    coin.get("coin_id") or coin.get("id")
-                )
+                coin_id = self._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
                 if not coin_id or coin_id in pre_view_coin_ids:
                     return None
                 pre_view_coin_ids.append(coin_id)
@@ -1729,9 +1727,7 @@ class CoinPrepWorker:
             if coin_id:
                 try:
                     upsert_coin(coin_id, wallet_type, amount)
-                    designate_reserve(
-                        coin_id, wallet_type, amount, purpose="top_up"
-                    )
+                    designate_reserve(coin_id, wallet_type, amount, purpose="top_up")
                     _mark_coin_already_advised(coin_id)
                     self.log(
                         f"   DB: post-consolidation {wallet_type} topup pool coin → "
@@ -2098,9 +2094,7 @@ class CoinPrepWorker:
             wallet_id=self.xch_wallet_id,
             operation_kind="combine",
             purpose="fee_reserve",
-            output_amounts_and_purposes=[
-                (combined_amount - fee_mojos, "fee_reserve")
-            ],
+            output_amounts_and_purposes=[(combined_amount - fee_mojos, "fee_reserve")],
         )
         result = self._call_wallet_mutation(
             "coin_prep.combine_fee_reserve",
@@ -3411,7 +3405,9 @@ class CoinPrepWorker:
                     if amount is None:
                         amount = coin.get("amount")
                     if not coin_id or type(amount) is not int or amount <= 0:
-                        self.log("❌ /combine coin identity or amount is not authoritative")
+                        self.log(
+                            "❌ /combine coin identity or amount is not authoritative"
+                        )
                         return None
                     inputs.append((str(coin_id), amount))
                 return inputs
@@ -5006,9 +5002,7 @@ class CoinPrepWorker:
                         selected_coin_ids = []
                         selected_total = 0
                         for coin in candidates:
-                            coin_id = str(coin.get("coin_id") or "").replace(
-                                "0x", ""
-                            )
+                            coin_id = str(coin.get("coin_id") or "").replace("0x", "")
                             amount = int(coin.get("amount", 0) or 0)
                             if len(coin_id) != 64 or amount <= 0:
                                 continue
@@ -5377,19 +5371,25 @@ class CoinPrepWorker:
 
                 elapsed = int(time.time() - poll_started_at)
                 if elapsed >= deadline_s:
-                    extend_xch = not xch_confirmed and should_extend_pending_pool_confirmation_grace(
-                        tx_known=bool(xch_tx_state["known"]),
-                        tx_confirmed=bool(xch_tx_state["confirmed"]),
-                        expected_outputs_owned=xch_expected_outputs_owned,
-                        outputs_selectable=xch_confirmed,
-                        extensions_used=grace_extensions_used,
+                    extend_xch = (
+                        not xch_confirmed
+                        and should_extend_pending_pool_confirmation_grace(
+                            tx_known=bool(xch_tx_state["known"]),
+                            tx_confirmed=bool(xch_tx_state["confirmed"]),
+                            expected_outputs_owned=xch_expected_outputs_owned,
+                            outputs_selectable=xch_confirmed,
+                            extensions_used=grace_extensions_used,
+                        )
                     )
-                    extend_cat = not cat_confirmed and should_extend_pending_pool_confirmation_grace(
-                        tx_known=bool(cat_tx_state["known"]),
-                        tx_confirmed=bool(cat_tx_state["confirmed"]),
-                        expected_outputs_owned=cat_expected_outputs_owned,
-                        outputs_selectable=cat_confirmed,
-                        extensions_used=grace_extensions_used,
+                    extend_cat = (
+                        not cat_confirmed
+                        and should_extend_pending_pool_confirmation_grace(
+                            tx_known=bool(cat_tx_state["known"]),
+                            tx_confirmed=bool(cat_tx_state["confirmed"]),
+                            expected_outputs_owned=cat_expected_outputs_owned,
+                            outputs_selectable=cat_confirmed,
+                            extensions_used=grace_extensions_used,
+                        )
                     )
                     if extend_xch or extend_cat:
                         pending_label = "XCH" if extend_xch else "CAT"
@@ -7746,9 +7746,7 @@ class CoinPrepWorker:
                     fee_mojos=split_fee_mojos,
                     is_cat=is_cat,
                     _authority_fee_coin_ids=(
-                        [bare_coin_id]
-                        if split_fee_mojos > 0 and not is_cat
-                        else None
+                        [bare_coin_id] if split_fee_mojos > 0 and not is_cat else None
                     ),
                     _prep_contract=prep_contract,
                 )
@@ -8579,9 +8577,7 @@ class CoinPrepWorker:
                 evidence_json=evidence,
             )
         except Exception as exc:
-            self.log(
-                f"Coin prep authoritative outcome could not be persisted: {exc}"
-            )
+            self.log(f"Coin prep authoritative outcome could not be persisted: {exc}")
             return False
         if decision.confirmed:
             return True
@@ -8604,9 +8600,7 @@ class CoinPrepWorker:
 
         runtime = mutation_gate.current_runtime()
         if runtime is not None:
-            binding = runtime.require_wallet_identity_authority(
-                "coin_prep.prepare"
-            )
+            binding = runtime.require_wallet_identity_authority("coin_prep.prepare")
         else:
             lease = mutation_gate.worker_identity_lease_binding()
             binding = lease.get("binding") if type(lease) is dict else None
@@ -8703,9 +8697,7 @@ class CoinPrepWorker:
                             outcome="SUBMITTED_UNKNOWN",
                             evidence_json={
                                 "reason_code": "authoritative_observation_unavailable",
-                                "effect_claim_token": operation[
-                                    "effect_claim_token"
-                                ],
+                                "effect_claim_token": operation["effect_claim_token"],
                                 "effect_claim_generation": operation[
                                     "effect_claim_generation"
                                 ],
@@ -8723,9 +8715,7 @@ class CoinPrepWorker:
                     authoritative_view=authoritative_view,
                     expected_wallet_identity=expected_identity,
                     effect_claim_token=operation["effect_claim_token"],
-                    effect_claim_generation=operation[
-                        "effect_claim_generation"
-                    ],
+                    effect_claim_generation=operation["effect_claim_generation"],
                     dispatch_outcome=(
                         "PREPARED"
                         if operation.get("outcome") == "PREPARED"
@@ -8748,9 +8738,7 @@ class CoinPrepWorker:
             target = json.loads(operation["target_contract_json"])
             prepared_evidence = json.loads(operation["prepared_evidence_json"])
             expected_identity = json.loads(operation["wallet_identity_json"])
-            identity_binding = mutation_gate.WalletIdentityBinding(
-                **expected_identity
-            )
+            identity_binding = mutation_gate.WalletIdentityBinding(**expected_identity)
             if (
                 mutation_gate.wallet_identity_binding_payload(identity_binding)
                 != expected_identity
@@ -8780,7 +8768,12 @@ class CoinPrepWorker:
             for coin in observed:
                 coin_id = self._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
                 amount = coin.get("amount_mojos", coin.get("amount"))
-                if not coin_id or type(amount) is not int or amount <= 0 or coin_id in by_id:
+                if (
+                    not coin_id
+                    or type(amount) is not int
+                    or amount <= 0
+                    or coin_id in by_id
+                ):
                     return None
                 by_id[coin_id] = amount
             source_ids = {
@@ -8806,9 +8799,7 @@ class CoinPrepWorker:
                 purposes_by_amount.setdefault(output["amount_mojos"], set()).add(
                     output["purpose"]
                 )
-            if any(
-                len(purposes) != 1 for purposes in purposes_by_amount.values()
-            ):
+            if any(len(purposes) != 1 for purposes in purposes_by_amount.values()):
                 return None
             exact_amounts_match = len(new_coins) == len(outputs) and [
                 item["amount_mojos"] for item in new_coins
@@ -8844,9 +8835,9 @@ class CoinPrepWorker:
             expires_at = observed_at + timedelta(
                 seconds=expected_identity["maximum_age_seconds"]
             )
-            expires_text = expires_at.isoformat(
-                timespec="microseconds"
-            ).replace("+00:00", "Z")
+            expires_text = expires_at.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            )
             return {
                 "expected_outputs": expected_outputs,
                 "authoritative_view": {
@@ -8877,9 +8868,7 @@ class CoinPrepWorker:
         if type(purpose) is not str or not purpose:
             return None
         primary = [item for item in target_outputs if item.get("purpose") == purpose]
-        remainder = [
-            item for item in target_outputs if item.get("purpose") == "top_up"
-        ]
+        remainder = [item for item in target_outputs if item.get("purpose") == "top_up"]
         if (
             len(primary) < 2
             or len(remainder) != 1
@@ -10171,7 +10160,9 @@ def recover_coin_prep_operations_at_startup() -> bool:
     worker._is_subprocess = False
 
     def _recovery_log(message: str, severity: str | None = None) -> None:
-        level = severity if severity in {"debug", "info", "warning", "error"} else "info"
+        level = (
+            severity if severity in {"debug", "info", "warning", "error"} else "info"
+        )
         slog(
             "COIN_PREP",
             message,

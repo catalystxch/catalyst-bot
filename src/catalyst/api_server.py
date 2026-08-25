@@ -1155,9 +1155,7 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     offer_manager = getattr(bot, "offer_manager", None)
     if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
-            wallet_open_buys, wallet_open_sells, _ = (
-                offer_manager.sync_from_wallet()
-            )
+            wallet_open_buys, wallet_open_sells, _ = offer_manager.sync_from_wallet()
             trade_ids = [
                 o.get("trade_id", "")
                 for o in (wallet_open_buys + wallet_open_sells)
@@ -1319,7 +1317,10 @@ def _public_stability_durable_counts() -> tuple[dict[str, int], bool]:
 def _public_stability_timestamp(value: Any) -> Optional[str]:
     if type(value) is not str or len(value) > 40:
         return None
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value) is None:
+    if (
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
+        is None
+    ):
         return None
     return value
 
@@ -1464,7 +1465,10 @@ def get_public_stability_status() -> dict:
         )
 
     wallet_hash, network = _configured_mutation_binding()
-    if type(wallet_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", wallet_hash) is None:
+    if (
+        type(wallet_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", wallet_hash) is None
+    ):
         malformed = True
         redacted_fingerprint = None
     else:
@@ -1670,9 +1674,7 @@ def _mutation_stop_handler(reason_code: str) -> None:
         return
     try:
         if current_bot.is_running():
-            defer_reader = getattr(
-                current_bot, "can_defer_mutation_safety_stop", None
-            )
+            defer_reader = getattr(current_bot, "can_defer_mutation_safety_stop", None)
             if reason_code == "UNRESOLVED_OPERATIONS" and callable(defer_reader):
                 try:
                     if defer_reader(reason_code) is True:
@@ -1809,9 +1811,7 @@ def _run_stability_startup_check(name: str, **context) -> dict:
                 == runtime.run_id
             )
             if exact_current_owner:
-                return _startup_check_result(
-                    True, source_age_seconds=heartbeat_age
-                )
+                return _startup_check_result(True, source_age_seconds=heartbeat_age)
             try:
                 expiry = datetime.fromisoformat(
                     str(lease.get("expires_at") or "").replace("Z", "+00:00")
@@ -2007,9 +2007,7 @@ def _read_distinct_wallet_identity_snapshots(reader: Any) -> tuple[Any, Any]:
     """Boundedly avoid equal timestamp observations on coarse Windows clocks."""
 
     first = reader()
-    first_observed = (
-        first.get("observed_at_utc") if type(first) is dict else None
-    )
+    first_observed = first.get("observed_at_utc") if type(first) is dict else None
     second = reader()
     for _attempt in range(4):
         second_observed = (
@@ -2171,9 +2169,10 @@ def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            recovery_id = "recovery:" + hashlib.sha256(
-                recovery_material.encode("utf-8")
-            ).hexdigest()
+            recovery_id = (
+                "recovery:"
+                + hashlib.sha256(recovery_material.encode("utf-8")).hexdigest()
+            )
             if (
                 existing_epoch is not None
                 and existing_epoch.get("recovery_id") != recovery_id
@@ -2353,9 +2352,7 @@ def initialize_mutation_runtime(
             except Exception:
                 frozen_recovery = None
             if type(frozen_recovery) is dict:
-                adopted = _mutation_runtime.acquire_recovery_successor(
-                    frozen_recovery
-                )
+                adopted = _mutation_runtime.acquire_recovery_successor(frozen_recovery)
                 if adopted.get("acquired") is not True:
                     result = _blocked_startup_recovery_status(
                         "RUNTIME_DISCONTINUITY",
@@ -3724,9 +3721,7 @@ def api_safety_release_resolved():
             ),
             409,
         )
-    return jsonify(
-        {"success": True, "released": True, "reason_code": "RELEASED"}
-    )
+    return jsonify({"success": True, "released": True, "reason_code": "RELEASED"})
 
 
 def _quarantine_runtime_request(payload: Any) -> dict:
@@ -3858,9 +3853,7 @@ def api_safety_quarantine_status(quarantine_id: str):
                 {"success": False, "reason_code": "QUARANTINE_NOT_FOUND"}
             ), 404
         latch = database.get_runtime_safety_latch()
-        current_blocked = (
-            type(latch) is dict and latch.get("state") == "tripped"
-        )
+        current_blocked = type(latch) is dict and latch.get("state") == "tripped"
         return jsonify(
             {
                 "success": True,
@@ -3874,8 +3867,7 @@ def api_safety_quarantine_status(quarantine_id: str):
                     "current_mutation_blocked": current_blocked,
                     "current_latch_generation": (
                         int(latch["generation"])
-                        if type(latch) is dict
-                        and type(latch.get("generation")) is int
+                        if type(latch) is dict and type(latch.get("generation")) is int
                         else None
                     ),
                 },
@@ -3991,9 +3983,7 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         except Exception:
             history = None
         identity_hash = (
-            identity.get("wallet_fingerprint_hash")
-            if type(identity) is dict
-            else None
+            identity.get("wallet_fingerprint_hash") if type(identity) is dict else None
         )
         if (
             type(identity) is dict
@@ -4005,9 +3995,7 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
                 f"fingerprint:{identity['fingerprint']}".encode("utf-8")
             ).hexdigest()
         identity_network = (
-            identity.get("network_id")
-            if type(identity) is dict
-            else None
+            identity.get("network_id") if type(identity) is dict else None
         )
         if identity_network is None and type(identity) is dict:
             identity_network = identity.get("network")
@@ -4055,7 +4043,10 @@ def _resolve_runtime_quarantine_request(payload: Any) -> dict:
     }
     if type(payload) is not dict or set(payload) != required:
         return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
-    if type(payload.get("confirmation")) is not bool or payload["confirmation"] is not True:
+    if (
+        type(payload.get("confirmation")) is not bool
+        or payload["confirmation"] is not True
+    ):
         return {"success": False, "reason_code": "QUARANTINE_CONFIRMATION_REQUIRED"}
     try:
         requirements = database.get_runtime_quarantine_resolution_requirements(
@@ -4063,8 +4054,7 @@ def _resolve_runtime_quarantine_request(payload: Any) -> dict:
         )
         if (
             requirements["recovery_id"] != payload["expected_recovery_id"]
-            or requirements["latch_generation"]
-            != payload["expected_latch_generation"]
+            or requirements["latch_generation"] != payload["expected_latch_generation"]
         ):
             return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
         proof = _collect_quarantine_resolution_proof(requirements)

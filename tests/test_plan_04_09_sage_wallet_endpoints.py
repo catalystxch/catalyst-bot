@@ -299,9 +299,10 @@ class TestSageStartWithFingerprint(_FlaskBase):
 
     def test_non_text_or_noncanonical_fingerprint_returns_400(self):
         for fingerprint in (12345678, True, " 12345678", "012345678"):
-            with self.subTest(fingerprint=fingerprint), patch(
-                "chia_node.trigger_start"
-            ) as mock_trigger:
+            with (
+                self.subTest(fingerprint=fingerprint),
+                patch("chia_node.trigger_start") as mock_trigger,
+            ):
                 resp = self._post(
                     "/api/sage/start-with-fingerprint",
                     {"fingerprint": fingerprint},

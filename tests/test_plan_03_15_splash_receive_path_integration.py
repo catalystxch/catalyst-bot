@@ -71,9 +71,7 @@ class _TempDB(unittest.TestCase):
             patch.object(
                 api_server.mutation_gate, "enter_mutation", return_value="permit"
             ),
-            patch.object(
-                api_server.mutation_gate, "exit_mutation", return_value=True
-            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
         )
         for mutation_patch in self._mutation_patches:
             mutation_patch.start()

@@ -1515,8 +1515,7 @@ def _initialize_startup_ownership() -> dict:
     if (
         authorization.get("allowed") is False
         and authorization.get("failed_check") == "publication_claims"
-        and authorization.get("reason_code")
-        == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
     ):
         try:
             from dexie_manager import recover_expired_dexie_publications_at_startup

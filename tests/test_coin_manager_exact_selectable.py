@@ -52,9 +52,7 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
                 "read-only selectable view must not dispatch a wallet effect"
             )
         )
-        fake_database.wallet_effect_adapter_dispatch_authority = (
-            contextlib.nullcontext
-        )
+        fake_database.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
         fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
             _ for _ in ()
         ).throw(

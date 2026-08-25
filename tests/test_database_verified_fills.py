@@ -350,15 +350,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-        _authoritatively_terminalize_offer(
-            "trade-old", selected_coin_ids=[coin_id]
-        )
-        with self.assertRaisesRegex(
-            ValueError, "authoritative terminal coin outcome"
-        ):
-            _authoritatively_terminalize_offer(
-                "trade-new", selected_coin_ids=[coin_id]
-            )
+        _authoritatively_terminalize_offer("trade-old", selected_coin_ids=[coin_id])
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
 
         stats = database.get_stats(asset_id)
 
@@ -391,12 +385,8 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             ("verified_exact", result["fill_id"]),
         )
         database.get_connection().commit()
-        with self.assertRaisesRegex(
-            ValueError, "authoritative terminal coin outcome"
-        ):
-            _authoritatively_terminalize_offer(
-                "trade-new", selected_coin_ids=[coin_id]
-            )
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
 
         stats = database.get_stats(asset_id)
 
@@ -421,15 +411,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-        _authoritatively_terminalize_offer(
-            "trade-old", selected_coin_ids=[coin_id]
-        )
-        with self.assertRaisesRegex(
-            ValueError, "authoritative terminal coin outcome"
-        ):
-            _authoritatively_terminalize_offer(
-                "trade-new", selected_coin_ids=[coin_id]
-            )
+        _authoritatively_terminalize_offer("trade-old", selected_coin_ids=[coin_id])
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
 
         unmatched = database.get_unmatched_fills(asset_id, "sell")
 

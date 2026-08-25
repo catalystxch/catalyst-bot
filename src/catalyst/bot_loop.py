@@ -340,9 +340,7 @@ def collect_locally_expired_stale_offer_ids(
     return expired
 
 
-def build_startup_fill_baseline(
-    wallet_buy_ids, wallet_sell_ids, database_open_offers
-):
+def build_startup_fill_baseline(wallet_buy_ids, wallet_sell_ids, database_open_offers):
     """Keep persisted open offers visible to the first post-start fill check.
 
     Sage's current-open view necessarily omits offers completed while CATalyst
@@ -913,18 +911,24 @@ class BotLoop:
         lease = get_runtime_mutation_lease()
         network = lease.get("network")
         if type(network) is not str or not network:
-            raise RuntimeError("durable publication requires the active runtime network")
+            raise RuntimeError(
+                "durable publication requires the active runtime network"
+            )
 
         def observed_at() -> str:
-            return datetime.now(timezone.utc).isoformat(
-                timespec="microseconds"
-            ).replace("+00:00", "Z")
+            return (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
 
         def lease_expires(at: str) -> str:
             parsed = datetime.fromisoformat(at[:-1] + "+00:00")
-            return (parsed + timedelta(seconds=30)).isoformat(
-                timespec="microseconds"
-            ).replace("+00:00", "Z")
+            return (
+                (parsed + timedelta(seconds=30))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
 
         self.dexie_manager.enable_durable_outbox(
             owner_run_id=owner + ":dexie",
@@ -1294,7 +1298,6 @@ class BotLoop:
                 "active without AMM drift protection"
             )
         return health_data
-
 
     def _emit_alert(
         self,
@@ -11404,9 +11407,8 @@ class BotLoop:
                     # Task 8/9 resolution complete.  Do not hide the old
                     # quote by advancing the drift baseline at this boundary.
                     made_progress = (
-                        (replaced_count > 0 or len(new_offers) > 0)
-                        and lineage_pending_count == 0
-                    )
+                        replaced_count > 0 or len(new_offers) > 0
+                    ) and lineage_pending_count == 0
 
                     if requote_result.get("fully_replaced"):
                         # True full replace: advance baselines + refresh

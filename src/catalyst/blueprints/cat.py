@@ -58,9 +58,7 @@ def _tibet_resolution_event(meta: dict, name: str, asset_id: str) -> dict:
         return {
             "level": "info",
             "event_type": "cat_tibet_pair_resolved",
-            "message": (
-                f"TIBET_PAIR_ID auto-resolved for {name}: {pair_id[:20]}..."
-            ),
+            "message": (f"TIBET_PAIR_ID auto-resolved for {name}: {pair_id[:20]}..."),
         }
     if meta.get("pair_lookup_status") == "unavailable":
         return {

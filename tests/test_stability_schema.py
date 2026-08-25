@@ -1432,9 +1432,7 @@ def test_migration_normalizes_existing_mutable_stability_timestamps(
     _prepare_intent("intent-legacy-time")
     database.enqueue_publication_outbox(
         publication_id="publication-legacy-time",
-        idempotency_key=(
-            f"mainnet:{_sha('offer-legacy-time')}:epoch-legacy-time"
-        ),
+        idempotency_key=(f"mainnet:{_sha('offer-legacy-time')}:epoch-legacy-time"),
         intent_id="intent-legacy-time",
         network="mainnet",
         offer_fingerprint=_sha("offer-legacy-time"),

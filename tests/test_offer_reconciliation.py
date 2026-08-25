@@ -1559,10 +1559,7 @@ def test_sage_loader_accepts_oversized_snapshot_only_with_authoritative_total():
 
 
 def test_sage_loader_accepts_authoritative_history_above_legacy_thousand_cap():
-    rows = [
-        _offer(status=1, trade_id=f"{index:064x}")
-        for index in range(1934)
-    ]
+    rows = [_offer(status=1, trade_id=f"{index:064x}") for index in range(1934)]
 
     source = load_sage_offer_history(
         get_all_offers=lambda **_kwargs: {
@@ -1962,9 +1959,7 @@ def test_sage_coin_adapter_recovers_missing_asset_from_exact_offer_lock(monkeypa
                                     "amount": 28804800,
                                 }
                             ],
-                            "taker": [
-                                {"asset": {"asset_id": None}, "amount": 1000}
-                            ],
+                            "taker": [{"asset": {"asset_id": None}, "amount": 1000}],
                         },
                     }
                 ]
@@ -8634,7 +8629,9 @@ def test_ambiguous_single_member_of_grouped_cohort_auto_derives_manifest_subset(
 ):
     """A sequential batch may confirm one member before its siblings run."""
     context, evidence = _persist_grouped_cancel_case()
-    target = next(member for member in context["members"] if member["trade_id"] == TRADE)
+    target = next(
+        member for member in context["members"] if member["trade_id"] == TRADE
+    )
     unknown = cancellation_result(
         CANCEL_UNKNOWN,
         method="single_rpc",

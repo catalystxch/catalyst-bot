@@ -61,9 +61,7 @@ def canonical_publication_identity(
     safe_fingerprint = _exact_matching_text(
         offer_fingerprint, _FINGERPRINT_RE, "offer_fingerprint"
     )
-    safe_epoch = _exact_matching_text(
-        publication_epoch, _EPOCH_RE, "publication_epoch"
-    )
+    safe_epoch = _exact_matching_text(publication_epoch, _EPOCH_RE, "publication_epoch")
     return PublicationIdentity(
         network=safe_network,
         offer_fingerprint=safe_fingerprint,
@@ -302,6 +300,8 @@ def classify_provider_result(
         if type(result.get("reason_code")) is str and result.get("reason_code")
         else "AMBIGUOUS_PROVIDER_RESULT"
     )
+
+
 _TRANSITIONS = {
     PublicationState.QUEUED: frozenset(
         {
@@ -334,7 +334,10 @@ _TRANSITIONS = {
 def transition_publication(source: Any, destination: Any) -> PublicationState:
     """Authorize one publication transition or fail closed."""
 
-    if type(source) is not PublicationState or type(destination) is not PublicationState:
+    if (
+        type(source) is not PublicationState
+        or type(destination) is not PublicationState
+    ):
         raise TypeError("publication transitions require exact PublicationState values")
     if destination not in _TRANSITIONS[source]:
         raise ValueError(

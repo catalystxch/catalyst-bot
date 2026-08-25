@@ -174,11 +174,7 @@ def _canonical_target_contract(target_contract: Any) -> dict[str, Any]:
     if type(wallet_type) is not str or wallet_type not in {"xch", "cat"}:
         raise ValueError("target_contract wallet_type is invalid")
     outputs = target_contract.get("outputs")
-    if (
-        type(outputs) is not list
-        or not outputs
-        or len(outputs) > _MAX_TARGET_OUTPUTS
-    ):
+    if type(outputs) is not list or not outputs or len(outputs) > _MAX_TARGET_OUTPUTS:
         raise ValueError("target_contract outputs are invalid")
     canonical_outputs = []
     indexes: set[int] = set()
@@ -217,7 +213,9 @@ def canonical_coin_prep_contract(
     safe_purpose = validate_purpose(purpose)
     if type(source_coin_ids) is not list or not source_coin_ids:
         raise TypeError("source_coin_ids must be an exact non-empty list")
-    sources = sorted(_canonical_coin_id(value, "source coin id") for value in source_coin_ids)
+    sources = sorted(
+        _canonical_coin_id(value, "source coin id") for value in source_coin_ids
+    )
     if len(sources) != len(set(sources)):
         raise ValueError("source coin identities must be unique")
     target = _canonical_target_contract(target_contract)
@@ -231,9 +229,9 @@ def canonical_coin_prep_contract(
     encoded = json.dumps(
         material, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
-    material["operation_id"] = "coin-prep:" + hashlib.sha256(
-        encoded.encode("utf-8")
-    ).hexdigest()
+    material["operation_id"] = (
+        "coin-prep:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    )
     return material
 
 
@@ -300,20 +298,18 @@ def verify_coin_prep_post_view(
         expires_at = _canonical_utc_time(authoritative_view.get("expires_at"))
         bound_at = _canonical_utc_time(expected_identity["bound_at_utc"])
     except ValueError:
-        return CoinPrepPostViewDecision(
-            False, "authoritative_view_time_malformed", ()
-        )
+        return CoinPrepPostViewDecision(False, "authoritative_view_time_malformed", ())
     authoritative_expiry = observed_at + timedelta(
         seconds=expected_identity["maximum_age_seconds"]
     )
     if expires_at != authoritative_expiry:
-        return CoinPrepPostViewDecision(
-            False, "authoritative_view_time_malformed", ()
-        )
+        return CoinPrepPostViewDecision(False, "authoritative_view_time_malformed", ())
     if observed_at <= bound_at:
         return CoinPrepPostViewDecision(False, "wallet_identity_expired", ())
     try:
-        sources = {_canonical_coin_id(value, "source coin id") for value in source_coin_ids}
+        sources = {
+            _canonical_coin_id(value, "source coin id") for value in source_coin_ids
+        }
     except (TypeError, ValueError):
         return CoinPrepPostViewDecision(False, "source_coin_identity_malformed", ())
     if type(expected_outputs) is not list or not expected_outputs:

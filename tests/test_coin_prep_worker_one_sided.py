@@ -87,7 +87,9 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
         else ({pool_id, change_id} if submitted["value"] else {source_id})
     )
     worker._wait_for_preselected_pool_coin = (
-        lambda wallet_id, pool_coin, side_label, tier_name, timeout_s=300, poll_interval_s=5: pool_coin
+        lambda wallet_id, pool_coin, side_label, tier_name, timeout_s=300, poll_interval_s=5: (
+            pool_coin
+        )
     )
     worker._are_coin_ids_selectable = lambda *args, **kwargs: True
 
@@ -115,9 +117,16 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
         patch.dict("os.environ", {"CAT_ASSET_ID": asset_id}),
         patch("coin_prep_worker.time.sleep", return_value=None),
     ):
-        assert worker.create_and_split_tier_pools_sage(Decimal("0"), Decimal("20")) is False
+        assert (
+            worker.create_and_split_tier_pools_sage(Decimal("0"), Decimal("20"))
+            is False
+        )
 
-    exact_calls = [call for call in mutation_calls if call[0] == "coin_prep.create_tier_pools_exact"]
+    exact_calls = [
+        call
+        for call in mutation_calls
+        if call[0] == "coin_prep.create_tier_pools_exact"
+    ]
     assert len(exact_calls) == 2
     _operation, callback, kwargs = exact_calls[0]
     assert callback is not fake_wallet.send_cat_multi
@@ -148,8 +157,7 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
         {"type": "fee", "amount": "13079100"},
     ]
     assert not any(
-        "confirmed on-chain" in str(call.args[0])
-        for call in worker.log.call_args_list
+        "confirmed on-chain" in str(call.args[0]) for call in worker.log.call_args_list
     )
     fake_wallet.send_cat_multi.assert_not_called()
 

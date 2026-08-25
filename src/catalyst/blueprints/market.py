@@ -44,9 +44,7 @@ def _confirmed_tibetswap_outage(bot=None) -> dict:
     active_bot = bot if bot is not None else api_server.bot
     startup_results = getattr(active_bot, "_startup_self_test_results", {}) or {}
     tibet_health = (
-        startup_results.get("tibet", {})
-        if isinstance(startup_results, dict)
-        else {}
+        startup_results.get("tibet", {}) if isinstance(startup_results, dict) else {}
     )
     if not isinstance(tibet_health, dict) or tibet_health.get("ok") is not False:
         return {}
@@ -779,10 +777,7 @@ def api_market_summary():
                     if isinstance(startup_results, dict)
                     else {}
                 )
-                if (
-                    isinstance(tibet_health, dict)
-                    and tibet_health.get("ok") is True
-                ):
+                if isinstance(tibet_health, dict) and tibet_health.get("ok") is True:
                     result["tibet_available"] = True
                     result["tibet_reason"] = "no_pool"
         except Exception:

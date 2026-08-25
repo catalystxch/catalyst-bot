@@ -458,12 +458,12 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "outcome": "PREPARED",
         }
         recorded = []
-        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [
-            operation
-        ]
+        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [operation]
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda op_id, **kwargs: recorded.append((op_id, kwargs))
-            or {"operation": {"operation_id": op_id, **kwargs}}
+            lambda op_id, **kwargs: (
+                recorded.append((op_id, kwargs))
+                or {"operation": {"operation_id": op_id, **kwargs}}
+            )
         )
         self.worker._call_wallet_mutation = lambda *_args, **_kwargs: self.fail(
             "restart recovery must not dispatch a wallet effect"
@@ -517,9 +517,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             .replace("+00:00", "Z"),
             "maximum_age_seconds": 300,
         }
-        operation_id = "coin-prep:" + hashlib.sha256(
-            b"startup-recovery"
-        ).hexdigest()
+        operation_id = "coin-prep:" + hashlib.sha256(b"startup-recovery").hexdigest()
         operation = {
             "operation_id": operation_id,
             "operation_kind": "split",
@@ -537,9 +535,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     ],
                 }
             ),
-            "prepared_evidence_json": json.dumps(
-                {"pre_view_coin_ids": [source]}
-            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
             "wallet_identity_json": json.dumps(identity),
             "effect_claim_token": "f" * 64,
             "effect_claim_generation": 1,
@@ -558,16 +554,14 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                 "+00:00", "Z"
             ),
         }
-        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [
-            operation
-        ]
+        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [operation]
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda op_id, **kwargs: recorded.append((op_id, kwargs))
-            or {"operation": {"operation_id": op_id, **kwargs}}
+            lambda op_id, **kwargs: (
+                recorded.append((op_id, kwargs))
+                or {"operation": {"operation_id": op_id, **kwargs}}
+            )
         )
-        sys.modules["wallet_sage"].get_owned_coins = lambda wallet_id: {
-            output: 100
-        }
+        sys.modules["wallet_sage"].get_owned_coins = lambda wallet_id: {output: 100}
         sys.modules["wallet_sage"].get_owned_coins_detailed = lambda wallet_id: {
             output: {
                 "amount": 100,
@@ -586,9 +580,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             )
         )
         try:
-            recovered = (
-                self.coin_prep_worker.recover_coin_prep_operations_at_startup()
-            )
+            recovered = self.coin_prep_worker.recover_coin_prep_operations_at_startup()
         finally:
             self.coin_prep_worker.CoinPrepWorker.__init__ = original_init
             self.coin_prep_worker.CoinPrepWorker._call_wallet_mutation = (
@@ -599,7 +591,9 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.assertEqual(recorded[0][0], operation_id)
         self.assertEqual(recorded[0][1]["outcome"], "CONFIRMED")
 
-    def test_split_dispatch_commits_prepared_before_effect_and_confirms_exact_view(self):
+    def test_split_dispatch_commits_prepared_before_effect_and_confirms_exact_view(
+        self,
+    ):
         """Catches an actual split dispatch bypassing the Task 12 journal sequence."""
 
         source = hashlib.sha256(b"dispatch-source").hexdigest()
@@ -629,24 +623,25 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         claim = {"claim_token": "c" * 64, "generation": 1}
         dispatch = object()
         self.coin_prep_worker.DB_AVAILABLE = True
-        self.coin_prep_worker.claim_wallet_effect = (
-            lambda **kwargs: events.append(("claim", kwargs)) or claim
+        self.coin_prep_worker.claim_wallet_effect = lambda **kwargs: (
+            events.append(("claim", kwargs)) or claim
         )
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **kwargs: events.append(("begin", kwargs)) or dispatch
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **kwargs: (
+            events.append(("begin", kwargs)) or dispatch
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
         )
         self.coin_prep_worker.complete_wallet_effect_dispatch = (
-            lambda *_args, **kwargs: events.append(("classified", kwargs))
-            or "SUBMITTED"
+            lambda *_args, **kwargs: (
+                events.append(("classified", kwargs)) or "SUBMITTED"
+            )
         )
-        self.coin_prep_worker.prepare_coin_prep_operation = (
-            lambda **kwargs: events.append(("prepared", kwargs))
+        self.coin_prep_worker.prepare_coin_prep_operation = lambda **kwargs: (
+            events.append(("prepared", kwargs))
             or {
                 "operation": {
                     "operation_id": "coin-prep:" + "a" * 64,
@@ -659,10 +654,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             }
         )
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda operation_id, **kwargs: events.append(
-                ("outcome", {"operation_id": operation_id, **kwargs})
+            lambda operation_id, **kwargs: (
+                events.append(("outcome", {"operation_id": operation_id, **kwargs}))
+                or {"operation": {"operation_id": operation_id, **kwargs}}
             )
-            or {"operation": {"operation_id": operation_id, **kwargs}}
         )
         self.worker._current_coin_prep_wallet_identity = lambda: identity
         self.worker._observe_coin_prep_post_effect = lambda _operation: {
@@ -672,8 +667,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
 
         result = self.worker._call_wallet_mutation(
             "coin_prep.split_single_sage",
-            lambda **_kwargs: events.append(("effect", {}))
-            or {"success": True},
+            lambda **_kwargs: events.append(("effect", {})) or {"success": True},
             wallet_id=1,
             target_coin_id=source,
             num_coins=1,
@@ -743,8 +737,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -771,17 +765,15 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             lambda _operation, callback, *args, **kwargs: callback(*args, **kwargs)
         )
         original_sleep = self.coin_prep_worker.time.sleep
-        self.addCleanup(
-            setattr, self.coin_prep_worker.time, "sleep", original_sleep
-        )
+        self.addCleanup(setattr, self.coin_prep_worker.time, "sleep", original_sleep)
         self.coin_prep_worker.time.sleep = lambda _seconds: None
         self.worker._is_subprocess = True
         self.worker._current_coin_prep_wallet_identity = lambda: identity
         self.worker._observe_coin_prep_post_effect = lambda operation: (
             observed.append(operation["operation_id"]) or next(observations)
         )
-        self.worker._verify_authoritative_post_operation_view = (
-            lambda **kwargs: verified.append(kwargs) or True
+        self.worker._verify_authoritative_post_operation_view = lambda **kwargs: (
+            verified.append(kwargs) or True
         )
 
         result = self.worker._call_wallet_mutation(
@@ -836,8 +828,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -857,10 +849,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         }
         outcomes = []
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda recorded_operation_id, **kwargs: outcomes.append(
-                (recorded_operation_id, kwargs["outcome"])
+            lambda recorded_operation_id, **kwargs: (
+                outcomes.append((recorded_operation_id, kwargs["outcome"]))
+                or {"operation": {"operation_id": recorded_operation_id, **kwargs}}
             )
-            or {"operation": {"operation_id": recorded_operation_id, **kwargs}}
         )
         self.worker._current_coin_prep_wallet_identity = lambda: identity
         self.worker._observe_coin_prep_post_effect = lambda _operation: {
@@ -874,8 +866,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "authoritative_view": {"fresh": True, "complete": True},
         }
         verified = []
-        self.worker._verify_authoritative_post_operation_view = (
-            lambda **kwargs: verified.append(kwargs) or True
+        self.worker._verify_authoritative_post_operation_view = lambda **kwargs: (
+            verified.append(kwargs) or True
         )
 
         result = self.worker._call_wallet_mutation(
@@ -955,9 +947,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                 for coin_id in sources
             ],
         }
-        fake_wallet.combine_coins = (
-            lambda **_kwargs: wallet_calls.append("effect")
-            or {"success": True, "submitted": True}
+        fake_wallet.combine_coins = lambda **_kwargs: (
+            wallet_calls.append("effect") or {"success": True, "submitted": True}
         )
         claim = {"claim_token": "f" * 64, "generation": 1}
         self.coin_prep_worker.DB_AVAILABLE = True
@@ -965,8 +956,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -985,10 +976,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             }
         }
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda operation_id, **kwargs: outcomes.append(
-                (operation_id, kwargs["outcome"])
+            lambda operation_id, **kwargs: (
+                outcomes.append((operation_id, kwargs["outcome"]))
+                or {"operation": {"operation_id": operation_id, **kwargs}}
             )
-            or {"operation": {"operation_id": operation_id, **kwargs}}
         )
         self.worker._current_coin_prep_wallet_identity = lambda: identity
         self.worker._build_coin_prep_contract = lambda **_kwargs: {
@@ -1004,8 +995,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.worker._sage_submit_succeeded = lambda result: (
             caller_results.append(result) or submit_succeeded(result)
         )
-        self.worker._consolidate_wallet_sage_fallback = (
-            lambda *_args: fallback_calls.append("fallback") or False
+        self.worker._consolidate_wallet_sage_fallback = lambda *_args: (
+            fallback_calls.append("fallback") or False
         )
 
         accepted = self.worker._consolidate_wallet_sage_combine(2, "CAT")
@@ -1017,9 +1008,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             type(caller_results[0]), self.coin_prep_worker.CoinPrepSubmittedUnknown
         )
         self.assertEqual(caller_results[0].outcome, "SUBMITTED_UNKNOWN")
-        self.assertEqual(
-            outcomes, [("coin-prep:" + "b" * 64, "SUBMITTED_UNKNOWN")]
-        )
+        self.assertEqual(outcomes, [("coin-prep:" + "b" * 64, "SUBMITTED_UNKNOWN")])
 
     def test_subprocess_combine_waits_for_authoritative_confirmation(self):
         """Catches CAT combine blocking the immediately following XCH combine."""
@@ -1051,8 +1040,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -1076,23 +1065,23 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.worker._observe_coin_prep_post_effect = lambda _operation: None
         wait_calls = []
         self.worker._wait_for_coin_prep_post_effect = (
-            lambda operation, *, timeout_s, poll_interval_s: wait_calls.append(
-                (operation["operation_id"], timeout_s, poll_interval_s)
+            lambda operation, *, timeout_s, poll_interval_s: (
+                wait_calls.append(
+                    (operation["operation_id"], timeout_s, poll_interval_s)
+                )
+                or {
+                    "expected_outputs": [
+                        {
+                            "coin_id": output,
+                            "amount_mojos": 100,
+                            "purpose": "top_up",
+                        }
+                    ],
+                    "authoritative_view": {"fresh": True, "complete": True},
+                }
             )
-            or {
-                "expected_outputs": [
-                    {
-                        "coin_id": output,
-                        "amount_mojos": 100,
-                        "purpose": "top_up",
-                    }
-                ],
-                "authoritative_view": {"fresh": True, "complete": True},
-            }
         )
-        self.worker._verify_authoritative_post_operation_view = (
-            lambda **_kwargs: True
-        )
+        self.worker._verify_authoritative_post_operation_view = lambda **_kwargs: True
         adapter_result = {"success": True, "submitted": True}
 
         result = self.worker._call_wallet_mutation(
@@ -1123,7 +1112,9 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
     def test_exact_source_tier_pool_creation_reaches_adapter_with_bound_fee_cohort(
         self,
     ):
-        sources = [hashlib.sha256(label).hexdigest() for label in (b"pool-a", b"pool-b")]
+        sources = [
+            hashlib.sha256(label).hexdigest() for label in (b"pool-a", b"pool-b")
+        ]
         identity = {
             "backend": "sage",
             "name": "Task 16 Wallet",
@@ -1138,14 +1129,14 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         adapter_calls = []
         claim = {"claim_token": "e" * 64, "generation": 1}
         self.coin_prep_worker.DB_AVAILABLE = True
-        self.coin_prep_worker.claim_wallet_effect = (
-            lambda **kwargs: claims.append(kwargs) or claim
+        self.coin_prep_worker.claim_wallet_effect = lambda **kwargs: (
+            claims.append(kwargs) or claim
         )
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -1173,8 +1164,9 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
 
         result = self.worker._call_wallet_mutation(
             "coin_prep.create_tier_pools_exact",
-            lambda **kwargs: adapter_calls.append(kwargs)
-            or {"success": True, "submitted": True},
+            lambda **kwargs: (
+                adapter_calls.append(kwargs) or {"success": True, "submitted": True}
+            ),
             selected_coin_ids=sources,
             actions=[{"type": "fee", "amount": "10"}],
             auto_submit=True,
@@ -1236,9 +1228,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                 for coin in source_coins
             ],
         }
-        fake_wallet.combine_coins = (
-            lambda *_args, **_kwargs: wallet_calls.append("effect")
-            or {"success": True, "submitted": True}
+        fake_wallet.combine_coins = lambda *_args, **_kwargs: (
+            wallet_calls.append("effect") or {"success": True, "submitted": True}
         )
         fake_wallet.get_pending_transactions = lambda: []
         claim = {"claim_token": "e" * 64, "generation": 1}
@@ -1247,8 +1238,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.wallet_effect_claim_is_current = (
             lambda *_args, **_kwargs: True
         )
-        self.coin_prep_worker.begin_wallet_effect_dispatch = (
-            lambda *_args, **_kwargs: object()
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
         )
         self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
             lambda _dispatch: nullcontext()
@@ -1267,10 +1258,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             }
         }
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
-            lambda operation_id, **kwargs: outcomes.append(
-                (operation_id, kwargs["outcome"])
+            lambda operation_id, **kwargs: (
+                outcomes.append((operation_id, kwargs["outcome"]))
+                or {"operation": {"operation_id": operation_id, **kwargs}}
             )
-            or {"operation": {"operation_id": operation_id, **kwargs}}
         )
         self.worker.is_sage = True
         self.worker.tier_enabled = True
@@ -1318,9 +1309,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.assertNotIn("transaction_id", caller_results[0])
         with self.assertRaises(TypeError):
             caller_results[0]["success"] = False
-        self.assertEqual(
-            outcomes, [("coin-prep:" + "e" * 64, "SUBMITTED_UNKNOWN")]
-        )
+        self.assertEqual(outcomes, [("coin-prep:" + "e" * 64, "SUBMITTED_UNKNOWN")])
 
     def test_equal_amount_different_purposes_have_no_inferred_coin_mapping(self):
         """Catches coin-ID sort order assigning policy purpose without evidence."""
@@ -1360,17 +1349,17 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     ],
                 }
             ),
-            "prepared_evidence_json": json.dumps(
-                {"pre_view_coin_ids": [source]}
-            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
             "wallet_identity_json": json.dumps(identity),
         }
         self.worker.xch_wallet_id = 1
         self.worker.cat_wallet_id = 2
         self.worker._current_coin_prep_wallet_identity = lambda: identity
-        observed_at = datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        observed_at = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         self.coin_prep_worker.get_wallet_identity = lambda: {
             "success": True,
             "backend": "sage",
@@ -1452,14 +1441,14 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     ],
                 }
             ),
-            "prepared_evidence_json": json.dumps(
-                {"pre_view_coin_ids": [source]}
-            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
             "wallet_identity_json": json.dumps(identity),
         }
-        observed_at = datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        observed_at = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         self.coin_prep_worker.get_wallet_identity = lambda: {
             "success": True,
             "backend": "sage",
@@ -1521,17 +1510,17 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     ],
                 }
             ),
-            "prepared_evidence_json": json.dumps(
-                {"pre_view_coin_ids": [source]}
-            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
             "wallet_identity_json": json.dumps(identity),
         }
         self.worker.xch_wallet_id = 1
         self.worker.cat_wallet_id = 2
         self.worker._current_coin_prep_wallet_identity = lambda: identity
-        observed_at = datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        observed_at = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         self.coin_prep_worker.get_wallet_identity = lambda: {
             "success": True,
             "backend": "sage",
@@ -1554,13 +1543,17 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             {"replacement"},
         )
 
-    def test_recovery_observation_uses_fresh_read_only_identity_while_gate_is_blocked(self):
+    def test_recovery_observation_uses_fresh_read_only_identity_while_gate_is_blocked(
+        self,
+    ):
         """The operation's own safety latch must not block read-only reconciliation."""
 
         now = datetime.now(timezone.utc)
-        bound_at = (now - timedelta(minutes=5)).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        bound_at = (
+            (now - timedelta(minutes=5))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         observed_at = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
         source = hashlib.sha256(b"self-fenced-recovery-source").hexdigest()
         output = hashlib.sha256(b"self-fenced-recovery-output").hexdigest()
@@ -1589,9 +1582,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     ],
                 }
             ),
-            "prepared_evidence_json": json.dumps(
-                {"pre_view_coin_ids": [source]}
-            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
             "wallet_identity_json": json.dumps(identity),
         }
         self.worker.xch_wallet_id = 1
@@ -1621,9 +1612,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             self.coin_prep_worker.get_wallet_identity = original_identity
 
         self.assertIsInstance(observation, dict)
-        self.assertEqual(
-            observation["authoritative_view"]["observed_at"], observed_at
-        )
+        self.assertEqual(observation["authoritative_view"]["observed_at"], observed_at)
         self.assertEqual(
             observation["authoritative_view"]["expires_at"],
             (now + timedelta(seconds=10))
@@ -1642,8 +1631,8 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         worker.log = lambda *_args, **_kwargs: None
         worker.update_status = lambda *_args, **_kwargs: None
         calls = []
-        worker._recover_coin_prep_operations_read_only = (
-            lambda _observer: calls.append("recovery") or False
+        worker._recover_coin_prep_operations_read_only = lambda _observer: (
+            calls.append("recovery") or False
         )
         worker._observe_recoverable_coin_prep_operation = lambda _row: None
         worker.get_current_state = lambda: self.fail(

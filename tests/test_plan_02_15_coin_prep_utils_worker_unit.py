@@ -602,8 +602,7 @@ class TestPartitionCoinsForDesignation(unittest.TestCase):
         worker.cat_decimals = 3
 
         coins = [
-            {"coin_id": f"wrong-{index}", "amount": 2_363_648}
-            for index in range(13)
+            {"coin_id": f"wrong-{index}", "amount": 2_363_648} for index in range(13)
         ]
 
         assigned, unmatched = CoinPrepWorker._partition_coins_for_designation(

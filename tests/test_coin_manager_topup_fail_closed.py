@@ -132,6 +132,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 return_value=True,
             )
         )
+
         # Runtime top-up Task 12 persistence and post-view proof have focused
         # coverage in test_coin_manager_live_topup_journal.py.  This legacy
         # suite deliberately isolates wallet-response/polling behavior and uses
@@ -855,9 +856,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 "_get_transaction_confirmation_state",
                 return_value={"confirmed": False, "height": None},
             ),
-            patch.object(
-                manager, "_spacescan_self_send_confirmed", return_value=False
-            ),
+            patch.object(manager, "_spacescan_self_send_confirmed", return_value=False),
             patch.object(manager, "_stamp_topup_output_designations"),
             patch.object(coin_manager, "log_event") as log_event,
             patch.object(coin_manager.time, "sleep", return_value=None),
@@ -920,16 +919,14 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 "_get_transaction_confirmation_state",
                 return_value={"confirmed": False, "height": None},
             ),
-            patch.object(
-                manager, "_spacescan_self_send_confirmed", return_value=False
-            ),
+            patch.object(manager, "_spacescan_self_send_confirmed", return_value=False),
             patch.object(manager, "_stamp_topup_output_designations") as stamp,
-            patch.object(manager, "_confirm_runtime_topup_prep", return_value=True) as confirm,
+            patch.object(
+                manager, "_confirm_runtime_topup_prep", return_value=True
+            ) as confirm,
             patch.object(coin_manager, "log_event") as log_event,
             patch.object(coin_manager.time, "sleep", return_value=None),
-            patch.object(
-                coin_manager.time, "time", side_effect=[0, 0, 0, 0, 121, 121]
-            ),
+            patch.object(coin_manager.time, "time", side_effect=[0, 0, 0, 0, 121, 121]),
         ):
             result = manager._sage_one_step_split(
                 name="XCH-sniper",

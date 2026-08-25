@@ -424,9 +424,7 @@ class TestDetectExpiringOffers(_OM):
             },
         ]
 
-        result = self._manager.detect_expiring_offers(
-            offers, refresh_before_secs=1800
-        )
+        result = self._manager.detect_expiring_offers(offers, refresh_before_secs=1800)
 
         self.assertNotIn("sniper-tid", result)
 
@@ -461,10 +459,9 @@ class TestCancelSettlementOrdering(_OM):
             patch.object(
                 self._manager,
                 "_settle_submitted_cancel",
-                side_effect=lambda intent: order.append(
-                    ("settle", intent.operation_id)
-                )
-                or True,
+                side_effect=lambda intent: (
+                    order.append(("settle", intent.operation_id)) or True
+                ),
             ),
             patch.object(
                 self._manager,

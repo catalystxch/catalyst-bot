@@ -441,6 +441,8 @@ def get_wallet_identity():
     from wallet import get_wallet_identity as wallet_call
 
     return wallet_call()
+
+
 from win_subprocess import hidden_subprocess_kwargs
 
 
@@ -1056,16 +1058,12 @@ def _effective_tier_size_drift_bounds(
     except Exception:
         default_low = 0.98
     try:
-        headroom_pct = Decimal(
-            str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", "0") or "0")
-        )
+        headroom_pct = Decimal(str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", "0") or "0"))
     except Exception:
         headroom_pct = Decimal("0")
     headroom_pct = max(Decimal("0"), headroom_pct)
     if headroom_pct > 0:
-        funded_floor = Decimal("1") / (
-            Decimal("1") + (headroom_pct / Decimal("100"))
-        )
+        funded_floor = Decimal("1") / (Decimal("1") + (headroom_pct / Decimal("100")))
         default_low = min(default_low, float(funded_floor))
     try:
         default_high = float(getattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5) or 1.5)
@@ -1206,8 +1204,10 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
                     None, None
                 )
                 current_ratio = Decimal(amount) / Decimal(current_target)
-                if Decimal(str(retention_low)) <= current_ratio <= Decimal(
-                    str(retention_high)
+                if (
+                    Decimal(str(retention_low))
+                    <= current_ratio
+                    <= Decimal(str(retention_high))
                 ):
                     moved["unchanged"] += 1
                     continue
@@ -8801,8 +8801,8 @@ class CoinManager:
             if source_amount is None:
                 return None
             source_fee = 0 if is_cat else fee_mojos
-            remainder = source_amount - source_fee - (
-                num_to_create * trading_size_mojos
+            remainder = (
+                source_amount - source_fee - (num_to_create * trading_size_mojos)
             )
             if remainder < 0:
                 return None

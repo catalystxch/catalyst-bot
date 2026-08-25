@@ -3623,9 +3623,7 @@ def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
         manager._reconcile_elapsed_cancel_retry(
             intent,
             offer,
-            now_timestamp=datetime(
-                2026, 8, 16, 12, 1, tzinfo=timezone.utc
-            ).timestamp(),
+            now_timestamp=datetime(2026, 8, 16, 12, 1, tzinfo=timezone.utc).timestamp(),
         )
         is True
     )

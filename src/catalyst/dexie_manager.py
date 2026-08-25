@@ -51,7 +51,9 @@ _offer_detail_cache: Dict[str, Dict] = {}
 _offer_detail_cache_at: Dict[str, float] = {}
 
 
-def recover_expired_dexie_publications_at_startup(*, now_provider=None) -> Dict[str, int]:
+def recover_expired_dexie_publications_at_startup(
+    *, now_provider=None
+) -> Dict[str, int]:
     """Recover crashed Dexie dispatches from exact active-orderbook bytes."""
 
     observed_at = (
@@ -66,7 +68,9 @@ def recover_expired_dexie_publications_at_startup(*, now_provider=None) -> Dict[
     except (TypeError, ValueError):
         raise ValueError("startup publication recovery timestamp is invalid")
     if observed_dt.tzinfo is None or observed_dt.utcoffset() is None:
-        raise ValueError("startup publication recovery timestamp must be timezone-aware")
+        raise ValueError(
+            "startup publication recovery timestamp must be timezone-aware"
+        )
 
     candidates = []
     for row in list_publication_outbox(publisher="dexie"):
@@ -323,9 +327,7 @@ class DexieManager:
                     self._total_posted += 1
                     provider_id = decision.evidence["provider_response_id"]
                     with self._lock:
-                        self._posted_fingerprints.add(
-                            self._fingerprint(offer_bech32)
-                        )
+                        self._posted_fingerprints.add(self._fingerprint(offer_bech32))
                         if trade_id:
                             self._trade_dexie_map[trade_id] = provider_id
                     if trade_id:
@@ -364,9 +366,7 @@ class DexieManager:
             if trade_id:
                 with self._lock:
                     self._queue = [
-                        item
-                        for item in self._queue
-                        if item.get("trade_id") != trade_id
+                        item for item in self._queue if item.get("trade_id") != trade_id
                     ]
         return {
             "posted": posted,
@@ -631,16 +631,12 @@ class DexieManager:
             if request_contract is None:
                 claim_rewards = getattr(cfg, "DEXIE_AUTO_CLAIM_REWARDS", True)
                 if type(claim_rewards) is not bool:
-                    raise TypeError(
-                        "DEXIE_AUTO_CLAIM_REWARDS must be an exact bool"
-                    )
+                    raise TypeError("DEXIE_AUTO_CLAIM_REWARDS must be an exact bool")
                 request_contract = canonical_publication_request_contract(
                     publisher="dexie",
                     offer_bech32=offer_bech32,
                     idempotency_key=idempotency_key,
-                    destination_url=(
-                        f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"
-                    ),
+                    destination_url=(f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers"),
                     claim_rewards=claim_rewards,
                     bot_tag=cfg.BOT_TAG,
                 )
@@ -648,8 +644,7 @@ class DexieManager:
             if (
                 request_contract["publisher"] != "dexie"
                 or request_contract["body"]["offer"] != offer_bech32
-                or request_contract["headers"]["idempotency-key"]
-                != idempotency_key
+                or request_contract["headers"]["idempotency-key"] != idempotency_key
             ):
                 raise ValueError("durable Dexie request contract does not match claim")
             url = request_contract["destination_url"]
@@ -677,9 +672,7 @@ class DexieManager:
                             else None
                         ),
                         "echoed_idempotency_key": (
-                            data.get("idempotency_key")
-                            if type(data) is dict
-                            else None
+                            data.get("idempotency_key") if type(data) is dict else None
                         ),
                     }
                 if r.status_code == 429 or (
@@ -694,9 +687,7 @@ class DexieManager:
                         "response_sha256": response_digest,
                         "status_code": r.status_code,
                         "reason_code": (
-                            "RATE_LIMITED"
-                            if r.status_code == 429
-                            else "INVALID_OFFER"
+                            "RATE_LIMITED" if r.status_code == 429 else "INVALID_OFFER"
                         ),
                     }
                 return {

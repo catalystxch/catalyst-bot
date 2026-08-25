@@ -3803,37 +3803,85 @@ _STABILITY_REQUIRED_COLUMNS = {
         "updated_at",
     },
     "runtime_recovery_epochs": {
-        "recovery_id", "blocker_id", "reason_code", "clock_evidence_json",
-        "clock_evidence_sha256", "owner_run_id", "wallet_fingerprint_hash",
-        "network", "lease_version", "lease_active", "lease_owner_pid",
-        "lease_owner_host", "lease_acquired_at", "lease_heartbeat_at",
-        "lease_expires_at", "lease_updated_at", "lease_snapshot_sha256",
-        "latch_generation", "started_at",
+        "recovery_id",
+        "blocker_id",
+        "reason_code",
+        "clock_evidence_json",
+        "clock_evidence_sha256",
+        "owner_run_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "lease_version",
+        "lease_active",
+        "lease_owner_pid",
+        "lease_owner_host",
+        "lease_acquired_at",
+        "lease_heartbeat_at",
+        "lease_expires_at",
+        "lease_updated_at",
+        "lease_snapshot_sha256",
+        "latch_generation",
+        "started_at",
     },
     "runtime_recovery_takeovers": {
-        "takeover_sequence", "recovery_id", "takeover_number", "takeover_id",
-        "predecessor_lease_snapshot_sha256", "owner_run_id",
-        "wallet_fingerprint_hash", "network", "lease_version", "lease_active",
-        "lease_owner_pid", "lease_owner_host", "lease_acquired_at",
-        "lease_heartbeat_at", "lease_expires_at", "lease_updated_at",
-        "lease_snapshot_sha256", "adopted_at",
+        "takeover_sequence",
+        "recovery_id",
+        "takeover_number",
+        "takeover_id",
+        "predecessor_lease_snapshot_sha256",
+        "owner_run_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "lease_version",
+        "lease_active",
+        "lease_owner_pid",
+        "lease_owner_host",
+        "lease_acquired_at",
+        "lease_heartbeat_at",
+        "lease_expires_at",
+        "lease_updated_at",
+        "lease_snapshot_sha256",
+        "adopted_at",
     },
     "runtime_recovery_passes": {
-        "attempt_sequence", "recovery_id", "attempt_number", "attempt_id",
-        "authority_digest", "checks_json", "checks_sha256", "passed_at",
+        "attempt_sequence",
+        "recovery_id",
+        "attempt_number",
+        "attempt_id",
+        "authority_digest",
+        "checks_json",
+        "checks_sha256",
+        "passed_at",
     },
     "runtime_recovery_promotions": {
-        "recovery_id", "attempt_id", "latch_generation", "promoted_at",
+        "recovery_id",
+        "attempt_id",
+        "latch_generation",
+        "promoted_at",
     },
     "runtime_quarantine_manifests": {
-        "quarantine_id", "recovery_id", "latch_generation", "owner_run_id",
-        "wallet_fingerprint_hash", "network", "blocker_ids_json",
-        "blocker_ids_sha256", "prior_latch_json", "prior_latch_sha256",
-        "manifest_json", "manifest_sha256", "quarantined_at",
+        "quarantine_id",
+        "recovery_id",
+        "latch_generation",
+        "owner_run_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "blocker_ids_json",
+        "blocker_ids_sha256",
+        "prior_latch_json",
+        "prior_latch_sha256",
+        "manifest_json",
+        "manifest_sha256",
+        "quarantined_at",
     },
     "runtime_quarantine_resolutions": {
-        "quarantine_id", "recovery_id", "latch_generation",
-        "authority_digest", "proof_json", "proof_sha256", "resolved_at",
+        "quarantine_id",
+        "recovery_id",
+        "latch_generation",
+        "authority_digest",
+        "proof_json",
+        "proof_sha256",
+        "resolved_at",
     },
     "stability_migration_watermarks": {
         "migration_key",
@@ -3898,20 +3946,34 @@ _STABILITY_REQUIRED_COLUMNS = {
         "committed_at",
     },
     "offer_refresh_lineage_blockers": {
-        "operation_id", "wallet_fingerprint_hash", "network", "side",
-        "asset_id", "cohort_trade_ids_json", "snapshot_material_json", "reason_code", "state",
-        "recorded_at", "resolved_at",
+        "operation_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "side",
+        "asset_id",
+        "cohort_trade_ids_json",
+        "snapshot_material_json",
+        "reason_code",
+        "state",
+        "recorded_at",
+        "resolved_at",
     },
 }
 
 _STABILITY_INDEXES = {
     "idx_runtime_recovery_epochs_binding": (
-        "runtime_recovery_epochs", False, False,
-        ("wallet_fingerprint_hash", "network", "latch_generation"), None,
+        "runtime_recovery_epochs",
+        False,
+        False,
+        ("wallet_fingerprint_hash", "network", "latch_generation"),
+        None,
     ),
     "idx_runtime_quarantine_binding": (
-        "runtime_quarantine_manifests", False, False,
-        ("recovery_id", "latch_generation", "quarantined_at"), None,
+        "runtime_quarantine_manifests",
+        False,
+        False,
+        ("recovery_id", "latch_generation", "quarantined_at"),
+        None,
     ),
     "uniq_offer_intents_sage_trade_id": (
         "offer_intents",
@@ -4441,9 +4503,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
         conn, "runtime_recovery_takeovers", ("recovery_id", "takeover_number")
     )
     _require_unique_key(conn, "runtime_recovery_takeovers", ("takeover_id",))
-    _require_unique_key(
-        conn, "runtime_recovery_takeovers", ("lease_snapshot_sha256",)
-    )
+    _require_unique_key(conn, "runtime_recovery_takeovers", ("lease_snapshot_sha256",))
     _require_unique_key(
         conn, "runtime_recovery_passes", ("recovery_id", "attempt_number")
     )
@@ -5284,7 +5344,9 @@ def _reassert_unresolved_wallet_effect_claims(conn: sqlite3.Connection) -> None:
             (_MAX_FILL_AUTHORITY_CLOSURE_ROWS + 1,),
         ).fetchall()
         if len(rows) > _MAX_FILL_AUTHORITY_CLOSURE_ROWS:
-            raise RuntimeError("unresolved wallet effect claim audit exceeds hard limit")
+            raise RuntimeError(
+                "unresolved wallet effect claim audit exceeds hard limit"
+            )
         audited_at = _stability_wall_clock()
         for row in confirmed_rows:
             _reconciliation_latch_update(
@@ -5436,9 +5498,10 @@ def _migrate_stability_schema() -> None:
                     f"{legacy_pass['recovery_id']}:{legacy_pass['checks_sha256']}:"
                     f"{legacy_pass['passed_at']}"
                 )
-                attempt_id = "recovery-pass:" + hashlib.sha256(
-                    attempt_material.encode("utf-8")
-                ).hexdigest()
+                attempt_id = (
+                    "recovery-pass:"
+                    + hashlib.sha256(attempt_material.encode("utf-8")).hexdigest()
+                )
                 conn.execute(
                     "INSERT INTO runtime_recovery_passes "
                     "(recovery_id,attempt_number,attempt_id,authority_digest,"
@@ -5487,9 +5550,7 @@ def _migrate_stability_schema() -> None:
             )
         publication_columns = {
             str(row["name"])
-            for row in conn.execute(
-                "PRAGMA table_info(publication_outbox)"
-            ).fetchall()
+            for row in conn.execute("PRAGMA table_info(publication_outbox)").fetchall()
         }
         publication_column_upgrades = {
             "claim_token": "TEXT",
@@ -5512,8 +5573,7 @@ def _migrate_stability_schema() -> None:
                     f"{column_name} {column_sql}"
                 )
         for publication_row in conn.execute(
-            "SELECT publication_id,payload_json,last_error_json "
-            "FROM publication_outbox"
+            "SELECT publication_id,payload_json,last_error_json FROM publication_outbox"
         ).fetchall():
             payload_text = str(publication_row["payload_json"])
             error_text = publication_row["last_error_json"]
@@ -5792,9 +5852,7 @@ def _init_database_impl():
         ("effect_claim_generation", "INTEGER"),
     ):
         try:
-            conn.execute(
-                f"SELECT {column_name} FROM coin_prep_operations LIMIT 1"
-            )
+            conn.execute(f"SELECT {column_name} FROM coin_prep_operations LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(
                 f"ALTER TABLE coin_prep_operations ADD COLUMN "
@@ -9496,9 +9554,7 @@ def get_authoritative_replacement_capacity_count(
 ) -> int:
     """Task 11's explicit authoritative overlap-capacity input."""
 
-    result = get_authoritative_coin_capacity(
-        "replacement", wallet_type=wallet_type
-    )
+    result = get_authoritative_coin_capacity("replacement", wallet_type=wallet_type)
     return int(result["count"]) if result["authoritative"] is True else 0
 
 
@@ -18591,6 +18647,8 @@ _MAX_STABILITY_JSON_CONTAINER_ITEMS = 4096
 _MAX_STABILITY_JSON_DEPTH = 64
 _MAX_STABILITY_JSON_NODES = 100_000
 _MAX_STABILITY_CANONICAL_BYTES = 16 * 1024 * 1024
+
+
 def _preflight_stability_json(
     value: Any,
     label: str,
@@ -19406,8 +19464,7 @@ def prepare_offer_cancel(
         )
         if claim_effect and effect_claimed:
             recovery_latch = conn.execute(
-                "SELECT generation,state FROM runtime_safety_latch "
-                "WHERE singleton_id=1"
+                "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
             ).fetchone()
             if recovery_latch is None or recovery_latch["state"] != "resolved":
                 raise ValueError(
@@ -19697,15 +19754,21 @@ def get_unresolved_offer_cancel_cohort_manifests() -> List[Dict[str, Any]]:
 
 
 def _validated_offer_cancel_effect_claim(row: Any) -> Dict[str, Any]:
-    if type(row) is not dict or set(row) not in ({
-        "operation_id",
-        "attempt",
-        "prepared_event_id",
-        "claimed_at",
-    }, {
-        "operation_id", "attempt", "prepared_event_id", "claimed_at",
-        "recovery_generation",
-    }):
+    if type(row) is not dict or set(row) not in (
+        {
+            "operation_id",
+            "attempt",
+            "prepared_event_id",
+            "claimed_at",
+        },
+        {
+            "operation_id",
+            "attempt",
+            "prepared_event_id",
+            "claimed_at",
+            "recovery_generation",
+        },
+    ):
         raise ValueError("cancellation effect claim fields are invalid")
     attempt = _exact_integer(row["attempt"], "attempt", minimum=1)
     operation_id = _required_stability_text(row["operation_id"], "operation_id")
@@ -20209,9 +20272,7 @@ def prepare_coin_prep_operation(
         conn.close()
 
 
-def _coin_prep_outcome_evidence(
-    outcome: str, value: Any
-) -> tuple[str, Dict[str, Any]]:
+def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str, Any]]:
     if type(value) is not dict:
         raise ValueError("coin prep outcome evidence must be an exact mapping")
     common = {"reason_code", "effect_claim_token", "effect_claim_generation"}
@@ -20439,12 +20500,13 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
             }:
                 raise ValueError("legacy top-up fee reconciliation evidence is invalid")
             supplied_fee_sources = sorted(
-                _reconciliation_coin_identity(
-                    value, "legacy top-up fee source"
-                )[0]
+                _reconciliation_coin_identity(value, "legacy top-up fee source")[0]
                 for value in fee_reconciliation["source_coin_ids"]
             )
-            if sorted(norm_coin_id(value) for value in supplied_fee_sources) != fee_sources:
+            if (
+                sorted(norm_coin_id(value) for value in supplied_fee_sources)
+                != fee_sources
+            ):
                 raise ValueError("legacy top-up fee reconciliation cohort differs")
             fee_decision = verify_coin_prep_post_view(
                 source_coin_ids=supplied_fee_sources,
@@ -20670,7 +20732,9 @@ def record_coin_prep_operation_outcome(
         if current["outcome"] not in {"PREPARED", "SUBMITTED_UNKNOWN"}:
             raise ValueError("coin prep operation is already terminal")
         if current["outcome"] == "SUBMITTED_UNKNOWN" and outcome != "CONFIRMED":
-            raise ValueError("effect-unknown coin prep may resolve only from confirmation")
+            raise ValueError(
+                "effect-unknown coin prep may resolve only from confirmation"
+            )
         if outcome == "CONFIRMED":
             target = json.loads(current["target_contract_json"])
             wallet_type = target.get("wallet_type")
@@ -20765,9 +20829,7 @@ def record_coin_prep_operation_outcome(
             ),
             reconciled_at=when,
             blocking=blocking,
-            additionally_resolved=(
-                f"wallet-effect:{current['effect_claim_token']}",
-            ),
+            additionally_resolved=(f"wallet-effect:{current['effect_claim_token']}",),
         )
         row = dict(
             conn.execute(
@@ -20792,13 +20854,13 @@ def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, 
         raise ValueError("coin prep recovery limit exceeds hard limit")
     conn = get_connection()
     rows = conn.execute(
-            """
+        """
             SELECT * FROM coin_prep_operations
              WHERE outcome IN ('PREPARED', 'SUBMITTED_UNKNOWN')
              ORDER BY prepared_at, operation_id LIMIT ?
             """,
-            (safe_limit,),
-        ).fetchall()
+        (safe_limit,),
+    ).fetchall()
     if rows:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -21299,9 +21361,10 @@ def _insert_confirmed_publication_rows(
             offer_fingerprint,
             f"{generation}:{publisher}",
         )
-        publication_id = "publication:" + hashlib.sha256(
-            identity.idempotency_key.encode("utf-8")
-        ).hexdigest()
+        publication_id = (
+            "publication:"
+            + hashlib.sha256(identity.idempotency_key.encode("utf-8")).hexdigest()
+        )
         existing = conn.execute(
             "SELECT * FROM publication_outbox WHERE idempotency_key=? OR "
             "(network=? AND offer_fingerprint=? AND publication_epoch=?)",
@@ -21951,9 +22014,7 @@ def _validate_reconciliation_cancel_context(
                     )[0]
                     for value in raw_auxiliary
                 )
-        missing_prepared_auxiliary = bool(
-            auxiliary_bare and durable_auxiliary is None
-        )
+        missing_prepared_auxiliary = bool(auxiliary_bare and durable_auxiliary is None)
         if durable_auxiliary is not None and durable_auxiliary != auxiliary_bare:
             raise ValueError("Task 8 auxiliary coin claim is not exact")
         latest_row = conn.execute(
@@ -21979,8 +22040,7 @@ def _validate_reconciliation_cancel_context(
         )
         journaled_unknown_effect = bool(
             latest["phase"] == "FINALIZED"
-            and latest["outcome"]
-            in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+            and latest["outcome"] in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
             and latest["blocks_mutation"] == 1
             and type(latest_evidence) is dict
             and latest_evidence.get("effect_attempted") is True
@@ -22004,8 +22064,7 @@ def _validate_reconciliation_cancel_context(
                 and prepared_evidence.get("cohort_size") in (None, 1)
                 and prepared_evidence.get("trade_id") == member_trade
                 and prepared_evidence.get("intent_id") == member_intent
-                and prepared_evidence.get("operation_id")
-                == prepared["operation_id"]
+                and prepared_evidence.get("operation_id") == prepared["operation_id"]
                 and latest["phase"] == "FINALIZED"
                 and latest["outcome"]
                 in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
@@ -22042,8 +22101,7 @@ def _validate_reconciliation_cancel_context(
                 effect_claim["operation_id"] != prepared["operation_id"]
                 or effect_claim["attempt"] != prepared["attempt"]
                 or effect_claim["prepared_event_id"] != prepared["event_id"]
-                or not request_timestamp
-                <= effect_claim["claimed_at"]
+                or not request_timestamp <= effect_claim["claimed_at"]
                 or _parse_iso_timestamp(
                     effect_claim["claimed_at"],
                     "Task 8 effect claim timestamp",
@@ -22129,9 +22187,7 @@ def _validate_reconciliation_cancel_context(
                         prepared_wallet = json.loads(prepared["wallet_identity_json"])
                         snapshot = prepared_wallet.get("snapshot")
                         binding = (
-                            snapshot.get("binding")
-                            if type(snapshot) is dict
-                            else None
+                            snapshot.get("binding") if type(snapshot) is dict else None
                         )
                         wallet_backend = (
                             binding.get("backend")
@@ -22146,8 +22202,7 @@ def _validate_reconciliation_cancel_context(
                             else None
                         )
                         selected_count = sum(
-                            len(row["selected_coin_ids"])
-                            for row in context["members"]
+                            len(row["selected_coin_ids"]) for row in context["members"]
                         )
                         compact_cancel_shape = bool(
                             type(cancel_result) is dict
@@ -22177,8 +22232,7 @@ def _validate_reconciliation_cancel_context(
                             and cancel_result.get("transaction_id")
                             == latest["transaction_id"]
                             and compact_response.get("code") == "CS"
-                            and compact_response.get("tx")
-                            == latest["transaction_id"]
+                            and compact_response.get("tx") == latest["transaction_id"]
                         )
                         sage_auto_selected_fee_coin = bool(
                             missing_prepared_auxiliary
@@ -22200,9 +22254,7 @@ def _validate_reconciliation_cancel_context(
                             "Task 8 auxiliary coins lack durable result binding"
                         )
             elif missing_prepared_auxiliary:
-                raise ValueError(
-                    "Task 8 auxiliary coins lack durable attempt binding"
-                )
+                raise ValueError("Task 8 auxiliary coins lack durable attempt binding")
             else:
                 if type(latest_auxiliary) is not list:
                     raise ValueError("Task 8 result auxiliary coin claim is invalid")
@@ -22332,9 +22384,7 @@ def _validate_reconciliation_cancel_context(
                         f"cancel-target:{member_trade}",
                     }
                 ):
-                    raise ValueError(
-                        "Task 8 cohort cancellation lineage is not exact"
-                    )
+                    raise ValueError("Task 8 cohort cancellation lineage is not exact")
                 latest_events[member_trade] = latest
     target = targets[0]
     return {
@@ -22511,11 +22561,10 @@ def commit_offer_reconciliation(
         raise ValueError("proven cancellation requires exact Task 8 context")
     if safe_classification != "CANCELLED_PROVEN" and safe_cancel_context is not None:
         raise ValueError("only proven cancellation may carry Task 8 context")
+
     def reconciliation_journal(attempt: int) -> Dict[str, Any]:
         return _journal_values(
-            event_id=(
-                f"{safe_operation_id}:attempt:{attempt}:{phase.lower()}"
-            ),
+            event_id=(f"{safe_operation_id}:attempt:{attempt}:{phase.lower()}"),
             operation_id=safe_operation_id,
             intent_id=safe_intent_id,
             operation_type="RECONCILE",
@@ -23296,9 +23345,7 @@ def record_offer_intent_visibility(
     """Persist the existing registry visibility boundary for a created offer."""
 
     safe_intent_id = _required_stability_text(intent_id, "intent_id")
-    publication = _required_stability_text(
-        publication_identity, "publication_identity"
-    )
+    publication = _required_stability_text(publication_identity, "publication_identity")
     when = _stability_timestamp_or_now(visible_at, "visible_at")
     conn = _stability_connection()
     try:
@@ -23310,8 +23357,13 @@ def record_offer_intent_visibility(
             raise ValueError("offer intent does not exist")
         current = dict(row)
         if current["lifecycle_state"] == "visible":
-            if current["publication_identity"] != publication or not current["first_visible_at"]:
-                raise ValueError("offer visibility replay conflicts with durable authority")
+            if (
+                current["publication_identity"] != publication
+                or not current["first_visible_at"]
+            ):
+                raise ValueError(
+                    "offer visibility replay conflicts with durable authority"
+                )
             conn.commit()
             return {"intent": current, "idempotent": True}
         if current["lifecycle_state"] != "created":
@@ -23556,8 +23608,10 @@ def get_pending_refresh_lineage_parent_ids(
     safe_limit = _exact_integer(limit, "refresh lineage limit", minimum=1)
     if safe_limit > 128:
         raise ValueError("refresh lineage limit is bounded")
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT parent.intent_id
         FROM offer_intents AS parent
         LEFT JOIN offer_refresh_lineage_commits AS committed
@@ -23568,8 +23622,10 @@ def get_pending_refresh_lineage_parent_ids(
         ORDER BY parent.updated_at, parent.intent_id
         LIMIT ?
         """,
-        (safe_asset, safe_side, safe_limit),
-    ).fetchall()
+            (safe_asset, safe_side, safe_limit),
+        )
+        .fetchall()
+    )
     return [str(row["intent_id"]) for row in rows]
 
 
@@ -23584,7 +23640,9 @@ def _canonical_refresh_malformed_snapshot_entries(value: Any) -> List[Dict[str, 
     for entry in value:
         if type(entry) is not dict:
             raise ValueError("malformed refresh snapshot entry is invalid")
-        index = _exact_integer(entry.get("entry_index"), "malformed entry_index", minimum=0)
+        index = _exact_integer(
+            entry.get("entry_index"), "malformed entry_index", minimum=0
+        )
         if set(entry) == {"entry_index", "entry_sha256"}:
             digest = _reconciliation_coin_identity(
                 entry["entry_sha256"], "malformed entry_sha256"
@@ -23594,17 +23652,28 @@ def _canonical_refresh_malformed_snapshot_entries(value: Any) -> List[Dict[str, 
         # A malformed identity is recorded only as a digest; it is never
         # upgraded to a made-up trade identifier or persisted raw.
         digest_source = _canonical_json_text(
-            entry, "malformed refresh snapshot entry", expected_type=dict, max_bytes=4096
+            entry,
+            "malformed refresh snapshot entry",
+            expected_type=dict,
+            max_bytes=4096,
         )
-        normalized.append({"entry_index": index, "entry_sha256": hashlib.sha256(
-            digest_source.encode("utf-8")).hexdigest()})
+        normalized.append(
+            {
+                "entry_index": index,
+                "entry_sha256": hashlib.sha256(
+                    digest_source.encode("utf-8")
+                ).hexdigest(),
+            }
+        )
     if len({item["entry_index"] for item in normalized}) != len(normalized):
         raise ValueError("malformed refresh snapshot entries are ambiguous")
     return sorted(normalized, key=lambda item: item["entry_index"])
 
 
 def refresh_lineage_blocker_operation_id(
-    *, reason_code: str, cohort_trade_ids: Any,
+    *,
+    reason_code: str,
+    cohort_trade_ids: Any,
     malformed_snapshot_entries: Any = None,
 ) -> str:
     """Return the deterministic incident identity for one bounded snapshot."""
@@ -23616,12 +23685,15 @@ def refresh_lineage_blocker_operation_id(
     )
     if len(trades) != len(set(trades)):
         raise ValueError("refresh cohort trade identities are invalid")
-    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
+    malformed = _canonical_refresh_malformed_snapshot_entries(
+        malformed_snapshot_entries
+    )
     if not trades and not malformed:
         raise ValueError("refresh incident has no authoritative snapshot material")
     material = _canonical_json_text(
         {"reason_code": safe_reason, "trade_ids": trades, "malformed": malformed},
-        "refresh incident material", expected_type=dict,
+        "refresh incident material",
+        expected_type=dict,
     )
     return f"refresh-lineage:{safe_reason.lower()}:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
 
@@ -23647,9 +23719,12 @@ def record_refresh_lineage_blocker(
         _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
         for value in cohort_trade_ids
     )
-    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
+    malformed = _canonical_refresh_malformed_snapshot_entries(
+        malformed_snapshot_entries
+    )
     expected_op = refresh_lineage_blocker_operation_id(
-        reason_code=reason_code, cohort_trade_ids=trades,
+        reason_code=reason_code,
+        cohort_trade_ids=trades,
         malformed_snapshot_entries=malformed,
     )
     if op != expected_op:
@@ -23685,27 +23760,48 @@ def record_refresh_lineage_blocker(
                     operation_id, wallet_fingerprint_hash, network, side, asset_id,
                     cohort_trade_ids_json, snapshot_material_json, reason_code, state, recorded_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'blocking', ?)""",
-                tuple(values[key] for key in (
-                    "operation_id", "wallet_fingerprint_hash", "network", "side",
-                    "asset_id", "cohort_trade_ids_json", "snapshot_material_json", "reason_code", "recorded_at"
-                )),
+                tuple(
+                    values[key]
+                    for key in (
+                        "operation_id",
+                        "wallet_fingerprint_hash",
+                        "network",
+                        "side",
+                        "asset_id",
+                        "cohort_trade_ids_json",
+                        "snapshot_material_json",
+                        "reason_code",
+                        "recorded_at",
+                    )
+                ),
             )
         else:
             current = dict(row)
-            if any(current[key] != values[key] for key in values if key != "recorded_at"):
-                raise ValueError("refresh blocker replay conflicts with durable authority")
+            if any(
+                current[key] != values[key] for key in values if key != "recorded_at"
+            ):
+                raise ValueError(
+                    "refresh blocker replay conflicts with durable authority"
+                )
             if current["state"] == "resolved":
                 conn.commit()
                 return current
         _reconciliation_latch_update(
-            conn, operation_id=op, wallet_fingerprint_hash=values["wallet_fingerprint_hash"],
-            network=values["network"], reason_code="REFRESH_LINEAGE_INCONSISTENT",
+            conn,
+            operation_id=op,
+            wallet_fingerprint_hash=values["wallet_fingerprint_hash"],
+            network=values["network"],
+            reason_code="REFRESH_LINEAGE_INCONSISTENT",
             reason="Refresh lineage requires authoritative reconciliation",
-            reconciled_at=values["recorded_at"], blocking=True,
+            reconciled_at=values["recorded_at"],
+            blocking=True,
         )
-        result = dict(conn.execute(
-            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
-        ).fetchone())
+        result = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?",
+                (op,),
+            ).fetchone()
+        )
         conn.commit()
         return result
     except Exception:
@@ -23716,7 +23812,9 @@ def record_refresh_lineage_blocker(
 
 
 def resolve_refresh_lineage_blocker(
-    *, operation_id: str, cohort_trade_ids: Any,
+    *,
+    operation_id: str,
+    cohort_trade_ids: Any,
     malformed_snapshot_entries: Any = None,
     repaired_snapshot_entries: Any = None,
 ) -> Dict[str, Any]:
@@ -23727,7 +23825,9 @@ def resolve_refresh_lineage_blocker(
         _reconciliation_coin_identity(value, "refresh cohort trade_id")[0]
         for value in cohort_trade_ids
     )
-    malformed = _canonical_refresh_malformed_snapshot_entries(malformed_snapshot_entries)
+    malformed = _canonical_refresh_malformed_snapshot_entries(
+        malformed_snapshot_entries
+    )
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -23748,12 +23848,18 @@ def resolve_refresh_lineage_blocker(
         if malformed:
             if type(repaired_snapshot_entries) is not list:
                 conn.commit()
-                return {"resolved": False, "reason": "malformed_snapshot_unrepaired", "blocker": blocker}
+                return {
+                    "resolved": False,
+                    "reason": "malformed_snapshot_unrepaired",
+                    "blocker": blocker,
+                }
             repair_by_index: Dict[int, str] = {}
             for entry in repaired_snapshot_entries:
                 if type(entry) is not dict:
                     raise ValueError("repaired refresh snapshot entry is invalid")
-                index = _exact_integer(entry.get("entry_index"), "repaired entry_index", minimum=0)
+                index = _exact_integer(
+                    entry.get("entry_index"), "repaired entry_index", minimum=0
+                )
                 trade_id = _reconciliation_coin_identity(
                     entry.get("trade_id"), "repaired refresh trade_id"
                 )[0]
@@ -23762,7 +23868,11 @@ def resolve_refresh_lineage_blocker(
                 repair_by_index[index] = trade_id
             if set(repair_by_index) != {item["entry_index"] for item in malformed}:
                 conn.commit()
-                return {"resolved": False, "reason": "malformed_snapshot_unrepaired", "blocker": blocker}
+                return {
+                    "resolved": False,
+                    "reason": "malformed_snapshot_unrepaired",
+                    "blocker": blocker,
+                }
             repaired_trades.extend(repair_by_index.values())
         if len(repaired_trades) != len(set(repaired_trades)):
             conn.commit()
@@ -23800,27 +23910,41 @@ def resolve_refresh_lineage_blocker(
                     break
             if intent["child_intent_id"]:
                 try:
-                    _refresh_lineage_rows(conn, intent["intent_id"], intent["child_intent_id"])
+                    _refresh_lineage_rows(
+                        conn, intent["intent_id"], intent["child_intent_id"]
+                    )
                 except ValueError:
                     repaired = False
                     break
         if not repaired:
             conn.commit()
-            return {"resolved": False, "reason": "cohort_not_repaired", "blocker": blocker}
+            return {
+                "resolved": False,
+                "reason": "cohort_not_repaired",
+                "blocker": blocker,
+            }
         when = _stability_wall_clock()
         conn.execute(
             "UPDATE offer_refresh_lineage_blockers SET state='resolved', resolved_at=? "
-            "WHERE operation_id=? AND state='blocking'", (when, op)
+            "WHERE operation_id=? AND state='blocking'",
+            (when, op),
         )
         _reconciliation_latch_update(
-            conn, operation_id=op, wallet_fingerprint_hash=blocker["wallet_fingerprint_hash"],
-            network=blocker["network"], reason_code="REFRESH_LINEAGE_REPAIRED",
+            conn,
+            operation_id=op,
+            wallet_fingerprint_hash=blocker["wallet_fingerprint_hash"],
+            network=blocker["network"],
+            reason_code="REFRESH_LINEAGE_REPAIRED",
             reason="Refresh lineage cohort repaired by exact durable proof",
-            reconciled_at=when, blocking=False,
+            reconciled_at=when,
+            blocking=False,
         )
-        result = dict(conn.execute(
-            "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?", (op,)
-        ).fetchone())
+        result = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_lineage_blockers WHERE operation_id=?",
+                (op,),
+            ).fetchone()
+        )
         conn.commit()
         return {"resolved": True, "idempotent": False, "blocker": result}
     except Exception:
@@ -23830,14 +23954,20 @@ def resolve_refresh_lineage_blocker(
         conn.close()
 
 
-def get_refresh_lineage_commit_for_child(child_intent_id: str) -> Optional[Dict[str, Any]]:
+def get_refresh_lineage_commit_for_child(
+    child_intent_id: str,
+) -> Optional[Dict[str, Any]]:
     """Return the one durable completed incoming edge for a child, if any."""
 
     child_id = _required_stability_text(child_intent_id, "child_intent_id")
-    row = get_connection().execute(
-        "SELECT * FROM offer_refresh_lineage_commits WHERE child_intent_id=?",
-        (child_id,),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_refresh_lineage_commits WHERE child_intent_id=?",
+            (child_id,),
+        )
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 
@@ -24259,8 +24389,7 @@ def get_stability_diagnostic_counts() -> Dict[str, int]:
         if row is None:
             raise RuntimeError("stability diagnostic aggregate is unavailable")
         result = {
-            key: row[key]
-            for key in ("registry", "lineage", "reserve", "publication")
+            key: row[key] for key in ("registry", "lineage", "reserve", "publication")
         }
         if any(type(value) is not int or value < 0 for value in result.values()):
             raise RuntimeError("stability diagnostic aggregate is malformed")
@@ -24700,7 +24829,10 @@ _RUNTIME_RECOVERY_REASONS = frozenset(
 
 def _runtime_identifier(value: Any, name: str, prefix: str) -> str:
     text = _required_stability_text(value, name)
-    if len(text) > 96 or re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", text) is None:
+    if (
+        len(text) > 96
+        or re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", text) is None
+    ):
         raise ValueError(f"{name} is not canonical")
     return text
 
@@ -24822,8 +24954,7 @@ def _assert_runtime_recovery_lease(
             for lease_field, epoch_field in _RECOVERY_LEASE_INCARNATION_FIELDS.items()
         )
         or epoch.get("owner_run_id") != current["owner_run_id"]
-        or epoch.get("wallet_fingerprint_hash")
-        != current["wallet_fingerprint_hash"]
+        or epoch.get("wallet_fingerprint_hash") != current["wallet_fingerprint_hash"]
         or epoch.get("network") != current["network"]
         or type(captured_version) is not int
         or captured_version < 1
@@ -25140,9 +25271,10 @@ def record_runtime_recovery_pass(
     generation = _exact_integer(
         expected_latch_generation, "expected_latch_generation", minimum=1
     )
-    if type(authority_digest) is not str or re.fullmatch(
-        r"[0-9a-f]{64}", authority_digest
-    ) is None:
+    if (
+        type(authority_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", authority_digest) is None
+    ):
         raise ValueError("authority_digest must be canonical")
     checks_json = _canonical_json_text(
         checks, "checks", expected_type=list, max_bytes=65536
@@ -25174,8 +25306,7 @@ def record_runtime_recovery_pass(
             int(epoch["latch_generation"]) != generation
             or int(latch["generation"]) != generation
             or latch["state"] != "tripped"
-            or json.loads(latch["blocking_operation_ids_json"])
-            != [epoch["blocker_id"]]
+            or json.loads(latch["blocking_operation_ids_json"]) != [epoch["blocker_id"]]
         ):
             raise ValueError("runtime recovery authority changed")
         previous = conn.execute(
@@ -25196,9 +25327,10 @@ def record_runtime_recovery_pass(
             sort_keys=True,
             separators=(",", ":"),
         )
-        attempt_id = "recovery-pass:" + hashlib.sha256(
-            attempt_material.encode("utf-8")
-        ).hexdigest()
+        attempt_id = (
+            "recovery-pass:"
+            + hashlib.sha256(attempt_material.encode("utf-8")).hexdigest()
+        )
         conn.execute(
             "INSERT INTO runtime_recovery_passes "
             "(recovery_id,attempt_number,attempt_id,authority_digest,checks_json,"
@@ -25244,9 +25376,7 @@ def quarantine_runtime_blockers(
 
     if type(confirmation) is not bool or confirmation is not True:
         raise TypeError("confirmation must be the exact boolean true")
-    quarantine = _runtime_identifier(
-        quarantine_id, "quarantine_id", "quarantine:"
-    )
+    quarantine = _runtime_identifier(quarantine_id, "quarantine_id", "quarantine:")
     recovery = _runtime_identifier(
         expected_recovery_id, "expected_recovery_id", "recovery:"
     )
@@ -25399,7 +25529,9 @@ def quarantine_runtime_blockers(
                 max_bytes=8192,
             )
             selected = json.loads(selected_json)
-            if any(type(coin_id) is not str or len(coin_id) > 128 for coin_id in selected):
+            if any(
+                type(coin_id) is not str or len(coin_id) > 128 for coin_id in selected
+            ):
                 raise ValueError("affected selected coin authority is invalid")
             affected_coin_count += len(selected)
             if affected_coin_count > 64:
@@ -25473,35 +25605,45 @@ def quarantine_runtime_blockers(
 
 
 def get_runtime_quarantine_manifest(quarantine_id: str) -> Optional[Dict[str, Any]]:
-    quarantine = _runtime_identifier(
-        quarantine_id, "quarantine_id", "quarantine:"
+    quarantine = _runtime_identifier(quarantine_id, "quarantine_id", "quarantine:")
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM runtime_quarantine_manifests WHERE quarantine_id=?",
+            (quarantine,),
+        )
+        .fetchone()
     )
-    row = get_connection().execute(
-        "SELECT * FROM runtime_quarantine_manifests WHERE quarantine_id=?",
-        (quarantine,),
-    ).fetchone()
     return None if row is None else dict(row)
 
 
 def get_runtime_recovery_epoch(recovery_id: str) -> Optional[Dict[str, Any]]:
     recovery = _runtime_identifier(recovery_id, "recovery_id", "recovery:")
-    row = get_connection().execute(
-        "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
-        (recovery,),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
+            (recovery,),
+        )
+        .fetchone()
+    )
     return None if row is None else dict(row)
 
 
 def get_current_runtime_recovery() -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT epoch.* FROM runtime_recovery_epochs AS epoch "
-        "JOIN runtime_safety_latch AS latch "
-        "ON latch.generation=epoch.latch_generation "
-        "WHERE latch.singleton_id=1 AND latch.state='tripped' "
-        "AND EXISTS (SELECT 1 FROM json_each(latch.blocking_operation_ids_json) "
-        "WHERE json_each.value=epoch.blocker_id) "
-        "ORDER BY epoch.latch_generation DESC LIMIT 1"
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT epoch.* FROM runtime_recovery_epochs AS epoch "
+            "JOIN runtime_safety_latch AS latch "
+            "ON latch.generation=epoch.latch_generation "
+            "WHERE latch.singleton_id=1 AND latch.state='tripped' "
+            "AND EXISTS (SELECT 1 FROM json_each(latch.blocking_operation_ids_json) "
+            "WHERE json_each.value=epoch.blocker_id) "
+            "ORDER BY epoch.latch_generation DESC LIMIT 1"
+        )
+        .fetchone()
+    )
     return None if row is None else dict(row)
 
 
@@ -25526,9 +25668,7 @@ def adopt_runtime_recovery_epoch(
     """
 
     recovery = _runtime_identifier(recovery_id, "recovery_id", "recovery:")
-    owner = _required_stability_text(
-        successor_owner_run_id, "successor_owner_run_id"
-    )
+    owner = _required_stability_text(successor_owner_run_id, "successor_owner_run_id")
     pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
     host = _required_stability_text(successor_owner_host, "successor_owner_host")
     wallet_hash = _required_stability_text(
@@ -25651,9 +25791,10 @@ def adopt_runtime_recovery_epoch(
             expected_type=dict,
             max_bytes=4096,
         )
-        takeover_id = "recovery-takeover:" + hashlib.sha256(
-            takeover_material.encode("utf-8")
-        ).hexdigest()
+        takeover_id = (
+            "recovery-takeover:"
+            + hashlib.sha256(takeover_material.encode("utf-8")).hexdigest()
+        )
         conn.execute(
             """
             INSERT INTO runtime_recovery_takeovers (
@@ -25810,9 +25951,7 @@ def resolve_runtime_quarantine(
 ) -> Dict[str, Any]:
     """Append resolution only after atomically rechecking every DB ambiguity."""
 
-    quarantine_id = _runtime_identifier(
-        quarantine_id, "quarantine_id", "quarantine:"
-    )
+    quarantine_id = _runtime_identifier(quarantine_id, "quarantine_id", "quarantine:")
     recovery_id = _runtime_identifier(
         expected_recovery_id, "expected_recovery_id", "recovery:"
     )
@@ -26064,9 +26203,7 @@ def resolve_runtime_safety_latch(
         expected_generation, "expected_generation"
     )
     if type(resolved_operation_ids) not in (list, tuple):
-        raise TypeError(
-            "resolved_operation_ids must be an exact bounded list or tuple"
-        )
+        raise TypeError("resolved_operation_ids must be an exact bounded list or tuple")
     if len(resolved_operation_ids) > 64:
         raise ValueError("resolved_operation_ids exceeds bound")
     resolved_ids = sorted(
@@ -26921,9 +27058,7 @@ def enqueue_publication_for_trade(
     from publication_outbox import canonical_publication_identity
 
     trade = _required_stability_text(trade_id, "trade_id")
-    fingerprint = _required_stability_text(
-        offer_fingerprint, "offer_fingerprint"
-    )
+    fingerprint = _required_stability_text(offer_fingerprint, "offer_fingerprint")
     if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
         raise ValueError("offer_fingerprint is not canonical")
     safe_publisher = _required_stability_text(publisher, "publisher")
@@ -26966,10 +27101,7 @@ def enqueue_publication_for_trade(
                 "publication requires an exact nonterminal authoritative intent"
             )
         authoritative_network = str(intent["network"])
-        if (
-            supplied_network is not None
-            and supplied_network != authoritative_network
-        ):
+        if supplied_network is not None and supplied_network != authoritative_network:
             raise ValueError("publication network conflicts with offer intent")
         existing_rows = [
             dict(row)
@@ -27007,9 +27139,7 @@ def enqueue_publication_for_trade(
             )
             for row in existing_rows
         ):
-            raise ValueError(
-                "possible dispatched publication history blocks new work"
-            )
+            raise ValueError("possible dispatched publication history blocks new work")
         if any(row["state"] == "suppressed" for row in existing_rows):
             raise ValueError("suppressed publication history blocks new work")
         if not force:
@@ -27024,16 +27154,13 @@ def enqueue_publication_for_trade(
             if not all(row["state"] == "succeeded" for row in existing_rows):
                 raise ValueError("publication history does not authorize a new epoch")
             repost_numbers = []
-            pattern = re.compile(
-                rf"repost-([0-9]{{10}}):{re.escape(safe_publisher)}\Z"
-            )
+            pattern = re.compile(rf"repost-([0-9]{{10}}):{re.escape(safe_publisher)}\Z")
             for row in existing_rows:
                 match = pattern.fullmatch(row["publication_epoch"])
                 if match is not None:
                     repost_numbers.append(int(match.group(1)))
             publication_epoch = (
-                f"repost-{max(repost_numbers, default=0) + 1:010d}:"
-                f"{safe_publisher}"
+                f"repost-{max(repost_numbers, default=0) + 1:010d}:{safe_publisher}"
             )
         else:
             publication_epoch = f"legacy-0000000001:{safe_publisher}"
@@ -27045,9 +27172,10 @@ def enqueue_publication_for_trade(
         payload_text = json.dumps(
             {"offer_ref": trade}, separators=(",", ":"), sort_keys=True
         )
-        publication_id = "publication:" + hashlib.sha256(
-            identity.idempotency_key.encode("utf-8")
-        ).hexdigest()
+        publication_id = (
+            "publication:"
+            + hashlib.sha256(identity.idempotency_key.encode("utf-8")).hexdigest()
+        )
         values = {
             "publication_id": publication_id,
             "idempotency_key": identity.idempotency_key,
@@ -27057,9 +27185,7 @@ def enqueue_publication_for_trade(
             "publication_epoch": identity.publication_epoch,
             "publisher": safe_publisher,
             "payload_json": payload_text,
-            "payload_sha256": hashlib.sha256(
-                payload_text.encode("utf-8")
-            ).hexdigest(),
+            "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
             "queued_at": queued,
         }
         conn.execute(
@@ -27120,12 +27246,16 @@ def list_publication_outbox(
         clauses.append("publisher=?")
         params.append(safe_publisher)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    rows = get_connection().execute(
-        "SELECT * FROM publication_outbox"
-        + where
-        + " ORDER BY publisher,publication_epoch,publication_id",
-        params,
-    ).fetchall()
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM publication_outbox"
+            + where
+            + " ORDER BY publisher,publication_epoch,publication_id",
+            params,
+        )
+        .fetchall()
+    )
     return [dict(row) for row in rows]
 
 
@@ -27183,9 +27313,7 @@ def claim_publication_outbox(
     at = _stability_timestamp(claimed_at, "claimed_at")
     expires = _stability_timestamp(claim_expires_at, "claim_expires_at")
     at_dt = _parse_iso_timestamp(at, "claimed_at", require_timezone=True)
-    expiry_dt = _parse_iso_timestamp(
-        expires, "claim_expires_at", require_timezone=True
-    )
+    expiry_dt = _parse_iso_timestamp(expires, "claim_expires_at", require_timezone=True)
     lease_seconds = (expiry_dt - at_dt).total_seconds()
     if lease_seconds <= 0 or lease_seconds > 300:
         raise ValueError("publication claim lease is outside its bounded window")
@@ -27358,9 +27486,10 @@ def mark_publication_dispatch_started(
     token = _required_stability_text(claim_token, "claim_token")
     generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
     version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
-    if type(request_sha256) is not str or re.fullmatch(
-        r"[0-9a-f]{64}", request_sha256
-    ) is None:
+    if (
+        type(request_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+    ):
         raise ValueError("request_sha256 must be a canonical SHA-256 digest")
     dispatched = _stability_timestamp(dispatched_at, "dispatched_at")
     conn = _stability_connection()
@@ -27581,9 +27710,7 @@ def recover_publication_outbox_from_provider_readback(
     safe_provider = _required_stability_text(provider, "provider")
     if safe_provider != "dexie":
         raise ValueError("provider readback recovery is not supported")
-    provider_id = _required_stability_text(
-        provider_response_id, "provider_response_id"
-    )
+    provider_id = _required_stability_text(provider_response_id, "provider_response_id")
     if len(provider_id) > 256 or any(ord(character) < 33 for character in provider_id):
         raise ValueError("provider_response_id is not canonical")
     if type(provider_status) is not int or provider_status != 0:

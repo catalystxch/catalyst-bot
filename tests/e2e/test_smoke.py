@@ -279,7 +279,9 @@ def test_inactive_amm_monitor_is_not_shown_as_still_gathering(page):
     expect(page.locator("#ammPlaceholder")).to_contain_text(
         "TibetSwap monitor inactive"
     )
-    expect(page.locator("#ammPlaceholder .v4-data-strip-placeholder-dots")).to_be_hidden()
+    expect(
+        page.locator("#ammPlaceholder .v4-data-strip-placeholder-dots")
+    ).to_be_hidden()
 
 
 def test_market_intel_names_confirmed_tibetswap_outage(page):
@@ -335,9 +337,7 @@ def test_dashboard_diagnostics_do_not_render_false_tibet_values_during_outage(pa
 
     expect(page.locator("#mktTibetDepth")).to_have_text("Tibet: unavailable")
     expect(page.locator("#mktArbGap")).to_have_text("Unavailable")
-    expect(page.locator("#mktArbSub")).to_have_text(
-        "TibetSwap outage — Dexie-only"
-    )
+    expect(page.locator("#mktArbSub")).to_have_text("TibetSwap outage — Dexie-only")
     expect(page.locator("#coverageTibet")).to_have_text("outage")
     expect(page.locator("#intelArbGapTrend")).to_have_text("Unavailable")
     expect(page.locator("#intelArbGapTrendSub")).to_have_text(
@@ -473,11 +473,13 @@ def test_no_console_errors_on_initial_load(app_page):
     )
     app_page.on(
         "response",
-        lambda response: server_errors.append(
-            f"{response.status} {response.request.method} {response.url}"
-        )
-        if response.status >= 500
-        else None,
+        lambda response: (
+            server_errors.append(
+                f"{response.status} {response.request.method} {response.url}"
+            )
+            if response.status >= 500
+            else None
+        ),
     )
     # Note: cannot use wait_until="networkidle" — the dashboard holds an
     # open SSE connection (`/api/events`) that never goes idle.
@@ -495,6 +497,5 @@ def test_no_console_errors_on_initial_load(app_page):
         and "ERR_NETWORK" not in e
     ]
     assert not real_errors, (
-        f"Unexpected JS console errors: {real_errors}; "
-        f"server errors: {server_errors}"
+        f"Unexpected JS console errors: {real_errors}; server errors: {server_errors}"
     )

@@ -143,7 +143,9 @@ class TestAMMMonitorFetchPair(unittest.TestCase):
             response = MagicMock()
             response.raise_for_status = MagicMock()
             response.json.return_value = (
-                fresh_pair if url.endswith(f"/pair/{_FakeCfg.TIBET_PAIR_ID}") else stale_list
+                fresh_pair
+                if url.endswith(f"/pair/{_FakeCfg.TIBET_PAIR_ID}")
+                else stale_list
             )
             return response
 

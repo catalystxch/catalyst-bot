@@ -81,9 +81,7 @@ def plan_refresh(
         )
     staged = min(len(intent_ids), capacity, limit)
     if staged == 0:
-        return RefreshPlan(
-            "pause", "overlap_capacity_exhausted", (), (), True, True
-        )
+        return RefreshPlan("pause", "overlap_capacity_exhausted", (), (), True, True)
     return RefreshPlan("stage", None, intent_ids[:staged], (), True, True)
 
 

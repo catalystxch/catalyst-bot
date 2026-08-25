@@ -394,11 +394,14 @@ def test_read_only_status_does_not_install_a_transient_durable_latch_fence(
     assert observed.allowed is False
     assert observed.source == "durable_latch"
     _append_event(operation_id, blocks=False, suffix="confirmed")
-    assert database.resolve_runtime_safety_latch(
-        expected_generation=1,
-        resolved_operation_ids=[operation_id],
-        resolved_at=clock(),
-    )["resolved"] is True
+    assert (
+        database.resolve_runtime_safety_latch(
+            expected_generation=1,
+            resolved_operation_ids=[operation_id],
+            resolved_at=clock(),
+        )["resolved"]
+        is True
+    )
 
     assert gate.read_only_status().allowed is True
     assert gate.status().allowed is True
@@ -7013,7 +7016,9 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
             },
         },
     )
-    monkeypatch.setattr(api_server, "_configured_mutation_binding", lambda: ("f" * 64, "mainnet"))
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: ("f" * 64, "mainnet")
+    )
     monkeypatch.setattr(api_server.database, "DB_PATH", __file__)
     monkeypatch.setattr(
         api_server.database,

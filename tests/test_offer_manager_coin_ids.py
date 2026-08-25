@@ -80,8 +80,8 @@ fake_database.get_runtime_mutation_lease = lambda: {
     "wallet_fingerprint_hash": "f" * 64,
     "network": "mainnet",
 }
-fake_database.refresh_lineage_blocker_operation_id = (
-    lambda **kwargs: "refresh-lineage:test-blocker"
+fake_database.refresh_lineage_blocker_operation_id = lambda **kwargs: (
+    "refresh-lineage:test-blocker"
 )
 fake_database.record_refresh_lineage_blocker = lambda **kwargs: {"state": "blocking"}
 sys.modules["database"] = fake_database
@@ -1714,9 +1714,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
     def test_get_replenishment_slots_selects_the_actual_vacant_durable_slot(self):
         manager = offer_manager.OfferManager()
         existing = [{"tier": "inner"}] * 7
-        occupied = [
-            f"ladder:test-cat:sell:{slot}" for slot in (0, 1, 2, 3, 4, 5, 7)
-        ]
+        occupied = [f"ladder:test-cat:sell:{slot}" for slot in (0, 1, 2, 3, 4, 5, 7)]
 
         with (
             patch.object(offer_manager.cfg, "TIER_ENABLED", True),

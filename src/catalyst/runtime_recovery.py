@@ -48,7 +48,9 @@ def _exact_finite_decimal(value: Any) -> Decimal | None:
 
 def _threshold(value: Any, *, allow_zero: bool) -> Decimal | None:
     candidate = _exact_finite_decimal(value)
-    lower_ok = candidate is not None and (candidate >= 0 if allow_zero else candidate > 0)
+    lower_ok = candidate is not None and (
+        candidate >= 0 if allow_zero else candidate > 0
+    )
     return candidate if lower_ok and candidate <= _MAX_TIMING_SECONDS else None
 
 
@@ -104,13 +106,9 @@ def detect_discontinuity(
     mono_text = _seconds_text(monotonic_delta)
     wall_text = _seconds_text(wall_delta)
     if monotonic_delta < 0:
-        return DiscontinuityDecision(
-            True, "MONOTONIC_ROLLBACK", mono_text, wall_text
-        )
+        return DiscontinuityDecision(True, "MONOTONIC_ROLLBACK", mono_text, wall_text)
     if wall_delta < 0:
-        return DiscontinuityDecision(
-            True, "WALL_CLOCK_ROLLBACK", mono_text, wall_text
-        )
+        return DiscontinuityDecision(True, "WALL_CLOCK_ROLLBACK", mono_text, wall_text)
     if monotonic_delta > gap_limit:
         return DiscontinuityDecision(True, "MONOTONIC_GAP", mono_text, wall_text)
     if abs(wall_delta - monotonic_delta) > skew_limit:
@@ -129,9 +127,11 @@ def _canonical_utc_text(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except (TypeError, ValueError, OverflowError):
         return None
-    canonical = parsed.astimezone(timezone.utc).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    canonical = (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
     return parsed if parsed.tzinfo is not None and canonical == value else None
 
 
@@ -181,7 +181,11 @@ def validate_quarantine_resolution_proof(
         offers = requirements.get("offers")
         absent = proof.get("absent_offer_ids")
         coins = proof.get("coins")
-        if type(offers) is not list or type(absent) is not list or type(coins) is not list:
+        if (
+            type(offers) is not list
+            or type(absent) is not list
+            or type(coins) is not list
+        ):
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
         expected_offer_ids: set[str] = set()
         expected_coin_ids: set[str] = set()
@@ -189,7 +193,9 @@ def validate_quarantine_resolution_proof(
             if type(offer) is not dict or type(offer.get("trade_id")) is not str:
                 return _proof_denied("QUARANTINE_PROOF_MALFORMED")
             selected = offer.get("selected_coin_ids")
-            if type(selected) is not list or any(type(item) is not str for item in selected):
+            if type(selected) is not list or any(
+                type(item) is not str for item in selected
+            ):
                 return _proof_denied("QUARANTINE_PROOF_MALFORMED")
             expected_offer_ids.add(offer["trade_id"])
             expected_coin_ids.update(selected)
@@ -201,7 +207,10 @@ def validate_quarantine_resolution_proof(
                 return _proof_denied("QUARANTINE_PROOF_MALFORMED")
             if coin["coin_id"] in by_coin:
                 return _proof_denied("QUARANTINE_PROOF_MALFORMED")
-            if type(coin.get("owned")) is not bool or type(coin.get("unlocked")) is not bool:
+            if (
+                type(coin.get("owned")) is not bool
+                or type(coin.get("unlocked")) is not bool
+            ):
                 return _proof_denied("QUARANTINE_PROOF_MALFORMED")
             by_coin[coin["coin_id"]] = coin
         if set(by_coin) != expected_coin_ids:

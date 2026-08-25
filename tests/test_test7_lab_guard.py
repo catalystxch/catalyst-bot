@@ -21,8 +21,10 @@ _SPEC.loader.exec_module(lab)
 
 
 def _utc(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -140,7 +142,9 @@ def test_every_mutation_uses_a_fresh_identity_and_failure_never_calls_effect(tmp
     }
 
     assert lab.run_guarded_mutation(
-        operation="create", effect=lambda: effects.append("create") or {"ok": True}, **kwargs
+        operation="create",
+        effect=lambda: effects.append("create") or {"ok": True},
+        **kwargs,
     )["result"] == {"ok": True}
     with pytest.raises(lab.LabRefusal, match="SIGNING_DISABLED"):
         lab.run_guarded_mutation(
@@ -159,7 +163,9 @@ def test_checkpoint_advances_only_after_success_and_keeps_bounded_redacted_evide
     checkpoint = lab.CheckpointStore(tmp_path / "checkpoint.json")
 
     with pytest.raises(RuntimeError, match="boom"):
-        checkpoint.run_stage("lifecycle", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        checkpoint.run_stage(
+            "lifecycle", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
     assert checkpoint.completed_stages() == []
 
     result = checkpoint.run_stage(
@@ -227,8 +233,10 @@ def test_read_only_stage_runs_without_live_authority(tmp_path):
         live=False,
         checkpoint=checkpoint,
         handlers={
-            "inventory": lambda: invoked.append("inventory")
-            or {"success": True, "stage": "inventory", "count": 3}
+            "inventory": lambda: (
+                invoked.append("inventory")
+                or {"success": True, "stage": "inventory", "count": 3}
+            )
         },
         authority={},
     )
@@ -244,7 +252,9 @@ def test_live_stage_reauthorizes_each_individual_effect(tmp_path):
     identity_reads = []
     effects = []
     authority = _live_kwargs(tmp_path, now)
-    authority["identity_reader"] = lambda: identity_reads.append("read") or _identity(now)
+    authority["identity_reader"] = lambda: (
+        identity_reads.append("read") or _identity(now)
+    )
 
     def lifecycle(mutate):
         mutate("create", lambda: effects.append("create") or {"success": True})
@@ -342,19 +352,21 @@ def _fake_runtime_modules(now, *, history_complete=True, wallets=None):
         get_unresolved_offer_operation_blockers=lambda: [],
         get_runtime_safety_latch=lambda: {"state": "resolved"},
         list_publication_outbox=lambda: [],
-        get_free_coins=lambda wallet_type: [
-            {
-                "coin_id": "1" * 64,
-                "amount_mojos": 3_000_000_000,
-                "status": "free",
-                "trade_id": None,
-                "designation": "unknown",
-                "assigned_tier": "none",
-                "purpose": None,
-            }
-        ]
-        if wallet_type == "xch"
-        else [],
+        get_free_coins=lambda wallet_type: (
+            [
+                {
+                    "coin_id": "1" * 64,
+                    "amount_mojos": 3_000_000_000,
+                    "status": "free",
+                    "trade_id": None,
+                    "designation": "unknown",
+                    "assigned_tier": "none",
+                    "purpose": None,
+                }
+            ]
+            if wallet_type == "xch"
+            else []
+        ),
         set_coin_designation=lambda *_args, **_kwargs: True,
     )
     config = SimpleNamespace(
@@ -414,8 +426,8 @@ def test_inventory_prefers_public_authoritative_history_reader():
     authoritative = lambda **_kwargs: {"offers": [], "total": 0}
     modules["wallet"].get_authoritative_offer_history = authoritative
     observed = []
-    modules["offer_reconciliation"].load_sage_offer_history = (
-        lambda **kwargs: observed.append(kwargs["get_all_offers"])
+    modules["offer_reconciliation"].load_sage_offer_history = lambda **kwargs: (
+        observed.append(kwargs["get_all_offers"])
         or {
             "complete": True,
             "read_error": None,
@@ -438,9 +450,7 @@ def test_inventory_requires_one_exact_sbx_wallet():
     ]
 
     for wallets in (no_sbx, two_sbx):
-        runtime = lab.CatalystLabRuntime(
-            _fake_runtime_modules(now, wallets=wallets)
-        )
+        runtime = lab.CatalystLabRuntime(_fake_runtime_modules(now, wallets=wallets))
         with pytest.raises(lab.LabRefusal, match="SBX_WALLET_AMBIGUOUS"):
             runtime.inventory(now=now)
 
@@ -468,9 +478,8 @@ def test_reconcile_uses_durable_intents_and_requires_zero_safety_blockers():
         "publication_issues": [],
         "authority_digest": "d" * 64,
     }
-    modules["offer_reconciliation"].reconcile_offer = (
-        lambda intent_id, **kwargs: calls.append((intent_id, kwargs))
-        or {"classification": "ACTIVE_PROVEN"}
+    modules["offer_reconciliation"].reconcile_offer = lambda intent_id, **kwargs: (
+        calls.append((intent_id, kwargs)) or {"classification": "ACTIVE_PROVEN"}
     )
 
     result = lab.CatalystLabRuntime(modules).reconcile()
@@ -546,18 +555,21 @@ def test_main_refuses_unmarked_directory_or_wrong_live_confirmation(tmp_path, ca
 
     data_dir = tmp_path / "test7-lab"
     lab.initialize_lab_directory(data_dir)
-    assert lab.main(
-        [
-            "--data-dir",
-            str(data_dir),
-            "--stage",
-            "lifecycle",
-            "--live",
-            "--confirm",
-            "wrong",
-        ],
-        environment={},
-    ) == 2
+    assert (
+        lab.main(
+            [
+                "--data-dir",
+                str(data_dir),
+                "--stage",
+                "lifecycle",
+                "--live",
+                "--confirm",
+                "wrong",
+            ],
+            environment={},
+        )
+        == 2
+    )
     assert "LIVE_CONFIRMATION_REQUIRED" in capsys.readouterr().err
 
 
@@ -1030,9 +1042,7 @@ def test_main_live_lifecycle_acquires_and_releases_runtime(
 
 
 def test_main_refuses_live_mode_without_explicit_isolated_data_dir(capsys):
-    assert lab.main(
-        ["--live", "--confirm", lab.LIVE_CONFIRMATION], environment={}
-    ) == 2
+    assert lab.main(["--live", "--confirm", lab.LIVE_CONFIRMATION], environment={}) == 2
     assert "ISOLATED_DATA_DIR_REQUIRED" in capsys.readouterr().err
 
 
@@ -1064,9 +1074,7 @@ def test_replacement_runs_two_visible_child_before_parent_cancel_waves():
     modules["database"].get_free_coins = lambda wallet_type: (
         rows if wallet_type == "xch" else []
     )
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
     modules["database"].get_offer_intents_for_registry = lambda: []
     assignments = []
 
@@ -1113,17 +1121,16 @@ def test_replacement_runs_two_visible_child_before_parent_cancel_waves():
     modules["database"].add_offer = lambda **kwargs: legacy.append(kwargs) or True
     modules["database"].update_offer_bech32 = lambda *_args: True
     visible = []
-    modules["database"].record_offer_intent_visibility = (
-        lambda intent_id, **kwargs: visible.append((intent_id, kwargs))
-        or {"intent": {"intent_id": intent_id}}
+    modules["database"].record_offer_intent_visibility = lambda intent_id, **kwargs: (
+        visible.append((intent_id, kwargs)) or {"intent": {"intent_id": intent_id}}
     )
     bound = []
-    modules["database"].bind_refresh_lineage = (
-        lambda parent, child: bound.append((parent, child)) or {"idempotent": False}
+    modules["database"].bind_refresh_lineage = lambda parent, child: (
+        bound.append((parent, child)) or {"idempotent": False}
     )
     committed = []
-    modules["database"].commit_refresh_lineage_completion = (
-        lambda parent: committed.append(parent) or {"committed": True}
+    modules["database"].commit_refresh_lineage_completion = lambda parent: (
+        committed.append(parent) or {"committed": True}
     )
     modules["offer_reconciliation"].reconcile_offer = lambda *_args, **_kwargs: {
         "classification": "CANCELLED_PROVEN"
@@ -1245,9 +1252,7 @@ def test_fill_self_takes_through_guarded_rpc_and_proves_disjoint_assets(monkeypa
         rows if wallet_type == "xch" else []
     )
     modules["database"].get_offer_intents_for_registry = lambda: []
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
 
     def designate(coin_id, designation, assigned_tier, *, purpose):
         rows[0].update(
@@ -1392,14 +1397,13 @@ def test_fill_resumes_proven_active_prior_attempt_with_explicit_submit(monkeypat
         rows if wallet_type == "xch" else []
     )
     modules["database"].get_offer_intents_for_registry = lambda: intents
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
     modules["database"].get_offer = lambda trade_id: (
         {"offer_bech32": "offer1old", "coin_id": maker_coin}
         if trade_id == old_trade
         else None
     )
+
     def designate(coin_id, designation, assigned_tier, *, purpose):
         rows[0].update(
             designation=designation,
@@ -1449,9 +1453,7 @@ def test_fill_resumes_proven_active_prior_attempt_with_explicit_submit(monkeypat
 
     def reconcile(intent_id, **_kwargs):
         if intent_id == old_intent:
-            return {
-                "classification": "FILLED_PROVEN" if submitted else "ACTIVE_PROVEN"
-            }
+            return {"classification": "FILLED_PROVEN" if submitted else "ACTIVE_PROVEN"}
         return {"classification": "FILLED_PROVEN"}
 
     modules["offer_reconciliation"].reconcile_offer = reconcile
@@ -1478,9 +1480,7 @@ def test_fill_resumes_proven_active_prior_attempt_with_explicit_submit(monkeypat
 def test_soak_samples_identity_history_and_clean_gate_without_wallet_effects():
     now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
     modules = _fake_runtime_modules(now)
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
     operations = []
     sleeps = []
 
@@ -1517,9 +1517,7 @@ def test_soak_clock_is_sampled_after_fresh_identity_read():
         return _identity(observed, observed_at_utc=_utc(observed))
 
     modules["wallet"].get_wallet_identity = identity
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
 
     result = lab.CatalystLabRuntime(modules).soak(
         lambda _operation, effect: {"result": effect()},
@@ -1534,9 +1532,7 @@ def test_soak_clock_is_sampled_after_fresh_identity_read():
 def test_final_reconcile_requires_terminal_lab_intents_and_terminal_outbox():
     now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
     modules = _fake_runtime_modules(now)
-    modules["database"].get_stability_startup_recovery_snapshot = (
-        _clean_safety_snapshot
-    )
+    modules["database"].get_stability_startup_recovery_snapshot = _clean_safety_snapshot
     modules["database"].get_offer_intents_for_registry = lambda: [
         {
             "intent_id": "done",

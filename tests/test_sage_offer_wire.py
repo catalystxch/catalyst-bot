@@ -101,7 +101,9 @@ def test_unsigned_offer_preserves_exact_coin_spends_and_removes_only_signature()
     signed = SpendBundle(original.coin_spends, G2Element.generator())
     compressor = zlib.compressobj(zdict=sage_offer_wire._puzzle_dictionary(version))
     signed_text = _encode_test_offer(
-        version.to_bytes(2, "big") + compressor.compress(bytes(signed)) + compressor.flush()
+        version.to_bytes(2, "big")
+        + compressor.compress(bytes(signed))
+        + compressor.flush()
     )
 
     unsigned_text = sage_offer_wire.unsigned_sage_offer_text(signed_text)

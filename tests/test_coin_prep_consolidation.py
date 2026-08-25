@@ -179,8 +179,8 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             self.coin_prep_worker.CoinPrepAuthorityUnresolved("still pending")
         )
         fallback_calls = []
-        worker._consolidate_wallet_sage_fallback = (
-            lambda *_args: fallback_calls.append("fallback") or False
+        worker._consolidate_wallet_sage_fallback = lambda *_args: (
+            fallback_calls.append("fallback") or False
         )
 
         self.assertFalse(worker._consolidate_wallet_sage_combine(2, "CAT"))
@@ -377,6 +377,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "success": True,
             "confirmed_records": list(records),
         }
+
         def send_transaction(
             wallet_id, amount_mojos, address, fee_mojos=0, source_coin_ids=None
         ):
@@ -805,9 +806,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
                 }
             }
 
-        self.coin_prep_worker.prepare_coin_prep_operation = (
-            prepare_coin_prep_operation
-        )
+        self.coin_prep_worker.prepare_coin_prep_operation = prepare_coin_prep_operation
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
             lambda *args, **kwargs: {"operation": {"outcome": kwargs["outcome"]}}
         )
@@ -887,9 +886,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         fake_wallet_sage.get_spendable_coins_rpc = lambda wallet_id: {
             "success": True,
             "confirmed_records": list(
-                refreshed_records
-                if state["first_batch_confirmed"]
-                else initial_records
+                refreshed_records if state["first_batch_confirmed"] else initial_records
             ),
         }
 

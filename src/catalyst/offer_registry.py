@@ -755,10 +755,7 @@ def _lineage_decision(
             and len(provisional_children) == 1
             and provisional_children[0] is record
         )
-        if (
-            parent.child_intent_id != record.intent_id
-            and not provisional_child_claim
-        ):
+        if parent.child_intent_id != record.intent_id and not provisional_child_claim:
             return _decision(
                 False,
                 AuthorizationCode.INVALID_LINEAGE,

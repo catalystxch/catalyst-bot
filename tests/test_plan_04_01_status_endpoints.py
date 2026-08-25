@@ -501,7 +501,9 @@ class TestStatusEndpointSmoke(_FlaskBase):
 
         self.assertEqual(resp.status_code, 200)
         offers = resp.get_json()["offers"]
-        self.assertEqual([offer["full_id"] for offer in offers["buy"]], ["buy-trade-id"])
+        self.assertEqual(
+            [offer["full_id"] for offer in offers["buy"]], ["buy-trade-id"]
+        )
         self.assertEqual(
             [offer["full_id"] for offer in offers["sell"]], ["sell-trade-id"]
         )
@@ -564,9 +566,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
 
         self.assertEqual(resp.status_code, 200)
         offers = resp.get_json()["offers"]
-        self.assertEqual(
-            [offer["full_id"] for offer in offers["buy"]], ["live-buy-id"]
-        )
+        self.assertEqual([offer["full_id"] for offer in offers["buy"]], ["live-buy-id"])
         self.assertEqual(offers["sell"], [])
         get_all_offers.assert_not_called()
 

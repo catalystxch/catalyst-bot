@@ -75,9 +75,7 @@ class TierGroupCountTests(unittest.TestCase):
             lambda *args, **kwargs: None
         )
         fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
-        fake_database.wallet_effect_adapter_dispatch_authority = (
-            contextlib.nullcontext
-        )
+        fake_database.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
         sys.modules["database"] = fake_database
 
         fake_wallet = types.ModuleType("wallet")

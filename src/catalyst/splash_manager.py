@@ -180,9 +180,7 @@ class SplashManager:
                     posted += 1
                     self._total_posted += 1
                     with self._lock:
-                        self._posted_fingerprints.add(
-                            self._fingerprint(offer_bech32)
-                        )
+                        self._posted_fingerprints.add(self._fingerprint(offer_bech32))
                 else:
                     failed += 1
             elif decision.state is PublicationState.RETRYABLE:
@@ -217,9 +215,7 @@ class SplashManager:
             if trade_id:
                 with self._lock:
                     self._queue = [
-                        item
-                        for item in self._queue
-                        if item.get("trade_id") != trade_id
+                        item for item in self._queue if item.get("trade_id") != trade_id
                     ]
         return {
             "posted": posted,
@@ -442,8 +438,7 @@ class SplashManager:
             if (
                 request_contract["publisher"] != "splash"
                 or request_contract["body"]["offer"] != offer_bech32
-                or request_contract["headers"]["idempotency-key"]
-                != idempotency_key
+                or request_contract["headers"]["idempotency-key"] != idempotency_key
             ):
                 raise ValueError("durable Splash request contract does not match claim")
             url = request_contract["destination_url"]
@@ -491,9 +486,7 @@ class SplashManager:
                         "response_sha256": response_digest,
                         "status_code": r.status_code,
                         "reason_code": (
-                            "RATE_LIMITED"
-                            if r.status_code == 429
-                            else "INVALID_OFFER"
+                            "RATE_LIMITED" if r.status_code == 429 else "INVALID_OFFER"
                         ),
                     }
                 return {

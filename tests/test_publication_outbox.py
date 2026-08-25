@@ -351,7 +351,9 @@ def test_finalize_rolls_back_confirmation_if_publication_insert_fails(
     monkeypatch.setattr(
         isolated_database,
         "_insert_confirmed_publication_rows",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected insert failure")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected insert failure")
+        ),
     )
 
     with pytest.raises(RuntimeError, match="injected insert failure"):
@@ -368,7 +370,10 @@ def test_finalize_rolls_back_confirmation_if_publication_insert_fails(
             finalized_at=LATER,
         )
 
-    assert isolated_database.get_offer_intent("intent-rollback")["lifecycle_state"] == "prepared"
+    assert (
+        isolated_database.get_offer_intent("intent-rollback")["lifecycle_state"]
+        == "prepared"
+    )
     assert isolated_database.list_publication_outbox(intent_id="intent-rollback") == []
 
 
@@ -427,7 +432,9 @@ def test_confirmation_conflict_rolls_back_intent_but_persists_unresolved_evidenc
             finalized_at=LATER,
         )
 
-    assert isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+    assert (
+        isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+    )
     conflict = isolated_database.get_publication_outbox("preexisting-conflict")
     assert conflict["state"] == "unresolved"
     assert conflict["last_error_sha256"] == _sha(conflict["last_error_json"])
@@ -473,7 +480,9 @@ def test_finalize_requires_exact_canonical_publication_identity(isolated_databas
             evidence_json={},
             finalized_at=LATER,
         )
-    assert isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+    assert (
+        isolated_database.get_offer_intent(intent_id)["lifecycle_state"] == "prepared"
+    )
 
     confirmed = isolated_database.finalize_offer_intent(
         intent_id=intent_id,
@@ -513,7 +522,11 @@ def test_exact_duplicate_is_idempotent_and_conflicting_duplicate_unresolves(
 
     with pytest.raises(ValueError, match="conflict"):
         isolated_database.enqueue_publication_outbox(
-            **{**kwargs, "publisher": "splash", "payload_json": {"offer_ref": _sha("other")}}
+            **{
+                **kwargs,
+                "publisher": "splash",
+                "payload_json": {"offer_ref": _sha("other")},
+            }
         )
     conflicted = isolated_database.get_publication_outbox("pub-duplicate")
     assert conflicted["state"] == "unresolved"
@@ -563,11 +576,14 @@ def test_repost_queue_is_idempotent_while_exact_publication_is_in_flight(
     assert queued["queued"] is False
     assert queued["idempotent"] is True
     assert queued["record"]["publication_id"] == claim["publication_id"]
-    assert len(
-        isolated_database.list_publication_outbox(
-            intent_id=intent["intent_id"], publisher="dexie"
+    assert (
+        len(
+            isolated_database.list_publication_outbox(
+                intent_id=intent["intent_id"], publisher="dexie"
+            )
         )
-    ) == 1
+        == 1
+    )
 
 
 @pytest.mark.parametrize("projection", ["missing", "mutated"])
@@ -589,8 +605,10 @@ def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
     monkeypatch.setattr(
         manager,
         "_post_single",
-        lambda *args, **kwargs: remote_calls.append((args, kwargs))
-        or {"success": True, "dexie_id": "should-not-run"},
+        lambda *args, **kwargs: (
+            remote_calls.append((args, kwargs))
+            or {"success": True, "dexie_id": "should-not-run"}
+        ),
     )
 
     result = manager.flush_queue()
@@ -614,22 +632,30 @@ def test_success_requires_current_claim_version_and_digest_binds_acknowledgement
         claim_token="claim-a",
         claim_generation=claim["claim_generation"],
         expected_row_version=claim["row_version"],
-        acknowledgement_json={"provider_response_id": "dexie-1", "offer": "offer1secret"},
+        acknowledgement_json={
+            "provider_response_id": "dexie-1",
+            "offer": "offer1secret",
+        },
         completed_at=WITHIN_LEASE,
     )
 
     assert completed["state"] == "succeeded"
     assert "offer1secret" not in completed["acknowledgement_json"]
-    assert completed["acknowledgement_sha256"] == _sha(completed["acknowledgement_json"])
-    assert isolated_database.complete_publication_outbox(
-        publication_id=claim["publication_id"],
-        owner_run_id="worker-a",
-        claim_token="claim-a",
-        claim_generation=claim["claim_generation"],
-        expected_row_version=claim["row_version"],
-        acknowledgement_json={"provider_response_id": "late"},
-        completed_at=WITHIN_LEASE,
-    ) is None
+    assert completed["acknowledgement_sha256"] == _sha(
+        completed["acknowledgement_json"]
+    )
+    assert (
+        isolated_database.complete_publication_outbox(
+            publication_id=claim["publication_id"],
+            owner_run_id="worker-a",
+            claim_token="claim-a",
+            claim_generation=claim["claim_generation"],
+            expected_row_version=claim["row_version"],
+            acknowledgement_json={"provider_response_id": "late"},
+            completed_at=WITHIN_LEASE,
+        )
+        is None
+    )
 
 
 def test_retry_preserves_identity_payload_and_uses_injected_backoff_time(
@@ -670,15 +696,18 @@ def test_crash_after_remote_success_reclaims_stale_claim_with_same_identity(
     assert reclaimed["idempotency_key"] == abandoned["idempotency_key"]
     assert reclaimed["payload_json"] == abandoned["payload_json"]
     assert reclaimed["claim_generation"] == abandoned["claim_generation"] + 1
-    assert isolated_database.complete_publication_outbox(
-        publication_id=abandoned["publication_id"],
-        owner_run_id="worker-a",
-        claim_token="claim-a",
-        claim_generation=abandoned["claim_generation"],
-        expected_row_version=abandoned["row_version"],
-        acknowledgement_json={"provider_response_id": "stale-success"},
-        completed_at=AFTER_LEASE,
-    ) is None
+    assert (
+        isolated_database.complete_publication_outbox(
+            publication_id=abandoned["publication_id"],
+            owner_run_id="worker-a",
+            claim_token="claim-a",
+            claim_generation=abandoned["claim_generation"],
+            expected_row_version=abandoned["row_version"],
+            acknowledgement_json={"provider_response_id": "stale-success"},
+            completed_at=AFTER_LEASE,
+        )
+        is None
+    )
 
 
 def test_terminal_suppression_invalidates_late_claim_without_wallet_side_effect(
@@ -701,16 +730,22 @@ def test_terminal_suppression_invalidates_late_claim_without_wallet_side_effect(
 
     suppressed = isolated_database.get_publication_outbox(claim["publication_id"])
     assert suppressed["state"] == "suppressed"
-    assert isolated_database.complete_publication_outbox(
-        publication_id=claim["publication_id"],
-        owner_run_id="worker-a",
-        claim_token="claim-a",
-        claim_generation=claim["claim_generation"],
-        expected_row_version=claim["row_version"],
-        acknowledgement_json={"provider_response_id": "late"},
-        completed_at=AFTER_LEASE,
-    ) is None
-    assert isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
+    assert (
+        isolated_database.complete_publication_outbox(
+            publication_id=claim["publication_id"],
+            owner_run_id="worker-a",
+            claim_token="claim-a",
+            claim_generation=claim["claim_generation"],
+            expected_row_version=claim["row_version"],
+            acknowledgement_json={"provider_response_id": "late"},
+            completed_at=AFTER_LEASE,
+        )
+        is None
+    )
+    assert (
+        isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"]
+        == "created"
+    )
 
 
 def test_terminal_reconciliation_suppresses_unresolved_publication_blocker(
@@ -729,7 +764,9 @@ def test_terminal_reconciliation_suppresses_unresolved_publication_blocker(
     intent, trade_id, _fingerprint = _prepare_and_confirm(
         isolated_database, reserve_selected_coins=True
     )
-    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
     claim = _claim(isolated_database)
     unresolved = isolated_database.unresolve_publication_outbox(
         publication_id=claim["publication_id"],
@@ -857,8 +894,13 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     assert result["posted"] == 1
     assert observed[0][0] == offer_text
     assert observed[0][1] == trade_id
-    assert observed[0][3].startswith(f"mainnet:{_sha(_offer_text(intent['intent_id']))}")
-    assert isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
+    assert observed[0][3].startswith(
+        f"mainnet:{_sha(_offer_text(intent['intent_id']))}"
+    )
+    assert (
+        isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"]
+        == "created"
+    )
     assert isolated_database.get_offer(trade_id)["status"] == "open"
 
 
@@ -876,7 +918,9 @@ def test_durable_manager_latches_ambiguous_remote_success_unresolved(
         now_provider=lambda: LATER,
         lease_expires_provider=lambda _now: LEASE_END,
     )
-    monkeypatch.setattr(manager, "_post_single", lambda *args, **kwargs: {"success": True})
+    monkeypatch.setattr(
+        manager, "_post_single", lambda *args, **kwargs: {"success": True}
+    )
 
     result = manager.flush_queue()
     row = isolated_database.list_publication_outbox(
@@ -962,9 +1006,10 @@ def test_expired_dispatched_claim_recovers_from_exact_dexie_readback_only(
         )
         is None
     )
-    assert isolated_database.get_publication_outbox(claim["publication_id"])[
-        "state"
-    ] == "claimed"
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"])["state"]
+        == "claimed"
+    )
 
     recovered = isolated_database.recover_publication_outbox_from_provider_readback(
         publication_id=dispatched["publication_id"],
@@ -1103,7 +1148,12 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     acknowledgement = __import__("json").loads(row["acknowledgement_json"])
     assert acknowledgement["provider_response_id"] == provider_id
     assert acknowledgement["request_sha256"] == row["request_sha256"]
-    assert acknowledgement["response_sha256"] == _sha(calls[0][0] and _TransportResponse(201, {"id": provider_id, "idempotency_key": row["idempotency_key"]}).content.decode())
+    assert acknowledgement["response_sha256"] == _sha(
+        calls[0][0]
+        and _TransportResponse(
+            201, {"id": provider_id, "idempotency_key": row["idempotency_key"]}
+        ).content.decode()
+    )
 
 
 @pytest.mark.parametrize("failure", ["mismatched_echo", "timeout"])
@@ -1111,7 +1161,9 @@ def test_dispatched_ambiguous_response_is_unresolved_and_never_retried(
     isolated_database, monkeypatch, failure
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
-    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
     manager = dexie_manager.DexieManager()
     monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
     monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
@@ -1146,7 +1198,9 @@ def test_stale_dispatched_claim_without_observation_contract_never_replays(
     isolated_database, monkeypatch
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
-    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
     first = dexie_manager.DexieManager()
     monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
     monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
@@ -1166,7 +1220,9 @@ def test_stale_dispatched_claim_without_observation_contract_never_replays(
     monkeypatch.setattr(
         dexie_manager,
         "complete_publication_outbox",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("crash after remote success")),
+        lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash after remote success")
+        ),
     )
     with pytest.raises(RuntimeError, match="crash after remote success"):
         first.flush_queue()
@@ -1191,9 +1247,7 @@ def test_stale_dispatched_claim_without_observation_contract_never_replays(
     )
     for force in (False, True):
         with pytest.raises(ValueError, match="unresolved"):
-            second.queue_post(
-                _offer_text(intent["intent_id"]), trade_id, force=force
-            )
+            second.queue_post(_offer_text(intent["intent_id"]), trade_id, force=force)
     after = isolated_database.list_publication_outbox(
         intent_id=intent["intent_id"], publisher="dexie"
     )
@@ -1259,11 +1313,14 @@ def test_intentional_reposts_allocate_monotonic_durable_publisher_epochs(
     assert manager.flush_queue()["posted"] == 1
 
     manager.queue_post(offer_text, trade_id, force=False)
-    assert len(
-        isolated_database.list_publication_outbox(
-            intent_id=intent["intent_id"], publisher="dexie"
+    assert (
+        len(
+            isolated_database.list_publication_outbox(
+                intent_id=intent["intent_id"], publisher="dexie"
+            )
         )
-    ) == 1
+        == 1
+    )
 
     manager.queue_post(offer_text, trade_id, force=True)
     assert manager._queue == []
@@ -1359,19 +1416,20 @@ def test_visible_repost_keeps_intent_link_and_task9_suppresses_late_worker(
         evidence_sha256=_sha(evidence_text),
         reconciled_at="2026-08-15T12:00:08.000000Z",
     )
-    suppressed = isolated_database.get_publication_outbox(
-        claim["publication_id"]
-    )
+    suppressed = isolated_database.get_publication_outbox(claim["publication_id"])
     assert suppressed["state"] == "suppressed"
-    assert isolated_database.complete_publication_outbox(
-        publication_id=claim["publication_id"],
-        owner_run_id=claim["claim_owner_run_id"],
-        claim_token=claim["claim_token"],
-        claim_generation=claim["claim_generation"],
-        expected_row_version=claim["row_version"],
-        acknowledgement_json={"provider_response_id": "too-late"},
-        completed_at="2026-08-15T12:00:09.000000Z",
-    ) is None
+    assert (
+        isolated_database.complete_publication_outbox(
+            publication_id=claim["publication_id"],
+            owner_run_id=claim["claim_owner_run_id"],
+            claim_token=claim["claim_token"],
+            claim_generation=claim["claim_generation"],
+            expected_row_version=claim["row_version"],
+            acknowledgement_json={"provider_response_id": "too-late"},
+            completed_at="2026-08-15T12:00:09.000000Z",
+        )
+        is None
+    )
 
 
 def test_canonical_request_digest_binds_claim_rewards_and_rejects_payload_drift():

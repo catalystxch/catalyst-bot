@@ -80,8 +80,9 @@ def test_owner_effect_uses_acquired_adapter_when_identity_read_swaps_all_globals
 
     events = []
     evil = SimpleNamespace(
-        create_offer=lambda *args, **kwargs: events.append("evil_effect")
-        or {"success": True, "source": "evil"},
+        create_offer=lambda *args, **kwargs: (
+            events.append("evil_effect") or {"success": True, "source": "evil"}
+        ),
     )
 
     def original_identity():
@@ -92,8 +93,9 @@ def test_owner_effect_uses_acquired_adapter_when_identity_read_swaps_all_globals
 
     original = SimpleNamespace(
         get_wallet_identity=original_identity,
-        create_offer=lambda *args, **kwargs: events.append("original_effect")
-        or {"success": True, "source": "original"},
+        create_offer=lambda *args, **kwargs: (
+            events.append("original_effect") or {"success": True, "source": "original"}
+        ),
     )
     _configure_runtime(monkeypatch, original)
 
@@ -116,13 +118,15 @@ def test_owner_rejects_self_consistent_adapter_swap_before_boundary(monkeypatch)
     effects = []
     original = SimpleNamespace(
         get_wallet_identity=_identity,
-        create_offer=lambda *args, **kwargs: effects.append("original")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("original") or {"success": True}
+        ),
     )
     evil = SimpleNamespace(
         get_wallet_identity=_identity,
-        create_offer=lambda *args, **kwargs: effects.append("evil")
-        or {"success": True},
+        create_offer=lambda *args, **kwargs: (
+            effects.append("evil") or {"success": True}
+        ),
     )
     _configure_runtime(monkeypatch, original)
     monkeypatch.setattr(wallet, "_wallet_adapter", evil)
@@ -145,8 +149,9 @@ def test_owner_effect_keeps_acquired_adapter_during_threaded_identity_race(
 
     events = []
     evil = SimpleNamespace(
-        create_offer=lambda *args, **kwargs: events.append("evil_effect")
-        or {"success": True, "source": "evil"},
+        create_offer=lambda *args, **kwargs: (
+            events.append("evil_effect") or {"success": True, "source": "evil"}
+        ),
     )
 
     def race_swap():
@@ -162,8 +167,9 @@ def test_owner_effect_keeps_acquired_adapter_during_threaded_identity_race(
 
     original = SimpleNamespace(
         get_wallet_identity=original_identity,
-        create_offer=lambda *args, **kwargs: events.append("original_effect")
-        or {"success": True, "source": "original"},
+        create_offer=lambda *args, **kwargs: (
+            events.append("original_effect") or {"success": True, "source": "original"}
+        ),
     )
     _configure_runtime(monkeypatch, original)
 
@@ -281,8 +287,9 @@ def test_worker_effect_keeps_installed_adapter_during_identity_read_swap(monkeyp
     }
     events = []
     evil = SimpleNamespace(
-        create_offer=lambda *args, **kwargs: events.append("evil_effect")
-        or {"success": True, "source": "evil"}
+        create_offer=lambda *args, **kwargs: (
+            events.append("evil_effect") or {"success": True, "source": "evil"}
+        )
     )
 
     def original_identity():
@@ -293,8 +300,9 @@ def test_worker_effect_keeps_installed_adapter_during_identity_read_swap(monkeyp
 
     original = SimpleNamespace(
         get_wallet_identity=original_identity,
-        create_offer=lambda *args, **kwargs: events.append("original_effect")
-        or {"success": True, "source": "original"},
+        create_offer=lambda *args, **kwargs: (
+            events.append("original_effect") or {"success": True, "source": "original"}
+        ),
     )
     monkeypatch.setattr(wallet, "_wallet_adapter", original)
     monkeypatch.setattr(wallet, "_WALLET_ADAPTER_AUTHORITY", original)

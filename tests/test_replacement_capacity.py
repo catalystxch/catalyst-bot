@@ -160,9 +160,12 @@ def test_ambiguous_or_unproven_coins_count_toward_no_purpose(overrides):
     coin.update(overrides)
 
     for purpose in PURPOSES:
-        assert replacement_capacity.decide_capacity(
-            [coin], purpose=purpose, required_count=1
-        ).available_count == 0
+        assert (
+            replacement_capacity.decide_capacity(
+                [coin], purpose=purpose, required_count=1
+            ).available_count
+            == 0
+        )
 
 
 def test_duplicate_authoritative_coin_identity_fails_the_whole_view_closed():
@@ -242,9 +245,7 @@ def test_database_persists_exact_purpose_through_designation_and_reservation(
         wallet_identity_json={"network": "mainnet"},
         evidence_json={"source": "task-12-test"},
     )
-    reservations = database.get_offer_intent_coin_reservations(
-        "purpose-reservation"
-    )
+    reservations = database.get_offer_intent_coin_reservations("purpose-reservation")
     assert reservations[0]["purpose"] == "replacement"
 
 
@@ -273,9 +274,7 @@ def test_repository_capacity_is_exact_and_excludes_intent_reservations(
             purpose=purpose,
         )
 
-    before = database.get_authoritative_coin_capacity(
-        "replacement", wallet_type="xch"
-    )
+    before = database.get_authoritative_coin_capacity("replacement", wallet_type="xch")
     assert before["count"] == 1
     assert before["coin_ids"] == [database.norm_coin_id(replacement_id)]
 
@@ -298,9 +297,7 @@ def test_repository_capacity_is_exact_and_excludes_intent_reservations(
         wallet_identity_json={"network": "mainnet"},
         evidence_json={"source": "task-12-test"},
     )
-    assert database.get_authoritative_replacement_capacity_count(
-        wallet_type="xch"
-    ) == 0
+    assert database.get_authoritative_replacement_capacity_count(wallet_type="xch") == 0
 
 
 def test_coin_manager_exposes_authoritative_replacement_count_without_lineage_logic(
@@ -324,10 +321,7 @@ def test_coin_manager_exposes_authoritative_replacement_count_without_lineage_lo
         purpose="replacement",
     )
     assert (
-        coin_manager.get_authoritative_replacement_capacity_count_standalone(
-            "xch"
-        )
-        == 1
+        coin_manager.get_authoritative_replacement_capacity_count_standalone("xch") == 1
     )
 
 
@@ -679,9 +673,7 @@ def test_ambiguous_equal_amount_purposes_stay_latched_with_zero_capacity(
     import coin_prep_worker
 
     database.init_database()
-    binding = _activate_wallet_authority(
-        monkeypatch, run_id="task-12-ambiguous-output"
-    )
+    binding = _activate_wallet_authority(monkeypatch, run_id="task-12-ambiguous-output")
     identity = mutation_gate.wallet_identity_binding_payload(binding)
     source = hashlib.sha256(b"ambiguous-capacity-source").hexdigest()
     outputs = [
@@ -748,9 +740,7 @@ def test_reserving_selected_coins_derives_one_exact_non_null_purpose(
     database.init_database()
     replacement_id = hashlib.sha256(b"derive-replacement").hexdigest()
     lifecycle_id = hashlib.sha256(b"derive-lifecycle").hexdigest()
-    assert database.upsert_coin(
-        replacement_id, "xch", 100, purpose="replacement"
-    )
+    assert database.upsert_coin(replacement_id, "xch", 100, purpose="replacement")
     assert database.upsert_coin(lifecycle_id, "xch", 100, purpose="lifecycle")
 
     with pytest.raises(ValueError, match="one exact purpose"):
@@ -932,15 +922,31 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
             "expected_output_missing",
         ),
         (
-            {**view, "coins": [dict(expected_outputs[0])] * 2 + [dict(expected_outputs[1])]},
+            {
+                **view,
+                "coins": [dict(expected_outputs[0])] * 2 + [dict(expected_outputs[1])],
+            },
             "duplicate_coin_identity",
         ),
         (
-            {**view, "coins": [dict(expected_outputs[0]), {**expected_outputs[1], "amount_mojos": 41}]},
+            {
+                **view,
+                "coins": [
+                    dict(expected_outputs[0]),
+                    {**expected_outputs[1], "amount_mojos": 41},
+                ],
+            },
             "expected_output_contradiction",
         ),
         (
-            {**view, "coins": [dict(expected_outputs[0]), dict(expected_outputs[1]), _coin("post-source", "replacement")]},
+            {
+                **view,
+                "coins": [
+                    dict(expected_outputs[0]),
+                    dict(expected_outputs[1]),
+                    _coin("post-source", "replacement"),
+                ],
+            },
             "source_coin_still_present",
         ),
     ):

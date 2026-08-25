@@ -107,7 +107,9 @@ def test_runtime_topup_persists_prepared_before_dispatch(monkeypatch):
         coin_manager, "complete_wallet_effect_dispatch", lambda *_a, **_k: "SUBMITTED"
     )
     monkeypatch.setattr(
-        coin_manager, "record_coin_prep_operation_outcome", lambda *a, **k: outcomes.append((a, k))
+        coin_manager,
+        "record_coin_prep_operation_outcome",
+        lambda *a, **k: outcomes.append((a, k)),
     )
     monkeypatch.setattr(
         coin_manager, "_current_coin_prep_wallet_identity", lambda: identity
@@ -258,10 +260,9 @@ def test_runtime_absorb_journals_and_confirms_exact_combined_output(monkeypatch)
     monkeypatch.setattr(
         manager,
         "_confirm_runtime_topup_prep",
-        lambda actual_receipt, *, owned_map: confirmations.append(
-            (actual_receipt, owned_map)
-        )
-        or True,
+        lambda actual_receipt, *, owned_map: (
+            confirmations.append((actual_receipt, owned_map)) or True
+        ),
     )
     monkeypatch.setattr(manager, "_record_topup_pool_refund", lambda *_a, **_k: None)
     monkeypatch.setattr(coin_manager.time, "sleep", lambda *_a, **_k: None)

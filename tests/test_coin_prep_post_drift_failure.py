@@ -18,8 +18,10 @@ def test_authoritative_post_operation_identity_drift_is_durable_failure(monkeypa
     monkeypatch.setattr(
         coin_prep_worker,
         "record_coin_prep_operation_outcome",
-        lambda operation_id, **kwargs: outcomes.append((operation_id, kwargs))
-        or {"operation": {"operation_id": operation_id, **kwargs}},
+        lambda operation_id, **kwargs: (
+            outcomes.append((operation_id, kwargs))
+            or {"operation": {"operation_id": operation_id, **kwargs}}
+        ),
         raising=False,
     )
     worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)

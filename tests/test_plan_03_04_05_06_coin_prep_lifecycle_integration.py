@@ -81,9 +81,7 @@ class _TempDB(unittest.TestCase):
             patch.object(
                 api_server.mutation_gate, "enter_mutation", return_value="permit"
             ),
-            patch.object(
-                api_server.mutation_gate, "exit_mutation", return_value=True
-            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
         )
         for mutation_patch in self._mutation_patches:
             mutation_patch.start()
@@ -378,8 +376,7 @@ class TestCoinPrepFullCycle(_TempDB):
             (intent_id,),
         )
         conn.execute(
-            "UPDATE offers SET status='open', lifecycle_state='open' "
-            "WHERE trade_id=?",
+            "UPDATE offers SET status='open', lifecycle_state='open' WHERE trade_id=?",
             (trade_id,),
         )
         conn.execute(

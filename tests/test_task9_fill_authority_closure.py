@@ -2262,7 +2262,11 @@ def test_worker_denies_auto_selected_source_and_fee_inputs(
 
     source_coin_id = hashlib.sha256(b"explicit-worker-source").hexdigest()
     assert database.upsert_coin(
-        source_coin_id, "xch", 200_000, designation="reserve", tier="none",
+        source_coin_id,
+        "xch",
+        200_000,
+        designation="reserve",
+        tier="none",
         purpose="lifecycle",
     )
     calls: list[str] = []
@@ -2887,7 +2891,6 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
             ),
         )
 
-
     database.get_connection().rollback()
 
     with database.wallet_effect_adapter_dispatch_authority(dispatch):
@@ -2942,7 +2945,9 @@ def test_submitted_legacy_runtime_topup_can_be_adopted_only_with_exact_fee_proof
         result = _wallet_effect_real_facade_result(
             runtime, monkeypatch, attempted=True, success=True
         )
-    assert database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+    assert (
+        database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+    )
 
     identity = mutation_gate.wallet_identity_binding_payload(
         runtime._wallet_identity_binding
@@ -3051,7 +3056,9 @@ def test_submitted_legacy_runtime_absorb_can_be_adopted_with_exact_output_proof(
         result = _wallet_effect_real_facade_result(
             runtime, monkeypatch, attempted=True, success=True
         )
-    assert database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+    assert (
+        database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+    )
 
     identity = mutation_gate.wallet_identity_binding_payload(
         runtime._wallet_identity_binding

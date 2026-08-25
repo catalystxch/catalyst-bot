@@ -108,9 +108,7 @@ class TestWalletIdentitySnapshot(unittest.TestCase):
         self.assertEqual(identity["kind"], "private")
         self.assertTrue(identity["has_secrets"])
         self.assertIsNotNone(
-            datetime.fromisoformat(
-                identity["observed_at_utc"].replace("Z", "+00:00")
-            )
+            datetime.fromisoformat(identity["observed_at_utc"].replace("Z", "+00:00"))
         )
         self.assertNotIn("error", identity)
 
@@ -152,9 +150,7 @@ class TestWalletIdentitySnapshot(unittest.TestCase):
         self.assertIsNone(identity["kind"])
         self.assertIsNone(identity["has_secrets"])
         self.assertIsNotNone(
-            datetime.fromisoformat(
-                identity["observed_at_utc"].replace("Z", "+00:00")
-            )
+            datetime.fromisoformat(identity["observed_at_utc"].replace("Z", "+00:00"))
         )
         self.assertNotIn("error", identity)
 

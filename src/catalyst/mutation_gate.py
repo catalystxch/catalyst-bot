@@ -661,9 +661,7 @@ def _is_exact_prepared_operation_blocker(
                 attempt = single_evidence["attempt"]
                 cohort_id = single_evidence["cohort_id"]
                 reason = single_evidence["reason"]
-                continuation_digest = single_evidence[
-                    "continuation_journal_sha256"
-                ]
+                continuation_digest = single_evidence["continuation_journal_sha256"]
                 wallet_identity = json.loads(blocker["wallet_identity_json"])
                 if (
                     type(trade_id) is not str
@@ -682,8 +680,7 @@ def _is_exact_prepared_operation_blocker(
                     or len(continuation_digest) != 64
                     or continuation_digest.lower() != continuation_digest
                     or type(wallet_identity) is not dict
-                    or wallet_identity.get("snapshot_sha256")
-                    != continuation_digest
+                    or wallet_identity.get("snapshot_sha256") != continuation_digest
                     or single_evidence["effect_claim_protocol"]
                     != "durable_cohort_claim_v1"
                     or single_evidence["wallet_effect"]
@@ -1432,19 +1429,23 @@ class MutationGate:
                     }
                 now = self._now()
                 prior_dead = False
-                if bool(current.get("active")) and current.get(
-                    "owner_run_id"
-                ) != self.run_id:
+                if (
+                    bool(current.get("active"))
+                    and current.get("owner_run_id") != self.run_id
+                ):
                     if _as_utc(current.get("expires_at")) > now:
                         return {
                             "acquired": False,
                             "reason": "prior_recovery_owner_active",
                             "lease": current,
                         }
-                    prior_dead = self._pid_liveness(
-                        int(current.get("owner_pid") or 0),
-                        str(current.get("owner_host") or ""),
-                    ) is False
+                    prior_dead = (
+                        self._pid_liveness(
+                            int(current.get("owner_pid") or 0),
+                            str(current.get("owner_host") or ""),
+                        )
+                        is False
+                    )
                     if not prior_dead:
                         return {
                             "acquired": False,

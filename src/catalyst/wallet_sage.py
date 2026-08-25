@@ -1523,7 +1523,9 @@ def _emit_sage_diagnostic(diagnostic: dict[str, Any], endpoint: Any) -> None:
         if initialize_not_required:
             _console("[Sage] Optional initialize endpoint not exposed; continuing.")
         else:
-            _console("[Sage] " + _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True))
+            _console(
+                "[Sage] " + _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True)
+            )
     try:
         from database import log_event as _le
 
@@ -5400,7 +5402,10 @@ def _exact_authoritative_offer_asset_ids(offer_ids: set[str]) -> Dict[str, str]:
         if type(offered) is not dict or len(offered) != 1:
             continue
         raw_asset_id, raw_amount = next(iter(offered.items()))
-        if _exact_positive_atomic_amount(raw_amount) is None or type(raw_asset_id) is not str:
+        if (
+            _exact_positive_atomic_amount(raw_amount) is None
+            or type(raw_asset_id) is not str
+        ):
             continue
         asset_id = raw_asset_id.strip().lower()
         if asset_id == "xch":

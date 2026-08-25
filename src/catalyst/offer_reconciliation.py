@@ -1120,8 +1120,7 @@ def _cancel_proof(
     tx_time = _parse_utc(tx["timestamp"])
     if tx_time is None or any(
         tx_time.timestamp()
-        < _parse_utc(member["request_timestamp"]).timestamp()
-        - _MAX_SOURCE_SKEW_SECONDS
+        < _parse_utc(member["request_timestamp"]).timestamp() - _MAX_SOURCE_SKEW_SECONDS
         for member in members
     ):
         return None
@@ -1469,9 +1468,7 @@ def _classify_terminal_evidence(
             )
             is not None
         ]
-    conflicts = [
-        proof for proof in cancel_candidates if proof.get("_conflict_reason")
-    ]
+    conflicts = [proof for proof in cancel_candidates if proof.get("_conflict_reason")]
     exact_cancels = [
         proof for proof in cancel_candidates if not proof.get("_conflict_reason")
     ]
@@ -1894,15 +1891,18 @@ def _normalized_transaction_row(row: dict[str, Any]) -> dict[str, Any]:
             "spent": sorted(spent, key=lambda flow: flow["coin_id"]),
             "created": sorted(created, key=lambda flow: flow["coin_id"]),
         }
-        spend_identity = "sha256:" + hashlib.sha256(
-            json.dumps(
-                identity_payload,
-                ensure_ascii=True,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        spend_identity = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity_payload,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
     return {
         "transaction_id": transaction_id,
         "spend_identity": spend_identity,

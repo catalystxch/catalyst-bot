@@ -213,7 +213,10 @@ def test_coin_prep_reload_restores_and_balance_caps_cat_topup_coin():
     preview_start = html.index("function updateCoinPrepPreview()")
     preview_end = html.index("function setWarning", preview_start)
     preview_block = html[preview_start:preview_end]
-    assert "topupPoolCat: parseFloat(document.getElementById('configTopupPoolCat')?.value) || 0" in preview_block
+    assert (
+        "topupPoolCat: parseFloat(document.getElementById('configTopupPoolCat')?.value) || 0"
+        in preview_block
+    )
 
     modal_start = html.index("function showCoinPrepConfirm(config")
     modal_end = html.index("function closeCoinPrepConfirm()", modal_start)
@@ -380,9 +383,15 @@ def test_pnl_position_limit_uses_live_backend_value():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
     assert 'id="invMaxPosition"' in html
-    assert 'id="invMaxPosition" style="font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">—</div>' in html
+    assert (
+        'id="invMaxPosition" style="font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">—</div>'
+        in html
+    )
     assert "data.max_position_xch !== undefined && el('invMaxPosition')" in html
-    assert "el('invMaxPosition').textContent = formatXchAmount(data.max_position_xch) + ' XCH';" in html
+    assert (
+        "el('invMaxPosition').textContent = formatXchAmount(data.max_position_xch) + ' XCH';"
+        in html
+    )
 
 
 def test_advisor_fill_rate_reads_dashboard_field_name():

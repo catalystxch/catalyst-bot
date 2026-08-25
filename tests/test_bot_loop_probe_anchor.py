@@ -431,7 +431,10 @@ class ProbeAnchorTests(unittest.TestCase):
             self.assertFalse(loop._run_cancel_retry_pass())
 
         self.assertTrue(
-            any(event == "cancel_retry_waiting_for_confirmation" for _, event, _, _ in events)
+            any(
+                event == "cancel_retry_waiting_for_confirmation"
+                for _, event, _, _ in events
+            )
         )
         self.assertEqual(stop_calls, [False])
 
@@ -441,9 +444,7 @@ class ProbeAnchorTests(unittest.TestCase):
         loop = bot_loop.BotLoop()
         loop._running = True
         operation_id = "cancel:" + ("a" * 64)
-        loop.offer_manager.get_active_cancel_settlement_operation = (
-            lambda: operation_id
-        )
+        loop.offer_manager.get_active_cancel_settlement_operation = lambda: operation_id
 
         with (
             patch.object(

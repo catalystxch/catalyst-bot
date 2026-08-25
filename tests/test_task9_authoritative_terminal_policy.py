@@ -138,9 +138,7 @@ def _seed_registry_only_intent(*, lifecycle_state: str) -> tuple[str, str, str]:
 
     intent_id = f"intent-registry-only-{lifecycle_state}"
     coin_id = hashlib.sha256(f"coin:{lifecycle_state}".encode()).hexdigest()
-    assert database.upsert_coin(
-        coin_id, "xch", 1000, tier="inner", purpose="lifecycle"
-    )
+    assert database.upsert_coin(coin_id, "xch", 1000, tier="inner", purpose="lifecycle")
     database.prepare_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
@@ -506,7 +504,11 @@ def test_direct_prepare_cannot_bypass_reconciliation_blocked_slot(
 ):
     _seed_created_intent(run_id="run-old", slot_key="ladder:buy:7", generation=4)
     assert database.upsert_coin(
-        OTHER_COIN, "xch", 1000, designation="tier_spare", tier="inner",
+        OTHER_COIN,
+        "xch",
+        1000,
+        designation="tier_spare",
+        tier="inner",
         purpose="lifecycle",
     )
     conn = database.get_connection()
@@ -1162,9 +1164,7 @@ def test_pnl_reset_route_returns_stable_conflict_for_authoritative_fill(
     monkeypatch.setattr(
         api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
     )
-    monkeypatch.setattr(
-        api_server.mutation_gate, "exit_mutation", lambda _permit: True
-    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
     api_server.app.testing = True
     client = api_server.app.test_client()
 
@@ -1237,9 +1237,7 @@ def test_offer_history_reset_refuses_nonterminal_kernel_state(
     monkeypatch.setattr(
         api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
     )
-    monkeypatch.setattr(
-        api_server.mutation_gate, "exit_mutation", lambda _permit: True
-    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
     api_server.app.testing = True
     client = api_server.app.test_client()
 
@@ -1265,9 +1263,7 @@ def test_session_fresh_start_does_not_mask_authoritative_reset_conflict(
     monkeypatch.setattr(
         api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
     )
-    monkeypatch.setattr(
-        api_server.mutation_gate, "exit_mutation", lambda _permit: True
-    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
     fresh_start_set = MagicMock()
     monkeypatch.setattr(api_server, "_fresh_start_set", fresh_start_set)
     api_server.app.testing = True

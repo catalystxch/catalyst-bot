@@ -418,8 +418,9 @@ def test_generic_identity_switch_rpc_requires_exact_frozen_target(
 
     adapter_calls = []
     adapter = SimpleNamespace(
-        rpc=lambda *args, **kwargs: adapter_calls.append((args, kwargs))
-        or {"success": True}
+        rpc=lambda *args, **kwargs: (
+            adapter_calls.append((args, kwargs)) or {"success": True}
+        )
     )
     _authorize_wallet(monkeypatch, adapter)
 
@@ -510,8 +511,9 @@ def test_generic_rpc_rejects_normalizing_identity_endpoint_alias(monkeypatch, en
 
     adapter_calls = []
     adapter = SimpleNamespace(
-        rpc=lambda *args, **kwargs: adapter_calls.append((args, kwargs))
-        or {"success": True}
+        rpc=lambda *args, **kwargs: (
+            adapter_calls.append((args, kwargs)) or {"success": True}
+        )
     )
     _authorize_wallet(monkeypatch, adapter)
 
@@ -543,8 +545,9 @@ def test_generic_rpc_requires_exact_boundary_types(
 
     adapter_calls = []
     adapter = SimpleNamespace(
-        rpc=lambda *args, **kwargs: adapter_calls.append((args, kwargs))
-        or {"success": True}
+        rpc=lambda *args, **kwargs: (
+            adapter_calls.append((args, kwargs)) or {"success": True}
+        )
     )
     _authorize_wallet(monkeypatch, adapter)
 
@@ -561,8 +564,9 @@ def test_sage_login_requires_exact_resync_flag(monkeypatch, force_resync):
 
     adapter_calls = []
     adapter = SimpleNamespace(
-        sage_login=lambda *args, **kwargs: adapter_calls.append((args, kwargs))
-        or {"success": True}
+        sage_login=lambda *args, **kwargs: (
+            adapter_calls.append((args, kwargs)) or {"success": True}
+        )
     )
     _authorize_wallet(monkeypatch, adapter)
 
@@ -624,12 +628,14 @@ def test_chia_saved_startup_fingerprint_requires_runtime_target_authority(monkey
     monkeypatch.setattr(
         wallet,
         "validate_runtime_target_fingerprint",
-        lambda target: decisions.append(target)
-        or {
-            "success": False,
-            "error": "Wallet mutation blocked by identity safety check",
-            "reason": "WALLET_IDENTITY_MISMATCH",
-        },
+        lambda target: (
+            decisions.append(target)
+            or {
+                "success": False,
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+            }
+        ),
     )
 
     fingerprint = sage_node._resolve_startup_fingerprint()
