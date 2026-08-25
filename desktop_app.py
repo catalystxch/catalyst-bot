@@ -645,8 +645,10 @@ def _focus_catalyst_window_with_user32(user32, callback_factory) -> bool:
         return False
     handle = target[0]
     user32.ShowWindow(handle, 9)  # SW_RESTORE
-    user32.SetForegroundWindow(handle)
-    return True
+    user32.BringWindowToTop(handle)
+    if not user32.SetForegroundWindow(handle):
+        return False
+    return int(user32.GetForegroundWindow() or 0) == int(handle)
 
 
 def _focus_existing_catalyst_window() -> bool:

@@ -725,7 +725,8 @@ def _handler(database: Path):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
         def _html(self, status: int, body: bytes) -> None:
             self.send_response(status)
@@ -770,6 +771,18 @@ def _handler(database: Path):
         do_PUT = do_POST
         do_PATCH = do_POST
         do_DELETE = do_POST
+        do_HEAD = do_POST
+        do_OPTIONS = do_POST
+        do_TRACE = do_POST
+        do_CONNECT = do_POST
+
+        def __getattr__(self, name: str):
+            # BaseHTTPRequestHandler normally emits 501 when a do_<VERB>
+            # method is absent.  This listener is deliberately read-only, so
+            # every future or non-standard HTTP verb must fail closed too.
+            if name.startswith("do_"):
+                return self._locked
+            raise AttributeError(name)
 
     return Handler
 

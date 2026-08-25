@@ -84,6 +84,72 @@ def _visible_catalyst_window(process_id: int) -> str | None:
     return titles[0] if titles else None
 
 
+def _visible_catalyst_window_handle(process_id: int) -> int | None:
+    """Return the exact visible main CATalyst HWND owned by one process."""
+
+    if os.name != "nt":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    handles: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPARAM,
+    )
+
+    @callback_type
+    def inspect_window(handle, _context):
+        owner_pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(handle, ctypes.byref(owner_pid))
+        if owner_pid.value != process_id:
+            return True
+        length = int(user32.GetWindowTextLengthW(handle) or 0)
+        if length < 1:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(handle, buffer, len(buffer))
+        if buffer.value.strip().casefold() == "catalyst":
+            handles.append(int(handle))
+            return False
+        return True
+
+    user32.EnumWindows(inspect_window, 0)
+    return handles[0] if handles else None
+
+
+def _minimize_catalyst_window(process_id: int) -> int:
+    """Minimize the owner window so duplicate-launch handoff is observable."""
+
+    handle = _visible_catalyst_window_handle(process_id)
+    if handle is None:
+        raise SmokeFailure("owner desktop window was not available to minimize")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow(handle, 6)  # SW_MINIMIZE
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if user32.IsIconic(handle):
+            return handle
+        time.sleep(0.05)
+    raise SmokeFailure("owner desktop window did not minimize before duplicate launch")
+
+
+def _window_is_restored_and_foreground(process_id: int, handle: int) -> bool:
+    """Return true only when the same owner HWND is visible and foregrounded."""
+
+    if os.name != "nt":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    if not user32.IsWindow(handle) or not user32.IsWindowVisible(handle):
+        return False
+    owner_pid = ctypes.wintypes.DWORD()
+    user32.GetWindowThreadProcessId(handle, ctypes.byref(owner_pid))
+    return (
+        owner_pid.value == process_id
+        and not user32.IsIconic(handle)
+        and int(user32.GetForegroundWindow() or 0) == int(handle)
+    )
+
+
 def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
     deadline = time.monotonic() + 45
     root_url = f"http://127.0.0.1:{port}/"
@@ -132,7 +198,9 @@ def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
     raise SmokeFailure(f"first-run desktop UI did not become ready: {last_error}")
 
 
-def _wait_for_duplicate_launch_handoff(process: subprocess.Popen) -> None:
+def _wait_for_duplicate_launch_handoff(
+    process: subprocess.Popen, owner_process_id: int, owner_window_handle: int
+) -> None:
     """Require a duplicate launcher to restore the owner and exit promptly."""
 
     try:
@@ -145,6 +213,16 @@ def _wait_for_duplicate_launch_handoff(process: subprocess.Popen) -> None:
         raise SmokeFailure(
             f"duplicate desktop launch exited with code {return_code}"
         )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if _window_is_restored_and_foreground(
+            owner_process_id, owner_window_handle
+        ):
+            return
+        time.sleep(0.1)
+    raise SmokeFailure(
+        "duplicate launcher exited but the owner window was not restored and foregrounded"
+    )
 
 
 def _nearby_diagnostics_ports(preferred: int) -> tuple[int, ...]:
@@ -241,9 +319,12 @@ def main() -> int:
             process = _launch(executable, environment, log_file)
             try:
                 _wait_for_first_launch(port, process)
+                owner_window_handle = _minimize_catalyst_window(process.pid)
                 duplicate = _launch(executable, environment, log_file)
                 try:
-                    _wait_for_duplicate_launch_handoff(duplicate)
+                    _wait_for_duplicate_launch_handoff(
+                        duplicate, process.pid, owner_window_handle
+                    )
                 finally:
                     _stop_process(duplicate)
                 if process.poll() is not None:

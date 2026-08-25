@@ -64,7 +64,30 @@ def test_duplicate_launch_must_exit_instead_of_serving_raw_diagnostics():
         smoke.SmokeFailure,
         match="duplicate desktop launch did not hand off",
     ):
-        smoke._wait_for_duplicate_launch_handoff(Process())
+        smoke._wait_for_duplicate_launch_handoff(Process(), 7365, 101)
+
+
+def test_duplicate_launch_must_restore_and_foreground_owner(monkeypatch):
+    process = SimpleNamespace(wait=lambda timeout: 0)
+    checks = []
+
+    monkeypatch.setattr(
+        smoke,
+        "_window_is_restored_and_foreground",
+        lambda process_id, handle: checks.append((process_id, handle)) or False,
+        raising=False,
+    )
+    clock = iter((0.0, 0.0, 11.0))
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        smoke.SmokeFailure,
+        match="owner window was not restored and foregrounded",
+    ):
+        smoke._wait_for_duplicate_launch_handoff(process, 7365, 101)
+
+    assert checks == [(7365, 101)]
 
 
 def test_safety_fallback_waits_for_branded_native_window(monkeypatch):

@@ -5083,6 +5083,7 @@ def test_windows_existing_catalyst_window_is_restored_and_foregrounded(monkeypat
     class User32:
         def __init__(self):
             self.shown = []
+            self.raised = []
             self.foregrounded = []
 
         @staticmethod
@@ -5109,9 +5110,17 @@ def test_windows_existing_catalyst_window_is_restored_and_foregrounded(monkeypat
             self.shown.append((handle, command))
             return True
 
+        def BringWindowToTop(self, handle):
+            self.raised.append(handle)
+            return True
+
         def SetForegroundWindow(self, handle):
             self.foregrounded.append(handle)
             return True
+
+        @staticmethod
+        def GetForegroundWindow():
+            return 101
 
     user32 = User32()
     monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
@@ -5120,7 +5129,54 @@ def test_windows_existing_catalyst_window_is_restored_and_foregrounded(monkeypat
         user32, lambda callback: callback
     )
     assert user32.shown == [(101, 9)]
+    assert user32.raised == [101]
     assert user32.foregrounded == [101]
+
+
+def test_windows_existing_window_handoff_fails_when_foreground_is_denied(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(_handle, owner_pid):
+            owner_pid._obj.value = 4567
+            return 1
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return False
+
+        @staticmethod
+        def SetForegroundWindow(_handle):
+            return False
+
+        @staticmethod
+        def GetForegroundWindow():
+            return 303
+
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert not desktop_app._focus_catalyst_window_with_user32(
+        User32(), lambda callback: callback
+    )
 
 
 def test_desktop_safety_fallback_opens_branded_native_window(monkeypatch):
@@ -5751,7 +5807,13 @@ def test_minimal_diagnostics_root_is_branded_html_not_raw_safety_json(tmp_path):
         thread.join(timeout=2)
 
 
-def test_minimal_diagnostics_root_rejects_posts_as_read_only(tmp_path):
+@pytest.mark.parametrize(
+    "method",
+    ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "BREW"],
+)
+def test_minimal_diagnostics_rejects_every_non_get_method_as_read_only(
+    tmp_path, method
+):
     import read_only_diagnostics
 
     reservation = read_only_diagnostics.reserve_loopback_port(5000)
@@ -5767,16 +5829,20 @@ def test_minimal_diagnostics_root_rejects_posts_as_read_only(tmp_path):
     thread.start()
     try:
         request = urllib.request.Request(
-            f"http://127.0.0.1:{selected}/", data=b"", method="POST"
+            f"http://127.0.0.1:{selected}/", data=b"", method=method
         )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(request, timeout=2)
         assert exc_info.value.code == 423
-        assert json.loads(exc_info.value.read().decode("utf-8")) == {
-            "success": False,
-            "error": "diagnostics_read_only",
-            "reason": "DIAGNOSTICS_READ_ONLY",
-        }
+        body = exc_info.value.read()
+        if method == "HEAD":
+            assert body == b""
+        else:
+            assert json.loads(body.decode("utf-8")) == {
+                "success": False,
+                "error": "diagnostics_read_only",
+                "reason": "DIAGNOSTICS_READ_ONLY",
+            }
     finally:
         server.shutdown()
         server.server_close()
