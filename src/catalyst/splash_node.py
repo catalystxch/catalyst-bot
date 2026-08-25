@@ -659,18 +659,26 @@ class SplashNode:
             except Exception:
                 pass
 
+        process_running = self.is_running()
         result = {
             "binary_found": self._binary_path is not None,
             "binary_path": self._binary_path,
-            "process_running": self.is_running(),
+            "process_running": process_running,
             "pid": self._pid,
             "restart_count": self._restart_count,
             "uptime_seconds": 0,
             "api_reachable": False,
         }
 
-        if self._last_start_time > 0 and self.is_running():
+        if self._last_start_time > 0 and process_running:
             result["uptime_seconds"] = round(time.time() - self._last_start_time)
+
+        # A disabled, stopped Splash node cannot contribute to this bot run.
+        # Avoid blocking every dashboard state snapshot on an unnecessary
+        # network timeout.  Still probe when Splash is enabled or when a
+        # manually-started managed process is actually running.
+        if not getattr(cfg, "SPLASH_ENABLED", False) and not process_running:
+            return result
 
         # Quick connectivity check
         try:

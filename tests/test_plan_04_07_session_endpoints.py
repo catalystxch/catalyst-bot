@@ -179,11 +179,43 @@ class TestCheckResume(_FlaskBase):
     def test_bot_running_returns_cannot_resume(self):
         bot = MagicMock()
         bot._loop_count = 5
+        bot.is_running.return_value = True
         with patch.object(api_server, "bot", bot):
             resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
         self.assertEqual(body.get("reason"), "bot_already_running")
+
+    def test_stopped_bot_with_completed_loops_can_resume_live_offers(self):
+        """Stopping after live cycles must expose the existing Sage ladder."""
+        fake_buy = {"trade_id": "live-buy", "status": "active", "side": "buy"}
+        fake_sell = {
+            "trade_id": "live-sell",
+            "status": "active",
+            "side": "sell",
+        }
+        offer_manager = MagicMock()
+        offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        bot = MagicMock()
+        bot._loop_count = 46
+        bot.is_running.return_value = False
+        bot.offer_manager = offer_manager
+
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "_fresh_start_is_set", return_value=False),
+            patch("api_server.get_connection", return_value=MagicMock()),
+            patch("database.get_connection", return_value=MagicMock()),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertTrue(body["can_resume"])
+        self.assertEqual(body["buy_count"], 1)
+        self.assertEqual(body["sell_count"], 1)
+        offer_manager.sync_from_wallet.assert_called_once_with()
 
     def test_fresh_start_set_returns_cannot_resume(self):
         with (
@@ -225,6 +257,39 @@ class TestCheckResume(_FlaskBase):
         self.assertTrue(body["can_resume"])
         self.assertIn("buy_count", body)
         self.assertIn("sell_count", body)
+
+    def test_open_offers_refreshes_offer_manager_snapshot_for_status_ui(self):
+        """Resume detection and the stopped status UI must share one live book."""
+        fake_buy = {"trade_id": "live-buy", "status": "active", "side": "buy"}
+        fake_sell = {
+            "trade_id": "live-sell",
+            "status": "active",
+            "side": "sell",
+        }
+        offer_manager = MagicMock()
+        offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        bot = MagicMock()
+        bot._loop_count = 0
+        bot.is_running.return_value = False
+        bot.offer_manager = offer_manager
+
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch("api_server.get_connection", return_value=MagicMock()),
+            patch("database.get_connection", return_value=MagicMock()),
+            patch("database.get_open_offers", return_value=[]),
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "_fresh_start_is_set", return_value=False),
+        ):
+            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["buy_count"], 1)
+        self.assertEqual(body["sell_count"], 1)
+        offer_manager.sync_from_wallet.assert_called_once_with()
+        get_all_offers.assert_not_called()
 
     def test_wallet_not_started_does_not_query_offers(self):
         with (

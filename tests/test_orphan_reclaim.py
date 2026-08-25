@@ -140,6 +140,14 @@ class OrphanReclaimTests(unittest.TestCase):
         ):
             return coin_manager.CoinManager()
 
+    @staticmethod
+    def _submitted_absorb_receipt(_operation, callback, **_kwargs):
+        return coin_manager._PreparedWalletEffectReceipt(
+            result=callback(),
+            operation={"operation_id": "coin-prep:" + "ab" * 32},
+            dispatch_outcome="SUBMITTED",
+        )
+
     # ==================================================================
     # Part 1: Absorber now sweeps the 'small' bucket
     # ==================================================================
@@ -198,6 +206,14 @@ class OrphanReclaimTests(unittest.TestCase):
             ),
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
             ),
         ):
             result = m._absorb_misfits_to_reserve(
@@ -264,6 +280,14 @@ class OrphanReclaimTests(unittest.TestCase):
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
+            ),
         ):
             m._absorb_misfits_to_reserve(
                 name="CAT",
@@ -325,6 +349,14 @@ class OrphanReclaimTests(unittest.TestCase):
             ),
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
             ),
         ):
             m._absorb_misfits_to_reserve(

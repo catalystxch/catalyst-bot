@@ -1095,7 +1095,7 @@ def api_check_resume():
     server = _api_server()
     bot = server.bot
     cfg = server.cfg
-    if bot and getattr(bot, "_loop_count", 0) > 0:
+    if bot and bot.is_running():
         return jsonify(
             {
                 "can_resume": False,
@@ -1139,35 +1139,49 @@ def api_check_resume():
             }
         )
     try:
-        from wallet import get_all_offers, classify_offers_from_list
-
         active_cat = server._active_cat
         asset_id = active_cat.get("asset_id") or (
             cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
         )
-        offers = get_all_offers(include_completed=False, start=0, end=200)
-        if not offers:
-            return jsonify(
-                {
-                    "can_resume": False,
-                    "has_session": False,
-                    "buy_count": 0,
-                    "sell_count": 0,
-                    "reason": "no offers",
-                }
-            )
+        offer_manager = getattr(bot, "offer_manager", None) if bot else None
+        sync_from_wallet = getattr(offer_manager, "sync_from_wallet", None)
+        if callable(sync_from_wallet):
+            # Share this explicit live read with /api/status so the stopped
+            # dashboard cannot overwrite the verified resume count with stale
+            # database rows on its next poll.
+            open_buy, open_sell, _ = sync_from_wallet()
+        else:
+            from wallet import get_all_offers, classify_offers_from_list
 
-        open_buy, open_sell, _ = classify_offers_from_list(offers, asset_id)
+            offers = get_all_offers(include_completed=False, start=0, end=200)
+            if not offers:
+                return jsonify(
+                    {
+                        "can_resume": False,
+                        "has_session": False,
+                        "buy_count": 0,
+                        "sell_count": 0,
+                        "reason": "no offers",
+                    }
+                )
+
+            open_buy, open_sell, _ = classify_offers_from_list(offers, asset_id)
         total = len(open_buy) + len(open_sell)
         can_resume = total > 0
 
         saved = {}
         if hasattr(cfg, "DEFAULT_TRADE_XCH"):
             saved["trade_xch"] = str(cfg.DEFAULT_TRADE_XCH)
-        if hasattr(cfg, "MAX_ACTIVE_BUY"):
-            saved["max_buy"] = int(cfg.MAX_ACTIVE_BUY)
-        if hasattr(cfg, "MAX_ACTIVE_SELL"):
-            saved["max_sell"] = int(cfg.MAX_ACTIVE_SELL)
+        max_buy = getattr(
+            cfg, "MAX_ACTIVE_BUY_OFFERS", getattr(cfg, "MAX_ACTIVE_BUY", None)
+        )
+        max_sell = getattr(
+            cfg, "MAX_ACTIVE_SELL_OFFERS", getattr(cfg, "MAX_ACTIVE_SELL", None)
+        )
+        if max_buy is not None:
+            saved["max_buy"] = int(max_buy)
+        if max_sell is not None:
+            saved["max_sell"] = int(max_sell)
         if hasattr(cfg, "SPREAD_BPS"):
             saved["spread_bps"] = float(cfg.SPREAD_BPS)
         saved["cat_name"] = active_cat.get("name") or getattr(cfg, "CAT_NAME", "CAT")

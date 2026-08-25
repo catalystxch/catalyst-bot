@@ -649,6 +649,12 @@ class SplashManager:
         Returns: {healthy: bool, url: str, error: str|None}
         """
         submit_url = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+        if not getattr(cfg, "SPLASH_ENABLED", False):
+            return {
+                "healthy": False,
+                "url": submit_url,
+                "error": "Splash disabled",
+            }
         try:
             # Just try connecting — Splash may not have a health endpoint,
             # so we just check if the port is open with a short timeout

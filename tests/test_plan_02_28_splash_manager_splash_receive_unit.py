@@ -75,6 +75,26 @@ class TestSplashQueuePurge(unittest.TestCase):
         self.assertEqual(remaining, ["keep", "keep-too"])
 
 
+def test_disabled_splash_manager_health_does_not_probe_submit_endpoint(monkeypatch):
+    import splash_manager
+    from config import cfg
+
+    submit_calls = []
+
+    def unexpected_get(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+        raise AssertionError("disabled Splash must not make a network health probe")
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", False, raising=False)
+    monkeypatch.setattr(splash_manager.requests, "get", unexpected_get)
+
+    result = SplashManager().check_health()
+
+    assert result["healthy"] is False
+    assert result["error"] == "Splash disabled"
+    assert submit_calls == []
+
+
 def test_splash_outbound_copy_distinguishes_local_submit_from_peer_relay():
     manager = (ROOT / "src" / "catalyst" / "splash_manager.py").read_text(
         encoding="utf-8"

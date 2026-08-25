@@ -1119,7 +1119,9 @@ def _cancel_proof(
             return None
     tx_time = _parse_utc(tx["timestamp"])
     if tx_time is None or any(
-        tx_time.timestamp() < _parse_utc(member["request_timestamp"]).timestamp() - 5
+        tx_time.timestamp()
+        < _parse_utc(member["request_timestamp"]).timestamp()
+        - _MAX_SOURCE_SKEW_SECONDS
         for member in members
     ):
         return None
@@ -1288,7 +1290,11 @@ def _cancel_proof(
 
 
 def _selected_inputs_are_exactly_owned_and_linked(
-    intent: dict[str, Any], coins: dict[str, dict[str, Any]]
+    intent: dict[str, Any],
+    coins: dict[str, dict[str, Any]],
+    *,
+    allow_released_link: bool = False,
+    allow_missing_asset: bool = False,
 ) -> bool:
     offered_asset = "xch" if intent["side"] == "buy" else intent["asset_id"]
     selected_total = 0
@@ -1300,13 +1306,19 @@ def _selected_inputs_are_exactly_owned_and_linked(
             record is None
             or record.get("owned") is not True
             or record.get("spent_height") not in (None, 0)
-            or _asset(record.get("asset_id")) != offered_asset
+            or (
+                _asset(record.get("asset_id")) != offered_asset
+                and not (allow_missing_asset and not _asset(record.get("asset_id")))
+            )
             or amount is None
-            or offer_link
-            not in {
-                intent["sage_trade_id"],
-                _norm_id(intent["offer_text_sha256"]),
-            }
+            or (
+                offer_link
+                not in {
+                    intent["sage_trade_id"],
+                    _norm_id(intent["offer_text_sha256"]),
+                }
+                and not (allow_released_link and not offer_link)
+            )
         ):
             return False
         selected_total += amount
@@ -1472,9 +1484,21 @@ def _classify_terminal_evidence(
         return _conflict(cancel["_conflict_reason"])
     if status in _FILLED_STATUSES and cancel is not None:
         return _conflict()
-    if status in (_ACTIVE_STATUSES | _EXPIRED_STATUSES) and (
-        fill is not None or cancel is not None
-    ):
+    if status in _EXPIRED_STATUSES and cancel is not None:
+        # Sage keeps the terminal label ``expired`` when a cancellation is
+        # submitted after the offer's time bound has elapsed.  The label does
+        # not contradict an exact request-bound spend that returns every
+        # selected coin to this wallet (less the proven XCH fee).  Treat that
+        # on-chain effect as the cancellation it is so its mutation latch can
+        # be settled instead of remaining permanently blocked.
+        return {
+            "classification": CANCELLED_PROVEN,
+            "reason_code": "EXACT_POST_EXPIRY_CANCEL_RETURN_PROOF",
+            **cancel,
+        }
+    if status in _ACTIVE_STATUSES and (fill is not None or cancel is not None):
+        return _conflict()
+    if status in _EXPIRED_STATUSES and fill is not None:
         return _conflict()
     # A grouped cancellation can return another cohort member's asset in the
     # exact amount this member requested.  The complete request-bound return
@@ -1500,7 +1524,18 @@ def _classify_terminal_evidence(
     if status in _CANCELLED_STATUSES:
         return _unknown("CANCEL_PROOF_INCOMPLETE")
     if status in _EXPIRED_STATUSES:
-        if not _selected_inputs_are_exactly_owned_and_linked(exact_intent, coins):
+        # Sage clears a coin's offer_id/offer_hash when an expired offer
+        # releases that input back to the selectable wallet set, and its
+        # get-coins-by-ids response can omit asset_id at the same time.  The
+        # exact coin ID and the already-validated authoritative offer summary
+        # still bind the asset and amount, so a missing field is acceptable
+        # here.  An explicit different asset or link still fails closed.
+        if not _selected_inputs_are_exactly_owned_and_linked(
+            exact_intent,
+            coins,
+            allow_released_link=True,
+            allow_missing_asset=True,
+        ):
             return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
         return {
             "classification": EXPIRED_PROVEN,
@@ -1675,7 +1710,14 @@ def load_sage_offer_history(
             remote_bounds_honored = False
             stable_oversized = len(rows) > page_size
             authoritative_end = page_authoritative_end
-            complete = authoritative_end and len(rows) <= max_records
+            # A response exactly equal to the requested page size can carry a
+            # page-local ``total`` while ignoring start/end entirely.  Only an
+            # oversized repeated snapshot proves that the first response was
+            # the provider's bounded full history rather than one repeated
+            # page.
+            complete = (
+                stable_oversized and authoritative_end and len(rows) <= max_records
+            )
             pages = [pages[0]]
             break
         if len(rows) > page_size:
@@ -3000,6 +3042,37 @@ def _derive_single_cancel_context(
     )
     if not exact_effect_claim and not legacy_single_effect:
         return None
+    manifest_sha256 = prepared["evidence_sha256"]
+    context_intent_id = prepared.get("intent_id")
+    try:
+        manifest_reader = getattr(
+            database_module, "get_offer_cancel_cohort_manifest", None
+        )
+        manifest = manifest_reader(cohort_id) if callable(manifest_reader) else None
+    except BaseException:
+        return None
+    if manifest is not None:
+        if (
+            type(manifest) is not dict
+            or type(manifest.get("manifest_sha256")) is not str
+            or type(manifest.get("members")) is not list
+        ):
+            return None
+        manifested_targets = [
+            row
+            for row in manifest["members"]
+            if type(row) is dict
+            and row.get("trade_id") == exact_intent["sage_trade_id"]
+            and row.get("operation_id") == operation_id
+            and row.get("prepared_event_id") == prepared.get("event_id")
+            and row.get("member_id") == member_id
+            and row.get("intent_id") == context_intent_id
+        ]
+        if len(manifested_targets) != 1:
+            return None
+        manifest_sha256 = manifest["manifest_sha256"]
+    elif prepared_evidence.get("cohort_size") not in (None, 1):
+        return None
     transaction_source = evidence.get("transaction_history")
     transactions = (
         _transaction_rows(transaction_source)
@@ -3019,14 +3092,15 @@ def _derive_single_cancel_context(
             for entry in transaction["spent"]
             if (flow := _flow(entry)) is not None
         }
-        if spent_ids != selected:
+        if not selected.issubset(spent_ids):
             continue
+        auxiliary_coin_ids = sorted(spent_ids - selected)
         context = {
             "cohort_id": cohort_id,
-            "manifest_sha256": prepared["evidence_sha256"],
+            "manifest_sha256": manifest_sha256,
             "members": [
                 {
-                    "intent_id": intent["intent_id"],
+                    "intent_id": context_intent_id,
                     "trade_id": exact_intent["sage_trade_id"],
                     "member_id": member_id,
                     "prepared_event_id": prepared["event_id"],
@@ -3043,7 +3117,7 @@ def _derive_single_cancel_context(
                     "spend_identity": transaction.get("spend_identity"),
                 }
             ],
-            "auxiliary_coin_ids": [],
+            "auxiliary_coin_ids": auxiliary_coin_ids,
         }
         proof = _classify_terminal_evidence(
             intent,

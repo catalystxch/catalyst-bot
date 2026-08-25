@@ -535,6 +535,41 @@ def test_claim_is_compare_and_set_with_exact_owner_token_generation_and_version(
     assert racing is None
 
 
+def test_repost_queue_is_idempotent_while_exact_publication_is_in_flight(
+    isolated_database,
+):
+    intent, trade_id, fingerprint = _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("request-contract"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    assert dispatched["state"] == "claimed"
+
+    queued = isolated_database.enqueue_publication_for_trade(
+        trade_id=trade_id,
+        offer_fingerprint=fingerprint,
+        publisher="dexie",
+        force=True,
+        network=intent["network"],
+        queued_at=WITHIN_LEASE,
+    )
+
+    assert queued["queued"] is False
+    assert queued["idempotent"] is True
+    assert queued["record"]["publication_id"] == claim["publication_id"]
+    assert len(
+        isolated_database.list_publication_outbox(
+            intent_id=intent["intent_id"], publisher="dexie"
+        )
+    ) == 1
+
+
 @pytest.mark.parametrize("projection", ["missing", "mutated"])
 def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
     isolated_database, monkeypatch, projection
@@ -678,6 +713,88 @@ def test_terminal_suppression_invalidates_late_claim_without_wallet_side_effect(
     assert isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
 
 
+def test_terminal_reconciliation_suppresses_unresolved_publication_blocker(
+    isolated_database,
+):
+    selected_coin_id = _sha("coin:intent-1")
+    assert isolated_database.upsert_coin(
+        selected_coin_id,
+        "xch",
+        1000000000000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    intent, trade_id, _fingerprint = _prepare_and_confirm(
+        isolated_database, reserve_selected_coins=True
+    )
+    _persist_offer_projection(isolated_database, trade_id, _offer_text(intent["intent_id"]))
+    claim = _claim(isolated_database)
+    unresolved = isolated_database.unresolve_publication_outbox(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        error_json={"code": "PUBLICATION_OFFER_REFERENCE_MISSING"},
+        unresolved_at=WITHIN_LEASE,
+    )
+    assert unresolved["state"] == "unresolved"
+
+    evidence = {"proof": "authoritative terminal state"}
+    evidence_text = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    isolated_database.commit_offer_reconciliation(
+        intent_id=intent["intent_id"],
+        operation_id=f"reconcile:{intent['intent_id']}",
+        classification="EXPIRED_PROVEN",
+        reason_code="AUTHORITATIVE_EXPIRY",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet"),
+            "network": "mainnet",
+        },
+        evidence_json=evidence,
+        evidence_sha256=_sha(evidence_text),
+        reconciled_at=AFTER_LEASE,
+    )
+
+    suppressed = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert suppressed["state"] == "suppressed"
+    snapshot = isolated_database.get_stability_startup_recovery_snapshot()
+    assert snapshot["publication_issues"] == []
+    assert snapshot["blocker_counts"]["publication_claims"] == 0
+
+    # A legacy build could terminalize the intent without suppressing an
+    # already-unresolved row.  Exact reconciliation replay must repair it.
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET state='unresolved', suppression_json=NULL, "
+        "suppression_sha256=NULL, updated_at=? WHERE publication_id=?",
+        (AFTER_LEASE, claim["publication_id"]),
+    )
+    conn.commit()
+    replay = isolated_database.commit_offer_reconciliation(
+        intent_id=intent["intent_id"],
+        operation_id=f"reconcile:{intent['intent_id']}",
+        classification="EXPIRED_PROVEN",
+        reason_code="AUTHORITATIVE_EXPIRY",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet"),
+            "network": "mainnet",
+        },
+        evidence_json=evidence,
+        evidence_sha256=_sha(evidence_text),
+        reconciled_at=AFTER_LEASE,
+    )
+    assert replay["idempotent"] is True
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"])["state"]
+        == "suppressed"
+    )
+
+
 def _persist_offer_projection(db, trade_id, offer_text):
     assert db.add_offer(
         trade_id=trade_id,
@@ -814,6 +931,129 @@ class _TransportResponse:
         if self._payload is None:
             raise ValueError("malformed response")
         return self._payload
+
+
+def test_expired_dispatched_claim_recovers_from_exact_dexie_readback_only(
+    isolated_database,
+):
+    intent, trade_id, fingerprint = _prepare_claimable(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("request-contract"),
+        dispatched_at=WITHIN_LEASE,
+    )
+
+    assert (
+        isolated_database.recover_publication_outbox_from_provider_readback(
+            publication_id=dispatched["publication_id"],
+            expected_row_version=dispatched["row_version"],
+            provider="dexie",
+            provider_response_id="dexie-readback-1",
+            observed_trade_id=trade_id,
+            observed_offer_bech32="offer1wrong",
+            provider_status=0,
+            observed_at=AFTER_LEASE,
+        )
+        is None
+    )
+    assert isolated_database.get_publication_outbox(claim["publication_id"])[
+        "state"
+    ] == "claimed"
+
+    recovered = isolated_database.recover_publication_outbox_from_provider_readback(
+        publication_id=dispatched["publication_id"],
+        expected_row_version=dispatched["row_version"],
+        provider="dexie",
+        provider_response_id="dexie-readback-1",
+        observed_trade_id=f"0x{trade_id}",
+        observed_offer_bech32=offer_text,
+        provider_status=0,
+        observed_at=AFTER_LEASE,
+    )
+
+    assert recovered["state"] == "succeeded"
+    assert recovered["offer_fingerprint"] == fingerprint
+    acknowledgement = json.loads(recovered["acknowledgement_json"])
+    assert acknowledgement == {
+        "code": "EXACT_PROVIDER_READBACK",
+        "payload_sha256": fingerprint,
+        "provider": "dexie",
+        "provider_response_id": "dexie-readback-1",
+        "provider_status": 0,
+        "request_sha256": _sha("request-contract"),
+        "trade_id": trade_id,
+    }
+    assert recovered["acknowledgement_sha256"] == _sha(
+        recovered["acknowledgement_json"]
+    )
+    projected = isolated_database.get_offer(trade_id)
+    assert projected["dexie_id"] == "dexie-readback-1"
+    assert projected["dexie_posted"] == 1
+    snapshot = isolated_database.get_stability_startup_recovery_snapshot()
+    assert snapshot["blocker_counts"]["publication_claims"] == 0
+
+
+def test_startup_recovers_expired_dexie_claim_from_exact_active_offer(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_claimable(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    claim = _claim(isolated_database)
+    isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("request-contract"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    calls = []
+
+    def exact_orderbook(url, **kwargs):
+        calls.append((url, kwargs["params"]))
+        return _TransportResponse(
+            200,
+            {
+                "count": 1,
+                "page": 1,
+                "page_size": 100,
+                "offers": [
+                    {
+                        "id": "dexie-readback-1",
+                        "status": 0,
+                        "trade_id": f"0x{trade_id}",
+                        "offer": offer_text,
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(dexie_manager.requests, "get", exact_orderbook)
+    result = dexie_manager.recover_expired_dexie_publications_at_startup(
+        now_provider=lambda: AFTER_LEASE
+    )
+
+    assert result == {"checked": 1, "recovered": 1, "remaining": 0}
+    assert calls == [
+        (
+            "https://api.dexie.space/v1/offers",
+            {
+                "offered": "xch",
+                "requested": _sha("asset"),
+                "status": 0,
+                "page_size": 100,
+                "page": 1,
+            },
+        )
+    ]
+    assert isolated_database.get_offer(trade_id)["dexie_id"] == "dexie-readback-1"
 
 
 @pytest.mark.parametrize(

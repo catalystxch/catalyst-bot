@@ -102,6 +102,46 @@ class TestSlogRingBuffer(unittest.TestCase):
         # Should not raise
         _call_slog("TEST", "msg", level="nonexistent_level")
 
+    def test_slog_makes_each_file_line_visible_without_waiting_for_close(self):
+        class DelayedVisibilityFile:
+            closed = False
+
+            def __init__(self):
+                self.pending = ""
+                self.visible = ""
+
+            def write(self, text):
+                self.pending += text
+                return len(text)
+
+            def flush(self):
+                self.visible += self.pending
+                self.pending = ""
+
+        log_file = DelayedVisibilityFile()
+        original = (
+            _sl._log_file,
+            _sl._initialized,
+            _sl._file_level,
+            _sl._terminal_level,
+            _sl._bytes_written,
+        )
+        _sl._log_file = log_file
+        _sl._initialized = True
+        _sl._file_level = _sl.LEVELS["info"]
+        _sl._terminal_level = _sl.LEVELS["error"]
+        try:
+            _sl.slog("TEST", "live persistence marker")
+            self.assertIn("live persistence marker", log_file.visible)
+        finally:
+            (
+                _sl._log_file,
+                _sl._initialized,
+                _sl._file_level,
+                _sl._terminal_level,
+                _sl._bytes_written,
+            ) = original
+
 
 # ===========================================================================
 # set_file_level / set_terminal_level

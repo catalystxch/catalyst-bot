@@ -1237,7 +1237,14 @@ def _merge_partial_spacescan(new_payload: Dict, asset_id: str) -> Dict:
         return new_payload  # full fetch — no merge needed
 
     try:
-        prior = get_market_analysis_cache(asset_id, "spacescan") or {}
+        prior = (
+            get_market_analysis_cache(
+                asset_id,
+                "spacescan",
+                include_expired=True,
+            )
+            or {}
+        )
     except Exception:
         return new_payload
 

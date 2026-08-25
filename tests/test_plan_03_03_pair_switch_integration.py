@@ -281,6 +281,26 @@ class TestPairSwitchRiskManagerReset(_TempDB):
         resp = self._switch(asset_id=_ASSET_B, bot=bot)
         self.assertEqual(resp.status_code, 200)
 
+    def test_switch_restores_selected_pair_inventory_after_session_reset(self):
+        """A stopped pair selection must not leave persisted fill exposure at zero."""
+        from risk_manager import RiskManager
+
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.risk_manager = RiskManager()
+
+        with patch(
+            "risk_manager.get_net_position",
+            return_value=Decimal("-188825.894"),
+        ):
+            resp = self._switch(asset_id=_ASSET_B, bot=bot)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            bot.risk_manager.get_inventory_state()["net_position_cat"],
+            "-188825.894",
+        )
+
 
 # ---------------------------------------------------------------------------
 # DB preservation after pair switch

@@ -16,9 +16,11 @@ Key responsibilities:
 
 import time
 import hashlib
+import json
 import requests
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from config import cfg
@@ -28,6 +30,9 @@ from database import (
     enqueue_publication_for_trade,
     log_event,
     mark_publication_dispatch_started,
+    get_offer,
+    list_publication_outbox,
+    recover_publication_outbox_from_provider_readback,
     retry_publication_outbox,
     unresolve_publication_outbox,
     update_offer_dexie,
@@ -44,6 +49,124 @@ from publication_outbox import (
 
 _offer_detail_cache: Dict[str, Dict] = {}
 _offer_detail_cache_at: Dict[str, float] = {}
+
+
+def recover_expired_dexie_publications_at_startup(*, now_provider=None) -> Dict[str, int]:
+    """Recover crashed Dexie dispatches from exact active-orderbook bytes."""
+
+    observed_at = (
+        now_provider()
+        if callable(now_provider)
+        else datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    try:
+        observed_dt = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValueError("startup publication recovery timestamp is invalid")
+    if observed_dt.tzinfo is None or observed_dt.utcoffset() is None:
+        raise ValueError("startup publication recovery timestamp must be timezone-aware")
+
+    candidates = []
+    for row in list_publication_outbox(publisher="dexie"):
+        if (
+            row.get("state") != "claimed"
+            or not row.get("dispatch_started_at")
+            or not row.get("request_sha256")
+            or not row.get("claim_expires_at")
+        ):
+            continue
+        try:
+            expiry = datetime.fromisoformat(
+                str(row["claim_expires_at"]).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        if expiry.tzinfo is None or expiry.utcoffset() is None or expiry >= observed_dt:
+            continue
+        candidates.append(row)
+
+    recovered = 0
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate["payload_json"])
+            trade_id = payload.get("offer_ref") if type(payload) is dict else None
+            offer = get_offer(trade_id) if type(trade_id) is str else None
+            if type(offer) is not dict or offer.get("status") != "open":
+                continue
+            asset_id = offer.get("cat_asset_id")
+            if type(asset_id) is not str or not asset_id:
+                continue
+            if offer.get("side") == "buy":
+                offered, requested = "xch", asset_id
+            elif offer.get("side") == "sell":
+                offered, requested = asset_id, "xch"
+            else:
+                continue
+            page = 1
+            while page <= 20:
+                response = requests.get(
+                    f"{cfg.DEXIE_API_BASE.rstrip('/')}/v1/offers",
+                    params={
+                        "offered": offered,
+                        "requested": requested,
+                        "status": 0,
+                        "page_size": 100,
+                        "page": page,
+                    },
+                    timeout=10,
+                )
+                if response.status_code != 200:
+                    break
+                body = response.json()
+                rows = body.get("offers") if type(body) is dict else None
+                if type(rows) is not list:
+                    break
+                matched = None
+                for remote in rows:
+                    if type(remote) is not dict:
+                        continue
+                    remote_trade = str(remote.get("trade_id") or "").lower()
+                    if remote_trade.startswith("0x"):
+                        remote_trade = remote_trade[2:]
+                    if (
+                        remote.get("status") == 0
+                        and remote_trade == trade_id
+                        and remote.get("offer") == offer.get("offer_bech32")
+                    ):
+                        matched = remote
+                        break
+                if matched is not None:
+                    committed = recover_publication_outbox_from_provider_readback(
+                        publication_id=candidate["publication_id"],
+                        expected_row_version=int(candidate["row_version"]),
+                        provider="dexie",
+                        provider_response_id=matched.get("id"),
+                        observed_trade_id=matched.get("trade_id"),
+                        observed_offer_bech32=matched.get("offer"),
+                        provider_status=matched.get("status"),
+                        observed_at=observed_at,
+                    )
+                    if committed is not None:
+                        recovered += 1
+                    break
+                total = int(body.get("count") or 0)
+                page_size = max(1, int(body.get("page_size") or len(rows) or 100))
+                if not rows or page * page_size >= total:
+                    break
+                page += 1
+        except Exception:
+            # Exact recovery is fail-closed. The original claim remains the
+            # startup blocker when provider evidence is incomplete.
+            continue
+
+    remaining = sum(
+        1
+        for row in list_publication_outbox(publisher="dexie")
+        if row.get("state") in {"claimed", "unresolved"}
+    )
+    return {"checked": len(candidates), "recovered": recovered, "remaining": remaining}
 
 
 class DexieManager:

@@ -178,13 +178,21 @@ class TestDexie5xxRetry(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 try:
-    from price_engine import PriceEngine, _tibet_cache, _tibet_lock
+    from price_engine import (
+        PriceEngine,
+        _tibet_cache,
+        _tibet_lock,
+        _tibet_warning_lock,
+        _tibet_warning_state,
+    )
 
     _PE_SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     PriceEngine = None
     _tibet_cache = None
     _tibet_lock = None
+    _tibet_warning_lock = None
+    _tibet_warning_state = None
     _PE_SKIP = str(exc)
 
 
@@ -196,11 +204,15 @@ class TestTibetSwap5xxFallback(unittest.TestCase):
         with _tibet_lock:
             _tibet_cache["pairs"] = []
             _tibet_cache["fetched_at"] = 0
+        with _tibet_warning_lock:
+            _tibet_warning_state.update(last_warn=0.0, signature="", repeats=0)
 
     def tearDown(self):
         with _tibet_lock:
             _tibet_cache["pairs"] = []
             _tibet_cache["fetched_at"] = 0
+        with _tibet_warning_lock:
+            _tibet_warning_state.update(last_warn=0.0, signature="", repeats=0)
 
     def _make_engine(self):
         return PriceEngine()
@@ -219,6 +231,19 @@ class TestTibetSwap5xxFallback(unittest.TestCase):
         with patch.object(engine._session, "get", return_value=self._fail_resp()):
             pairs = engine._get_tibet_pairs()
         self.assertEqual(pairs, [])
+
+    def test_repeated_tibet_5xx_across_engines_logs_one_warning(self):
+        """A sustained Tibet outage must not flood logs across bot lifecycles."""
+        engines = [self._make_engine() for _ in range(3)]
+        with patch("price_engine.log_event") as log_event:
+            for engine in engines:
+                with patch.object(
+                    engine._session, "get", return_value=self._fail_resp(502)
+                ):
+                    self.assertEqual(engine._get_tibet_pairs(), [])
+
+        self.assertEqual(log_event.call_count, 1)
+        self.assertEqual(log_event.call_args.args[1], "tibet_error")
 
     def test_tibet_5xx_falls_back_to_stale_cache(self):
         """When cache is within max_stale_secs, stale pairs are returned."""

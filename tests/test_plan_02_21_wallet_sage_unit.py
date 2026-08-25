@@ -92,6 +92,23 @@ class TestSageMempoolConflictClassification(unittest.TestCase):
         )
 
 
+@unittest.skipIf(_SKIP is not None, _SKIP_MSG)
+class TestQueryCoinRecordsFailurePropagation(unittest.TestCase):
+    def test_sage_401_remains_failure_shaped_during_tibetswap_outage(self):
+        """The concurrent TibetSwap outage must not hide a separate Sage failure."""
+        diagnostic = {
+            "error": "The Sage RPC service returned an HTTP error.",
+            "error_code": "SAGE_HTTP_ERROR",
+            "http_status": 401,
+        }
+
+        with patch.object(_ws, "rpc", return_value=diagnostic):
+            result = _ws._query_coin_records(1, "selectable")
+
+        self.assertIs(result, diagnostic)
+        self.assertFalse(_rpc_succeeded(result))
+
+
 # ---------------------------------------------------------------------------
 # _is_cat_wallet
 # ---------------------------------------------------------------------------

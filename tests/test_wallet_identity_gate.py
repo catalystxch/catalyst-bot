@@ -1120,6 +1120,29 @@ def test_sage_sign_recheck_block_is_not_converted_to_adapter_error(monkeypatch):
     assert calls == []
 
 
+def test_sage_cancel_sign_recheck_block_is_not_converted_to_adapter_error(monkeypatch):
+    """A cancel's pre-submit identity fence must escape adapter normalization."""
+    import wallet_sage
+
+    monkeypatch.setattr(wallet_sage, "_require_signing_capability", lambda: True)
+    monkeypatch.setattr(
+        wallet_sage,
+        "_sage_post",
+        lambda *args, **kwargs: {"coin_spends": [{"coin": "safe"}]},
+    )
+
+    def recheck(step):
+        if step.endswith(":sign"):
+            raise mutation_gate.MutationBlocked("WALLET_IDENTITY_MISMATCH", step)
+
+    with pytest.raises(mutation_gate.MutationBlocked):
+        wallet_sage.cancel_offer(
+            "a" * 64,
+            secure=False,
+            _identity_recheck=recheck,
+        )
+
+
 def test_adapter_identity_rechecks_are_never_inside_broad_exception_catches():
     root = Path(__file__).resolve().parents[1] / "src" / "catalyst"
     violations = []

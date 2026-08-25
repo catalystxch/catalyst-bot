@@ -314,7 +314,14 @@ class TestPositionHardGuard(_OM):
             self._manager.record_slot_coin_failure("sell", 0)
             self._manager.record_slot_coin_failure("sell", 1)
 
-        with patch.object(_om_mod, "get_open_offers", return_value=[]):
+        with (
+            patch.object(_om_mod, "get_open_offers", return_value=[]),
+            patch.object(
+                _om_mod.database,
+                "get_active_offer_slot_keys",
+                return_value=[],
+            ),
+        ):
             slots = self._manager.get_replenishment_slots("sell", 7)
 
         self.assertEqual(slots, [2, 3, 4, 5, 6])
@@ -405,6 +412,78 @@ class TestDetectExpiringOffers(_OM):
         result = self._manager.detect_expiring_offers(offers, refresh_before_secs=300)
         self.assertIn("soon", result)
         self.assertNotIn("far", result)
+
+    def test_short_lived_sniper_duplicate_is_not_generic_expiry_refresh(self):
+        soon = int(time.time()) + 600
+        offers = [
+            # Wallet records do not carry CATalyst's DB-only tier label.
+            self._make_offer("sniper-tid", soon),
+            {
+                **self._make_offer("sniper-tid", soon),
+                "tier": "sniper",
+            },
+        ]
+
+        result = self._manager.detect_expiring_offers(
+            offers, refresh_before_secs=1800
+        )
+
+        self.assertNotIn("sniper-tid", result)
+
+
+class TestCancelSettlementOrdering(_OM):
+    def test_retry_settles_submitted_blocker_before_retrying_failed_peer(self):
+        trade_id = "a" * 64
+        operation_id = f"cancel:{trade_id}"
+        order = []
+
+        with (
+            patch.object(
+                _om_mod.database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": operation_id}],
+            ),
+            patch.object(
+                _om_mod.database,
+                "get_offer_intent_by_trade_id",
+                return_value=None,
+            ),
+            patch.object(
+                _om_mod.database,
+                "get_retryable_failed_offer_cancels",
+                side_effect=lambda: order.append("retry_read") or [],
+            ),
+            patch.object(
+                self._manager,
+                "_begin_cancel_settlement",
+                side_effect=lambda value: order.append(("begin", value)) or True,
+            ),
+            patch.object(
+                self._manager,
+                "_settle_submitted_cancel",
+                side_effect=lambda intent: order.append(
+                    ("settle", intent.operation_id)
+                )
+                or True,
+            ),
+            patch.object(
+                self._manager,
+                "_end_cancel_settlement",
+                side_effect=lambda value: order.append(("end", value)),
+            ),
+        ):
+            result = self._manager.retry_failed_cancels()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            order,
+            [
+                ("begin", operation_id),
+                ("settle", operation_id),
+                ("end", operation_id),
+                "retry_read",
+            ],
+        )
 
 
 class TestCleanupExpiredDbOffers(_OM):

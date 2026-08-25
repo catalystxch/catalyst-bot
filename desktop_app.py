@@ -1484,7 +1484,7 @@ def _run_coin_prep_worker_mode(worker_args):
 
 
 def _initialize_startup_ownership() -> dict:
-    """Initialize the schema and acquire the mutation lease without wallet RPC."""
+    """Initialize storage, reconcile exact prep evidence, and acquire ownership."""
 
     from database import init_database
 
@@ -1492,6 +1492,42 @@ def _initialize_startup_ownership() -> dict:
     import api_server
 
     authorization = api_server.initialize_mutation_runtime()
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "unresolved_operations"
+        and authorization.get("reason_code")
+        in {
+            "COIN_PREP_EFFECT_UNKNOWN",
+            "COIN_PREP_RECOVERY_REQUIRED",
+            "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+            "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+        }
+    ):
+        try:
+            from coin_prep_worker import recover_coin_prep_operations_at_startup
+
+            if recover_coin_prep_operations_at_startup() is True:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Recovery is fail-closed. The original authorization keeps the
+            # app in diagnostics mode with its durable reason intact.
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code")
+        == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from dexie_manager import recover_expired_dexie_publications_at_startup
+
+            recovery = recover_expired_dexie_publications_at_startup()
+            if recovery.get("recovered", 0) > 0 and recovery.get("remaining") == 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Provider readback recovery is exact and fail-closed. Keep the
+            # diagnostics blocker when the public offer cannot be proven.
+            pass
     return authorization
 
 

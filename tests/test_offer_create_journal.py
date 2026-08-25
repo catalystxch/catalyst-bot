@@ -2603,6 +2603,109 @@ def test_offer_manager_concurrent_creation_has_exactly_one_effect_winner(
     )
 
 
+def test_offer_manager_serializes_same_instance_sage_creation_authority(
+    isolated_database,
+    monkeypatch,
+):
+    """Parallel ladder workers must not race the ordered identity authority."""
+
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    assert database.upsert_coin(COIN_B, "xch", 1000, designation="tier_spare")
+    authority_lane = threading.Lock()
+    overlap_attempted = threading.Event()
+    effects = []
+    effects_lock = threading.Lock()
+
+    def effect(_offer_dict, **kwargs):
+        selected = kwargs["coin_ids"][0]
+        try:
+            with effects_lock:
+                effects.append(selected)
+            return {
+                "success": True,
+                "trade_id": ("3" if selected == COIN_A else "4") * 64,
+                "offer": VALID_SAGE_OFFER,
+                "_catalyst_effect_attempted": True,
+            }
+        finally:
+            authority_lane.release()
+
+    begun, _closed = _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    original_begin = wallet.begin_offer_creation_continuation
+
+    def ordered_begin(**kwargs):
+        if not authority_lane.acquire(blocking=False):
+            overlap_attempted.set()
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_STALE",
+                "wallet:create_offer",
+            )
+        # Before the regression fix, the competing worker reaches this lane
+        # while the first authority is still held. After the fix it waits on
+        # the manager's serialization boundary and enters only after release.
+        overlap_attempted.wait(timeout=0.25)
+        try:
+            return original_begin(**kwargs)
+        except BaseException:
+            authority_lane.release()
+            raise
+
+    monkeypatch.setattr(wallet, "begin_offer_creation_continuation", ordered_begin)
+    manager = offer_manager.OfferManager()
+    monkeypatch.setattr(
+        manager,
+        "_canonical_sage_creation_identity",
+        lambda result: (result["trade_id"], f"offer-{result['trade_id']}"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_verify_sage_offer_locked_inputs",
+        lambda _wallet_id, _trade_id, selected_coin_id, max_polls=6: {
+            "verified": True,
+            "locked_coin_ids": ["0x" + selected_coin_id],
+            "selected_present": True,
+        },
+    )
+
+    contexts = []
+    for index in range(2):
+        context = dict(CREATION_CONTEXT)
+        context["slot_key"] = f"ladder:buy:{7 + index}"
+        context["offer_size_uniqueness"] = {
+            "slot": 7 + index,
+            "requested_amount_atomic": str(2000 + index),
+        }
+        contexts.append(context)
+
+    results = []
+    result_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    def run(index):
+        start.wait(timeout=5)
+        result = manager.create_offer_with_retry(
+            {"1": -1000, "2": 2000 + index},
+            coin_ids_enabled=True,
+            selected_coin_id=(COIN_A, COIN_B)[index],
+            preferred_tier="inner",
+            creation_context=contexts[index],
+        )
+        with result_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(thread.is_alive() is False for thread in threads)
+    assert len(results) == 2
+    assert all(result.get("success") is True for result in results), results
+    assert sorted(effects) == [COIN_A, COIN_B]
+    assert len(begun) == 2
+
+
 def test_mutation_gate_continuation_allows_only_its_prepared_blocker(
     isolated_database,
     monkeypatch,

@@ -12,6 +12,7 @@ def _coin(amount_mojos, status="free"):
 def _patch_drift_inputs(monkeypatch, amounts_by_key):
     monkeypatch.setattr(cfg, "TIER_ENABLED", True, raising=False)
     monkeypatch.setattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5, raising=False)
+    monkeypatch.setattr(cfg, "COIN_PREP_HEADROOM_PCT", 0, raising=False)
 
     def fake_tier_sizes(is_cat=False):
         return {"inner": 1000, "mid": 500, "outer": 250, "extreme": 125}
@@ -41,6 +42,15 @@ def test_standalone_drift_flags_under_floor_coins(monkeypatch):
     assert findings[0]["side"] == "xch"
     assert findings[0]["tier"] == "inner"
     assert findings[0]["ratio"] == 0.97
+
+
+def test_standalone_drift_keeps_prepared_coins_within_headroom(monkeypatch):
+    _patch_drift_inputs(monkeypatch, {("cat", "inner"): [900, 900]})
+    monkeypatch.setattr(cfg, "COIN_PREP_HEADROOM_PCT", 15, raising=False)
+
+    findings = coin_manager.check_tier_size_drift_standalone()
+
+    assert findings == []
 
 
 def test_standalone_drift_ignores_locked_offer_coins(monkeypatch):
@@ -121,3 +131,46 @@ def test_reclassify_moves_reserve_sized_tier_spares_to_reserve(monkeypatch):
 
     assert designations == [("0xreservefuel", "reserve", "none")]
     assert moved["reclassified"] == 1
+
+
+def test_reclassify_keeps_prepared_tier_assignment_within_headroom(monkeypatch):
+    monkeypatch.setattr(cfg, "TIER_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "COIN_PREP_HEADROOM_PCT", 15, raising=False)
+    monkeypatch.setattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5, raising=False)
+    monkeypatch.setattr(
+        coin_manager,
+        "get_tier_sizes_mojos_from_cfg",
+        lambda is_cat=False: {
+            "inner": 1000,
+            "mid": 780,
+            "outer": 400,
+            "extreme": 200,
+        },
+    )
+
+    def fake_coins(wallet_type, designation, tier=None):
+        assert designation == "tier_spare"
+        if wallet_type == "cat":
+            return [
+                {
+                    "coin_id": "0xpreparedinner",
+                    "amount_mojos": 900,
+                    "assigned_tier": "inner",
+                }
+            ]
+        return []
+
+    designations = []
+    monkeypatch.setattr(database, "get_coins_by_designation", fake_coins)
+    monkeypatch.setattr(
+        database,
+        "set_coin_designation",
+        lambda coin_id, designation, assigned_tier=None: designations.append(
+            (coin_id, designation, assigned_tier)
+        ),
+    )
+
+    moved = coin_manager.reclassify_tier_spare_coins()
+
+    assert designations == []
+    assert moved["unchanged"] == 1

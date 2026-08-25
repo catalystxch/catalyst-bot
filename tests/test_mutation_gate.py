@@ -269,7 +269,7 @@ def test_reason_codes_are_allowlisted_and_never_expose_exception_text(
     gate = _gate(clock)
     assert gate.acquire()["acquired"] is True
     _append_event("create:1", blocks=True, suffix="unknown")
-    secret = "rpc failed token=super-secret"
+    secret = "rpc failed token=test-placeholder-secret"
 
     status = gate.trip(secret, ["create:1"])
 
@@ -343,6 +343,64 @@ def test_release_requires_generation_and_every_journal_blocker_resolved(
     _append_event("create:1", blocks=False, suffix="reconciled")
     released = gate.release_resolved(1, ["create:1"])
     assert released["released"] is True
+    assert gate.status().allowed is True
+
+
+def test_release_clears_matching_local_fence_after_external_durable_resolution(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    operation_id = "create:external-reconciliation"
+    _append_event(operation_id, blocks=True, suffix="unknown")
+    gate.trip("CREATE_UNKNOWN", [operation_id])
+    _append_event(operation_id, blocks=False, suffix="reconciled")
+    durable = database.resolve_runtime_safety_latch(
+        expected_generation=1,
+        resolved_operation_ids=[operation_id],
+        resolved_at=clock(),
+    )
+    assert durable["resolved"] is True
+    assert gate.status().allowed is False
+
+    released = gate.release_resolved(1, [operation_id])
+
+    assert released["released"] is True
+    assert released["reason"] == "released"
+    assert gate.status().allowed is True
+
+
+def test_read_only_status_does_not_install_a_transient_durable_latch_fence(
+    isolated_gate_database,
+):
+    """Diagnostics must observe a worker latch without mutating owner state."""
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    operation_id = "create:diagnostic-read"
+    _append_event(operation_id, blocks=True, suffix="submitted")
+    database.trip_runtime_safety_latch(
+        reason_code="CREATE_UNKNOWN",
+        blocking_operation_ids=[operation_id],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+
+    observed = gate.read_only_status()
+
+    assert observed.allowed is False
+    assert observed.source == "durable_latch"
+    _append_event(operation_id, blocks=False, suffix="confirmed")
+    assert database.resolve_runtime_safety_latch(
+        expected_generation=1,
+        resolved_operation_ids=[operation_id],
+        resolved_at=clock(),
+    )["resolved"] is True
+
+    assert gate.read_only_status().allowed is True
     assert gate.status().allowed is True
 
 
@@ -1894,7 +1952,53 @@ def test_api_write_route_classification_is_exhaustive_and_explicit(monkeypatch):
     assert "coin_prep.api_coin_prep_trigger" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_begin_startup" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_retry_sage_connect" in api_server._MUTATING_API_ENDPOINTS
+    assert "coin_prep.api_log_event" in api_server._READ_ONLY_WRITE_API_ENDPOINTS
     assert "bot.api_bot_stop" in api_server._CONTROL_WRITE_API_ENDPOINTS
+
+
+def test_coin_prep_telemetry_does_not_enter_wallet_mutation_gate(monkeypatch):
+    import api_server
+
+    api_server.app.testing = True
+    client = api_server.app.test_client()
+    auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
+    received = []
+
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "enter_mutation",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("telemetry must not sample the wallet mutation gate")
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "log_event",
+        lambda severity, event_type, message: received.append(
+            (severity, event_type, message)
+        ),
+    )
+
+    response = client.post(
+        "/api/log",
+        json={
+            "severity": "info",
+            "event_type": "coin_prep",
+            "message": "worker telemetry remains available during reconciliation",
+        },
+        headers=auth,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"success": True}
+    assert received == [
+        (
+            "info",
+            "coin_prep",
+            "worker telemetry remains available during reconciliation",
+        )
+    ]
 
 
 def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
@@ -1959,7 +2063,7 @@ def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
         "get_stability_diagnostic_counts",
         lambda: {"registry": 0, "lineage": 0, "reserve": 0, "publication": 0},
     )
-    monkeypatch.setattr(api_server.mutation_gate, "status", lambda: denied)
+    monkeypatch.setattr(api_server.mutation_gate, "read_only_status", lambda: denied)
     monkeypatch.setattr(
         api_server.mutation_gate,
         "require_allowed",
@@ -4832,6 +4936,38 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     assert started == [reservation]
 
 
+def test_mutation_stop_handler_defers_only_exact_cancel_settlement(monkeypatch):
+    import api_server
+
+    stop_calls = []
+    deferred_reasons = []
+
+    class Bot:
+        @staticmethod
+        def is_running():
+            return True
+
+        @staticmethod
+        def can_defer_mutation_safety_stop(reason_code):
+            deferred_reasons.append(reason_code)
+            return True
+
+        @staticmethod
+        def stop(wait=True):
+            stop_calls.append(wait)
+
+    monkeypatch.setattr(api_server, "bot", Bot())
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    api_server._mutation_stop_handler("UNRESOLVED_OPERATIONS")
+    assert deferred_reasons == ["UNRESOLVED_OPERATIONS"]
+    assert stop_calls == []
+
+    api_server._mutation_stop_handler("WALLET_IDENTITY_MISMATCH")
+    assert deferred_reasons == ["UNRESOLVED_OPERATIONS"]
+    assert stop_calls == [False]
+
+
 def test_second_desktop_opens_exact_diagnostics_port_not_unrelated_preferred(
     monkeypatch,
 ):
@@ -5744,6 +5880,105 @@ def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
 
     assert desktop_app._initialize_startup_ownership() == {"allowed": True}
     assert events == ["database", "lease"]
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "COIN_PREP_EFFECT_UNKNOWN",
+        "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+        "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+    ],
+)
+def test_desktop_retries_startup_after_exact_coin_prep_recovery(
+    monkeypatch, reason_code
+):
+    """Catches a recoverable submitted split trapping reload in diagnostics."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": reason_code,
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(
+            recover_coin_prep_operations_at_startup=lambda: (
+                events.append("coin_prep_recovery") or True
+            )
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
+    monkeypatch,
+):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
+                "failed_check": "publication_claims",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "dexie_manager",
+        SimpleNamespace(
+            recover_expired_dexie_publications_at_startup=lambda: (
+                events.append("dexie_publication_recovery")
+                or {"checked": 1, "recovered": 1, "remaining": 0}
+            )
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "dexie_publication_recovery",
+        "authorize",
+    ]
 
 
 def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
@@ -6749,7 +6984,7 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
         owner_pid=456,
     )
     monkeypatch.setattr(api_server, "_read_only_diagnostics_active", True)
-    monkeypatch.setattr(api_server.mutation_gate, "status", lambda: denied)
+    monkeypatch.setattr(api_server.mutation_gate, "read_only_status", lambda: denied)
     monkeypatch.setattr(
         api_server,
         "_stability_startup_status",

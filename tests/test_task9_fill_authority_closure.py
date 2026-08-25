@@ -1600,7 +1600,7 @@ def test_coin_manager_topup_rechecks_authority_before_wallet_effect(
     effect_calls: list[str] = []
     manager = object.__new__(coin_manager.CoinManager)
     manager._topup_should_stop = lambda: False
-    manager._get_owned_coin_amount_map = lambda *_args: {}
+    manager._get_owned_coin_amount_map = lambda *_args, **_kwargs: {}
     manager._coinset_topup_split_state = lambda **_kwargs: None
     manager._tx_fee_mojos = lambda: 0
     monkeypatch.setattr(
@@ -2425,6 +2425,134 @@ def test_worker_binds_xch_combine_fee_to_the_exact_source_cohort(
     ]
 
 
+def test_worker_binds_xch_split_fee_to_its_exact_source_coin(
+    isolated_database,
+    monkeypatch,
+):
+    import coin_prep_worker
+    import replacement_capacity
+
+    source_coin_id = hashlib.sha256(b"worker-xch-split-source").hexdigest()
+    target_contract = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": 0,
+                "amount_mojos": 499_999,
+                "purpose": "fee_reserve",
+            },
+            {
+                "output_index": 1,
+                "amount_mojos": 499_999,
+                "purpose": "fee_reserve",
+            },
+        ],
+    }
+    prep_contract = {
+        "operation_kind": "split",
+        "purpose": "fee_reserve",
+        "target_contract": target_contract,
+        "pre_view_coin_ids": [source_coin_id],
+    }
+    canonical_prep = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="fee_reserve",
+        source_coin_ids=[source_coin_id],
+        target_contract=target_contract,
+    )
+    wallet_identity = {"backend": "sage", "fingerprint": 171717171}
+    assert database.upsert_coin(
+        source_coin_id,
+        "xch",
+        1_000_000,
+        designation="fee",
+        tier="fees",
+        purpose="fee_reserve",
+    )
+
+    claims: list[dict] = []
+
+    def claim(**kwargs):
+        claims.append(kwargs)
+        return {"claim_token": "c" * 64, "generation": 1}
+
+    monkeypatch.setattr(coin_prep_worker, "claim_wallet_effect", claim)
+    monkeypatch.setattr(
+        coin_prep_worker, "wallet_effect_claim_is_current", lambda *_a, **_k: True
+    )
+    dispatch = object()
+    monkeypatch.setattr(
+        coin_prep_worker, "begin_wallet_effect_dispatch", lambda *_a, **_k: dispatch
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "wallet_effect_adapter_dispatch_authority",
+        lambda capability: nullcontext(capability),
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "complete_wallet_effect_dispatch",
+        lambda capability, **_kwargs: "SUBMITTED" if capability is dispatch else None,
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "prepare_coin_prep_operation",
+        lambda **_kwargs: {
+            "operation": {
+                "operation_id": canonical_prep["operation_id"],
+                "source_coin_ids_json": json.dumps([source_coin_id]),
+                "wallet_identity_json": json.dumps(wallet_identity),
+                "effect_claim_token": "c" * 64,
+                "effect_claim_generation": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "record_coin_prep_operation_outcome",
+        lambda operation_id, **kwargs: {
+            "operation": {"operation_id": operation_id, **kwargs}
+        },
+    )
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._is_subprocess = False
+    worker.log = lambda _message: None
+    worker._current_coin_prep_wallet_identity = lambda: wallet_identity
+    worker._observe_coin_prep_post_effect = lambda _operation: {
+        "expected_outputs": [],
+        "authoritative_view": {},
+    }
+    worker._verify_authoritative_post_operation_view = lambda **_kwargs: True
+    calls: list[dict] = []
+
+    denied = worker._call_wallet_mutation(
+        "coin_prep.split_xch_pool",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
+        target_coin_id=source_coin_id,
+        fee_mojos=2,
+        _prep_contract=prep_contract,
+    )
+    exact = worker._call_wallet_mutation(
+        "coin_prep.split_xch_pool",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
+        target_coin_id=source_coin_id,
+        fee_mojos=2,
+        _authority_fee_coin_ids=[source_coin_id],
+        _prep_contract=prep_contract,
+    )
+
+    assert denied is None
+    assert exact == {"success": True}
+    assert calls == [{"target_coin_id": source_coin_id, "fee_mojos": 2}]
+    assert claims == [
+        {
+            "operation_id": canonical_prep["operation_id"],
+            "source_coin_ids": [source_coin_id],
+            "fee_coin_ids": [source_coin_id],
+        }
+    ]
+
+
 def test_coin_manager_denies_unknown_or_malformed_wallet_effect_contract(
     isolated_database,
 ):
@@ -2758,6 +2886,8 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
                 AT,
             ),
         )
+
+
     database.get_connection().rollback()
 
     with database.wallet_effect_adapter_dispatch_authority(dispatch):
@@ -2778,6 +2908,208 @@ def test_wallet_effect_resolution_guard_requires_exact_outcome_evidence_and_repl
             result={},
             resolved_at=AFTER,
         )
+
+
+def test_submitted_legacy_runtime_topup_can_be_adopted_only_with_exact_fee_proof(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    """Recover the pre-journal live top-up without directly clearing safety."""
+
+    import mutation_gate
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    source = hashlib.sha256(b"legacy-runtime-topup-source").hexdigest()
+    fee_source = hashlib.sha256(b"legacy-runtime-topup-fee").hexdigest()
+    target = hashlib.sha256(b"legacy-runtime-topup-target").hexdigest()
+    change = hashlib.sha256(b"legacy-runtime-topup-change").hexdigest()
+    fee_change = hashlib.sha256(b"legacy-runtime-topup-fee-change").hexdigest()
+    assert database.upsert_coin(source, "cat", 500, purpose="top_up")
+    assert database.upsert_coin(fee_source, "xch", 1000, purpose="fee_reserve")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.topup_split_sage",
+        source_coin_ids=[source],
+        fee_coin_ids=[fee_source],
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[source],
+        fee_coin_ids=[fee_source],
+    )
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=True, success=True
+        )
+    assert database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+
+    identity = mutation_gate.wallet_identity_binding_payload(
+        runtime._wallet_identity_binding
+    )
+    expected_outputs = [
+        {"coin_id": target, "amount_mojos": 100, "purpose": "replacement"},
+        {"coin_id": change, "amount_mojos": 400, "purpose": "top_up"},
+    ]
+    fee_outputs = [
+        {"coin_id": fee_change, "amount_mojos": 987, "purpose": "fee_reserve"}
+    ]
+    target_contract = {
+        "wallet_type": "cat",
+        "outputs": [
+            {
+                "output_index": index,
+                "amount_mojos": output["amount_mojos"],
+                "purpose": output["purpose"],
+            }
+            for index, output in enumerate(expected_outputs)
+        ],
+    }
+
+    def view(coins):
+        return {
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": identity,
+            "observed_at": "2026-08-20T12:00:00.000000Z",
+            "expires_at": "2026-08-20T12:00:15.000000Z",
+            "coins": coins,
+        }
+
+    common = {
+        "operation_kind": "split",
+        "purpose": "replacement",
+        "source_coin_ids": [source],
+        "target_contract": target_contract,
+        "wallet_identity_json": identity,
+        "effect_claim_token": claim["claim_token"],
+        "effect_claim_generation": claim["generation"],
+    }
+    with pytest.raises(ValueError, match="fee reconciliation"):
+        database.adopt_legacy_submitted_topup_coin_prep_operation(
+            **common,
+            evidence_json={"pre_view_coin_ids": [source]},
+        )
+
+    adopted = database.adopt_legacy_submitted_topup_coin_prep_operation(
+        **common,
+        evidence_json={
+            "pre_view_coin_ids": [source],
+            "fee_reconciliation": {
+                "source_coin_ids": [fee_source],
+                "expected_outputs": fee_outputs,
+                "authoritative_view": view(fee_outputs),
+            },
+        },
+    )
+    assert adopted["operation"]["outcome"] == "SUBMITTED_UNKNOWN"
+
+    confirmed = database.record_coin_prep_operation_outcome(
+        adopted["operation"]["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": [source],
+            "expected_outputs": expected_outputs,
+            "authoritative_view": view(expected_outputs),
+            "expected_wallet_identity": identity,
+        },
+    )
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_submitted_legacy_runtime_absorb_can_be_adopted_with_exact_output_proof(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    """Recover the pre-journal reserve combine without replaying its spend."""
+
+    import mutation_gate
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    reserve = hashlib.sha256(b"legacy-runtime-absorb-reserve").hexdigest()
+    misfit = hashlib.sha256(b"legacy-runtime-absorb-misfit").hexdigest()
+    combined = hashlib.sha256(b"legacy-runtime-absorb-output").hexdigest()
+    assert database.upsert_coin(reserve, "xch", 1000, purpose="top_up")
+    assert database.upsert_coin(misfit, "xch", 200, purpose="replacement")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.absorb_sage",
+        source_coin_ids=[reserve, misfit],
+        fee_coin_ids=[reserve, misfit],
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=[reserve, misfit],
+        fee_coin_ids=[reserve, misfit],
+    )
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=True, success=True
+        )
+    assert database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+
+    identity = mutation_gate.wallet_identity_binding_payload(
+        runtime._wallet_identity_binding
+    )
+    expected_outputs = [
+        {"coin_id": combined, "amount_mojos": 1187, "purpose": "top_up"}
+    ]
+    authoritative_view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-20T12:00:00.000000Z",
+        "expires_at": "2026-08-20T12:00:15.000000Z",
+        "coins": expected_outputs,
+    }
+    adopted = database.adopt_legacy_submitted_topup_coin_prep_operation(
+        operation_kind="combine",
+        purpose="top_up",
+        source_coin_ids=[reserve, misfit],
+        target_contract={
+            "wallet_type": "xch",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 1187,
+                    "purpose": "top_up",
+                }
+            ],
+        },
+        wallet_identity_json=identity,
+        evidence_json={
+            "pre_view_coin_ids": [reserve, misfit],
+            "fee_reconciliation": {
+                "source_coin_ids": [reserve, misfit],
+                "expected_outputs": expected_outputs,
+                "authoritative_view": authoritative_view,
+            },
+        },
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    assert adopted["operation"]["outcome"] == "SUBMITTED_UNKNOWN"
+
+    confirmed = database.record_coin_prep_operation_outcome(
+        adopted["operation"]["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": [reserve, misfit],
+            "expected_outputs": expected_outputs,
+            "authoritative_view": authoritative_view,
+            "expected_wallet_identity": identity,
+        },
+    )
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
 def test_post_fill_claim_attestation_guard_recomputes_exact_canonical_binding(

@@ -71,7 +71,7 @@ def _startup_status(**overrides):
 def _install_status_fakes(monkeypatch, api_server, *, live=None, startup=None):
     monkeypatch.setattr(
         api_server.mutation_gate,
-        "status",
+        "read_only_status",
         lambda: SimpleNamespace(to_dict=lambda: live or _live_status()),
     )
     monkeypatch.setattr(

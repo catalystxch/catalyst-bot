@@ -78,6 +78,15 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertTrue(parsed["is_ours"])
 
+    def test_orderbook_snapshot_identifies_aggregated_v3_source(self):
+        """Catches v3 price levels being mistaken for attributable offers."""
+
+        self.intel._competitors["orderbook_source"] = "dexie_v3_orderbook"
+
+        snapshot = self.intel.get_orderbook_snapshot()
+
+        self.assertEqual(snapshot["source"], "dexie_v3_orderbook")
+
 
 if __name__ == "__main__":
     unittest.main()

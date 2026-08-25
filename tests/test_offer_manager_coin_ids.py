@@ -1711,6 +1711,35 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         # fill from innermost extreme positions [22, 23, 24].
         self.assertEqual(slots, [22, 23, 24])
 
+    def test_get_replenishment_slots_selects_the_actual_vacant_durable_slot(self):
+        manager = offer_manager.OfferManager()
+        existing = [{"tier": "inner"}] * 7
+        occupied = [
+            f"ladder:test-cat:sell:{slot}" for slot in (0, 1, 2, 3, 4, 5, 7)
+        ]
+
+        with (
+            patch.object(offer_manager.cfg, "TIER_ENABLED", True),
+            patch.object(offer_manager.cfg, "SELL_INNER_TIER_COUNT", 8, create=True),
+            patch.object(offer_manager.cfg, "SELL_MID_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager.cfg, "SELL_OUTER_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager.cfg, "SELL_EXTREME_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager, "get_open_offers", return_value=existing),
+            patch.object(
+                offer_manager.database,
+                "get_active_offer_slot_keys",
+                return_value=occupied,
+                create=True,
+            ),
+        ):
+            slots = manager.get_replenishment_slots(
+                side="sell",
+                total_slots=8,
+                cat_asset_id="test-cat",
+            )
+
+        self.assertEqual(slots, [6])
+
     def test_create_ladder_can_bypass_stale_refill_interpolation(self):
         manager = offer_manager.OfferManager()
         selected = itertools.count(1)

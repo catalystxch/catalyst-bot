@@ -257,6 +257,49 @@ class RuntimeMonitorTests(unittest.TestCase):
             )
         )
 
+    def test_ignores_dexie_visibility_gap_for_aggregated_v3_orderbook(self):
+        """Catches unattributable v3 price levels producing a false 0/0 alert."""
+
+        bot = _FakeBot(
+            wallet_buys=24,
+            wallet_sells=24,
+            market_snapshot={
+                "buy_count": 27,
+                "sell_count": 54,
+                "our_buy_count": 0,
+                "our_sell_count": 0,
+                "buy_truncated": False,
+                "sell_truncated": False,
+                "our_best_bid": "0",
+                "our_best_ask": "0",
+                "source": "dexie_v3_orderbook",
+            },
+        )
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+        monitor._last_post_activity_at = time.time() - 600
+
+        with (
+            patch("runtime_monitor.get_events_since", return_value=[]),
+            patch(
+                "runtime_monitor.get_open_offers", return_value=_open_offer_rows(24, 24)
+            ),
+            patch("runtime_monitor.log_event") as log_event_mock,
+            patch.object(monitor, "_resolve_superlog_path", return_value=""),
+        ):
+            monitor._run_once()
+            monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertNotIn("dexie_visibility_gap", active_codes)
+        self.assertFalse(
+            any(
+                call.args[1] == "bot_health_dexie_gap"
+                for call in log_event_mock.call_args_list
+            )
+        )
+
     def test_flags_db_wallet_divergence_when_wallet_excess_persists(self):
         bot = _FakeBot(wallet_buys=25, wallet_sells=24)
         monitor = RuntimeMonitor(bot)

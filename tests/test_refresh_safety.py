@@ -65,12 +65,13 @@ def _prepare(
     generation=0,
     reserve_selected_coins: bool = False,
     slot_key: str = "asset-a:buy:inner",
+    run_id: str = "run-a",
 ):
     return database.prepare_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
         event_id=f"create:{intent_id}:prepared",
-        run_id="run-a",
+        run_id=run_id,
         wallet_fingerprint_hash=_sha("wallet-a"),
         network="mainnet",
         asset_id=_sha("asset-a"),
@@ -278,6 +279,52 @@ def test_visible_parent_selects_exact_next_generation_for_a_replacement_child(is
     _confirm("visible-child")
     bound = database.bind_refresh_lineage("parent", "visible-child")
     assert bound["child"]["sage_trade_id"] == _sha("trade:visible-child")
+
+
+def test_restarted_runtime_can_stage_a_replacement_for_its_exact_visible_parent(
+    isolated_database,
+):
+    """Catches a restart making every inherited live offer impossible to requote."""
+
+    database.init_database()
+    _prepare("parent", run_id="run-old")
+    _confirm("parent")
+    database.record_offer_intent_visibility(
+        "parent", publication_identity="registry:parent"
+    )
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-new",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+
+    from offer_manager import OfferManager
+
+    resolved = OfferManager._resolve_creation_context_generation(
+        {
+            "select_next_generation": True,
+            "slot_key": "asset-a:buy:inner",
+            "parent_intent_id": "parent",
+        }
+    )
+    assert resolved["generation"] == 1
+    assert resolved["_authority_run_id"] == "run-new"
+
+    _prepare(
+        "replacement",
+        parent_intent_id="parent",
+        generation=resolved["generation"],
+        run_id=resolved["_authority_run_id"],
+    )
+    _confirm("replacement")
+    bound = database.bind_refresh_lineage("parent", "replacement")
+
+    assert bound["parent"]["run_id"] == "run-old"
+    assert bound["child"]["run_id"] == "run-new"
 
 
 def test_lineage_completion_requires_cancel_resolution_and_terminal_proof(isolated_database):

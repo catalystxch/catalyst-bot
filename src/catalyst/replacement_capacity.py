@@ -303,14 +303,14 @@ def verify_coin_prep_post_view(
         return CoinPrepPostViewDecision(
             False, "authoritative_view_time_malformed", ()
         )
-    authoritative_expiry = bound_at + timedelta(
+    authoritative_expiry = observed_at + timedelta(
         seconds=expected_identity["maximum_age_seconds"]
     )
     if expires_at != authoritative_expiry:
         return CoinPrepPostViewDecision(
             False, "authoritative_view_time_malformed", ()
         )
-    if observed_at <= bound_at or observed_at > expires_at:
+    if observed_at <= bound_at:
         return CoinPrepPostViewDecision(False, "wallet_identity_expired", ())
     try:
         sources = {_canonical_coin_id(value, "source coin id") for value in source_coin_ids}

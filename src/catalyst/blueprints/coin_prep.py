@@ -46,6 +46,86 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _reconcile_authoritative_open_offers_before_prep() -> dict:
+    """Resolve proof-backed terminal offers before the re-prep safety guard.
+
+    A stopped bot cannot run its normal fill/expiry reconciler.  Sage may
+    therefore already show an offer as completed, cancelled, or expired while
+    the durable CATalyst row still says ``open``.  Coin prep must not erase or
+    infer those rows, but it can ask the existing proof-bound authority to
+    settle any result that is already fully proven.  Unknown/active/conflicted
+    rows remain untouched and the reset guard continues to fail closed.
+    """
+
+    import database
+    import offer_reconciliation
+
+    rows = database.get_open_offers(include_elapsed=True)
+    summary = {
+        "examined": len(rows),
+        "terminal_applied": 0,
+        "pending": 0,
+        "errors": 0,
+    }
+    terminal = {
+        offer_reconciliation.FILLED_PROVEN,
+        offer_reconciliation.CANCELLED_PROVEN,
+        offer_reconciliation.EXPIRED_PROVEN,
+    }
+    for row in rows:
+        trade_id = row.get("trade_id") if type(row) is dict else None
+        intent = (
+            database.get_offer_intent_by_trade_id(trade_id)
+            if type(trade_id) is str and trade_id
+            else None
+        )
+        if type(intent) is not dict or type(intent.get("intent_id")) is not str:
+            summary["pending"] += 1
+            continue
+        try:
+            evidence = offer_reconciliation.load_authoritative_evidence(intent)
+            observed_at = offer_reconciliation._clock_utc()
+            cancel_context = offer_reconciliation._derive_single_cancel_context(
+                intent,
+                evidence,
+                database_module=database,
+                observed_at=observed_at,
+            )
+            classification = offer_reconciliation.classify_terminal_evidence(
+                intent,
+                evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            if classification.get("classification") not in terminal:
+                summary["pending"] += 1
+                continue
+            reconciled = offer_reconciliation.reconcile_offer(
+                intent["intent_id"],
+                evidence=evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            if reconciled.get("applied") is True:
+                summary["terminal_applied"] += 1
+            else:
+                summary["pending"] += 1
+        except Exception:
+            summary["errors"] += 1
+
+    if summary["examined"]:
+        log_event(
+            "info" if not summary["errors"] else "warning",
+            "coin_prep_authoritative_reconcile",
+            "Coin prep authoritative preflight: "
+            f"examined {summary['examined']}, "
+            f"settled {summary['terminal_applied']}, "
+            f"pending {summary['pending']}, errors {summary['errors']}",
+            data=summary,
+        )
+    return summary
+
+
 def _inventory_summary_from_coin_summary(
     coin_summary: dict, manager_summary: dict = None
 ) -> dict:
@@ -1455,18 +1535,22 @@ def _api_coin_prep_trigger_locked():
                 bot.coin_manager._prep_running = False
 
         # ---- Clear session data before the coin_prep_worker runs ----
-        # Under the default preserve_history path we only wipe state that
-        # directly refers to the coin IDs / offers about to be replaced:
-        # coin rows, inventory snapshots, cancelled offers. Fills, round
-        # trips, position baseline, and market-intel stats all survive so
-        # a routine re-prep doesn't destroy the user's trading record.
+        # Under the default preserve_history path we keep the coin proof rows
+        # as well as fills / round trips.  The worker already calls
+        # mark_unreserved_free_coins_gone_for_preparation() before its wallet
+        # re-scan, which invalidates only disposable cache rows while retaining
+        # coins bound to append-only offer evidence.  Asking the broad reset to
+        # clear every coin here would correctly trip the authority guard after
+        # any completed offer and make routine re-prep impossible.
         #
         # Under full_reset=True the caller requests the broad legacy reset.
         # It remains opt-in, but authoritative or protected state produces a
         # stable conflict instead of deleting fills, proofs, offers, or locks.
+        if not _prep_reset_pnl:
+            _reconcile_authoritative_open_offers_before_prep()
         try:
             reset_summary = api_server._reset_fresh_run_session(
-                clear_coins=True,
+                clear_coins=_prep_reset_pnl,
                 clear_price_history=_prep_reset_pnl,
                 clear_inventory=True,
                 cancel_open_offers=True,
@@ -1651,6 +1735,7 @@ def _api_coin_prep_trigger_locked():
                 from coin_manager import (
                     _coin_prep_active_cat_wallet_id,
                     _coin_prep_worker_command,
+                    _coin_prep_worker_delegation_ttl_seconds,
                     _coin_prep_worker_environment,
                     _issue_coin_prep_worker_delegation,
                     _revoke_coin_prep_worker_delegation,
@@ -1978,14 +2063,11 @@ def _api_coin_prep_trigger_locked():
 
                 operation_id = f"coin-prep:{run_id}"
                 worker_id = f"coin-prep-worker:{run_id}"
-                max_runtime = int(
-                    float(getattr(cfg, "COIN_PREP_MAX_RUNTIME_SECS", 600) or 600)
-                )
                 delegation = _issue_coin_prep_worker_delegation(
                     env,
                     operation_id=operation_id,
                     worker_id=worker_id,
-                    ttl_seconds=max(60, min(3600, max_runtime + 60)),
+                    ttl_seconds=_coin_prep_worker_delegation_ttl_seconds(),
                 )
 
                 log_path = _coin_prep_output_log_file()

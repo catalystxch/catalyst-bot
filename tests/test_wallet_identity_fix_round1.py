@@ -983,7 +983,6 @@ def test_coin_prep_worker_copies_complete_delegation_environment():
         True,
         ["hostile"],
         "accepted",
-        {},
         {"success": False, "error": "secret backend rejection"},
         {"success": 1},
         {"success": True, "error": "rejected"},
@@ -1023,6 +1022,23 @@ def test_set_change_address_accepts_only_exact_success_true(monkeypatch):
         "rpc",
         lambda *args, **kwargs: {"success": True},
     )
+
+    assert wallet_sage.set_change_address("xch1safe", 123456) == {
+        "success": True,
+        "fingerprint": 123456,
+        "address": "xch1safe",
+    }
+
+
+def test_set_change_address_accepts_documented_empty_response(monkeypatch):
+    """Sage v0.12.10 returns its documented EmptyResponse as an empty object."""
+
+    monkeypatch.setattr(
+        wallet_sage,
+        "_validate_address_for_active_network",
+        lambda address, context: address,
+    )
+    monkeypatch.setattr(wallet_sage, "rpc", lambda *args, **kwargs: {})
 
     assert wallet_sage.set_change_address("xch1safe", 123456) == {
         "success": True,

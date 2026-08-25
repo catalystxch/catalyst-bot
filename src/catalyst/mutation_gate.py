@@ -1491,6 +1491,8 @@ class MutationGate:
         latch: Mapping[str, Any],
         lease: Mapping[str, Any],
         unresolved: list[Mapping[str, Any]],
+        *,
+        mirror_process_fence: bool = True,
     ) -> GateStatus:
         generation = int(latch.get("generation") or 0)
         blockers = _decode_blockers(latch)
@@ -1537,7 +1539,8 @@ class MutationGate:
                 if binding_matches
                 else "LATCH_BINDING_MISMATCH"
             )
-            self._set_local_block(reason, latch_generation=generation)
+            if mirror_process_fence:
+                self._set_local_block(reason, latch_generation=generation)
             return result(reason, "durable_latch")
         if str(latch.get("state") or "") != "resolved":
             return result("DURABLE_STATE_UNAVAILABLE", "durable_latch")
@@ -1551,17 +1554,20 @@ class MutationGate:
         if expected_version is not None and (
             not lease_active or not owned or lease_version != expected_version
         ):
-            self._set_local_block("LEASE_LOST")
+            if mirror_process_fence:
+                self._set_local_block("LEASE_LOST")
             return result("LEASE_LOST", "lease")
         if not lease_active:
             return result("LEASE_UNAVAILABLE", "lease")
         if not owned:
             return result("LEASE_OWNED_BY_OTHER", "lease")
         if expected_version is None:
-            self._set_local_block("LEASE_LOST")
+            if mirror_process_fence:
+                self._set_local_block("LEASE_LOST")
             return result("LEASE_LOST", "lease")
         if lease_expiry is None or _as_utc(lease_expiry) <= self._now():
-            self._set_local_block("LEASE_EXPIRED")
+            if mirror_process_fence:
+                self._set_local_block("LEASE_EXPIRED")
             return result("LEASE_EXPIRED", "lease")
         return GateStatus(
             allowed=True,
@@ -1589,6 +1595,31 @@ class MutationGate:
                 )
             except Exception:
                 self._set_local_block("DURABLE_STATE_UNAVAILABLE")
+                return GateStatus(
+                    allowed=False,
+                    reason_code="DURABLE_STATE_UNAVAILABLE",
+                    source="durable_read",
+                )
+
+    def read_only_status(self) -> GateStatus:
+        """Return fresh diagnostics without installing a process-local fence.
+
+        Mutation boundaries continue to use :meth:`status`, which mirrors any
+        durable stop into process memory and invokes the stop handler.  A GET
+        diagnostics request must not create that state transition merely by
+        sampling a short-lived worker reconciliation latch.
+        """
+
+        with self._lock:
+            try:
+                authorization = self._authorization_snapshot()
+                return self._status_from_rows(
+                    authorization["latch"],
+                    authorization["lease"],
+                    authorization["unresolved"],
+                    mirror_process_fence=False,
+                )
+            except Exception:
                 return GateStatus(
                     allowed=False,
                     reason_code="DURABLE_STATE_UNAVAILABLE",
@@ -1854,6 +1885,38 @@ class MutationGate:
                 authorization = self._authorization_snapshot()
                 latch = authorization["latch"]
                 if str(latch.get("state") or "") != "tripped":
+                    externally_resolved = (
+                        str(latch.get("state") or "") == "resolved"
+                        and int(latch.get("generation") or 0) == expected_generation
+                        and self._local_latch_generation == expected_generation
+                        and bool(local_reason)
+                        and not authorization["unresolved"]
+                        and type(resolved_operation_ids) in (list, tuple)
+                        and 1 <= len(resolved_operation_ids) <= 64
+                        and len(set(resolved_operation_ids))
+                        == len(resolved_operation_ids)
+                        and all(
+                            type(operation_id) is str and bool(operation_id.strip())
+                            for operation_id in resolved_operation_ids
+                        )
+                        and str(latch.get("wallet_fingerprint_hash") or "")
+                        == self.wallet_fingerprint_hash
+                        and str(latch.get("network") or "") == self.network
+                    )
+                    if externally_resolved:
+                        self._local_reason_code = ""
+                        self._local_latch_generation = None
+                        self._notified_stop_handler = None
+                        current = self.status()
+                        return {
+                            "released": current.allowed,
+                            "reason": (
+                                "released"
+                                if current.allowed
+                                else current.reason_code.lower()
+                            ),
+                            "status": current.to_dict(),
+                        }
                     return {
                         "released": False,
                         "reason": "not_tripped",
@@ -3088,6 +3151,15 @@ def status() -> GateStatus:
     return runtime.status() if runtime is not None else _uninitialized_status()
 
 
+def read_only_status() -> GateStatus:
+    """Read the live gate for diagnostics without changing process state."""
+
+    runtime = current_runtime()
+    return (
+        runtime.read_only_status() if runtime is not None else _uninitialized_status()
+    )
+
+
 def require_allowed(operation: str) -> GateStatus:
     runtime = current_runtime()
     if runtime is None:
@@ -3195,6 +3267,7 @@ __all__ = [
     "require_worker_allowed_from_environment",
     "shutdown_runtime",
     "status",
+    "read_only_status",
     "trip",
     "validate_wallet_identity",
     "validate_worker_environment",

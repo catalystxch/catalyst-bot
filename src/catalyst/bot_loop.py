@@ -340,6 +340,32 @@ def collect_locally_expired_stale_offer_ids(
     return expired
 
 
+def build_startup_fill_baseline(
+    wallet_buy_ids, wallet_sell_ids, database_open_offers
+):
+    """Keep persisted open offers visible to the first post-start fill check.
+
+    Sage's current-open view necessarily omits offers completed while CATalyst
+    was stopped. Unioning persisted open rows into the startup baseline makes
+    those wallet-absent IDs appear as disappearances on the first live cycle,
+    where the existing proof-bound reconciler can classify them.
+    """
+    buy_ids = set(wallet_buy_ids or set())
+    sell_ids = set(wallet_sell_ids or set())
+    for offer in database_open_offers or []:
+        if not isinstance(offer, dict):
+            continue
+        trade_id = str(offer.get("trade_id") or "").strip()
+        side = str(offer.get("side") or "").strip().lower()
+        if not trade_id:
+            continue
+        if side == "buy":
+            buy_ids.add(trade_id)
+        elif side == "sell":
+            sell_ids.add(trade_id)
+    return buy_ids, sell_ids
+
+
 class _ReserveCheckDeferred(Exception):
     """Raised inside the reserve-floor block when a balance read failed.
 
@@ -1237,6 +1263,38 @@ class BotLoop:
                 f"Spacescan health augment failed (non-critical): {e}",
             )
         return health_data
+
+    def _augment_health_with_provider_context(self, health_data: dict) -> dict:
+        """Add external-provider state required by live dashboard SSE updates."""
+        health_data = self._augment_health_with_spacescan(health_data)
+        startup_results = getattr(self, "_startup_self_test_results", {}) or {}
+        tibet_health = startup_results.get("tibet") or {}
+        if tibet_health.get("ok") is not False:
+            return health_data
+
+        outage_text = (
+            "TibetSwap API unavailable — Dexie-only pricing; "
+            "AMM drift protection and reference price unavailable"
+        )
+        conditions = health_data.setdefault("conditions", [])
+        if not any(
+            isinstance(condition, dict) and condition.get("text") == outage_text
+            for condition in conditions
+        ):
+            conditions.append({"level": "amber", "text": outage_text})
+
+        metrics = health_data.setdefault("metrics", {})
+        metrics["tibetswap_available"] = False
+        metrics["tibetswap_status_code"] = tibet_health.get("status_code")
+        metrics["pricing_mode"] = "dexie_only"
+        if health_data.get("status") == "green":
+            health_data["status"] = "amber"
+            health_data["message"] = (
+                "Market degraded — TibetSwap unavailable; Dexie-only pricing "
+                "active without AMM drift protection"
+            )
+        return health_data
+
 
     def _emit_alert(
         self,
@@ -7042,28 +7100,25 @@ class BotLoop:
                 f"{len(open_sells)} open sells, {len(closed)} closed",
             )
 
-            # Set fill tracker baseline
+            # Current wallet-open IDs are only part of the startup baseline.
+            # Persisted DB-open offers are added below so an offer completed
+            # while CATalyst was stopped is not silently forgotten.
             buy_ids = {o.get("trade_id", "") for o in open_buys if o.get("trade_id")}
             sell_ids = {o.get("trade_id", "") for o in open_sells if o.get("trade_id")}
-
-            # Pre-seed fill tracker with pre-cleanup offer state.
-            # This lets the first detect_fills() after startup detect any
-            # offers that filled while the bot was offline (offline fills),
-            # rather than silently treating the current state as the baseline.
-            try:
-                self.fill_tracker.set_baseline(buy_ids, sell_ids)
-            except AttributeError:
-                pass  # set_baseline not yet available — harmless
 
             # ---- Diagnose stale database offers without inferring terminal state ----
             # Wallet-open absence, local expiry, and a terminal-looking history row
             # are observations only. Task 10 will coordinate startup reconciliation
             # by calling the proof-bound Task 9 authority.
             wallet_open_ids = buy_ids | sell_ids
+            db_open = []
             try:
                 from database import get_open_offers
 
-                db_open = get_open_offers(include_elapsed=True)
+                db_open = get_open_offers(
+                    cat_asset_id=cfg.CAT_ASSET_ID,
+                    include_elapsed=True,
+                )
                 stale_ids = [
                     row.get("trade_id")
                     for row in db_open
@@ -7091,6 +7146,19 @@ class BotLoop:
                     "db_cleanup_failed",
                     f"DB offer diagnostic failed: {e}",
                 )
+
+            # Pre-seed with both the current Sage-open set and the persisted
+            # pre-stop set. The first detect_fills() call can then hand any
+            # offline disappearance to the existing authoritative reconciler.
+            baseline_buys, baseline_sells = build_startup_fill_baseline(
+                buy_ids,
+                sell_ids,
+                db_open,
+            )
+            try:
+                self.fill_tracker.set_baseline(baseline_buys, baseline_sells)
+            except AttributeError:
+                pass  # set_baseline not yet available — harmless
 
             recovered_startup_trade_ids = set()
 
@@ -7149,7 +7217,7 @@ class BotLoop:
                 try:
                     offer_edges = self._get_live_offer_edges(open_buys, open_sells)
                     self._record_live_offer_edges(offer_edges)
-                    health_data = self._augment_health_with_spacescan(
+                    health_data = self._augment_health_with_provider_context(
                         self.risk_manager.get_market_health(loop_count=self._loop_count)
                     )
                     cached_intel = {}
@@ -8096,6 +8164,71 @@ class BotLoop:
             for trade_id in confirmed:
                 self.sniper._active_snipe_sides.pop(trade_id, None)
         return confirmed
+
+    def _run_cancel_retry_pass(self) -> bool:
+        """Retry durable cancels without crossing an unresolved submit boundary."""
+
+        if not self._enter_runtime_effect_phase("cancel"):
+            return False
+        retried = self.offer_manager.retry_failed_cancels()
+        if retried < 0:
+            log_event(
+                "warning",
+                "cancel_retry_waiting_for_confirmation",
+                "A submitted cancel is awaiting authoritative confirmation; "
+                "ending this cycle before any later wallet mutation",
+            )
+            try:
+                self.stop(wait=False)
+            except TypeError:
+                self.stop()
+            return False
+        if retried > 0:
+            suffix = "" if retried == 1 else "s"
+            log_event(
+                "info",
+                "cancel_retries",
+                f"Cancel retry pass completed for {retried} pending cancel{suffix}",
+            )
+        return True
+
+    def can_defer_mutation_safety_stop(self, reason_code: str) -> bool:
+        """Keep one exact cancel settlement worker alive behind a closed gate."""
+
+        if reason_code != "UNRESOLVED_OPERATIONS" or self._running is not True:
+            return False
+        getter = getattr(
+            self.offer_manager, "get_active_cancel_settlement_operation", None
+        )
+        if not callable(getter):
+            return False
+        try:
+            operation_id = getter()
+            if (
+                type(operation_id) is not str
+                or not operation_id.startswith("cancel:")
+                or len(operation_id) != 71
+                or any(char not in "0123456789abcdef" for char in operation_id[7:])
+            ):
+                return False
+            import database
+
+            latch = database.get_runtime_safety_latch()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            generation = latch.get("generation") if type(latch) is dict else None
+            return bool(
+                latch.get("state") == "tripped"
+                and latch.get("reason_code") == "UNRESOLVED_OPERATIONS"
+                and type(generation) is int
+                and not isinstance(generation, bool)
+                and generation > 0
+                and type(blockers) is list
+                and len(blockers) == 1
+                and type(blockers[0]) is dict
+                and blockers[0].get("operation_id") == operation_id
+            )
+        except Exception:
+            return False
 
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
@@ -9196,16 +9329,8 @@ class BotLoop:
                 )
 
         # ---- Step 7c: Retry failed cancels (V1 parity) ----
-        if not self._enter_runtime_effect_phase("cancel"):
+        if not self._run_cancel_retry_pass():
             return False
-        retried = self.offer_manager.retry_failed_cancels()
-        if retried > 0:
-            suffix = "" if retried == 1 else "s"
-            log_event(
-                "info",
-                "cancel_retries",
-                f"Cancel retry pass completed for {retried} pending cancel{suffix}",
-            )
 
         # Update cancel retry alert
         pending_retries = len(self.offer_manager._pending_cancel_retries)
@@ -9229,8 +9354,8 @@ class BotLoop:
         # ---- Step 7d: Refresh fee pool after all cancels ----
         # Steps 7/7c may have consumed fee coins via Sage auto-pick.
         # Re-query spendable fee coins so the pool only contains coins
-        # that are actually available — prevents creates (steps 8-10)
-        # from passing an already-spent coin to make_offer.
+        # that are actually available before a later CAT split/top-up can
+        # reserve an explicit fee input.
         try:
             self.coin_manager.refresh_fee_pool_from_wallet()
         except Exception:
@@ -10474,12 +10599,13 @@ class BotLoop:
 
         # ---- Step 10: Create new offers if needed ----
         self._set_cycle_step("step10_create_offers")
-        # Cap is based on DB-open count (_db_open_*_ids) so zombie wallet offers
-        # (cancelled in DB, still active in Sage) don't falsely fill the cap.
-        # Both branches of the try/except above guarantee these are defined.
+        # The configured limit is a hard live-book cap. Count every offer Sage
+        # still reports open, including probes and pending-cancel offers. A
+        # wallet-active offer remains fillable and must keep its slot until
+        # authoritative reconciliation proves it terminal.
         print(
-            f"   [10] Offers: buys {len(_db_open_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
-            f"sells {len(_db_open_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}",
+            f"   [10] Offers: buys {len(current_buy_ids)}/{cfg.MAX_ACTIVE_BUY_OFFERS}, "
+            f"sells {len(current_sell_ids)}/{cfg.MAX_ACTIVE_SELL_OFFERS}",
             flush=True,
         )
         # step10 count log removed — console print covers this
@@ -10513,10 +10639,10 @@ class BotLoop:
 
         self._create_offers_if_needed(
             mid_price,
-            len(_db_open_buy_ids),  # DB-open count (excludes zombie wallet offers)
-            len(_db_open_sell_ids),  # DB-open count (excludes zombie wallet offers)
-            current_buy_ids=_db_open_buy_ids,
-            current_sell_ids=_db_open_sell_ids,
+            len(current_buy_ids),
+            len(current_sell_ids),
+            current_buy_ids=current_buy_ids,
+            current_sell_ids=current_sell_ids,
             arb_gap=arb_gap,
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
@@ -10634,7 +10760,7 @@ class BotLoop:
         try:
             offer_edges = self._get_live_offer_edges(open_buys, open_sells)
             self._record_live_offer_edges(offer_edges)
-            health_data = self._augment_health_with_spacescan(
+            health_data = self._augment_health_with_provider_context(
                 self.risk_manager.get_market_health(loop_count=self._loop_count)
             )
             # Include competitor spread + fill rate for Smart Advisor
@@ -11612,13 +11738,12 @@ class BotLoop:
         # different assets. For debugging wallet selection issues, we can
         # force a single global queue so only one make_offer flow runs at once.
         created_any = False
-        probe_slot_offsets = self._confirmed_probe_slot_offsets(
-            current_buy_ids=current_buy_ids,
-            current_sell_ids=current_sell_ids,
-        )
-        effective_buy_count = max(0, current_buy_count - probe_slot_offsets["buy"])
+        # Confirmed probes are live, fillable offers and therefore consume one
+        # of the configured per-side slots. Treating them as free capacity
+        # produced 24 live offers against a 23-offer limit in TEST 7.
+        effective_buy_count = max(0, current_buy_count)
         effective_buy_count += self.offer_manager.get_recently_created_count("buy")
-        effective_sell_count = max(0, current_sell_count - probe_slot_offsets["sell"])
+        effective_sell_count = max(0, current_sell_count)
         effective_sell_count += self.offer_manager.get_recently_created_count("sell")
         adaptive_targets = self._get_adaptive_offer_targets(
             mid_price,

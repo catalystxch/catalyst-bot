@@ -88,7 +88,7 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     )
     monkeypatch.setattr(
         api_server.mutation_gate,
-        "status",
+        "read_only_status",
         lambda: SimpleNamespace(to_dict=lambda: _gate_status()),
     )
     monkeypatch.setattr(
@@ -176,7 +176,7 @@ def test_clean_safety_status_recommends_no_operator_action(monkeypatch):
     )
     monkeypatch.setattr(
         api_server.mutation_gate,
-        "status",
+        "read_only_status",
         lambda: SimpleNamespace(
             to_dict=lambda: _gate_status(allowed=True, reason_code="")
         ),
@@ -197,6 +197,42 @@ def test_clean_safety_status_recommends_no_operator_action(monkeypatch):
     assert payload["safety"]["recovery"]["durable_counts"] == expected_counts
 
 
+def test_safety_status_uses_the_non_mutating_gate_reader(monkeypatch):
+    import api_server
+
+    _install_diagnostic_counts(monkeypatch, api_server)
+    monkeypatch.setattr(
+        api_server,
+        "_stability_startup_status",
+        _startup_status(allowed=True, reason_code=""),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "read_only_status",
+        lambda: SimpleNamespace(
+            to_dict=lambda: _gate_status(allowed=True, reason_code="")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "status",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("read-only diagnostics used the enforcing gate reader")
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_configured_mutation_binding",
+        lambda: ("a" * 64, "mainnet"),
+    )
+
+    response = api_server.app.test_client().get("/api/safety/status")
+
+    assert response.status_code == 200
+    assert response.get_json()["safety"]["allowed"] is True
+
+
 def test_app_bridge_safety_status_matches_api_exactly(monkeypatch):
     import api_server
     import app_bridge
@@ -205,7 +241,7 @@ def test_app_bridge_safety_status_matches_api_exactly(monkeypatch):
     monkeypatch.setattr(api_server, "_stability_startup_status", _startup_status())
     monkeypatch.setattr(
         api_server.mutation_gate,
-        "status",
+        "read_only_status",
         lambda: SimpleNamespace(to_dict=lambda: _gate_status()),
     )
     monkeypatch.setattr(
@@ -252,7 +288,7 @@ def test_safety_status_api_fails_closed_when_live_gate_read_raises(monkeypatch):
 
     monkeypatch.setattr(
         api_server.mutation_gate,
-        "status",
+        "read_only_status",
         lambda: (_ for _ in ()).throw(RuntimeError("secret database path")),
     )
 
@@ -268,3 +304,68 @@ def test_safety_status_api_fails_closed_when_live_gate_read_raises(monkeypatch):
             "recommended_action": "RESTORE_DATABASE_BACKUP",
         },
     }
+
+
+def test_safety_release_resolved_uses_exact_runtime_cas(monkeypatch):
+    import api_server
+
+    calls = []
+
+    class FakeRuntime:
+        def release_resolved(self, expected_generation, resolved_operation_ids):
+            calls.append((expected_generation, resolved_operation_ids))
+            return {
+                "released": True,
+                "reason": "released",
+                "status": {"allowed": True},
+            }
+
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: FakeRuntime(),
+    )
+    client = api_server.app.test_client()
+    response = client.post(
+        "/api/safety/release-resolved",
+        json={
+            "expected_generation": 7,
+            "resolved_operation_ids": ["cancel:" + "a" * 64],
+        },
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "success": True,
+        "released": True,
+        "reason_code": "RELEASED",
+    }
+    assert calls == [(7, ["cancel:" + "a" * 64])]
+    assert "api_safety_release_resolved" in api_server._CONTROL_WRITE_API_ENDPOINTS
+
+
+def test_safety_release_resolved_rejects_malformed_authority(monkeypatch):
+    import api_server
+
+    calls = []
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(release_resolved=lambda *args: calls.append(args)),
+    )
+    response = api_server.app.test_client().post(
+        "/api/safety/release-resolved",
+        json={"expected_generation": True, "resolved_operation_ids": []},
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "success": False,
+        "released": False,
+        "reason_code": "RELEASE_REQUEST_MALFORMED",
+    }
+    assert calls == []

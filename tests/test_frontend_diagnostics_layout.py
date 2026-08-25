@@ -159,6 +159,85 @@ def test_settings_review_state_survives_reload_before_blank_template_gate():
     assert "isSettingsReviewedForCurrentPair()" in start_block
 
 
+def test_reselecting_persisted_pair_loads_saved_config_for_explicit_review():
+    """Re-confirming the server's saved pair must not look like a new CAT switch."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    select_start = html.index("async function selectCAT()")
+    select_end = html.index("async function refreshBalances", select_start)
+    select_block = html[select_start:select_end]
+
+    assert "const reselectingPersistedPair" in select_block
+    assert "_resumeCandidateCAT?.asset_id === assetId" in select_block
+    assert "previousCAT.asset_id === assetId" in select_block
+    assert "setFreshStartTemplateState(!reselectingPersistedPair);" in select_block
+    # Review remains explicit even though the valid saved values are reloaded.
+    assert "setSettingsReviewedState(false);" in select_block
+
+    resume_start = html.index("async function checkForResume()")
+    resume_end = html.index("async function resumeSession()", resume_start)
+    resume_block = html[resume_start:resume_end]
+    assert "const reselectingPersistedPair" in resume_block
+    assert "setFreshStartTemplateState(!reselectingPersistedPair);" in resume_block
+
+
+def test_resume_session_revalidates_live_summary_after_status_refresh():
+    """A concurrent idle-status refresh must not blank the post-load summary."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    resume_start = html.index("async function resumeSession()")
+    resume_end = html.index("function dismissResume()", resume_start)
+    resume_block = html[resume_start:resume_end]
+    status_refresh = resume_block.index("await fetchStatus();")
+    summary_render = resume_block.index("const _rs = _resumeSessionSummary || {};")
+    between = resume_block[status_refresh:summary_render]
+
+    assert "`${API_URL}/check-resume`" in between
+    assert "refreshedResume.can_resume" in between
+    assert "setResumeSessionSummary(refreshedResume);" in between
+    assert "throw new Error" in between
+
+
+def test_coin_prep_reload_restores_and_balance_caps_cat_topup_coin():
+    """The modal must not lose the saved CAT topup pool after a page reload."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    plan_start = html.index("function buildCoinPrepPlan({")
+    plan_end = html.index("function updateCoinPrepPreview()", plan_start)
+    plan_block = html[plan_start:plan_end]
+    assert "topupPoolCat" in plan_block
+    assert "topupPoolXch" in plan_block
+    assert "getWalletBalance('cat')" in plan_block
+    assert "_catBalanceResidual" in plan_block
+
+    preview_start = html.index("function updateCoinPrepPreview()")
+    preview_end = html.index("function setWarning", preview_start)
+    preview_block = html[preview_start:preview_end]
+    assert "topupPoolCat: parseFloat(document.getElementById('configTopupPoolCat')?.value) || 0" in preview_block
+
+    modal_start = html.index("function showCoinPrepConfirm(config")
+    modal_end = html.index("function closeCoinPrepConfirm()", modal_start)
+    modal_block = html[modal_start:modal_end]
+    assert "topupPoolCat: parseFloat(config.topup_pool_cat) || 0" in modal_block
+
+
+def test_coin_prep_preflight_verifies_prepared_buy_sizes_with_headroom():
+    """The wallet preflight must compare against the coins prep actually creates."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    check_start = html.index("async function checkIfCoinPrepNeeded(config)")
+    check_end = html.index("function showCoinPrepConfirm(config", check_start)
+    check_block = html[check_start:check_end]
+
+    assert "const preparedBuyXch = buyXch * prepFactor;" in check_block
+    assert "params.set(`${t}_xch`, String(preparedBuyXch));" in check_block
+    assert "const preparedSniperXch = sniperSize * prepFactor;" in check_block
+    assert "params.set('sniper_xch', String(preparedSniperXch));" in check_block
+    assert "const preparedFeeXch = feeSize * prepFactor;" in check_block
+    assert "params.set('fees_xch', String(preparedFeeXch));" in check_block
+    assert "const xch = Number(config[sizeKey(t)] || sellXch || 0);" not in check_block
+
+
 def test_desktop_bridge_covers_reset_routes_used_by_data_buttons():
     html = GUI.read_text(encoding="utf-8", errors="replace")
     bridge = APP_BRIDGE.read_text(encoding="utf-8", errors="replace")
@@ -297,6 +376,15 @@ def test_inventory_drift_advisor_uses_backend_position_percent():
     assert "Math.abs(netPos) > maxPos * 0.7" not in html
 
 
+def test_pnl_position_limit_uses_live_backend_value():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert 'id="invMaxPosition"' in html
+    assert 'id="invMaxPosition" style="font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">—</div>' in html
+    assert "data.max_position_xch !== undefined && el('invMaxPosition')" in html
+    assert "el('invMaxPosition').textContent = formatXchAmount(data.max_position_xch) + ' XCH';" in html
+
+
 def test_advisor_fill_rate_reads_dashboard_field_name():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
@@ -356,6 +444,19 @@ def test_logs_tab_has_run_doctor_button_wired_to_existing_modal():
     assert "async function runDoctorFromLogs" in html
     assert "await showDoctorReport();" in html
     assert "const resp = await apiFetch('/api/doctor?force=true');" in html
+
+
+def test_logs_tab_orders_api_backfill_and_polls_while_visible():
+    """A dropped SSE stream must not leave the operator log frozen."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "function orderSystemLogEntries(entries)" in html
+    assert "const orderedEntries = orderSystemLogEntries(entries);" in html
+    assert "_sysLogBuffer = orderedEntries" in html
+    assert "function startSystemLogBackfillPolling()" in html
+    assert "if (_v4CurrentView !== 'logs') return;" in html
+    assert "_systemLogBackfillPoll = setInterval" in html
+    assert "startSystemLogBackfillPolling();" in html
 
 
 def test_dashboard_has_active_toxicity_guard_notice():

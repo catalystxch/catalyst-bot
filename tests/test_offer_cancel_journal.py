@@ -267,6 +267,7 @@ def _seed_task7_created_offer(
     trade_id: str,
     coin_id: str,
     intent_seed: str,
+    expires_at: str | None = None,
 ) -> str:
     """Persist one Task 7 creation journal and its confirmed trade binding."""
 
@@ -324,6 +325,7 @@ def _seed_task7_created_offer(
         Decimal("1000"),
         ASSET_ID,
         tier="inner",
+        expires_at=expires_at,
         coin_id=coin_id,
     )
     return intent_id
@@ -3515,6 +3517,294 @@ def test_retry_failed_cancel_uses_durable_backoff(
     assert restarted_manager.retry_failed_cancels() == 0
     assert effects == [TRADE_ID, TRADE_ID]
     assert restarted_manager._pending_cancel_retries[TRADE_ID]["attempts"] == 2
+
+
+def test_retry_failed_cancel_reconciles_elapsed_offer_before_wallet_effect(
+    isolated_database,
+    monkeypatch,
+):
+    intent_id = _seed_task7_created_offer(
+        trade_id=TRADE_ID,
+        coin_id=COIN_ID,
+        intent_seed="retry-expired-before-effect",
+        expires_at="2026-08-16T11:59:00Z",
+    )
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={"success": False},
+        )
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=3,
+    )
+    manager = OfferManager()
+    manager._cancel_retry_backoff_seconds = 0
+    manager.cancel_offers([TRADE_ID], force_storm=True)
+
+    import offer_reconciliation
+
+    reconcile_calls = []
+
+    def reconcile(candidate_intent_id):
+        reconcile_calls.append(candidate_intent_id)
+        assert database.update_offer_status(TRADE_ID, "expired") is True
+        return {
+            "classification": offer_reconciliation.EXPIRED_PROVEN,
+            "applied": True,
+        }
+
+    monkeypatch.setattr(offer_reconciliation, "reconcile_offer", reconcile)
+    monkeypatch.setattr(
+        offer_manager.time,
+        "time",
+        lambda: datetime(2026, 8, 16, 12, 1, tzinfo=timezone.utc).timestamp(),
+    )
+
+    assert manager.retry_failed_cancels() == 0
+
+    assert effects == [TRADE_ID]
+    assert reconcile_calls == [intent_id]
+    assert manager.get_active_cancel_settlement_operation() is None
+
+
+def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
+    isolated_database,
+    monkeypatch,
+):
+    intent_id = _seed_task7_created_offer(
+        trade_id=TRADE_ID,
+        coin_id=COIN_ID,
+        intent_seed="retry-existing-terminal-authority",
+        expires_at="2026-08-16T11:59:00Z",
+    )
+    manager = OfferManager()
+    intent = manager._canonical_cancel_intent(TRADE_ID)
+    offer = database.get_offer(TRADE_ID)
+    replay_calls = []
+
+    monkeypatch.setattr(
+        database,
+        "get_offer_intent",
+        lambda candidate_intent_id: {
+            **database.get_offer_intent_by_trade_id(TRADE_ID),
+            "intent_id": candidate_intent_id,
+            "lifecycle_state": "terminal",
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "get_authoritative_terminal_record",
+        lambda trade_id: {
+            "intent_id": intent_id,
+            "operation_id": f"reconcile:{intent_id}",
+            "sage_trade_id": trade_id,
+            "outcome": "EXPIRED_PROVEN",
+            "terminal_state": "expired",
+        },
+    )
+
+    import offer_reconciliation
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda *args, **kwargs: replay_calls.append((args, kwargs)),
+    )
+
+    assert (
+        manager._reconcile_elapsed_cancel_retry(
+            intent,
+            offer,
+            now_timestamp=datetime(
+                2026, 8, 16, 12, 1, tzinfo=timezone.utc
+            ).timestamp(),
+        )
+        is True
+    )
+    assert replay_calls == []
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
+    isolated_database,
+    monkeypatch,
+):
+    intent_id = _seed_task7_created_offer(
+        trade_id=TRADE_ID,
+        coin_id=COIN_ID,
+        intent_seed="retry-submitted-settlement",
+    )
+    effects = []
+    active_operations = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        active_operations.append(manager.get_active_cancel_settlement_operation())
+        if len(effects) == 1:
+            return cancellation_result(
+                CANCEL_FAILED,
+                method="single_rpc",
+                raw_response={"success": False},
+            )
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True, "transaction_id": "e" * 64},
+            transaction_id="e" * 64,
+        )
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=6,
+    )
+    manager = OfferManager()
+    manager._cancel_retry_backoff_seconds = 0
+    manager.cancel_offers([TRADE_ID], force_storm=True)
+
+    import offer_reconciliation
+
+    reconcile_calls = []
+    release_calls = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: {"wallet": "complete"},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_derive_single_cancel_context",
+        lambda *_args, **_kwargs: {"members": [{"trade_id": TRADE_ID}]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kwargs: {
+            "classification": offer_reconciliation.CANCELLED_PROVEN,
+            "reason_code": "EXACT_CANCEL_RETURN_PROOF",
+        },
+    )
+
+    def reconcile(intent_id, **kwargs):
+        reconcile_calls.append((intent_id, kwargs))
+        return {
+            "classification": offer_reconciliation.CANCELLED_PROVEN,
+            "applied": True,
+        }
+
+    monkeypatch.setattr(offer_reconciliation, "reconcile_offer", reconcile)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda generation, operation_ids: (
+                release_calls.append((generation, operation_ids))
+                or {"released": True, "reason": "released"}
+            )
+        ),
+    )
+
+    assert manager.retry_failed_cancels() == 0
+
+    assert effects == [TRADE_ID, TRADE_ID]
+    assert active_operations == [None, OPERATION_ID]
+    assert manager.get_active_cancel_settlement_operation() is None
+    assert len(reconcile_calls) == 1
+    assert reconcile_calls[0][0] == intent_id
+    assert release_calls == [(1, [OPERATION_ID])]
+
+
+def test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven(
+    isolated_database,
+    monkeypatch,
+):
+    _seed_task7_created_offer(
+        trade_id=TRADE_ID,
+        coin_id=COIN_ID,
+        intent_seed="retry-submitted-not-proven",
+    )
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        if len(effects) == 1:
+            return cancellation_result(
+                CANCEL_FAILED,
+                method="single_rpc",
+                raw_response={"success": False},
+            )
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True, "transaction_id": "e" * 64},
+            transaction_id="e" * 64,
+        )
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=6,
+    )
+    manager = OfferManager()
+    manager._cancel_retry_backoff_seconds = 0
+    manager.cancel_offers([TRADE_ID], force_storm=True)
+
+    import offer_reconciliation
+
+    reconcile_calls = []
+    release_calls = []
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: {"wallet": "pending"},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_derive_single_cancel_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kwargs: {
+            "classification": offer_reconciliation.UNKNOWN,
+            "reason_code": "CANCEL_PROOF_INCOMPLETE",
+        },
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda *args, **kwargs: reconcile_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda generation, operation_ids: (
+                release_calls.append((generation, operation_ids))
+                or {"released": True, "reason": "released"}
+            )
+        ),
+    )
+
+    assert manager.retry_failed_cancels() == -1
+
+    assert effects == [TRADE_ID, TRADE_ID]
+    assert reconcile_calls == []
+    assert release_calls == []
+    blockers = database.get_unresolved_offer_operation_blockers()
+    assert [row["operation_id"] for row in blockers] == [OPERATION_ID]
 
 
 def test_retry_failed_cancel_race_has_one_new_wallet_effect(

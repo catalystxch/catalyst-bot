@@ -10063,7 +10063,7 @@
                         </div>
                         <div>
                             <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Position Limit <span class="cc-help">?<span class="cc-tooltip">Max position size before circuit breaker trips. Prevents excessive inventory in one direction.</span></span></div>
-                            <div id="invMaxPosition" style="font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">5.0 XCH</div>
+                            <div id="invMaxPosition" style="font-size: var(--text-xl); font-weight: 700; font-family: var(--font-mono); color: var(--text-primary);">—</div>
                         </div>
                     </div>
                     <!-- Position gauge bar -->
@@ -13248,9 +13248,23 @@
             if (viewName === 'dashboard' && typeof fetchDashboard === 'function') {
                 try { fetchDashboard(); } catch (_) {}
             }
-            // If switching to Logs, reset the unread-event counter badge.
-            if (viewName === 'logs' && typeof _resetLogsUnread === 'function') {
-                _resetLogsUnread();
+            // If switching to Logs, refresh immediately so a buffer restored
+            // while the view was hidden cannot repaint stale startup entries.
+            if (viewName === 'logs') {
+                if (typeof _resetLogsUnread === 'function') {
+                    _resetLogsUnread();
+                }
+                if (typeof loadInitialSystemLogs === 'function') {
+                    await loadInitialSystemLogs();
+                }
+                // Entering the Logs view is an explicit request to inspect
+                // current activity. Reveal the newest entry after the hidden
+                // panel has been laid out; _renderSysLog still preserves the
+                // user's position while they remain on this tab.
+                requestAnimationFrame(() => {
+                    const logPanel = document.getElementById('logsContainer');
+                    if (logPanel) logPanel.scrollTop = logPanel.scrollHeight;
+                });
             }
             // When returning to any view that owns canvas charts, re-render
             // them immediately so they pick up the correct container width.
@@ -13797,6 +13811,10 @@
         // -----------------------------------------------------------------
         const _v4PnlHistory = [];
         let _v4LastPnlSignature = '';
+        function v4ResetPnlHistory() {
+            _v4PnlHistory.length = 0;
+            _v4LastPnlSignature = '';
+        }
         function v4AddPnlPoint(pnlValue, meta = {}) {
             const numericValue = Number(pnlValue || 0);
             const signature = numericValue.toFixed(8) + '|' +
@@ -14807,6 +14825,8 @@
             const hasDexie = Number(pricing.bid || 0) > 0 || Number(pricing.ask || 0) > 0;
             const amm = (typeof _lastAmmPriceData !== 'undefined' && _lastAmmPriceData) || {};
             const summary = (typeof _lastMarketSummary !== 'undefined' && _lastMarketSummary) || {};
+            const tibetOutage = summary.tibet_available === false
+                && summary.tibet_reason === 'provider_outage';
             const summaryTibetXch = Number(summary.pool_xch || 0);
             const hasTibet = Number(pricing.tibet_price || 0) > 0
                 || String(pricing.source || '').toLowerCase() === 'tibetswap'
@@ -14819,10 +14839,15 @@
             const sageOk = healthText.indexOf('error') === -1 && healthText.indexOf('offline') === -1;
             const spacescan = data.diagnostics && data.diagnostics.spacescan_enabled !== false;
             _diagPill('coverageDexie', hasDexie, hasDexie ? 'ready' : 'thin');
-            _diagPill('coverageTibet', hasTibet, hasTibet ? 'ready' : 'none');
+            _diagPill('coverageTibet', hasTibet && !tibetOutage, tibetOutage ? 'outage' : (hasTibet ? 'ready' : 'none'));
             _diagPill('coverageSpacescan', spacescan, spacescan ? 'enabled' : 'limited');
             _diagPill('coverageSage', sageOk, sageOk ? 'ready' : 'check');
 
+            if (tibetOutage) {
+                _diagText('intelArbGapTrend', 'Unavailable');
+                _diagText('intelArbGapTrendSub', 'TibetSwap outage — Dexie-only');
+                return;
+            }
             const gap = Number(data.arb_gap_bps || 0);
             _diagText('intelArbGapTrend', gap > 0 ? (gap / 100).toFixed(2) + '%' : '0.00%');
             _diagText('intelArbGapTrendSub', gap >= 500 ? 'shock-risk range' : gap >= 200 ? 'sniper watch' : 'normal watch');
@@ -18130,7 +18155,7 @@
             return true;
         }
 
-        function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '') {
+        function mergeVerifiedWalletBalances(incomingBalances = {}, assetId = '', options = {}) {
             const activeAssetId = String(
                 assetId
                 || currentCAT?.asset_id
@@ -18149,7 +18174,10 @@
             if (cacheMatches) {
                 for (const sideName of ['xch', 'cat']) {
                     const cachedSide = cached.balances?.[sideName] || {};
-                    if (!live[sideName] && cached.live?.[sideName]) {
+                    const transientStatusZero = options.preserveVerifiedOnZero
+                        && !_walletBalanceSideHasValue(merged[sideName])
+                        && _walletBalanceSideHasValue(cachedSide);
+                    if ((!live[sideName] || transientStatusZero) && cached.live?.[sideName]) {
                         merged[sideName] = { ...cachedSide };
                         live[sideName] = true;
                     }
@@ -18807,7 +18835,11 @@
         function canAttemptBotStart() {
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const hasPair = !!pair.selected;
-            return isSettingsReviewedForCurrentPair() && hasPair && coinPrepStatus !== 'none' && coinPrepStatus !== 'checking';
+            const restoredBookIsPrepared = hasResumedLiveBook();
+            return isSettingsReviewedForCurrentPair()
+                && hasPair
+                && coinPrepStatus !== 'checking'
+                && (coinPrepStatus !== 'none' || restoredBookIsPrepared);
         }
 
         function _getPairFromSelector(selectorId = 'catSelector') {
@@ -19064,13 +19096,14 @@
             let coinPrepDetail = pair.selected
                 ? 'Save settings to verify coin sizes for this pair.'
                 : 'Choose a trading pair first, then verify coin prep.';
+            const restoredBookIsPrepared = hasResumedLiveBook();
             if (coinPrepStatus === 'done') {
                 coinPrepState = 'ready';
                 coinPrepDetail = 'Prepared coin sizes look ready for trading.';
             } else if (coinPrepStatus === 'checking') {
                 coinPrepState = 'pending';
                 coinPrepDetail = 'Checking wallet coin sizes now...';
-            } else if (coinPrepStatus === 'skipped-safe') {
+            } else if (coinPrepStatus === 'skipped-safe' || restoredBookIsPrepared) {
                 coinPrepState = 'ready';
                 coinPrepDetail = _resumeSessionSummary
                     ? 'Existing live offers are already using prepared coins. Coin prep does not need to run again to resume this session.'
@@ -19082,7 +19115,13 @@
             setStartupStepState('startupStepCoinPrep', coinPrepState, coinPrepDetail);
 
             const startReady = !!(data && data.running)
-                || (walletReachable && pair.selected && settingsReviewed && (coinPrepStatus === 'done' || coinPrepStatus === 'skipped-safe'));
+                || (
+                    walletReachable
+                    && pair.selected
+                    && settingsReviewed
+                    && coinPrepStatus !== 'checking'
+                    && (coinPrepStatus === 'done' || coinPrepStatus === 'skipped-safe' || restoredBookIsPrepared)
+                );
             let startState = 'pending';
             let startDetail = 'Complete the steps above to enable Start Bot.';
             if (data && data.running) {
@@ -20484,7 +20523,12 @@
             const el = document.getElementById(id);
             if (!el) return null;
             if (el.type === 'checkbox') return el.checked ? '1' : '0';
-            return String(el.value || '');
+            const raw = String(el.value ?? '');
+            if (el.type === 'number' && raw.trim() !== '') {
+                const numeric = Number(raw);
+                if (Number.isFinite(numeric)) return String(numeric);
+            }
+            return raw;
         }
 
         function snapshotSmartSettingsWatched() {
@@ -21652,7 +21696,9 @@
             sniperCount,
             feePoolEnabled,
             feeCoinSize,
-            feeCount
+            feeCount,
+            topupPoolXch,
+            topupPoolCat
         }) {
             const modeState = getLiquidityModeState(liquidityMode);
             const buySideActive = modeState.buyActive;
@@ -21874,7 +21920,8 @@
                 // estimate; back-filling here ensures the freed-up XCH shows
                 // in the topup line rather than silently disappearing from the
                 // total. Falls back to the server value when balance is unknown.
-                const _topupBufferXchRaw = Number(window._topupBufferXch || 0);
+                const _topupBufferXchRaw = Number(
+                    topupPoolXch ?? window._topupBufferXch ?? 0);
                 let _topupBufferXch = _topupBufferXchRaw;
                 // F66: compute topup as residual so Total always equals wallet
                 // balance. Use _smartXchBalance (set by Smart Settings run) or
@@ -21904,7 +21951,32 @@
                         _smartXchBal - _reserveForTopup - plan.totalXchForCoinPrep - _safetyMarginXch);
                 }
                 if (!buySideActive) _topupBufferXch = 0;
-                const _topupBufferCat = sellSideActive ? Number(window._topupBufferCat || 0) : 0;
+                const _topupBufferCatRaw = Number(
+                    topupPoolCat ?? window._topupBufferCat ?? 0);
+                let _topupBufferCat = sellSideActive ? _topupBufferCatRaw : 0;
+                // Mirror the XCH residual policy for CAT. On reload the
+                // Smart Settings cache is empty even though TOPUP_POOL_CAT
+                // is saved, and the saved budget can exceed the current
+                // residual after headroom rounding or price drift. Prefer
+                // the pair-bound live balance and cap to exact CAT mojos so
+                // the preview includes the change/topup output without ever
+                // advertising a plan larger than the wallet.
+                const _effectiveCatBal = Number(
+                    typeof getWalletBalance === 'function'
+                        ? getWalletBalance('cat')
+                        : (bot_state?.balances?.cat?.total || 0)
+                );
+                if (sellSideActive && _effectiveCatBal > 0) {
+                    const _reserveForCatTopup = parseFloat(
+                        document.getElementById('configCatReserve')?.value) || 0;
+                    const _catDecimals = Math.max(0, Math.min(12,
+                        parseInt(currentCAT?.decimals ?? 3, 10) || 0));
+                    const _catScale = 10 ** _catDecimals;
+                    const _catBalanceResidual = Math.max(0,
+                        _effectiveCatBal - _reserveForCatTopup - plan.totalCatForCoinPrep);
+                    _topupBufferCat = Math.floor(
+                        (_catBalanceResidual + Number.EPSILON) * _catScale) / _catScale;
+                }
                 if (_topupBufferXch > 0 || _topupBufferCat > 0) {
                     plan.tierSequence.push('topup');
                     plan.offerTierSizesXch.topup = _topupBufferXch;
@@ -22515,6 +22587,8 @@
                 sniperEnabled: document.getElementById('configSniperEnabled')?.checked || false,
                 sniperSize: parseFloat(document.getElementById('configSniperSizeXch')?.value) || 0,
                 sniperCount: parseInt(document.getElementById('configSniperPrepCount')?.value) || 0,
+                topupPoolXch: parseFloat(document.getElementById('configTopupPoolXch')?.value) || 0,
+                topupPoolCat: parseFloat(document.getElementById('configTopupPoolCat')?.value) || 0,
                 ...getFeeOptionsFromInputs()
             });
 
@@ -23409,6 +23483,14 @@
             const name = selectedOption.getAttribute('data-name');
             const decimals = parseInt(selectedOption.getAttribute('data-decimals') || '3');
             const previousCAT = currentCAT ? { ...currentCAT } : {};
+            // Re-confirming the server's persisted pair after reconnect is not
+            // a cross-pair switch. Keep its saved sizing visible for explicit
+            // review; an actual new pair (or an explicit Start Fresh flow,
+            // where _resumeHandled is already true) must still start blank.
+            const reselectingPersistedPair = !!(
+                previousCAT.asset_id === assetId
+                || (!_resumeHandled && _resumeCandidateCAT?.asset_id === assetId)
+            );
             const switchStartedAt = Date.now();
             _catSwitchInProgress = true;
             _catSwitchTargetAssetId = assetId;
@@ -23458,7 +23540,7 @@
                     try {
                         if (typeof _v4PriceHistory !== 'undefined') _v4PriceHistory.length = 0;
                         if (typeof _v4InventoryHistory !== 'undefined') _v4InventoryHistory.length = 0;
-                        if (typeof _v4PnlHistory !== 'undefined') _v4PnlHistory.length = 0;
+                        v4ResetPnlHistory();
                         if (typeof _v4LastPriceSample !== 'undefined') _v4LastPriceSample = 0;
                         if (typeof _v4LastInvSample !== 'undefined') _v4LastInvSample = 0;
                         window._v4LastOrderbookBuys = [];
@@ -23477,11 +23559,10 @@
                     updateStartupChecklist(bot_state);
                     clearPairScopedDashboardState(name);
 
-                    // New pair selected — reset session state for the new pair.
-                    // This ensures trading-size fields (Smart Defaults output) are blank
-                    // on next settings open rather than showing the previous pair's values.
-                    // Also clears coin prep so the check runs for the new pair's coin sizes.
-                    setFreshStartTemplateState(true);
+                    // A genuine pair switch starts with blank market-derived
+                    // fields. Re-confirming the exact persisted pair reloads
+                    // its saved values, while still requiring review below.
+                    setFreshStartTemplateState(!reselectingPersistedPair);
                     setSettingsReviewedState(false);
                     setCoinPrepStatus('none');
                     userHasSavedSettings = false;
@@ -23578,10 +23659,35 @@
         let _marketSummaryTimer = null;
         let _lastMarketSummary = null;
 
+        function renderMarketSummaryVenueState(data = {}) {
+            _lastMarketSummary = data;
+            const tibetOutage = data.tibet_available === false
+                && data.tibet_reason === 'provider_outage';
+            if (!tibetOutage) return false;
+
+            const tibetDepthEl = document.getElementById('mktTibetDepth');
+            const gapEl = document.getElementById('mktArbGap');
+            const gapSub = document.getElementById('mktArbSub');
+            const lcGapVal = document.getElementById('lcGapValue');
+            if (tibetDepthEl) tibetDepthEl.textContent = 'Tibet: unavailable';
+            if (gapEl) {
+                gapEl.textContent = 'Unavailable';
+                gapEl.style.color = 'var(--status-warning)';
+            }
+            if (gapSub) gapSub.textContent = 'TibetSwap outage — Dexie-only';
+            if (lcGapVal) lcGapVal.textContent = '—';
+            _latestFastArbGapBps = null;
+            return true;
+        }
+
         async function fetchMarketSummary() {
             if (isWalletSwitchBusy()) return;
+            const hasActiveMarketPair = !!(
+                (currentCAT && currentCAT.asset_id)
+                || (bot_state && bot_state.running && bot_state.current_cat && bot_state.current_cat.asset_id)
+            );
             // No trading pair selected — show friendly prompt instead of calling API
-            if (!currentCAT || !currentCAT.asset_id) {
+            if (!hasActiveMarketPair) {
                 _lastMarketSummary = null;
                 const noPairMsg = 'Select pair';
                 const noPairColor = 'rgba(255,255,255,0.3)';
@@ -23619,6 +23725,7 @@
                     var el = document.getElementById(id);
                     if (el) { el.style.fontSize = ''; el.style.color = ''; }
                 });
+                const tibetOutage = renderMarketSummaryVenueState(d);
 
                 // Best Bid / Ask
                 const bidEl = document.getElementById('mktBestBid');
@@ -23643,13 +23750,13 @@
                     const totalXch = tibetXch + dexieXch;
                     poolEl.textContent = totalXch > 0 ? totalXch.toFixed(1) + ' XCH' : '—';
                     if (dexieDepthEl) dexieDepthEl.textContent = 'Dexie: ' + (dexieXch > 0 ? dexieXch.toFixed(1) : '0');
-                    if (tibetDepthEl) tibetDepthEl.textContent = 'Tibet: ' + (tibetXch > 0 ? tibetXch.toFixed(1) : '0');
+                    if (tibetDepthEl && !tibetOutage) tibetDepthEl.textContent = 'Tibet: ' + (tibetXch > 0 ? tibetXch.toFixed(1) : '0');
                 }
 
                 // Arb Gap
                 const gapEl = document.getElementById('mktArbGap');
                 const gapSub = document.getElementById('mktArbSub');
-                if (gapEl) {
+                if (gapEl && !tibetOutage) {
                     const g = parseFloat(d.arb_gap_bps) || 0;
                     _latestFastArbGapBps = g;
                     if (!bot_state) bot_state = {};
@@ -23660,7 +23767,7 @@
                     const lcGapVal = document.getElementById('lcGapValue');
                     if (lcGapVal) lcGapVal.textContent = g > 0 ? (g / 100).toFixed(2) + '%' : '—';
                 }
-                if (gapSub) {
+                if (gapSub && !tibetOutage) {
                     const g = parseFloat(d.arb_gap_bps) || 0;
                     if (g > 0) {
                         if (g > 200) gapSub.textContent = 'Sniper opportunity';
@@ -23672,7 +23779,7 @@
                 }
 
                 mergeLiveMarketHealthMetrics({
-                    arb_gap_bps: d.arb_gap_bps,
+                    ...(tibetOutage ? {} : { arb_gap_bps: d.arb_gap_bps }),
                     best_bid: d.best_bid,
                     best_ask: d.best_ask,
                 }, {
@@ -23682,7 +23789,7 @@
 
                 // Also update hero mid price if not being updated by bot state
                 // (but don't override "Select pair" message when no pair is chosen)
-                if (d.mid_price > 0 && currentCAT && currentCAT.asset_id) {
+                if (d.mid_price > 0 && hasActiveMarketPair) {
                     const heroMid = document.getElementById('heroMidPrice');
                     if (heroMid && (heroMid.textContent === '—' || heroMid.textContent === '0.00000000' || heroMid.textContent === 'Loading...')) {
                         heroMid.textContent = fmtPrice(d.mid_price);
@@ -23977,7 +24084,8 @@
                 if (data.balances) {
                     data.balances = mergeVerifiedWalletBalances(
                         data.balances,
-                        data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                        data?.current_cat?.asset_id || currentCAT?.asset_id || '',
+                        { preserveVerifiedOnZero: true }
                     );
                 }
                 bot_state = data;
@@ -24054,6 +24162,7 @@
                         // is first hydrated via the status poll (no pair-
                         // selector event fires to drive the snapshot).
                         try { updateTokenSnapshot(currentCAT); } catch (_) {}
+                        try { fetchMarketSummary(); } catch (_) {}
                         
                         // Auto-sync dropdown if server has an active CAT but dropdown isn't set
                         const selector = document.getElementById('catSelector');
@@ -24161,6 +24270,9 @@
 
             // Status badge — handle running, stopped, blocked, and starting states
             const isRunning = data.running;
+            if (isRunning) {
+                dismissStartupOverlaysForRunningBot();
+            }
             const botStatus = data.status || (isRunning ? 'running' : 'stopped');
             let badgeText = isRunning ? '● Running' : '◯ Stopped';
             let badgeClass = isRunning ? 'status-running' : 'status-stopped';
@@ -25600,30 +25712,54 @@
             // Also fetch slippage data
             apiFetch('/api/market/slippage?amount=1&side=buy')
                 .then(r => r.json())
-                .then(data => {
-                    const el = id => document.getElementById(id);
-                    if (data.slippage_bps) {
-                        const slipBps = parseFloat(data.slippage_bps);
-                        el('intelSlippage').textContent = bps2pct(slipBps);
-                        el('intelSlippage').style.color = slipBps < 50 ? 'var(--status-success)' : slipBps < 200 ? 'var(--status-warning)' : 'var(--status-danger)';
-                    }
-                    if (data.pool_depth_xch) {
-                        const depth = parseFloat(data.pool_depth_xch);
-                        const ratio = 1 / depth * 100;
-                        el('intelPoolRatio').textContent = ratio.toFixed(2) + '%';
-                        el('intelPoolRatio').style.color = ratio < 1 ? 'var(--status-success)' : ratio < 5 ? 'var(--status-warning)' : 'var(--status-danger)';
-                        if (el('intelTibetContext')) {
-                            const slipBps = parseFloat(data.slippage_bps || 0) || 0;
-                            const slipText = slipBps > 0 ? bps2pct(slipBps) + ' estimated slippage' : 'slippage unavailable';
-                            el('intelTibetContext').textContent =
-                                'Pool depth ' + depth.toFixed(2) + ' XCH. A 1 XCH test trade is ' +
-                                ratio.toFixed(2) + '% of pool depth with ' + slipText + '.';
-                        }
-                    } else if (el('intelTibetContext')) {
-                        el('intelTibetContext').textContent = 'No TibetSwap pool depth available for this pair yet.';
-                    }
-                })
+                .then(data => renderTibetSlippageContext(data))
                 .catch(() => {});
+        }
+
+        function renderTibetSlippageContext(data = {}) {
+            const el = id => document.getElementById(id);
+            const slippageEl = el('intelSlippage');
+            const poolRatioEl = el('intelPoolRatio');
+            const contextEl = el('intelTibetContext');
+
+            if (data.reason === 'provider_outage') {
+                if (slippageEl) {
+                    slippageEl.textContent = 'Unavailable';
+                    slippageEl.style.color = 'var(--status-warning)';
+                }
+                if (poolRatioEl) {
+                    poolRatioEl.textContent = 'Unavailable';
+                    poolRatioEl.style.color = 'var(--status-warning)';
+                }
+                if (contextEl) {
+                    contextEl.textContent = data.message ||
+                        'TibetSwap outage: pool depth and slippage are unavailable. CATalyst is using Dexie-only pricing; AMM drift protection is unavailable.';
+                }
+                return;
+            }
+
+            if (data.slippage_bps && slippageEl) {
+                const slipBps = parseFloat(data.slippage_bps);
+                slippageEl.textContent = bps2pct(slipBps);
+                slippageEl.style.color = slipBps < 50 ? 'var(--status-success)' : slipBps < 200 ? 'var(--status-warning)' : 'var(--status-danger)';
+            }
+            if (data.pool_depth_xch) {
+                const depth = parseFloat(data.pool_depth_xch);
+                const ratio = 1 / depth * 100;
+                if (poolRatioEl) {
+                    poolRatioEl.textContent = ratio.toFixed(2) + '%';
+                    poolRatioEl.style.color = ratio < 1 ? 'var(--status-success)' : ratio < 5 ? 'var(--status-warning)' : 'var(--status-danger)';
+                }
+                if (contextEl) {
+                    const slipBps = parseFloat(data.slippage_bps || 0) || 0;
+                    const slipText = slipBps > 0 ? bps2pct(slipBps) + ' estimated slippage' : 'slippage unavailable';
+                    contextEl.textContent =
+                        'Pool depth ' + depth.toFixed(2) + ' XCH. A 1 XCH test trade is ' +
+                        ratio.toFixed(2) + '% of pool depth with ' + slipText + '.';
+                }
+            } else if (contextEl) {
+                contextEl.textContent = 'No TibetSwap pool depth available for this pair yet.';
+            }
         }
 
         async function toggleSplashListening() {
@@ -25851,6 +25987,9 @@
 
             if (data.net_position_cat !== undefined && el('invNetPosition')) {
                 el('invNetPosition').textContent = parseFloat(data.net_position_cat || 0).toFixed(2);
+            }
+            if (data.max_position_xch !== undefined && el('invMaxPosition')) {
+                el('invMaxPosition').textContent = formatXchAmount(data.max_position_xch) + ' XCH';
             }
             if (sniperStats) {
                 if (el('sniperTotal')) el('sniperTotal').textContent = sniperStats.total_snipes || 0;
@@ -26995,16 +27134,33 @@
                     compEl.style.opacity = '1';
                 }
             }
-            if (m.arb_gap_bps !== undefined) {
-                const arbEl = el('ccArbGap');
+            const tibetSwapOutage = (
+                m.tibetswap_available === false
+                && String(m.pricing_mode || '').toLowerCase() === 'dexie_only'
+            );
+            const arbEl = el('ccArbGap');
+            const poolDepthEl = el('ccPoolDepth');
+            if (tibetSwapOutage) {
+                arbEl.textContent = 'Unavailable';
+                arbEl.title = 'TibetSwap outage — Dexie-only pricing';
+                arbEl.style.color = 'var(--status-warning)';
+                arbEl.style.opacity = '1';
+                poolDepthEl.textContent = 'Unavailable';
+                poolDepthEl.title = 'TibetSwap outage — pool depth unavailable';
+                poolDepthEl.style.color = 'var(--status-warning)';
+                poolDepthEl.style.opacity = '1';
+            } else if (m.arb_gap_bps !== undefined) {
                 const arbVal = parseFloat(m.arb_gap_bps);
                 arbEl.textContent = bps2pct(m.arb_gap_bps);
+                arbEl.title = '';
                 arbEl.style.color = arbVal > 200 ? 'var(--status-warning)' : 'var(--slate-200)';
                 arbEl.style.opacity = '1';
             }
-            if (m.pool_depth_ratio !== undefined) {
-                el('ccPoolDepth').textContent = (parseFloat(m.pool_depth_ratio) * 100).toFixed(2) + '%';
-                el('ccPoolDepth').style.opacity = '1';
+            if (!tibetSwapOutage && m.pool_depth_ratio !== undefined) {
+                poolDepthEl.textContent = (parseFloat(m.pool_depth_ratio) * 100).toFixed(2) + '%';
+                poolDepthEl.title = '';
+                poolDepthEl.style.color = '';
+                poolDepthEl.style.opacity = '1';
             }
 
             // --- New metrics ---
@@ -27200,6 +27356,46 @@
             }
         }
 
+        function mergeStatusRiskIntoDashboard(data = {}, dashboard = {}) {
+            const risk = data.risk || {};
+            dashboard.performance = dashboard.performance || {};
+            dashboard.market_health = dashboard.market_health || {
+                status: 'green',
+                message: 'Live update pending',
+                conditions: [],
+                metrics: {},
+            };
+            const metrics = dashboard.market_health.metrics =
+                dashboard.market_health.metrics || {};
+
+            const rawPosition = risk.net_position_cat;
+            const position = Number(rawPosition);
+            if (rawPosition !== undefined && rawPosition !== null && Number.isFinite(position)) {
+                dashboard.performance.net_position = rawPosition;
+                dashboard.performance.net_position_cat = rawPosition;
+                metrics.net_position_cat = rawPosition;
+
+                const midPrice = Number(data?.pricing?.mid);
+                const maxPositionXch = Number(
+                    risk.max_position_xch
+                    ?? dashboard?.settings?.inventory?.max_position_xch
+                );
+                if (midPrice > 0 && maxPositionXch > 0) {
+                    metrics.position_pct =
+                        (Math.abs(position * midPrice) / maxPositionXch) * 100;
+                }
+            }
+
+            if (risk.pool_depth_ratio !== undefined && risk.pool_depth_ratio !== null) {
+                metrics.pool_depth_ratio = risk.pool_depth_ratio;
+            }
+            if (risk.circuit_breaker_active !== undefined) {
+                metrics.circuit_breaker_active = !!risk.circuit_breaker_active;
+                metrics.circuit_breaker_reason = risk.circuit_breaker_reason || '';
+            }
+            return dashboard;
+        }
+
         function syncCommandCentreFromStatus(data) {
             if (!data) return;
 
@@ -27223,7 +27419,8 @@
             if (data.balances) {
                 const statusBalances = mergeVerifiedWalletBalances(
                     data.balances,
-                    data?.current_cat?.asset_id || currentCAT?.asset_id || ''
+                    data?.current_cat?.asset_id || currentCAT?.asset_id || '',
+                    { preserveVerifiedOnZero: true }
                 );
                 _dashboardData.wallet = {
                     ...(_dashboardData.wallet || {}),
@@ -27280,6 +27477,7 @@
             if (data.arb_gap_bps !== undefined) {
                 health.metrics.arb_gap_bps = data.arb_gap_bps;
             }
+            mergeStatusRiskIntoDashboard(data, _dashboardData);
 
             ensureFiatPricesFromDashboard('status sync');
             updateCommandCentre(_dashboardData);
@@ -29720,6 +29918,28 @@
         const _sysLogPage = 200;  // Entries shown per page
         let _sysLogBuffer = [];   // All buffered entries (oldest→newest)
         let _sysLogShowing = _sysLogPage;  // How many currently visible
+        let _systemLogBackfillPoll = null;
+
+        function parseSystemLogTimestamp(value) {
+            const text = String(value || '').trim();
+            if (!text) return NaN;
+            const hasZone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(text);
+            const normalized = text.includes('T')
+                ? text
+                : text.replace(' ', 'T') + (hasZone ? '' : 'Z');
+            return Date.parse(normalized);
+        }
+
+        function orderSystemLogEntries(entries) {
+            return entries.slice().sort((left, right) => {
+                const leftTime = parseSystemLogTimestamp(left && left.timestamp);
+                const rightTime = parseSystemLogTimestamp(right && right.timestamp);
+                if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+                    return leftTime - rightTime;
+                }
+                return Number(left && left.id || 0) - Number(right && right.id || 0);
+            });
+        }
 
         function addLogEntry(severity, message, source = '') {
             // Buffer the entry
@@ -29848,11 +30068,13 @@
                 const entries = Array.isArray(data.logs) ? data.logs : [];
                 if (!entries.length) return;
 
-                _sysLogBuffer = entries
+                const orderedEntries = orderSystemLogEntries(entries);
+                _sysLogBuffer = orderedEntries
                     .filter((entry) => shouldShowSystemLogEvent(entry.severity, entry.event_type))
                     .map((entry) => {
-                    const ts = entry.timestamp ? new Date(entry.timestamp) : null;
-                    const time = ts && !Number.isNaN(ts.getTime())
+                    const parsedTimestamp = parseSystemLogTimestamp(entry.timestamp);
+                    const ts = Number.isFinite(parsedTimestamp) ? new Date(parsedTimestamp) : null;
+                    const time = ts
                         ? ts.toLocaleTimeString()
                         : new Date().toLocaleTimeString();
                     const severity = String(entry.severity || 'info');
@@ -29871,6 +30093,14 @@
             } catch (error) {
                 debugWarn('[LOGS] Could not load recent session logs:', error);
             }
+        }
+
+        function startSystemLogBackfillPolling() {
+            if (_systemLogBackfillPoll) return;
+            _systemLogBackfillPoll = setInterval(() => {
+                if (_v4CurrentView !== 'logs') return;
+                loadInitialSystemLogs();
+            }, 15000);
         }
 
         // Start SSE connection on page load
@@ -30889,7 +31119,13 @@
                             debugWarn('[RESUME] Failed to auto-start fresh session on no-resume path:', resetErr);
                         }
                         clearResumeSessionSummary();
-                        setFreshStartTemplateState(true);
+                        const assetId = currentCAT?.asset_id || '';
+                        const reselectingPersistedPair = !!(
+                            assetId
+                            && !_resumeHandled
+                            && _resumeCandidateCAT?.asset_id === assetId
+                        );
+                        setFreshStartTemplateState(!reselectingPersistedPair);
                     }
                     debugLog('[RESUME] No session to resume:', data.reason || 'no offers');
                     return false;
@@ -31103,6 +31339,27 @@
                 progressBar.style.width = '70%';
                 await fetchStatus();
 
+                // An idle status refresh may require explicit pair selection and
+                // clear the in-memory resume summary. Re-read the authoritative
+                // live book before enabling Start Bot so the confirmation cannot
+                // show zero offers or stale settings for an active ladder.
+                const refreshedResumeResponse = await apiFetch(`${API_URL}/check-resume`, {
+                    cache: 'no-store'
+                });
+                const refreshedResume = await refreshedResumeResponse.json();
+                const expectedResumeAssetId = resumeCat?.asset_id || currentCAT?.asset_id || '';
+                const refreshedResumeAssetId = refreshedResume?.active_cat?.asset_id || '';
+                if (
+                    !refreshedResumeResponse.ok
+                    || !refreshedResume.can_resume
+                    || !expectedResumeAssetId
+                    || refreshedResumeAssetId !== expectedResumeAssetId
+                ) {
+                    throw new Error('Existing live offers could not be revalidated safely.');
+                }
+                setResumeSessionSummary(refreshedResume);
+                syncResumePairIntoSelectors(refreshedResume.active_cat);
+
                 // Step 5: Done — dismiss the modal and hand control back to Quick Start
                 progressBar.style.width = '100%';
                 statusEl.textContent = 'Session restored!';
@@ -31290,7 +31547,7 @@
             }
 
             // Block if settings haven't been saved yet (no coin prep check has run)
-            if (coinPrepStatus === 'none') {
+            if (coinPrepStatus === 'none' && !hasResumedLiveBook()) {
                 showToast('Please save your settings first — coin preparation needs to be checked.', 'warning');
                 return;
             }
@@ -34127,19 +34384,19 @@ function closeCtgErrorModal() {
                     for (const t of tiers) {
                         const buyXch = Number(config[`buy_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const sellXch = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
+                        const preparedBuyXch = buyXch * prepFactor;
                         const buyCnt = parseInt(config[`buy_${t}_tier_count`] || config[countKey(t)] || 0);
                         const sellCnt = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
                         const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
                         if (liquidityMode === 'buy_only') {
-                            if (buyXch > 0) params.set(`${t}_xch`, String(buyXch));
+                            if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
                             if (buyCnt > 0) params.set(`${t}_count`, String(buyCnt));
                         } else if (liquidityMode === 'sell_only') {
                             if (sellCatSize > 0) params.set(`${t}_cat`, String(sellCatSize * prepFactor));
                             if (sellCnt > 0) params.set(`${t}_count`, String(sellCnt));
                         } else {
-                            const xch = Number(config[sizeKey(t)] || sellXch || 0);
                             const cnt = parseInt(config[countKey(t)] || sellCnt || 0);
-                            if (xch > 0) params.set(`${t}_xch`, String(xch));
+                            if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
                             if (cnt > 0) params.set(`${t}_count`, String(cnt));
                             if (sellCatSize > 0) {
                                 params.set(`${t}_cat`, String(sellCatSize * prepFactor));
@@ -34148,14 +34405,16 @@ function closeCtgErrorModal() {
                     }
                     const sniperSize = Number(config.sniper_size_xch || 0);
                     const sniperCount = parseInt(config.sniper_prep_count || 0);
+                    const preparedSniperXch = sniperSize * prepFactor;
                     if (liquidityMode === 'two_sided' && config.sniper_enabled && sniperSize > 0 && sniperCount > 0) {
-                        params.set('sniper_xch', String(sniperSize));
+                        params.set('sniper_xch', String(preparedSniperXch));
                         params.set('sniper_count', String(sniperCount));
                     }
                     const feeSize = Number(config.fee_coin_size_xch || 0);
                     const feeCount = parseInt(config.fee_prep_count || 0);
+                    const preparedFeeXch = feeSize * prepFactor;
                     if (feeSize > 0 && feeCount > 0) {
-                        params.set('fees_xch', String(feeSize));
+                        params.set('fees_xch', String(preparedFeeXch));
                         params.set('fees_count', String(feeCount));
                     }
                 } else {
@@ -34280,6 +34539,8 @@ function closeCtgErrorModal() {
                 sniperEnabled: !!config.sniper_enabled,
                 sniperSize: parseFloat(config.sniper_size_xch) || 0,
                 sniperCount: parseInt(config.sniper_prep_count) || 0,
+                topupPoolXch: parseFloat(config.topup_pool_xch) || 0,
+                topupPoolCat: parseFloat(config.topup_pool_cat) || 0,
                 ...getFeeOptionsFromConfig(config)
             });
 
@@ -35246,14 +35507,22 @@ function updateAmmStatusBar(data) {
         bar.classList.add('is-loading');
         const placeholder = document.getElementById('ammPlaceholder');
         if (placeholder) {
-            // Distinguish "no pool exists" from "fetching" — the former is
-            // a permanent state for tokens with no TibetSwap listing.
-            placeholder.firstChild && (placeholder.firstChild.nodeValue =
-                (data && data.reason === 'no_pool')
-                    ? 'No TibetSwap pool for this token'
-                    : 'Gathering TibetSwap pool data');
+            const noPool = data && data.reason === 'no_pool';
+            const monitorInactive = data
+                && !String(data.pair_id || '').trim()
+                && Number(data.total_polls || 0) === 0;
+            const fetchUnavailable = data
+                && (Boolean(data.error) || Number(data.failed_polls || 0) > 0);
+            const placeholderText = noPool
+                ? 'No TibetSwap pool for this token'
+                : fetchUnavailable
+                    ? 'TibetSwap data unavailable'
+                    : monitorInactive
+                        ? 'TibetSwap monitor inactive'
+                        : 'Gathering TibetSwap pool data';
+            placeholder.firstChild && (placeholder.firstChild.nodeValue = placeholderText);
             const dots = placeholder.querySelector('.v4-data-strip-placeholder-dots');
-            if (dots) dots.style.display = (data && data.reason === 'no_pool') ? 'none' : '';
+            if (dots) dots.style.display = placeholderText === 'Gathering TibetSwap pool data' ? '' : 'none';
         }
         return;
     }
@@ -36105,6 +36374,31 @@ async function startupDismiss(skipPrompt = false) {
 
 // Original dismiss (skips Splash gate — used when Splash gate completes)
 let _startupGatesComplete = false;
+function dismissStartupOverlaysForRunningBot() {
+    // Another trusted local client may resume the existing bot while this
+    // window is still inside the startup wizard. The normal page-load probe
+    // already skips the wizard for a running bot; mirror that behaviour on a
+    // live status update so a stale window cannot cover its live dashboard.
+    if (_startupPollTimer) {
+        clearTimeout(_startupPollTimer);
+        _startupPollTimer = null;
+    }
+    if (_splashGatePollTimer) {
+        clearTimeout(_splashGatePollTimer);
+        _splashGatePollTimer = null;
+    }
+
+    ['startupOverlay', 'splashGateOverlay', 'spacescanGateOverlay'].forEach((id) => {
+        const overlay = document.getElementById(id);
+        if (!overlay) return;
+        overlay.classList.add('hidden');
+        overlay.classList.remove('active');
+        overlay.style.display = 'none';
+    });
+    _startupGatesComplete = true;
+    window.scrollTo(0, 0);
+}
+
 function finalDismiss() {
     debugLog('[STARTUP] All gates passed — showing main GUI');
     _startupGatesComplete = true;
@@ -36767,10 +37061,6 @@ function startupPollUntilReady() {
 document.addEventListener('DOMContentLoaded', async () => {
     debugLog('[INIT] Page loading...');
 
-    // Risk disclosure is always the very first screen — show it immediately
-    // so the user never sees "Connecting to Sage" before accepting risks.
-    startupShowRiskDisclosure();
-
     // Auto-skip the startup wizard when:
     //   1. The bot is already running (page reload mid-session), OR
     //   2. Sage already has a wallet logged in and the backend reports
@@ -36803,6 +37093,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const _overlay = document.getElementById('startupOverlay');
         if (_overlay) { _overlay.classList.add('hidden'); _overlay.style.display = 'none'; }
         finalDismiss();
+    } else {
+        startupShowRiskDisclosure();
     }
 
     // Then fetch fingerprint
@@ -36831,6 +37123,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Fetch Command Centre dashboard data immediately
     fetchDashboard();
     loadInitialSystemLogs();
+    startSystemLogBackfillPolling();
     // Refresh dashboard every 120 seconds as backup (SSE is primary)
     setInterval(() => { fetchDashboard(); }, 120000);
 

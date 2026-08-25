@@ -67,6 +67,9 @@ build/
 # --- Alternate build output directories ---
 build2/
 dist2/
+# Timestamped/local release verification output. Preserve on disk, never commit.
+build_verification_*/
+deploy_rollback_*/
 
 # --- Runtime test/state files ---
 smoke_test_state.json

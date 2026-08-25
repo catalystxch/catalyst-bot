@@ -683,6 +683,38 @@ class TestLogEventAndGetRecentEvents(_TempDB):
         events = _db.get_recent_events(limit=5)
         self.assertLessEqual(len(events), 5)
 
+    def test_recent_events_orders_mixed_timestamp_formats_by_instant(self):
+        conn = _db.get_connection()
+        conn.execute("DELETE FROM events")
+        conn.executemany(
+            "INSERT INTO events (timestamp, event_type, severity, message) VALUES (?, ?, 'info', ?)",
+            [
+                ("2026-08-23T06:17:52.317108Z", "older_iso", "older"),
+                ("2026-08-23 10:50:48", "newer_sqlite", "newer"),
+            ],
+        )
+        conn.commit()
+
+        events = _db.get_recent_events(limit=1)
+
+        self.assertEqual([event["event_type"] for event in events], ["newer_sqlite"])
+
+    def test_events_since_excludes_older_iso_row_with_mixed_timestamp_formats(self):
+        conn = _db.get_connection()
+        conn.execute("DELETE FROM events")
+        conn.executemany(
+            "INSERT INTO events (timestamp, event_type, severity, message) VALUES (?, ?, 'info', ?)",
+            [
+                ("2026-08-23T06:17:52.317108Z", "older_iso", "older"),
+                ("2026-08-23 10:50:48", "newer_sqlite", "newer"),
+            ],
+        )
+        conn.commit()
+
+        events = _db.get_events_since("2026-08-23T09:06:09Z", limit=10)
+
+        self.assertEqual([event["event_type"] for event in events], ["newer_sqlite"])
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestGetSetSetting(_TempDB):

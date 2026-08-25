@@ -157,8 +157,19 @@ class TestPnlGet(_FlaskBase):
             "circuit_breaker_active",
             "volume_xch",
             "fill_rate_per_hour",
+            "max_position_xch",
         ):
             self.assertIn(key, body)
+
+    def test_response_exposes_live_position_limit(self):
+        with (
+            patch.object(api_server, "bot", _make_bot()),
+            patch("api_server.get_stats", return_value=_fake_stats()),
+            patch.object(api_server.cfg, "MAX_POSITION_XCH", Decimal("63.3")),
+        ):
+            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.get_json()["max_position_xch"], "63.3")
 
     def test_fill_counts_match_stats(self):
         with (

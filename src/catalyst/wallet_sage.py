@@ -1502,16 +1502,35 @@ def _build_sage_diagnostic(
 
 def _emit_sage_diagnostic(diagnostic: dict[str, Any], endpoint: Any) -> None:
     code = diagnostic["error_code"]
-    level = _sage_tx_error_level(code, _safe_string(endpoint))
+    endpoint_name = _safe_sage_endpoint(endpoint).split("?", 1)[0].strip("/").lower()
+    initialize_not_required = (
+        endpoint_name == "initialize"
+        and code == "SAGE_HTTP_ERROR"
+        and diagnostic.get("http_status") == 404
+    )
+    if initialize_not_required:
+        level = "info"
+        event_type = "sage_initialize_not_required"
+        message = (
+            "This Sage version does not expose the optional initialize endpoint; "
+            "continuing."
+        )
+    else:
+        level = _sage_tx_error_level(code, _safe_string(endpoint))
+        event_type = f"sage_{code.lower()}"
+        message = diagnostic["message"]
     if not _quiet_mode:
-        _console("[Sage] " + _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True))
+        if initialize_not_required:
+            _console("[Sage] Optional initialize endpoint not exposed; continuing.")
+        else:
+            _console("[Sage] " + _json.dumps(diagnostic, ensure_ascii=True, sort_keys=True))
     try:
         from database import log_event as _le
 
         _le(
             level,
-            f"sage_{code.lower()}",
-            diagnostic["message"],
+            event_type,
+            message,
             data=diagnostic,
         )
     except Exception:
@@ -2177,6 +2196,12 @@ def _query_coin_records(
 
     if not result or not isinstance(result, dict):
         return None
+    if not _rpc_succeeded(result):
+        # Preserve the structured Sage failure so coin watchers and other
+        # callers fail closed instead of diffing an invented empty wallet.
+        # This remains independent of external market-provider degradation,
+        # including the current TibetSwap outage.
+        return result
 
     coins = _extract_sage_coin_list(result)
     if not coins:
@@ -2811,8 +2836,49 @@ def _response_transaction_id(result: Optional[Dict]) -> Optional[str]:
     return None
 
 
+def _spend_bundle_transaction_id(spend_bundle: Any) -> Optional[str]:
+    """Return the authoritative transaction id for a signed Sage spend bundle."""
+    if not isinstance(spend_bundle, dict):
+        return None
+    try:
+        from chia_rs import SpendBundle
+
+        transaction_id = SpendBundle.from_json_dict(spend_bundle).name().hex()
+    except Exception:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{64}", transaction_id or ""):
+        return transaction_id.lower()
+    return None
+
+
+def _pending_transaction_ids() -> Optional[set[str]]:
+    """Return an exact snapshot of Sage's pending transaction identities."""
+    try:
+        pending = get_pending_transactions()
+    except Exception:
+        return None
+    if not isinstance(pending, list):
+        return None
+
+    transaction_ids: set[str] = set()
+    for transaction in pending:
+        if not isinstance(transaction, dict):
+            return None
+        transaction_id = transaction.get("transaction_id")
+        if not isinstance(transaction_id, str) or not re.fullmatch(
+            r"(?:0x)?[0-9a-fA-F]{64}", transaction_id
+        ):
+            return None
+        transaction_ids.add(transaction_id.lower())
+    return transaction_ids
+
+
 def _submit_coin_spends_if_needed(
-    result: Optional[Dict], context: str, *, _identity_recheck=None
+    result: Optional[Dict],
+    context: str,
+    *,
+    _identity_recheck=None,
+    _track_pending_identity: bool = False,
 ) -> Optional[Dict]:
     """Sign and submit Sage responses that only contain unsigned coin_spends."""
     if not isinstance(result, dict):
@@ -2857,6 +2923,13 @@ def _submit_coin_spends_if_needed(
             "error": f"{context} sign_coin_spends returned no signed spend bundle",
         }
 
+    bundle_transaction_id = _spend_bundle_transaction_id(spend_bundle)
+    pending_before = (
+        _pending_transaction_ids()
+        if _track_pending_identity and not bundle_transaction_id
+        else None
+    )
+
     if _identity_recheck is not None:
         _identity_recheck(f"{context}:submit")
     try:
@@ -2898,14 +2971,18 @@ def _submit_coin_spends_if_needed(
     out["submitted"] = True
     out["submit_response"] = submit_resp
     tx_id = _response_transaction_id(submit_resp)
+    if not tx_id:
+        tx_id = bundle_transaction_id
+    if not tx_id and _track_pending_identity and pending_before is not None:
+        pending_after = _pending_transaction_ids()
+        if pending_after is not None:
+            new_transaction_ids = pending_after - pending_before
+            if len(new_transaction_ids) == 1:
+                tx_id = next(iter(new_transaction_ids))
     if tx_id:
         out["transaction_id"] = tx_id
     else:
-        try:
-            pending_count = len(get_pending_transactions() or [])
-        except Exception:
-            pending_count = None
-        if pending_count is None:
+        if pending_before is None:
             return {
                 "success": False,
                 "error": (
@@ -2914,15 +2991,14 @@ def _submit_coin_spends_if_needed(
                 ),
                 "submit_response": submit_resp,
             }
-        if pending_count == 0:
-            return {
-                "success": False,
-                "error": (
-                    f"{context} submit_transaction returned no transaction id "
-                    "and Sage reports no pending transaction"
-                ),
-                "submit_response": submit_resp,
-            }
+        return {
+            "success": False,
+            "error": (
+                f"{context} submit_transaction returned no transaction id "
+                "and Sage reported no uniquely new pending transaction"
+            ),
+            "submit_response": submit_resp,
+        }
     return out
 
 
@@ -3032,7 +3108,10 @@ def combine_coins(
     if WALLET_DEBUG:
         print(f"  [Sage] combine result: {result}")
     return _submit_coin_spends_if_needed(
-        result, "combine", _identity_recheck=_identity_recheck
+        result,
+        "combine",
+        _identity_recheck=_identity_recheck,
+        _track_pending_identity=True,
     )
 
 
@@ -3735,11 +3814,16 @@ def set_change_address(
             },
             timeout=10,
         )
-        if (
-            type(result) is not dict
-            or set(result) != {"success"}
-            or result["success"] is not True
-        ):
+        # Sage v0.12.10 documents this mutation as EmptyResponse, serialized
+        # as exactly {}.  Retain the exact legacy success object as well, but
+        # reject every other shape so an error-bearing response cannot pass.
+        is_empty_response = type(result) is dict and not result
+        is_legacy_success = (
+            type(result) is dict
+            and set(result) == {"success"}
+            and result["success"] is True
+        )
+        if not (is_empty_response or is_legacy_success):
             return {"success": False, "error": "set_change_address_failed"}
 
         return {"success": True, "fingerprint": fingerprint, "address": address}
@@ -4117,11 +4201,11 @@ def cancel_offer(
     Sage's cancel_offer takes offer_id and optional fee.
     The 'secure' flag maps to whether we pay a fee for on-chain cancel.
 
-    NOTE: Sage's CancelOffer struct does NOT accept coin_ids — fee coin
-    is always auto-selected.  Fee contention between cancels is handled
-    by using bulk cancel (single tx) and sequencing cancels before creates
-    in the bot loop.  Creates DO get dedicated fee coins via make_offer's
-    coin_ids parameter.
+    NOTE: Sage's CancelOffer struct does NOT accept coin_ids, so any fee coin
+    is auto-selected by Sage.  CATalyst serializes batch members as independent
+    cancel_offer calls and sequences cancels before creates in the bot loop.
+    The make_offer coin_ids parameter selects the offered tier coin; it is not
+    a dedicated transaction-fee coin.
 
     Returns dict with 'success' key, or error dict on failure.
     """
@@ -4146,7 +4230,9 @@ def cancel_offer(
     payload = {
         "offer_id": trade_id,  # Sage uses offer_id, not trade_id
         "fee": str(int(resolved_fee)),  # REQUIRED — Sage 422s without fee field
-        "auto_submit": True,  # Submit the cancel transaction immediately
+        # Sage's auto-submit response has no transaction id.  Build first so
+        # CATalyst can sign, submit, and retain the signed bundle's exact id.
+        "auto_submit": False,
     }
 
     # Use _sage_post directly so we can see the actual HTTP status + body
@@ -4160,9 +4246,17 @@ def cancel_offer(
             timeout=timeout,
             retry_transport_error=False,
         )
+        result = _submit_coin_spends_if_needed(
+            result,
+            "cancel_offer",
+            _identity_recheck=_identity_recheck,
+            _track_pending_identity=True,
+        )
 
         return normalize_cancel_response(result, method="single_rpc")
 
+    except mutation_gate.MutationBlocked:
+        raise
     except SageHTTPError as exc:
         return normalize_cancel_response(
             {"error_code": exc.error_code, "http_status": exc.status},
@@ -4786,31 +4880,15 @@ def cancel_offers_batch(
     *,
     _identity_recheck=None,
 ):
-    """Cancel multiple offers via Sage, then wait for coins to return.
+    """Cancel multiple Sage offers as serialized, independent transactions.
 
-    Uses the same 3-step path the Sage GUI uses for bulk (>=2 offers):
-      cancel_offers(auto_submit=False) → sign_coin_spends → submit_transaction
-    Falls back to sequential individual cancel_offer calls if bulk fails.
+    Sage's bulk cancel endpoint merges per-offer spends into one bundle. That
+    path has historically produced duplicate/conflicting fee-coin spends and
+    invalid aggregate signatures. CATalyst therefore calls cancel_offer once
+    per trade ID and preserves each typed result independently. ``max_workers``
+    and ``skip_confirmation`` remain accepted only for adapter compatibility.
 
-    Simple model:
-      1. Snapshot spendable coin count before cancel.
-      2. Send bulk cancel_offers RPC (single transaction, fee=0).
-      3. Poll spendable count until coins come back (count increases)
-         or timeout. Coins will have new IDs but same values — coin
-         manager handles ID tracking naturally.
-      4. If bulk RPC fails, fall back to sequential cancels.
-
-    IMPORTANT: The Sage cancel_offers endpoint applies the fee parameter
-    independently per offer in a loop, then merges all CoinSpend objects
-    into ONE spend bundle.  Passing fee > 0 causes Sage to select a fee
-    coin for EACH offer separately; when merged the duplicate/conflicting
-    fee coin spends cause BAD_AGGREGATE_SIGNATURE on-chain.  The fix is to
-    always send fee=0 for the bulk RPC — the offer escrow coins are still
-    spent and the cancel is confirmed on-chain, just without a priority fee.
-    Sequential single-offer cancels (the fallback) each submit their own
-    independent TX and are not affected by this bug.
-
-    Returns dict of {trade_id: {"success": bool, ...}}.
+    Returns a dict mapping every trade ID to its typed cancellation outcome.
     """
     del max_workers, skip_confirmation
     results = {}
@@ -5277,6 +5355,64 @@ def _exact_positive_atomic_amount(value) -> Optional[int]:
 _MAX_GET_COINS_BY_IDS = 4096
 
 
+def _exact_authoritative_offer_asset_ids(offer_ids: set[str]) -> Dict[str, str]:
+    """Resolve omitted coin assets from exact, complete Sage offer records.
+
+    Sage may omit ``asset_id`` on coins locked by an offer.  The offer's maker
+    summary is still wallet-owned authority for the asset being spent.  Remain
+    fail-closed unless the full local offer table contains exactly one matching
+    row whose offered side contains exactly one valid asset.
+    """
+
+    if not offer_ids:
+        return {}
+    history = get_authoritative_offer_history(
+        include_completed=True,
+        start=0,
+        end=max(50, len(offer_ids)),
+    )
+    if (
+        type(history) is not dict
+        or history.get("success") is not True
+        or history.get("end_of_history") is not True
+        or type(history.get("offers")) is not list
+        or type(history.get("total")) is not int
+        or history["total"] != len(history["offers"])
+        or not _authoritative_provider_value_is_bounded(history)
+    ):
+        return {}
+
+    matches: Dict[str, list] = {offer_id: [] for offer_id in offer_ids}
+    for offer in history["offers"]:
+        if type(offer) is not dict:
+            return {}
+        raw_offer_id = offer.get("trade_id") or offer.get("offer_id")
+        normalized_offer_id = _normalize_offer_lock_id(raw_offer_id)
+        if normalized_offer_id in matches:
+            matches[normalized_offer_id].append(offer)
+
+    resolved: Dict[str, str] = {}
+    for offer_id, rows in matches.items():
+        if len(rows) != 1:
+            continue
+        summary = rows[0].get("summary")
+        offered = summary.get("offered") if type(summary) is dict else None
+        if type(offered) is not dict or len(offered) != 1:
+            continue
+        raw_asset_id, raw_amount = next(iter(offered.items()))
+        if _exact_positive_atomic_amount(raw_amount) is None or type(raw_asset_id) is not str:
+            continue
+        asset_id = raw_asset_id.strip().lower()
+        if asset_id == "xch":
+            resolved[offer_id] = "xch"
+            continue
+        if asset_id.startswith("0x"):
+            asset_id = asset_id[2:]
+        if len(asset_id) == 64 and re.fullmatch(r"[0-9a-f]{64}", asset_id):
+            resolved[offer_id] = asset_id
+    return resolved
+
+
 def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
     """Get detailed status for specific coins by their IDs.
 
@@ -5336,6 +5472,7 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
     if not _authoritative_provider_value_is_bounded(result):
         return None
     coin_map = {}
+    missing_asset_offer_locks: Dict[str, str] = {}
     for c in coins:
         amount = _exact_positive_atomic_amount(c.get("amount"))
         if amount is None:
@@ -5379,12 +5516,27 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
                 asset_value = c["asset"].get("asset_id")
             if asset_present:
                 record["asset_id"] = "xch" if asset_value is None else asset_value
+            elif offer_id is not None:
+                normalized_offer_id = _normalize_offer_lock_id(offer_id)
+                if (
+                    normalized_offer_id is not None
+                    and len(normalized_offer_id) == 64
+                    and re.fullmatch(r"[0-9a-f]{64}", normalized_offer_id)
+                ):
+                    missing_asset_offer_locks[cid] = normalized_offer_id
             owned_value = c.get("owned")
             if "owned" not in c:
                 owned_value = c.get("is_owned")
             if type(owned_value) is bool:
                 record["owned"] = owned_value
             coin_map[cid] = record
+    inferred_assets = _exact_authoritative_offer_asset_ids(
+        set(missing_asset_offer_locks.values())
+    )
+    for cid, offer_id in missing_asset_offer_locks.items():
+        asset_id = inferred_assets.get(offer_id)
+        if asset_id is not None:
+            coin_map[cid]["asset_id"] = asset_id
     return coin_map
 
 

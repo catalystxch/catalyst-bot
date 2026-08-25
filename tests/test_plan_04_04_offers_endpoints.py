@@ -503,6 +503,51 @@ class TestCancelAllPost(_FlaskBase):
             },
         )
 
+    def test_stopped_cancel_all_retries_exact_durable_failed_attempt(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_UNKNOWN",
+                "success": False,
+                "submitted": False,
+                "reconciliation_required": True,
+            }
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_retryable_failed_offer_cancels",
+                return_value=[
+                    {
+                        "trade_id": trade_id,
+                        "operation_id": f"cancel:{trade_id}",
+                        "attempt": 1,
+                    }
+                ],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            resp = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(resp.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [trade_id],
+            reason="manual_cancel_all",
+            force_storm=True,
+            _retry_failed_attempts={trade_id: 1},
+        )
+
         gui_source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
         status_consumer = gui_source.split(
             "async function pollShutdownCancelAllStatusOnce()", 1

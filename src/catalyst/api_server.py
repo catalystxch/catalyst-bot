@@ -235,7 +235,6 @@ _MUTATING_API_ENDPOINTS = {
     "coin_prep.api_coin_prep_trigger",
     "coin_prep.api_coin_topup",
     "coin_prep.api_db_backup",
-    "coin_prep.api_log_event",
     "coin_prep.api_logs_clear",
     "config_bp.api_config_apply",
     "config_bp.api_config_live",
@@ -272,10 +271,15 @@ _MUTATING_API_ENDPOINTS = {
 
 _READ_ONLY_WRITE_API_ENDPOINTS = {
     "cat.api_balances_refresh",
+    # Subprocess telemetry persists diagnostics and emits SSE only.  It must
+    # remain available while a wallet effect is being reconciled and must not
+    # sample a transient safety latch into this process's local mutation fence.
+    "coin_prep.api_log_event",
     "config_bp.api_settings_validate",
 }
 
 _CONTROL_WRITE_API_ENDPOINTS = {
+    "api_safety_release_resolved",
     "api_safety_quarantine",
     "api_safety_quarantine_resolve",
     "api_open_data_folder",
@@ -1148,10 +1152,11 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
         return result
 
     trade_ids = None
-    if _live_wallet_reads_allowed(bot) and getattr(bot, "offer_manager", None):
+    offer_manager = getattr(bot, "offer_manager", None)
+    if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
             wallet_open_buys, wallet_open_sells, _ = (
-                bot.offer_manager.sync_from_wallet()
+                offer_manager.sync_from_wallet()
             )
             trade_ids = [
                 o.get("trade_id", "")
@@ -1161,6 +1166,28 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
             result["our_open_buys"] = len(wallet_open_buys)
             result["our_open_sells"] = len(wallet_open_sells)
             result["source"] = "wallet_sync"
+        except Exception:
+            trade_ids = None
+    elif offer_manager:
+        try:
+            snapshot_getter = getattr(offer_manager, "get_wallet_sync_snapshot", None)
+            wallet_snapshot = snapshot_getter() if callable(snapshot_getter) else {}
+            wallet_meta = (wallet_snapshot or {}).get("meta") or {}
+            if (
+                wallet_meta.get("fresh") is True
+                and wallet_meta.get("using_cache") is not True
+                and float(wallet_meta.get("last_success_at", 0) or 0) > 0
+            ):
+                wallet_open_buys = list(wallet_snapshot.get("buy") or [])
+                wallet_open_sells = list(wallet_snapshot.get("sell") or [])
+                trade_ids = [
+                    o.get("trade_id", "")
+                    for o in (wallet_open_buys + wallet_open_sells)
+                    if o.get("trade_id")
+                ]
+                result["our_open_buys"] = len(wallet_open_buys)
+                result["our_open_sells"] = len(wallet_open_sells)
+                result["source"] = "wallet_snapshot"
         except Exception:
             trade_ids = None
 
@@ -1332,7 +1359,7 @@ def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
 def get_public_stability_status() -> dict:
     """Return the stable, redacted Task 10 diagnostics contract."""
 
-    live = mutation_gate.status().to_dict()
+    live = mutation_gate.read_only_status().to_dict()
     startup = _stability_startup_status
     if type(live) is not dict or type(startup) is not dict:
         raise RuntimeError("malformed stability status")
@@ -1643,6 +1670,21 @@ def _mutation_stop_handler(reason_code: str) -> None:
         return
     try:
         if current_bot.is_running():
+            defer_reader = getattr(
+                current_bot, "can_defer_mutation_safety_stop", None
+            )
+            if reason_code == "UNRESOLVED_OPERATIONS" and callable(defer_reader):
+                try:
+                    if defer_reader(reason_code) is True:
+                        slog(
+                            "SAFETY",
+                            "Bot cancel settlement remains read-only pending exact proof",
+                            {"reason_code": reason_code},
+                            level="warning",
+                        )
+                        return
+                except Exception:
+                    pass
             try:
                 current_bot.stop(wait=False)
             except TypeError:
@@ -3309,31 +3351,60 @@ except Exception as e:
 
 
 def _get_live_mid_price_str() -> Optional[str]:
-    """Return the bot's current weighted mid as a decimal string, or None.
+    """Return the current displayed mid as a decimal string, or None.
 
     Used to seed the coin-prep subprocess with the same price the bot trades
-    against, so CAT-coin sizes align with live ladder sizes. Tries the cached
-    last_price first, then a fresh fetch via get_price() if the cache is empty
-    or stale (common when prep is triggered before the bot loop has started
-    and no cycle has populated the cache yet).
+    against, so CAT-coin sizes align with live ladder sizes. When the bot exists,
+    tries its cached weighted price first and then a fresh price-engine fetch.
+    Before the bot is created, uses the fresh pre-start price already displayed
+    by ``/api/status`` instead of silently falling back to a different oracle.
 
-    Returns None only when both paths fail; the worker then falls back to
+    Returns None only when all paths fail; the worker then falls back to
     Dexie's last_price ticker, which may lag on thin markets.
     """
     try:
         pe = getattr(bot, "price_engine", None) if "bot" in globals() else None
-        if pe is None:
-            return None
-        p = pe.get_last_price()
+        p = None
+        if pe is not None:
+            p = pe.get_last_price()
+            if p is None or Decimal(str(p)) <= 0:
+                # Cache miss — force a fresh fetch of the weighted mid so prep
+                # and the bot agree on price even on first run.
+                try:
+                    fresh = pe.get_price()
+                    if isinstance(fresh, dict):
+                        p = (
+                            fresh.get("mid_price")
+                            or fresh.get("mid")
+                            or fresh.get("price")
+                        )
+                    else:
+                        p = fresh
+                except Exception:
+                    p = None
+
         if p is None or Decimal(str(p)) <= 0:
-            # Cache miss — force a fresh fetch of the weighted mid so prep
-            # and the bot agree on price even on first run.
+            # /api/status owns the stopped-bot market lookup and caches it for
+            # 60 seconds. Reuse that exact price so the Smart Settings preview
+            # and the worker cannot size the CAT pool from different markets.
             try:
-                fresh = pe.get_price()
-                if isinstance(fresh, dict):
-                    p = fresh.get("mid_price") or fresh.get("mid") or fresh.get("price")
-                else:
-                    p = fresh
+                from blueprints import bot as bot_blueprint
+
+                cache = getattr(bot_blueprint, "_prebot_price_cache", {}) or {}
+                active_asset_id = str(
+                    _active_cat.get("asset_id")
+                    or getattr(cfg, "CAT_ASSET_ID", "")
+                    or ""
+                ).strip()
+                cached_asset_id = str(cache.get("asset_id") or "").strip()
+                cache_age = time.time() - float(cache.get("fetched_at", 0.0) or 0.0)
+                pricing = cache.get("pricing") or {}
+                if (
+                    active_asset_id
+                    and cached_asset_id == active_asset_id
+                    and 0 <= cache_age < 60.0
+                ):
+                    p = pricing.get("mid") or pricing.get("mid_price")
             except Exception:
                 p = None
         if p is None:
@@ -3544,6 +3615,118 @@ def api_safety_status():
                 },
             }
         ), 503
+
+
+@app.route("/api/safety/release-resolved", methods=["POST"])
+def api_safety_release_resolved():
+    """Release only the exact runtime latch already resolved durably.
+
+    Authoritative reconciliation is deliberately separate from this control
+    endpoint.  The caller supplies the latch generation and the complete set
+    of operation IDs it reconciled; ``MutationGate.release_resolved`` performs
+    the durable compare-and-swap and refuses stale, partial, or mismatched
+    authority.
+    """
+
+    if request.content_length is not None and request.content_length > 16384:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "RELEASE_REQUEST_TOO_LARGE",
+                }
+            ),
+            413,
+        )
+    payload = request.get_json(silent=True)
+    expected_keys = {"expected_generation", "resolved_operation_ids"}
+    generation = payload.get("expected_generation") if type(payload) is dict else None
+    operation_ids = (
+        payload.get("resolved_operation_ids") if type(payload) is dict else None
+    )
+    valid_operation_ids = (
+        type(operation_ids) is list
+        and 1 <= len(operation_ids) <= 128
+        and len(operation_ids) == len(set(operation_ids))
+        and all(
+            type(operation_id) is str
+            and re.fullmatch(r"(?:create|cancel):[0-9a-f]{64}", operation_id)
+            is not None
+            for operation_id in operation_ids
+        )
+    )
+    if (
+        type(payload) is not dict
+        or set(payload) != expected_keys
+        or type(generation) is not int
+        or isinstance(generation, bool)
+        or generation < 1
+        or not valid_operation_ids
+    ):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "RELEASE_REQUEST_MALFORMED",
+                }
+            ),
+            400,
+        )
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "MUTATION_RUNTIME_NOT_INITIALIZED",
+                }
+            ),
+            503,
+        )
+    try:
+        released = runtime.release_resolved(generation, operation_ids)
+    except Exception:
+        released = None
+    if type(released) is not dict:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "DURABLE_STATE_UNAVAILABLE",
+                }
+            ),
+            503,
+        )
+    if released.get("released") is not True:
+        reason_codes = {
+            "durable_state_unavailable": "DURABLE_STATE_UNAVAILABLE",
+            "generation_mismatch": "LATCH_GENERATION_MISMATCH",
+            "latch_binding_mismatch": "LATCH_BINDING_MISMATCH",
+            "not_resolved": "OPERATIONS_NOT_RESOLVED",
+            "not_tripped": "LATCH_NOT_TRIPPED",
+            "terminal_process_fence": "TERMINAL_PROCESS_FENCE",
+        }
+        reason_code = reason_codes.get(
+            str(released.get("reason") or ""), "LATCH_RELEASE_REJECTED"
+        )
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": reason_code,
+                }
+            ),
+            409,
+        )
+    return jsonify(
+        {"success": True, "released": True, "reason_code": "RELEASED"}
+    )
 
 
 def _quarantine_runtime_request(payload: Any) -> dict:

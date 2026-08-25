@@ -60,27 +60,16 @@ else:
 # --------------------------------------------------------------------------
 
 
-def _make_pair_response(xch_reserve: int, token_reserve: int) -> list:
-    """Build the response list that TibetSwap /pairs returns.
-
-    The list contains the target pair (matching _FakeCfg.TIBET_PAIR_ID)
-    plus one extra decoy so the pair-filtering logic is exercised.
-    """
-    return [
-        {
-            "pair_id": "other-pair-decoy",
-            "xch_reserve": 999,
-            "token_reserve": 999,
-            "liquidity": 1,
-        },
-        {
-            "pair_id": _FakeCfg.TIBET_PAIR_ID,
-            "launcher_id": _FakeCfg.TIBET_PAIR_ID,
-            "xch_reserve": xch_reserve,
-            "token_reserve": token_reserve,
-            "liquidity": 1_000_000,
-        },
-    ]
+def _make_pair_response(xch_reserve: int, token_reserve: int) -> dict:
+    """Build the response object that TibetSwap /pair/{id} returns."""
+    return {
+        "pair_id": _FakeCfg.TIBET_PAIR_ID,
+        "asset_id": "asset-id",
+        "xch_reserve": xch_reserve,
+        "token_reserve": token_reserve,
+        "liquidity": 1_000_000,
+        "last_coin_id_on_chain": "pair-coin",
+    }
 
 
 def _mock_session_get(response_data: dict, status_code: int = 200):
@@ -133,6 +122,43 @@ class TestAMMMonitorFetchPair(unittest.TestCase):
         self.assertAlmostEqual(float(state["amm_price"]), 0.001, places=8)
         self.assertAlmostEqual(float(state["xch_reserve"]), 10.0, places=4)
         self.assertAlmostEqual(float(state["token_reserve"]), 10_000.0, places=2)
+
+    def test_uses_fresh_single_pair_state_when_bulk_list_is_stale(self):
+        stale_list = [
+            {
+                **_make_pair_response(91_989_779_772_002, 1_328_896_548),
+                "last_coin_id_on_chain": "stale-pair-coin",
+            }
+        ]
+        fresh_pair = {
+            "pair_id": _FakeCfg.TIBET_PAIR_ID,
+            "asset_id": "asset-id",
+            "xch_reserve": 91_205_871_506_043,
+            "token_reserve": 1_342_456_611,
+            "liquidity": 397_056_877,
+            "last_coin_id_on_chain": "fresh-pair-coin",
+        }
+
+        def response_for(url, **_kwargs):
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            response.json.return_value = (
+                fresh_pair if url.endswith(f"/pair/{_FakeCfg.TIBET_PAIR_ID}") else stale_list
+            )
+            return response
+
+        monitor = AMMMonitor()
+        monitor._session = MagicMock()
+        monitor._session.get.side_effect = response_for
+
+        state = monitor._fetch_pair(_FakeCfg.TIBET_PAIR_ID)
+
+        self.assertEqual(
+            state["amm_price"],
+            Decimal("91.205871506043") / Decimal("1342456.611"),
+        )
+        self.assertEqual(state["xch_reserve_mojos"], Decimal("91205871506043"))
+        self.assertEqual(state["token_reserve_mojos"], Decimal("1342456611"))
 
     def test_returns_none_on_zero_reserves(self):
         m = self._make_monitor(_make_pair_response(0, 1000))
@@ -338,7 +364,13 @@ class TestAMMMonitorUserFacingLogs(unittest.TestCase):
                 "fetched_at": time.time(),
             }
 
-        with patch("amm_monitor.log_event") as log_event:
+        with (
+            patch("amm_monitor.log_event") as log_event,
+            patch(
+                "dynamic_amm_buffer.get_buffer",
+                return_value=Decimal("30"),
+            ),
+        ):
             self.assertFalse(m.check_amm_buffer(Decimal("0.001"), "buy"))
 
         message = log_event.call_args.args[2]
@@ -371,6 +403,24 @@ class TestAMMMonitorUserFacingLogs(unittest.TestCase):
         message = drift_calls[0].args[2]
         self.assertIn("2.0%", message)
         self.assertNotIn("bps", message.lower())
+
+    def test_unavailable_pair_warning_does_not_claim_api_is_down(self):
+        m = AMMMonitor()
+        m._fetch_pair = MagicMock(return_value=None)
+
+        with patch("amm_monitor.log_event") as log_event:
+            for _ in range(3):
+                m._do_poll()
+
+        warning_calls = [
+            call
+            for call in log_event.call_args_list
+            if len(call.args) >= 3 and call.args[1] == "amm_monitor_unhealthy"
+        ]
+        self.assertEqual(len(warning_calls), 1)
+        message = warning_calls[0].args[2]
+        self.assertIn("unavailable or unusable", message)
+        self.assertNotIn("API may be down", message)
 
 
 class TestAMMMonitorGetStats(unittest.TestCase):

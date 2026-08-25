@@ -432,11 +432,25 @@ class OfferManager:
         # Lock for thread safety during offer operations
         self._lock = threading.Lock()
 
+        # Sage creation authority requires strictly newer identity evidence for
+        # every continuation. Parallel ladder workers can observe identities in
+        # one order and enter the authority gate in another, causing valid
+        # creates to fail closed as stale. Keep the complete journal + wallet
+        # effect on one ordered lane per manager while leaving ladder planning
+        # and result processing parallel.
+        self._sage_creation_authority_lock = threading.Lock()
+
         # ----- V1 Parity: Retry failed cancels -----
         # Dict of trade_id -> {"attempts": int, "first_failed": float}
         self._pending_cancel_retries: Dict[str, Dict] = {}
         self._max_cancel_retries: int = 5
         self._cancel_retry_backoff_seconds: int = 30
+        # A retry that submits a Sage cancellation must remain the sole
+        # mutation owner while Task 9 proves the resulting spend.  The API
+        # safety callback reads this exact operation ID so it can defer its
+        # stop notification without ever reopening the mutation gate.
+        self._cancel_settlement_lock = threading.Lock()
+        self._cancel_settlement_operation_id: Optional[str] = None
 
         # ----- V1 Parity: Recently created offers (anti-overcount) -----
         # Dict of trade_id -> creation_time — offers created this cycle
@@ -1479,8 +1493,40 @@ class OfferManager:
             tier = self._classify_tier(slot, total_slots, side=side)
             tier_slots.setdefault(tier, []).append(slot)
 
+        occupied_slots: set[int] = set()
+        slot_reader = getattr(database, "get_active_offer_slot_keys", None)
+        if slot_reader is not None:
+            try:
+                slot_prefix = f"ladder:{asset_id}:{side}:"
+                for slot_key in slot_reader(
+                    asset_id=asset_id,
+                    side=side,
+                ):
+                    if not isinstance(slot_key, str) or not slot_key.startswith(
+                        slot_prefix
+                    ):
+                        raise ValueError("active ladder slot key is not canonical")
+                    suffix = slot_key[len(slot_prefix) :]
+                    slot = int(suffix)
+                    if str(slot) != suffix or slot < 0 or slot >= total_slots:
+                        raise ValueError("active ladder slot key is out of range")
+                    occupied_slots.add(slot)
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "replenishment_slot_authority_unavailable",
+                    "Durable ladder slot authority is unavailable; replenishment paused",
+                    {"side": side, "asset_id": asset_id, "error": str(exc)},
+                )
+                return []
+
         if not cfg.TIER_ENABLED:
-            return list(tier_slots.get("mid", []))
+            return [
+                slot
+                for slot in tier_slots.get("mid", [])
+                if slot not in occupied_slots
+                and not self.is_slot_suspended(side, slot)
+            ]
 
         live_counts = {tier: 0 for tier in tier_slots}
         for offer in get_open_offers(side=side, cat_asset_id=asset_id):
@@ -1491,16 +1537,21 @@ class OfferManager:
 
         planned_slots: List[int] = []
         for tier in ("inner", "mid", "outer", "extreme"):
-            slots = tier_slots.get(tier, [])
-            if not slots:
+            tier_candidates = tier_slots.get(tier, [])
+            if not tier_candidates:
                 continue
-            slots = [slot for slot in slots if not self.is_slot_suspended(side, slot)]
-            if not slots:
+            eligible_slots = [
+                slot
+                for slot in tier_candidates
+                if not self.is_slot_suspended(side, slot)
+            ]
+            if not eligible_slots:
                 continue
             live_count = live_counts.get(tier, 0)
-            needed = len(slots) - live_count
+            needed = len(eligible_slots) - live_count
             if needed <= 0:
                 continue
+            slots = [slot for slot in eligible_slots if slot not in occupied_slots]
             # Fill from the INNERMOST slots (front of the list, closest to mid)
             # so that replenishments after fills land back at the tightest
             # price position rather than the outermost end of the tier.
@@ -1991,8 +2042,11 @@ class OfferManager:
                 raise ValueError("refresh parent intent is missing")
             if (
                 parent.get("slot_key") != slot_key
-                or parent.get("run_id") != run_id
                 or type(parent.get("generation")) is not int
+                or generation != parent.get("generation")
+                or selection.get("active_intent_id") != parent_intent_id
+                or selection.get("active_lifecycle_state")
+                != parent.get("lifecycle_state")
                 or parent.get("child_intent_id") is not None
                 or parent.get("lifecycle_state") not in {"created", "visible"}
             ):
@@ -2438,6 +2492,18 @@ class OfferManager:
         }
 
     def _create_offer_from_journal(
+        self,
+        *,
+        intent: _CanonicalOfferCreationIntent,
+        spend_wallet_id: int,
+    ) -> dict:
+        with self._sage_creation_authority_lock:
+            return self._create_offer_from_journal_serialized(
+                intent=intent,
+                spend_wallet_id=spend_wallet_id,
+            )
+
+    def _create_offer_from_journal_serialized(
         self,
         *,
         intent: _CanonicalOfferCreationIntent,
@@ -5217,7 +5283,7 @@ class OfferManager:
                 events = database.get_offer_operation_events(intent.operation_id)
                 if any(
                     event.get("attempt") == attempt
-                    and event.get("phase") == "FINALIZED"
+                    and event.get("phase") in {"FINALIZED", "RECONCILED"}
                     for event in events
                 ):
                     break
@@ -5946,6 +6012,25 @@ class OfferManager:
         intent: _CanonicalOfferCancelIntent,
     ) -> Optional[dict]:
         projection = OfferManager._read_existing_cancel_result(intent)
+        if projection.latch_binding is not None and type(projection.result) is dict:
+            attempt = projection.result.get("_catalyst_attempt")
+            try:
+                events = database.get_offer_operation_events(intent.operation_id)
+                latest = events[-1] if events else None
+            except Exception:
+                latest = None
+            if (
+                type(attempt) is int
+                and type(latest) is dict
+                and latest.get("attempt") == attempt
+                and latest.get("phase") == "PREPARED"
+            ):
+                # Another exact caller owns (or already claimed) this effect.
+                # Returning the durable PREPARED projection is fail-closed and
+                # must not advance the recovery generation underneath the
+                # owner before it can append FINALIZED. Startup recovery still
+                # fences a genuinely stranded PREPARED row.
+                return projection.result
         if projection.latch_binding is not None:
             wallet_hash, network = projection.latch_binding
             OfferManager._trip_cancel_latch(
@@ -6951,9 +7036,23 @@ class OfferManager:
             refresh_before_secs = getattr(cfg, "OFFER_REFRESH_BEFORE", 1800)
 
         now = int(time.time())
+        # Sniper and boost probes intentionally use short expiries. Wallet
+        # records do not carry CATalyst's DB-only ``tier`` label, while this
+        # input commonly contains both wallet and DB copies of the same offer.
+        # Discover protected IDs across the complete merged view first so an
+        # unlabeled wallet copy cannot be selected before its labeled DB copy.
+        protected_ids = {
+            offer.get("trade_id")
+            for offer in open_offers
+            if (offer.get("tier") or "").lower() in {"sniper", "boost"}
+            and offer.get("trade_id")
+        }
         expiring = []
 
         for offer in open_offers:
+            trade_id = offer.get("trade_id", "")
+            if trade_id in protected_ids:
+                continue
             # Check valid_times.max_time from the wallet RPC record
             valid_times = offer.get("valid_times") or {}
             max_time = (
@@ -6983,9 +7082,8 @@ class OfferManager:
             if max_time_int > 0:
                 time_left = max_time_int - now
                 if 0 < time_left < refresh_before_secs:
-                    tid = offer.get("trade_id", "")
-                    if tid:
-                        expiring.append(tid)
+                    if trade_id:
+                        expiring.append(trade_id)
 
         expiring = list(dict.fromkeys(expiring))
 
@@ -7174,8 +7272,260 @@ class OfferManager:
     # Retry failed cancels (V1 parity: retry_failed_cancels)
     # -------------------------------------------------------------------
 
+    def get_active_cancel_settlement_operation(self) -> Optional[str]:
+        """Return the exact retry operation currently awaiting Task 9 proof."""
+
+        with self._cancel_settlement_lock:
+            return self._cancel_settlement_operation_id
+
+    def _begin_cancel_settlement(self, operation_id: str) -> bool:
+        if type(operation_id) is not str or not operation_id:
+            return False
+        with self._cancel_settlement_lock:
+            if self._cancel_settlement_operation_id is not None:
+                return False
+            self._cancel_settlement_operation_id = operation_id
+            return True
+
+    def _end_cancel_settlement(self, operation_id: str) -> None:
+        with self._cancel_settlement_lock:
+            if self._cancel_settlement_operation_id == operation_id:
+                self._cancel_settlement_operation_id = None
+
+    @staticmethod
+    def _settle_submitted_cancel(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> bool:
+        """Release one cancel latch only after exact authoritative proof.
+
+        A successful Sage submission is not a terminal outcome.  Retry callers
+        must therefore wait for Task 9 reconciliation before attempting the
+        next wallet mutation; otherwise the next retry collides with the latch
+        raised for this operation and stops the bot.
+        """
+
+        import offer_reconciliation
+
+        try:
+            latch = database.get_runtime_safety_latch()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            blocker_ids = [row.get("operation_id") for row in blockers]
+            generation = latch.get("generation")
+            if (
+                latch.get("state") != "tripped"
+                or type(generation) is not int
+                or isinstance(generation, bool)
+                or generation < 1
+                or blocker_ids != [intent.operation_id]
+            ):
+                return False
+        except Exception:
+            return False
+
+        max_wait = max(0.0, float(cfg.CANCEL_MAX_WAIT_SECS))
+        poll_interval = max(0.05, float(cfg.CANCEL_POLL_INTERVAL_SECS))
+        deadline = time.monotonic() + max_wait
+        while True:
+            try:
+                intent_row = database.get_offer_intent(intent.intent_id)
+                if (
+                    type(intent_row) is not dict
+                    or intent_row.get("sage_trade_id") != intent.trade_id
+                ):
+                    return False
+                evidence = offer_reconciliation.load_authoritative_evidence(intent_row)
+                observed_at = offer_reconciliation._clock_utc()
+                cancel_context = offer_reconciliation._derive_single_cancel_context(
+                    intent_row,
+                    evidence,
+                    database_module=database,
+                    observed_at=observed_at,
+                )
+                classification = offer_reconciliation.classify_terminal_evidence(
+                    intent_row,
+                    evidence,
+                    cancel_context=cancel_context,
+                    now=observed_at,
+                )
+                if (
+                    cancel_context is not None
+                    and classification.get("classification")
+                    == offer_reconciliation.CANCELLED_PROVEN
+                ):
+                    reconciled = offer_reconciliation.reconcile_offer(
+                        intent.intent_id,
+                        evidence=evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
+                    )
+                    if (
+                        reconciled.get("classification")
+                        == offer_reconciliation.CANCELLED_PROVEN
+                        and reconciled.get("applied") is True
+                    ):
+                        runtime = mutation_gate.current_runtime()
+                        if runtime is None:
+                            return False
+                        released = runtime.release_resolved(
+                            generation,
+                            [intent.operation_id],
+                        )
+                        if released.get("released") is True:
+                            return True
+                        # The transactional reconciliation may have resolved
+                        # the durable latch itself.  In that case, accept the
+                        # transition only when this exact generation is clear
+                        # and the live runtime independently reports allowed.
+                        post_latch = database.get_runtime_safety_latch()
+                        post_blockers = (
+                            database.get_unresolved_offer_operation_blockers()
+                        )
+                        status_reader = getattr(runtime, "status", None)
+                        runtime_status = (
+                            status_reader() if callable(status_reader) else None
+                        )
+                        runtime_allowed = (
+                            runtime_status.get("allowed") is True
+                            if type(runtime_status) is dict
+                            else getattr(runtime_status, "allowed", False) is True
+                        )
+                        return bool(
+                            post_latch.get("state") == "resolved"
+                            and post_latch.get("generation") == generation
+                            and not post_blockers
+                            and runtime_allowed
+                        )
+            except Exception:
+                # Read-only evidence can be briefly incomplete while Sage is
+                # confirming the spend.  Never infer success from that gap.
+                pass
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
+    @staticmethod
+    def _reconcile_elapsed_cancel_retry(
+        intent: _CanonicalOfferCancelIntent,
+        offer: Any,
+        *,
+        now_timestamp: float,
+    ) -> Optional[bool]:
+        """Reconcile an already-terminal offer before retrying its cancel.
+
+        A failed batch peer can naturally expire while another member awaits
+        confirmation.  Retrying the stale peer through Sage creates a second,
+        redundant wallet spend and immediately closes the safety gate.  Once
+        the durable expiry has elapsed (or the DB is already terminal), use
+        Task 9 evidence instead.  ``None`` means the offer is still eligible
+        for an ordinary retry; ``False`` means proof is not ready and the
+        wallet effect must be skipped this pass.
+        """
+
+        if type(offer) is not dict:
+            return None
+        status = str(offer.get("status") or "").strip().lower()
+        should_reconcile = status in {"cancelled", "expired"}
+        expires_at = offer.get("expires_at")
+        if not should_reconcile and expires_at:
+            try:
+                expiry = datetime.fromisoformat(
+                    str(expires_at).strip().replace("Z", "+00:00")
+                )
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                should_reconcile = expiry <= datetime.fromtimestamp(
+                    now_timestamp, tz=timezone.utc
+                )
+            except (OverflowError, OSError, TypeError, ValueError):
+                should_reconcile = False
+        if not should_reconcile:
+            return None
+
+        try:
+            import offer_reconciliation
+
+            intent_row = database.get_offer_intent(intent.intent_id)
+            if (
+                type(intent_row) is not dict
+                or intent_row.get("sage_trade_id") != intent.trade_id
+            ):
+                return False
+            terminal = {
+                offer_reconciliation.FILLED_PROVEN,
+                offer_reconciliation.CANCELLED_PROVEN,
+                offer_reconciliation.EXPIRED_PROVEN,
+            }
+            if intent_row.get("lifecycle_state") == "terminal":
+                authoritative = database.get_authoritative_terminal_record(
+                    intent.trade_id
+                )
+                if (
+                    type(authoritative) is dict
+                    and authoritative.get("intent_id") == intent.intent_id
+                    and authoritative.get("sage_trade_id") == intent.trade_id
+                    and authoritative.get("operation_id")
+                    == f"reconcile:{intent.intent_id}"
+                    and authoritative.get("outcome") in terminal
+                ):
+                    return True
+                return False
+            result = offer_reconciliation.reconcile_offer(intent.intent_id)
+            if result.get("applied") is True and result.get("classification") in terminal:
+                return True
+            log_event(
+                "info",
+                "cancel_retry_terminal_reconciliation_pending",
+                f"Offer {intent.trade_id[:16]}... is past its terminal bound; "
+                "awaiting authoritative reconciliation instead of submitting "
+                "another cancel",
+                data={
+                    "trade_id": intent.trade_id,
+                    "classification": result.get("classification"),
+                    "reason_code": result.get("reason_code"),
+                },
+            )
+        except Exception as exc:
+            log_event(
+                "warning",
+                "cancel_retry_terminal_reconciliation_failed",
+                f"Could not reconcile elapsed offer {intent.trade_id[:16]}...: "
+                f"{type(exc).__name__}",
+                data={"trade_id": intent.trade_id},
+            )
+        return False
+
     def retry_failed_cancels(self) -> int:
         """Retry exact durable failures; memory is only a health-reporting cache."""
+        # A batch deliberately aborts later members after one cancellation
+        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
+        # blocker before reading or retrying failed peers; otherwise the retry
+        # attempts a second wallet mutation behind a closed safety gate.
+        try:
+            blockers = database.get_unresolved_offer_operation_blockers()
+        except Exception as exc:
+            log_event(
+                "error",
+                "cancel_settlement_journal_unavailable",
+                f"Could not read unresolved cancellations: {type(exc).__name__}",
+            )
+            return -1
+        if blockers:
+            if len(blockers) != 1:
+                return -1
+            operation_id = blockers[0].get("operation_id")
+            if not self._is_canonical_cancel_digest_id(operation_id, "cancel:"):
+                return -1
+            intent = self._canonical_cancel_intent(operation_id.removeprefix("cancel:"))
+            if not self._begin_cancel_settlement(intent.operation_id):
+                return -1
+            try:
+                if not self._settle_submitted_cancel(intent):
+                    return -1
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
+
         try:
             candidates = database.get_retryable_failed_offer_cancels()
         except Exception as exc:
@@ -7230,17 +7580,50 @@ class OfferManager:
             if offer and (offer.get("status") == "filled" or offer.get("filled_at")):
                 self._pending_cancel_retries.pop(trade_id, None)
                 continue
+            terminal_reconciled = self._reconcile_elapsed_cancel_retry(
+                intent,
+                offer,
+                now_timestamp=now,
+            )
+            if terminal_reconciled is not None:
+                if terminal_reconciled:
+                    self._pending_cancel_retries.pop(trade_id, None)
+                    self._bot_cancelled_ids.discard(trade_id)
+                # Even incomplete terminal proof is a reason to wait, never
+                # to submit a redundant wallet mutation for an elapsed offer.
+                continue
             if attempt >= self._max_cancel_retries:
                 continue
             retry_after = self._cancel_retry_backoff_seconds * (2 ** (attempt - 1))
             if now < failed_timestamp + retry_after:
                 continue
-            self.cancel_offers(
-                [trade_id],
-                reason="retry_failed_cancel",
-                force_storm=True,
-                _retry_failed_attempts={trade_id: attempt},
-            )
+            if not self._begin_cancel_settlement(intent.operation_id):
+                return -1
+            try:
+                results = self.cancel_offers(
+                    [trade_id],
+                    reason="retry_failed_cancel",
+                    force_storm=True,
+                    _retry_failed_attempts={trade_id: attempt},
+                )
+                result = results.get(trade_id)
+                if type(result) is not dict:
+                    return -1
+                outcome = result.get("outcome")
+                if outcome == CANCEL_SUBMITTED_UNCONFIRMED:
+                    if not self._settle_submitted_cancel(intent):
+                        log_event(
+                            "warning",
+                            "cancel_retry_confirmation_pending",
+                            "A submitted cancel still requires exact authoritative "
+                            "confirmation; no further wallet mutation will run this cycle",
+                            data={"operation_id": intent.operation_id},
+                        )
+                        return -1
+                elif outcome == CANCEL_UNKNOWN:
+                    return -1
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
 
         for trade_id in set(self._pending_cancel_retries) - durable_ids:
             self._pending_cancel_retries.pop(trade_id, None)
@@ -7320,6 +7703,15 @@ class OfferManager:
         """Return lightweight metadata about the last wallet offer sync."""
         return dict(self._wallet_sync_meta)
 
+    def get_wallet_sync_snapshot(self) -> Dict[str, Any]:
+        """Return a defensive copy of the last wallet-authoritative offer book."""
+        return {
+            "buy": [dict(o) for o in self._wallet_sync_cache.get("buy", [])],
+            "sell": [dict(o) for o in self._wallet_sync_cache.get("sell", [])],
+            "closed": [dict(o) for o in self._wallet_sync_cache.get("closed", [])],
+            "meta": dict(self._wallet_sync_meta),
+        }
+
     def expect_empty_wallet_offer_book(
         self, reason: str, ttl_seconds: int = 180
     ) -> None:
@@ -7391,7 +7783,28 @@ class OfferManager:
             return ""
         if not active_offers:
             return "db_no_active_offers"
-        return ""
+
+        # Sage can retain an offer's open-looking status after its max-time
+        # has elapsed, while omitting that max-time from get_offers.  The
+        # durable row still has the exact expiry written when CATalyst created
+        # the offer.  If every protected row is locally expired, accepting the
+        # wallet's empty book is safe and avoids pinning a stale resume cache.
+        now_dt = datetime.now(timezone.utc)
+        for offer in active_offers:
+            expires_at = offer.get("expires_at")
+            if not expires_at:
+                return ""
+            try:
+                expiry_dt = datetime.fromisoformat(
+                    str(expires_at).replace("Z", "+00:00")
+                )
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                return ""
+            if expiry_dt > now_dt:
+                return ""
+        return "db_all_offers_expired"
 
     def _expected_empty_wallet_reason(self, now_ts: float, cached_ids: set) -> str:
         expected_until = float(

@@ -541,6 +541,7 @@ def slog(category: str, message: str, data: dict = None, level: str = "info"):
                 if _log_file and not _log_file.closed:
                     _log_file.write(line + "\n")
                     _bytes_written += len(line) + 1
+                    _log_file.flush()
             except Exception:
                 pass
 

@@ -508,7 +508,7 @@ def test_prepared_operation_must_bind_active_effect_claim_and_fences_capacity(
         "complete": True,
         "wallet_identity": identity,
         "observed_at": "2026-08-21T12:00:01.000000Z",
-        "expires_at": "2026-08-21T12:00:14.000000Z",
+        "expires_at": "2026-08-21T12:00:16.000000Z",
         "coins": expected_outputs,
     }
     contradictory_outputs = [
@@ -550,6 +550,21 @@ def test_prepared_operation_must_bind_active_effect_claim_and_fences_capacity(
     assert capacity["coin_ids"] == ["0x" + output]
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
+    database.trip_runtime_safety_latch(
+        reason_code="WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+        blocking_operation_ids=[f"wallet-effect:{claim['claim_token']}"],
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(
+            binding.fingerprint
+        ),
+        network="mainnet",
+        reason="simulate an older startup reasserting the submitted claim",
+    )
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+    database._reassert_unresolved_wallet_effect_claims(database.get_connection())
+
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
 
 def test_confirmed_outcome_requires_complete_authoritative_proof(isolated_database):
     """Catches a CONFIRMED row created from an empty or count-only assertion."""
@@ -561,6 +576,99 @@ def test_confirmed_outcome_requires_complete_authoritative_proof(isolated_databa
             outcome="CONFIRMED",
             evidence_json={},
         )
+
+
+def test_legacy_sage_even_split_confirmation_resolves_exact_total(
+    isolated_database, monkeypatch
+):
+    """Recover old /split contracts when Sage distributed the remainder."""
+
+    database.init_database()
+    binding = _activate_wallet_authority(
+        monkeypatch, run_id="task-12-legacy-sage-even-split"
+    )
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"legacy-sage-even-source").hexdigest()
+    target = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": index,
+                "amount_mojos": 33,
+                "purpose": "replacement",
+            }
+            for index in range(3)
+        ]
+        + [
+            {
+                "output_index": 3,
+                "amount_mojos": 1,
+                "purpose": "top_up",
+            }
+        ],
+    }
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"], source_coin_ids=[source]
+    )
+    prepared = database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    database.record_coin_prep_operation_outcome(
+        prepared["operation"]["operation_id"],
+        outcome="SUBMITTED_UNKNOWN",
+        evidence_json={
+            "reason_code": "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "dispatch_outcome": "SUBMITTED",
+        },
+    )
+    expected_outputs = [
+        {
+            "coin_id": hashlib.sha256(f"legacy-even-{index}".encode()).hexdigest(),
+            "amount_mojos": amount,
+            "purpose": "replacement",
+        }
+        for index, amount in enumerate([34, 34, 32])
+    ]
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:01.000000Z",
+        "expires_at": "2026-08-21T12:00:16.000000Z",
+        "coins": expected_outputs,
+    }
+
+    confirmed = database.record_coin_prep_operation_outcome(
+        prepared["operation"]["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": [source],
+            "expected_outputs": expected_outputs,
+            "authoritative_view": view,
+            "expected_wallet_identity": identity,
+        },
+    )
+
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
 def test_ambiguous_equal_amount_purposes_stay_latched_with_zero_capacity(
@@ -770,7 +878,7 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
         "complete": True,
         "wallet_identity": dict(expected_identity),
         "observed_at": "2026-08-21T12:00:01.000000Z",
-        "expires_at": "2026-08-21T12:05:00.000000Z",
+        "expires_at": "2026-08-21T12:05:01.000000Z",
         "coins": [dict(item) for item in expected_outputs],
     }
     confirmed = replacement_capacity.verify_coin_prep_post_view(
@@ -797,11 +905,15 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
             "authoritative_view_time_malformed",
         ),
         (
-            {**view, "observed_at": "2026-08-21T12:05:01.000000Z"},
+            {
+                **view,
+                "observed_at": "2026-08-21T12:00:00.000000Z",
+                "expires_at": "2026-08-21T12:05:00.000000Z",
+            },
             "wallet_identity_expired",
         ),
         (
-            {**view, "expires_at": "2026-08-21T12:05:01.000000Z"},
+            {**view, "expires_at": "2026-08-21T12:05:02.000000Z"},
             "authoritative_view_time_malformed",
         ),
         (
@@ -840,3 +952,39 @@ def test_authoritative_post_view_requires_exact_fresh_identity_and_outputs():
         )
         assert decision.confirmed is False
         assert decision.reason == reason
+
+
+def test_authoritative_post_view_uses_observation_freshness_not_startup_binding_age():
+    """A confirmed effect must remain recoverable after its startup binding ages."""
+
+    source = hashlib.sha256(b"late-recovery-source").hexdigest()
+    output = hashlib.sha256(b"late-recovery-output").hexdigest()
+    expected_identity = {
+        "backend": "sage",
+        "name": "Task 12 Wallet",
+        "fingerprint": 123,
+        "network_id": "mainnet",
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": "2026-08-21T12:00:00.000000Z",
+        "maximum_age_seconds": 10,
+    }
+    expected_outputs = [
+        {"coin_id": output, "amount_mojos": 100, "purpose": "replacement"}
+    ]
+
+    decision = replacement_capacity.verify_coin_prep_post_view(
+        source_coin_ids=[source],
+        expected_outputs=expected_outputs,
+        authoritative_view={
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": dict(expected_identity),
+            "observed_at": "2026-08-21T13:00:00.000000Z",
+            "expires_at": "2026-08-21T13:00:10.000000Z",
+            "coins": [dict(expected_outputs[0])],
+        },
+        expected_wallet_identity=expected_identity,
+    )
+
+    assert decision.confirmed is True

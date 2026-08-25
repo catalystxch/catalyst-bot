@@ -428,6 +428,204 @@ class TestStatusEndpointSmoke(_FlaskBase):
         get_spendable_coin_count.assert_not_called()
         get_wallet_balance.assert_not_called()
 
+    def test_stopped_status_reuses_one_bot_state_snapshot(self):
+        stopped_bot = _fake_bot_stopped()
+        original_get_state = stopped_bot.get_state
+        state_reads = 0
+
+        def counted_get_state():
+            nonlocal state_reads
+            state_reads += 1
+            return original_get_state()
+
+        stopped_bot.get_state = counted_get_state
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state_reads, 1)
+
+    def test_stopped_status_reports_durable_open_offers_without_wallet_poll(self):
+        asset_id = "ab" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "ABC_XCH",
+                "name": "ABC",
+            }
+        )
+        durable_buy = {
+            "trade_id": "buy-trade-id",
+            "side": "buy",
+            "price_xch": "0.000064",
+            "size_xch": "1.25",
+            "size_cat": "19531.250",
+            "status": "open",
+        }
+        durable_sell = {
+            "trade_id": "sell-trade-id",
+            "side": "sell",
+            "price_xch": "0.000067",
+            "size_xch": "1.50",
+            "size_cat": "22388.060",
+            "status": "open",
+        }
+
+        def durable_open_offers(*, side=None, cat_asset_id=None, **_kwargs):
+            self.assertEqual(cat_asset_id, asset_id)
+            return [durable_buy] if side == "buy" else [durable_sell]
+
+        with (
+            patch.object(api_server, "bot", _fake_bot_stopped()),
+            patch("database.get_open_offers", side_effect=durable_open_offers),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        offers = resp.get_json()["offers"]
+        self.assertEqual([offer["full_id"] for offer in offers["buy"]], ["buy-trade-id"])
+        self.assertEqual(
+            [offer["full_id"] for offer in offers["sell"]], ["sell-trade-id"]
+        )
+        get_all_offers.assert_not_called()
+
+    def test_stopped_status_prefers_fresh_wallet_offer_snapshot_over_stale_db(self):
+        """A resume-time Sage sync must remove DB-stale offers from the UI."""
+        asset_id = "cd" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        live_buy = {
+            "trade_id": "live-buy-id",
+            "side": "buy",
+            "price_xch": "0.000064",
+            "size_xch": "1.25",
+            "size_cat": "19531.250",
+            "status": "active",
+        }
+        stale_sell = {
+            "trade_id": "stale-sell-id",
+            "side": "sell",
+            "price_xch": "0.000067",
+            "size_xch": "1.50",
+            "size_cat": "22388.060",
+            "status": "open",
+        }
+        stopped_bot = _fake_bot_stopped()
+        stopped_bot.offer_manager = types.SimpleNamespace(
+            get_wallet_sync_snapshot=lambda: {
+                "buy": [live_buy],
+                "sell": [],
+                "closed": [],
+                "meta": {"fresh": True},
+            }
+        )
+
+        def stale_db_offers(*, side=None, cat_asset_id=None, **_kwargs):
+            self.assertEqual(cat_asset_id, asset_id)
+            return [live_buy] if side == "buy" else [stale_sell]
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_open_offers", side_effect=stale_db_offers),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        offers = resp.get_json()["offers"]
+        self.assertEqual(
+            [offer["full_id"] for offer in offers["buy"]], ["live-buy-id"]
+        )
+        self.assertEqual(offers["sell"], [])
+        get_all_offers.assert_not_called()
+
+    def test_stopped_status_enriches_zero_formatted_wallet_amounts_from_db(self):
+        """Sage controls membership while CATalyst retains known display amounts."""
+        asset_id = "ef" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        live_buy = {
+            "trade_id": "live-buy-id",
+            "side": "buy",
+            "size_xch": "0.0000",
+            "size_cat": "0.000",
+            "status": "active",
+        }
+        durable_buy = {
+            "trade_id": "live-buy-id",
+            "side": "buy",
+            "price_xch": "0.000064",
+            "size_xch": "1.25",
+            "size_cat": "19531.250",
+            "status": "open",
+        }
+        stopped_bot = _fake_bot_stopped()
+        stopped_bot.offer_manager = types.SimpleNamespace(
+            get_wallet_sync_snapshot=lambda: {
+                "buy": [live_buy],
+                "sell": [],
+                "closed": [],
+                "meta": {"fresh": True},
+            }
+        )
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_open_offers", return_value=[durable_buy]),
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        offer = resp.get_json()["offers"]["buy"][0]
+        self.assertEqual(offer["size_xch"], "1.2500")
+        self.assertEqual(offer["size_cat"], "19,531.250")
+        self.assertEqual(offer["price"], "0.0000640000")
+        self.assertEqual(offer["status"], "PENDING_ACCEPT")
+
     def test_stopped_bot_state_does_not_read_wallet_for_zero_db_snapshot(self):
         zero_bot = _fake_bot_stopped()
         zero_state = zero_bot.get_state()

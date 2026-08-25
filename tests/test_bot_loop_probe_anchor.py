@@ -37,7 +37,10 @@ class _FakeCfg:
     SNIPER_BUFFER_BPS = Decimal("50")
     OFFER_EXPIRY_SECS = 86400
     OFFER_REFRESH_BEFORE = 1800
-    ADAPTIVE_LADDER_TARGETS = True
+    # This file isolates probe anchoring. Adaptive capacity has its own tests;
+    # leaving it enabled here makes the dummy coin inventory cap every target
+    # at the current live count before the probe behavior can run.
+    ADAPTIVE_LADDER_TARGETS = False
     DB_ONLY_OFFER_CONFIRM_GRACE_SECS = 90
     DB_ONLY_OFFER_RETRY_BACKOFF_SECS = 300
 
@@ -404,6 +407,91 @@ class ProbeAnchorTests(unittest.TestCase):
     def tearDown(self):
         self._cfg_patcher.stop()
 
+    def test_submitted_cancel_retry_ends_cycle_before_later_wallet_mutations(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager.retry_failed_cancels = lambda: -1
+        events = []
+        stop_calls = []
+
+        with (
+            patch.object(loop, "_enter_runtime_effect_phase", return_value=True),
+            patch.object(
+                loop,
+                "stop",
+                side_effect=lambda wait=True: stop_calls.append(wait),
+            ),
+            patch.object(
+                bot_loop,
+                "log_event",
+                side_effect=lambda level, event, message, data=None: events.append(
+                    (level, event, message, data)
+                ),
+            ),
+        ):
+            self.assertFalse(loop._run_cancel_retry_pass())
+
+        self.assertTrue(
+            any(event == "cancel_retry_waiting_for_confirmation" for _, event, _, _ in events)
+        )
+        self.assertEqual(stop_calls, [False])
+
+    def test_exact_cancel_settlement_window_is_the_only_deferred_safety_stop(self):
+        import database as runtime_database
+
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        operation_id = "cancel:" + ("a" * 64)
+        loop.offer_manager.get_active_cancel_settlement_operation = (
+            lambda: operation_id
+        )
+
+        with (
+            patch.object(
+                runtime_database,
+                "get_runtime_safety_latch",
+                return_value={
+                    "state": "tripped",
+                    "generation": 7,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                },
+                create=True,
+            ),
+            patch.object(
+                runtime_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": operation_id}],
+                create=True,
+            ),
+        ):
+            self.assertTrue(
+                loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
+            )
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("WALLET_IDENTITY_MISMATCH")
+            )
+
+        with (
+            patch.object(
+                runtime_database,
+                "get_runtime_safety_latch",
+                return_value={
+                    "state": "tripped",
+                    "generation": 7,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                },
+                create=True,
+            ),
+            patch.object(
+                runtime_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": "cancel:" + ("b" * 64)}],
+                create=True,
+            ),
+        ):
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
+            )
+
     def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
         self,
     ):
@@ -651,11 +739,12 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        targets = loop._get_adaptive_offer_targets(
-            Decimal("1.10"),
-            current_buy_count=4,
-            current_sell_count=2,
-        )
+        with patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True):
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=2,
+            )
 
         self.assertEqual(targets["buy"], 4)
         self.assertEqual(targets["sell"], 2)
@@ -667,11 +756,12 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 2, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        targets = loop._get_adaptive_offer_targets(
-            Decimal("1.10"),
-            current_buy_count=4,
-            current_sell_count=2,
-        )
+        with patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True):
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=2,
+            )
 
         self.assertEqual(targets["sell"], 4)
 
@@ -684,6 +774,7 @@ class ProbeAnchorTests(unittest.TestCase):
         loop._adaptive_target_backoff_until["sell"] = 1300.0
 
         with (
+            patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True),
             patch.object(bot_loop.time, "time", return_value=1000.0),
             patch.object(
                 bot_loop,
@@ -714,7 +805,10 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 2, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        with patch.object(bot_loop.time, "time", return_value=1000.0):
+        with (
+            patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True),
+            patch.object(bot_loop.time, "time", return_value=1000.0),
+        ):
             loop._clear_adaptive_target_backoff_for_confirmed_fills(
                 buy_fills=[],
                 sell_fills=[{"trade_id": "filled-sell"}],
@@ -1159,7 +1253,7 @@ class ProbeAnchorTests(unittest.TestCase):
             Decimal("1.18") / Decimal("1.03"),
         )
 
-    def test_create_offers_if_needed_excludes_live_confirmed_probes_from_slots(self):
+    def test_create_offers_if_needed_counts_live_confirmed_probes_in_hard_cap(self):
         loop = bot_loop.BotLoop()
         loop._probe_state.update(
             {
@@ -1186,8 +1280,8 @@ class ProbeAnchorTests(unittest.TestCase):
         sell_call = next(
             call for call in loop.offer_manager.create_calls if call[0] == "sell"
         )
-        self.assertEqual(buy_call[2]["num_offers"], 4)
-        self.assertEqual(sell_call[2]["num_offers"], 4)
+        self.assertEqual(buy_call[2]["num_offers"], 3)
+        self.assertEqual(sell_call[2]["num_offers"], 3)
 
     def test_create_offers_if_needed_waits_for_wallet_active_pending_cancels(self):
         loop = bot_loop.BotLoop()

@@ -257,6 +257,99 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         self.assertEqual(result["transaction_id"], transaction_id)
         validate_cancel_result(result)
 
+    def test_cancel_offer_derives_identity_from_signed_sage_bundle(self):
+        from chia_rs import Coin, CoinSpend, G2Element, Program, SpendBundle
+        from chia_rs.sized_bytes import bytes32
+
+        coin = Coin(bytes32(b"1" * 32), bytes32(b"2" * 32), 1)
+        coin_spend = CoinSpend(coin, Program.to(1), Program.to([]))
+        spend_bundle = SpendBundle([coin_spend], G2Element())
+        spend_bundle_json = spend_bundle.to_json_dict()
+        expected_transaction_id = spend_bundle.name().hex()
+        requests = []
+
+        def sage_post(endpoint, payload, **kwargs):
+            requests.append((endpoint, payload))
+            if endpoint == "cancel_offer":
+                return {
+                    "summary": {"inputs": [], "outputs": []},
+                    "coin_spends": spend_bundle_json["coin_spends"],
+                }
+            if endpoint == "sign_coin_spends":
+                return {"spend_bundle": spend_bundle_json}
+            if endpoint == "submit_transaction":
+                return {}
+            raise AssertionError(f"unexpected Sage endpoint: {endpoint}")
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(wallet_sage, "_sage_post", side_effect=sage_post),
+            patch.object(wallet_sage, "get_pending_transactions") as pending,
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertEqual(
+            [endpoint for endpoint, _payload in requests],
+            ["cancel_offer", "sign_coin_spends", "submit_transaction"],
+        )
+        self.assertFalse(requests[0][1]["auto_submit"])
+        self.assertEqual(result["outcome"], CANCEL_SUBMITTED_UNCONFIRMED)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["transaction_id"], expected_transaction_id)
+        pending.assert_not_called()
+        validate_cancel_result(result)
+
+    def test_cancel_offer_uses_single_new_pending_txid_when_bundle_name_is_unavailable(
+        self,
+    ):
+        transaction_id = "a" * 64
+        requests = []
+
+        def sage_post(endpoint, payload, **kwargs):
+            requests.append((endpoint, payload))
+            if endpoint == "cancel_offer":
+                return {
+                    "summary": {"inputs": [], "outputs": []},
+                    "coin_spends": [{"coin": "live-sage-shape"}],
+                }
+            if endpoint == "sign_coin_spends":
+                return {
+                    "spend_bundle": {
+                        "coin_spends": [{"coin": "live-sage-shape"}],
+                        "aggregated_signature": "0xsig",
+                    }
+                }
+            if endpoint == "submit_transaction":
+                return {"success": True, "status": "success"}
+            raise AssertionError(f"unexpected Sage endpoint: {endpoint}")
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(wallet_sage, "_sage_post", side_effect=sage_post),
+            patch.object(
+                wallet_sage,
+                "_spend_bundle_transaction_id",
+                return_value=None,
+            ),
+            patch.object(
+                wallet_sage,
+                "get_pending_transactions",
+                side_effect=[[], [{"transaction_id": transaction_id}]],
+            ),
+            patch("builtins.print"),
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=False)
+
+        self.assertEqual(
+            [endpoint for endpoint, _payload in requests],
+            ["cancel_offer", "sign_coin_spends", "submit_transaction"],
+        )
+        self.assertEqual(result["outcome"], CANCEL_SUBMITTED_UNCONFIRMED)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["transaction_id"], transaction_id)
+        validate_cancel_result(result)
+
     def test_cancel_offer_local_signing_rejection_is_failed_without_effect(self):
         rechecks = []
         with (

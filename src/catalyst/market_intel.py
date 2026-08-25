@@ -821,6 +821,7 @@ class MarketIntel:
         with self._lock:
             buy_offers = list(self._orderbook.get("buy_offers", []))
             sell_offers = list(self._orderbook.get("sell_offers", []))
+            source = str(self._competitors.get("orderbook_source", "") or "")
 
         our_buys = [offer for offer in buy_offers if offer.get("is_ours")]
         our_sells = [offer for offer in sell_offers if offer.get("is_ours")]
@@ -838,6 +839,7 @@ class MarketIntel:
             "page_size": int(self._orderbook_page_size or 0),
             "buy_truncated": len(buy_offers) >= int(self._orderbook_page_size or 0),
             "sell_truncated": len(sell_offers) >= int(self._orderbook_page_size or 0),
+            "source": source,
             "our_best_bid": str(our_best_bid),
             "our_best_ask": str(our_best_ask),
         }

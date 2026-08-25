@@ -500,6 +500,103 @@ def test_exact_zero_fee_cancel_return_flow_is_proven():
     ]
 
 
+def test_exact_post_expiry_cancel_return_proof_overrides_expired_wallet_label():
+    """A cancel submitted after expiry still has an exact on-chain effect."""
+
+    evidence = _evidence(
+        offers=[_offer(status=5)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 990,
+                        "address_kind": "own",
+                        "parent_coin_id": COIN,
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=990,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    result = _classify(evidence, cancel_context=_cancel_context())
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["reason_code"] == "EXACT_POST_EXPIRY_CANCEL_RETURN_PROOF"
+    assert result["fee_mojos"] == 10
+
+
+def test_cancel_accepts_confirmed_block_timestamp_within_source_skew():
+    transaction_timestamp = "2026-08-20T12:00:02.000000Z"
+    request_timestamp = "2026-08-20T12:00:49.000000Z"
+    observed_at = "2026-08-20T12:00:50.000000Z"
+    evidence = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                timestamp=transaction_timestamp,
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    }
+                ],
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+        observed_at=observed_at,
+    )
+    context = _cancel_context()
+    context["members"][0]["request_timestamp"] = request_timestamp
+    context["members"][0]["transaction_timestamp"] = transaction_timestamp
+
+    result = classify_terminal_evidence(
+        _intent(),
+        evidence,
+        cancel_context=context,
+        now=observed_at,
+    )
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["reason_code"] == "EXACT_CANCEL_RETURN_PROOF"
+
+
 def _same_value_cancel_evidence(*, with_lineage: bool) -> tuple[dict, dict, dict]:
     spent = [
         {
@@ -1156,6 +1253,47 @@ def test_exact_authoritative_expiry_with_owned_unspent_input_is_proven():
     assert _classify(evidence)["classification"] == EXPIRED_PROVEN
 
 
+def test_sage_expiry_with_owned_unspent_input_after_offer_unlock_is_proven():
+    """Sage clears offer_id when an expired offer releases its input coin."""
+
+    evidence = _evidence(
+        offers=[_offer(status="expired", transaction_id="")],
+        transactions=[],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                offer_id=None,
+            )
+        },
+    )
+
+    assert _classify(evidence)["classification"] == EXPIRED_PROVEN
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_sage_expiry_accepts_unlocked_coin_when_asset_field_is_omitted(side):
+    """Sage omits asset_id as well as offer_id on released expiry inputs."""
+
+    evidence = _evidence(
+        offers=[_offer(status="expired", transaction_id="", side=side)],
+        transactions=[],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id=None,
+                amount=1000,
+                offer_id=None,
+            )
+        },
+    )
+
+    result = _classify(evidence, intent=_intent(side=side))
+
+    assert result["classification"] == EXPIRED_PROVEN
+
+
 def test_local_expiry_and_offer_absence_are_never_terminal_proof():
     result = _classify(
         _evidence(offers=[], transactions=[], local_expired=True),
@@ -1371,6 +1509,32 @@ def test_sage_loader_rejects_stable_oversized_snapshot_without_authoritative_end
     assert source["complete"] is False
     assert source["pagination"]["remote_bounds_honored"] is False
     assert source["pagination"]["stable_oversized_snapshot"] is True
+    assert len(calls) == 2
+
+
+def test_sage_loader_rejects_repeated_exact_page_with_page_local_total():
+    """A provider-local ``total`` must not bless an ignored page boundary."""
+
+    rows = [_offer(status=1, trade_id=f"{index:064x}") for index in range(2)]
+    calls = []
+
+    def ignored_bounds_with_page_total(**kwargs):
+        calls.append(kwargs)
+        return {"offers": [dict(row) for row in rows], "total": len(rows)}
+
+    source = load_sage_offer_history(
+        get_all_offers=ignored_bounds_with_page_total,
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=2,
+        max_pages=4,
+        max_records=10,
+    )
+
+    assert len(source["records"]) == 2
+    assert source["complete"] is False
+    assert source["pagination"]["remote_bounds_honored"] is False
+    assert source["pagination"]["stable_oversized_snapshot"] is False
     assert len(calls) == 2
 
 
@@ -1766,6 +1930,90 @@ def test_sage_coin_adapter_normalizes_explicit_native_asset_without_inventing_mi
 
     assert records["0x" + COIN]["asset_id"] == "xch"
     assert "asset_id" not in records["0x" + OTHER_COIN]
+
+
+def test_sage_coin_adapter_recovers_missing_asset_from_exact_offer_lock(monkeypatch):
+    """Sage's offer-locked CAT rows can omit asset_id; the offer is authority."""
+    import wallet_sage
+
+    def sage_rpc(method, *_args, **_kwargs):
+        if method == "get_coins_by_ids":
+            return {
+                "coins": [
+                    {
+                        "coin_id": COIN,
+                        "amount": "33887186",
+                        "owned": True,
+                        "offer_id": TRADE,
+                        "spent_height": None,
+                    }
+                ]
+            }
+        if method == "get_offers":
+            return {
+                "offers": [
+                    {
+                        "offer_id": TRADE,
+                        "status": 1,
+                        "summary": {
+                            "maker": [
+                                {
+                                    "asset": {"asset_id": ASSET},
+                                    "amount": 28804800,
+                                }
+                            ],
+                            "taker": [
+                                {"asset": {"asset_id": None}, "amount": 1000}
+                            ],
+                        },
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected Sage RPC: {method}")
+
+    monkeypatch.setattr(wallet_sage, "rpc", sage_rpc)
+
+    records = wallet_sage.get_coins_by_ids([COIN])
+
+    assert records["0x" + COIN]["asset_id"] == ASSET
+
+
+def test_sage_coin_adapter_does_not_infer_ambiguous_offer_asset(monkeypatch):
+    import wallet_sage
+
+    def sage_rpc(method, *_args, **_kwargs):
+        if method == "get_coins_by_ids":
+            return {
+                "coins": [
+                    {
+                        "coin_id": COIN,
+                        "amount": "33887186",
+                        "owned": True,
+                        "offer_id": TRADE,
+                        "spent_height": None,
+                    }
+                ]
+            }
+        if method == "get_offers":
+            return {
+                "offers": [
+                    {
+                        "offer_id": TRADE,
+                        "status": 1,
+                        "summary": {
+                            "offered": {ASSET: 28804800, OTHER_TRADE: 7},
+                            "requested": {"xch": 1000},
+                        },
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected Sage RPC: {method}")
+
+    monkeypatch.setattr(wallet_sage, "rpc", sage_rpc)
+
+    records = wallet_sage.get_coins_by_ids([COIN])
+
+    assert "asset_id" not in records["0x" + COIN]
 
 
 @pytest.mark.parametrize(
@@ -3280,6 +3528,7 @@ def _persist_cancel_result(
     attempt: int = 1,
     transaction_id: str = "",
     spend_identity: str = "",
+    effect_attempted: bool | None = None,
 ) -> dict:
     result = cancellation_result(
         outcome,
@@ -3289,6 +3538,9 @@ def _persist_cancel_result(
         transaction_id=transaction_id,
         spend_identity=spend_identity,
     )
+    evidence = {"trade_id": TRADE, "cancel_result": result}
+    if effect_attempted is not None:
+        evidence["effect_attempted"] = effect_attempted
     return database.finalize_offer_cancel(
         operation_id=f"cancel:{TRADE}",
         event_id=f"cancel:{TRADE}:attempt:{attempt}:finalized",
@@ -3300,7 +3552,7 @@ def _persist_cancel_result(
             "wallet_fingerprint_hash": WALLET,
             "network": NETWORK,
         },
-        evidence_json={"trade_id": TRADE, "cancel_result": result},
+        evidence_json=evidence,
         finalized_at=AFTER,
     )
 
@@ -7378,10 +7630,21 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
     assert database.get_coin_state(RETURN)["amount_mojos"] == 1000
 
 
+@pytest.mark.parametrize("include_auxiliary_fee_coin", [False, True])
+@pytest.mark.parametrize("transaction_offset_seconds", [10, -47])
+@pytest.mark.parametrize("submitted_with_pending_txid", [False, True])
 def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
     isolated_database,
+    include_auxiliary_fee_coin,
+    transaction_offset_seconds,
+    submitted_with_pending_txid,
 ):
     _persist_created_offer()
+    cancel_wallet_identity = {
+        "backend": "sage",
+        "wallet_fingerprint_hash": WALLET,
+        "network": NETWORK,
+    }
     cohort_id = "cancel-cohort:" + "a" * 64
     member_id = "cancel-member:" + "c" * 64
     prepared = database.prepare_offer_cancel(
@@ -7390,10 +7653,7 @@ def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
         trade_id=TRADE,
         intent_id="intent-task9",
         attempt=1,
-        wallet_identity_json={
-            "wallet_fingerprint_hash": WALLET,
-            "network": NETWORK,
-        },
+        wallet_identity_json=cancel_wallet_identity,
         evidence_json={
             "trade_id": TRADE,
             "intent_id": "intent-task9",
@@ -7415,11 +7675,20 @@ def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
         attempt=1,
         claimed_at=AT,
     )
-    unknown = cancellation_result(
-        CANCEL_UNKNOWN,
+    cancel_result = cancellation_result(
+        (
+            CANCEL_SUBMITTED_UNCONFIRMED
+            if submitted_with_pending_txid
+            else CANCEL_UNKNOWN
+        ),
         method="single_rpc",
-        raw_response={"coin_spends": [{}], "aggregated_signature": "redacted"},
-        error="CANCEL_ERROR_UNCLASSIFIED",
+        raw_response={
+            "coin_spends": [{}] * (2 if include_auxiliary_fee_coin else 1),
+            "aggregated_signature": "redacted",
+            **({"transaction_id": TX} if submitted_with_pending_txid else {}),
+        },
+        error="" if submitted_with_pending_txid else "CANCEL_ERROR_UNCLASSIFIED",
+        transaction_id=TX if submitted_with_pending_txid else "",
     )
     database.finalize_offer_cancel(
         operation_id=f"cancel:{TRADE}",
@@ -7427,24 +7696,91 @@ def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
         trade_id=TRADE,
         intent_id="intent-task9",
         attempt=1,
-        cancel_result=unknown,
-        wallet_identity_json={
-            "wallet_fingerprint_hash": WALLET,
-            "network": NETWORK,
-        },
+        cancel_result=cancel_result,
+        wallet_identity_json=cancel_wallet_identity,
         evidence_json={
             "trade_id": TRADE,
             "attempt": 1,
             "cohort_id": cohort_id,
             "member_id": member_id,
             "effect_attempted": True,
-            "cancel_result": unknown,
+            "cancel_result": cancel_result,
         },
         finalized_at=AFTER,
     )
     tx_timestamp = int(
-        datetime.fromisoformat(RECONCILED.replace("Z", "+00:00")).timestamp()
+        (
+            datetime.fromisoformat(AT.replace("Z", "+00:00"))
+            + timedelta(seconds=transaction_offset_seconds)
+        ).timestamp()
     )
+    spent = [
+        {
+            "coin_id": COIN,
+            "asset": {"asset_id": None},
+            "amount": 1000,
+            "address_kind": "own",
+        }
+    ]
+    returned_amount = 999
+    created = [
+        {
+            "coin_id": RETURN,
+            "asset": {"asset_id": None},
+            "amount": returned_amount,
+            "address_kind": "own",
+        }
+    ]
+    coins = {
+        "0x" + COIN: {
+            "amount": 1000,
+            "offer_id": None,
+            "spent_height": 42,
+            "created_height": 1,
+            "transaction_id": None,
+        },
+        "0x" + RETURN: {
+            "amount": returned_amount,
+            "offer_id": None,
+            "spent_height": None,
+            "created_height": 42,
+            "transaction_id": None,
+        },
+    }
+    if include_auxiliary_fee_coin:
+        spent.append(
+            {
+                "coin_id": FEE_COIN,
+                "asset": {"asset_id": None},
+                "amount": 100,
+                "address_kind": "own",
+            }
+        )
+        returned_amount = 1000
+        created[0]["amount"] = returned_amount
+        created.append(
+            {
+                "coin_id": FEE_RETURN,
+                "asset": {"asset_id": None},
+                "amount": 99,
+                "address_kind": "own",
+            }
+        )
+        coins["0x" + FEE_COIN] = {
+            "amount": 100,
+            "offer_id": None,
+            "spent_height": 42,
+            "created_height": 1,
+            "transaction_id": None,
+        }
+        coins["0x" + RETURN]["amount"] = returned_amount
+        coins["0x" + FEE_RETURN] = {
+            "amount": 99,
+            "offer_id": None,
+            "spent_height": None,
+            "created_height": 42,
+            "transaction_id": None,
+        }
     facade = SimpleNamespace(
         get_wallet_backend_authority=lambda: "sage",
         get_wallet_identity=lambda: {
@@ -7474,42 +7810,13 @@ def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
                 {
                     "height": 42,
                     "timestamp": tx_timestamp,
-                    "spent": [
-                        {
-                            "coin_id": COIN,
-                            "asset": {"asset_id": None},
-                            "amount": 1000,
-                            "address_kind": "own",
-                        }
-                    ],
-                    "created": [
-                        {
-                            "coin_id": RETURN,
-                            "asset": {"asset_id": None},
-                            "amount": 999,
-                            "address_kind": "own",
-                        }
-                    ],
+                    "spent": spent,
+                    "created": created,
                 }
             ],
             "total": 1,
         },
-        get_coins_by_ids=lambda _coin_ids: {
-            "0x" + COIN: {
-                "amount": 1000,
-                "offer_id": None,
-                "spent_height": 42,
-                "created_height": 1,
-                "transaction_id": None,
-            },
-            "0x" + RETURN: {
-                "amount": 999,
-                "offer_id": None,
-                "spent_height": None,
-                "created_height": 42,
-                "transaction_id": None,
-            },
-        },
+        get_coins_by_ids=lambda _coin_ids: coins,
     )
 
     evidence = load_authoritative_evidence(
@@ -7530,7 +7837,7 @@ def test_sage_ambiguous_cancel_auto_derives_task8_context_from_exact_chain_flow(
     assert database.get_coin_state(COIN)["status"] == "spent"
     returned = database.get_coin_state(RETURN)
     assert returned["status"] == "free"
-    assert returned["amount_mojos"] == 999
+    assert returned["amount_mojos"] == returned_amount
     latest_cancel = database.get_offer_operation_events(f"cancel:{TRADE}")[-1]
     assert latest_cancel["phase"] == "RECONCILED"
     assert latest_cancel["outcome"] == "CANCEL_CONFIRMED"
@@ -7970,6 +8277,38 @@ def test_cancel_commit_rejects_context_identity_different_from_task8_result(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
+def test_cancel_commit_accepts_sage_pending_txid_confirmed_as_spend_identity(
+    isolated_database,
+):
+    _persist_created_offer()
+    _persist_cancel_prepared()
+    _persist_cancel_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        transaction_id=TX,
+        effect_attempted=True,
+    )
+    evidence = _cancel_evidence_with_identity(
+        transaction_id="",
+        spend_identity=SPEND,
+    )
+    context = _cancel_context(
+        transaction_id=None,
+        spend_identity=SPEND,
+    )
+
+    result = reconcile_offer(
+        "intent-task9",
+        evidence=evidence,
+        cancel_context=context,
+        now=AFTER,
+    )
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["applied"] is True
+    assert database.get_offer(TRADE)["status"] == "cancelled"
+    assert database.get_coin_state(COIN)["status"] == "spent"
+
+
 def test_cancel_commit_rejects_newer_attempt_than_bound_context_and_trips_latch(
     isolated_database,
 ):
@@ -8288,6 +8627,89 @@ def test_cancel_commit_validates_cohort_manifest_and_resolves_only_target_blocke
     assert [event["outcome"] for event in sibling_events] == ["PREPARED"]
     assert sibling_events[-1]["blocks_mutation"] == 1
     assert database.get_coin_state(OTHER_COIN)["status"] == "locked"
+
+
+def test_ambiguous_single_member_of_grouped_cohort_auto_derives_manifest_subset(
+    isolated_database,
+):
+    """A sequential batch may confirm one member before its siblings run."""
+    context, evidence = _persist_grouped_cancel_case()
+    target = next(member for member in context["members"] if member["trade_id"] == TRADE)
+    unknown = cancellation_result(
+        CANCEL_UNKNOWN,
+        method="single_rpc",
+        raw_response={"coin_spends": [{}], "aggregated_signature": "redacted"},
+        error="CANCEL_ERROR_UNCLASSIFIED",
+    )
+    database.finalize_offer_cancel(
+        operation_id=f"cancel:{TRADE}",
+        event_id=f"cancel:{TRADE}:attempt:1:finalized",
+        trade_id=TRADE,
+        intent_id=target["intent_id"],
+        attempt=1,
+        cancel_result=unknown,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": WALLET,
+            "network": NETWORK,
+        },
+        evidence_json={
+            "trade_id": TRADE,
+            "attempt": 1,
+            "cohort_id": context["cohort_id"],
+            "member_id": target["member_id"],
+            "effect_attempted": True,
+            "cancel_result": unknown,
+        },
+        finalized_at=AFTER,
+    )
+    evidence["offer_history"]["records"] = [_offer(status=3)]
+    transaction = evidence["transaction_history"]["records"][0]
+    transaction["spent"] = [
+        {
+            "coin_id": COIN,
+            "asset_id": "xch",
+            "amount": 1000,
+            "address_kind": "offer",
+        }
+    ]
+    transaction["created"] = [
+        {
+            "coin_id": RETURN,
+            "asset_id": "xch",
+            "amount": 1000,
+            "address_kind": "own",
+        }
+    ]
+    evidence["coin_records"]["records"] = {
+        COIN: _coin(
+            COIN,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=TRADE,
+        ),
+        RETURN: _coin(
+            RETURN,
+            asset_id="xch",
+            amount=1000,
+            created_height=42,
+            transaction_id=TX,
+        ),
+    }
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == CANCELLED_PROVEN
+    durable = json.loads(result["event"]["evidence_json"])
+    exact = durable.get("exact_subset", durable)
+    assert exact["cancel_context"]["manifest_sha256"] == context["manifest_sha256"]
+    assert [member["trade_id"] for member in exact["cancel_context"]["members"]] == [
+        TRADE
+    ]
+    sibling_events = database.get_offer_operation_events(f"cancel:{OTHER_TRADE}")
+    assert sibling_events[-1]["phase"] == "PREPARED"
+    assert sibling_events[-1]["blocks_mutation"] == 1
 
 
 def test_cancel_commit_rechecks_changed_sibling_sequence_inside_terminal_transaction(
@@ -9171,6 +9593,22 @@ def test_unlinked_coin_repair_never_terminalizes_from_wallet_absence(monkeypatch
 
     fake_database.update_offer_status.assert_not_called()
     fake_database.lock_coin.assert_called_once_with(database.norm_coin_id(COIN), TRADE)
+
+
+def test_unlinked_coin_query_matches_offer_and_coin_id_prefix_forms(isolated_database):
+    """A durable lock must not look missing solely because offers omit ``0x``."""
+
+    _persist_created_offer()
+    conn = database.get_connection()
+    conn.execute("UPDATE offers SET coin_id=? WHERE trade_id=?", (COIN, TRADE))
+    conn.commit()
+
+    offer = database.get_offer(TRADE)
+    coin = database.get_coin_state(COIN)
+    assert offer["coin_id"] == COIN
+    assert coin["coin_id"] == database.norm_coin_id(COIN)
+    assert coin["status"] == "locked"
+    assert database.get_unlinked_open_offer_coins(limit=50) == []
 
 
 def test_repeated_wallet_absence_cannot_retire_created_intent_or_release_coin(

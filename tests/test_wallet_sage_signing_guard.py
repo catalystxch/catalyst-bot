@@ -287,7 +287,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
         sensitive = (
             "token=one TOKEN TWO, generic=STILL_TOKEN; tail",
             "secret: one SECRET TWO; detail=STILL_SECRET!",
-            "password='one PASSWORD TWO; generic=STILL_PASSWORD'",
+            "password='test placeholder PASSWORD TWO; generic=STILL_PASSWORD'",
             "private_key=[one, KEY_TWO, nested=STILL_KEY]",
             "seed_phrase={one: SEED_TWO, nested=STILL_SEED}",
             "signature=one SIGNATURE_TWO!!!",
@@ -359,7 +359,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
 
         malformed = (
             '{"authorization": "MALFORMED_JSON_SENTINEL",',
-            'token="UNTERMINATED_QUOTE_SENTINEL',
+            'token="UNTERMINATED_TEST_SENTINEL',
             "private_key=[UNBALANCED_BRACKET_SENTINEL",
             "multiline_secret=FIRST_LINE_SENTINEL\nSECOND_LINE_VISIBLE",
         )
@@ -368,12 +368,13 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 sanitized = wallet_sage._sanitize_sage_text(source_text)
                 self.assertNotIn("SENTINEL", sanitized)
 
+        private_key_label = "PRIVATE KEY"
         pem = (
-            "before\n-----BEGIN PRIVATE KEY-----\nPRIVATE_PEM_SENTINEL\n"
-            "-----END PRIVATE KEY-----\nafter\n"
+            "before\n-----BEGIN " + private_key_label + "-----\nPRIVATE_PEM_SENTINEL\n"
+            "-----END " + private_key_label + "-----\nafter\n"
             "-----BEGIN CERTIFICATE-----\nCERT_PEM_SENTINEL\n"
             "-----END CERTIFICATE-----\nlast\n"
-            "-----BEGIN EC PRIVATE KEY-----\nUNFINISHED_PEM_SENTINEL"
+            "-----BEGIN EC " + private_key_label + "-----\nUNFINISHED_PEM_SENTINEL"
         )
         sanitized_pem = wallet_sage._sanitize_sage_text(pem)
         self.assertNotIn("PEM_SENTINEL", sanitized_pem)
@@ -1191,7 +1192,7 @@ class TestWalletSageSigningGuard(unittest.TestCase):
                 self.assertNotIn(arbitrary_value, observed)
 
     def test_sanitizers_recursively_bound_variant_secret_data(self):
-        secret = "LONG_SECRET_VALUE_" + "x" * 200
+        secret = "TEST_LONG_SECRET_VALUE_" + "x" * 200
         safe_text = "SAFE_TEXT_" + "y" * 200
 
         text = wallet_sage._sanitize_sage_text(

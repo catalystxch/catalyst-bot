@@ -224,6 +224,14 @@ class TestStartupPhase1CheckResume(_TempDB):
         self.assertIn("buy_count", body)
         self.assertIn("sell_count", body)
 
+    def test_resume_saved_settings_exposes_live_offer_caps(self):
+        """Recovery UI receives the configured buy/sell book limits."""
+        resp = self._check([{"trade_id": "b1"}], classified_buy=[{"trade_id": "b1"}])
+        saved = resp.get_json()["saved_settings"]
+
+        self.assertEqual(saved["max_buy"], api_server.cfg.MAX_ACTIVE_BUY_OFFERS)
+        self.assertEqual(saved["max_sell"], api_server.cfg.MAX_ACTIVE_SELL_OFFERS)
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: session mode selection (fresh-start vs resume-chosen)

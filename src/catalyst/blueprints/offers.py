@@ -18,6 +18,7 @@ from decimal import Decimal
 from flask import Blueprint, current_app, jsonify, request
 
 import api_server
+import database
 from config import cfg
 from database import log_event, get_stats, get_connection
 from super_log import slog
@@ -46,6 +47,39 @@ def _decimal_or_none(value) -> Decimal | None:
 
 _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
+
+
+def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
+    """Return exact retry authority for wallet-active, no-effect failures."""
+
+    exact_open_ids = {
+        trade_id for trade_id in open_ids if type(trade_id) is str and trade_id
+    }
+    try:
+        candidates = database.get_retryable_failed_offer_cancels()
+    except Exception as exc:
+        log_event(
+            "error",
+            "cancel_all_retry_journal_unavailable",
+            f"Could not read durable failed cancellations: {type(exc).__name__}",
+        )
+        return {}
+    retries: dict[str, int] = {}
+    for row in candidates if type(candidates) is list else []:
+        if type(row) is not dict:
+            continue
+        trade_id = row.get("trade_id")
+        attempt = row.get("attempt")
+        if (
+            trade_id in exact_open_ids
+            and row.get("operation_id") == f"cancel:{trade_id}"
+            and type(attempt) is int
+            and not isinstance(attempt, bool)
+            and attempt >= 1
+            and trade_id not in retries
+        ):
+            retries[trade_id] = attempt
+    return retries
 
 
 def _norm_offer_state(value) -> str:
@@ -473,15 +507,24 @@ def api_cancel_all():
 
             # ---- Background worker ----
             _cancel_open_ids = list(open_ids)  # snapshot
+            _retry_failed_attempts = _durable_failed_cancel_retry_attempts(
+                _cancel_open_ids
+            )
 
             def _cancel_all_worker():
                 _w_pending = 0
                 _w_failed = 0
                 try:
+                    _cancel_kwargs = {
+                        "reason": "manual_cancel_all",
+                        "force_storm": True,
+                    }
+                    if _retry_failed_attempts:
+                        _cancel_kwargs["_retry_failed_attempts"] = (
+                            _retry_failed_attempts
+                        )
                     _results = durable_manager.cancel_offers(
-                        _cancel_open_ids,
-                        reason="manual_cancel_all",
-                        force_storm=True,
+                        _cancel_open_ids, **_cancel_kwargs
                     )
                     for _tid in _cancel_open_ids:
                         _res = _results.get(_tid) if type(_results) is dict else None
@@ -1822,6 +1865,7 @@ def api_pnl():
             "pending_verification_count": server._get_session_pending_verification_count(),
             "avg_spread_capture": stats.get("avg_spread_capture", "0"),
             "net_position_cat": inventory.get("net_position_cat", "0"),
+            "max_position_xch": str(cfg.MAX_POSITION_XCH),
             "circuit_breaker_active": inventory.get("circuit_breaker_active", False),
             "sniper": sniper_stats,
             # Extended statistics

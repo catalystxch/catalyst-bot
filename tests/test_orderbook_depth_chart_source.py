@@ -55,3 +55,13 @@ def test_market_intel_sse_payload_includes_dexie_totals():
     assert '"dexie_total_buy_depth_cat"' in bot_loop
     assert '"dexie_total_sell_depth_xch"' in bot_loop
     assert '"dexie_total_sell_depth_cat"' in bot_loop
+
+
+def test_running_pair_hydration_refreshes_dashboard_market_strip_immediately():
+    html = GUI.read_text(encoding="utf-8")
+
+    expected = (
+        "try { updateTokenSnapshot(currentCAT); } catch (_) {}\n"
+        "                        try { fetchMarketSummary(); } catch (_) {}"
+    )
+    assert expected in html

@@ -43,8 +43,9 @@ def resolve_cat_metadata(
 ) -> Dict:
     """Query TibetSwap to resolve CAT metadata from asset_id.
 
-    Returns dict with keys: pair_id, ticker_id, name, short_name, verified.
-    All values are None if the CAT is not found on TibetSwap.
+    Returns dict with keys: pair_id, ticker_id, name, short_name, verified,
+    and pair_lookup_status.  The status distinguishes a successful lookup
+    with no matching pool from an unavailable provider.
 
     This is safe to call at startup — failures return empty dict, never raise.
     """
@@ -54,6 +55,7 @@ def resolve_cat_metadata(
         "name": None,
         "short_name": None,
         "verified": None,
+        "pair_lookup_status": "not_found",
     }
 
     if not asset_id:
@@ -101,6 +103,8 @@ def resolve_cat_metadata(
             for p in pairs:
                 if str(p.get("asset_id", "")).lower() == asset_id_norm:
                     result["pair_id"] = p.get("pair_id") or None
+                    if result["pair_id"]:
+                        result["pair_lookup_status"] = "resolved"
                     # Fill name/short_name from pairs if /tokens didn't have it
                     if not result["name"]:
                         result["name"] = p.get("asset_name") or None
@@ -110,6 +114,7 @@ def resolve_cat_metadata(
                         result["ticker_id"] = f"{result['short_name']}_XCH"
                     break
     except Exception as e:
+        result["pair_lookup_status"] = "unavailable"
         log_event(
             "warning",
             "cat_resolver_pair_fetch_failed",
