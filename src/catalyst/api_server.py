@@ -350,6 +350,21 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
         or startup_authorization.get("reason_code") != "WALLET_IDENTITY_BINDING_INVALID"
     ):
         return False
+    raw_backend = getattr(cfg, "WALLET_TYPE", "")
+    raw_fingerprint = getattr(cfg, "SAGE_FINGERPRINT", "")
+    raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
+    raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+    if (
+        type(raw_backend) is not str
+        or raw_backend.strip().lower() != "sage"
+        or type(raw_fingerprint) is not str
+        or bool(raw_fingerprint.strip())
+        or type(raw_expected_name) is not str
+        or bool(raw_expected_name.strip())
+        or type(raw_expected_kind) is not str
+        or raw_expected_kind.strip().lower() not in {"", "bls"}
+    ):
+        return False
     _wallet_hash, network = _configured_mutation_binding()
     if _configured_wallet_identity_binding(network) is not None:
         return False

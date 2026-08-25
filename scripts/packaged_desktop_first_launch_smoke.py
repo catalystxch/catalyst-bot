@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import socket
@@ -12,6 +13,9 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+
+if os.name == "nt":
+    from ctypes import wintypes
 
 
 class SmokeFailure(RuntimeError):
@@ -42,6 +46,42 @@ def _clean_first_launch_env(data_dir: Path, port: int) -> dict[str, str]:
         }
     )
     return env
+
+
+def _visible_catalyst_window(process_id: int) -> str | None:
+    """Return the title of a visible CATalyst top-level window for one PID."""
+
+    if os.name != "nt":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    titles: list[str] = []
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+
+    @callback_type
+    def inspect_window(handle, _context):
+        if not user32.IsWindowVisible(handle):
+            return True
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(handle, ctypes.byref(owner_pid))
+        if owner_pid.value != process_id:
+            return True
+        length = user32.GetWindowTextLengthW(handle)
+        if length < 1:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(handle, buffer, len(buffer))
+        title = buffer.value.strip()
+        if "catalyst" in title.lower():
+            titles.append(title)
+            return False
+        return True
+
+    user32.EnumWindows(inspect_window, 0)
+    return titles[0] if titles else None
 
 
 def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
@@ -79,6 +119,10 @@ def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
                 raise SmokeFailure(
                     "unconfigured first launch unexpectedly enabled trading"
                 )
+            if _visible_catalyst_window(process.pid) is None:
+                last_error = "native CATalyst window not visible"
+                time.sleep(0.25)
+                continue
             return
         except SmokeFailure:
             raise

@@ -130,6 +130,26 @@ def test_bootstrap_candidate_requires_unconfigured_identity_and_clean_durable_st
     assert api_server.wallet_setup_bootstrap_active() is False
 
 
+def test_bootstrap_rejects_malformed_complete_identity_settings(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(api_server.cfg, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(api_server.cfg, "SAGE_FINGERPRINT", "abc")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_NAME", "TEST 7")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_KEY_KIND", "bls")
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        _clean_snapshot,
+    )
+
+    assert (
+        api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
+        is False
+    )
+    assert api_server.wallet_setup_bootstrap_active() is False
+
+
 def test_bootstrap_allows_only_wallet_setup_operations(monkeypatch):
     import api_server
 

@@ -1402,6 +1402,8 @@ class Config:
                             note="Exact Sage identity selected during first launch",
                         )
                     except Exception:
+                        # Audit telemetry must not roll back a binding that was
+                        # already persisted atomically to the protected env file.
                         pass
             return True
         except Exception:
@@ -1409,6 +1411,7 @@ class Config:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
             except OSError:
+                # Preserve the original persistence failure for the caller.
                 pass
             return False
 
