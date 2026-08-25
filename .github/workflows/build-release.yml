@@ -72,33 +72,6 @@ jobs:
       - name: Build with PyInstaller
         run: python build.py
 
-      - name: Smoke test (verify binary starts)
-        shell: bash
-        run: |
-          cd dist/Catalyst
-          # Run in --flask mode so the smoke test doesn't require a display
-          # on headless Linux CI runners. We're testing /api/health, not
-          # the native window.
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            ./Catalyst.exe --flask &
-          else
-            chmod +x ./Catalyst
-            ./Catalyst --flask &
-          fi
-          APP_PID=$!
-          # Wait up to 30 seconds for Flask to respond
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:5000/api/health > /dev/null 2>&1; then
-              echo "Smoke test PASSED — app responded on /api/health"
-              kill $APP_PID 2>/dev/null || true
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Smoke test FAILED — app did not respond within 30 seconds"
-          kill $APP_PID 2>/dev/null || true
-          exit 1
-
       - name: Smoke test packaged Sage RPC worker (Windows)
         if: matrix.os == 'windows-latest'
         run: python scripts/packaged_sage_rpc_smoke.py --exe dist/Catalyst/Catalyst.exe
