@@ -5227,11 +5227,12 @@ def test_windows_owner_handoff_retries_while_native_window_is_starting(monkeypat
         desktop_app.time, "sleep", lambda seconds: attempts.append(seconds)
     )
 
-    assert desktop_app._focus_existing_catalyst_window(
+    focused = desktop_app._focus_existing_catalyst_window(
         owner_pid=4567,
         timeout_seconds=2,
         focus_attempt=lambda pid: attempts.append(pid) or next(outcomes),
     )
+    assert focused
     assert attempts == [4567, 0.1, 4567, 0.1, 4567]
 
 

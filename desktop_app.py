@@ -630,6 +630,7 @@ def _instance_lock_reported_pid() -> int | None:
                 if candidate > 0 and candidate != os.getpid():
                     return candidate
     except Exception:
+        # A stale or partially-written lock is not owner evidence.
         pass
     return None
 
@@ -645,6 +646,7 @@ def _current_profile_owner_pid() -> int | None:
         if lease.get("active") is True and candidate > 0 and candidate != os.getpid():
             return candidate
     except Exception:
+        # Fall back to the independently maintained instance lock below.
         pass
     return _instance_lock_reported_pid()
 
@@ -766,9 +768,11 @@ def _attach_to_kill_on_close_job() -> bool:
         return False
     try:
         import ctypes
-        from ctypes import wintypes
+        import ctypes.wintypes
     except Exception:
         return False
+
+    wintypes = ctypes.wintypes
 
     JobObjectExtendedLimitInformation = 9
 
