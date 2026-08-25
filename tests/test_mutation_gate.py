@@ -4918,6 +4918,7 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
 
     started = []
     reservation = SimpleNamespace(port=desktop_app.FLASK_PORT + 7)
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
     monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: False)
     monkeypatch.setattr(
         desktop_app, "_open_existing_instance_in_browser", lambda _port: None
@@ -6401,6 +6402,7 @@ def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     calls = []
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
     monkeypatch.setattr(
         read_only_diagnostics, "preflight_requires_diagnostics", lambda: True
     )
