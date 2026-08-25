@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 if os.name == "nt":
-    from ctypes import wintypes
+    import ctypes.wintypes
 
 
 class SmokeFailure(RuntimeError):
@@ -56,16 +56,16 @@ def _visible_catalyst_window(process_id: int) -> str | None:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     titles: list[str] = []
     callback_type = ctypes.WINFUNCTYPE(
-        wintypes.BOOL,
-        wintypes.HWND,
-        wintypes.LPARAM,
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPARAM,
     )
 
     @callback_type
     def inspect_window(handle, _context):
         if not user32.IsWindowVisible(handle):
             return True
-        owner_pid = wintypes.DWORD()
+        owner_pid = ctypes.wintypes.DWORD()
         user32.GetWindowThreadProcessId(handle, ctypes.byref(owner_pid))
         if owner_pid.value != process_id:
             return True
