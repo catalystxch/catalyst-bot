@@ -5125,7 +5125,7 @@ def test_windows_existing_catalyst_window_is_restored_and_foregrounded(monkeypat
     monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
 
     assert desktop_app._focus_catalyst_window_with_user32(
-        user32, lambda callback: callback
+        user32, lambda callback: callback, owner_pid=4567
     )
     assert user32.shown == [(101, 9)]
     assert user32.raised == [101]
@@ -5174,8 +5174,86 @@ def test_windows_existing_window_handoff_fails_when_foreground_is_denied(monkeyp
     monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
 
     assert not desktop_app._focus_catalyst_window_with_user32(
-        User32(), lambda callback: callback
+        User32(), lambda callback: callback, owner_pid=4567
     )
+
+
+def test_windows_window_handoff_rejects_same_title_from_wrong_process(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        shown = []
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(_handle, owner_pid):
+            owner_pid._obj.value = 9876
+            return 1
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        def ShowWindow(self, handle, command):
+            self.shown.append((handle, command))
+            return True
+
+    user32 = User32()
+
+    assert not desktop_app._focus_catalyst_window_with_user32(
+        user32, lambda callback: callback, owner_pid=4567
+    )
+    assert user32.shown == []
+
+
+def test_windows_owner_handoff_retries_while_native_window_is_starting(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    attempts = []
+    outcomes = iter((False, False, True))
+    clock = iter((0.0, 0.1, 0.2))
+
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_app.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        desktop_app.time, "sleep", lambda seconds: attempts.append(seconds)
+    )
+
+    assert desktop_app._focus_existing_catalyst_window(
+        owner_pid=4567,
+        timeout_seconds=2,
+        focus_attempt=lambda pid: attempts.append(pid) or next(outcomes),
+    )
+    assert attempts == [4567, 0.1, 4567, 0.1, 4567]
+
+
+def test_windows_handoff_owner_pid_comes_from_current_profile_lock(
+    tmp_path, monkeypatch
+):
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    lock_path = tmp_path / ".instance.lock"
+    lock_path.write_bytes(b"\x00pid=4567 started=123\n")
+
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_app, "_instance_lock_path", lambda: str(lock_path))
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "read_safety_status",
+        lambda: {"lease": {"active": False, "owner_pid": None}},
+    )
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert desktop_app._current_profile_owner_pid() == 4567
 
 
 def test_desktop_safety_fallback_opens_branded_native_window(monkeypatch):
@@ -5183,8 +5261,8 @@ def test_desktop_safety_fallback_opens_branded_native_window(monkeypatch):
     reservation = SimpleNamespace(port=6133)
     events = []
 
-    def serve(supplied, *, ready_callback=None):
-        events.append(("serve", supplied))
+    def serve(supplied, *, ready_callback=None, lifetime_seconds=300):
+        events.append(("serve", supplied, lifetime_seconds))
         ready_callback()
 
     fake_webview = SimpleNamespace(
@@ -5197,9 +5275,10 @@ def test_desktop_safety_fallback_opens_branded_native_window(monkeypatch):
 
     desktop_app.run_read_only_diagnostics_desktop_mode(reservation)
 
-    window = next(value for event, value in events if event == "window")
+    window = next(item[1] for item in events if item[0] == "window")
     assert window["title"] == "CATalyst Startup Safety"
     assert window["url"] == "http://127.0.0.1:6133/"
+    assert ("serve", reservation, None) in events
     assert ("start", {"gui": "edgechromium", "http_server": False}) in events
 
 
