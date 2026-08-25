@@ -5,6 +5,12 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.1 - 2026-08-25
+
+- Corrected the cross-platform release workflow to use CATalyst's isolated,
+  identity-aware packaged API smoke harness instead of starting an unconfigured
+  runtime that safety correctly redirected to read-only diagnostics.
+
 ## v1.3.0 - 2026-08-25
 
 - Added a durable stability kernel for wallet mutation ownership, offer

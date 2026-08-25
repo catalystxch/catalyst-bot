@@ -23,6 +23,17 @@ def test_release_workflow_builds_windows_and_linux_downloads_only():
     assert "scripts/package_macos.sh" not in workflow
 
 
+def test_release_workflow_uses_identity_aware_packaged_smoke_only():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Smoke test packaged API runtime" in workflow
+    assert 'python scripts/packaged_api_smoke.py --exe "$exe"' in workflow
+    assert "Smoke test (verify binary starts)" not in workflow
+    assert "curl -sf http://127.0.0.1:5000/api/health" not in workflow
+
+
 def test_release_workflow_does_not_publish_macos_assets():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"
