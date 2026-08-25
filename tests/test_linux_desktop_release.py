@@ -194,7 +194,8 @@ def test_linux_package_launchers_export_loopback_runtime_env():
 def test_linux_desktop_smoke_requires_loopback_url():
     smoke = (ROOT / "scripts" / "linux_desktop_smoke.sh").read_text(encoding="utf-8")
 
-    assert "Desktop window URL: http://127.0.0.1:5000/" in smoke
+    assert "grep -Eq 'Desktop window URL: http://127\\.0\\.0\\.1:[0-9]+/'" in smoke
+    assert 'grep -Fq "Desktop window URL: http://127.0.0.1:5000/"' not in smoke
 
 
 def test_linux_detect_gui_backend_prefers_qt_when_available(monkeypatch):

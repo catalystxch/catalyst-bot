@@ -211,7 +211,7 @@ if grep -E \
   exit 1
 fi
 
-if ! grep -Fq "Desktop window URL: http://127.0.0.1:5000/" "$log"; then
+if ! grep -Eq 'Desktop window URL: http://127\.0\.0\.1:[0-9]+/' "$log"; then
   echo "Linux desktop smoke failed: loopback URL not used (old file:// splash build?)" >&2
   exit 1
 fi
