@@ -4922,9 +4922,7 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     monkeypatch.setattr(
         desktop_app, "_open_existing_instance_in_browser", lambda _port: None
     )
-    monkeypatch.setattr(
-        desktop_app, "_focus_existing_catalyst_window", lambda: False
-    )
+    monkeypatch.setattr(desktop_app, "_focus_existing_catalyst_window", lambda: False)
     monkeypatch.setattr(
         desktop_app,
         "_reserve_diagnostics_server_port",
@@ -6378,9 +6376,7 @@ def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
     monkeypatch.setattr(
         desktop_app, "_open_existing_instance_in_browser", lambda _port: None
     )
-    monkeypatch.setattr(
-        desktop_app, "_focus_existing_catalyst_window", lambda: False
-    )
+    monkeypatch.setattr(desktop_app, "_focus_existing_catalyst_window", lambda: False)
     reservation = SimpleNamespace(port=desktop_app.FLASK_PORT + 9)
     monkeypatch.setattr(
         desktop_app,

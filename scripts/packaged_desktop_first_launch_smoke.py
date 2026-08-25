@@ -210,14 +210,10 @@ def _wait_for_duplicate_launch_handoff(
             "duplicate desktop launch did not hand off to the existing window"
         ) from exc
     if return_code != 0:
-        raise SmokeFailure(
-            f"duplicate desktop launch exited with code {return_code}"
-        )
+        raise SmokeFailure(f"duplicate desktop launch exited with code {return_code}")
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if _window_is_restored_and_foreground(
-            owner_process_id, owner_window_handle
-        ):
+        if _window_is_restored_and_foreground(owner_process_id, owner_window_handle):
             return
         time.sleep(0.1)
     raise SmokeFailure(
@@ -273,7 +269,9 @@ def _wait_for_safety_fallback(port: int, process: subprocess.Popen) -> None:
             except Exception as exc:
                 last_error = type(exc).__name__
         time.sleep(0.2)
-    raise SmokeFailure(f"native startup safety fallback did not become ready: {last_error}")
+    raise SmokeFailure(
+        f"native startup safety fallback did not become ready: {last_error}"
+    )
 
 
 def _stop_process(process: subprocess.Popen) -> None:
@@ -382,9 +380,7 @@ def main() -> int:
                 )
             finally:
                 _stop_process(blocked)
-    print(
-        "Packaged clean, duplicate, persisted, and native safety launches passed"
-    )
+    print("Packaged clean, duplicate, persisted, and native safety launches passed")
     return 0
 
 
