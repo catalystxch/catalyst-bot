@@ -29,7 +29,12 @@ try:
     from PIL import Image, ImageDraw
 
     PYSTRAY_AVAILABLE = True
-except ImportError:
+except Exception:
+    pystray = None
+    MenuItem = None
+    Menu = None
+    Image = None
+    ImageDraw = None
     PYSTRAY_AVAILABLE = False
 
 # HTTP client for calling Flask API actions from tray
