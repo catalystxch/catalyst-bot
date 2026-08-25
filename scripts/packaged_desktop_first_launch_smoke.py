@@ -132,6 +132,72 @@ def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
     raise SmokeFailure(f"first-run desktop UI did not become ready: {last_error}")
 
 
+def _wait_for_duplicate_launch_handoff(process: subprocess.Popen) -> None:
+    """Require a duplicate launcher to restore the owner and exit promptly."""
+
+    try:
+        return_code = process.wait(timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        raise SmokeFailure(
+            "duplicate desktop launch did not hand off to the existing window"
+        ) from exc
+    if return_code != 0:
+        raise SmokeFailure(
+            f"duplicate desktop launch exited with code {return_code}"
+        )
+
+
+def _nearby_diagnostics_ports(preferred: int) -> tuple[int, ...]:
+    candidates = []
+    for distance in range(1, 9):
+        for candidate in (preferred + distance, preferred - distance):
+            if 1 <= candidate <= 65535 and candidate not in candidates:
+                candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _wait_for_safety_fallback(port: int, process: subprocess.Popen) -> None:
+    """Require a branded native window for a fail-closed startup denial."""
+
+    deadline = time.monotonic() + 45
+    last_error = "diagnostics server not reached"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise SmokeFailure(
+                "desktop process exited before native safety diagnostics were ready: "
+                f"{process.returncode}"
+            )
+        title = _visible_catalyst_window(process.pid)
+        for candidate in _nearby_diagnostics_ports(port):
+            try:
+                root_url = f"http://127.0.0.1:{candidate}/"
+                with urllib.request.urlopen(root_url, timeout=1) as response:  # nosec B310
+                    content_type = response.headers.get("content-type", "").lower()
+                    body = response.read().decode("utf-8", errors="replace")
+                if "text/html" not in content_type or (
+                    "CATalyst could not start normally" not in body
+                ):
+                    continue
+                safety_url = root_url + "api/safety/status"
+                with urllib.request.urlopen(safety_url, timeout=1) as response:  # nosec B310
+                    payload = json.loads(response.read().decode("utf-8"))
+                status = payload.get("safety") if isinstance(payload, dict) else None
+                if not isinstance(status, dict) or status.get("allowed") is not False:
+                    raise SmokeFailure(
+                        "startup safety fallback did not remain fail-closed"
+                    )
+                if title != "CATalyst Startup Safety":
+                    last_error = "native startup safety window not visible"
+                    continue
+                return
+            except SmokeFailure:
+                raise
+            except Exception as exc:
+                last_error = type(exc).__name__
+        time.sleep(0.2)
+    raise SmokeFailure(f"native startup safety fallback did not become ready: {last_error}")
+
+
 def _stop_process(process: subprocess.Popen) -> None:
     if process.poll() is None:
         process.terminate()
@@ -140,6 +206,21 @@ def _stop_process(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10)
+
+
+def _launch(
+    executable: Path,
+    environment: dict[str, str],
+    log_file,
+) -> subprocess.Popen:
+    return subprocess.Popen(
+        [str(executable)],
+        cwd=executable.parent,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
 
 
 def main() -> int:
@@ -156,16 +237,23 @@ def main() -> int:
         port = _free_port()
         log_path = temp_dir / "desktop-first-launch.log"
         with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
-            process = subprocess.Popen(
-                [str(executable)],
-                cwd=executable.parent,
-                env=_clean_first_launch_env(data_dir, port),
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
+            environment = _clean_first_launch_env(data_dir, port)
+            process = _launch(executable, environment, log_file)
             try:
                 _wait_for_first_launch(port, process)
+                duplicate = _launch(executable, environment, log_file)
+                try:
+                    _wait_for_duplicate_launch_handoff(duplicate)
+                finally:
+                    _stop_process(duplicate)
+                if process.poll() is not None:
+                    raise SmokeFailure(
+                        "owner desktop exited during duplicate-launch handoff"
+                    )
+                if _visible_catalyst_window(process.pid) is None:
+                    raise SmokeFailure(
+                        "owner desktop window disappeared during duplicate-launch handoff"
+                    )
             except Exception:
                 log_file.flush()
                 details = log_path.read_text(encoding="utf-8", errors="replace")
@@ -174,7 +262,48 @@ def main() -> int:
                 )
             finally:
                 _stop_process(process)
-    print("Packaged clean-desktop first launch passed")
+
+            persisted = _launch(executable, environment, log_file)
+            try:
+                _wait_for_first_launch(port, persisted)
+            except Exception:
+                log_file.flush()
+                details = log_path.read_text(encoding="utf-8", errors="replace")
+                raise SmokeFailure(
+                    "packaged persisted-profile desktop relaunch failed\n"
+                    + details[-12000:]
+                )
+            finally:
+                _stop_process(persisted)
+
+            blocked_data_dir = temp_dir / "malformed-identity-user-data"
+            blocked_data_dir.mkdir()
+            (blocked_data_dir / ".env").write_text(
+                "WALLET_TYPE=sage\n"
+                "SAGE_FINGERPRINT=malformed-test-identity\n"
+                "WALLET_EXPECTED_NAME=Synthetic Invalid Identity\n"
+                "WALLET_EXPECTED_KEY_KIND=bls\n"
+                "CATALYST_NETWORK_ID=mainnet\n",
+                encoding="utf-8",
+            )
+            blocked_port = _free_port()
+            blocked_environment = _clean_first_launch_env(
+                blocked_data_dir, blocked_port
+            )
+            blocked = _launch(executable, blocked_environment, log_file)
+            try:
+                _wait_for_safety_fallback(blocked_port, blocked)
+            except Exception:
+                log_file.flush()
+                details = log_path.read_text(encoding="utf-8", errors="replace")
+                raise SmokeFailure(
+                    "packaged native safety fallback failed\n" + details[-12000:]
+                )
+            finally:
+                _stop_process(blocked)
+    print(
+        "Packaged clean, duplicate, persisted, and native safety launches passed"
+    )
     return 0
 
 

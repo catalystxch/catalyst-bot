@@ -4923,6 +4923,9 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
         desktop_app, "_open_existing_instance_in_browser", lambda _port: None
     )
     monkeypatch.setattr(
+        desktop_app, "_focus_existing_catalyst_window", lambda: False
+    )
+    monkeypatch.setattr(
         desktop_app,
         "_reserve_diagnostics_server_port",
         lambda: reservation,
@@ -4930,8 +4933,8 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     )
     monkeypatch.setattr(
         desktop_app,
-        "run_read_only_diagnostics_mode",
-        lambda supplied, **_kwargs: started.append(supplied),
+        "run_read_only_diagnostics_desktop_mode",
+        lambda supplied: started.append(supplied),
         raising=False,
     )
 
@@ -4983,6 +4986,9 @@ def test_second_desktop_opens_exact_diagnostics_port_not_unrelated_preferred(
     monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
     monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
     monkeypatch.setattr(
+        desktop_app, "_focus_existing_catalyst_window", lambda: False, raising=False
+    )
+    monkeypatch.setattr(
         desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
     )
     monkeypatch.setattr(
@@ -4999,9 +5005,9 @@ def test_second_desktop_opens_exact_diagnostics_port_not_unrelated_preferred(
         SimpleNamespace(open=lambda url: opened.append(url)),
     )
 
-    assert desktop_app.main(["--show-console"]) == 0
+    assert desktop_app.main(["--flask", "--show-console"]) == 0
     assert served == [reservation]
-    assert opened == ["http://127.0.0.1:6130/api/safety/status"]
+    assert opened == ["http://127.0.0.1:6130/"]
 
 
 def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch):
@@ -5019,6 +5025,9 @@ def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch)
     monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
     monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
     monkeypatch.setattr(
+        desktop_app, "_focus_existing_catalyst_window", lambda: False, raising=False
+    )
+    monkeypatch.setattr(
         desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
     )
     monkeypatch.setattr(
@@ -5030,12 +5039,142 @@ def test_second_desktop_opens_diagnostics_only_after_socket_handoff(monkeypatch)
         SimpleNamespace(open=lambda url: events.append(("open", url))),
     )
 
-    assert desktop_app.main(["--show-console"]) == 0
+    assert desktop_app.main(["--flask", "--show-console"]) == 0
     assert events == [
         "handoff",
-        ("open", "http://127.0.0.1:6131/api/safety/status"),
+        ("open", "http://127.0.0.1:6131/"),
         "serve",
     ]
+
+
+def test_second_desktop_restores_existing_window_without_opening_diagnostics(
+    monkeypatch,
+):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
+    monkeypatch.setattr(
+        desktop_app,
+        "_release_instance_lock",
+        lambda: events.append("release") or True,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_focus_existing_catalyst_window",
+        lambda: events.append("focus") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "_reserve_diagnostics_server_port",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("focused duplicate must not start diagnostics")
+        ),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == ["release", "focus"]
+
+
+def test_windows_existing_catalyst_window_is_restored_and_foregrounded(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.shown = []
+            self.foregrounded = []
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            callback(202, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            owner_pid._obj.value = 4567 if handle == 101 else 9876
+            return 1
+
+        @staticmethod
+        def GetWindowTextLengthW(handle):
+            return len("CATalyst" if handle == 101 else "CATalyst Setup")
+
+        @staticmethod
+        def GetWindowTextW(handle, buffer, _length):
+            buffer.value = "CATalyst" if handle == 101 else "CATalyst Setup"
+            return len(buffer.value)
+
+        def ShowWindow(self, handle, command):
+            self.shown.append((handle, command))
+            return True
+
+        def SetForegroundWindow(self, handle):
+            self.foregrounded.append(handle)
+            return True
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert desktop_app._focus_catalyst_window_with_user32(
+        user32, lambda callback: callback
+    )
+    assert user32.shown == [(101, 9)]
+    assert user32.foregrounded == [101]
+
+
+def test_desktop_safety_fallback_opens_branded_native_window(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    reservation = SimpleNamespace(port=6133)
+    events = []
+
+    def serve(supplied, *, ready_callback=None):
+        events.append(("serve", supplied))
+        ready_callback()
+
+    fake_webview = SimpleNamespace(
+        create_window=lambda **kwargs: events.append(("window", kwargs)),
+        start=lambda **kwargs: events.append(("start", kwargs)),
+    )
+    monkeypatch.setattr(desktop_app, "run_read_only_diagnostics_mode", serve)
+    monkeypatch.setattr(desktop_app, "_detect_gui_backend", lambda: "edgechromium")
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+
+    desktop_app.run_read_only_diagnostics_desktop_mode(reservation)
+
+    window = next(value for event, value in events if event == "window")
+    assert window["title"] == "CATalyst Startup Safety"
+    assert window["url"] == "http://127.0.0.1:6133/"
+    assert ("start", {"gui": "edgechromium", "http_server": False}) in events
+
+
+def test_failed_desktop_start_routes_to_native_diagnostics(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    reservation = SimpleNamespace(port=6134)
+    events = []
+
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: False)
+    monkeypatch.setattr(desktop_app, "_release_instance_lock", lambda: False)
+    monkeypatch.setattr(desktop_app, "_focus_existing_catalyst_window", lambda: False)
+    monkeypatch.setattr(
+        desktop_app, "_reserve_diagnostics_server_port", lambda: reservation
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_desktop_mode",
+        lambda supplied: events.append(supplied),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_read_only_diagnostics_mode",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("desktop fallback must not open a browser")
+        ),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == [reservation]
 
 
 @pytest.mark.parametrize(
@@ -5581,6 +5720,69 @@ def test_minimal_diagnostics_serve_consumes_supplied_reservation(monkeypatch):
     assert events[1:] == [("serve", 0.2), "close"]
 
 
+def test_minimal_diagnostics_root_is_branded_html_not_raw_safety_json(tmp_path):
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    server = reservation.into_http_server(
+        read_only_diagnostics._handler(tmp_path / "missing.db")
+    )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{selected}/", timeout=2
+        ) as response:
+            content_type = response.headers.get("content-type", "").lower()
+            body = response.read().decode("utf-8")
+
+        assert "text/html" in content_type
+        assert "CATalyst could not start normally" in body
+        assert "/api/safety/status" in body
+        assert not body.lstrip().startswith("{")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_minimal_diagnostics_root_rejects_posts_as_read_only(tmp_path):
+    import read_only_diagnostics
+
+    reservation = read_only_diagnostics.reserve_loopback_port(5000)
+    selected = reservation.port
+    server = reservation.into_http_server(
+        read_only_diagnostics._handler(tmp_path / "missing.db")
+    )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{selected}/", data=b"", method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request, timeout=2)
+        assert exc_info.value.code == 423
+        assert json.loads(exc_info.value.read().decode("utf-8")) == {
+            "success": False,
+            "error": "diagnostics_read_only",
+            "reason": "DIAGNOSTICS_READ_ONLY",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_minimal_diagnostics_serve_schedules_bounded_shutdown(monkeypatch):
     import read_only_diagnostics
 
@@ -6110,6 +6312,9 @@ def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
     monkeypatch.setattr(
         desktop_app, "_open_existing_instance_in_browser", lambda _port: None
     )
+    monkeypatch.setattr(
+        desktop_app, "_focus_existing_catalyst_window", lambda: False
+    )
     reservation = SimpleNamespace(port=desktop_app.FLASK_PORT + 9)
     monkeypatch.setattr(
         desktop_app,
@@ -6118,8 +6323,8 @@ def test_desktop_foreign_lease_preflight_never_touches_writable_instance_lock(
     )
     monkeypatch.setattr(
         desktop_app,
-        "run_read_only_diagnostics_mode",
-        lambda supplied, **_kwargs: calls.append(supplied),
+        "run_read_only_diagnostics_desktop_mode",
+        lambda supplied: calls.append(supplied),
     )
 
     assert desktop_app.main(["--show-console"]) == 0
