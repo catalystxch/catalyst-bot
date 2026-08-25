@@ -5,6 +5,12 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.2 - 2026-08-25
+
+- Isolated the Linux desktop package smoke test with an explicit synthetic Sage
+  wallet identity and mainnet binding so CATalyst can prove the real GUI under
+  Xvfb without weakening fail-closed startup safety.
+
 ## v1.3.1 - 2026-08-25
 
 - Corrected the cross-platform release workflow to use CATalyst's isolated,
