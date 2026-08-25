@@ -10,9 +10,10 @@ exe="$1"
 log="${2:-linux-desktop-smoke.log}"
 proof_dir="${CATALYST_GUI_PROOF_DIR:-$(mktemp -d)}"
 screenshot="${CATALYST_GUI_PROOF_SCREENSHOT:-$proof_dir/linux-desktop-smoke.xwd}"
+data_dir="${CATALYST_DESKTOP_SMOKE_DATA_DIR:-$proof_dir/catalyst-data}"
 runner="$(mktemp)"
 
-mkdir -p "$(dirname "$log")" "$(dirname "$screenshot")"
+mkdir -p "$(dirname "$log")" "$(dirname "$screenshot")" "$data_dir"
 rm -f "$log" "$screenshot"
 
 cat >"$runner" <<'RUNNER'
@@ -22,6 +23,7 @@ set -euo pipefail
 exe="$1"
 log="$2"
 screenshot="$3"
+data_dir="$4"
 
 if ! command -v xdotool >/dev/null 2>&1; then
   echo "Linux desktop smoke failed: xdotool is required to prove window visibility" >&2
@@ -35,6 +37,14 @@ export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:---no-sandbox --disable-gpu --disable-dev-shm-usage}"
 export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/catalyst-runtime-$(id -u)}"
+export CMM_DATA_DIR="$data_dir"
+export WALLET_TYPE="sage"
+export SAGE_FINGERPRINT="123456789"
+export WALLET_EXPECTED_NAME="Linux Desktop Smoke Sage"
+export WALLET_EXPECTED_KEY_KIND="bls"
+export CATALYST_NETWORK_ID="mainnet"
+export CATALYST_FLASK_PORT="5000"
+export _CATALYST_PRESERVE_PROCESS_ENV="1"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR" || true
 
@@ -181,7 +191,7 @@ RUNNER
 chmod +x "$runner"
 
 set +e
-timeout 55s xvfb-run -a -s "-screen 0 1920x1080x24" bash "$runner" "$exe" "$log" "$screenshot"
+timeout 55s xvfb-run -a -s "-screen 0 1920x1080x24" bash "$runner" "$exe" "$log" "$screenshot" "$data_dir"
 code=$?
 set -e
 

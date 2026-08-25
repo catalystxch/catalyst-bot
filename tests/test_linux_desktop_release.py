@@ -136,6 +136,22 @@ def test_linux_notification_runtime_dependencies_are_declared():
     assert "libnotify-bin" in package_script
 
 
+def test_linux_desktop_smoke_uses_isolated_configured_identity():
+    script = (ROOT / "scripts" / "linux_desktop_smoke.sh").read_text(encoding="utf-8")
+
+    assert (
+        'data_dir="${CATALYST_DESKTOP_SMOKE_DATA_DIR:-$proof_dir/catalyst-data}"'
+        in script
+    )
+    assert 'export CMM_DATA_DIR="$data_dir"' in script
+    assert 'export WALLET_TYPE="sage"' in script
+    assert 'export SAGE_FINGERPRINT="123456789"' in script
+    assert 'export WALLET_EXPECTED_NAME="Linux Desktop Smoke Sage"' in script
+    assert 'export WALLET_EXPECTED_KEY_KIND="bls"' in script
+    assert 'export CATALYST_NETWORK_ID="mainnet"' in script
+    assert 'export _CATALYST_PRESERVE_PROCESS_ENV="1"' in script
+
+
 def test_linux_initial_desktop_url_uses_loopback(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")
