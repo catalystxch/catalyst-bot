@@ -5,6 +5,12 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.4 - 2026-08-25
+
+- Corrected the Linux desktop release smoke assertion to accept CATalyst's safe
+  loopback-port fallback while continuing to reject stale `file://` launchers or
+  non-loopback desktop URLs.
+
 ## v1.3.3 - 2026-08-25
 
 - Ensured sequential Linux AppImage and Debian package smoke tests terminate the
