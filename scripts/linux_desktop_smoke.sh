@@ -55,14 +55,19 @@ if command -v openbox >/dev/null 2>&1; then
   sleep 1
 fi
 
-"$exe" >"$log" 2>&1 &
+setsid "$exe" >"$log" 2>&1 &
 app_pid=$!
 
 cleanup() {
-  if kill -0 "$app_pid" >/dev/null 2>&1; then
-    kill "$app_pid" >/dev/null 2>&1 || true
-    wait "$app_pid" >/dev/null 2>&1 || true
-  fi
+  kill -TERM -- "-$app_pid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 10); do
+    if ! kill -0 -- "-$app_pid" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  kill -KILL -- "-$app_pid" >/dev/null 2>&1 || true
+  wait "$app_pid" >/dev/null 2>&1 || true
   if [[ -n "$wm_pid" ]] && kill -0 "$wm_pid" >/dev/null 2>&1; then
     kill "$wm_pid" >/dev/null 2>&1 || true
     wait "$wm_pid" >/dev/null 2>&1 || true

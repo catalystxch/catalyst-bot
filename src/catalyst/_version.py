@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 
 def _describe_to_version(describe: str) -> str:

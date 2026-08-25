@@ -152,6 +152,14 @@ def test_linux_desktop_smoke_uses_isolated_configured_identity():
     assert 'export _CATALYST_PRESERVE_PROCESS_ENV="1"' in script
 
 
+def test_linux_desktop_smoke_cleans_up_the_complete_app_process_group():
+    script = (ROOT / "scripts" / "linux_desktop_smoke.sh").read_text(encoding="utf-8")
+
+    assert 'setsid "$exe" >"$log" 2>&1 &' in script
+    assert 'kill -TERM -- "-$app_pid"' in script
+    assert 'kill -KILL -- "-$app_pid"' in script
+
+
 def test_linux_initial_desktop_url_uses_loopback(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")
