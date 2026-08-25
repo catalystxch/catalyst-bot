@@ -5,6 +5,12 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.3 - 2026-08-25
+
+- Ensured sequential Linux AppImage and Debian package smoke tests terminate the
+  complete desktop process group, preventing an extracted AppImage child from
+  retaining the loopback port used by the following package test.
+
 ## v1.3.2 - 2026-08-25
 
 - Isolated the Linux desktop package smoke test with an explicit synthetic Sage
