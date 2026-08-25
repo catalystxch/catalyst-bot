@@ -1,9 +1,73 @@
 import sys
 import types
+import hashlib
 from decimal import Decimal
 from unittest.mock import MagicMock
 
 import coin_prep_worker
+
+
+def test_authoritative_post_operation_identity_drift_is_durable_failure(monkeypatch):
+    """Catches count-only prep success under a stale or different wallet binding."""
+
+    assert hasattr(
+        coin_prep_worker.CoinPrepWorker,
+        "_verify_authoritative_post_operation_view",
+    )
+    outcomes = []
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "record_coin_prep_operation_outcome",
+        lambda operation_id, **kwargs: (
+            outcomes.append((operation_id, kwargs))
+            or {"operation": {"operation_id": operation_id, **kwargs}}
+        ),
+        raising=False,
+    )
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.log = MagicMock()
+    worker.update_status = MagicMock()
+    source = hashlib.sha256(b"source").hexdigest()
+    output = hashlib.sha256(b"output").hexdigest()
+    expected_identity = {
+        "backend": "sage",
+        "name": "Task 12 Wallet",
+        "fingerprint": 123,
+        "network_id": "mainnet",
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": "2026-08-21T12:00:00.000000Z",
+        "maximum_age_seconds": 300,
+    }
+
+    verified = worker._verify_authoritative_post_operation_view(
+        operation_id="coin-prep:" + hashlib.sha256(b"operation").hexdigest(),
+        source_coin_ids=[source],
+        expected_outputs=[
+            {"coin_id": output, "amount_mojos": 100, "purpose": "replacement"}
+        ],
+        authoritative_view={
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": {**expected_identity, "fingerprint": 999},
+            "observed_at": "2026-08-21T12:00:01.000000Z",
+            "expires_at": "2026-08-21T12:05:00.000000Z",
+            "coins": [
+                {"coin_id": output, "amount_mojos": 100, "purpose": "replacement"}
+            ],
+        },
+        expected_wallet_identity=expected_identity,
+        effect_claim_token="e" * 64,
+        effect_claim_generation=1,
+        dispatch_outcome="SUBMITTED",
+    )
+
+    assert verified is False
+    assert outcomes[0][1]["outcome"] == "SUBMITTED_UNKNOWN"
+    assert outcomes[0][1]["evidence_json"]["reason_code"] == "wallet_identity_mismatch"
+    assert worker.update_status.call_args.kwargs["error"].startswith(
+        "POST_PREP_AUTHORITY_UNRESOLVED"
+    )
 
 
 def test_post_prep_tier_drift_is_a_hard_failure(monkeypatch):
@@ -105,6 +169,8 @@ def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
     worker._merge_xch_fee_change_into_reserve = MagicMock(return_value=False)
     worker._designate_final_sweep = MagicMock()
     worker._format_cat_amount = str
+    worker._recover_coin_prep_operations_read_only = MagicMock(return_value=True)
+    worker._observe_recoverable_coin_prep_operation = MagicMock()
 
     assert worker.run_full_preparation() is False
     worker.update_status.assert_any_call(

@@ -57,20 +57,7 @@ if sys.platform == "win32":
         elif _st is None and _under_pythonw:
             # pythonw.exe — open a startup log file so print() works
             if _pythonw_log is None:
-                try:
-                    _log_dir = os.path.join(
-                        os.environ.get("APPDATA", os.path.expanduser("~")),
-                        "Catalyst",
-                    )
-                    os.makedirs(_log_dir, exist_ok=True)
-                    _pythonw_log = open(
-                        os.path.join(_log_dir, "startup.log"),
-                        "w",
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                except Exception:
-                    _pythonw_log = open(os.devnull, "w", encoding="utf-8")
+                _pythonw_log = open(os.devnull, "w", encoding="utf-8")
             setattr(sys, _pair[0], _pythonw_log)
             setattr(sys, _pair[1], _pythonw_log)
 
@@ -120,9 +107,21 @@ else:
 APP_NAME = "CATalyst"
 WINDOWS_APP_USER_MODEL_ID = APP_NAME
 FLASK_HOST = "127.0.0.1"
+
+
+def _normalize_flask_port(value) -> int:
+    """Return a valid configured loopback port or the stable default."""
+
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 5000
+    return port if 1 <= port <= 65535 else 5000
+
+
 try:
-    FLASK_PORT = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
-except (TypeError, ValueError):
+    FLASK_PORT = _normalize_flask_port(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+except Exception:
     FLASK_PORT = 5000
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1000
@@ -151,7 +150,7 @@ def _configure_linux_webengine_env() -> None:
 def _initial_desktop_url() -> str:
     """Return the first URL shown in the native desktop window."""
     flask_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
-    if sys.platform.startswith("linux"):
+    if sys.platform.startswith("linux") or FLASK_PORT != 5000:
         return flask_url
 
     splash_path = _bundle_path("splash.html")
@@ -177,14 +176,22 @@ def _kill_on_close_job_limit_flags() -> int:
     return JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
 
 
-# Window geometry persistence — lives in the user data directory so
-# the setting survives installs to read-only locations like Program Files.
-try:
-    from user_paths import window_state_file as _window_state_file
+# Window geometry persistence is resolved lazily.  The duplicate-process
+# diagnostics path must not import user_paths because that module performs a
+# first-run migration and creates files at import time.
+_WINDOW_STATE_FILE = None
 
-    _WINDOW_STATE_FILE = _window_state_file()
-except Exception:
-    _WINDOW_STATE_FILE = os.path.join(APP_DIR, ".window_state.json")
+
+def _window_state_path() -> str:
+    global _WINDOW_STATE_FILE
+    if _WINDOW_STATE_FILE is None:
+        try:
+            from user_paths import window_state_file
+
+            _WINDOW_STATE_FILE = window_state_file()
+        except Exception:
+            _WINDOW_STATE_FILE = os.path.join(APP_DIR, ".window_state.json")
+    return _WINDOW_STATE_FILE
 
 
 def _load_window_state() -> dict:
@@ -192,9 +199,10 @@ def _load_window_state() -> dict:
     try:
         import json as _json
 
-        if not os.path.exists(_WINDOW_STATE_FILE):
+        path = _window_state_path()
+        if not os.path.exists(path):
             return {}
-        with open(_WINDOW_STATE_FILE, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             data = _json.load(fh)
         if not isinstance(data, dict):
             return {}
@@ -233,7 +241,7 @@ def _save_window_state(window) -> None:
         # Skip obviously invalid snapshots (e.g. minimized window reports 0/0)
         if state["width"] < WINDOW_MIN_WIDTH or state["height"] < WINDOW_MIN_HEIGHT:
             return
-        with open(_WINDOW_STATE_FILE, "w", encoding="utf-8") as fh:
+        with open(_window_state_path(), "w", encoding="utf-8") as fh:
             _json.dump(state, fh)
     except Exception as e:
         print(f"[WINDOW] Could not save window state: {e}", flush=True)
@@ -472,14 +480,41 @@ _instance_lock_handle = None
 _kill_on_close_job = None
 
 
+def _enable_pythonw_startup_log() -> None:
+    """Enable persistent launcher logging only after startup ownership."""
+
+    global _pythonw_log
+    if not _under_pythonw:
+        return
+    try:
+        from read_only_diagnostics import _data_directory
+
+        log_dir = _data_directory()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        persistent = open(
+            log_dir / "startup.log",
+            "w",
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return
+    previous = _pythonw_log
+    _pythonw_log = persistent
+    for stream_name in ("stdout", "__stdout__", "stderr", "__stderr__"):
+        setattr(sys, stream_name, persistent)
+    if previous is not None and previous is not persistent:
+        try:
+            previous.close()
+        except Exception:
+            pass
+
+
 def _instance_lock_path() -> str:
     """Path to the cross-process singleton lock file."""
-    try:
-        from user_paths import data_dir
+    from read_only_diagnostics import _data_directory
 
-        return os.path.join(data_dir(), ".instance.lock")
-    except Exception:
-        return os.path.join(APP_DIR, ".instance.lock")
+    return str(_data_directory() / ".instance.lock")
 
 
 def _acquire_instance_lock() -> bool:
@@ -505,13 +540,14 @@ def _acquire_instance_lock() -> bool:
     global _instance_lock_handle
     lock_path = _instance_lock_path()
     try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fh = open(lock_path, "a+", encoding="utf-8")
     except Exception as e:
         print(
             f"[INSTANCE-LOCK] Could not open {lock_path}: {e} — skipping lock",
             flush=True,
         )
-        return True  # Fail open: don't block startup on a filesystem hiccup
+        return False
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -552,9 +588,38 @@ def _acquire_instance_lock() -> bool:
     return True
 
 
-def _open_existing_instance_in_browser() -> None:
-    """Bring the already-running instance forward when our own start was rejected."""
-    _app_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+def _release_instance_lock() -> bool:
+    """Close the desktop singleton handle on every rejected startup path."""
+
+    global _instance_lock_handle
+    handle = _instance_lock_handle
+    _instance_lock_handle = None
+    if handle is None:
+        return False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+    return True
+
+
+def _open_existing_instance_in_browser(port: int) -> None:
+    """Open this non-owner process's exact read-only diagnostics endpoint."""
+
+    _app_url = f"http://{FLASK_HOST}:{int(port)}/api/safety/status"
     print(f"\n  {APP_NAME} is already running — opening {_app_url}", flush=True)
     try:
         import webbrowser
@@ -692,7 +757,30 @@ def wait_for_flask(timeout: float = 15.0) -> bool:
     return False
 
 
-def start_flask_server():
+def _reserve_owner_server_port():
+    """Reserve and publish the exact loopback port selected by this owner."""
+
+    import read_only_diagnostics
+
+    global FLASK_PORT
+    reservation = read_only_diagnostics.reserve_loopback_port(FLASK_PORT)
+    FLASK_PORT = reservation.port
+    os.environ["CATALYST_FLASK_PORT"] = str(FLASK_PORT)
+    return reservation
+
+
+def _start_owned_runtime_services() -> None:
+    """Start owner-only services after the HTTP socket is safely reserved."""
+
+    import api_server
+
+    authorization = api_server.initialize_mutation_runtime()
+    if not authorization.get("allowed"):
+        raise RuntimeError("mutation lease was lost before server startup")
+    api_server._start_owned_runtime_services(authorization)
+
+
+def start_flask_server(reservation):
     """
     Start the Flask API server in the current thread.
     This runs in a daemon thread so it dies when the main process exits.
@@ -745,13 +833,7 @@ def start_flask_server():
         f"Desktop app v{APP_VERSION} starting Flask on port {FLASK_PORT}",
     )
 
-    api_server.app.run(
-        host=FLASK_HOST,
-        port=FLASK_PORT,
-        debug=False,
-        threaded=True,
-        use_reloader=False,  # Important: don't use reloader in desktop mode
-    )
+    api_server._serve_flask_app_on_reservation(reservation)
 
 
 def run_desktop_mode(dev_mode: bool = False):
@@ -776,34 +858,38 @@ def run_desktop_mode(dev_mode: bool = False):
     print(f"\n  {APP_NAME} v{APP_VERSION}")
     print(f"  {'=' * 40}")
 
-    # Check port — if our app is already running, open it in the browser
-    # instead of showing an error and quitting.
-    if not check_port_free(FLASK_PORT):
-        _app_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
-        print(f"\n  {APP_NAME} is already running — opening {_app_url}")
-        try:
-            import webbrowser
-
-            webbrowser.open(_app_url)
-        except Exception:
-            pass
-        if _CONSOLE_HIDDEN or _under_pythonw:
-            # Only show dialog if browser open fails silently (edge case)
-            pass
-        sys.exit(0)
+    reservation = None
+    try:
+        reservation = _reserve_owner_server_port()
+        _start_owned_runtime_services()
+    except BaseException:
+        if reservation is not None:
+            reservation.release()
+        _cleanup()
+        raise
 
     # Start Flask in background thread
     print(f"  Starting Flask server on port {FLASK_PORT}...")
-    flask_thread = threading.Thread(
-        target=start_flask_server, daemon=True, name="FlaskServer"
-    )
-    flask_thread.start()
+    try:
+        flask_thread = threading.Thread(
+            target=start_flask_server,
+            args=(reservation,),
+            daemon=True,
+            name="FlaskServer",
+        )
+        flask_thread.start()
+    except BaseException:
+        reservation.release()
+        _cleanup()
+        raise
 
     # Wait for Flask to be ready
     print("  Waiting for Flask to accept connections...")
     if not wait_for_flask(timeout=20.0):
         print("\n  ERROR: Flask didn't start within 20 seconds.")
         print("  Check the console output above for errors.")
+        reservation.release()
+        _cleanup()
         sys.exit(1)
 
     print("  Flask is ready.")
@@ -1065,14 +1151,20 @@ def run_desktop_mode(dev_mode: bool = False):
 
 def run_flask_mode():
     """Fallback: run as plain Flask server (like v3)."""
+    reservation = None
+    try:
+        reservation = _reserve_owner_server_port()
+        _start_owned_runtime_services()
+    except BaseException:
+        if reservation is not None:
+            reservation.release()
+        _cleanup()
+        raise
+
     print(f"\n  {APP_NAME} v{APP_VERSION} - Flask Mode")
     print(f"  {'=' * 40}")
     print(f"  Open http://{FLASK_HOST}:{FLASK_PORT}/ in your browser")
     print("  Press Ctrl+C to stop\n")
-
-    if not check_port_free(FLASK_PORT):
-        print(f"  Port {FLASK_PORT} is already in use!")
-        sys.exit(1)
 
     # Register signal handlers — must call sys.exit() so Werkzeug's
     # serve_forever() loop actually terminates after cleanup.
@@ -1080,12 +1172,37 @@ def run_flask_mode():
         _cleanup()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _flask_shutdown)
-    signal.signal(signal.SIGTERM, _flask_shutdown)
-    if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _flask_shutdown)
+    try:
+        signal.signal(signal.SIGINT, _flask_shutdown)
+        signal.signal(signal.SIGTERM, _flask_shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _flask_shutdown)
+        start_flask_server(reservation)
+    finally:
+        reservation.release()
+        _cleanup()
 
-    start_flask_server()
+
+def _reserve_diagnostics_server_port():
+    """Atomically reserve a nearby port without claiming owner authority."""
+
+    import read_only_diagnostics
+
+    return read_only_diagnostics.reserve_loopback_port(
+        FLASK_PORT, include_preferred=False
+    )
+
+
+def run_read_only_diagnostics_mode(reservation, *, ready_callback=None) -> None:
+    """Serve diagnostics without constructing the bot or acquiring a lease."""
+
+    import read_only_diagnostics
+
+    read_only_diagnostics.serve(
+        reservation=reservation,
+        ready_callback=ready_callback,
+        lifetime_seconds=300,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1192,18 +1309,16 @@ def _tray_graceful_quit(webview_module, tray):
 def _cleanup():
     """Clean shutdown of bot and modules."""
     try:
-        import api_server
+        from database import log_event
 
-        if api_server.bot and api_server.bot._running:
-            print("  Stopping bot...")
-            api_server.bot.stop()
+        log_event("info", "app_shutdown", f"Desktop app v{APP_VERSION} shutting down")
     except Exception:
         pass
 
     try:
-        from database import log_event
+        import api_server
 
-        log_event("info", "app_shutdown", f"Desktop app v{APP_VERSION} shutting down")
+        api_server.quiesce_and_release_mutation_runtime()
     except Exception:
         pass
 
@@ -1372,6 +1487,83 @@ def _run_coin_prep_worker_mode(worker_args):
         sys.argv = old_argv
 
 
+def _initialize_startup_ownership() -> dict:
+    """Initialize storage, reconcile exact prep evidence, and acquire ownership."""
+
+    from database import init_database
+
+    init_database()
+    import api_server
+
+    authorization = api_server.initialize_mutation_runtime()
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "unresolved_operations"
+        and authorization.get("reason_code")
+        in {
+            "COIN_PREP_EFFECT_UNKNOWN",
+            "COIN_PREP_RECOVERY_REQUIRED",
+            "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+            "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+        }
+    ):
+        try:
+            from coin_prep_worker import recover_coin_prep_operations_at_startup
+
+            if recover_coin_prep_operations_at_startup() is True:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Recovery is fail-closed. The original authorization keeps the
+            # app in diagnostics mode with its durable reason intact.
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from dexie_manager import recover_expired_dexie_publications_at_startup
+
+            recovery = recover_expired_dexie_publications_at_startup()
+            if recovery.get("recovered", 0) > 0 and recovery.get("remaining") == 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Provider readback recovery is exact and fail-closed. Keep the
+            # diagnostics blocker when the public offer cannot be proven.
+            pass
+    return authorization
+
+
+def _authorize_desktop_startup() -> bool:
+    """Serialize durable inspection through schema and lease acquisition."""
+
+    from read_only_diagnostics import (
+        acquire_startup_arbiter,
+        preflight_requires_diagnostics,
+    )
+
+    arbiter = acquire_startup_arbiter()
+    if not arbiter.acquired:
+        return False
+    try:
+        if preflight_requires_diagnostics():
+            return False
+        if not _acquire_instance_lock():
+            return False
+        try:
+            from database import attempt_db_recovery
+
+            attempt_db_recovery()
+        except Exception:
+            pass
+        authorization = _initialize_startup_ownership()
+        return bool(authorization.get("allowed"))
+    except Exception:
+        return False
+    finally:
+        arbiter.release()
+
+
 def main(argv=None):
     """Desktop app entry point for both .py and .pyw launchers."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -1405,14 +1597,25 @@ def main(argv=None):
         if _respawn_under_pythonw():
             return 0
 
+    # Durable ownership outranks port and file-lock heuristics. This
+    # stdlib-only preflight cannot create/migrate SQLite or import user_paths.
+    if not _authorize_desktop_startup():
+        _release_instance_lock()
+        diagnostics_reservation = _reserve_diagnostics_server_port()
+        run_read_only_diagnostics_mode(
+            diagnostics_reservation,
+            ready_callback=lambda: _open_existing_instance_in_browser(
+                diagnostics_reservation.port
+            ),
+        )
+        return 0
+
     # Cross-process singleton: only ONE desktop_app may run at a time.
     # Without this, a second double-click within the 1-2s Python startup
     # window slips past the port check, both instances start their own
     # Flask/AppBridge/coin-prep workers, and the workers race the same
     # wallet coins → MEMPOOL_CONFLICT cascade in Sage.
-    if not _acquire_instance_lock():
-        _open_existing_instance_in_browser()
-        return 0
+    _enable_pythonw_startup_log()
 
     # Kill-on-close Job Object: ensures default child processes (coin-prep
     # workers, helper commands, etc.) die when this parent dies, even on
@@ -1458,6 +1661,7 @@ def main(argv=None):
             run_desktop_mode(dev_mode=args.dev)
         return 0
     except Exception as e:
+        _cleanup()
         # Log crash to file so we can diagnose even if console is hidden.
         # The crash log lives under the user data directory so it's
         # writable regardless of install location.

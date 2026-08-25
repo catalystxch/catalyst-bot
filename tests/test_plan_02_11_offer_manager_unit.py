@@ -24,7 +24,6 @@ try:
         mojos_to_xch,
         cat_to_mojos,
         mojos_to_cat,
-        CANCEL_PENDING_METHODS,
     )
 
     _SKIP = None
@@ -115,23 +114,6 @@ class TestConversionHelpers(unittest.TestCase):
     def test_cat_to_mojos_large_decimals(self):
         # CAT with 12 decimals (same as XCH)
         self.assertEqual(cat_to_mojos(Decimal("1"), 12), 1_000_000_000_000)
-
-
-# ===========================================================================
-# CANCEL_PENDING_METHODS frozenset
-# ===========================================================================
-
-
-@unittest.skipIf(_SKIP is not None, f"offer_manager unavailable: {_SKIP}")
-class TestCancelPendingMethods(unittest.TestCase):
-    def test_submitted_pending_in_set(self):
-        self.assertIn("submitted_pending_confirm", CANCEL_PENDING_METHODS)
-
-    def test_already_in_mempool_in_set(self):
-        self.assertIn("already_in_mempool", CANCEL_PENDING_METHODS)
-
-    def test_confirmed_not_in_set(self):
-        self.assertNotIn("confirmed", CANCEL_PENDING_METHODS)
 
 
 # ===========================================================================
@@ -332,7 +314,14 @@ class TestPositionHardGuard(_OM):
             self._manager.record_slot_coin_failure("sell", 0)
             self._manager.record_slot_coin_failure("sell", 1)
 
-        with patch.object(_om_mod, "get_open_offers", return_value=[]):
+        with (
+            patch.object(_om_mod, "get_open_offers", return_value=[]),
+            patch.object(
+                _om_mod.database,
+                "get_active_offer_slot_keys",
+                return_value=[],
+            ),
+        ):
             slots = self._manager.get_replenishment_slots("sell", 7)
 
         self.assertEqual(slots, [2, 3, 4, 5, 6])
@@ -424,6 +413,75 @@ class TestDetectExpiringOffers(_OM):
         self.assertIn("soon", result)
         self.assertNotIn("far", result)
 
+    def test_short_lived_sniper_duplicate_is_not_generic_expiry_refresh(self):
+        soon = int(time.time()) + 600
+        offers = [
+            # Wallet records do not carry CATalyst's DB-only tier label.
+            self._make_offer("sniper-tid", soon),
+            {
+                **self._make_offer("sniper-tid", soon),
+                "tier": "sniper",
+            },
+        ]
+
+        result = self._manager.detect_expiring_offers(offers, refresh_before_secs=1800)
+
+        self.assertNotIn("sniper-tid", result)
+
+
+class TestCancelSettlementOrdering(_OM):
+    def test_retry_settles_submitted_blocker_before_retrying_failed_peer(self):
+        trade_id = "a" * 64
+        operation_id = f"cancel:{trade_id}"
+        order = []
+
+        with (
+            patch.object(
+                _om_mod.database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": operation_id}],
+            ),
+            patch.object(
+                _om_mod.database,
+                "get_offer_intent_by_trade_id",
+                return_value=None,
+            ),
+            patch.object(
+                _om_mod.database,
+                "get_retryable_failed_offer_cancels",
+                side_effect=lambda: order.append("retry_read") or [],
+            ),
+            patch.object(
+                self._manager,
+                "_begin_cancel_settlement",
+                side_effect=lambda value: order.append(("begin", value)) or True,
+            ),
+            patch.object(
+                self._manager,
+                "_settle_submitted_cancel",
+                side_effect=lambda intent: (
+                    order.append(("settle", intent.operation_id)) or True
+                ),
+            ),
+            patch.object(
+                self._manager,
+                "_end_cancel_settlement",
+                side_effect=lambda value: order.append(("end", value)),
+            ),
+        ):
+            result = self._manager.retry_failed_cancels()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            order,
+            [
+                ("begin", operation_id),
+                ("settle", operation_id),
+                ("end", operation_id),
+                "retry_read",
+            ],
+        )
+
 
 class TestCleanupExpiredDbOffers(_OM):
     def setUp(self):
@@ -463,7 +521,7 @@ class TestCleanupExpiredDbOffers(_OM):
             pass
         super().tearDown()
 
-    def test_cleanup_expired_db_offers_skips_pending_cancel_rows(self):
+    def test_cleanup_expired_db_offers_preserves_rows_without_authoritative_proof(self):
         now = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
         past = (now - timedelta(seconds=1)).isoformat()
         future = (now + timedelta(hours=1)).isoformat()
@@ -513,8 +571,8 @@ class TestCleanupExpiredDbOffers(_OM):
         with patch.object(_db_mod.time, "time", return_value=now.timestamp()):
             expired = self._manager.cleanup_expired_db_offers()
 
-        self.assertEqual(expired, ["plain-expired"])
-        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "expired")
+        self.assertEqual(expired, [])
+        self.assertEqual(_db_mod.get_offer("plain-expired")["status"], "open")
         self.assertEqual(_db_mod.get_offer("pending-cancel-expired")["status"], "open")
         self.assertEqual(
             _db_mod.get_offer("pending-cancel-expired")["lifecycle_state"],
@@ -528,7 +586,7 @@ class TestCleanupExpiredDbOffers(_OM):
                 include_pending_cancel=True,
             )
         }
-        self.assertNotIn("plain-expired", open_with_pending)
+        self.assertIn("plain-expired", open_with_pending)
         self.assertIn("pending-cancel-expired", open_with_pending)
         self.assertIn("pending-cancel-future", open_with_pending)
         plain_coin = (
@@ -539,8 +597,8 @@ class TestCleanupExpiredDbOffers(_OM):
             )
             .fetchone()
         )
-        self.assertEqual(plain_coin["status"], "free")
-        self.assertIsNone(plain_coin["trade_id"])
+        self.assertEqual(plain_coin["status"], "locked")
+        self.assertEqual(plain_coin["trade_id"], "plain-expired")
         pending_coin = (
             _db_mod.get_connection()
             .execute(

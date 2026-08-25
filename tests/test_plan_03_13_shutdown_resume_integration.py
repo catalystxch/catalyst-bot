@@ -17,10 +17,10 @@ Tests the full shutdown → restart → resume decision flow:
     - Fills and offers in DB are preserved.
 
   Fresh start chosen:
-    - /api/session/fresh-start calls _reset_fresh_run_session():
-      fills cleared, round-trips cleared, position baseline reset.
+    - /api/session/fresh-start calls _reset_fresh_run_session().
+    - Task 9 authoritative fills are preserved and make the reset fail closed.
     - Subsequent check-resume returns can_resume=False (flag guards it).
-    - DB fills count drops to 0 after reset.
+    - DB fills remain durable when the reset is refused.
 
 Uses real temp SQLite to verify DB-level state changes.
 Wallet calls are mocked — only DB and session-flag logic is exercised live.
@@ -33,6 +33,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from api_test_support import permit_api_mutations
 
 try:
     import database as _db
@@ -76,6 +78,7 @@ class _TempDB(unittest.TestCase):
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
         # Snapshot globals mutated by _reset_fresh_run_session() so tearDown
         # can restore them and avoid polluting subsequent test modules.
@@ -230,7 +233,7 @@ class TestResumePath(_TempDB):
 
 
 # ---------------------------------------------------------------------------
-# fresh-start: fills cleared from DB
+# fresh-start: authoritative fills are preserved
 # ---------------------------------------------------------------------------
 
 
@@ -249,12 +252,14 @@ class TestFreshStartPath(_TempDB):
         resp = self._fresh_start()
         self.assertTrue(resp.get_json().get("success"))
 
-    def test_fresh_start_clears_fills_from_db(self):
-        """_reset_fresh_run_session() deletes fills — DB fill count becomes 0."""
+    def test_fresh_start_preserves_authoritative_fills(self):
+        """Task 9 fill history makes the broad fresh reset fail closed."""
         self._seed_fill()
         self.assertEqual(self._fill_count(), 1)
-        self._fresh_start()
-        self.assertEqual(self._fill_count(), 0)
+        resp = self._fresh_start()
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(resp.get_json().get("success"))
+        self.assertEqual(self._fill_count(), 1)
 
     def test_fresh_start_sets_flag(self):
         """After fresh-start, the session flag is set."""
@@ -275,12 +280,14 @@ class TestFreshStartPath(_TempDB):
             resp = self.client.get("/api/check-resume", environ_base=_LOOPBACK)
         self.assertFalse(resp.get_json().get("can_resume"))
 
-    def test_response_includes_fills_cleared_count(self):
-        """fresh-start response reports how many fills were cleared."""
+    def test_response_reports_no_authoritative_fills_cleared(self):
+        """A refused reset reports that no authoritative fills were deleted."""
         self._seed_fill()
         resp = self._fresh_start()
         body = resp.get_json()
-        self.assertGreaterEqual(body.get("fills_cleared", 0), 1)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(body.get("fills_cleared"), 0)
+        self.assertEqual(self._fill_count(), 1)
 
 
 if __name__ == "__main__":

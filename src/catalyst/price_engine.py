@@ -37,6 +37,12 @@ _tibet_cache = {
     # whichever is shorter: this TTL or the AMM poll interval.
 }
 _tibet_lock = threading.Lock()
+_tibet_warning_state = {
+    "last_warn": 0.0,
+    "signature": "",
+    "repeats": 0,
+}
+_tibet_warning_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -342,10 +348,18 @@ class PriceEngine:
         decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
         cat_scale = Decimal(10) ** Decimal(decimals)
 
-        xch_reserve = Decimal(str(pair.get("xch_reserve", 0))) / Decimal("1e12")
+        xch_reserve_mojos = Decimal(str(pair.get("xch_reserve", 0)))
+        token_reserve_mojos = Decimal(str(pair.get("token_reserve", 0)))
+        # Tibet can retain a pair record after its spendable reserves have
+        # drained to zero.  Treat that as unavailable pool data; otherwise a
+        # one-mojo XCH sentinel becomes a fantastically large and misleading
+        # trade-to-pool ratio on the dashboard.
+        if xch_reserve_mojos <= 0 or token_reserve_mojos <= 0:
+            return None
+
+        xch_reserve = xch_reserve_mojos / Decimal("1e12")
         # Raw token_reserve is in token mojos — scale down to display units
         # so price = xch_reserve / token_reserve is in XCH-per-token.
-        token_reserve_mojos = Decimal(str(pair.get("token_reserve", 0)))
         token_reserve = (
             token_reserve_mojos / cat_scale if cat_scale > 0 else token_reserve_mojos
         )
@@ -514,6 +528,27 @@ class PriceEngine:
     # TibetSwap price fetching
     # -------------------------------------------------------------------
 
+    def _log_tibet_warning(self, event: str, message: str) -> None:
+        """Rate-limit repeated warnings from one sustained Tibet outage."""
+        now = time.time()
+        signature = "tibet_fetch_unavailable"
+        with _tibet_warning_lock:
+            if signature == _tibet_warning_state["signature"]:
+                _tibet_warning_state["repeats"] += 1
+            else:
+                _tibet_warning_state["signature"] = signature
+                _tibet_warning_state["repeats"] = 1
+            cooldown = (
+                self._stuck_cooldown_secs
+                if _tibet_warning_state["repeats"] >= 2
+                else self._warn_cooldown_secs
+            )
+            if now - _tibet_warning_state["last_warn"] < cooldown:
+                return
+            _tibet_warning_state["last_warn"] = now
+
+        log_event("warning", event, message)
+
     def _fetch_tibet_price(self, asset_id: str, decimals: int = 3) -> Optional[Decimal]:
         """Fetch price from TibetSwap AMM reserves.
 
@@ -588,8 +623,7 @@ class PriceEngine:
                 url, params={"skip": 0, "limit": 200}, timeout=cfg.TIBET_TIMEOUT
             )
             if resp.status_code == 429:
-                log_event(
-                    "warning",
+                self._log_tibet_warning(
                     "tibet_rate_limited",
                     "TibetSwap returned 429 — will use cached price if available",
                 )
@@ -605,10 +639,9 @@ class PriceEngine:
                 return pairs
 
         except requests.RequestException as e:
-            log_event("warning", "tibet_error", f"TibetSwap fetch failed: {e}")
+            self._log_tibet_warning("tibet_error", f"TibetSwap fetch failed: {e}")
         except (ValueError, KeyError, TypeError) as e:
-            log_event(
-                "warning",
+            self._log_tibet_warning(
                 "tibet_parse_error",
                 f"TibetSwap returned unparseable response: {e}",
             )
@@ -626,16 +659,14 @@ class PriceEngine:
         )
         stale_age = time.time() - _tibet_cache["fetched_at"]
         if stale_pairs and stale_age <= max_stale_secs:
-            log_event(
-                "warning",
+            self._log_tibet_warning(
                 "tibet_stale_cache",
                 f"TibetSwap API error — using {stale_age:.0f}s old cached price "
                 f"(max allowed: {max_stale_secs}s)",
             )
             return stale_pairs
         elif stale_pairs:
-            log_event(
-                "warning",
+            self._log_tibet_warning(
                 "tibet_cache_expired",
                 f"TibetSwap API error AND cache is {stale_age:.0f}s old "
                 f"(> {max_stale_secs}s max) — refusing to return stale price",

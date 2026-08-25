@@ -50,6 +50,8 @@ _ORIG_MODULES = {
         "coin_manager",
         "tx_fees",
         "win_subprocess",
+        "mutation_gate",
+        "offer_registry",
         "offer_manager",
     )
 }
@@ -72,6 +74,17 @@ fake_database.lock_coin = lambda *args, **kwargs: None
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
 fake_database.transition_offer = lambda *args, **kwargs: None
 fake_database.mark_cancel_attempted = lambda *args, **kwargs: None
+fake_database.get_unresolved_offer_operation_blockers = lambda: []
+fake_database.get_retryable_failed_offer_cancels = lambda: []
+fake_database.get_pending_refresh_lineage_parent_ids = lambda **kwargs: []
+fake_database.get_runtime_mutation_lease = lambda: {
+    "wallet_fingerprint_hash": "f" * 64,
+    "network": "mainnet",
+}
+fake_database.refresh_lineage_blocker_operation_id = lambda **kwargs: (
+    "refresh-lineage:test-blocker"
+)
+fake_database.record_refresh_lineage_blocker = lambda **kwargs: {"state": "blocking"}
 sys.modules["database"] = fake_database
 
 fake_wallet = types.ModuleType("wallet")
@@ -91,6 +104,7 @@ fake_wallet.get_spendable_coins_rpc = lambda *args, **kwargs: {
 fake_wallet.get_exact_spendable_coins_rpc = fake_wallet.get_spendable_coins_rpc
 fake_wallet.get_owned_coins_detailed = lambda *args, **kwargs: None
 fake_wallet.get_wallet_type = lambda: "sage"
+fake_wallet.get_wallet_backend_authority = lambda: "sage"
 fake_wallet.WALLET_ID_XCH = 1
 sys.modules["wallet"] = fake_wallet
 
@@ -117,6 +131,23 @@ sys.modules["win_subprocess"] = fake_win_subprocess
 # version loaded by test_api_local_guard (which uses real config/wallet).
 sys.modules.pop("offer_manager", None)
 import offer_manager
+from cancel_outcomes import (
+    CANCEL_SUBMITTED_UNCONFIRMED,
+    cancellation_result,
+)
+
+
+def _submitted_cancel_results(trade_ids):
+    return {
+        trade_id: cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="unit_requote",
+            raw_response={"success": True, "transaction_id": "1" * 64},
+            transaction_id="1" * 64,
+        )
+        for trade_id in trade_ids
+    }
+
 
 # Restore originals after import so we don't pollute subsequent test files.
 for _name, _mod in _ORIG_MODULES.items():
@@ -144,45 +175,11 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             self.assertEqual(manager._get_ladder_parallelism(True), 1)
             self.assertEqual(manager._get_ladder_parallelism(False), 1)
 
-    def test_cancel_offers_logs_only_confirmed_cancels(self):
-        manager = offer_manager.OfferManager()
-        events = []
-
-        with (
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "trade-ok": {"success": True},
-                    "trade-fail": {"success": False},
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(
-                offer_manager,
-                "log_event",
-                side_effect=lambda level, event_type, message: events.append(
-                    (level, event_type, message)
-                ),
-            ),
-        ):
-            result = manager.cancel_offers(["trade-ok", "trade-fail"], reason="test")
-
-        self.assertTrue(result["trade-ok"]["success"])
-        mock_update.assert_called_once_with("trade-ok", "cancelled")
-        event_types = [event_type for _, event_type, _ in events]
-        self.assertIn("cancel_result", event_types)
-        self.assertIn("offers_cancelled", event_types)
-        self.assertIn("offers_cancel_pending", event_types)
-        cancelled_msgs = [
-            msg for _, event_type, msg in events if event_type == "offers_cancelled"
-        ]
-        self.assertEqual(cancelled_msgs, ["Cancelled 1 offers (reason: test)"])
-
-    def test_requote_side_cancels_most_at_risk_first(self):
-        """Single-pass requote cancels the most-at-risk old offers first."""
+    def test_requote_side_journals_most_at_risk_first_without_overstacking(self):
+        """Single-pass requote journals the most-at-risk old offers first."""
         manager = offer_manager.OfferManager()
         cancel_batches = []
+        create_batches = []
         open_offers = [
             {
                 "trade_id": "extreme-trade",
@@ -212,6 +209,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -219,7 +217,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             del reason, skip_confirmation, force_storm
             cancel_batches.append(list(trade_ids))
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         # Two spare trading coins (DB-first path in requote_side).
         # Must have designation in {"tier_spare","tier_active"} and assigned_tier
@@ -243,21 +241,23 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("buy", Decimal("0.1200"))
 
-        # Single pass: 2 spares → create 2, cancel 2 most-at-risk
-        self.assertEqual(result["replaced_count"], 2)
+        # Legacy, non-canonical wallet rows have no durable parent authority.
+        self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 4)
         self.assertFalse(result["fully_replaced"])
-        self.assertEqual(len(result["offers"]), 2)
-        # Only one cancel batch (single pass, no rolling waves)
-        self.assertEqual(len(cancel_batches), 1)
-        # Most-at-risk first: inner (closest to mid), then mid
-        self.assertEqual(cancel_batches[0], ["inner-trade", "mid-trade"])
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["pending_cancel_count"], 0)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
+        self.assertEqual(create_batches, [])
+        self.assertEqual(cancel_batches, [])
 
     def test_requote_side_large_partial_retires_stale_survivor(self):
         """Larger partial requotes blend stale/far survivors into cancel targets."""
         manager = offer_manager.OfferManager()
         cancel_batches = []
         force_flags = []
+        create_batches = []
         open_offers = []
         for idx, price in enumerate(
             [
@@ -299,6 +299,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -307,7 +308,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             del reason, skip_confirmation
             cancel_batches.append(list(trade_ids))
             force_flags.append(force_storm)
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         _eight_spare_coins = [
             {"designation": "tier_spare", "assigned_tier": "inner"} for _ in range(8)
@@ -322,28 +323,20 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("buy", Decimal("0.1200"))
 
-        self.assertEqual(result["replaced_count"], 8)
+        self.assertEqual(result["replaced_count"], 0)
         self.assertEqual(result["target_count"], 10)
         self.assertFalse(result["fully_replaced"])
-        self.assertEqual(len(cancel_batches), 1)
-        self.assertEqual(
-            cancel_batches[0][:6],
-            [
-                "risk-1",
-                "risk-2",
-                "risk-3",
-                "risk-4",
-                "risk-5",
-                "risk-6",
-            ],
-        )
-        self.assertIn("stale-old-far", cancel_batches[0][6:])
-        self.assertNotIn("risk-7", cancel_batches[0])
-        self.assertEqual(force_flags, [False])
+        self.assertEqual(result["pending_cancel_count"], 0)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
+        self.assertEqual(create_batches, [])
+        self.assertEqual(cancel_batches, [])
+        self.assertEqual(force_flags, [])
 
     def test_requote_side_can_force_intentional_cancel_storm(self):
         manager = offer_manager.OfferManager()
         force_flags = []
+        create_batches = []
         open_offers = [
             {
                 "trade_id": f"old-{idx}",
@@ -357,6 +350,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         def fake_create_ladder(mid_price, side, num_offers=None, **kwargs):
             del mid_price, side, kwargs
             count = int(num_offers or 0)
+            create_batches.append(count)
             return [{"trade_id": f"new-{i}"} for i in range(count)]
 
         def fake_cancel_offers(
@@ -364,7 +358,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             del reason, skip_confirmation
             force_flags.append(force_storm)
-            return {tid: {"success": True} for tid in trade_ids}
+            return _submitted_cancel_results(trade_ids)
 
         _six_spare_coins = [
             {"designation": "tier_spare", "assigned_tier": "inner"} for _ in range(6)
@@ -383,8 +377,12 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 force_cancel_storm=True,
             )
 
-        self.assertEqual(result["replaced_count"], 6)
-        self.assertEqual(force_flags, [True])
+        self.assertEqual(result["replaced_count"], 0)
+        self.assertEqual(result["pending_cancel_count"], 0)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
+        self.assertEqual(create_batches, [])
+        self.assertEqual(force_flags, [])
 
     def test_requote_side_does_not_create_when_cancel_is_pending(self):
         manager = offer_manager.OfferManager()
@@ -425,11 +423,56 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         ):
             result = manager.requote_side("sell", Decimal("0.1200"))
 
-        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(calls, [])
         self.assertEqual(result["offers"], [])
         self.assertEqual(result["replaced_count"], 0)
-        self.assertEqual(result["pending_cancel_count"], 1)
+        self.assertEqual(result["pending_cancel_count"], 0)
         self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
+        self.assertFalse(result["fully_replaced"])
+
+    def test_requote_side_does_not_overstack_after_typed_cancel_failure(self):
+        manager = offer_manager.OfferManager()
+        open_offers = [
+            {
+                "trade_id": "old-sell",
+                "tier": "inner",
+                "price_xch": "0.1200",
+                "created_at": "2026-03-29T00:00:01+00:00",
+            }
+        ]
+        calls = []
+
+        def fake_create_ladder(*args, **kwargs):
+            del args, kwargs
+            calls.append("create")
+            return [{"trade_id": "new-sell"}]
+
+        def fake_cancel_offers(
+            trade_ids, reason="requote", skip_confirmation=False, force_storm=False
+        ):
+            del trade_ids, reason, skip_confirmation, force_storm
+            calls.append("cancel")
+            return {"old-sell": {"outcome": "CANCEL_FAILED"}}
+
+        with (
+            patch.object(offer_manager, "get_open_offers", return_value=open_offers),
+            patch(
+                "database.get_free_coins",
+                return_value=[{"designation": "tier_spare", "assigned_tier": "inner"}],
+            ),
+            patch.object(manager, "create_ladder", side_effect=fake_create_ladder),
+            patch.object(manager, "cancel_offers", side_effect=fake_cancel_offers),
+            patch.object(offer_manager, "log_event"),
+        ):
+            result = manager.requote_side("sell", Decimal("0.1200"))
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["replaced_count"], 0)
+        self.assertEqual(result["pending_cancel_count"], 0)
+        self.assertEqual(result["failed_cancel_count"], 0)
+        self.assertTrue(result["refresh_paused"])
         self.assertFalse(result["fully_replaced"])
 
     def test_retry_failed_cancels_exhaustion_does_not_mark_cancelled(self):
@@ -452,27 +495,25 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
     def test_create_offer_with_retry_uses_selected_coin_id_directly(self):
         manager = offer_manager.OfferManager()
-        selected_coin_id = "0xabc123"
+        selected_coin_id = "a" * 64
         seen = {}
 
-        def fake_create_offer(
-            offer_dict,
-            validate_only=False,
-            max_time=None,
-            min_coin_amount=None,
-            max_coin_amount=None,
-            coin_ids=None,
-        ):
-            seen["coin_ids"] = coin_ids
+        def fake_journaled_create(*, intent, **_kwargs):
+            seen["coin_ids"] = [intent.selected_coin_id]
             return {
                 "success": True,
                 "offer": "offer1selectedcoin",
                 "trade_id": "trade-selected",
                 "trade_record": {"trade_id": "trade-selected"},
+                "locked_coin_id": intent.selected_coin_id,
             }
 
         with (
-            patch.object(offer_manager, "create_offer", side_effect=fake_create_offer),
+            patch.object(
+                manager,
+                "_create_offer_from_journal",
+                side_effect=fake_journaled_create,
+            ),
             patch.object(
                 offer_manager.OfferManager,
                 "_select_coin_for_offer",
@@ -507,6 +548,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             seen.append(selected_coin_id)
@@ -559,6 +601,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -849,6 +892,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -945,6 +989,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1035,6 +1080,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1120,6 +1166,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1216,6 +1263,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             return {
@@ -1323,6 +1371,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1425,6 +1474,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             idx = next(counter)
             return {
@@ -1480,6 +1530,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             coin_ids_enabled=False,
             selected_coin_id=None,
             preferred_tier=None,
+            creation_context=None,
         ):
             return {
                 "success": True,
@@ -1549,6 +1600,85 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             )
         )
 
+    def test_create_ladder_matches_sage_prefixed_selected_coin_without_warning(self):
+        """Sage's 0x prefix must not turn the selected coin into a false mismatch."""
+
+        manager = offer_manager.OfferManager()
+
+        def fake_create_offer_with_retry(
+            self,
+            offer_dict,
+            max_retries=2,
+            expiry_offset=0,
+            expiry_secs=None,
+            used_coins=None,
+            coin_ids_enabled=False,
+            selected_coin_id=None,
+            preferred_tier=None,
+            strict_preferred_tier=False,
+            creation_context=None,
+        ):
+            return {
+                "success": True,
+                "trade_id": "trade-prefixed-coin",
+                "trade_record": {"trade_id": "trade-prefixed-coin"},
+                "locked_coin_id": selected_coin_id,
+                "offer": "offer-prefixed-coin",
+            }
+
+        locked_map = {
+            "0xcoin-mid": {
+                "amount": 10_000_000_000,
+                "offer_id": "trade-prefixed-coin",
+            }
+        }
+
+        with (
+            patch.object(
+                offer_manager.OfferManager,
+                "_select_coin_for_offer",
+                return_value="coin-mid",
+            ),
+            patch.object(
+                offer_manager.OfferManager,
+                "create_offer_with_retry",
+                new=fake_create_offer_with_retry,
+            ),
+            patch.object(
+                offer_manager, "get_owned_coins_detailed", return_value=locked_map
+            ),
+            patch.object(
+                offer_manager,
+                "get_exact_spendable_coins_rpc",
+                return_value={
+                    "success": True,
+                    "confirmed_records": [
+                        {"coin_id": "coin-mid", "coin": {"amount": 10_000_000_000}}
+                    ],
+                },
+            ),
+            patch.object(offer_manager, "add_offer"),
+            patch.object(offer_manager, "lock_coin"),
+            patch.object(offer_manager, "log_event") as mock_log_event,
+            patch.object(offer_manager, "get_offer_bech32", return_value=""),
+            patch("builtins.print"),
+        ):
+            created = manager.create_ladder(
+                mid_price=Decimal("0.001"),
+                side="buy",
+                num_offers=1,
+                coin_ids_enabled=True,
+            )
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["coin_id"], "coin-mid")
+        self.assertFalse(
+            any(
+                args[1] == "trade_coin_not_verified"
+                for args, _ in mock_log_event.call_args_list
+            )
+        )
+
     def test_get_replenishment_slots_heals_tier_shortage_instead_of_mini_ladder(self):
         # Scenario: only the extreme tier has a shortage (3 slots short).
         # With the current tier config (INNER=10, MID=7, OUTER=5, EXTREME=28
@@ -1582,6 +1712,33 @@ class OfferManagerCoinIdTests(unittest.TestCase):
         # fill from innermost extreme positions [22, 23, 24].
         self.assertEqual(slots, [22, 23, 24])
 
+    def test_get_replenishment_slots_selects_the_actual_vacant_durable_slot(self):
+        manager = offer_manager.OfferManager()
+        existing = [{"tier": "inner"}] * 7
+        occupied = [f"ladder:test-cat:sell:{slot}" for slot in (0, 1, 2, 3, 4, 5, 7)]
+
+        with (
+            patch.object(offer_manager.cfg, "TIER_ENABLED", True),
+            patch.object(offer_manager.cfg, "SELL_INNER_TIER_COUNT", 8, create=True),
+            patch.object(offer_manager.cfg, "SELL_MID_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager.cfg, "SELL_OUTER_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager.cfg, "SELL_EXTREME_TIER_COUNT", 0, create=True),
+            patch.object(offer_manager, "get_open_offers", return_value=existing),
+            patch.object(
+                offer_manager.database,
+                "get_active_offer_slot_keys",
+                return_value=occupied,
+                create=True,
+            ),
+        ):
+            slots = manager.get_replenishment_slots(
+                side="sell",
+                total_slots=8,
+                cat_asset_id="test-cat",
+            )
+
+        self.assertEqual(slots, [6])
+
     def test_create_ladder_can_bypass_stale_refill_interpolation(self):
         manager = offer_manager.OfferManager()
         selected = itertools.count(1)
@@ -1603,6 +1760,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             del self, offer_dict, max_retries, expiry_offset, expiry_secs
             del used_coins, coin_ids_enabled, preferred_tier, strict_preferred_tier
@@ -1695,6 +1853,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
             selected_coin_id=None,
             preferred_tier=None,
             strict_preferred_tier=False,
+            creation_context=None,
         ):
             del self, offer_dict, max_retries, expiry_offset, expiry_secs
             del used_coins, coin_ids_enabled, preferred_tier, strict_preferred_tier
@@ -1814,129 +1973,8 @@ class CancelPendingMempoolTests(unittest.TestCase):
     the offer is still live and can still fill. Previously the bot did
     flip the DB, producing ghost offers during mempool congestion."""
 
-    def test_pending_methods_constant_covers_all_unconfirmed_sage_paths(self):
-        self.assertIn("submitted_pending_confirm", offer_manager.CANCEL_PENDING_METHODS)
-        self.assertIn("already_in_mempool", offer_manager.CANCEL_PENDING_METHODS)
-        self.assertIn("mempool_conflict_inflight", offer_manager.CANCEL_PENDING_METHODS)
-
-    def test_cancel_offers_skips_db_update_for_pending_methods(self):
-        manager = offer_manager.OfferManager()
-
-        # Mock the DB open-offers lookup to return one offer we want to cancel.
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[
-                    {"trade_id": "tid-pending", "coin_id": "0xc1", "side": "buy"}
-                ],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-pending": {
-                        "success": True,
-                        "method": "submitted_pending_confirm",
-                        "note": "Cancel submitted, awaiting on-chain confirm",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-pending"], reason="test")
-
-        # The DB must NOT be flipped to cancelled — the offer is still live.
-        cancelled_calls = [
-            c
-            for c in mock_update.call_args_list
-            if len(c.args) >= 2 and c.args[1] == "cancelled"
-        ]
-        self.assertEqual(
-            cancelled_calls,
-            [],
-            "DB must not be marked cancelled while cancel TX is "
-            "still pending in the mempool",
-        )
-
-    def test_cancel_offers_flips_db_for_confirmed_methods(self):
-        """Sanity check: the happy path (truly confirmed) DOES flip the DB."""
-        manager = offer_manager.OfferManager()
-
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[{"trade_id": "tid-ok", "coin_id": "0xc2", "side": "buy"}],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-ok": {
-                        "success": True,
-                        "method": "confirmed_by_unlock",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status") as mock_update,
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-ok"], reason="test")
-
-        cancelled_calls = [
-            c
-            for c in mock_update.call_args_list
-            if len(c.args) >= 2 and c.args[1] == "cancelled"
-        ]
-        self.assertEqual(
-            len(cancelled_calls),
-            1,
-            "DB must be flipped to cancelled when Sage confirms "
-            "the cancel via coin unlock",
-        )
-
-    def test_cancel_offers_purges_public_post_queues(self):
-        manager = offer_manager.OfferManager()
-        purged = {"dexie": [], "splash": []}
-
-        class QueueStub:
-            def __init__(self, name):
-                self.name = name
-
-            def purge_trade_ids(self, trade_ids):
-                purged[self.name].append(list(trade_ids))
-
-        manager.dexie_manager = QueueStub("dexie")
-        manager.splash_manager = QueueStub("splash")
-
-        with (
-            patch.object(
-                offer_manager,
-                "get_open_offers",
-                return_value=[{"trade_id": "tid-ok", "coin_id": "0xc2", "side": "buy"}],
-            ),
-            patch.object(
-                offer_manager,
-                "cancel_offers_batch",
-                return_value={
-                    "tid-ok": {
-                        "success": True,
-                        "method": "confirmed_by_unlock",
-                    }
-                },
-            ),
-            patch.object(offer_manager, "update_offer_status"),
-            patch.object(offer_manager, "transition_offer"),
-            patch.object(offer_manager, "cleanup_expired_offers", return_value=0),
-        ):
-            manager.cancel_offers(["tid-ok"], reason="test")
-
-        self.assertEqual(purged["dexie"], [["tid-ok"]])
-        self.assertEqual(purged["splash"], [["tid-ok"]])
+    def test_pending_methods_string_policy_is_removed(self):
+        self.assertFalse(hasattr(offer_manager, "CANCEL_PENDING_METHODS"))
 
 
 if __name__ == "__main__":

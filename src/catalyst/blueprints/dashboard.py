@@ -309,6 +309,42 @@ def api_dashboard():
                 market_health = bot.risk_manager.get_market_health(loop_count=_lc)
             except Exception as e:
                 market_health["message"] = f"Health check error: {e}"
+        if (
+            bot
+            and market_health.get("status") == "green"
+            and market_health.get("message")
+            == "Market healthy — bot operating normally"
+        ):
+            try:
+                bot_running = bool(bot.is_running())
+            except Exception:
+                bot_running = None
+            if bot_running is False:
+                market_health["message"] = "Market conditions healthy — bot stopped"
+        if bot:
+            startup_results = getattr(bot, "_startup_self_test_results", {}) or {}
+            tibet_health = startup_results.get("tibet") or {}
+            if tibet_health.get("ok") is False:
+                conditions = market_health.setdefault("conditions", [])
+                conditions.append(
+                    {
+                        "level": "amber",
+                        "text": (
+                            "TibetSwap API unavailable — Dexie-only pricing; "
+                            "AMM drift protection and reference price unavailable"
+                        ),
+                    }
+                )
+                metrics = market_health.setdefault("metrics", {})
+                metrics["tibetswap_available"] = False
+                metrics["tibetswap_status_code"] = tibet_health.get("status_code")
+                metrics["pricing_mode"] = "dexie_only"
+                if market_health.get("status") == "green":
+                    market_health["status"] = "amber"
+                    market_health["message"] = (
+                        "Market degraded — TibetSwap unavailable; Dexie-only "
+                        "pricing active without AMM drift protection"
+                    )
         if bot:
             try:
                 metrics = market_health.setdefault("metrics", {})
@@ -719,12 +755,27 @@ def api_dashboard():
                 active_cat_id = api_server._active_cat.get("asset_id") or getattr(
                     cfg, "CAT_ASSET_ID", ""
                 )
-                live_open_buys = len(
-                    get_open_offers(side="buy", cat_asset_id=active_cat_id)
-                )
-                live_open_sells = len(
-                    get_open_offers(side="sell", cat_asset_id=active_cat_id)
-                )
+                used_wallet_snapshot = False
+                if not _live_wallet_reads_allowed(bot):
+                    offer_manager = getattr(bot, "offer_manager", None)
+                    snapshot_getter = getattr(
+                        offer_manager, "get_wallet_sync_snapshot", None
+                    )
+                    if callable(snapshot_getter):
+                        wallet_snapshot = snapshot_getter() or {}
+                        wallet_meta = wallet_snapshot.get("meta") or {}
+                        if wallet_meta.get("fresh") is True:
+                            live_open_buys = len(wallet_snapshot.get("buy") or [])
+                            live_open_sells = len(wallet_snapshot.get("sell") or [])
+                            used_wallet_snapshot = True
+
+                if not used_wallet_snapshot:
+                    live_open_buys = len(
+                        get_open_offers(side="buy", cat_asset_id=active_cat_id)
+                    )
+                    live_open_sells = len(
+                        get_open_offers(side="sell", cat_asset_id=active_cat_id)
+                    )
                 performance["open_buys"] = live_open_buys
                 performance["open_sells"] = live_open_sells
                 performance["open_offers"] = live_open_buys + live_open_sells

@@ -5,6 +5,8 @@ isolation. Tests covers norm_coin_id, add_offer/get_offer/update_offer_status,
 get_open_offers, record_fill/get_fills/get_net_position, upsert_coin/
 get_free_coins/lock_coin/free_coin/get_coin_summary, record_price/
 get_recent_prices, log_event/get_recent_events, get_setting/set_setting.
+The durable stability repository is also smoke-tested through its initial
+singleton latch state.
 """
 
 import os
@@ -157,27 +159,29 @@ class TestAddOffer(_TempDB):
 class TestUpdateOfferStatus(_TempDB):
     """update_offer_status - state transitions."""
 
-    def test_returns_true_on_success(self):
+    def test_terminal_update_requires_authoritative_reconciliation(self):
         _db.add_offer(
             "t1", "buy", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetid1"
         )
         result = _db.update_offer_status("t1", "cancelled")
-        self.assertTrue(result)
+        self.assertFalse(result)
+        self.assertEqual(_db.get_offer("t1")["status"], "open")
 
-    def test_status_updated(self):
+    def test_unproven_fill_status_is_preserved_open(self):
         _db.add_offer(
             "t2", "buy", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetid1"
         )
-        _db.update_offer_status("t2", "filled")
+        result = _db.update_offer_status("t2", "filled")
         offer = _db.get_offer("t2")
-        self.assertEqual(offer["status"], "filled")
+        self.assertFalse(result)
+        self.assertEqual(offer["status"], "open")
 
     def test_returns_true_on_unknown_trade_id(self):
         # SQLite UPDATE of 0 rows is not an error; function returns True (no-op success)
         result = _db.update_offer_status("nonexistent", "cancelled")
         self.assertTrue(result)
 
-    def test_not_submitted_marks_offer_terminal_and_frees_locked_coin(self):
+    def test_not_submitted_is_diagnostic_and_preserves_locked_open_offer(self):
         _db.upsert_coin(
             "0xnot-submitted", "cat", 123456, designation="tier_spare", tier="inner"
         )
@@ -204,11 +208,11 @@ class TestUpdateOfferStatus(_TempDB):
             )
             .fetchone()
         )
-        self.assertTrue(result)
-        self.assertEqual(offer["status"], "expired")
-        self.assertEqual(offer["lifecycle_state"], "not_submitted")
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
+        self.assertFalse(result)
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "t-not-submitted")
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
@@ -242,12 +246,12 @@ class TestGetOpenOffers(_TempDB):
         self.assertIn("s1", trade_ids)
         self.assertNotIn("b2", trade_ids)
 
-    def test_excludes_cancelled_offers(self):
-        _db.update_offer_status("b1", "cancelled")
+    def test_unproven_cancel_does_not_hide_offer(self):
+        self.assertFalse(_db.update_offer_status("b1", "cancelled"))
         buys = _db.get_open_offers(side="buy", cat_asset_id="assetA")
-        self.assertNotIn("b1", {o["trade_id"] for o in buys})
+        self.assertIn("b1", {o["trade_id"] for o in buys})
 
-    def test_expire_open_offers_by_time_marks_elapsed_rows_and_frees_coin(self):
+    def test_expire_open_offers_by_time_preserves_rows_and_coins_without_proof(self):
         now = datetime.now(timezone.utc)
         past = (now - timedelta(seconds=1)).isoformat()
         future = (now + timedelta(hours=1)).isoformat()
@@ -278,11 +282,11 @@ class TestGetOpenOffers(_TempDB):
             cat_asset_id="assetA", now_ts=now.timestamp()
         )
 
-        self.assertEqual(expired, ["expired-row"])
-        self.assertEqual(_db.get_offer("expired-row")["status"], "expired")
+        self.assertEqual(expired, [])
+        self.assertEqual(_db.get_offer("expired-row")["status"], "open")
         self.assertEqual(_db.get_offer("future-row")["status"], "open")
         open_ids = {o["trade_id"] for o in _db.get_open_offers(cat_asset_id="assetA")}
-        self.assertNotIn("expired-row", open_ids)
+        self.assertIn("expired-row", open_ids)
         self.assertIn("future-row", open_ids)
         coin = (
             _db.get_connection()
@@ -292,10 +296,10 @@ class TestGetOpenOffers(_TempDB):
             )
             .fetchone()
         )
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "expired-row")
 
-    def test_elapsed_offer_expiry_is_hidden_until_explicit_expiry(self):
+    def test_elapsed_offer_remains_in_safety_view_until_authoritative_expiry(self):
         now = datetime.now(timezone.utc)
         past = (now - timedelta(seconds=1)).isoformat()
 
@@ -326,7 +330,7 @@ class TestGetOpenOffers(_TempDB):
             .fetchone()
         )
 
-        self.assertNotIn("idle-expired", {o["trade_id"] for o in offers})
+        self.assertIn("idle-expired", {o["trade_id"] for o in offers})
         self.assertIn("idle-expired", {o["trade_id"] for o in startup_offers})
         self.assertEqual(offer["status"], "open")
         self.assertEqual(offer["lifecycle_state"], "open")
@@ -343,11 +347,11 @@ class TestGetOpenOffers(_TempDB):
             )
             .fetchone()
         )
-        self.assertEqual(retired, 1)
-        self.assertEqual(offer["status"], "expired")
-        self.assertEqual(offer["lifecycle_state"], "expired")
-        self.assertEqual(coin["status"], "free")
-        self.assertIsNone(coin["trade_id"])
+        self.assertEqual(retired, 0)
+        self.assertEqual(offer["status"], "open")
+        self.assertEqual(offer["lifecycle_state"], "open")
+        self.assertEqual(coin["status"], "locked")
+        self.assertEqual(coin["trade_id"], "idle-expired")
 
     def test_get_stats_excludes_elapsed_expiry_without_mutating_rows(self):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -361,7 +365,7 @@ class TestGetOpenOffers(_TempDB):
         stats = _db.get_stats(cat_asset_id="assetA")
         lifecycle = _db.get_offer_lifecycle_summary(cat_asset_id="assetA")
 
-        self.assertEqual(stats["open_offers"], 0)
+        self.assertEqual(stats["open_offers"], 2)
         self.assertEqual(lifecycle["by_status"]["expired"], 2)
         self.assertEqual(_db.get_offer("b1")["status"], "open")
         self.assertEqual(_db.get_offer("s1")["status"], "open")
@@ -402,17 +406,17 @@ class TestGetOpenOffers(_TempDB):
             )
             .fetchone()
         )
-        self.assertNotIn("boot-expired", {o["trade_id"] for o in live_offers})
+        self.assertIn("boot-expired", {o["trade_id"] for o in live_offers})
         self.assertIn("boot-expired", {o["trade_id"] for o in startup_offers})
         self.assertEqual(offer["status"], "open")
         self.assertEqual(offer["lifecycle_state"], "open")
         self.assertEqual(coin["status"], "locked")
         self.assertEqual(coin["trade_id"], "boot-expired")
 
-    def test_excludes_pending_fill_verification_by_default(self):
+    def test_includes_pending_fill_verification_in_safety_view_by_default(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
         offers = _db.get_open_offers(cat_asset_id="assetA")
-        self.assertNotIn("b1", {o["trade_id"] for o in offers})
+        self.assertIn("b1", {o["trade_id"] for o in offers})
 
         with_pending = _db.get_open_offers(
             cat_asset_id="assetA",
@@ -420,15 +424,15 @@ class TestGetOpenOffers(_TempDB):
         )
         self.assertIn("b1", {o["trade_id"] for o in with_pending})
 
-    def test_get_stats_excludes_non_actionable_open_rows(self):
+    def test_get_stats_retains_nonterminal_pending_rows_for_safety_accounting(self):
         _db.update_offer_lifecycle_state("b1", "mempool_observed")
         _db.update_offer_lifecycle_state("s1", "cancel_requested")
 
         stats = _db.get_stats(cat_asset_id="assetA")
 
-        self.assertEqual(stats["open_offers"], 0)
-        self.assertEqual(stats["open_buys"], 0)
-        self.assertEqual(stats["open_sells"], 0)
+        self.assertEqual(stats["open_offers"], 2)
+        self.assertEqual(stats["open_buys"], 1)
+        self.assertEqual(stats["open_sells"], 1)
 
     def test_get_offers_for_repost_excludes_non_actionable_open_rows(self):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -502,14 +506,14 @@ class TestOfferLifecycleSummary(_TempDB):
             "assetB",
         )
 
-        _db.update_offer_status("cancel-buy", "cancelled")
+        self.assertFalse(_db.update_offer_status("cancel-buy", "cancelled"))
         _db.update_offer_lifecycle_state("pending-sell", "cancel_requested")
 
         summary = _db.get_offer_lifecycle_summary(cat_asset_id="assetA")
 
         self.assertEqual(summary["total"], 4)
-        self.assertEqual(summary["by_side"]["buy"]["open"], 1)
-        self.assertEqual(summary["by_side"]["buy"]["cancelled"], 1)
+        self.assertEqual(summary["by_side"]["buy"]["open"], 2)
+        self.assertEqual(summary["by_side"]["buy"]["cancelled"], 0)
         self.assertEqual(summary["by_side"]["sell"]["open"], 2)
         self.assertEqual(summary["by_lifecycle"]["cancel_requested"], 1)
         self.assertEqual(summary["pending_cancel"], 1)
@@ -526,13 +530,14 @@ class TestRecordFill(_TempDB):
         self.assertIsNotNone(fill_id)
         self.assertGreater(fill_id, 0)
 
-    def test_get_fills_returns_recorded_fill(self):
+    def test_get_fills_hides_unproven_record_from_economics(self):
         _db.record_fill(
             "t2", "sell", Decimal("1.10"), Decimal("0.3"), Decimal("300"), "assetA"
         )
         fills = _db.get_fills(cat_asset_id="assetA")
-        trade_ids = [f["trade_id"] for f in fills]
-        self.assertIn("t2", trade_ids)
+        self.assertEqual(fills, [])
+        history = _db.get_fills(cat_asset_id="assetA", include_legacy=True)
+        self.assertEqual([fill["trade_id"] for fill in history], ["t2"])
 
     def test_get_fills_filters_by_side(self):
         _db.record_fill(
@@ -553,19 +558,19 @@ class TestGetNetPosition(_TempDB):
         pos = _db.get_net_position("assetA")
         self.assertEqual(pos, Decimal("0"))
 
-    def test_buy_fill_adds_to_position(self):
+    def test_unproven_buy_fill_does_not_change_position(self):
         _db.record_fill(
             "t1", "buy", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetA"
         )
         pos = _db.get_net_position("assetA")
-        self.assertGreater(pos, Decimal("0"))
+        self.assertEqual(pos, Decimal("0"))
 
-    def test_sell_fill_subtracts_from_position(self):
+    def test_unproven_sell_fill_does_not_change_position(self):
         _db.record_fill(
             "t1", "sell", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetA"
         )
         pos = _db.get_net_position("assetA")
-        self.assertLess(pos, Decimal("0"))
+        self.assertEqual(pos, Decimal("0"))
 
     def test_balanced_buys_and_sells_near_zero(self):
         _db.record_fill(
@@ -678,6 +683,38 @@ class TestLogEventAndGetRecentEvents(_TempDB):
         events = _db.get_recent_events(limit=5)
         self.assertLessEqual(len(events), 5)
 
+    def test_recent_events_orders_mixed_timestamp_formats_by_instant(self):
+        conn = _db.get_connection()
+        conn.execute("DELETE FROM events")
+        conn.executemany(
+            "INSERT INTO events (timestamp, event_type, severity, message) VALUES (?, ?, 'info', ?)",
+            [
+                ("2026-08-23T06:17:52.317108Z", "older_iso", "older"),
+                ("2026-08-23 10:50:48", "newer_sqlite", "newer"),
+            ],
+        )
+        conn.commit()
+
+        events = _db.get_recent_events(limit=1)
+
+        self.assertEqual([event["event_type"] for event in events], ["newer_sqlite"])
+
+    def test_events_since_excludes_older_iso_row_with_mixed_timestamp_formats(self):
+        conn = _db.get_connection()
+        conn.execute("DELETE FROM events")
+        conn.executemany(
+            "INSERT INTO events (timestamp, event_type, severity, message) VALUES (?, ?, 'info', ?)",
+            [
+                ("2026-08-23T06:17:52.317108Z", "older_iso", "older"),
+                ("2026-08-23 10:50:48", "newer_sqlite", "newer"),
+            ],
+        )
+        conn.commit()
+
+        events = _db.get_events_since("2026-08-23T09:06:09Z", limit=10)
+
+        self.assertEqual([event["event_type"] for event in events], ["newer_sqlite"])
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestGetSetSetting(_TempDB):
@@ -750,6 +787,19 @@ class TestElapsedExpiryMissingTable(_TempDB):
                 for call in log_event.mock_calls
             )
         )
+
+
+@unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
+class TestStabilityRepository(_TempDB):
+    """The stability migration exposes a durable resolved latch on every DB."""
+
+    def test_initial_runtime_safety_latch_is_resolved(self):
+        latch = _db.get_runtime_safety_latch()
+
+        self.assertEqual(latch["singleton_id"], 1)
+        self.assertEqual(latch["generation"], 0)
+        self.assertEqual(latch["state"], "resolved")
+        self.assertEqual(latch["blocking_operation_ids_json"], "[]")
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

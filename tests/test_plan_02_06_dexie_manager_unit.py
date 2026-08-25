@@ -370,6 +370,7 @@ class TestComputeV3TradeMetrics(_DM):
 
     @patch("dexie_manager.log_event")
     def test_returns_none_when_no_trades(self, _mock_log):
+        self._inject_trades("NO_TICKER", [])
         result = self.dm.compute_v3_trade_metrics("NO_TICKER")
         self.assertIsNone(result)
 

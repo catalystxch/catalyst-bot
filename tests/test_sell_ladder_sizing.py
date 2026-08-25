@@ -1,4 +1,5 @@
 from decimal import Decimal, ROUND_HALF_UP
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,61 @@ def test_coin_prep_worker_uses_cli_cat_tier_counts_for_ladder_prices(monkeypatch
     )
 
     assert result["extreme"] == expected_extreme
+
+
+def test_cat_tier_size_ssot_matches_coin_prep_sell_ladder_prices(monkeypatch):
+    """Post-prep verification must target the sizes the worker just created."""
+    import coin_manager
+    import config
+    from amount_utils import cat_display_amount_to_mojos_ceil
+    from ladder_sizing import summarize_sell_ladder_cat
+
+    mid = Decimal("0.00006793426265966367389097258339")
+    sizes = {
+        "inner": Decimal("2.0819"),
+        "mid": Decimal("1.7349"),
+        "outer": Decimal("0.9108"),
+        "extreme": Decimal("0.2776"),
+    }
+    counts = {"inner": 7, "mid": 7, "outer": 6, "extreme": 4}
+    stub = SimpleNamespace(
+        TIER_ENABLED=True,
+        BUY_LADDER_REVERSED=True,
+        COIN_PREP_HEADROOM_PCT=Decimal("15"),
+        CAT_DECIMALS=3,
+        SPREAD_BPS=Decimal("1000"),
+        MIN_EDGE_BPS=Decimal("400"),
+        MAX_ACTIVE_SELL_OFFERS=24,
+        SELL_INNER_TIER_COUNT=counts["inner"],
+        SELL_MID_TIER_COUNT=counts["mid"],
+        SELL_OUTER_TIER_COUNT=counts["outer"],
+        SELL_EXTREME_TIER_COUNT=counts["extreme"],
+        COIN_MAX_SIZE_RATIO=Decimal("1.5"),
+        LAST_QUOTED_MID=Decimal("0"),
+        **{f"SELL_{tier.upper()}_SIZE_XCH": value for tier, value in sizes.items()},
+        **{f"{tier.upper()}_SIZE_XCH": Decimal("0") for tier in sizes},
+    )
+    monkeypatch.setattr(config, "cfg", stub)
+    monkeypatch.setattr(coin_manager, "cfg", stub)
+    monkeypatch.setenv("_CLI_LIVE_PRICE", str(mid))
+
+    summary = summarize_sell_ladder_cat(
+        mid_price=mid,
+        spread_fraction=stub.SPREAD_BPS / Decimal("10000"),
+        max_offers=stub.MAX_ACTIVE_SELL_OFFERS,
+        tier_counts=counts,
+        tier_sizes_xch=sizes,
+        min_edge_bps=stub.MIN_EDGE_BPS,
+    )
+    expected = {
+        tier: cat_display_amount_to_mojos_ceil(
+            summary.max_cat_per_tier[tier] * Decimal("1.15"),
+            stub.CAT_DECIMALS,
+        )
+        for tier in sizes
+    }
+
+    assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True) == expected
 
 
 def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():

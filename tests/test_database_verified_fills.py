@@ -3,6 +3,8 @@ import tempfile
 import unittest
 import importlib
 import sys
+import hashlib
+import json
 from decimal import Decimal
 
 
@@ -15,6 +17,196 @@ def _load_real_database_module():
 
 
 database = _load_real_database_module()
+
+
+_TEST_WALLET = "f" * 64
+_TEST_NETWORK = "mainnet"
+_TEST_PREPARED_AT = "2026-01-01T00:00:00+00:00"
+_TEST_FILLED_AT = "2026-03-28T00:00:00+00:00"
+_TEST_RECONCILED_AT = "2026-12-31T00:00:00+00:00"
+
+
+def _authoritatively_terminalize_offer(
+    trade_id,
+    *,
+    classification="FILLED_PROVEN",
+    selected_coin_ids=None,
+    filled_at=_TEST_FILLED_AT,
+):
+    """Build exact Task 4 state and cross Task 9's sole terminal boundary."""
+
+    offer = database.get_offer(trade_id)
+    if offer is None:
+        raise AssertionError(f"missing offer fixture: {trade_id}")
+    identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
+    intent_id = f"verified-fill-test:{identity}"
+    selected = list(
+        selected_coin_ids
+        or [hashlib.sha256(f"selected:{trade_id}".encode("utf-8")).hexdigest()]
+    )
+    cat_decimals = 3
+    xch_atomic_value = Decimal(str(offer["size_xch"])) * Decimal(10**12)
+    cat_atomic_value = Decimal(str(offer["size_cat"])) * Decimal(10**cat_decimals)
+    if (
+        xch_atomic_value != xch_atomic_value.to_integral_value()
+        or cat_atomic_value != cat_atomic_value.to_integral_value()
+    ):
+        raise AssertionError("offer fixture cannot be represented as atomic economics")
+    xch_atomic = int(xch_atomic_value)
+    cat_atomic = int(cat_atomic_value)
+    offered_atomic = xch_atomic if offer["side"] == "buy" else cat_atomic
+    requested_atomic = cat_atomic if offer["side"] == "buy" else xch_atomic
+    for coin_id in selected:
+        database.upsert_coin(
+            coin_id,
+            "xch" if offer["side"] == "buy" else "cat",
+            offered_atomic,
+            tier=offer.get("tier") or "unknown",
+            purpose="lifecycle",
+        )
+    wallet_identity = {
+        "wallet_fingerprint_hash": _TEST_WALLET,
+        "network": _TEST_NETWORK,
+    }
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
+        run_id="verified-fill-test-run",
+        wallet_fingerprint_hash=_TEST_WALLET,
+        network=_TEST_NETWORK,
+        asset_id=offer["cat_asset_id"],
+        side=offer["side"],
+        tier=offer.get("tier") or "unknown",
+        purpose="verified_fill_test",
+        slot_key=f"verified-fill-test-slot:{identity}",
+        generation=0,
+        offered_amount_atomic=str(offered_atomic),
+        requested_amount_atomic=str(requested_atomic),
+        selected_coin_ids_json=selected,
+        cat_decimals=cat_decimals,
+        fee_mojos_xch=int(offer.get("fee_mojos_xch") or 0),
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "authoritative intent"},
+        prepared_at=_TEST_PREPARED_AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=hashlib.sha256(
+            f"offer:{trade_id}".encode("utf-8")
+        ).hexdigest(),
+        wallet_identity_json=wallet_identity,
+        evidence_json={"fixture": "authoritative creation"},
+        finalized_at=_TEST_PREPARED_AT,
+        finalize_selected_coin_reservations=True,
+    )
+    economics = database.get_offer_intent_economic_authority(intent_id)
+    if economics is None:
+        raise AssertionError(f"missing immutable economics fixture: {trade_id}")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET price_xch=?, size_xch=?, size_cat=?, fee_mojos_xch=? "
+        "WHERE trade_id=?",
+        (
+            economics["price_xch"],
+            economics["size_xch"],
+            economics["size_cat"],
+            economics["fee_mojos_xch"],
+            trade_id,
+        ),
+    )
+    conn.commit()
+    evidence = {"fixture": "authoritative terminal proof", "trade_id": trade_id}
+    terminal = {}
+    if classification == "FILLED_PROVEN":
+        transaction_id = hashlib.sha256(
+            f"transaction:{trade_id}".encode("utf-8")
+        ).hexdigest()
+        receive_coin_id = hashlib.sha256(
+            f"receive:{trade_id}".encode("utf-8")
+        ).hexdigest()
+        canonical_filled_at = database._stability_timestamp(
+            filled_at, "fixture filled_at"
+        )
+        terminal = {
+            "transaction_id": transaction_id,
+            "block_height": 42,
+            "receive_coin_id": receive_coin_id,
+            "receive_amount_mojos": requested_atomic,
+            "filled_at": canonical_filled_at,
+        }
+        transaction_flow_sha256 = database.canonical_fill_transaction_flow_token(
+            transaction_id,
+            None,
+            42,
+            economics["selected_coin_ids_sha256"],
+            economics["side"],
+            economics["cat_asset_id"],
+            economics["offered_amount_atomic"],
+            economics["requested_amount_atomic"],
+            database.norm_coin_id(receive_coin_id),
+            requested_atomic,
+        )
+        evidence.update(
+            {
+                "classification": {
+                    "classification": "FILLED_PROVEN",
+                    "reason_code": "TEST_AUTHORITATIVE_PROOF",
+                    "transaction_id": transaction_id,
+                    "spend_identity": None,
+                    "block_height": 42,
+                    "receive_coin_id": receive_coin_id,
+                    "receive_amount_mojos": requested_atomic,
+                    "filled_at": canonical_filled_at,
+                },
+                "fill_authority": {
+                    "schema_version": 1,
+                    "intent_id": intent_id,
+                    "prepared_event_id": economics["prepared_event_id"],
+                    "economic_authority_token": economics["authority_token"],
+                    "trade_id": trade_id,
+                    "side": economics["side"],
+                    "price_xch": economics["price_xch"],
+                    "size_xch": economics["size_xch"],
+                    "size_cat": economics["size_cat"],
+                    "cat_asset_id": economics["cat_asset_id"],
+                    "tier": economics["tier"],
+                    "offered_amount_atomic": economics["offered_amount_atomic"],
+                    "requested_amount_atomic": economics["requested_amount_atomic"],
+                    "cat_decimals": economics["cat_decimals"],
+                    "fee_mojos_xch": economics["fee_mojos_xch"],
+                    "fee_provenance": economics["fee_provenance"],
+                    "selected_coin_ids_sha256": economics["selected_coin_ids_sha256"],
+                    "transaction_flow_sha256": transaction_flow_sha256,
+                    "spent_block_height": 42,
+                    "receive_coin_id": database.norm_coin_id(receive_coin_id),
+                    "receive_amount_mojos": requested_atomic,
+                    "filled_at": canonical_filled_at,
+                    "transaction_id": transaction_id,
+                    "spend_identity": None,
+                },
+            }
+        )
+    evidence_json = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    return database.commit_offer_reconciliation(
+        intent_id=intent_id,
+        operation_id=f"reconcile:{intent_id}",
+        classification=classification,
+        reason_code="TEST_AUTHORITATIVE_PROOF",
+        wallet_identity_json=wallet_identity,
+        evidence_json=evidence,
+        evidence_sha256=hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+        reconciled_at=_TEST_RECONCILED_AT,
+        **terminal,
+    )
 
 
 class DatabaseVerifiedFillsTests(unittest.TestCase):
@@ -71,22 +263,17 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
         position = database.get_net_position(asset_id)
 
-        self.assertEqual(stats["total_fills"], 1)
-        self.assertEqual(stats["fill_rate_per_hour"], 1.0)
+        self.assertEqual(stats["total_fills"], 0)
+        self.assertEqual(stats["fill_rate_per_hour"], 0.0)
         self.assertEqual(stats["buy_fills"], 0)
-        self.assertEqual(stats["sell_fills"], 1)
-        self.assertEqual(len(fills), 1)
-        self.assertEqual(fills[0]["trade_id"], "verified-fill")
-        # get_net_position() intentionally includes legacy fills — they represent
-        # real accumulated inventory from before the verification system was added.
-        # Stats (total_fills, buy_fills, sell_fills) exclude legacy; position does not.
-        # Net = legacy buy +1000 + verified sell -2000 = -1000.
-        self.assertEqual(position, Decimal("-1000"))
+        self.assertEqual(stats["sell_fills"], 0)
+        self.assertEqual(fills, [])
+        self.assertEqual(position, Decimal("0"))
 
     def test_stats_report_fee_adjusted_net_xch_flow(self):
         asset_id = "asset-fee-flow"
 
-        database.record_fill(
+        database.add_offer(
             trade_id="fee-buy",
             side="buy",
             price_xch=Decimal("0.001"),
@@ -96,7 +283,8 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             fee_mojos_xch=1_000_000_000,
         )
-        database.record_fill(
+        _authoritatively_terminalize_offer("fee-buy")
+        database.add_offer(
             trade_id="fee-sell",
             side="sell",
             price_xch=Decimal("0.0011"),
@@ -106,10 +294,11 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             fee_mojos_xch=1_000_000_000,
         )
+        _authoritatively_terminalize_offer("fee-sell")
 
         stats = database.get_stats(asset_id)
 
-        self.assertEqual(stats["net_xch_flow"], "0.010")
+        self.assertEqual(stats["net_xch_flow"], "0.01")
         self.assertEqual(stats["fee_xch"], "0.002")
         self.assertEqual(stats["net_xch_flow_after_fees"], "0.008")
 
@@ -137,15 +326,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="inner",
             coin_id=coin_id,
         )
-        database.record_fill(
-            trade_id="trade-new",
-            side="sell",
-            price_xch=Decimal("0.001"),
-            size_xch=Decimal("0.1"),
-            size_cat=Decimal("100"),
-            cat_asset_id=asset_id,
-            tier="inner",
-        )
+        _authoritatively_terminalize_offer("trade-new")
 
         summary = database.get_offer_coin_usage_summary(coin_id, asset_id)
 
@@ -156,7 +337,7 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
     def test_stats_deduplicate_verified_fills_for_reused_source_coin(self):
         asset_id = "asset-requote-stats"
-        coin_id = "0xcoin-reused-stats"
+        coin_id = hashlib.sha256(b"coin-reused-stats").hexdigest()
 
         for trade_id in ("trade-old", "trade-new"):
             database.add_offer(
@@ -169,64 +350,21 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            database.record_fill(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-            )
+        _authoritatively_terminalize_offer("trade-old", selected_coin_ids=[coin_id])
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
 
         stats = database.get_stats(asset_id)
 
-        self.assertEqual(stats["raw_total_fills"], 2)
-        self.assertEqual(stats["duplicate_fill_rows"], 1)
+        self.assertEqual(stats["raw_total_fills"], 1)
+        self.assertEqual(stats["duplicate_fill_rows"], 0)
         self.assertEqual(stats["total_fills"], 1)
         self.assertEqual(stats["sell_fills"], 1)
         self.assertEqual(stats["volume_xch"], "0.1")
 
-    def test_stats_count_exact_verified_reused_source_coin_fills_by_trade(self):
+    def test_status_text_cannot_override_source_coin_authority_deduplication(self):
         asset_id = "asset-requote-exact-stats"
-        coin_id = "0xcoin-reused-exact-stats"
-
-        for trade_id, status in (
-            ("trade-old", "verified"),
-            ("trade-new", "verified_exact"),
-        ):
-            database.add_offer(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-                coin_id=coin_id,
-            )
-            database.record_fill(
-                trade_id=trade_id,
-                side="sell",
-                price_xch=Decimal("0.001"),
-                size_xch=Decimal("0.1"),
-                size_cat=Decimal("100"),
-                cat_asset_id=asset_id,
-                tier="inner",
-                verification_status=status,
-            )
-
-        stats = database.get_stats(asset_id)
-
-        self.assertEqual(stats["raw_total_fills"], 2)
-        self.assertEqual(stats["duplicate_fill_rows"], 0)
-        self.assertEqual(stats["total_fills"], 2)
-        self.assertEqual(stats["sell_fills"], 2)
-        self.assertEqual(stats["volume_xch"], "0.2")
-
-    def test_unmatched_fills_deduplicate_verified_fills_for_reused_source_coin(self):
-        asset_id = "asset-requote-unmatched"
-        coin_id = "0xcoin-reused-unmatched"
+        coin_id = hashlib.sha256(b"coin-reused-exact-stats").hexdigest()
 
         for trade_id in ("trade-old", "trade-new"):
             database.add_offer(
@@ -239,7 +377,31 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 tier="inner",
                 coin_id=coin_id,
             )
-            database.record_fill(
+        result = _authoritatively_terminalize_offer(
+            "trade-old", selected_coin_ids=[coin_id]
+        )
+        database.get_connection().execute(
+            "UPDATE fills SET verification_status=? WHERE fill_id=?",
+            ("verified_exact", result["fill_id"]),
+        )
+        database.get_connection().commit()
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
+
+        stats = database.get_stats(asset_id)
+
+        self.assertEqual(stats["raw_total_fills"], 1)
+        self.assertEqual(stats["duplicate_fill_rows"], 0)
+        self.assertEqual(stats["total_fills"], 1)
+        self.assertEqual(stats["sell_fills"], 1)
+        self.assertEqual(stats["volume_xch"], "0.1")
+
+    def test_unmatched_fills_deduplicate_verified_fills_for_reused_source_coin(self):
+        asset_id = "asset-requote-unmatched"
+        coin_id = hashlib.sha256(b"coin-reused-unmatched").hexdigest()
+
+        for trade_id in ("trade-old", "trade-new"):
+            database.add_offer(
                 trade_id=trade_id,
                 side="sell",
                 price_xch=Decimal("0.001"),
@@ -247,19 +409,23 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 size_cat=Decimal("100"),
                 cat_asset_id=asset_id,
                 tier="inner",
+                coin_id=coin_id,
             )
+        _authoritatively_terminalize_offer("trade-old", selected_coin_ids=[coin_id])
+        with self.assertRaisesRegex(ValueError, "authoritative terminal coin outcome"):
+            _authoritatively_terminalize_offer("trade-new", selected_coin_ids=[coin_id])
 
         unmatched = database.get_unmatched_fills(asset_id, "sell")
 
         self.assertEqual(len(unmatched), 1)
-        self.assertEqual(unmatched[0]["trade_id"], "trade-new")
+        self.assertEqual(unmatched[0]["trade_id"], "trade-old")
 
     def test_fill_and_expiry_update_all_locked_coins_for_trade(self):
         conn = database.get_connection()
         asset_id = "asset-test"
+        coin_a = hashlib.sha256(b"trade-multi-a").hexdigest()
+        coin_b = hashlib.sha256(b"trade-multi-b").hexdigest()
 
-        database.upsert_coin("0xcoin-a", "xch", 2200000000000)
-        database.upsert_coin("0xcoin-b", "xch", 220000000000)
         database.add_offer(
             trade_id="trade-multi",
             side="buy",
@@ -268,19 +434,10 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("22000"),
             cat_asset_id=asset_id,
             tier="inner",
-            coin_id="0xcoin-a",
+            coin_id=coin_a,
         )
-        database.lock_coin("0xcoin-a", "trade-multi")
-        database.lock_coin("0xcoin-b", "trade-multi")
-
-        database.record_fill(
-            trade_id="trade-multi",
-            side="buy",
-            price_xch=Decimal("0.1"),
-            size_xch=Decimal("2.2"),
-            size_cat=Decimal("22000"),
-            cat_asset_id=asset_id,
-            tier="inner",
+        _authoritatively_terminalize_offer(
+            "trade-multi", selected_coin_ids=[coin_a, coin_b]
         )
 
         rows = conn.execute(
@@ -297,14 +454,16 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
                 )
                 for row in rows
             ],
-            [
-                ("0xcoin-a", "spent", "unknown", "none"),
-                ("0xcoin-b", "spent", "unknown", "none"),
-            ],
+            sorted(
+                [
+                    (database.norm_coin_id(coin_a), "spent", "unknown", "none"),
+                    (database.norm_coin_id(coin_b), "spent", "unknown", "none"),
+                ]
+            ),
         )
 
-        database.upsert_coin("0xcoin-c", "cat", 10473000)
-        database.upsert_coin("0xcoin-d", "cat", 2095000)
+        coin_c = hashlib.sha256(b"trade-expire-c").hexdigest()
+        coin_d = hashlib.sha256(b"trade-expire-d").hexdigest()
         database.add_offer(
             trade_id="trade-expire",
             side="sell",
@@ -313,27 +472,32 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("8446"),
             cat_asset_id=asset_id,
             tier="mid",
-            coin_id="0xcoin-c",
+            coin_id=coin_c,
         )
-        database.lock_coin("0xcoin-c", "trade-expire")
-        database.lock_coin("0xcoin-d", "trade-expire")
-        database.update_offer_status("trade-expire", "expired")
+        _authoritatively_terminalize_offer(
+            "trade-expire",
+            classification="EXPIRED_PROVEN",
+            selected_coin_ids=[coin_c, coin_d],
+        )
 
         rows = conn.execute(
-            "SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN ('0xcoin-c', '0xcoin-d') ORDER BY coin_id"
+            "SELECT coin_id, status, trade_id FROM coins WHERE coin_id IN (?, ?) ORDER BY coin_id",
+            (database.norm_coin_id(coin_c), database.norm_coin_id(coin_d)),
         ).fetchall()
         self.assertEqual(
             [(row["coin_id"], row["status"], row["trade_id"]) for row in rows],
-            [
-                ("0xcoin-c", "free", None),
-                ("0xcoin-d", "free", None),
-            ],
+            sorted(
+                [
+                    (database.norm_coin_id(coin_c), "free", None),
+                    (database.norm_coin_id(coin_d), "free", None),
+                ]
+            ),
         )
 
     def test_stats_net_position_honors_fresh_run_cutoff(self):
         asset_id = "asset-test"
 
-        database.record_fill(
+        database.add_offer(
             trade_id="old-run-buy",
             side="buy",
             price_xch=Decimal("0.1"),
@@ -341,9 +505,11 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("1000"),
             cat_asset_id=asset_id,
             tier="mid",
-            filled_at="2026-03-27T20:00:00+00:00",
         )
-        database.record_fill(
+        _authoritatively_terminalize_offer(
+            "old-run-buy", filled_at="2026-03-27T20:00:00+00:00"
+        )
+        database.add_offer(
             trade_id="fresh-run-sell",
             side="sell",
             price_xch=Decimal("0.1"),
@@ -351,7 +517,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             size_cat=Decimal("200"),
             cat_asset_id=asset_id,
             tier="mid",
-            filled_at="2026-03-28T22:10:00+00:00",
+        )
+        _authoritatively_terminalize_offer(
+            "fresh-run-sell", filled_at="2026-03-28T22:10:00+00:00"
         )
 
         stats = database.get_stats(asset_id, since="2026-03-28T22:07:28+00:00")
@@ -364,7 +532,6 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         conn = database.get_connection()
         asset_id = "asset-test"
 
-        database.upsert_coin("0xcoin-upgrade", "xch", 240000000000)
         database.add_offer(
             trade_id="trade-upgrade",
             side="sell",
@@ -375,10 +542,13 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="extreme",
             coin_id="0xcoin-upgrade",
         )
-        database.lock_coin("0xcoin-upgrade", "trade-upgrade")
+        conn.execute(
+            "UPDATE offers SET cancelled_at=? WHERE trade_id=?",
+            ("2026-02-01T00:00:00+00:00", "trade-upgrade"),
+        )
+        conn.commit()
 
-        self.assertTrue(database.update_offer_status("trade-upgrade", "cancelled"))
-        self.assertTrue(database.update_offer_status("trade-upgrade", "filled"))
+        _authoritatively_terminalize_offer("trade-upgrade")
 
         row = conn.execute(
             "SELECT status, filled_at, cancelled_at FROM offers WHERE trade_id=?",
@@ -388,8 +558,9 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         self.assertIsNotNone(row["filled_at"])
         self.assertIsNone(row["cancelled_at"])
 
-    def test_backfill_verified_fills_from_filled_offers_repairs_stats(self):
+    def test_backfill_parks_filled_offer_without_authoritative_proof(self):
         asset_id = "asset-test"
+        conn = database.get_connection()
 
         database.add_offer(
             trade_id="trade-backfill",
@@ -401,7 +572,12 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="outer",
             coin_id="0xcoin-backfill",
         )
-        self.assertTrue(database.update_offer_status("trade-backfill", "filled"))
+        conn.execute(
+            "UPDATE offers SET status='filled', lifecycle_state='filled', filled_at=? "
+            "WHERE trade_id=?",
+            ("2026-03-27T20:00:00+00:00", "trade-backfill"),
+        )
+        conn.commit()
 
         stats_before = database.get_stats(asset_id)
         self.assertEqual(stats_before["total_fills"], 0)
@@ -411,16 +587,22 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         self.assertTrue(repaired[0]["created"])
         self.assertEqual(repaired[0]["trade_id"], "trade-backfill")
         self.assertEqual(repaired[0]["tier"], "outer")
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
+        parked = database.get_fills(
+            cat_asset_id=asset_id, limit=10, include_legacy=True
+        )
         stats_after = database.get_stats(asset_id)
 
-        self.assertEqual(len(fills), 1)
-        self.assertEqual(fills[0]["trade_id"], "trade-backfill")
-        self.assertEqual(stats_after["total_fills"], 1)
-        self.assertEqual(stats_after["sell_fills"], 1)
+        self.assertEqual(fills, [])
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]["trade_id"], "trade-backfill")
+        self.assertEqual(parked[0]["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(stats_after["total_fills"], 0)
+        self.assertEqual(stats_after["sell_fills"], 0)
 
-    def test_backfill_promotes_legacy_fill_to_verified(self):
+    def test_backfill_parks_legacy_fill_without_authoritative_proof(self):
         conn = database.get_connection()
         asset_id = "asset-test"
 
@@ -434,8 +616,10 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
             tier="mid",
             coin_id="0xcoin-upgrade-verified",
         )
-        self.assertTrue(
-            database.update_offer_status("trade-upgrade-verified", "filled")
+        conn.execute(
+            "UPDATE offers SET status='filled', lifecycle_state='filled', filled_at=? "
+            "WHERE trade_id=?",
+            ("2026-03-27T20:00:00+00:00", "trade-upgrade-verified"),
         )
 
         conn.execute(
@@ -459,14 +643,111 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
 
         repaired = database.backfill_verified_fills_from_offers(limit=10)
         self.assertEqual(len(repaired), 1)
-        self.assertTrue(repaired[0]["upgraded"])
+        self.assertFalse(repaired[0]["upgraded"])
         self.assertFalse(repaired[0]["created"])
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         row = conn.execute(
             "SELECT verification_status FROM fills WHERE trade_id=?",
             ("trade-upgrade-verified",),
         ).fetchone()
-        self.assertEqual(row["verification_status"], "verified")
+        self.assertEqual(row["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 0)
+
+    def test_backfill_promotes_only_exact_existing_authoritative_fill(self):
+        conn = database.get_connection()
+        asset_id = "asset-test"
+        trade_id = "trade-authoritative-backfill"
+
+        database.add_offer(
+            trade_id=trade_id,
+            side="buy",
+            price_xch=Decimal("0.11"),
+            size_xch=Decimal("1.2"),
+            size_cat=Decimal("10000"),
+            cat_asset_id=asset_id,
+            tier="mid",
+            coin_id="0xcoin-authoritative-backfill",
+        )
+        terminal = _authoritatively_terminalize_offer(trade_id)
+        fill_id = terminal["fill_id"]
+        conn.execute(
+            "UPDATE fills SET verification_status='legacy' WHERE fill_id=?",
+            (fill_id,),
+        )
+        conn.commit()
+
+        repaired = database.backfill_verified_fills_from_offers(limit=10)
+
+        self.assertEqual(
+            repaired,
+            [
+                {
+                    "fill_id": fill_id,
+                    "trade_id": trade_id,
+                    "side": "buy",
+                    "price_xch": "0.00012",
+                    "size_xch": "1.2",
+                    "size_cat": "10000",
+                    "filled_at": "2026-03-28T00:00:00.000000Z",
+                    "cat_asset_id": asset_id,
+                    "tier": "mid",
+                    "verification_status": "verified_authoritative",
+                    "created": False,
+                    "upgraded": True,
+                }
+            ],
+        )
+        row = conn.execute(
+            "SELECT verification_status, spent_block_index, receive_coin_id, "
+            "receive_amount_mojos FROM fills WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone()
+        self.assertEqual(row["verification_status"], "verified_authoritative")
+        self.assertEqual(row["spent_block_index"], 42)
+        self.assertEqual(
+            row["receive_coin_id"],
+            database.norm_coin_id(
+                hashlib.sha256(f"receive:{trade_id}".encode("utf-8")).hexdigest()
+            ),
+        )
+        self.assertEqual(row["receive_amount_mojos"], 10_000_000)
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 1)
+
+    def test_backfill_parks_changed_authoritative_fill_identity(self):
+        conn = database.get_connection()
+        asset_id = "asset-test"
+        trade_id = "trade-changed-authoritative-backfill"
+
+        database.add_offer(
+            trade_id=trade_id,
+            side="sell",
+            price_xch=Decimal("0.125"),
+            size_xch=Decimal("0.6"),
+            size_cat=Decimal("4800"),
+            cat_asset_id=asset_id,
+            tier="outer",
+            coin_id="0xcoin-changed-authoritative-backfill",
+        )
+        terminal = _authoritatively_terminalize_offer(trade_id)
+        conn.execute(
+            "UPDATE fills SET verification_status='legacy', size_cat='9999' "
+            "WHERE fill_id=?",
+            (terminal["fill_id"],),
+        )
+        conn.commit()
+
+        repaired = database.backfill_verified_fills_from_offers(limit=10)
+
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
+        row = conn.execute(
+            "SELECT verification_status, size_cat FROM fills WHERE fill_id=?",
+            (terminal["fill_id"],),
+        ).fetchone()
+        self.assertEqual(row["verification_status"], "legacy_unproven_filled")
+        self.assertEqual(row["size_cat"], "9999")
+        self.assertEqual(database.get_stats(asset_id)["total_fills"], 0)
 
     def test_backfill_and_stats_honor_fresh_run_cutoff(self):
         conn = database.get_connection()
@@ -517,13 +798,18 @@ class DatabaseVerifiedFillsTests(unittest.TestCase):
         )
         self.assertEqual(len(repaired), 1)
         self.assertEqual(repaired[0]["trade_id"], "trade-new-filled")
+        self.assertEqual(repaired[0]["verification_status"], "legacy_unproven_filled")
 
         fills = database.get_fills(cat_asset_id=asset_id, limit=10)
-        self.assertEqual([f["trade_id"] for f in fills], ["trade-new-filled"])
+        self.assertEqual(fills, [])
+        parked = database.get_fills(
+            cat_asset_id=asset_id, limit=10, include_legacy=True
+        )
+        self.assertEqual([f["trade_id"] for f in parked], ["trade-new-filled"])
 
         stats = database.get_stats(asset_id, since="2026-03-28T22:07:28+00:00")
-        self.assertEqual(stats["total_fills"], 1)
-        self.assertEqual(stats["buy_fills"], 1)
+        self.assertEqual(stats["total_fills"], 0)
+        self.assertEqual(stats["buy_fills"], 0)
         self.assertEqual(stats["sell_fills"], 0)
 
 

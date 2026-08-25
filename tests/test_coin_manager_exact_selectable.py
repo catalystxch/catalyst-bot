@@ -1,4 +1,5 @@
 import importlib
+import contextlib
 import os
 import sys
 import types
@@ -31,6 +32,46 @@ class CoinManagerExactSelectableTests(unittest.TestCase):
 
         fake_database = types.ModuleType("database")
         fake_database.log_event = lambda *args, **kwargs: None
+        fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
+            coin_ids
+        )
+        fake_database.claim_wallet_effect = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("read-only selectable view must not claim a wallet effect")
+        )
+        fake_database.resolve_wallet_effect_claim = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("read-only selectable view must not resolve a wallet effect")
+        )
+        fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "read-only selectable view must not dispatch a wallet effect"
+            )
+        )
+        fake_database.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
+        fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "read-only selectable view must not complete a wallet effect"
+            )
+        )
+        fake_database.retain_wallet_effect_claim_for_reconciliation = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "read-only selectable view must not retain a wallet effect"
+                )
+            )
+        )
+        fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(
+            AssertionError("read-only selectable view must not inspect an effect claim")
+        )
         sys.modules["database"] = fake_database
 
         merged_coin_id = "0x" + "11" * 32

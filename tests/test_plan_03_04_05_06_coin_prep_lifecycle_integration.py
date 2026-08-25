@@ -15,10 +15,10 @@ with real SQLite DB and mocked subprocess/threading:
     - Re-trigger after reset sets running=True again
     - Error state is cleared on re-trigger
 
-  03-06: coin-prep full reset (fresh-start path)
-    - full_reset=True in trigger body → fills cleared from DB (0 rows)
-    - full_reset=False (default) → fills preserved
-    - full_reset=True also clears round_trips
+  03-06: guarded coin-prep full reset (fresh-start path)
+    - full_reset=True succeeds only when no authoritative fill state exists
+    - fills make the reset return a stable conflict without mutation
+    - full_reset=False (default) preserves history
 
 Threading is mocked to prevent the do_prep() thread from actually launching.
 Uses the TempDB pattern for real SQLite isolation.
@@ -76,6 +76,16 @@ class _TempDB(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._fresh_start_clear()
+        self._mutation_patches = (
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate, "enter_mutation", return_value="permit"
+            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+        )
+        for mutation_patch in self._mutation_patches:
+            mutation_patch.start()
+            self.addCleanup(mutation_patch.stop)
 
         self._orig_session_start_time = api_server._session_start_time
         self._orig_run_history_cutoff = api_server._run_history_cutoff
@@ -125,6 +135,88 @@ class _TempDB(unittest.TestCase):
             size_cat=Decimal("0.5"),
             cat_asset_id=_FAKE_ASSET,
         )
+
+    def _seed_terminal_offer_proof(self):
+        """Mirror a completed TEST 7 offer with append-only proof history."""
+        coin_id = "b" * 64
+        trade_id = "c" * 64
+        intent_id = "intent-terminal-reprep"
+        prepared_at = "2026-08-22T06:48:40Z"
+        finalized_at = "2026-08-22T06:48:41Z"
+
+        self.assertTrue(
+            _db.upsert_coin(
+                coin_id,
+                "xch",
+                1000,
+                designation="tier_spare",
+                tier="inner",
+                purpose="lifecycle",
+            )
+        )
+        _db.prepare_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:prepared",
+            run_id="run-terminal-reprep",
+            wallet_fingerprint_hash="d" * 64,
+            network="mainnet",
+            asset_id=_FAKE_ASSET,
+            side="buy",
+            tier="inner",
+            purpose="normal_lifecycle",
+            slot_key="ladder:buy:0",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[coin_id],
+            wallet_identity_json={"wallet_fingerprint_hash": "d" * 64},
+            evidence_json={"source": "terminal-reprep-regression"},
+            prepared_at=prepared_at,
+            reserve_selected_coins=True,
+        )
+        _db.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=f"create:{intent_id}",
+            event_id=f"create:{intent_id}:finalized",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=trade_id,
+            offer_text_sha256="e" * 64,
+            wallet_identity_json={"wallet_fingerprint_hash": "d" * 64},
+            evidence_json={"effect_attempted": True},
+            finalized_at=finalized_at,
+            finalize_selected_coin_reservations=True,
+        )
+        self.assertTrue(
+            _db.add_offer(
+                trade_id,
+                "buy",
+                Decimal("0.001"),
+                Decimal("1"),
+                Decimal("1000"),
+                _FAKE_ASSET,
+                tier="inner",
+                coin_id=coin_id,
+            )
+        )
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE offer_intents SET lifecycle_state='terminal', "
+            "terminal_at=?, updated_at=? WHERE intent_id=?",
+            (finalized_at, finalized_at, intent_id),
+        )
+        conn.execute(
+            "UPDATE offers SET status='cancelled', lifecycle_state='cancelled' "
+            "WHERE trade_id=?",
+            (trade_id,),
+        )
+        conn.execute(
+            "UPDATE coins SET status='spent', trade_id=? WHERE coin_id=?",
+            (trade_id, _db.norm_coin_id(coin_id)),
+        )
+        conn.commit()
+        return intent_id, trade_id, coin_id
 
     def _fill_count(self):
         conn = _db.get_connection()
@@ -244,6 +336,112 @@ class TestCoinPrepFullCycle(_TempDB):
         self._trigger(full_reset=False)
         self.assertEqual(self._fill_count(), 1)
 
+    def test_keep_history_reprep_starts_with_terminal_offer_proof(self):
+        """Completed offer evidence must not block the routine re-prep path."""
+        intent_id, trade_id, coin_id = self._seed_terminal_offer_proof()
+
+        resp = self._trigger(full_reset=False)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json().get("success"))
+        conn = _db.get_connection()
+        self.assertEqual(
+            conn.execute(
+                "SELECT lifecycle_state FROM offer_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()[0],
+            "terminal",
+        )
+        self.assertGreater(
+            conn.execute(
+                "SELECT COUNT(*) FROM offer_operation_journal WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()[0],
+            0,
+        )
+        coin = conn.execute(
+            "SELECT status, trade_id FROM coins WHERE coin_id=?",
+            (_db.norm_coin_id(coin_id),),
+        ).fetchone()
+        self.assertEqual((coin[0], coin[1]), ("spent", trade_id))
+
+    def test_keep_history_reprep_reconciles_expired_open_offer_before_guard(self):
+        """Routine re-prep must reconcile terminal Sage evidence first."""
+
+        intent_id, trade_id, coin_id = self._seed_terminal_offer_proof()
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE offer_intents SET lifecycle_state='created', terminal_at=NULL "
+            "WHERE intent_id=?",
+            (intent_id,),
+        )
+        conn.execute(
+            "UPDATE offers SET status='open', lifecycle_state='open' WHERE trade_id=?",
+            (trade_id,),
+        )
+        conn.execute(
+            "UPDATE coins SET status='locked', trade_id=? WHERE coin_id=?",
+            (trade_id, _db.norm_coin_id(coin_id)),
+        )
+        conn.commit()
+
+        def reconcile_expired(candidate_intent_id, **_kwargs):
+            self.assertEqual(candidate_intent_id, intent_id)
+            db_conn = _db.get_connection()
+            db_conn.execute(
+                "UPDATE offer_intents SET lifecycle_state='terminal', terminal_at=? "
+                "WHERE intent_id=?",
+                ("2026-08-24T09:55:00Z", intent_id),
+            )
+            db_conn.execute(
+                "UPDATE offers SET status='expired', lifecycle_state='expired' "
+                "WHERE trade_id=?",
+                (trade_id,),
+            )
+            db_conn.execute(
+                "UPDATE coins SET status='free', trade_id=NULL WHERE coin_id=?",
+                (_db.norm_coin_id(coin_id),),
+            )
+            db_conn.commit()
+            return {"classification": "EXPIRED_PROVEN", "applied": True}
+
+        with (
+            patch(
+                "offer_reconciliation.load_authoritative_evidence",
+                return_value={"schema_version": 1},
+            ),
+            patch(
+                "offer_reconciliation._clock_utc",
+                return_value="2026-08-24T09:55:00Z",
+            ),
+            patch(
+                "offer_reconciliation._derive_single_cancel_context",
+                return_value=None,
+            ),
+            patch(
+                "offer_reconciliation.classify_terminal_evidence",
+                return_value={"classification": "EXPIRED_PROVEN"},
+            ),
+            patch(
+                "offer_reconciliation.reconcile_offer",
+                side_effect=reconcile_expired,
+            ) as reconcile,
+        ):
+            resp = self._trigger(full_reset=False)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json().get("success"))
+        self.assertEqual(reconcile.call_count, 1)
+        self.assertEqual(reconcile.call_args.args, (intent_id,))
+        self.assertEqual(
+            reconcile.call_args.kwargs,
+            {
+                "evidence": {"schema_version": 1},
+                "cancel_context": None,
+                "now": "2026-08-24T09:55:00Z",
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # 03-05: coin-prep retry — soft reset preserves DB, re-trigger restores state
@@ -313,32 +511,36 @@ class TestCoinPrepRetry(_TempDB):
 
 
 # ---------------------------------------------------------------------------
-# 03-06: coin-prep full reset path — full_reset=True clears fills
+# 03-06: coin-prep full reset path — authoritative fills deny mutation
 # ---------------------------------------------------------------------------
 
 
 @unittest.skipIf(_SKIP is not None, f"modules unavailable: {_SKIP}")
 class TestCoinPrepFullReset(_TempDB):
-    """full_reset=True must clear fills from DB (unlike the default path)."""
+    """A full reset must not erase durable fill/proof history."""
 
     def test_full_reset_trigger_returns_success(self):
         resp = self._trigger(full_reset=True)
         self.assertTrue(resp.get_json().get("success"))
 
-    def test_full_reset_clears_fills(self):
-        """Triggering with full_reset=True deletes all fills from DB."""
+    def test_full_reset_with_fill_returns_conflict_without_mutation(self):
         self._seed_fill()
         self.assertEqual(self._fill_count(), 1)
-        self._trigger(full_reset=True)
-        self.assertEqual(self._fill_count(), 0)
+        resp = self._trigger(full_reset=True)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("error"), "authoritative_state_conflict")
+        self.assertEqual(self._fill_count(), 1)
 
-    def test_full_reset_with_multiple_fills(self):
-        """All fill rows are removed on full_reset=True, not just one."""
+    def test_full_reset_with_multiple_fills_preserves_every_row(self):
         self._seed_fill(trade_id=_TRADE_ID_A)
         self._seed_fill(trade_id=_TRADE_ID_B)
         self.assertEqual(self._fill_count(), 2)
-        self._trigger(full_reset=True)
-        self.assertEqual(self._fill_count(), 0)
+        resp = self._trigger(full_reset=True)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("conflicts"), ["authoritative_session_state"]
+        )
+        self.assertEqual(self._fill_count(), 2)
 
     def test_default_trigger_does_not_clear_fills(self):
         """full_reset=False (default) must NOT clear fills."""

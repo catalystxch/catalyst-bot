@@ -46,6 +46,86 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _reconcile_authoritative_open_offers_before_prep() -> dict:
+    """Resolve proof-backed terminal offers before the re-prep safety guard.
+
+    A stopped bot cannot run its normal fill/expiry reconciler.  Sage may
+    therefore already show an offer as completed, cancelled, or expired while
+    the durable CATalyst row still says ``open``.  Coin prep must not erase or
+    infer those rows, but it can ask the existing proof-bound authority to
+    settle any result that is already fully proven.  Unknown/active/conflicted
+    rows remain untouched and the reset guard continues to fail closed.
+    """
+
+    import database
+    import offer_reconciliation
+
+    rows = database.get_open_offers(include_elapsed=True)
+    summary = {
+        "examined": len(rows),
+        "terminal_applied": 0,
+        "pending": 0,
+        "errors": 0,
+    }
+    terminal = {
+        offer_reconciliation.FILLED_PROVEN,
+        offer_reconciliation.CANCELLED_PROVEN,
+        offer_reconciliation.EXPIRED_PROVEN,
+    }
+    for row in rows:
+        trade_id = row.get("trade_id") if type(row) is dict else None
+        intent = (
+            database.get_offer_intent_by_trade_id(trade_id)
+            if type(trade_id) is str and trade_id
+            else None
+        )
+        if type(intent) is not dict or type(intent.get("intent_id")) is not str:
+            summary["pending"] += 1
+            continue
+        try:
+            evidence = offer_reconciliation.load_authoritative_evidence(intent)
+            observed_at = offer_reconciliation._clock_utc()
+            cancel_context = offer_reconciliation._derive_single_cancel_context(
+                intent,
+                evidence,
+                database_module=database,
+                observed_at=observed_at,
+            )
+            classification = offer_reconciliation.classify_terminal_evidence(
+                intent,
+                evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            if classification.get("classification") not in terminal:
+                summary["pending"] += 1
+                continue
+            reconciled = offer_reconciliation.reconcile_offer(
+                intent["intent_id"],
+                evidence=evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            if reconciled.get("applied") is True:
+                summary["terminal_applied"] += 1
+            else:
+                summary["pending"] += 1
+        except Exception:
+            summary["errors"] += 1
+
+    if summary["examined"]:
+        log_event(
+            "info" if not summary["errors"] else "warning",
+            "coin_prep_authoritative_reconcile",
+            "Coin prep authoritative preflight: "
+            f"examined {summary['examined']}, "
+            f"settled {summary['terminal_applied']}, "
+            f"pending {summary['pending']}, errors {summary['errors']}",
+            data=summary,
+        )
+    return summary
+
+
 def _inventory_summary_from_coin_summary(
     coin_summary: dict, manager_summary: dict = None
 ) -> dict:
@@ -1376,8 +1456,10 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
-        # Historical flag: full_reset=True means "Start Fresh" — wipes fills /
-        # round-trips / position baseline alongside the coin-shape reset.
+        # Historical flag: full_reset=True means "Start Fresh" and requests
+        # the broad legacy reset. The authoritative-state guard refuses it
+        # without mutation when fills, protected offers, intents, or locks
+        # exist; proof and fill history are never deleted.
         # Default False (2026-04-19) so a routine re-prep keeps the user's
         # trading history. 2026-04-21: superseded by the granular flags
         # below (reset_pnl / reset_offer_history / reset_counters) driven by
@@ -1453,19 +1535,22 @@ def _api_coin_prep_trigger_locked():
                 bot.coin_manager._prep_running = False
 
         # ---- Clear session data before the coin_prep_worker runs ----
-        # Under the default preserve_history path we only wipe state that
-        # directly refers to the coin IDs / offers about to be replaced:
-        # coin rows, inventory snapshots, cancelled offers. Fills, round
-        # trips, position baseline, and market-intel stats all survive so
-        # a routine re-prep doesn't destroy the user's trading record.
+        # Under the default preserve_history path we keep the coin proof rows
+        # as well as fills / round trips.  The worker already calls
+        # mark_unreserved_free_coins_gone_for_preparation() before its wallet
+        # re-scan, which invalidates only disposable cache rows while retaining
+        # coins bound to append-only offer evidence.  Asking the broad reset to
+        # clear every coin here would correctly trip the authority guard after
+        # any completed offer and make routine re-prep impossible.
         #
-        # Under full_reset=True the call mirrors the pre-2026-04-19
-        # behaviour — fills and round-trips are deleted too. That path is
-        # opt-in, triggered from the GUI's "Start Fresh" button in the
-        # pre-prep confirm modal or the PnL tab's Reset Stats action.
+        # Under full_reset=True the caller requests the broad legacy reset.
+        # It remains opt-in, but authoritative or protected state produces a
+        # stable conflict instead of deleting fills, proofs, offers, or locks.
+        if not _prep_reset_pnl:
+            _reconcile_authoritative_open_offers_before_prep()
         try:
-            api_server._reset_fresh_run_session(
-                clear_coins=True,
+            reset_summary = api_server._reset_fresh_run_session(
+                clear_coins=_prep_reset_pnl,
                 clear_price_history=_prep_reset_pnl,
                 clear_inventory=True,
                 cancel_open_offers=True,
@@ -1476,12 +1561,15 @@ def _api_coin_prep_trigger_locked():
                     else "coin_prep_reprep_cleanup"
                 ),
             )
+            if not reset_summary["success"]:
+                return jsonify(reset_summary), 409
         except Exception as _clean_err:
             log_event(
                 "warning",
                 "fresh_start_cleanup_failed",
                 f"DB cleanup before coin prep failed: {_clean_err}",
             )
+            raise
 
         # Optional: delete terminal-state offer rows. Same SQL as the
         # standalone /api/reset/offer-history endpoint — live offers are
@@ -1490,30 +1578,26 @@ def _api_coin_prep_trigger_locked():
         # otherwise bloat the history view.
         if _prep_reset_offers:
             try:
-                conn = get_connection()
-                cur = conn.execute(
-                    "DELETE FROM offers "
-                    "WHERE status IN ('cancelled', 'filled', 'expired') "
-                    "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                    "                          'phantom_rejected', 'user_cancelled')"
+                from database import guarded_reset_authoritative_state
+
+                history_reset = guarded_reset_authoritative_state(
+                    clear_terminal_offers=True
                 )
-                deleted = int(cur.rowcount or 0)
-                conn.commit()
+                if not history_reset["success"]:
+                    return jsonify(history_reset), 409
+                deleted = int(history_reset["offers_deleted"])
                 log_event(
                     "info",
                     "coin_prep_offer_history_cleared",
                     f"Pre-prep: cleared {deleted} terminal-state offer rows",
                 )
             except Exception as _hist_err:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 log_event(
                     "warning",
                     "coin_prep_offer_history_failed",
                     f"Pre-prep offer-history clear failed: {_hist_err}",
                 )
+                raise
 
         # Optional: reset in-memory runtime counters (sniper / fill-tracker /
         # watchdog streaks / risk-manager position). Mirrors the counters
@@ -1642,6 +1726,7 @@ def _api_coin_prep_trigger_locked():
 
         def do_prep():
             prep_succeeded = False
+            delegation = None
             try:
                 # Launch worker without a visible console window.
                 # We rely on the DB/superlog/log file for debugging instead of
@@ -1650,7 +1735,10 @@ def _api_coin_prep_trigger_locked():
                 from coin_manager import (
                     _coin_prep_active_cat_wallet_id,
                     _coin_prep_worker_command,
+                    _coin_prep_worker_delegation_ttl_seconds,
                     _coin_prep_worker_environment,
+                    _issue_coin_prep_worker_delegation,
+                    _revoke_coin_prep_worker_delegation,
                 )
 
                 worker_dir = _coin_prep_runtime_dir()
@@ -1973,6 +2061,15 @@ def _api_coin_prep_trigger_locked():
 
                 cmd += ["--cat-wallet", str(cat_wallet_id)]
 
+                operation_id = f"coin-prep:{run_id}"
+                worker_id = f"coin-prep-worker:{run_id}"
+                delegation = _issue_coin_prep_worker_delegation(
+                    env,
+                    operation_id=operation_id,
+                    worker_id=worker_id,
+                    ttl_seconds=_coin_prep_worker_delegation_ttl_seconds(),
+                )
+
                 log_path = _coin_prep_output_log_file()
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 log_file = open(log_path, "w", encoding="utf-8")
@@ -2131,6 +2228,11 @@ def _api_coin_prep_trigger_locked():
                         log_file.close()
                 except Exception:
                     pass
+                try:
+                    if delegation is not None:
+                        _revoke_coin_prep_worker_delegation(delegation)
+                except Exception:
+                    pass
                 api_server._coin_prep_state["running"] = False
                 api_server._coin_prep_proc = None  # Clear global ref — worker is done
                 # CRITICAL: Ungate the bot loop so it can resume offer creation
@@ -2149,7 +2251,12 @@ def _api_coin_prep_trigger_locked():
                             "Coin prep ended with an error — review details before retrying",
                         )
 
-        threading.Thread(target=do_prep, daemon=True).start()
+        api_server._coin_prep_thread = threading.Thread(
+            target=do_prep,
+            daemon=True,
+            name="coin-prep-api-worker",
+        )
+        api_server._coin_prep_thread.start()
         return jsonify({"success": True, "message": "Coin prep started"})
     except Exception as e:
         api_server._coin_prep_state["running"] = False
@@ -2167,6 +2274,22 @@ def _api_coin_prep_trigger_locked():
 def api_coin_prep_reset():
     """Reset coin prep state."""
     bot = api_server.bot
+    blueprint_proc = api_server._coin_prep_proc
+    manager = getattr(bot, "coin_manager", None) if bot is not None else None
+    manager_proc = getattr(manager, "_prep_process", None)
+    blueprint_live = blueprint_proc is not None and blueprint_proc.poll() is None
+    manager_live = manager_proc is not None and manager_proc.poll() is None
+    if blueprint_live or manager_live:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "coin_prep_still_running",
+                    "reason": "cancel_coin_prep_before_reset",
+                }
+            ),
+            409,
+        )
     api_server._coin_prep_state["running"] = False
     api_server._coin_prep_state["complete"] = False
     api_server._coin_prep_state["started_at"] = None
@@ -2244,6 +2367,20 @@ def api_coin_prep_cancel():
                     f"Could not kill cm worker PID {pid}: {e}",
                 )
             cm._prep_process = None
+        delegation = getattr(cm, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                log_event(
+                    "warning",
+                    "coin_prep_cancel_delegation_revoke_failed",
+                    "Could not confirm coin-prep worker delegation revocation",
+                )
+            finally:
+                cm._prep_delegation = None
         # Always release the gate flag so /api/coins/prep can run again
         try:
             with cm._lock:

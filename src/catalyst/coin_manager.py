@@ -28,15 +28,43 @@ import json
 import os
 import hashlib
 import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+import mutation_gate
 from amount_utils import (
     cat_display_amount_to_mojos_ceil,
     round_cat_display_amount_up_to_mojo,
 )
 from config import cfg
-from database import log_event
+from database import (
+    begin_wallet_effect_dispatch,
+    claim_wallet_effect,
+    complete_wallet_effect_dispatch,
+    log_event,
+    retain_wallet_effect_claim_for_reconciliation,
+    wallet_effect_adapter_dispatch_authority,
+    wallet_effect_claim_is_current,
+)
+
+
+def prepare_coin_prep_operation(*args, **kwargs):
+    """Late-bind Task 12 persistence for lightweight/test wallet adapters."""
+
+    from database import prepare_coin_prep_operation as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def record_coin_prep_operation_outcome(*args, **kwargs):
+    """Late-bind Task 12 outcomes for lightweight/test wallet adapters."""
+
+    from database import record_coin_prep_operation_outcome as repository_call
+
+    return repository_call(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +94,274 @@ _fast_reconcile_flag: bool = False
 _fast_reconcile_lock: threading.Lock = threading.Lock()
 _TOPUP_PENDING = "pending"
 _TOPUP_STALE_SOURCE = "stale_source"
+_WALLET_EFFECT_DENIED = object()
+_WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS = frozenset(
+    {
+        "coin_manager.split_sage",
+        "coin_manager.topup_split_sage",
+        "coin_manager.pool_split_sage",
+    }
+)
+_WALLET_EFFECT_MULTI_SOURCE_CONTRACTS = frozenset(
+    {
+        "coin_manager.consolidate_sage",
+        "coin_manager.absorb_sage",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedWalletEffectReceipt:
+    """Carry the durable prep row alongside a submitted adapter result."""
+
+    result: object
+    operation: dict
+    dispatch_outcome: str
+
+
+def _current_coin_prep_wallet_identity() -> dict:
+    """Return the exact active Task 5 wallet binding for runtime top-ups."""
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        raise mutation_gate.MutationBlocked(
+            "WALLET_IDENTITY_AUTHORITY_UNAVAILABLE", "coin_manager.topup"
+        )
+    binding = runtime.require_wallet_identity_authority("coin_manager.topup")
+    if type(binding) is not mutation_gate.WalletIdentityBinding:
+        raise mutation_gate.MutationBlocked(
+            "WALLET_IDENTITY_BINDING_INVALID", "coin_manager.topup"
+        )
+    return mutation_gate.wallet_identity_binding_payload(binding)
+
+
+def _record_runtime_topup_dispatch_outcome(
+    operation: dict,
+    *,
+    dispatch_outcome: str,
+    reason_code: str,
+) -> None:
+    """Persist the bounded adapter result before any post-view is trusted."""
+
+    token = operation["effect_claim_token"]
+    generation = operation["effect_claim_generation"]
+    if dispatch_outcome == "RELEASED_NO_EFFECT":
+        outcome = "FAILED"
+        evidence = {
+            "reason_code": reason_code,
+            "effect_claim_token": token,
+            "effect_claim_generation": generation,
+            "dispatch_outcome": dispatch_outcome,
+            "effect_attempted": False,
+        }
+    else:
+        outcome = "SUBMITTED_UNKNOWN"
+        evidence = {
+            "reason_code": reason_code,
+            "effect_claim_token": token,
+            "effect_claim_generation": generation,
+            "dispatch_outcome": (
+                dispatch_outcome
+                if dispatch_outcome in {"SUBMITTED", "UNKNOWN"}
+                else "ADAPTER_EXCEPTION"
+            ),
+        }
+    record_coin_prep_operation_outcome(
+        operation["operation_id"], outcome=outcome, evidence_json=evidence
+    )
+
+
+def _run_claimed_wallet_effect(
+    operation: str,
+    callback,
+    *,
+    source_coin_ids: List[str],
+    fee_mojos: int = 0,
+    fee_coin_ids: Optional[List[str]] = None,
+    _prep_contract: Optional[dict] = None,
+):
+    """Linearize one exact durable coin claim before adapter dispatch."""
+
+    canonical_prep = None
+    prep_identity = None
+    if _prep_contract is not None:
+        if type(_prep_contract) is not dict or set(_prep_contract) != {
+            "operation_kind",
+            "purpose",
+            "target_contract",
+            "pre_view_coin_ids",
+        }:
+            return _WALLET_EFFECT_DENIED
+        try:
+            from replacement_capacity import canonical_coin_prep_contract
+
+            canonical_prep = canonical_coin_prep_contract(
+                operation_kind=_prep_contract["operation_kind"],
+                purpose=_prep_contract["purpose"],
+                source_coin_ids=list(source_coin_ids),
+                target_contract=_prep_contract["target_contract"],
+            )
+            pre_view_coin_ids = _prep_contract["pre_view_coin_ids"]
+            if type(pre_view_coin_ids) is not list:
+                raise ValueError("pre-view coin identities are malformed")
+            prep_identity = _current_coin_prep_wallet_identity()
+        except Exception as exc:
+            log_event(
+                "warning",
+                f"{operation}_prep_contract_denied",
+                "Wallet effect aborted because its exact runtime top-up journal "
+                "contract could not be established.",
+                data={"operation": operation, "error": str(exc)[:160]},
+            )
+            return _WALLET_EFFECT_DENIED
+
+    known_contract = operation in (
+        _WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS | _WALLET_EFFECT_MULTI_SOURCE_CONTRACTS
+    )
+    exact_sources = list(source_coin_ids) if type(source_coin_ids) is list else []
+    malformed_fee_cohort = fee_coin_ids is not None and type(fee_coin_ids) is not list
+    exact_fee_coin_ids = (
+        []
+        if fee_coin_ids is None
+        else list(fee_coin_ids)
+        if type(fee_coin_ids) is list
+        else []
+    )
+    single_source_shape = (
+        operation in _WALLET_EFFECT_SINGLE_SOURCE_CONTRACTS
+        and len(exact_sources) == 1
+        and len(exact_fee_coin_ids) <= 1
+        and (
+            operation == "coin_manager.topup_split_sage"
+            or set(exact_fee_coin_ids).issubset(exact_sources)
+        )
+    )
+    multi_source_shape = (
+        operation in _WALLET_EFFECT_MULTI_SOURCE_CONTRACTS
+        and len(exact_sources) >= 2
+        and (fee_mojos == 0 or set(exact_fee_coin_ids) == set(exact_sources))
+    )
+    fee_shape = (
+        type(fee_mojos) is int
+        and fee_mojos >= 0
+        and (
+            (fee_mojos == 0 and not exact_fee_coin_ids)
+            or (fee_mojos > 0 and bool(exact_fee_coin_ids))
+        )
+    )
+    if (
+        malformed_fee_cohort
+        or not known_contract
+        or not fee_shape
+        or not (single_source_shape or multi_source_shape)
+    ):
+        claim = None
+    else:
+        authority_operation = (
+            canonical_prep["operation_id"] if canonical_prep is not None else operation
+        )
+        claim = claim_wallet_effect(
+            operation_id=authority_operation,
+            source_coin_ids=exact_sources,
+            fee_coin_ids=exact_fee_coin_ids,
+        )
+    prepared_operation = None
+    if claim is not None and canonical_prep is not None:
+        try:
+            prepared = prepare_coin_prep_operation(
+                operation_kind=canonical_prep["operation_kind"],
+                purpose=canonical_prep["purpose"],
+                source_coin_ids=canonical_prep["source_coin_ids"],
+                target_contract=canonical_prep["target_contract"],
+                wallet_identity_json=prep_identity,
+                evidence_json={"pre_view_coin_ids": pre_view_coin_ids},
+                effect_claim_token=claim["claim_token"],
+                effect_claim_generation=claim["generation"],
+            )
+            prepared_operation = dict(prepared["operation"])
+        except Exception as exc:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="COIN_PREP_PREPARED_PERSIST_FAILED",
+            )
+            log_event(
+                "warning",
+                f"{operation}_prep_persist_denied",
+                "Wallet effect aborted because its PREPARED top-up journal could "
+                "not be persisted.",
+                data={"operation": operation, "error": str(exc)[:160]},
+            )
+            claim = None
+    authority_operation = (
+        canonical_prep["operation_id"] if canonical_prep is not None else operation
+    )
+    if claim is not None and not wallet_effect_claim_is_current(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=authority_operation,
+        source_coin_ids=exact_sources,
+        fee_coin_ids=exact_fee_coin_ids,
+    ):
+        retain_wallet_effect_claim_for_reconciliation(
+            claim["claim_token"],
+            claim["generation"],
+            reason_code="AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
+        )
+        claim = None
+    if claim is not None:
+        dispatch = begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=authority_operation,
+            source_coin_ids=exact_sources,
+            fee_coin_ids=exact_fee_coin_ids,
+        )
+        if dispatch is None:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DISPATCH_AUTHORITY_RECHECK_FAILED",
+            )
+            claim = None
+    if claim is not None:
+        try:
+            with wallet_effect_adapter_dispatch_authority(dispatch):
+                result = callback()
+        except Exception as exc:
+            dispatch_outcome = complete_wallet_effect_dispatch(dispatch, exception=exc)
+            if prepared_operation is not None:
+                _record_runtime_topup_dispatch_outcome(
+                    prepared_operation,
+                    dispatch_outcome=dispatch_outcome,
+                    reason_code="ADAPTER_EXCEPTION_UNKNOWN",
+                )
+            raise
+        dispatch_outcome = complete_wallet_effect_dispatch(dispatch, result=result)
+        if prepared_operation is not None:
+            _record_runtime_topup_dispatch_outcome(
+                prepared_operation,
+                dispatch_outcome=dispatch_outcome,
+                reason_code=(
+                    "ADAPTER_PROVEN_NO_EFFECT"
+                    if dispatch_outcome == "RELEASED_NO_EFFECT"
+                    else f"WALLET_EFFECT_{dispatch_outcome}_UNRECONCILED"
+                ),
+            )
+            return _PreparedWalletEffectReceipt(
+                result=result,
+                operation=prepared_operation,
+                dispatch_outcome=dispatch_outcome,
+            )
+        return result
+    log_event(
+        "warning",
+        f"{operation}_coin_authority_denied",
+        "Wallet effect aborted because an input coin no longer has durable "
+        "spend authority.",
+        data={"operation": operation, "input_count": len(exact_sources)},
+    )
+    return _WALLET_EFFECT_DENIED
 
 
 def _topup_event_log_level(event_type: str) -> str:
@@ -137,6 +433,16 @@ from wallet import (
     get_owned_coins,
     get_owned_coins_detailed,
 )
+
+
+def get_wallet_identity():
+    """Late-bind the identity reader for minimal wallet test doubles."""
+
+    from wallet import get_wallet_identity as wallet_call
+
+    return wallet_call()
+
+
 from win_subprocess import hidden_subprocess_kwargs
 
 
@@ -276,6 +582,71 @@ def _coin_prep_worker_environment(base_env: Optional[dict] = None) -> dict:
     return env
 
 
+def _issue_coin_prep_worker_delegation(
+    env: dict,
+    *,
+    operation_id: str,
+    worker_id: str,
+    ttl_seconds: int,
+):
+    """Issue one narrow worker authority and place its raw token only in env."""
+
+    if type(env) is not dict:
+        raise TypeError("coin prep worker environment must be an exact dict")
+    import mutation_gate
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        raise mutation_gate.MutationBlocked(
+            "MUTATION_RUNTIME_NOT_INITIALIZED", "coin_prep.launch"
+        )
+    handoff = runtime.issue_worker_delegation(
+        operation_id=operation_id,
+        purpose="coin_prep",
+        worker_id=worker_id,
+        ttl_seconds=ttl_seconds,
+        require_wallet_identity=True,
+    )
+    env.update(handoff.to_environment())
+    return handoff
+
+
+def _coin_prep_worker_delegation_ttl_seconds() -> int:
+    """Keep authority valid across legitimate mainnet confirmation waits.
+
+    A single submitted coin-prep transaction may need the worker's 900-second
+    authoritative-confirmation window.  A complete prep run has multiple such
+    stages, so deriving the delegation lifetime from the legacy 600-second
+    watchdog can expire an otherwise healthy worker between stages.  The
+    mutation gate caps narrow worker delegations at one hour and the parent
+    still revokes this delegation as soon as the subprocess exits.
+    """
+
+    return 3600
+
+
+def _revoke_coin_prep_worker_delegation(handoff):
+    import mutation_gate
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return {"revoked": False, "reason": "parent_runtime_unavailable"}
+    try:
+        return runtime.revoke_worker_delegation(handoff)
+    except Exception:
+        return {"revoked": False, "reason": "delegation_revoke_failed"}
+
+
+def get_authoritative_replacement_capacity_count_standalone(
+    wallet_type: Optional[str] = None,
+) -> int:
+    """Expose Task 12's repository count without duplicating Task 11 lineage."""
+
+    from database import get_authoritative_replacement_capacity_count
+
+    return get_authoritative_replacement_capacity_count(wallet_type=wallet_type)
+
+
 class _TopupWalletDegraded(Exception):
     """Raised when wallet RPC becomes too degraded to continue topup safely."""
 
@@ -286,16 +657,12 @@ class _TopupWalletDegraded(Exception):
 
 
 class FeeCoinPool:
-    """Thread-safe pool for reserving dedicated fee coins.
+    """Thread-safe pool for coin-management calls with explicit fee inputs.
 
-    Problem: when the bot fires multiple operations (creates + cancels)
-    in the same cycle, Sage auto-picks fee coins for each one.  If the
-    operations overlap, Sage may grab the *same* fee coin for two
-    different transactions → MEMPOOL_CONFLICT / BAD_AGGREGATE_SIGNATURE.
-
-    Solution: each operation reserves a specific fee coin from this pool
-    *before* calling Sage, and passes it via the ``coin_ids`` parameter.
-    Sage then uses the provided coin for the fee instead of auto-picking.
+    Sage CAT split/top-up calls can accept a dedicated XCH fee coin. Reserving
+    that coin here prevents overlapping coin-management effects from selecting
+    the same input. Offer creation uses fee zero, while Sage cancellation does
+    not accept an explicit fee coin and is serialized separately.
 
     Lifecycle:
       • ``refresh()`` is called once at the start of every bot cycle
@@ -676,13 +1043,28 @@ def _effective_tier_size_drift_bounds(
     low_ratio: Optional[float],
     high_ratio: Optional[float],
 ) -> Tuple[float, float]:
-    """Return the same coin-fit bounds used by tier offer selection."""
+    """Return usable bounds for already-prepared tier coins.
+
+    Coin-prep target sizes include ``COIN_PREP_HEADROOM_PCT``.  A prepared
+    coin can therefore remain large enough for its exact offer even when it
+    falls below the classifier's ordinary 0.98 target-size floor after a
+    price move.  Treat the headroom-funded portion as usable before starting
+    an on-chain live reshape.
+    """
     try:
         from coin_classifier import DEFAULT_FLOOR_TOLERANCE
 
         default_low = float(DEFAULT_FLOOR_TOLERANCE)
     except Exception:
         default_low = 0.98
+    try:
+        headroom_pct = Decimal(str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", "0") or "0"))
+    except Exception:
+        headroom_pct = Decimal("0")
+    headroom_pct = max(Decimal("0"), headroom_pct)
+    if headroom_pct > 0:
+        funded_floor = Decimal("1") / (Decimal("1") + (headroom_pct / Decimal("100")))
+        default_low = min(default_low, float(funded_floor))
     try:
         default_high = float(getattr(cfg, "COIN_MAX_SIZE_RATIO", 1.5) or 1.5)
     except Exception:
@@ -816,6 +1198,19 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
             if current_tier in ("sniper", "fees"):
                 moved["unchanged"] += 1
                 continue
+            current_target = int(live_sizes.get(current_tier, 0) or 0)
+            if current_target > 0:
+                retention_low, retention_high = _effective_tier_size_drift_bounds(
+                    None, None
+                )
+                current_ratio = Decimal(amount) / Decimal(current_target)
+                if (
+                    Decimal(str(retention_low))
+                    <= current_ratio
+                    <= Decimal(str(retention_high))
+                ):
+                    moved["unchanged"] += 1
+                    continue
             try:
                 cls = classify_coin(amount, live_sizes)
             except Exception:
@@ -1030,9 +1425,42 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
             # this produces wrong sizes that cause F70 misfit false
             # positives — avoid by keeping the price engine reachable.
             price = Decimal("0.0001")
+
+        # Sell offers are placed across the configured ladder, so CAT prep
+        # sizes each tier for that tier's closest (lowest) sell price rather
+        # than for the mid itself. Mirror CoinPrepWorker._derive_tier_cat_sizes
+        # here so the classifier, drift gate, and live selector all use the
+        # exact sizes the prep worker creates.
+        from ladder_sizing import TIER_ORDER, summarize_sell_ladder_cat
+
+        sell_tier_counts = {
+            tier: max(
+                0,
+                int(getattr(cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0) or 0),
+            )
+            for tier in TIER_ORDER
+        }
+        max_sell_offers = int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0)
+        if max_sell_offers <= 0:
+            max_sell_offers = sum(sell_tier_counts.values())
+        spread_fraction = Decimal(str(getattr(cfg, "SPREAD_BPS", 0) or 0)) / Decimal(
+            "10000"
+        )
+        min_edge_bps = Decimal(str(getattr(cfg, "MIN_EDGE_BPS", 0) or 0))
+        ladder_summary = summarize_sell_ladder_cat(
+            mid_price=price,
+            spread_fraction=spread_fraction,
+            max_offers=max_sell_offers,
+            tier_counts=sell_tier_counts,
+            tier_sizes_xch=result_xch,
+            min_edge_bps=min_edge_bps,
+        )
         out = {}
         for tier, xch_size in result_xch.items():
-            cat_amount = xch_size / price * prep_mult
+            cat_per_offer = ladder_summary.max_cat_per_tier.get(tier, Decimal("0"))
+            if cat_per_offer <= 0:
+                cat_per_offer = xch_size / price
+            cat_amount = cat_per_offer * prep_mult
             out[tier] = cat_display_amount_to_mojos_ceil(cat_amount, cfg.CAT_DECIMALS)
         return out
 
@@ -1568,6 +1996,7 @@ class CoinManager:
 
         # Coin prep worker process
         self._prep_process: Optional[subprocess.Popen] = None
+        self._prep_delegation = None
 
         # Lock for thread safety
         self._lock = threading.Lock()
@@ -1626,10 +2055,10 @@ class CoinManager:
         self._last_pace_calc: float = 0  # Timestamp of last pace calculation
         self._reconcile_counter: int = 0  # Counts loops between reconciliations
 
-        # ---- Fee Coin Pool (concurrent operation support) ----
-        # Each operation (create / cancel) reserves a dedicated fee coin
-        # from this pool so Sage doesn't auto-pick the same one for two
-        # concurrent transactions.  Refreshed at start of each cycle.
+        # ---- Fee Coin Pool (coin-management operation support) ----
+        # CAT split/top-up effects reserve an explicit XCH fee coin here so
+        # overlapping effects cannot reuse the same input. Refreshed at the
+        # start of each cycle.
         self.fee_pool = FeeCoinPool()
 
     def refresh_fee_pool_from_wallet(self):
@@ -1939,7 +2368,7 @@ class CoinManager:
 
     def _sage_pending_transaction_count(self) -> Optional[int]:
         try:
-            from wallet_sage import get_pending_transactions
+            from wallet import get_pending_transactions
 
             pending = get_pending_transactions()
             if pending is not None:
@@ -2075,7 +2504,13 @@ class CoinManager:
             "height": best_height,
         }
 
-    def _get_owned_coin_amount_map(self, wallet_id: int, name: str) -> Dict[str, int]:
+    def _get_owned_coin_amount_map(
+        self,
+        wallet_id: int,
+        name: str,
+        *,
+        require_complete: bool = False,
+    ) -> Dict[str, int]:
         """Return owned wallet coins as {coin_id: amount_mojos}."""
         try:
             owned_result = get_owned_coins(wallet_id) or {}
@@ -2095,6 +2530,8 @@ class CoinManager:
                 f"{name}_owned_unavailable",
                 f"Owned coin view unavailable: {str(e)[:160]}",
             )
+            if require_complete:
+                return {}
             # Safe lower-bound fallback: if Sage's owned view flakes out but the
             # strict selectable view is still healthy, treat selectable coins as
             # the minimum owned set instead of silently reporting "0 owned".
@@ -2168,17 +2605,17 @@ class CoinManager:
         wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
 
         if wallet_type == "sage":
-            # Sage: use get_current_key() instead of get_logged_in_fingerprint.
+            # Sage: use the backend-neutral wallet identity snapshot.
             # Retry up to 4 times with short delays — Sage may still be starting
             # up when the bot initializes (e.g. user closed Sage and let the app
             # launch it fresh). Non-fatal: fingerprint is re-resolved later if needed.
-            from wallet_sage import get_current_key
+            from wallet import get_wallet_identity
 
             for _attempt in range(4):
                 try:
-                    key = get_current_key()
-                    if key and key.get("fingerprint"):
-                        fp_str = str(key["fingerprint"])
+                    identity = get_wallet_identity()
+                    if identity.get("success") and identity.get("fingerprint"):
+                        fp_str = str(identity["fingerprint"])
                         log_event(
                             "info",
                             "coin_mgr_fingerprint",
@@ -2985,31 +3422,14 @@ class CoinManager:
                     # locked each coin — no more unreliable amount-based matching.
                     # This replaces the old link_offers_to_locked_coins() approach.
                     #
-                    # V6 FIX (2026-04-08): Wallet-authoritative audit pass.
-                    # Always run the audit when offer_id_map is available — not
-                    # just when stats["locked"] > 0. The previous gating left
-                    # three drift conditions unfixed:
-                    #   (a) coins already locked from a prior cycle with NULL
-                    #       trade_id (no longer caught after the first cycle)
-                    #   (b) coins already locked with a STALE trade_id
-                    #       (offer was replaced; coin was reused under a
-                    #       different offer)
-                    #   (c) coins still flagged status='locked' in DB whose
-                    #       offer no longer exists in the wallet at all
-                    #       (orphan locks — happen when reconcile_coins_with
-                    #       _wallet's free-transition is blocked by a stale
-                    #       trade_id at line 1994).
-                    # The audit fixes (a)+(b)+(c) in one pass, with the wallet
-                    # as the single source of truth.
+                    # A wallet-observed lock may conservatively add a missing
+                    # reservation. Existing trade-attributed or registry-owned
+                    # reservations are never rebound here: only Task 9 terminal
+                    # proof may release or replace them.
                     if offer_id_map is not None:
                         try:
-                            from database import get_connection, _now
+                            from database import reconcile_wallet_locked_coin_links
 
-                            conn = get_connection()
-                            now = _now()
-                            audit_linked = 0  # NULL → trade_id set
-                            audit_relinked = 0  # stale trade_id overwritten
-                            audit_freed = 0  # orphan lock freed
                             # Get all open offers from wallet to map offer_hash → trade_id
                             if wallet_open_offers is None:
                                 from wallet import get_all_offers
@@ -3029,13 +3449,11 @@ class CoinManager:
                             # we only ever assign a trade_id we've actually
                             # seen as an open offer (defends against junk).
                             hash_to_trade = {}
-                            open_trade_ids = set()
                             if all_open:
                                 for o in all_open:
                                     tid = o.get("trade_id", "")
                                     if tid:
                                         hash_to_trade[tid.lower()] = tid
-                                        open_trade_ids.add(tid)
 
                             # ---- Build the wallet-authoritative locked map ----
                             # For every coin that Sage says is locked, derive
@@ -3047,109 +3465,17 @@ class CoinManager:
                                 if trade_id:
                                     wallet_locked_to_trade[store_id] = trade_id
 
-                            # ---- Pass 1: Reconcile each wallet-locked coin ----
-                            # The DB row should be (status='locked',
-                            # trade_id=canonical). Apply the minimum update.
-                            for (
-                                store_id,
-                                canonical_tid,
-                            ) in wallet_locked_to_trade.items():
-                                row = conn.execute(
-                                    "SELECT status, trade_id FROM coins "
-                                    "WHERE coin_id=?",
-                                    (store_id,),
-                                ).fetchone()
-                                if row is None:
-                                    # Coin not in DB yet — reconcile_coins_with_wallet
-                                    # should have inserted it above. If it's
-                                    # still missing, something is wrong with
-                                    # the upsert; skip silently here so we
-                                    # don't double-commit.
-                                    continue
-                                cur_status = row["status"]
-                                cur_tid = row["trade_id"] or ""
-                                if cur_status != "locked":
-                                    conn.execute(
-                                        "UPDATE coins SET status='locked', "
-                                        "trade_id=?, last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_relinked += 1
-                                elif not cur_tid:
-                                    conn.execute(
-                                        "UPDATE coins SET trade_id=?, "
-                                        "last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_linked += 1
-                                elif cur_tid != canonical_tid:
-                                    conn.execute(
-                                        "UPDATE coins SET trade_id=?, "
-                                        "last_seen=? WHERE coin_id=?",
-                                        (canonical_tid, now, store_id),
-                                    )
-                                    audit_relinked += 1
-
-                            # ---- Pass 2: Free orphan locks ----
-                            # Any DB row that says status='locked' for THIS
-                            # wallet type but does NOT appear in the wallet's
-                            # locked map is a stale lock. Either the offer is
-                            # gone (cancelled/filled and confirmed on-chain)
-                            # or the trade_id was bogus to begin with.
-                            #
-                            # Guard: don't touch coins locked very recently
-                            # (last 60s). The offer_manager may have just
-                            # locked a coin in the gap between our wallet
-                            # snapshot and now — we don't want the audit to
-                            # race-clobber a fresh lock.
-                            stale_threshold_secs = 60
-                            db_locked_rows = conn.execute(
-                                "SELECT coin_id, trade_id, last_seen "
-                                "FROM coins "
-                                "WHERE wallet_type=? AND status='locked'",
-                                (wt,),
-                            ).fetchall()
-                            for row in db_locked_rows:
-                                cid_db = row["coin_id"]
-                                cid_norm = (
-                                    cid_db if cid_db.startswith("0x") else "0x" + cid_db
-                                ).lower()
-                                if cid_norm in wallet_locked_to_trade:
-                                    continue  # Wallet still locks it — fine
-                                # Wallet doesn't lock it. Is it freshly
-                                # locked by us in the last 60s?
-                                last_seen = row["last_seen"] or 0
-                                try:
-                                    age = now - int(last_seen)
-                                except Exception:
-                                    age = 999999
-                                if age < stale_threshold_secs:
-                                    continue  # Too fresh to touch
-                                # Also: if the row's trade_id is in our open
-                                # offers list, the wallet just hasn't reported
-                                # the lock yet (rare RPC race); leave it alone.
-                                cur_tid = row["trade_id"] or ""
-                                if cur_tid and cur_tid in open_trade_ids:
-                                    continue
-                                # Genuine orphan lock — free it.
-                                conn.execute(
-                                    "UPDATE coins SET status='free', "
-                                    "trade_id=NULL, last_seen=? "
-                                    "WHERE coin_id=?",
-                                    (now, cid_db),
-                                )
-                                audit_freed += 1
-
-                            conn.commit()
-
-                            if audit_linked or audit_relinked or audit_freed:
+                            audit = reconcile_wallet_locked_coin_links(
+                                wallet_locked_to_trade
+                            )
+                            if audit["linked"] or audit["locked"]:
                                 log_event(
                                     "info",
                                     "reconcile_audit",
                                     f"{wt.upper()} wallet audit: "
-                                    f"linked={audit_linked}, "
-                                    f"relinked={audit_relinked}, "
-                                    f"freed_orphans={audit_freed}",
+                                    f"linked={audit['linked']}, "
+                                    f"newly_locked={audit['locked']}, "
+                                    f"protected={audit['protected']}",
                                 )
                         except Exception as audit_e:
                             log_event(
@@ -3201,8 +3527,6 @@ class CoinManager:
                         get_free_coins,
                         get_locked_coins,
                         mark_coins_gone,
-                        mark_coin_spent,
-                        free_coin,
                         upsert_coin,
                         get_open_offers,
                     )
@@ -3243,14 +3567,9 @@ class CoinManager:
             if not is_sage:
                 try:
                     from database import (
+                        free_unreserved_locked_coin_for_reconciliation,
                         get_locked_coins,
-                        get_open_offers,
-                        free_coin,
-                        mark_coin_spent,
                     )
-
-                    open_offers_list = get_open_offers(cat_asset_id=cfg.CAT_ASSET_ID)
-                    open_trade_ids = {o["trade_id"] for o in open_offers_list}
 
                     xch_rpc = self._get_coins_fast(cfg.WALLET_ID_XCH)
                     cat_rpc = self._get_coins_fast(cfg.CAT_WALLET_ID)
@@ -3266,12 +3585,9 @@ class CoinManager:
                     reconciled = 0
                     for coin in db_locked:
                         cid = coin["coin_id"]
-                        linked_trade = coin.get("trade_id", "")
-                        if cid in wallet_spendable:
-                            free_coin(cid)
-                            reconciled += 1
-                        elif linked_trade and linked_trade not in open_trade_ids:
-                            mark_coin_spent(cid)
+                        if cid in wallet_spendable and (
+                            free_unreserved_locked_coin_for_reconciliation(cid)
+                        ):
                             reconciled += 1
                     if reconciled > 0:
                         log_event(
@@ -3328,14 +3644,10 @@ class CoinManager:
                     f"Offer-to-coin linking failed: {link_e}",
                 )
 
-            # ---- Orphaned locked coin cleanup (V5 FIX) ----
-            # Free locked coins whose trade_id no longer matches an open offer.
-            #
-            # CRITICAL FIX: For Sage wallets, pass the set of coin IDs that
-            # the wallet confirms are offer-locked (have offer_id set).
-            # The cleanup function will NOT free these coins even if they
-            # lack a trade_id in our DB — the wallet is authoritative.
-            # This breaks the tug-of-war: reconcile locks → orphan frees → repeat.
+            # ---- Conservative legacy orphan cleanup ----
+            # Wallet absence does not release trade-attributed or registry-owned
+            # locks. The database helper may reclaim only genuinely unattributed
+            # legacy debris; wallet-confirmed locks remain an additional guard.
             try:
                 from database import cleanup_orphaned_locked_coins, get_open_offers
 
@@ -3517,14 +3829,24 @@ class CoinManager:
                 # If we want 6 coins of 3.2 XCH from a 26.98 XCH coin, we can't
                 # control individual sizes — Sage divides equally. So we request
                 # the total number we need and accept even splits.
-                result = split_coins_rpc(
-                    wallet_id=wallet_id,
-                    target_coin_id=coin_id,
-                    num_coins=num_coins + 1,  # +1 for remainder
-                    amount_per_coin=0,  # Sage ignores this, splits evenly
-                    fee_mojos=self._tx_fee_mojos(),
-                    is_cat=is_cat,
+                fee_mojos = self._tx_fee_mojos()
+                fee_coin_ids = [coin_id] if not is_cat and fee_mojos > 0 else []
+                result = _run_claimed_wallet_effect(
+                    "coin_manager.split_sage",
+                    lambda: split_coins_rpc(
+                        wallet_id=wallet_id,
+                        target_coin_id=coin_id,
+                        num_coins=num_coins + 1,  # +1 for remainder
+                        amount_per_coin=0,  # Sage ignores this, splits evenly
+                        fee_mojos=fee_mojos,
+                        is_cat=is_cat,
+                    ),
+                    source_coin_ids=[coin_id],
+                    fee_mojos=fee_mojos,
+                    fee_coin_ids=fee_coin_ids,
                 )
+                if result is _WALLET_EFFECT_DENIED:
+                    return False
                 if result is None:
                     log_event(
                         "warning",
@@ -3549,57 +3871,13 @@ class CoinManager:
                 )
                 return False
         else:
-            # Chia CLI split (reliable — broadcasts to network every time)
-            # NOTE: CLI `-a` takes DISPLAY UNITS (XCH or CAT tokens), NOT mojos.
-            bare_coin_id = coin_id.replace("0x", "")
-
-            # Lazy-resolve fingerprint if it was empty at init time
-            if not self._fingerprint or not self._fingerprint.strip():
-                self._fingerprint = self._resolve_fingerprint()
-
-            cmd = [
-                "chia",
-                "wallet",
-                "coins",
-                "split",
-                "-f",
-                self._fingerprint,
-                "-i",
-                str(wallet_id),
-                "-n",
-                str(num_coins),
-                "-a",
-                str(coin_size),
-                "-t",
-                bare_coin_id,
-                "-m",
-                "0",
-            ]
-
-            try:
-                import subprocess as sp
-
-                process = sp.Popen(
-                    cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True
-                )
-                stdout, stderr = process.communicate(input="y\n", timeout=60)
-                output = stdout + stderr
-
-                if "submitted to" in output.lower() or "transaction" in output.lower():
-                    log_event(
-                        "info", f"split_cli_{name}", "CLI split submitted successfully"
-                    )
-                else:
-                    log_event(
-                        "warning",
-                        f"split_cli_{name}_fail",
-                        f"CLI split failed: {output[:200]}",
-                    )
-                    return False
-
-            except Exception as e:
-                log_event("warning", f"split_cli_{name}_error", f"CLI split error: {e}")
-                return False
+            log_event(
+                "warning",
+                f"split_chia_{name}_authority_denied",
+                "Chia CLI split cannot honor an exact durable source/fee cohort; "
+                "disabled pending Task 12.",
+            )
+            return False
 
         # --- Wait for confirmation via coin count polling ---
         expected_count = start_count + num_coins
@@ -4131,7 +4409,7 @@ class CoinManager:
                 f"classify_coin import failed: {_imp_err}",
             )
             return {"relabeled": 0, "demoted": 0}
-        from database import get_connection, _now
+        from database import get_connection, get_free_coins, _now
 
         summary = {"relabeled": 0, "demoted_reserve": 0, "demoted_unknown": 0}
         # Diagnostic counters so we can see why nothing fires even
@@ -4156,15 +4434,12 @@ class CoinManager:
                     f"No tier sizes available for {wt} — skipping",
                 )
                 continue
-            rows = conn.execute(
-                "SELECT coin_id, amount_mojos, assigned_tier "
-                "FROM coins "
-                "WHERE wallet_type=? "
-                "  AND status='free' "
-                "  AND designation='tier_spare' "
-                "  AND assigned_tier IN ('inner','mid','outer','extreme')",
-                (wt,),
-            ).fetchall()
+            rows = [
+                row
+                for row in get_free_coins(wt)
+                if row.get("designation") == "tier_spare"
+                and row.get("assigned_tier") in ("inner", "mid", "outer", "extreme")
+            ]
             scanned[wt] = len(rows)
 
             for r in rows:
@@ -4231,14 +4506,12 @@ class CoinManager:
                 target = int(targets.get(tier, 0) or 0)
                 if target <= 0:
                     continue
-                rows = conn.execute(
-                    "SELECT coin_id, amount_mojos FROM coins "
-                    "WHERE wallet_type=? AND status='free' "
-                    "  AND designation='tier_spare' "
-                    "  AND assigned_tier=? "
-                    "ORDER BY amount_mojos DESC",
-                    (wt, tier),
-                ).fetchall()
+                rows = [
+                    row
+                    for row in get_free_coins(wt)
+                    if row.get("designation") == "tier_spare"
+                    and row.get("assigned_tier") == tier
+                ]
                 if len(rows) <= target:
                     continue
                 # Excess = rows.length - target. Demote the LARGEST
@@ -4552,19 +4825,18 @@ class CoinManager:
         # instead of flagging EMPTY. Without this, the startup re-check
         # fires CRITICAL the moment the first ladder goes out.
         _locked_by_tier: Dict[str, Dict[str, int]] = {"xch": {}, "cat": {}}
+        _locked_rows: List[Dict] = []
         try:
-            from database import get_connection as _get_conn
+            from database import get_locked_coins
 
-            _conn = _get_conn()
+            _locked_rows = get_locked_coins()
             for _wt in ("xch", "cat"):
                 for _tn in ("inner", "mid", "outer", "extreme"):
-                    _locked_by_tier[_wt][_tn] = int(
-                        _conn.execute(
-                            "SELECT COUNT(*) FROM coins "
-                            "WHERE status='locked' AND wallet_type=? AND assigned_tier=?",
-                            (_wt, _tn),
-                        ).fetchone()[0]
-                        or 0
+                    _locked_by_tier[_wt][_tn] = sum(
+                        1
+                        for _row in _locked_rows
+                        if _row.get("wallet_type") == _wt
+                        and _row.get("assigned_tier") == _tn
                     )
         except Exception:
             pass
@@ -4687,19 +4959,18 @@ class CoinManager:
             # active offer is still part of the pool (just doing its job). The
             # old check only counted FREE coins, so firing 1 probe dropped the
             # count to SNIPER_PREP_COUNT-1 and triggered a false LOW_SPARES.
-            try:
-                from database import get_connection as _get_conn
-
-                _conn = _get_conn()
-                _locked_sniper_xch = _conn.execute(
-                    "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='sniper' AND wallet_type='xch'"
-                ).fetchone()[0]
-                _locked_sniper_cat = _conn.execute(
-                    "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='sniper' AND wallet_type='cat'"
-                ).fetchone()[0]
-            except Exception:
-                _locked_sniper_xch = 0
-                _locked_sniper_cat = 0
+            _locked_sniper_xch = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "xch"
+                and _row.get("assigned_tier") == "sniper"
+            )
+            _locked_sniper_cat = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "cat"
+                and _row.get("assigned_tier") == "sniper"
+            )
             sniper_xch_have += int(_locked_sniper_xch or 0)
             sniper_cat_have += int(_locked_sniper_cat or 0)
             sniper_xch_needed = sniper_target if cfg.ENABLE_BUY else 0
@@ -4751,18 +5022,12 @@ class CoinManager:
             fee_have = len(self._xch_inventory.get("fees", []))
             # F67: Count locked fee coins too — same as snipers, a fee coin
             # locked in an active offer is still part of the pool.
-            try:
-                from database import get_connection as _get_conn
-
-                _locked_fees = (
-                    _get_conn()
-                    .execute(
-                        "SELECT COUNT(*) FROM coins WHERE status='locked' AND assigned_tier='fees' AND wallet_type='xch'"
-                    )
-                    .fetchone()[0]
-                )
-            except Exception:
-                _locked_fees = 0
+            _locked_fees = sum(
+                1
+                for _row in _locked_rows
+                if _row.get("wallet_type") == "xch"
+                and _row.get("assigned_tier") == "fees"
+            )
             fee_have += int(_locked_fees or 0)
             fee_status = (
                 "READY"
@@ -5790,48 +6055,30 @@ class CoinManager:
         return True
 
     def stop_topup(self, wait_secs: float = 10.0) -> bool:
-        """Request any running top-up worker to stop.
+        """Request stop and retain ownership state until definitive exit."""
 
-        ESCAPE HATCH: when the worker is wedged on a wallet RPC call, the
-        join() times out and the thread stays alive. Previously we left
-        ``_topup_running`` at True in that case, which made every
-        subsequent is_busy() check return True and permanently locked the
-        topup/prep path behind the zombie until the operator restarted
-        the bot. Now we clear the running flag once the join timeout
-        elapses and emit a critical log so the operator knows a zombie
-        topup thread may be mutating the wallet in the background.
-        The underlying thread is a daemon, so it terminates at process
-        exit regardless.
-        """
-        thread = None
         with self._lock:
             if not self._topup_running:
                 return False
             self._topup_stop_requested = True
             thread = self._topup_thread
         log_event("info", "topup_stop_requested", "Stopping background coin top-up")
-        if thread and thread.is_alive() and wait_secs > 0:
-            thread.join(timeout=wait_secs)
-        if thread and thread.is_alive():
+        try:
+            if thread and thread.is_alive() and wait_secs > 0:
+                thread.join(timeout=wait_secs)
+            alive = bool(thread and thread.is_alive())
+        except Exception:
+            alive = True
+        if alive:
             log_event(
                 "critical",
                 "topup_stop_zombie",
                 f"Coin top-up worker {thread.name!r} did not stop within "
-                f"{wait_secs:.0f}s. Clearing the busy latch so future topup/"
-                f"prep paths are not locked out behind this zombie; the "
-                f"thread is a daemon and will die when its blocking RPC "
-                f"returns or at process exit.",
+                f"{wait_secs:.0f}s. Mutation ownership remains busy until "
+                f"the worker's finalizer proves definitive exit.",
                 data={"thread": thread.name, "wait_secs": wait_secs},
             )
-        with self._lock:
-            # Force-release the busy latch even if the worker is still
-            # alive. A new topup cannot be queued while the old worker is
-            # still mutating the wallet (the wallet RPCs themselves
-            # serialise), but is_busy() will now correctly report idle so
-            # the rest of the bot does not wedge waiting on the latch.
-            self._topup_running = False
-            self._topup_stop_requested = False
-            self._topup_thread = None
+            return False
         return True
 
     def _topup_should_stop(self) -> bool:
@@ -7006,6 +7253,8 @@ class CoinManager:
                 with self._lock:
                     self._topup_running = False
                     self._topup_stop_requested = False
+                    if self._topup_thread is threading.current_thread():
+                        self._topup_thread = None
             except Exception as _flag_err:
                 log_event(
                     "error",
@@ -7088,18 +7337,14 @@ class CoinManager:
             # source. Fall back to raw classification if the DB query
             # fails (fail-open) so a DB blip can't block every topup.
             try:
-                from database import get_connection as _db_conn_fresh
+                from database import get_all_coins_state
 
                 _wallet_type_str = "cat" if is_cat else "xch"
-                _rows_fresh = (
-                    _db_conn_fresh()
-                    .execute(
-                        "SELECT coin_id, designation, assigned_tier FROM coins "
-                        "WHERE wallet_type=? AND status IN ('free', 'locked')",
-                        (_wallet_type_str,),
-                    )
-                    .fetchall()
-                )
+                _rows_fresh = [
+                    _row
+                    for _row in get_all_coins_state().values()
+                    if _row.get("wallet_type") == _wallet_type_str
+                ]
                 _db_designations = {
                     str(_r["coin_id"]).lower(): str(
                         _r["designation"] or "unknown"
@@ -8505,6 +8750,279 @@ class CoinManager:
             )
         return kept
 
+    @staticmethod
+    def _canonical_runtime_topup_coin_id(value: str) -> str:
+        if type(value) is not str:
+            raise TypeError("coin id must be an exact string")
+        normalized = value[2:] if value.startswith("0x") else value
+        normalized = normalized.lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("coin id is not canonical")
+        return normalized
+
+    def _build_runtime_topup_prep_contract(
+        self,
+        *,
+        pre_owned_map: Dict[str, int],
+        source_coin_id: str,
+        num_to_create: int,
+        trading_size_mojos: int,
+        fee_mojos: int,
+        is_cat: bool,
+    ) -> Optional[dict]:
+        """Build the exact Task 12 contract for one live top-up split."""
+
+        try:
+            if (
+                type(pre_owned_map) is not dict
+                or not pre_owned_map
+                or type(num_to_create) is not int
+                or num_to_create <= 0
+                or type(trading_size_mojos) is not int
+                or trading_size_mojos <= 0
+                or type(fee_mojos) is not int
+                or fee_mojos < 0
+            ):
+                return None
+            canonical_owned = {}
+            for coin_id, amount in pre_owned_map.items():
+                canonical = self._canonical_runtime_topup_coin_id(coin_id)
+                if (
+                    canonical in canonical_owned
+                    or type(amount) is not int
+                    or amount <= 0
+                ):
+                    return None
+                canonical_owned[canonical] = amount
+            source = self._canonical_runtime_topup_coin_id(source_coin_id)
+            source_amount = canonical_owned.get(source)
+            if source_amount is None:
+                return None
+            source_fee = 0 if is_cat else fee_mojos
+            remainder = (
+                source_amount - source_fee - (num_to_create * trading_size_mojos)
+            )
+            if remainder < 0:
+                return None
+            outputs = [
+                {
+                    "output_index": index,
+                    "amount_mojos": trading_size_mojos,
+                    "purpose": "replacement",
+                }
+                for index in range(num_to_create)
+            ]
+            if remainder > 0:
+                outputs.append(
+                    {
+                        "output_index": len(outputs),
+                        "amount_mojos": remainder,
+                        "purpose": "top_up",
+                    }
+                )
+            return {
+                "operation_kind": "split",
+                "purpose": "replacement",
+                "target_contract": {
+                    "wallet_type": "cat" if is_cat else "xch",
+                    "outputs": outputs,
+                },
+                "pre_view_coin_ids": sorted(canonical_owned),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _build_runtime_absorb_prep_contract(
+        self,
+        *,
+        pre_owned_map: Dict[str, int],
+        source_coin_ids: List[str],
+        fee_mojos: int,
+        is_cat: bool,
+    ) -> Optional[dict]:
+        """Build the exact Task 12 contract for a live reserve absorption."""
+
+        try:
+            if (
+                type(pre_owned_map) is not dict
+                or not pre_owned_map
+                or type(source_coin_ids) is not list
+                or len(source_coin_ids) < 2
+                or type(fee_mojos) is not int
+                or fee_mojos < 0
+            ):
+                return None
+            canonical_owned = {}
+            for coin_id, amount in pre_owned_map.items():
+                canonical = self._canonical_runtime_topup_coin_id(coin_id)
+                if (
+                    canonical in canonical_owned
+                    or type(amount) is not int
+                    or amount <= 0
+                ):
+                    return None
+                canonical_owned[canonical] = amount
+            sources = [
+                self._canonical_runtime_topup_coin_id(coin_id)
+                for coin_id in source_coin_ids
+            ]
+            if len(sources) != len(set(sources)) or any(
+                coin_id not in canonical_owned for coin_id in sources
+            ):
+                return None
+            combined_amount = sum(canonical_owned[coin_id] for coin_id in sources)
+            output_amount = combined_amount if is_cat else combined_amount - fee_mojos
+            if output_amount <= 0:
+                return None
+            return {
+                "operation_kind": "combine",
+                "purpose": "top_up",
+                "target_contract": {
+                    "wallet_type": "cat" if is_cat else "xch",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "amount_mojos": output_amount,
+                            "purpose": "top_up",
+                        }
+                    ],
+                },
+                "pre_view_coin_ids": sorted(canonical_owned),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _confirm_runtime_topup_prep(
+        self,
+        receipt,
+        *,
+        owned_map: Dict[str, int],
+    ) -> bool:
+        """Resolve a submitted live top-up only from one exact fresh post-view."""
+
+        try:
+            operation = receipt.operation
+            if type(operation) is not dict or type(owned_map) is not dict:
+                return False
+            target = json.loads(operation["target_contract_json"])
+            prepared_evidence = json.loads(operation["prepared_evidence_json"])
+            expected_identity = json.loads(operation["wallet_identity_json"])
+            identity_binding = mutation_gate.WalletIdentityBinding(**expected_identity)
+            if (
+                mutation_gate.wallet_identity_binding_payload(identity_binding)
+                != expected_identity
+            ):
+                return False
+            identity_decision = mutation_gate.validate_wallet_identity(
+                identity_binding,
+                get_wallet_identity(),
+            )
+            if identity_decision.get("allowed") is not True:
+                return False
+
+            pre_ids = {
+                self._canonical_runtime_topup_coin_id(value)
+                for value in prepared_evidence["pre_view_coin_ids"]
+            }
+            source_ids = {
+                self._canonical_runtime_topup_coin_id(value)
+                for value in json.loads(operation["source_coin_ids_json"])
+            }
+            observed_by_id = {}
+            for coin_id, amount in owned_map.items():
+                canonical = self._canonical_runtime_topup_coin_id(coin_id)
+                if (
+                    canonical in observed_by_id
+                    or type(amount) is not int
+                    or amount <= 0
+                ):
+                    return False
+                observed_by_id[canonical] = amount
+            if source_ids.intersection(observed_by_id):
+                return False
+
+            new_coins = sorted(
+                (
+                    {"coin_id": coin_id, "amount_mojos": amount}
+                    for coin_id, amount in observed_by_id.items()
+                    if coin_id not in pre_ids
+                ),
+                key=lambda item: (item["amount_mojos"], item["coin_id"]),
+            )
+            outputs = sorted(
+                target["outputs"],
+                key=lambda item: (item["amount_mojos"], item["output_index"]),
+            )
+            purposes_by_amount = {}
+            for output in outputs:
+                purposes_by_amount.setdefault(output["amount_mojos"], set()).add(
+                    output["purpose"]
+                )
+            if any(len(purposes) != 1 for purposes in purposes_by_amount.values()):
+                return False
+            if len(new_coins) != len(outputs) or [
+                item["amount_mojos"] for item in new_coins
+            ] != [item["amount_mojos"] for item in outputs]:
+                return False
+            expected_outputs = [
+                {
+                    "coin_id": coin["coin_id"],
+                    "amount_mojos": coin["amount_mojos"],
+                    "purpose": output["purpose"],
+                }
+                for coin, output in zip(new_coins, outputs)
+            ]
+            observed_text = identity_decision["observed_at_utc"]
+            observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
+            expires_at = observed_at + timedelta(
+                seconds=expected_identity["maximum_age_seconds"]
+            )
+            authoritative_view = {
+                "fresh": True,
+                "complete": True,
+                "wallet_identity": expected_identity,
+                "observed_at": observed_text,
+                "expires_at": expires_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "coins": expected_outputs,
+            }
+            from replacement_capacity import verify_coin_prep_post_view
+
+            decision = verify_coin_prep_post_view(
+                source_coin_ids=sorted(source_ids),
+                expected_outputs=expected_outputs,
+                authoritative_view=authoritative_view,
+                expected_wallet_identity=expected_identity,
+            )
+            if decision.confirmed is not True:
+                return False
+            record_coin_prep_operation_outcome(
+                operation["operation_id"],
+                outcome="CONFIRMED",
+                evidence_json={
+                    "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+                    "effect_claim_token": operation["effect_claim_token"],
+                    "effect_claim_generation": operation["effect_claim_generation"],
+                    "source_coin_ids": sorted(source_ids),
+                    "expected_outputs": expected_outputs,
+                    "authoritative_view": authoritative_view,
+                    "expected_wallet_identity": expected_identity,
+                },
+            )
+            return True
+        except Exception as exc:
+            log_event(
+                "warning",
+                "runtime_topup_authoritative_resolution_failed",
+                "Runtime top-up remains safety-blocked because its exact post-view "
+                "could not be committed.",
+                data={"error": str(exc)[:160]},
+            )
+            return False
+
     def _sage_one_step_split(
         self,
         name: str,
@@ -8530,7 +9048,7 @@ class CoinManager:
         _two_step_split step 2 — poll for num_to_create new owned coins that
         match trading_size_mojos.
         """
-        from wallet_sage import sage_topup_split
+        from wallet import sage_topup_split
 
         tag = f"topup_{name.lower()}"
 
@@ -8701,7 +9219,12 @@ class CoinManager:
 
         # --- Snapshot before ---
         pre_owned_map = (
-            self._get_owned_coin_amount_map(wallet_id, f"{tag}-pre-osstep") or {}
+            self._get_owned_coin_amount_map(
+                wallet_id,
+                f"{tag}-pre-osstep",
+                require_complete=True,
+            )
+            or {}
         )
         pre_owned_ids = set(pre_owned_map.keys())
 
@@ -8710,6 +9233,23 @@ class CoinManager:
             return chain_action
 
         fee_mojos = self._tx_fee_mojos()
+        prep_contract = self._build_runtime_topup_prep_contract(
+            pre_owned_map=pre_owned_map,
+            source_coin_id=source_coin_id,
+            num_to_create=num_to_create,
+            trading_size_mojos=trading_size_mojos,
+            fee_mojos=fee_mojos,
+            is_cat=is_cat,
+        )
+        if prep_contract is None:
+            log_event(
+                "warning",
+                f"{tag}_prep_contract_unavailable",
+                "Runtime top-up refused because CATalyst could not establish a "
+                "complete exact pre-operation coin view.",
+                data={"source_coin_id": str(source_coin_id or "")[:18]},
+            )
+            return False
         fee_coin_id = None
         if is_cat and fee_mojos > 0 and self._fee_pool_enabled():
             fee_coin_id = self.fee_pool.reserve()
@@ -8740,16 +9280,47 @@ class CoinManager:
 
         # --- Submit the single create_transaction RPC ---
         weak_submit_onchain_confirmed = False
+        prep_receipt = None
         try:
-            result = sage_topup_split(
-                source_coin_id=source_coin_id,
-                num_coins=num_to_create,
-                trading_size_mojos=trading_size_mojos,
-                own_address=address,
-                fee_mojos=fee_mojos,
-                is_cat=is_cat,
-                fee_coin_id=fee_coin_id,
+            fee_coin_ids = (
+                [fee_coin_id]
+                if fee_coin_id
+                else [source_coin_id]
+                if fee_mojos > 0 and not is_cat
+                else []
             )
+            effect_result = _run_claimed_wallet_effect(
+                "coin_manager.topup_split_sage",
+                lambda: sage_topup_split(
+                    source_coin_id=source_coin_id,
+                    num_coins=num_to_create,
+                    trading_size_mojos=trading_size_mojos,
+                    own_address=address,
+                    fee_mojos=fee_mojos,
+                    is_cat=is_cat,
+                    fee_coin_id=fee_coin_id,
+                ),
+                source_coin_ids=[source_coin_id],
+                fee_mojos=fee_mojos,
+                fee_coin_ids=fee_coin_ids,
+                _prep_contract=prep_contract,
+            )
+            if effect_result is _WALLET_EFFECT_DENIED:
+                return False
+            prep_receipt = (
+                effect_result
+                if isinstance(effect_result, _PreparedWalletEffectReceipt)
+                else None
+            )
+            if prep_receipt is None:
+                log_event(
+                    "warning",
+                    f"{tag}_prep_receipt_missing",
+                    "Runtime top-up refused because its durable PREPARED receipt "
+                    "was not returned after adapter dispatch.",
+                )
+                return False
+            result = prep_receipt.result
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
                     log_event(
@@ -8774,6 +9345,21 @@ class CoinManager:
                         "continuing while Sage catches up",
                     )
                     weak_submit_onchain_confirmed = True
+                elif (
+                    prep_receipt.dispatch_outcome in {"SUBMITTED", "UNKNOWN"}
+                    and "no transaction id" in str(err).lower()
+                ):
+                    log_event(
+                        "warning",
+                        f"{tag}_osstep_receipt_unknown",
+                        "Sage returned no transaction id after dispatch; keeping the "
+                        "durable claim and polling the exact read-only coin view "
+                        "before deciding whether the split settled.",
+                        data={
+                            "source_coin_id": str(source_coin_id or "")[:18],
+                            "dispatch_outcome": prep_receipt.dispatch_outcome,
+                        },
+                    )
                 elif self._looks_like_wallet_rpc_degradation(err):
                     self._abort_topup_for_wallet_degradation(
                         f"{name} topup paused: /create_transaction degraded ({err})."
@@ -8814,7 +9400,7 @@ class CoinManager:
 
         def _sage_pending_count() -> Optional[int]:
             try:
-                from wallet_sage import get_pending_transactions
+                from wallet import get_pending_transactions
 
                 pending = get_pending_transactions()
                 if pending is not None:
@@ -8875,14 +9461,6 @@ class CoinManager:
         owned_logged = False
 
         while (time.time() - wait_start) < wait_max:
-            if self._topup_should_stop():
-                log_event(
-                    "info",
-                    f"{tag}_stopped",
-                    f"{name} top-up stopped while waiting for one-step split outputs",
-                )
-                return False
-
             time.sleep(poll_interval)
             owned_map = (
                 self._get_owned_coin_amount_map(wallet_id, f"{tag}-osstep-owned") or {}
@@ -8977,7 +9555,24 @@ class CoinManager:
                     owned_amounts=owned_map,
                     is_cat=is_cat,
                 )
+                if not self._confirm_runtime_topup_prep(
+                    prep_receipt,
+                    owned_map=owned_map,
+                ):
+                    return False
                 return True
+
+            # A submitted effect may itself trip the safety latch and request
+            # this worker to stop.  Complete one bounded read-only post-view
+            # first so exact outputs can resolve that journal; no new wallet
+            # action occurs after the stop request.
+            if self._topup_should_stop():
+                log_event(
+                    "info",
+                    f"{tag}_stopped",
+                    f"{name} top-up stopped after checking one-step split outputs",
+                )
+                return False
 
             if elapsed % 20 == 0 and elapsed > 0:
                 _wait_event = f"{tag}_osstep_wait"
@@ -9009,12 +9604,18 @@ class CoinManager:
         ]
         owned_count = len(new_coins)
         sel_count = sum(1 for c in new_coins if c in selectable_ids)
-        if tx_state["confirmed"] and owned_count >= num_to_create:
+        if owned_count >= num_to_create:
+            confirmation = (
+                "transaction confirmed"
+                if tx_state["confirmed"]
+                else "exact outputs owned"
+            )
             log_event(
                 "info",
                 f"{tag}_osstep_confirmed",
                 f"One-step split confirmed after timeout "
-                f"({owned_count}/{num_to_create} owned, selectable lagging)",
+                f"({confirmation}; {owned_count}/{num_to_create} owned, "
+                "selectable lagging)",
             )
             self._stamp_topup_output_designations(
                 name=name,
@@ -9023,6 +9624,11 @@ class CoinManager:
                 owned_amounts=owned_map,
                 is_cat=is_cat,
             )
+            if not self._confirm_runtime_topup_prep(
+                prep_receipt,
+                owned_map=owned_map,
+            ):
+                return False
             return True
 
         if not tx_ids and not weak_submit_onchain_confirmed:
@@ -9205,15 +9811,36 @@ class CoinManager:
             # automatically, but we've already re-fetched fresh IDs so it should
             # pick the largest available coin (our reserve).
             wallet_type = get_wallet_type()
+            if wallet_type != "sage":
+                log_event(
+                    "warning",
+                    f"{tag}_pool_send_authority_denied",
+                    "Chia pool creation auto-selects its source; disabled pending "
+                    "Task 12.",
+                )
+                return False
+            pool_fee_mojos = self._tx_fee_mojos()
             send_kwargs = {
                 "wallet_id": wallet_id,
                 "amount_mojos": pool_amount_mojos,
                 "address": address,
-                "fee_mojos": self._tx_fee_mojos(),
+                "fee_mojos": pool_fee_mojos,
+                "source_coin_ids": [source_coin_id],
             }
-            if wallet_type == "sage":
-                send_kwargs["source_coin_ids"] = [source_coin_id]
-            result = send_transaction(**send_kwargs)
+            pool_fee_coin_ids = (
+                [source_coin_id]
+                if pool_fee_mojos > 0 and wallet_id == WALLET_ID_XCH
+                else []
+            )
+            result = _run_claimed_wallet_effect(
+                "coin_manager.pool_send_sage",
+                lambda: send_transaction(**send_kwargs),
+                source_coin_ids=[source_coin_id],
+                fee_mojos=pool_fee_mojos,
+                fee_coin_ids=pool_fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
+                return False
             if not result:
                 if self._spacescan_self_send_confirmed(source_coin_id, address, tag):
                     log_event(
@@ -9431,7 +10058,7 @@ class CoinManager:
             if 118 < elapsed < 125:
                 try:
                     if get_wallet_type() == "sage":
-                        from wallet_sage import get_pending_transactions
+                        from wallet import get_pending_transactions
 
                         pending = get_pending_transactions() or []
                         pending_count = len(pending) if isinstance(pending, list) else 0
@@ -9475,18 +10102,38 @@ class CoinManager:
         )
 
         wallet_type = get_wallet_type()
+        if wallet_type != "sage":
+            log_event(
+                "warning",
+                f"{tag}_pool_split_authority_denied",
+                "Chia CLI split cannot honor the complete source/fee cohort; "
+                "disabled pending Task 12.",
+            )
+            return False
 
         if wallet_type == "sage":
             # Sage native /split — output_count = num_to_create (even split)
             try:
-                split_result = split_coins_rpc(
-                    wallet_id=wallet_id,
-                    target_coin_id=pool_coin_id,
-                    num_coins=num_to_create,
-                    amount_per_coin=trading_size_mojos,
-                    fee_mojos=self._tx_fee_mojos(),
-                    is_cat=is_cat,
+                split_fee_mojos = self._tx_fee_mojos()
+                split_fee_coin_ids = (
+                    [pool_coin_id] if split_fee_mojos > 0 and not is_cat else []
                 )
+                split_result = _run_claimed_wallet_effect(
+                    "coin_manager.pool_split_sage",
+                    lambda: split_coins_rpc(
+                        wallet_id=wallet_id,
+                        target_coin_id=pool_coin_id,
+                        num_coins=num_to_create,
+                        amount_per_coin=trading_size_mojos,
+                        fee_mojos=split_fee_mojos,
+                        is_cat=is_cat,
+                    ),
+                    source_coin_ids=[pool_coin_id],
+                    fee_mojos=split_fee_mojos,
+                    fee_coin_ids=split_fee_coin_ids,
+                )
+                if split_result is _WALLET_EFFECT_DENIED:
+                    return False
                 if split_result is None:
                     if self._spacescan_coin_spent_confirmed(pool_coin_id, tag, "split"):
                         log_event(
@@ -9889,9 +10536,20 @@ class CoinManager:
                     return _TOPUP_PENDING
 
             fee = self._tx_fee_mojos()
-            from wallet_sage import combine_coins
+            from wallet import combine_coins
 
-            result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
+            fee_coin_ids = (
+                list(filtered_ids) if fee > 0 and wallet_id == WALLET_ID_XCH else []
+            )
+            result = _run_claimed_wallet_effect(
+                "coin_manager.consolidate_sage",
+                lambda: combine_coins(coin_ids=filtered_ids, fee_mojos=fee),
+                source_coin_ids=list(filtered_ids),
+                fee_mojos=fee,
+                fee_coin_ids=fee_coin_ids,
+            )
+            if result is _WALLET_EFFECT_DENIED:
+                return False
 
             # /combine returns {summary, coin_spends} on success — same shape
             # as send_xch/send_cat.
@@ -10308,9 +10966,56 @@ class CoinManager:
                 f"[{reserve_id[:12]}...] — new reserve will be {amt_str}",
             )
 
-            from wallet_sage import combine_coins
+            from wallet import combine_coins
 
-            result = combine_coins(coin_ids=filtered_ids, fee_mojos=fee)
+            fee_coin_ids = list(filtered_ids) if fee > 0 and not is_cat else []
+            pre_owned_map = (
+                self._get_owned_coin_amount_map(
+                    wallet_id,
+                    f"topup_{name.lower()}_absorb-pre",
+                    require_complete=True,
+                )
+                or {}
+            )
+            prep_contract = self._build_runtime_absorb_prep_contract(
+                pre_owned_map=pre_owned_map,
+                source_coin_ids=list(filtered_ids),
+                fee_mojos=fee,
+                is_cat=is_cat,
+            )
+            if prep_contract is None:
+                log_event(
+                    "warning",
+                    f"topup_{name.lower()}_absorb_prep_contract_unavailable",
+                    "Misfit absorption refused because CATalyst could not establish "
+                    "a complete exact pre-operation coin view.",
+                    data={"input_count": len(filtered_ids)},
+                )
+                return False
+            effect_result = _run_claimed_wallet_effect(
+                "coin_manager.absorb_sage",
+                lambda: combine_coins(coin_ids=filtered_ids, fee_mojos=fee),
+                source_coin_ids=list(filtered_ids),
+                fee_mojos=fee,
+                fee_coin_ids=fee_coin_ids,
+                _prep_contract=prep_contract,
+            )
+            if effect_result is _WALLET_EFFECT_DENIED:
+                return False
+            prep_receipt = (
+                effect_result
+                if isinstance(effect_result, _PreparedWalletEffectReceipt)
+                else None
+            )
+            if prep_receipt is None:
+                log_event(
+                    "warning",
+                    f"topup_{name.lower()}_absorb_prep_receipt_missing",
+                    "Misfit absorption refused because its durable PREPARED receipt "
+                    "was not returned after adapter dispatch.",
+                )
+                return False
+            result = prep_receipt.result
 
             # Sage's send_xch/send_cat returns {summary, coin_spends} on success
             # (no "success" key in that response format). Accept either form.
@@ -10353,10 +11058,9 @@ class CoinManager:
                         "info",
                         f"topup_{name.lower()}_absorb_unverified",
                         "Sage /combine returned no transaction id; waiting for "
-                        "wallet/chain state to settle before marking it submitted",
+                        "an exact wallet post-view before resolving it",
                         data=event_data,
                     )
-                    return _TOPUP_PENDING
                 if absorb_key:
                     self._recent_absorb_submissions[absorb_key] = time.time()
                 # Log how many coin_spends Sage included for transparency
@@ -10372,6 +11076,33 @@ class CoinManager:
                     f"Misfit absorption submitted — enlarged reserve "
                     f"({amt_str}) will be available after confirmation{extra}",
                 )
+                confirmed = False
+                for attempt in range(31):
+                    owned_map = (
+                        self._get_owned_coin_amount_map(
+                            wallet_id,
+                            f"topup_{name.lower()}_absorb-post",
+                            require_complete=True,
+                        )
+                        or {}
+                    )
+                    if owned_map and self._confirm_runtime_topup_prep(
+                        prep_receipt,
+                        owned_map=owned_map,
+                    ):
+                        confirmed = True
+                        break
+                    if attempt < 30:
+                        time.sleep(4)
+                if not confirmed:
+                    log_event(
+                        "warning",
+                        f"topup_{name.lower()}_absorb_confirmation_pending",
+                        "Misfit absorption remains safety-blocked because its exact "
+                        "combined output is not yet present in a complete wallet view.",
+                        data={"input_count": len(filtered_ids)},
+                    )
+                    return _TOPUP_PENDING
                 # Credit the absorbed misfit total back to the topup pool
                 # spend counter. The misfits were originally carved from the
                 # reserve (contributing to spent), and folding them back in
@@ -10506,6 +11237,9 @@ class CoinManager:
                     f"Could not terminate previous coin prep worker (PID {self._prep_process.pid}): {e}",
                 )
             self._prep_process = None
+            if getattr(self, "_prep_delegation", None) is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             with self._lock:
                 self._prep_running = False
 
@@ -10533,6 +11267,9 @@ class CoinManager:
                 return False
             env = _coin_prep_worker_environment()
             cat_wallet_id = _coin_prep_active_cat_wallet_id(env)
+            prep_run_id = str(uuid.uuid4())
+            operation_id = f"coin-prep:{prep_run_id}"
+            worker_id = f"coin-prep-worker:{prep_run_id}"
 
             # Build CLI args to pass correct config to the worker.
             # This ensures the worker uses the ACTUAL bot settings
@@ -10691,6 +11428,7 @@ class CoinManager:
                 )
 
             cmd.extend(["--cat-wallet", str(cat_wallet_id)])
+            cmd.extend(["--run-id", prep_run_id])
 
             # Pass the bot's current weighted mid to the worker so CAT sizing
             # reflects what the bot is actually quoting, not Dexie's last_price
@@ -10717,6 +11455,13 @@ class CoinManager:
                     cmd.extend(["--live-price", str(_live_mid)])
             except Exception:
                 pass
+
+            self._prep_delegation = _issue_coin_prep_worker_delegation(
+                env,
+                operation_id=operation_id,
+                worker_id=worker_id,
+                ttl_seconds=_coin_prep_worker_delegation_ttl_seconds(),
+            )
 
             self._prep_process = subprocess.Popen(
                 cmd,
@@ -10765,6 +11510,9 @@ class CoinManager:
             return True
 
         except Exception as e:
+            if getattr(self, "_prep_delegation", None) is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             with self._lock:
                 self._prep_running = False
             log_event(
@@ -10827,6 +11575,9 @@ class CoinManager:
             with self._lock:
                 self._prep_running = False
             self._prep_process = None
+            if getattr(self, "_prep_delegation", None) is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
             return {"running": False, "exit_code": -1, "killed_for_runtime": True}
 
         poll = self._prep_process.poll()
@@ -10834,6 +11585,9 @@ class CoinManager:
         if poll is not None:
             with self._lock:
                 self._prep_running = False
+            if getattr(self, "_prep_delegation", None) is not None:
+                _revoke_coin_prep_worker_delegation(self._prep_delegation)
+                self._prep_delegation = None
 
             try:
                 stdout_data = (

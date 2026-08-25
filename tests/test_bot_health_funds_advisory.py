@@ -311,6 +311,34 @@ class FundsAdvisoryTests(unittest.TestCase):
             def _balance(wallet_id):
                 return high_cat_balance if int(wallet_id) == 2 else high_xch_balance
 
+            def _free_coins(wallet_type):
+                return [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM coins WHERE wallet_type=? AND status='free'",
+                        (wallet_type,),
+                    ).fetchall()
+                ]
+
+            def _tier_spare_counts(wallet_type):
+                counts = {
+                    "inner": 0,
+                    "mid": 0,
+                    "outer": 0,
+                    "extreme": 0,
+                    "sniper": 0,
+                    "fees": 0,
+                }
+                for row in conn.execute(
+                    "SELECT assigned_tier, COUNT(*) AS cnt FROM coins "
+                    "WHERE wallet_type=? AND status='free' "
+                    "AND designation='tier_spare' GROUP BY assigned_tier",
+                    (wallet_type,),
+                ).fetchall():
+                    if row["assigned_tier"] in counts:
+                        counts[row["assigned_tier"]] = int(row["cnt"])
+                return counts
+
             with ExitStack() as stack:
                 for name, value in {
                     "TIER_ENABLED": True,
@@ -343,6 +371,15 @@ class FundsAdvisoryTests(unittest.TestCase):
                     patch("wallet_sage.get_wallet_balance", side_effect=_balance)
                 )
                 stack.enter_context(patch("database.get_connection", return_value=conn))
+                stack.enter_context(
+                    patch("database.get_free_coins", side_effect=_free_coins)
+                )
+                stack.enter_context(
+                    patch(
+                        "database.get_tier_spare_counts",
+                        side_effect=_tier_spare_counts,
+                    )
+                )
                 stack.enter_context(
                     patch(
                         "coin_manager.get_tier_sizes_mojos_from_cfg",

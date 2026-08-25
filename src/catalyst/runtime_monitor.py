@@ -634,6 +634,9 @@ class RuntimeMonitor:
                 "dexie_sell_truncated": bool(
                     orderbook_snapshot.get("sell_truncated", False)
                 ),
+                "dexie_orderbook_source": str(
+                    orderbook_snapshot.get("source", "") or ""
+                ),
                 "best_competitor_bid": str(competitor_bid),
                 "best_competitor_ask": str(competitor_ask),
                 "our_best_bid": str(our_best_bid),
@@ -988,6 +991,10 @@ class RuntimeMonitor:
         dexie_visible = (
             not startup_grace
             and wallet_fresh
+            # Aggregated v3 price levels have no individual offer IDs, so
+            # ownership cannot be attributed there.  A 0/0 owned count is
+            # unknown, not proof that wallet offers are absent from Dexie.
+            and market.get("dexie_orderbook_source") != "dexie_v3_orderbook"
             and bool(getattr(cfg, "DEXIE_AUTO_POST", True))
             and bool(getattr(cfg, "DEXIE_POST_ENABLED", True))
             and int(market["dexie_queue_size"]) == 0

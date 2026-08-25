@@ -24,7 +24,9 @@ from typing import Optional, Dict, List, Any
 
 from config import cfg
 from database import (
+    _economic_fill_authority_join,
     get_connection,
+    get_net_position,
     get_market_analysis_cache,
     set_market_analysis_cache,
     get_pool_snapshots,
@@ -1235,7 +1237,14 @@ def _merge_partial_spacescan(new_payload: Dict, asset_id: str) -> Dict:
         return new_payload  # full fetch — no merge needed
 
     try:
-        prior = get_market_analysis_cache(asset_id, "spacescan") or {}
+        prior = (
+            get_market_analysis_cache(
+                asset_id,
+                "spacescan",
+                include_expired=True,
+            )
+            or {}
+        )
     except Exception:
         return new_payload
 
@@ -1709,6 +1718,9 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         "total_fill_volume_xch": 0,
         "avg_fill_size_xch": 0,
         "inventory_snapshots": 0,
+        "legacy_inventory_snapshots": 0,
+        "latest_legacy_net_position": None,
+        "inventory_position_authority": "authoritative_fill_receipts",
         "latest_net_position": 0,
         "pool_snapshots": 0,
         "pool_trend": "unknown",
@@ -1735,11 +1747,14 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         # Fill history (30 days)
         row = conn.execute(
             "SELECT COUNT(*) as cnt, "
-            "SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END) as buys, "
-            "SUM(CASE WHEN side='sell' THEN 1 ELSE 0 END) as sells, "
-            "SUM(CAST(size_xch AS REAL)) as total_vol, "
-            "AVG(CAST(size_xch AS REAL)) as avg_size "
-            "FROM fills WHERE cat_asset_id = ? AND filled_at >= datetime('now', '-30 days')",
+            "SUM(CASE WHEN f.side='buy' THEN 1 ELSE 0 END) as buys, "
+            "SUM(CASE WHEN f.side='sell' THEN 1 ELSE 0 END) as sells, "
+            "SUM(CAST(f.size_xch AS REAL)) as total_vol, "
+            "AVG(CAST(f.size_xch AS REAL)) as avg_size "
+            "FROM fills AS f "
+            + _economic_fill_authority_join()
+            + " WHERE f.cat_asset_id = ? "
+            "AND f.filled_at >= datetime('now', '-30 days')",
             (asset_id,),
         ).fetchone()
         if row and row["cnt"]:
@@ -1756,15 +1771,18 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
             (asset_id,),
         ).fetchone()
         result["inventory_snapshots"] = row["cnt"] if row else 0
+        result["legacy_inventory_snapshots"] = result["inventory_snapshots"]
 
-        # Latest net position
+        # Historical snapshots remain UI history only.  Current positioning,
+        # drift and risk derive from exact authoritative fill receipts.
         row = conn.execute(
             "SELECT net_position FROM inventory "
             "WHERE cat_asset_id = ? ORDER BY timestamp DESC LIMIT 1",
             (asset_id,),
         ).fetchone()
         if row:
-            result["latest_net_position"] = _safe_float(row["net_position"])
+            result["latest_legacy_net_position"] = _safe_float(row["net_position"])
+        result["latest_net_position"] = _safe_float(get_net_position(asset_id))
 
         # Pool snapshots (our own history)
         snapshots = get_pool_snapshots(asset_id, hours=720)
@@ -1791,11 +1809,13 @@ def _fetch_internal_db_history(asset_id: str) -> Dict:
         # skipped; we emit the raw sigma so downstream can pick a window.
         try:
             rows = conn.execute(
-                "SELECT CAST(price_xch AS REAL) AS price, filled_at "
-                "FROM fills WHERE cat_asset_id = ? "
-                "AND filled_at >= datetime('now', '-30 days') "
-                "AND price_xch IS NOT NULL "
-                "ORDER BY filled_at ASC",
+                "SELECT CAST(f.price_xch AS REAL) AS price, f.filled_at "
+                "FROM fills AS f "
+                + _economic_fill_authority_join()
+                + " WHERE f.cat_asset_id = ? "
+                "AND f.filled_at >= datetime('now', '-30 days') "
+                "AND f.price_xch IS NOT NULL "
+                "ORDER BY f.filled_at ASC",
                 (asset_id,),
             ).fetchall()
             prices = [r["price"] for r in rows if r["price"] and r["price"] > 0]

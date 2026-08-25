@@ -296,6 +296,72 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertEqual(meta["cache_size"], 0)
         self.assertEqual(meta.get("expected_empty_reason"), "coin_prep_cancel_all")
 
+    def test_empty_wallet_book_accepted_when_all_db_offers_are_locally_expired(self):
+        """Expired durable rows must not keep a stale wallet cache resumable."""
+        manager = self.offer_manager.OfferManager()
+
+        def fake_get_all_offers(*args, **kwargs):
+            if not hasattr(fake_get_all_offers, "_calls"):
+                fake_get_all_offers._calls = 0
+            fake_get_all_offers._calls += 1
+            if fake_get_all_offers._calls == 1:
+                return [{"trade_id": "seed"}]
+            return []
+
+        def fake_classify(all_offers, _asset_id):
+            if all_offers:
+                return (
+                    [{"trade_id": f"buy-live-{i}"} for i in range(3)],
+                    [{"trade_id": f"sell-live-{i}"} for i in range(3)],
+                    [],
+                )
+            return ([], [], [])
+
+        expired_db_rows = [
+            {
+                "trade_id": f"buy-live-{i}",
+                "side": "buy",
+                "status": "open",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            }
+            for i in range(3)
+        ] + [
+            {
+                "trade_id": f"sell-live-{i}",
+                "side": "sell",
+                "status": "open",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            }
+            for i in range(3)
+        ]
+
+        with (
+            patch.object(self.offer_manager, "get_all_offers", new=fake_get_all_offers),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                side_effect=fake_classify,
+            ),
+            patch.object(
+                self.offer_manager,
+                "get_open_offers",
+                return_value=expired_db_rows,
+            ),
+        ):
+            fresh_buy, fresh_sell, _ = manager.sync_from_wallet()
+            empty_buy, empty_sell, _ = manager.sync_from_wallet()
+
+        self.assertEqual(len(fresh_buy), 3)
+        self.assertEqual(len(fresh_sell), 3)
+        self.assertEqual(empty_buy, [])
+        self.assertEqual(empty_sell, [])
+
+        meta = manager.get_wallet_sync_meta()
+        self.assertTrue(meta["fresh"])
+        self.assertFalse(meta["using_cache"])
+        self.assertEqual(meta["cache_size"], 0)
+        self.assertEqual(meta.get("expected_empty_reason"), "db_all_offers_expired")
+
     def test_suspicious_empty_wallet_book_warning_logs_once_per_stale_run(self):
         manager = self.offer_manager.OfferManager()
 

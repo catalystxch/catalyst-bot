@@ -39,6 +39,29 @@ _TIBET_PAIRS_CACHE = {"base": "", "fetched_at": 0.0, "pairs": []}
 _TIBET_PAIRS_CACHE_TTL_SECS = 60.0
 
 
+def _confirmed_tibetswap_outage(bot=None) -> dict:
+    """Return UI-safe context for a confirmed external TibetSwap outage."""
+    active_bot = bot if bot is not None else api_server.bot
+    startup_results = getattr(active_bot, "_startup_self_test_results", {}) or {}
+    tibet_health = (
+        startup_results.get("tibet", {}) if isinstance(startup_results, dict) else {}
+    )
+    if not isinstance(tibet_health, dict) or tibet_health.get("ok") is not False:
+        return {}
+
+    status_code = tibet_health.get("status_code")
+    status_label = f"HTTP {status_code}" if status_code else "service unavailable"
+    return {
+        "message": (
+            f"TibetSwap outage ({status_label}): pool depth and slippage are "
+            "unavailable. CATalyst is using Dexie-only pricing; AMM drift "
+            "protection is unavailable."
+        ),
+        "reason": "provider_outage",
+        "status_code": status_code,
+    }
+
+
 def _get_tibet_pairs_cached(base: str = None, timeout: int = 8) -> list:
     """Return a short-lived cached TibetSwap /pairs list for GUI polling."""
     base_url = (
@@ -466,7 +489,21 @@ def api_market_slippage():
         quote = bot.price_engine.get_tibet_quote(amount_xch=Decimal(amount), side=side)
         if quote:
             return jsonify(quote)
-        return jsonify({"error": "Could not get quote"}), 404
+        result = {
+            "available": False,
+            "error": "TibetSwap quote unavailable",
+            "provider": "tibetswap",
+        }
+        outage = _confirmed_tibetswap_outage(bot)
+        if outage:
+            result.update(
+                {
+                    "message": outage["message"],
+                    "reason": outage["reason"],
+                    "status_code": outage["status_code"],
+                }
+            )
+        return jsonify(result)
     except Exception:
         return api_server._api_exception(request.path)
 
@@ -572,8 +609,21 @@ def api_market_summary():
         "pool_cat": 0,
         "dexie_depth_xch": 0,
         "arb_gap_bps": 0,
+        "tibet_available": None,
+        "tibet_reason": "",
+        "tibet_status_code": None,
         "has_data": False,
     }
+
+    tibet_outage = _confirmed_tibetswap_outage()
+    if tibet_outage:
+        result.update(
+            {
+                "tibet_available": False,
+                "tibet_reason": tibet_outage["reason"],
+                "tibet_status_code": tibet_outage["status_code"],
+            }
+        )
 
     if not asset_id:
         return jsonify(result)
@@ -700,24 +750,38 @@ def api_market_summary():
     except Exception:
         pass
 
-    try:
-        norm_id = asset_id.lower().strip().replace("0x", "")
-        pairs = _get_tibet_pairs_cached(
-            getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
-            timeout=8,
-        )
-        for p in pairs:
-            p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-            if p_id == norm_id:
-                xr = float(p.get("xch_reserve", 0)) / 1e12
-                tr = float(p.get("token_reserve", 0)) / (10**decimals)
-                if tr > 0:
-                    result["tibet_price"] = xr / tr
-                    result["pool_xch"] = round(xr, 2)
-                    result["pool_cat"] = round(tr, 0)
-                break
-    except Exception:
-        pass
+    if not tibet_outage:
+        try:
+            norm_id = asset_id.lower().strip().replace("0x", "")
+            pairs = _get_tibet_pairs_cached(
+                getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
+                timeout=8,
+            )
+            for p in pairs:
+                p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
+                if p_id == norm_id:
+                    xr = float(p.get("xch_reserve", 0)) / 1e12
+                    tr = float(p.get("token_reserve", 0)) / (10**decimals)
+                    if tr > 0:
+                        result["tibet_price"] = xr / tr
+                        result["pool_xch"] = round(xr, 2)
+                        result["pool_cat"] = round(tr, 0)
+                        result["tibet_available"] = True
+                    break
+            if result["tibet_available"] is None:
+                startup_results = (
+                    getattr(api_server.bot, "_startup_self_test_results", {}) or {}
+                )
+                tibet_health = (
+                    startup_results.get("tibet", {})
+                    if isinstance(startup_results, dict)
+                    else {}
+                )
+                if isinstance(tibet_health, dict) and tibet_health.get("ok") is True:
+                    result["tibet_available"] = True
+                    result["tibet_reason"] = "no_pool"
+        except Exception:
+            pass
 
     bb = result["best_bid"]
     ba = result["best_ask"]

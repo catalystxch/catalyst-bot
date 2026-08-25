@@ -16,7 +16,6 @@ Helpers `_normalize_asset_id` and `_get_dexie_pairs` live here since
 
 from __future__ import annotations
 
-import threading
 from decimal import Decimal
 from typing import Dict
 
@@ -50,6 +49,34 @@ def _normalize_asset_id(asset_id: str) -> str:
 
 def _active_cat_wallet_id(wallet_id, asset_id: str = "") -> int:
     return api_server.active_cat_wallet_id(wallet_id, asset_id)
+
+
+def _tibet_resolution_event(meta: dict, name: str, asset_id: str) -> dict:
+    """Describe the CAT pair lookup without conflating absence and outage."""
+    pair_id = str(meta.get("pair_id") or "").strip()
+    if pair_id:
+        return {
+            "level": "info",
+            "event_type": "cat_tibet_pair_resolved",
+            "message": (f"TIBET_PAIR_ID auto-resolved for {name}: {pair_id[:20]}..."),
+        }
+    if meta.get("pair_lookup_status") == "unavailable":
+        return {
+            "level": "warning",
+            "event_type": "cat_tibet_pair_unavailable",
+            "message": (
+                f"TibetSwap pair lookup unavailable for {name} "
+                f"({asset_id[:12]}...) — AMM monitoring is degraded"
+            ),
+        }
+    return {
+        "level": "info",
+        "event_type": "cat_tibet_pair_not_found",
+        "message": (
+            f"CAT {name} ({asset_id[:12]}...) has no TibetSwap pair — "
+            f"AMM monitoring disabled for this token"
+        ),
+    }
 
 
 def _notify_cat_asset_id_changed(asset_id: str) -> None:
@@ -586,10 +613,11 @@ def api_cat_select():
         try:
             if hasattr(bot, "risk_manager") and bot.risk_manager:
                 bot.risk_manager.reset_session()
+                bot.risk_manager.update_inventory()
                 log_event(
                     "info",
                     "cat_switch_risk_reset",
-                    f"Risk manager reset for CAT change to {name}",
+                    f"Risk manager reset and inventory restored for CAT change to {name}",
                 )
         except Exception as e:
             log_event(
@@ -609,22 +637,15 @@ def api_cat_select():
                 _cr._last_resolve_at = 0
                 cfg.update("TIBET_PAIR_ID", "")
                 meta = _cr.resolve_and_apply(cfg)
+                resolution_event = _tibet_resolution_event(meta, name, asset_id)
+                log_event(
+                    resolution_event["level"],
+                    resolution_event["event_type"],
+                    resolution_event["message"],
+                )
                 if meta.get("pair_id"):
-                    log_event(
-                        "info",
-                        "cat_tibet_pair_resolved",
-                        f"TIBET_PAIR_ID auto-resolved for {name}: "
-                        f"{meta['pair_id'][:20]}...",
-                    )
                     print(
                         f"[CAT SELECT] TIBET_PAIR_ID resolved: {meta['pair_id'][:20]}..."
-                    )
-                else:
-                    log_event(
-                        "info",
-                        "cat_tibet_pair_not_found",
-                        f"CAT {name} ({asset_id[:12]}...) has no TibetSwap pair — "
-                        f"AMM monitoring disabled for this token",
                     )
             except Exception as e:
                 log_event(
@@ -635,9 +656,23 @@ def api_cat_select():
             finally:
                 api_server.sync_active_cat_wallet_id(selected_wallet_id, asset_id)
 
-        threading.Thread(
-            target=_resolve_new_cat_tibet, daemon=True, name="cat-tibet-resolve"
-        ).start()
+        try:
+            api_server.start_mutation_thread(
+                operation="api:cat:tibet_resolve_worker",
+                target=_resolve_new_cat_tibet,
+                name="cat-tibet-resolve",
+            )
+        except api_server.mutation_gate.MutationBlocked as exc:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": exc.reason_code,
+                    }
+                ),
+                423,
+            )
 
     # Notify the Sage wallet adapter so _get_cat_asset_id() returns the new
     # asset ID immediately — without waiting for .env to be re-read.

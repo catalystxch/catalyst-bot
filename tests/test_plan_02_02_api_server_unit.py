@@ -11,6 +11,8 @@ import unittest
 from decimal import Decimal
 from unittest.mock import patch
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
 
@@ -212,6 +214,7 @@ class TestBotStartEndpoint(unittest.TestCase):
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
         self.headers = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()

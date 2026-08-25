@@ -7,7 +7,6 @@ so the GUI doesn't block on wallet RPC.
 
 from __future__ import annotations
 
-import threading
 from decimal import Decimal
 
 from flask import Blueprint, jsonify, request
@@ -187,8 +186,24 @@ def api_boost_activate():
         except Exception as e:
             log_event("error", "gap_closer_activate_error", f"Activation failed: {e}")
 
-    t = threading.Thread(target=_activate_bg, daemon=True)
-    t.start()
+    try:
+        t = api_server.start_mutation_thread(
+            operation="api:boost:activate_worker",
+            target=_activate_bg,
+            name="boost-activate-bg",
+        )
+    except api_server.mutation_gate.MutationBlocked as exc:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                }
+            ),
+            423,
+        )
+    api_server._boost_activation_thread = t
 
     return jsonify(
         {
@@ -210,7 +225,7 @@ def api_boost_deactivate():
         return jsonify({"error": "Bot not initialised"}), 500
 
     result = bot.boost_manager.deactivate()
-    api_server.events.emit("boost", {"active": False})
+    api_server.events.emit("boost", bot.boost_manager.get_state())
     return jsonify(result)
 
 

@@ -21,7 +21,11 @@ import threading
 import time
 from collections import deque
 from decimal import Decimal
+from math import isfinite
 from typing import Deque, Optional, Tuple
+
+
+_MAX_SWEEP_BUFFER = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -35,16 +39,44 @@ class DynamicAMMBuffer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         # Each entry: (timestamp_monotonic, fill_count)
-        self._sweeps: Deque[Tuple[float, int]] = deque()
+        self._sweeps: Deque[Tuple] = deque()
+        self._durable_event_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def record_sweep(self, fill_count: int = 1) -> None:
+    def record_sweep(
+        self,
+        fill_count: int = 1,
+        *,
+        event_id: str | None = None,
+        age_seconds: int | float = 0.0,
+    ) -> bool:
         """Record that a sweep just occurred (call after SweepEvent fires)."""
+
+        if event_id is not None and (
+            type(event_id) is not str
+            or len(event_id) != 64
+            or any(character not in "0123456789abcdef" for character in event_id)
+        ):
+            raise ValueError("durable sweep event_id must be an exact SHA-256 digest")
+        if type(age_seconds) not in {int, float} or age_seconds < 0:
+            raise ValueError("sweep age_seconds must be a non-negative exact number")
+        if age_seconds > 3_155_760_000 or not isfinite(age_seconds):
+            raise ValueError("sweep age_seconds exceeds the supported bound")
         with self._lock:
-            self._sweeps.append((time.monotonic(), fill_count))
+            self._prune_locked()
+            if event_id is not None and event_id in self._durable_event_ids:
+                return False
+            self._sweeps.append((time.monotonic() - age_seconds, fill_count, event_id))
+            if event_id is not None:
+                self._durable_event_ids.add(event_id)
+            while len(self._sweeps) > _MAX_SWEEP_BUFFER:
+                removed = self._sweeps.popleft()
+                if len(removed) > 2 and removed[2] is not None:
+                    self._durable_event_ids.discard(removed[2])
+            return True
 
     def get_effective_buffer_bps(self, base_bps) -> Decimal:
         """Return effective buffer bps, possibly widened by recent sweeps.
@@ -115,7 +147,9 @@ class DynamicAMMBuffer:
         window_secs = self._window_mins() * 60
         cutoff = time.monotonic() - window_secs
         while self._sweeps and self._sweeps[0][0] < cutoff:
-            self._sweeps.popleft()
+            removed = self._sweeps.popleft()
+            if len(removed) > 2 and removed[2] is not None:
+                self._durable_event_ids.discard(removed[2])
 
     @staticmethod
     def _window_mins() -> float:
@@ -165,9 +199,16 @@ def reset_buffer() -> None:
 # ---------------------------------------------------------------------------
 
 
-def record_sweep(fill_count: int = 1) -> None:
+def record_sweep(
+    fill_count: int = 1,
+    *,
+    event_id: str | None = None,
+    age_seconds: int | float = 0.0,
+) -> bool:
     """Record a sweep event.  Call this after each SweepEvent fires."""
-    _get_buffer_instance().record_sweep(fill_count)
+    return _get_buffer_instance().record_sweep(
+        fill_count, event_id=event_id, age_seconds=age_seconds
+    )
 
 
 def get_buffer(base_bps) -> Decimal:

@@ -27,25 +27,31 @@ import time
 import subprocess
 import threading
 import re
+from collections.abc import Iterator, Mapping
 from queue import Empty, Full, Queue
 from decimal import Decimal, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from win_subprocess import hidden_subprocess_kwargs
+import mutation_gate
+from super_log import slog
 
 from wallet import (
     get_all_offers,
-    cancel_offer as rpc_cancel_offer,
-    cancel_offers_batch,
+    get_pending_transactions,
     get_wallet_sync_status,
     get_spendable_coins_rpc,
     get_transaction,
+    get_wallet_adapter_authority,
+    get_wallet_identity,
 )
 from coin_prep_utils import (
+    remaining_pending_split_poll_seconds,
+    should_extend_pending_pool_confirmation_grace,
     should_extend_pending_consumed_split_grace,
     should_wait_for_pending_fee_inputs_before_split,
     should_retry_unconsumed_split,
@@ -72,6 +78,28 @@ load_dotenv()
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN", "").strip()
 _API_LOG_POST_TIMEOUT_S = 0.15
 _API_LOG_QUEUE_MAX = 400
+_WORKER_DELEGATION_ENV_NAMES = (
+    mutation_gate.DELEGATION_ID_ENV,
+    mutation_gate.DELEGATION_TOKEN_ENV,
+    mutation_gate.DELEGATION_PARENT_RUN_ENV,
+    mutation_gate.DELEGATION_OPERATION_ENV,
+    mutation_gate.DELEGATION_PURPOSE_ENV,
+    mutation_gate.DELEGATION_WORKER_ENV,
+    mutation_gate.DELEGATION_WALLET_ENV,
+    mutation_gate.DELEGATION_NETWORK_ENV,
+    mutation_gate.DELEGATION_IDENTITY_ENV,
+    mutation_gate.DELEGATION_IDENTITY_DIGEST_ENV,
+    mutation_gate.DELEGATION_PARENT_EPOCH_ENV,
+)
+_worker_delegation_environment = None
+
+
+def _coin_prep_status_file() -> str:
+    """Return the shared user-data sidecar read by the parent app."""
+
+    from user_paths import coin_prep_status_file
+
+    return coin_prep_status_file()
 
 
 def _local_api_headers() -> dict:
@@ -79,6 +107,106 @@ def _local_api_headers() -> dict:
     if _LOCAL_API_TOKEN:
         headers["X-Bot-Local-Token"] = _LOCAL_API_TOKEN
     return headers
+
+
+def _local_api_log_url() -> str:
+    """Return the exact loopback API selected by the owning parent process."""
+
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        port = 5000
+    if not 1 <= port <= 65535:
+        port = 5000
+    return f"http://127.0.0.1:{port}/api/log"
+
+
+def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
+    """Validate the exact parent/run scope before constructing the worker."""
+
+    global _worker_delegation_environment
+    try:
+        smoke = getattr(args, "sage_rpc_smoke", False)
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    if type(smoke) is not bool:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        )
+    if smoke:
+        return {"allowed": True, "reason": "read_only_smoke"}
+    env = os.environ if environment is None else environment
+    try:
+        run_id = getattr(args, "run_id", None)
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    if type(run_id) is not str or not run_id.strip() or len(run_id.strip()) > 128:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        )
+    safe_run_id = run_id.strip()
+    try:
+        handoff_environment = {
+            key: env.get(key) for key in _WORKER_DELEGATION_ENV_NAMES
+        }
+        expected = {
+            mutation_gate.DELEGATION_OPERATION_ENV: f"coin-prep:{safe_run_id}",
+            mutation_gate.DELEGATION_PURPOSE_ENV: "coin_prep",
+            mutation_gate.DELEGATION_WORKER_ENV: f"coin-prep-worker:{safe_run_id}",
+        }
+        if any(
+            type(handoff_environment[key]) is not str
+            or handoff_environment[key] != value
+            for key, value in expected.items()
+        ):
+            raise mutation_gate.MutationBlocked(
+                "WORKER_DELEGATION_INVALID", "coin_prep.start"
+            )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception as exc:
+        raise mutation_gate.MutationBlocked(
+            "WORKER_DELEGATION_INVALID", "coin_prep.start"
+        ) from exc
+    result = mutation_gate.require_worker_allowed_from_environment(
+        "coin_prep.start", handoff_environment
+    )
+    if environment is None:
+        mutation_gate.install_worker_authority_environment(
+            handoff_environment,
+            wallet_adapter_authority=get_wallet_adapter_authority(),
+        )
+        _worker_delegation_environment = dict(handoff_environment)
+        for key in _WORKER_DELEGATION_ENV_NAMES:
+            os.environ.pop(key, None)
+    return result
+
+
+def _worker_authority_environment(environment=None):
+    if environment is not None:
+        return environment
+    if _worker_delegation_environment is not None:
+        return _worker_delegation_environment
+    return os.environ
+
+
+def _guarded_wallet_mutation(
+    operation: str,
+    callback,
+    *args,
+    environment=None,
+    **kwargs,
+):
+    """Run a wallet callback only after a fresh delegated-authority read."""
+
+    mutation_gate.require_worker_allowed_from_environment(
+        operation, _worker_authority_environment(environment)
+    )
+    return callback(*args, **kwargs)
 
 
 def _env_int(name: str, default: int, *fallback_names: str) -> int:
@@ -125,11 +253,41 @@ try:
         mark_coins_gone,
         get_setting,
         set_setting,
+        begin_wallet_effect_dispatch,
+        claim_wallet_effect,
+        complete_wallet_effect_dispatch,
+        retain_wallet_effect_claim_for_reconciliation,
+        wallet_effect_adapter_dispatch_authority,
+        wallet_effect_claim_is_current,
     )
 
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
+
+
+def get_recoverable_coin_prep_operations(*args, **kwargs):
+    """Load the Task 12 recovery API without widening DB bootstrap coupling."""
+
+    from database import get_recoverable_coin_prep_operations as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def prepare_coin_prep_operation(*args, **kwargs):
+    """Load the Task 12 PREPARED API without widening DB bootstrap coupling."""
+
+    from database import prepare_coin_prep_operation as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def record_coin_prep_operation_outcome(*args, **kwargs):
+    """Load the Task 12 outcome API without widening DB bootstrap coupling."""
+
+    from database import record_coin_prep_operation_outcome as repository_call
+
+    return repository_call(*args, **kwargs)
 
 
 def _mark_coin_already_advised(coin_id: str) -> None:
@@ -163,6 +321,79 @@ class PrepPhase(Enum):
     VERIFYING = "verifying"
     COMPLETE = "complete"
     ERROR = "error"
+
+
+@dataclass(frozen=True)
+class CoinPrepSubmittedUnknown(Mapping[str, object]):
+    """Immutable accepted result without transaction or confirmation semantics."""
+
+    operation_id: str
+    dispatch_outcome: str
+    outcome: str = field(init=False, default="SUBMITTED_UNKNOWN")
+
+    def __getitem__(self, key: str) -> object:
+        if key == "success" or key == "submitted":
+            return True
+        if key == "outcome":
+            return self.outcome
+        if key == "operation_id":
+            return self.operation_id
+        if key == "dispatch_outcome":
+            return self.dispatch_outcome
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "success",
+                "submitted",
+                "outcome",
+                "operation_id",
+                "dispatch_outcome",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 5
+
+
+@dataclass(frozen=True)
+class CoinPrepAuthoritativelyConfirmed(Mapping[str, object]):
+    """Immutable success proven by the exact post-operation wallet view."""
+
+    operation_id: str
+    dispatch_outcome: str
+    outcome: str = field(init=False, default="CONFIRMED")
+
+    def __getitem__(self, key: str) -> object:
+        if key in {"success", "submitted", "confirmed"}:
+            return True
+        if key == "outcome":
+            return self.outcome
+        if key == "operation_id":
+            return self.operation_id
+        if key == "dispatch_outcome":
+            return self.dispatch_outcome
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "success",
+                "submitted",
+                "confirmed",
+                "outcome",
+                "operation_id",
+                "dispatch_outcome",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 6
+
+
+class CoinPrepAuthorityUnresolved(RuntimeError):
+    """Stop prep without replay when a submitted effect cannot be confirmed."""
 
 
 _STRUCTURED_COIN_PREP_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s")
@@ -324,7 +555,7 @@ class ApiMirrorStream:
             import requests as _req
 
             _req.post(
-                "http://localhost:5000/api/log",
+                _local_api_log_url(),
                 json={
                     "severity": self.severity,
                     "event_type": self.event_type,
@@ -687,7 +918,7 @@ class CoinPrepWorker:
             self.tier_order = []
 
         # Status file for GUI communication
-        self.status_file = "coin_prep_status.json"
+        self.status_file = _coin_prep_status_file()
 
         # Thread-safe status updates
         self.status_lock = threading.Lock()
@@ -735,6 +966,308 @@ class CoinPrepWorker:
         )
         self.log("   ⚡ Parallel optimization enabled!")
 
+    def _call_wallet_mutation(self, operation: str, callback, *args, **kwargs):
+        """Dispatch only an exact, durably claimed coin-effect contract."""
+
+        no_coin_effect_operations = {"coin_prep.sage_resync"}
+        disabled_auto_selection_operations = {
+            "coin_prep.create_pool",
+            "coin_prep.create_tier_pool",
+            "coin_prep.create_cat_tier_pools",
+            "coin_prep.create_xch_tier_pools",
+            "coin_prep.create_cat_fee_inputs",
+            # Sage's send_xch/send_cat structs do not bind coin_ids.  Passing
+            # source_coin_ids through wallet.send_transaction is therefore
+            # only a hint which the adapter can silently ignore.
+            "coin_prep.consolidate_staged_batch",
+            "coin_prep.consolidate_final_batch",
+            "coin_prep.consolidate_balance",
+        }
+        positional_cohort_operations = {"coin_prep.combine_fee_reserve"}
+        list_cohort_operations = {
+            "coin_prep.combine_batch": "coin_ids",
+            "coin_prep.combine": "coin_ids",
+            "coin_prep.create_tier_pools_exact": "selected_coin_ids",
+        }
+        exact_pool_operations = {"coin_prep.create_tier_pools_exact"}
+        single_source_operations = {
+            "coin_prep.split_tier_pool": "target_coin_id",
+            "coin_prep.split_xch_pool": "target_coin_id",
+            "coin_prep.retry_xch_split": "target_coin_id",
+            "coin_prep.split_single_sage": "target_coin_id",
+            "coin_prep.split_cat_pool": "source_coin_id",
+            "coin_prep.retry_cat_split": "source_coin_id",
+        }
+        prep_operation_kind = (
+            "combine"
+            if operation in positional_cohort_operations | set(list_cohort_operations)
+            and operation not in exact_pool_operations
+            else (
+                "split"
+                if operation in set(single_source_operations) | exact_pool_operations
+                else None
+            )
+        )
+        if operation in no_coin_effect_operations:
+            if not getattr(self, "_is_subprocess", False):
+                return callback(*args, **kwargs)
+            return _guarded_wallet_mutation(operation, callback, *args, **kwargs)
+        if operation in disabled_auto_selection_operations or not DB_AVAILABLE:
+            self.log(f"Wallet mutation {operation} denied by durable coin authority")
+            return None
+
+        source_coin_ids = None
+        if operation in positional_cohort_operations:
+            source_coin_ids = args[0] if args and type(args[0]) is list else None
+        elif operation in list_cohort_operations:
+            candidate = kwargs.get(list_cohort_operations[operation])
+            source_coin_ids = candidate if type(candidate) is list else None
+        elif operation in single_source_operations:
+            candidate = kwargs.get(single_source_operations[operation])
+            source_coin_ids = [candidate] if type(candidate) is str else None
+        else:
+            self.log(f"Wallet mutation {operation} has no exact coin contract")
+            return None
+        if not source_coin_ids:
+            self.log(f"Wallet mutation {operation} has no explicit source cohort")
+            return None
+
+        prep_contract = kwargs.pop("_prep_contract", None)
+        canonical_prep = None
+        prep_identity = None
+        if prep_operation_kind is not None:
+            if type(prep_contract) is not dict or set(prep_contract) != {
+                "operation_kind",
+                "purpose",
+                "target_contract",
+                "pre_view_coin_ids",
+            }:
+                self.log(
+                    f"Wallet mutation {operation} has no exact Task 12 prep contract"
+                )
+                return None
+            try:
+                from replacement_capacity import canonical_coin_prep_contract
+
+                canonical_prep = canonical_coin_prep_contract(
+                    operation_kind=prep_contract["operation_kind"],
+                    purpose=prep_contract["purpose"],
+                    source_coin_ids=list(source_coin_ids),
+                    target_contract=prep_contract["target_contract"],
+                )
+                if canonical_prep["operation_kind"] != prep_operation_kind:
+                    raise ValueError("prep operation kind differs")
+                pre_view_coin_ids = prep_contract["pre_view_coin_ids"]
+                if type(pre_view_coin_ids) is not list:
+                    raise ValueError("pre-view coin identities are malformed")
+                prep_identity = self._current_coin_prep_wallet_identity()
+            except Exception as exc:
+                self.log(f"Wallet mutation {operation} prep contract denied: {exc}")
+                return None
+
+        authority_fee_coin_ids = kwargs.pop("_authority_fee_coin_ids", None)
+        if (
+            authority_fee_coin_ids is not None
+            and type(authority_fee_coin_ids) is not list
+        ):
+            self.log(f"Wallet mutation {operation} has a malformed fee cohort")
+            return None
+        fee_mojos = kwargs.get("fee_mojos", 0)
+        if type(fee_mojos) is not int or fee_mojos < 0:
+            self.log(f"Wallet mutation {operation} has an invalid fee contract")
+            return None
+        fee_coin_id = kwargs.get("fee_coin_id")
+        fee_coin_ids: list[str] = []
+        sage_topup_operations = {
+            "coin_prep.split_cat_pool",
+            "coin_prep.retry_cat_split",
+        }
+        source_fee_operations = {
+            "coin_prep.combine_fee_reserve",
+            "coin_prep.combine_batch",
+            "coin_prep.combine",
+            "coin_prep.create_tier_pools_exact",
+            # Sage's /split fee is deducted from the explicitly selected XCH
+            # source coin; it does not auto-select a second fee input.
+            "coin_prep.split_tier_pool",
+            "coin_prep.split_xch_pool",
+            "coin_prep.retry_xch_split",
+            "coin_prep.split_single_sage",
+        }
+        if fee_mojos > 0:
+            if operation in sage_topup_operations and type(fee_coin_id) is str:
+                fee_coin_ids = [fee_coin_id]
+                if authority_fee_coin_ids not in (None, fee_coin_ids):
+                    self.log(
+                        f"Wallet mutation {operation} has a contradictory fee cohort"
+                    )
+                    return None
+            elif operation in source_fee_operations:
+                fee_coin_ids = authority_fee_coin_ids or []
+                if fee_coin_ids != list(source_coin_ids):
+                    self.log(
+                        f"Wallet mutation {operation} denied because its exact XCH "
+                        "fee cohort was not bound to the source cohort"
+                    )
+                    return None
+            else:
+                self.log(
+                    f"Wallet mutation {operation} denied because its fee input "
+                    "would be auto-selected"
+                )
+                return None
+        elif authority_fee_coin_ids:
+            self.log(f"Wallet mutation {operation} supplied a fee cohort without a fee")
+            return None
+
+        authority_operation = (
+            canonical_prep["operation_id"] if canonical_prep is not None else operation
+        )
+        claim = claim_wallet_effect(
+            operation_id=authority_operation,
+            source_coin_ids=list(source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        )
+        if claim is None:
+            self.log(f"Wallet mutation {operation} denied by durable coin authority")
+            return None
+        prepared_operation = None
+        if canonical_prep is not None:
+            try:
+                prepared = prepare_coin_prep_operation(
+                    operation_kind=canonical_prep["operation_kind"],
+                    purpose=canonical_prep["purpose"],
+                    source_coin_ids=canonical_prep["source_coin_ids"],
+                    target_contract=canonical_prep["target_contract"],
+                    wallet_identity_json=prep_identity,
+                    evidence_json={"pre_view_coin_ids": pre_view_coin_ids},
+                    effect_claim_token=claim["claim_token"],
+                    effect_claim_generation=claim["generation"],
+                )
+                prepared_operation = dict(prepared["operation"])
+            except Exception as exc:
+                retain_wallet_effect_claim_for_reconciliation(
+                    claim["claim_token"],
+                    claim["generation"],
+                    reason_code="COIN_PREP_PREPARED_PERSIST_FAILED",
+                )
+                self.log(f"Wallet mutation {operation} PREPARED denied: {exc}")
+                return None
+        if not wallet_effect_claim_is_current(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=authority_operation,
+            source_coin_ids=list(source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        ):
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="AUTHORITY_RECHECK_FAILED_BEFORE_EFFECT",
+            )
+            return None
+        dispatch = begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=authority_operation,
+            source_coin_ids=list(source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        )
+        if dispatch is None:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DISPATCH_AUTHORITY_RECHECK_FAILED",
+            )
+            return None
+        try:
+            with wallet_effect_adapter_dispatch_authority(dispatch):
+                if not getattr(self, "_is_subprocess", False):
+                    result = callback(*args, **kwargs)
+                else:
+                    result = _guarded_wallet_mutation(
+                        operation, callback, *args, **kwargs
+                    )
+        except Exception as exc:
+            dispatch_outcome = complete_wallet_effect_dispatch(dispatch, exception=exc)
+            if prepared_operation is not None:
+                self._record_coin_prep_dispatch_outcome(
+                    prepared_operation,
+                    dispatch_outcome=dispatch_outcome,
+                    reason_code="ADAPTER_EXCEPTION_UNKNOWN",
+                )
+            raise
+        dispatch_outcome = complete_wallet_effect_dispatch(dispatch, result=result)
+        if prepared_operation is None:
+            return result
+        if dispatch_outcome == "RELEASED_NO_EFFECT":
+            self._record_coin_prep_dispatch_outcome(
+                prepared_operation,
+                dispatch_outcome=dispatch_outcome,
+                reason_code="ADAPTER_PROVEN_NO_EFFECT",
+            )
+            return None
+        self._record_coin_prep_dispatch_outcome(
+            prepared_operation,
+            dispatch_outcome=dispatch_outcome,
+            reason_code=f"WALLET_EFFECT_{dispatch_outcome}_UNRECONCILED",
+        )
+        observation = self._observe_coin_prep_post_effect(prepared_operation)
+        post_effect_verify_timeout = None
+        if (
+            type(observation) is not dict
+            and getattr(self, "_is_subprocess", False)
+            and prep_operation_kind in {"combine", "split"}
+        ):
+            post_effect_verify_timeout = (
+                self._submitted_split_verify_timeout_seconds()
+                if prep_operation_kind == "split"
+                else self._consolidation_verify_timeout_seconds(
+                    xch_submitted=True, cat_submitted=False
+                )
+            )
+            observation = self._wait_for_coin_prep_post_effect(
+                prepared_operation,
+                timeout_s=post_effect_verify_timeout,
+                poll_interval_s=5,
+            )
+        if type(observation) is not dict:
+            if post_effect_verify_timeout is not None:
+                raise CoinPrepAuthorityUnresolved(
+                    f"submitted {prep_operation_kind} remained unresolved after "
+                    f"{post_effect_verify_timeout}s; "
+                    "coin prep stopped without replay"
+                )
+            return CoinPrepSubmittedUnknown(
+                operation_id=prepared_operation["operation_id"],
+                dispatch_outcome=dispatch_outcome,
+            )
+        if not self._verify_authoritative_post_operation_view(
+            operation_id=prepared_operation["operation_id"],
+            source_coin_ids=json.loads(prepared_operation["source_coin_ids_json"]),
+            expected_outputs=observation.get("expected_outputs"),
+            authoritative_view=observation.get("authoritative_view"),
+            expected_wallet_identity=json.loads(
+                prepared_operation["wallet_identity_json"]
+            ),
+            effect_claim_token=prepared_operation["effect_claim_token"],
+            effect_claim_generation=prepared_operation["effect_claim_generation"],
+            dispatch_outcome=dispatch_outcome,
+        ):
+            return CoinPrepSubmittedUnknown(
+                operation_id=prepared_operation["operation_id"],
+                dispatch_outcome=dispatch_outcome,
+            )
+        if self._sage_submit_succeeded(result):
+            return result
+        return CoinPrepAuthoritativelyConfirmed(
+            operation_id=prepared_operation["operation_id"],
+            dispatch_outcome=dispatch_outcome,
+        )
+
+    def _require_cli_mutation(self, operation: str) -> None:
+        raise mutation_gate.MutationBlocked("WALLET_BACKEND_UNSUPPORTED", operation)
+
     def _format_cat_amount(self, amount) -> str:
         return format_cat_display_amount(amount, self.cat_decimals)
 
@@ -744,10 +1277,15 @@ class CoinPrepWorker:
     def _tx_fee_mojos(self) -> int:
         return get_effective_transaction_fee_mojos()
 
-    def _split_tx_fee_mojos(self) -> int:
-        """Split RPC currently cannot pin a dedicated fee coin safely in Sage."""
+    def _split_tx_fee_mojos(self, *, is_cat: bool = False) -> int:
+        """Return the configured split fee when the source can pay it safely.
+
+        An XCH pool coin pays its own split fee, matching the runtime coin
+        manager. A Sage CAT split needs a separately pinned XCH fee input, so
+        CAT callers continue to use the dedicated fee-input path instead.
+        """
         fee_mojos = self._tx_fee_mojos()
-        if self.is_sage and fee_mojos > 0:
+        if self.is_sage and is_cat and fee_mojos > 0:
             return 0
         return fee_mojos
 
@@ -787,9 +1325,11 @@ class CoinPrepWorker:
     @staticmethod
     def _sage_submit_succeeded(result) -> bool:
         """Treat Sage RPC submission as successful only for non-error responses."""
+        if type(result) is CoinPrepSubmittedUnknown:
+            return True
         if result is None:
             return False
-        if isinstance(result, dict):
+        if isinstance(result, Mapping):
             if result.get("error"):
                 return False
             if result.get("success") is False:
@@ -806,7 +1346,7 @@ class CoinPrepWorker:
             return []
 
         tx_ids = []
-        if isinstance(result, dict):
+        if isinstance(result, Mapping):
             raw_ids = result.get("transaction_ids")
             if isinstance(raw_ids, list):
                 tx_ids.extend(raw_ids)
@@ -814,7 +1354,7 @@ class CoinPrepWorker:
             if single:
                 tx_ids.append(single)
             nested = result.get("transaction") or result.get("tx")
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 nested_single = nested.get("transaction_id")
                 if nested_single:
                     tx_ids.append(nested_single)
@@ -854,6 +1394,9 @@ class CoinPrepWorker:
         confirmed_count = 0
         best_height = 0
         any_known = False
+        requested_ids = {
+            str(tx_id).lower().removeprefix("0x") for tx_id in tx_ids if tx_id
+        }
         for tx_id in tx_ids:
             try:
                 tx_info = get_transaction(tx_id)
@@ -867,6 +1410,25 @@ class CoinPrepWorker:
             if confirmed or height > 0:
                 confirmed_count += 1
                 best_height = max(best_height, height)
+
+        # Sage 0.12.x can return HTTP 422 for the optional get_transaction
+        # endpoint even while get_pending_transactions authoritatively lists
+        # the same transaction. Treat an exact pending-list match as known and
+        # unconfirmed so the split poller can grant its bounded grace window.
+        if not any_known:
+            try:
+                pending_transactions = get_pending_transactions()
+            except Exception:
+                pending_transactions = None
+            if isinstance(pending_transactions, list):
+                pending_ids = {
+                    str(record.get("transaction_id") or record.get("id") or "")
+                    .lower()
+                    .removeprefix("0x")
+                    for record in pending_transactions
+                    if isinstance(record, dict)
+                }
+                any_known = bool(requested_ids & pending_ids)
 
         total = len(tx_ids)
         confirmed = confirmed_count > 0 if total == 1 else confirmed_count == total
@@ -888,6 +1450,127 @@ class CoinPrepWorker:
         if not coin_id:
             return coin_id
         return coin_id if coin_id.startswith("0x") else "0x" + coin_id
+
+    @staticmethod
+    def _canonical_coin_id(coin_id: str) -> str:
+        if type(coin_id) is not str:
+            raise TypeError("coin id must be an exact string")
+        normalized = coin_id[2:] if coin_id.startswith("0x") else coin_id
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in normalized
+        ):
+            raise ValueError("coin id is not canonical")
+        return normalized.lower()
+
+    @staticmethod
+    def _purpose_for_tier(tier_name: str | None) -> str:
+        return "fee_reserve" if tier_name == "fees" else "replacement"
+
+    def _build_coin_prep_contract(
+        self,
+        *,
+        wallet_id: int,
+        operation_kind: str,
+        purpose: str,
+        output_amounts_and_purposes: list[tuple[int, str]],
+    ) -> dict | None:
+        """Capture the exact pre-view and target contract before a mutation."""
+
+        try:
+            wallet_type = "xch" if wallet_id == self.xch_wallet_id else "cat"
+            observed = self._get_owned_coins_via_rpc(
+                wallet_id, "coin-prep-authoritative-pre-view"
+            )
+            if type(observed) is not list:
+                return None
+            pre_view_coin_ids = []
+            for coin in observed:
+                coin_id = self._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
+                if not coin_id or coin_id in pre_view_coin_ids:
+                    return None
+                pre_view_coin_ids.append(coin_id)
+            outputs = [
+                {
+                    "output_index": index,
+                    "amount_mojos": amount,
+                    "purpose": output_purpose,
+                }
+                for index, (amount, output_purpose) in enumerate(
+                    output_amounts_and_purposes
+                )
+                if type(amount) is int and amount > 0
+            ]
+            if len(outputs) != len(output_amounts_and_purposes) or not outputs:
+                return None
+            return {
+                "operation_kind": operation_kind,
+                "purpose": purpose,
+                "target_contract": {
+                    "wallet_type": wallet_type,
+                    "outputs": outputs,
+                },
+                "pre_view_coin_ids": sorted(pre_view_coin_ids),
+            }
+        except Exception:
+            return None
+
+    def _build_split_prep_contract(
+        self,
+        *,
+        wallet_id: int,
+        purpose: str,
+        source_amount_mojos: int,
+        count: int,
+        amount_per_coin: int,
+        fee_mojos: int = 0,
+        sage_native_even_split: bool = False,
+    ) -> dict | None:
+        """Build every exact output for an explicit or Sage-native split."""
+
+        if (
+            type(source_amount_mojos) is not int
+            or source_amount_mojos <= 0
+            or type(count) is not int
+            or count <= 0
+            or type(amount_per_coin) is not int
+            or amount_per_coin <= 0
+            or type(fee_mojos) is not int
+            or fee_mojos < 0
+        ):
+            return None
+        spendable = source_amount_mojos - fee_mojos
+        if sage_native_even_split:
+            if spendable < count:
+                return None
+            max_individual_amount = (spendable + count - 1) // count
+            remaining = spendable
+            outputs = []
+            for _index in range(count):
+                amount = min(max_individual_amount, remaining)
+                if amount <= 0:
+                    return None
+                outputs.append((amount, purpose))
+                remaining -= amount
+            if remaining != 0:
+                return None
+            return self._build_coin_prep_contract(
+                wallet_id=wallet_id,
+                operation_kind="split",
+                purpose=purpose,
+                output_amounts_and_purposes=outputs,
+            )
+        remainder = spendable - (count * amount_per_coin)
+        if remainder < 0:
+            return None
+        outputs = [(amount_per_coin, purpose)] * count
+        if remainder > 0:
+            outputs.append((remainder, "top_up"))
+        return self._build_coin_prep_contract(
+            wallet_id=wallet_id,
+            operation_kind="split",
+            purpose=purpose,
+            output_amounts_and_purposes=outputs,
+        )
 
     def _designate_coins_from_snapshot(
         self,
@@ -921,7 +1604,10 @@ class CoinPrepWorker:
             try:
                 upsert_coin(coin_id, wallet_type, amount)
                 set_coin_designation(
-                    coin_id, designation, assigned_tier=tier_name or "none"
+                    coin_id,
+                    designation,
+                    assigned_tier=tier_name or "none",
+                    purpose=self._purpose_for_tier(tier_name),
                 )
                 count += 1
             except Exception as e:
@@ -985,7 +1671,12 @@ class CoinPrepWorker:
                 # If amount matches tier size (exact) → tier_spare
                 # If amount doesn't match → it's the topup pool change coin
                 if expected_mojos > 0 and amount == expected_mojos:
-                    set_coin_designation(cid, "tier_spare", assigned_tier=tier_name)
+                    set_coin_designation(
+                        cid,
+                        "tier_spare",
+                        assigned_tier=tier_name,
+                        purpose=self._purpose_for_tier(tier_name),
+                    )
                     tier_count += 1
                 else:
                     # Likely the topup pool change coin — track the largest one
@@ -1003,7 +1694,12 @@ class CoinPrepWorker:
         # (internally stored as 'reserve' in the DB; displayed as 'topup pool' in logs)
         if reserve_coin:
             try:
-                designate_reserve(reserve_coin[0], wallet_type, reserve_coin[1])
+                designate_reserve(
+                    reserve_coin[0],
+                    wallet_type,
+                    reserve_coin[1],
+                    purpose="top_up",
+                )
                 _mark_coin_already_advised(reserve_coin[0])
                 self.log(
                     f"   DB: topup pool coin {wallet_type} → {reserve_coin[0][:16]}... "
@@ -1031,7 +1727,7 @@ class CoinPrepWorker:
             if coin_id:
                 try:
                     upsert_coin(coin_id, wallet_type, amount)
-                    designate_reserve(coin_id, wallet_type, amount)
+                    designate_reserve(coin_id, wallet_type, amount, purpose="top_up")
                     _mark_coin_already_advised(coin_id)
                     self.log(
                         f"   DB: post-consolidation {wallet_type} topup pool coin → "
@@ -1097,9 +1793,13 @@ class CoinPrepWorker:
             for tier_name, expected in specs:
                 plan_entries.append((int(plan_amount), tier_name, int(expected)))
 
-        # Tolerance: 1% of the plan amount, or a minimum of 10M mojos
-        # (0.00001 XCH) to cover typical single-tx fees on tiny fee coins.
-        # For XCH, also allow one full configured transaction-fee delta:
+        # CAT outputs are exact atom amounts, so only allow 1% relative
+        # tolerance.  The 10M-mojo floor is XCH-specific: applying it to a
+        # 3-decimal CAT means accepting coins up to 10,000 tokens away from
+        # their target size.
+        #
+        # For XCH, allow a minimum of 10M mojos plus one full configured
+        # transaction-fee delta:
         # Sage can spread the fee across the smallest fee-tier outputs, which
         # made two 0.00115 XCH fee coins land as 0.0011369209 XCH.
         fee_abs_tol = 0
@@ -1112,7 +1812,12 @@ class CoinPrepWorker:
         def _within_tolerance(coin_amount: int, plan_amount: int) -> bool:
             if plan_amount <= 0:
                 return False
-            abs_tol = max(int(plan_amount * 0.01), 10_000_000, fee_abs_tol)
+            relative_tol = max(1, int(plan_amount * 0.01))
+            abs_tol = (
+                max(relative_tol, 10_000_000, fee_abs_tol)
+                if wallet_type == "xch"
+                else relative_tol
+            )
             return abs(coin_amount - plan_amount) <= abs_tol
 
         # Sort coins by amount descending so biggest tiers get first pick
@@ -1348,7 +2053,8 @@ class CoinPrepWorker:
             return False
 
         try:
-            from wallet_sage import combine_coins, get_pending_transactions
+            from wallet import combine_coins
+            from wallet import get_pending_transactions
         except Exception as e:
             self.log(f"XCH fee cleanup unavailable: {e}")
             return False
@@ -1381,7 +2087,23 @@ class CoinPrepWorker:
         self.log(
             f"XCH fee cleanup: merging {len(extra_ids)} extra coin(s) ({extra_total:,} mojos) back into reserve"
         )
-        result = combine_coins([reserve_id] + extra_ids, fee_mojos=self._tx_fee_mojos())
+        source_coin_ids = [reserve_id] + extra_ids
+        fee_mojos = self._tx_fee_mojos()
+        combined_amount = int(reserve_coin.get("amount", 0)) + int(extra_total)
+        prep_contract = self._build_coin_prep_contract(
+            wallet_id=self.xch_wallet_id,
+            operation_kind="combine",
+            purpose="fee_reserve",
+            output_amounts_and_purposes=[(combined_amount - fee_mojos, "fee_reserve")],
+        )
+        result = self._call_wallet_mutation(
+            "coin_prep.combine_fee_reserve",
+            combine_coins,
+            source_coin_ids,
+            fee_mojos=fee_mojos,
+            _authority_fee_coin_ids=source_coin_ids if fee_mojos > 0 else None,
+            _prep_contract=prep_contract,
+        )
         if not self._sage_submit_succeeded(result):
             self.log("XCH fee cleanup combine was not accepted by Sage")
             return False
@@ -1501,16 +2223,10 @@ class CoinPrepWorker:
         self.log("\n   DB: Final designation sweep...")
 
         try:
-            from database import get_connection
+            from database import mark_unreserved_free_coins_gone_for_preparation
 
-            gc = get_connection()
-            gone_result = gc.execute(
-                "UPDATE coins SET status='gone' WHERE status='free'"
-            )
-            gc.commit()
-            self.log(
-                f"   DB: reset {gone_result.rowcount} coins to 'gone' before re-scan"
-            )
+            gone_count = mark_unreserved_free_coins_gone_for_preparation()
+            self.log(f"   DB: reset {gone_count} coins to 'gone' before re-scan")
         except Exception as ge:
             self.log(f"   DB: pre-sweep reset failed: {ge}")
 
@@ -1615,7 +2331,10 @@ class CoinPrepWorker:
                         continue
                     try:
                         result = set_coin_designation(
-                            coin_id, "tier_spare", assigned_tier=tier_name
+                            coin_id,
+                            "tier_spare",
+                            assigned_tier=tier_name,
+                            purpose=self._purpose_for_tier(tier_name),
                         )
                         if result:
                             desig_ok += 1
@@ -1635,7 +2354,10 @@ class CoinPrepWorker:
                 reserve_amount = reserve_candidate.get("amount", 0)
                 try:
                     result = designate_reserve(
-                        reserve_coin_id, wallet_type, reserve_amount
+                        reserve_coin_id,
+                        wallet_type,
+                        reserve_amount,
+                        purpose="top_up",
                     )
                     if result:
                         desig_ok += 1
@@ -1665,16 +2387,13 @@ class CoinPrepWorker:
             )
 
             try:
-                from database import get_connection
+                from database import get_free_coins
 
-                vconn = get_connection()
-                rows = vconn.execute(
-                    "SELECT designation, COUNT(*) as cnt FROM coins WHERE wallet_type=? AND status='free' GROUP BY designation",
-                    (wallet_type,),
-                ).fetchall()
-                verify_parts = [
-                    f"{dict(r)['designation']}={dict(r)['cnt']}" for r in rows
-                ]
+                counts = {}
+                for row in get_free_coins(wallet_type):
+                    designation = row.get("designation") or "unknown"
+                    counts[designation] = counts.get(designation, 0) + 1
+                verify_parts = [f"{key}={value}" for key, value in counts.items()]
                 self.log(f"   DB VERIFY {wallet_type}: {', '.join(verify_parts)}")
             except Exception as ve:
                 self.log(f"   DB VERIFY {wallet_type}: query failed: {ve}")
@@ -1688,16 +2407,15 @@ class CoinPrepWorker:
                 debug_path = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), "designation_debug.json"
                 )
-            from database import get_connection
+            from database import get_free_coins
 
-            dconn = get_connection()
             debug_data = {"timestamp": datetime.now().isoformat()}
             for wt in ["xch", "cat"]:
-                rows = dconn.execute(
-                    "SELECT designation, COUNT(*) as cnt FROM coins WHERE wallet_type=? AND status='free' GROUP BY designation",
-                    (wt,),
-                ).fetchall()
-                debug_data[wt] = {dict(r)["designation"]: dict(r)["cnt"] for r in rows}
+                counts = {}
+                for row in get_free_coins(wt):
+                    designation = row.get("designation") or "unknown"
+                    counts[designation] = counts.get(designation, 0) + 1
+                debug_data[wt] = counts
             with open(debug_path, "w") as f:
                 json.dump(debug_data, f, indent=2)
             self.log("   DB: debug summary written to designation_debug.json")
@@ -1883,10 +2601,10 @@ class CoinPrepWorker:
 
     def _get_fingerprint(self) -> str:
         """Get wallet fingerprint — tries RPC first (fast), then CLI (slow fallback)."""
-        # Sage: use get_current_key() from wallet_sage
+        # Sage: use the backend-neutral non-initializing key read.
         if self.is_sage:
             try:
-                from wallet_sage import get_current_key
+                from wallet import get_current_key
 
                 key = get_current_key()
                 if key and key.get("fingerprint"):
@@ -2033,7 +2751,7 @@ class CoinPrepWorker:
             if session is not None:
                 try:
                     session.post(
-                        "http://localhost:5000/api/log",
+                        _local_api_log_url(),
                         json=payload,
                         headers=_local_api_headers(),
                         timeout=_API_LOG_POST_TIMEOUT_S,
@@ -2233,10 +2951,8 @@ class CoinPrepWorker:
         """
         if self.is_sage:
             try:
-                from wallet_sage import (
-                    get_selectable_coins_only,
-                    get_spendable_coin_count,
-                )
+                from wallet import get_spendable_coin_count
+                from wallet_sage import get_selectable_coins_only
 
                 count = get_spendable_coin_count(wallet_id)
                 if count > 0:
@@ -2461,264 +3177,22 @@ class CoinPrepWorker:
             return []
 
     def cancel_all_offers(self):
-        """Cancel all open offers using Sage's bulk cancel RPC.
+        """Fail closed when coin prep discovers open offers.
 
-        Uses cancel_offers_batch() from wallet_sage.py which sends a single
-        cancel_offers RPC call with all offer IDs at once. Sage processes this
-        as one transaction — much faster than cancelling one-by-one.
-        Falls back to sequential cancel if bulk RPC fails.
-
-        Confirmation polling verifies all offers are actually gone before
-        returning. Coin prep needs the full wallet coin set unlocked; if any
-        offer remains open after retries, prep fails cleanly instead of
-        reshaping a partial wallet view.
+        The worker cannot mint OfferManager's durable per-offer cancellation
+        journal. The main process must journal and reconcile every cancellation
+        before coin reshaping can resume.
         """
-        try:
-            self.log(f"\n{'=' * 60}")
-            self.log("CANCELLING OPEN OFFERS (sequential -- wallet-safe)")
-            self.log(f"{'=' * 60}")
-
-            # Get all open offers
-            open_offers = self.get_all_open_offers_rpc()
-
-            if not open_offers:
-                self.log("No open offers found")
-                return True
-
-            initial_count = len(open_offers)
-            self.log(f"Found {initial_count} open offers")
-
-            trade_ids = [o["id"] for o in open_offers]
-
-            if not trade_ids:
-                self.log("  All offers are protected — skipping cancellation")
-                return True
-
-            cancel_count = len(trade_ids)
-
-            # Write IDs we're about to cancel to file, so bot can avoid false fill detection.
-            # Lives under the user data dir so it's writable alongside bot.db.
-            try:
-                try:
-                    from user_paths import worker_cancelled_ids_file
-
-                    worker_cancelled_file = worker_cancelled_ids_file()
-                except Exception:
-                    worker_cancelled_file = "worker_cancelled_ids.json"
-                with open(worker_cancelled_file, "w", encoding="utf-8") as f:
-                    json.dump({"cancelled_ids": trade_ids, "timestamp": time.time()}, f)
-            except Exception:
-                pass  # Non-critical
-
-            # Use Sage's bulk cancel RPC — one call to cancel ALL offers at once.
-            # cancel_offers_batch() in wallet_sage.py handles:
-            #   1. Bulk RPC call (cancel_offers with array of IDs)
-            #   2. Sequential fallback if bulk fails
-            #   3. Confirmation polling to verify offers are gone
-            # This replaces the old batch-of-5 approach (~7min for 80 offers)
-            # with a single RPC call + confirmation (~30-45s total).
-            self.log(f"\n⚡ Using bulk cancel RPC for {cancel_count} offers...")
-            self.update_status(
-                PrepPhase.CONSOLIDATING,
-                0.02,
-                f"Bulk cancelling {cancel_count} offers...",
-            )
-
-            results = cancel_offers_batch(trade_ids, secure=True)
-
-            # Count successes and failures from the batch result
-            pending_methods = {
-                "submitted_pending_confirm",
-                "already_in_mempool",
-                "mempool_conflict_inflight",
-                "already_gone_ambiguous",
-            }
-            cancelled = 0
-            failed_ids = []
-            pending_ids = []
-            for tid in trade_ids:
-                res = results.get(tid, {})
-                if res and res.get("success"):
-                    method = str(res.get("method") or "")
-                    if method in pending_methods:
-                        pending_ids.append(tid)
-                    else:
-                        cancelled += 1
-                else:
-                    failed_ids.append(tid)
-
-            self.log(
-                f"\nBulk cancel result: {cancelled} succeeded, {len(failed_ids)} failed"
-            )
-            if pending_ids:
-                self.log(
-                    f"{len(pending_ids)} cancels are still awaiting on-chain "
-                    "confirmation; aborting coin prep before reshaping coins"
-                )
-                return False
-
-            # RETRY failed cancels individually (transient errors)
-            permanently_failed = set()
-            if failed_ids:
-                max_retries = 3
-                for attempt in range(1, max_retries + 1):
-                    if not failed_ids:
-                        break
-                    wait_secs = 10 * attempt
-                    self.log(
-                        f"\nRetrying {len(failed_ids)} failed cancels (attempt {attempt}/{max_retries}, waiting {wait_secs}s)..."
-                    )
-                    time.sleep(wait_secs)
-
-                    still_failing = []
-                    for tid in failed_ids:
-                        try:
-                            res = rpc_cancel_offer(tid, secure=True, timeout=120)
-                            if res and res.get("success"):
-                                cancelled += 1
-                                self.log(f"   Retry OK: {tid[:16]}...")
-                            else:
-                                error = (res or {}).get("error", "Unknown")
-                                still_failing.append(tid)
-                                self.log(f"   Retry failed: {tid[:16]}... - {error}")
-                        except Exception as e:
-                            still_failing.append(tid)
-                            self.log(f"   Retry error: {tid[:16]}... - {e}")
-                        time.sleep(2)  # Brief pause between individual retries
-                    failed_ids = still_failing
-
-                # Any still failing after all retries are permanently failed
-                permanently_failed = set(failed_ids)
-                if permanently_failed:
-                    self.log(
-                        f"\n{len(permanently_failed)} offers could not be cancelled after {max_retries} retries -- skipping them"
-                    )
-
-            if cancelled == 0:
-                self.log("No offers were cancelled")
-                return False
-
-            # Build list of IDs we expect to be cancelled (exclude permanently failed)
-            expected_cancelled_ids = [
-                tid for tid in trade_ids if tid not in permanently_failed
-            ]
-
-            if not expected_cancelled_ids:
-                self.log("No offers to verify")
-                return True
-
-            # VERIFICATION LOOP — poll RPC until expected offers are gone.
-            #
-            # F62 (2026-04-09): aggressive straggler re-cancel.
-            #
-            # The old flow polled for 300s and then gave up — if any offers
-            # were still active on-chain, it just logged TIMEOUT and moved
-            # on, leaving their backing coins locked. On a busy Chia mempool
-            # this left 4-10 offers stuck per run.
-            #
-            # New flow: poll for a short window (60s), and if any stragglers
-            # remain, re-submit cancel RPCs for them and poll again. Loop up
-            # to 3 rounds, total ~3 minutes max. This both speeds up the
-            # common case (cancels typically confirm in 1-2 blocks) and
-            # dramatically reduces the straggler count in the pathological
-            # case (re-submission lands most in the next block).
-            pf_note = (
-                f", skipping {len(permanently_failed)} uncancellable"
-                if permanently_failed
-                else ""
-            )
-            self.log(
-                f"\nVERIFYING CANCELLATIONS... (checking {len(expected_cancelled_ids)} offers{pf_note})"
-            )
-
-            per_round_wait = 60  # 60s per round (covers ~1-3 blocks)
-            max_rounds = 3  # total max wait ~ 3 min (vs old 5 min)
-            check_interval = 5
-            round_num = 1
-            still_open: list = list(expected_cancelled_ids)
-
-            while round_num <= max_rounds and still_open:
-                round_start = time.time()
-                elapsed = 0
-                while elapsed < per_round_wait:
-                    current_offers = self.get_all_open_offers_rpc()
-                    current_ids = [o["id"] for o in current_offers]
-                    still_open = [
-                        tid for tid in expected_cancelled_ids if tid in current_ids
-                    ]
-                    if not still_open:
-                        total_elapsed = int(time.time() - round_start)
-                        self.log(
-                            f"   ALL OFFERS CANCELLED! (round {round_num}, {total_elapsed}s)"
-                        )
-                        if permanently_failed:
-                            self.log(
-                                f"   Note: {len(permanently_failed)} uncancellable offers remain open"
-                            )
-                        return True
-                    remaining = len(still_open)
-                    cancelled_so_far = len(expected_cancelled_ids) - remaining
-                    self.log(
-                        f"   Round {round_num}/{max_rounds}: {cancelled_so_far}/{len(expected_cancelled_ids)} cancelled, {remaining} remaining ({elapsed}s)"
-                    )
-                    time.sleep(check_interval)
-                    elapsed += check_interval
-
-                # Round timed out with stragglers remaining — re-submit cancels
-                if still_open and round_num < max_rounds:
-                    self.log(
-                        f"\nRound {round_num} timed out with {len(still_open)} stragglers — re-submitting cancels..."
-                    )
-                    try:
-                        re_results = cancel_offers_batch(still_open, secure=True)
-                        re_ok = sum(
-                            1
-                            for tid in still_open
-                            if (re_results.get(tid, {}) or {}).get("success")
-                        )
-                        self.log(
-                            f"   Re-submit result: {re_ok}/{len(still_open)} accepted"
-                        )
-                    except Exception as _re_err:
-                        self.log(f"   Re-submit failed: {_re_err}")
-                        # Fall back to individual re-cancels
-                        try:
-                            _ok = 0
-                            for _tid in still_open:
-                                try:
-                                    _r = rpc_cancel_offer(_tid, secure=True, timeout=60)
-                                    if _r and _r.get("success"):
-                                        _ok += 1
-                                except Exception:
-                                    pass
-                                time.sleep(0.3)
-                            self.log(
-                                f"   Individual re-submit: {_ok}/{len(still_open)} accepted"
-                            )
-                        except Exception:
-                            pass
-                round_num += 1
-
-            # All rounds exhausted — log final state and proceed
-            if still_open:
-                self.log(
-                    f"\nTIMEOUT: {len(still_open)} offers still open after {max_rounds} rounds"
-                )
-                self.log(
-                    "Aborting coin prep — all offers must cancel before reshaping coins"
-                )
-                return False
-            else:
-                self.log("\nAll cancellable offers confirmed!")
-
+        open_offers = self.get_all_open_offers_rpc()
+        if not open_offers:
+            self.log("No open offers found")
             return True
 
-        except Exception as e:
-            self.log(f"Cancellation error: {e}")
-            import traceback
-
-            self.log(f"   {traceback.format_exc()}")
-            return False
+        self.log(
+            "Open offers require the main durable cancellation coordinator; "
+            "aborting coin prep without issuing a wallet effect"
+        )
+        return False
 
     def consolidate_wallet(self, wallet_id: int, name: str) -> bool:
         """Consolidate all coins in wallet to single coin"""
@@ -2779,6 +3253,7 @@ class CoinPrepWorker:
         self.log("Submitting consolidation transaction...")
 
         try:
+            self._require_cli_mutation("coin_prep.cli_consolidate")
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -2843,6 +3318,39 @@ class CoinPrepWorker:
         return 1
 
     @staticmethod
+    def _side_needs_consolidation(
+        prepared_ok: bool, coin_count: int, success_max: int
+    ) -> bool:
+        """Only reshape a side whose current tier plan is incomplete."""
+        return not prepared_ok and (coin_count > success_max or coin_count == 0)
+
+    @staticmethod
+    def _side_consolidation_ready(
+        prepared_ok: bool, coin_count: int, success_max: int
+    ) -> bool:
+        """A prepared side remains ready without destroying its tier coins."""
+        return prepared_ok or 1 <= coin_count <= success_max
+
+    @staticmethod
+    def _consolidation_verify_timeout_seconds(
+        *, xch_submitted: bool, cat_submitted: bool
+    ) -> int:
+        """Allow a bounded slow-block window after a real submission."""
+
+        return 900 if xch_submitted or cat_submitted else 300
+
+    @staticmethod
+    def _submitted_split_verify_timeout_seconds() -> int:
+        """Allow the same bounded slow-block window after a submitted split."""
+
+        return 900
+
+    @staticmethod
+    def _tier_count_for_reprep(prepared_ok: bool, configured_count: int) -> int:
+        """Suppress pool creation for a side already matching the live plan."""
+        return 0 if prepared_ok else int(configured_count or 0)
+
+    @staticmethod
     def _chunk_sequence(items: list, chunk_size: int) -> list[list]:
         chunk_size = max(1, int(chunk_size or 1))
         return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
@@ -2850,80 +3358,20 @@ class CoinPrepWorker:
     def _consolidate_wallet_sage(self, wallet_id: int, name: str) -> bool:
         """Consolidate coins via Sage's native endpoints.
 
-        Strategy (in order of preference):
-        1. send-to-self — wallet-visible full-balance consolidation
-        2. /combine — manual combine with explicit coin IDs (fallback)
-
-        Sage's auto-combine and generic /combine endpoints can return
-        success without producing a durable wallet-visible reset for large
-        already-prepared coin sets. Coin prep needs a fresh start every run,
-        so the primary Sage path is the same operation an operator would
-        perform manually: send the wallet balance back to our own address.
+        Sage's send-to-self request cannot bind its source cohort, so durable
+        coin authority intentionally denies it.  Use the exact-source
+        ``/combine`` contract for small and large wallets alike.
         """
-        max_self_send_attempts = 3
-
-        for attempt in range(1, max_self_send_attempts + 1):
-            coin_count = self.get_coin_count(wallet_id)
-            if attempt == 1:
-                self.log(f"Current {name} coins: {coin_count}")
-            else:
-                self.log(
-                    f"Follow-up {name} consolidation pass {attempt}/"
-                    f"{max_self_send_attempts}: {coin_count} coins visible"
-                )
-
-            if coin_count <= 1:
-                self.log(f"✅ {name} already consolidated ({coin_count} coin)")
-                return True
-
-            large_threshold = 40 if wallet_id == self.xch_wallet_id else 20
-            large_consolidation = coin_count > large_threshold
-
-            self._sage_consolidation_submitted = False
-            self._sage_consolidation_settling = False
-            self._sage_consolidation_resync_start_count = None
-            self._sage_consolidation_resync_last_count = None
-            if self._consolidate_wallet_sage_fallback(wallet_id, name):
-                return True
-
-            if getattr(self, "_sage_consolidation_submitted", False):
-                if getattr(self, "_sage_consolidation_settling", False):
-                    self.log(
-                        f"{name} send-to-self was submitted, but Sage wallet is still "
-                        "settling after recent activity. Wait a minute, then rerun "
-                        "Coin Prep instead of forcing another combine immediately."
-                    )
-                    return False
-
-                current_count = self.get_coin_count(wallet_id)
-                if 1 < current_count < coin_count and attempt < max_self_send_attempts:
-                    self.log(
-                        f"{name} consolidation made progress "
-                        f"({coin_count} -> {current_count} coins) but did not "
-                        "reach one coin; continuing with a follow-up pass in "
-                        "this coin-prep run."
-                    )
-                    time.sleep(5)
-                    continue
-
-                self.log(
-                    f"{name} send-to-self was submitted but never verified as one coin; "
-                    "not retrying with another consolidation method"
-                )
-                return False
-
-            if large_consolidation:
-                self.log(
-                    f"Large {name} consolidation failed; not retrying as one giant /combine"
-                )
-                return False
-
-            self.log(
-                "⚠️ Send-to-self consolidation failed — trying /combine endpoint..."
-            )
-            return self._consolidate_wallet_sage_combine(wallet_id, name)
-
-        return False
+        coin_count = self.get_coin_count(wallet_id)
+        self.log(f"Current {name} coins: {coin_count}")
+        if coin_count <= 1:
+            self.log(f"✅ {name} already consolidated ({coin_count} coin)")
+            return True
+        self.log(
+            f"Using exact-source /combine for {name}; auto-selected "
+            "send-to-self is disabled"
+        )
+        return self._consolidate_wallet_sage_combine(wallet_id, name)
 
     def _consolidate_wallet_sage_combine(self, wallet_id: int, name: str) -> bool:
         """Consolidate via Sage's /combine endpoint with explicit coin IDs.
@@ -2931,88 +3379,184 @@ class CoinPrepWorker:
         Source: sage-api struct Combine { coin_ids, fee, auto_submit }
         The /combine endpoint is generic — works for both XCH and CAT coins.
         """
+        submitted_any = False
         try:
-            from wallet_sage import combine_coins, get_spendable_coins_rpc
+            from wallet import combine_coins, get_spendable_coins_rpc
 
-            # Get all spendable coins to extract their IDs
-            coins_result = get_spendable_coins_rpc(wallet_id)
-            if not coins_result or not coins_result.get("success"):
+            def _spendable_inputs() -> list[tuple[str, int]] | None:
+                coins_result = get_spendable_coins_rpc(wallet_id)
+                if not coins_result or not coins_result.get("success"):
+                    return None
+
+                records = coins_result.get("confirmed_records", [])
+                inputs: list[tuple[str, int]] = []
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    if int(record.get("spent_block_index", 0) or 0) != 0:
+                        continue
+                    coin = (
+                        record.get("coin")
+                        if isinstance(record.get("coin"), dict)
+                        else {}
+                    )
+                    coin_id = record.get("coin_id") or coin.get("coin_id") or ""
+                    amount = record.get("amount")
+                    if amount is None:
+                        amount = coin.get("amount")
+                    if not coin_id or type(amount) is not int or amount <= 0:
+                        self.log(
+                            "❌ /combine coin identity or amount is not authoritative"
+                        )
+                        return None
+                    inputs.append((str(coin_id), amount))
+                return inputs
+
+            def _submit_combine(
+                inputs: list[tuple[str, int]], operation_name: str
+            ) -> bool:
+                nonlocal submitted_any
+                coin_ids = [coin_id for coin_id, _amount in inputs]
+                # Sage's CAT /combine endpoint does not expose a way to bind the
+                # XCH coin that would pay its fee.  Keep CAT consolidation
+                # fee-free so the mutation gate never permits implicit fee-coin
+                # selection outside the authoritative source cohort.
+                combine_fee = (
+                    self._priority_combine_fee_mojos(len(inputs))
+                    if wallet_id == self.xch_wallet_id
+                    else 0
+                )
+                output_amount = sum(amount for _coin_id, amount in inputs)
+                if wallet_id == self.xch_wallet_id:
+                    output_amount -= combine_fee
+                if output_amount <= 0:
+                    self.log(f"ERROR: {name} /combine output would not be positive")
+                    return False
+
+                result = self._call_wallet_mutation(
+                    operation_name,
+                    combine_coins,
+                    coin_ids=coin_ids,
+                    fee_mojos=combine_fee,
+                    _authority_fee_coin_ids=(
+                        coin_ids
+                        if combine_fee > 0 and wallet_id == self.xch_wallet_id
+                        else None
+                    ),
+                    _prep_contract=self._build_coin_prep_contract(
+                        wallet_id=wallet_id,
+                        operation_kind="combine",
+                        purpose="top_up",
+                        output_amounts_and_purposes=[(output_amount, "top_up")],
+                    ),
+                )
+                if not self._sage_submit_succeeded(result):
+                    self.log(f"ERROR: Sage {name} /combine was not accepted")
+                    return False
+                submitted_any = True
+                self._sage_consolidation_submitted = True
+                return True
+
+            target_inputs = _spendable_inputs()
+            if target_inputs is None:
                 self.log(
-                    "❌ Could not get coins for /combine — falling back to send-to-self"
+                    "❌ Could not get authoritative coins for /combine — "
+                    "falling back to send-to-self"
                 )
                 return self._consolidate_wallet_sage_fallback(wallet_id, name)
-
-            records = coins_result.get("confirmed_records", [])
-            # Filter unspent
-            unspent = [r for r in records if r.get("spent_block_index", 0) == 0]
-
-            if len(unspent) == 0:
+            if not target_inputs:
                 self.log(
                     f"{name} has 0 spendable coins for /combine; not treating as consolidated"
                 )
                 return False
-
-            if len(unspent) == 1:
-                self.log(f"✅ {name} already consolidated ({len(unspent)} coin)")
+            if len(target_inputs) == 1:
+                self.log(f"✅ {name} already consolidated (1 coin)")
                 return True
 
-            # Extract all coin IDs, then submit them in block-cost-safe batches.
-            coin_ids = []
-            for r in unspent:
-                cid = r.get("coin_id", "")
-                if not cid and r.get("coin"):
-                    # Fallback: some formats have coin_id at top level
-                    cid = r["coin"].get("coin_id", "")
-                if cid:
-                    coin_ids.append(cid)
-
-            if len(coin_ids) < 2:
-                self.log("❌ Not enough coin IDs found for /combine")
-                return self._consolidate_wallet_sage_fallback(wallet_id, name)
-
+            initial_count = len(target_inputs)
             max_inputs = self._sage_consolidation_max_inputs_per_tx()
-            batches = self._chunk_sequence(coin_ids, max_inputs)
-            if len(batches) > 1:
+            if initial_count > max_inputs:
                 self.log(
-                    f"Combining {len(coin_ids)} {name} coins via /combine "
-                    f"in {len(batches)} batches (max {max_inputs} inputs each)..."
+                    f"Combining {initial_count} {name} coins via staged /combine "
+                    f"transactions (max {max_inputs} inputs each)..."
                 )
-                for index, batch in enumerate(batches, start=1):
-                    combine_fee = self._priority_combine_fee_mojos(len(batch))
-                    self.log(
-                        f"Combining {name} batch {index}/{len(batches)} "
-                        f"({len(batch)} coins, fee={combine_fee:,} mojos)..."
-                    )
-                    result = combine_coins(coin_ids=batch, fee_mojos=combine_fee)
-                    if not self._sage_submit_succeeded(result):
-                        self.log(
-                            "ERROR: /combine batch was not accepted; falling back to send-to-self"
-                        )
-                        return self._consolidate_wallet_sage_fallback(wallet_id, name)
+
+            while len(target_inputs) > max_inputs:
+                before_count = len(target_inputs)
+                batch_size = max_inputs
+                if before_count - batch_size == 1:
+                    batch_size -= 1
+                batch = target_inputs[:batch_size]
+                combine_fee = (
+                    self._priority_combine_fee_mojos(len(batch))
+                    if wallet_id == self.xch_wallet_id
+                    else 0
+                )
+                target_count = before_count - len(batch) + 1
                 self.log(
-                    f"OK: {name} /combine submitted in {len(batches)} safe batches "
-                    f"(was {len(coin_ids)} coins)"
+                    f"Combining staged {name} batch ({len(batch)} coins, "
+                    f"fee={combine_fee:,} mojos); waiting for wallet to reach "
+                    f"<= {target_count} coins before the next batch..."
+                )
+                if not _submit_combine(batch, "coin_prep.combine_batch"):
+                    return False
+                if not self._wait_for_sage_coin_count_at_most(
+                    wallet_id, name, before_count, target_count
+                ):
+                    return False
+
+                refreshed_inputs = _spendable_inputs()
+                if not refreshed_inputs:
+                    self.log(
+                        f"ERROR: {name} spendable inputs unavailable after staged "
+                        "/combine; not dispatching another transaction"
+                    )
+                    return False
+                if len(refreshed_inputs) >= before_count:
+                    self.log(
+                        f"ERROR: {name} staged /combine made no authoritative progress "
+                        f"({before_count} -> {len(refreshed_inputs)} coins)"
+                    )
+                    return False
+                target_inputs = refreshed_inputs
+
+            if len(target_inputs) == 1:
+                self.log(
+                    f"OK: {name} staged /combine already reached one spendable coin"
                 )
                 return True
 
-            # F61: scaled priority fee for large combines (same as the
-            # auto-combine path above) so the /combine fallback also
-            # benefits from faster block inclusion.
-            combine_fee = self._priority_combine_fee_mojos(len(coin_ids))
+            combine_fee = (
+                self._priority_combine_fee_mojos(len(target_inputs))
+                if wallet_id == self.xch_wallet_id
+                else 0
+            )
             self.log(
-                f"Combining {len(coin_ids)} {name} coins via /combine "
+                f"Combining final {len(target_inputs)} {name} coins via /combine "
                 f"(fee={combine_fee:,} mojos)..."
             )
-            result = combine_coins(coin_ids=coin_ids, fee_mojos=combine_fee)
+            if not _submit_combine(target_inputs, "coin_prep.combine"):
+                return False
+            self.log(
+                f"✅ {name} staged /combine sequence submitted "
+                f"(started with {initial_count} coins)"
+            )
+            return True
 
-            if self._sage_submit_succeeded(result):
-                self.log(f"✅ {name} /combine submitted (was {len(coin_ids)} coins)")
-                return True
-            else:
-                self.log("❌ /combine returned None — falling back to send-to-self")
-                return self._consolidate_wallet_sage_fallback(wallet_id, name)
-
+        except CoinPrepAuthorityUnresolved as e:
+            self._sage_consolidation_submitted = True
+            self.log(
+                f"ERROR: /combine was submitted but remained unresolved: {e}; "
+                "not dispatching a competing fallback"
+            )
+            return False
         except Exception as e:
+            if submitted_any:
+                self.log(
+                    f"ERROR: /combine failed after a transaction was submitted: {e}; "
+                    "not dispatching a competing fallback"
+                )
+                return False
             self.log(f"⚠️ /combine error: {e} — falling back to send-to-self")
             return self._consolidate_wallet_sage_fallback(wallet_id, name)
 
@@ -3145,7 +3689,13 @@ class CoinPrepWorker:
                 f"Consolidating {name}: {observed_count} coins",
             )
 
-            if 0 < observed_count <= target_count:
+            # A submitted batch temporarily hides its locked inputs before the
+            # replacement output is confirmed.  That transient view is one
+            # coin *below* target (68 - 50 == 18 in the live TEST7 case), so
+            # accepting "at most" would let the next batch race ahead and
+            # leave two independent consolidation outputs.  The exact target
+            # count proves that the replacement coin is visible.
+            if observed_count == target_count:
                 self.log(
                     f"OK: {name} batched consolidation stage confirmed: "
                     f"{before_count} -> {observed_count} coins"
@@ -3220,7 +3770,8 @@ class CoinPrepWorker:
             else max(1, int(target_count))
         )
         try:
-            from wallet_sage import get_current_key, sage_login
+            from wallet import sage_login, wallet_mutation_succeeded
+            from wallet import get_current_key
 
             key = get_current_key() or {}
             fingerprint = key.get("fingerprint")
@@ -3233,7 +3784,13 @@ class CoinPrepWorker:
             self.log(
                 f"Forcing Sage resync for {name} after stale consolidation view..."
             )
-            if not sage_login(int(fingerprint), force_resync=True):
+            login_result = self._call_wallet_mutation(
+                "coin_prep.sage_resync",
+                sage_login,
+                int(fingerprint),
+                force_resync=True,
+            )
+            if not wallet_mutation_succeeded(login_result):
                 self.log(f"Sage resync failed for {name}")
                 return False
 
@@ -3275,7 +3832,7 @@ class CoinPrepWorker:
         Used if Sage's auto_combine fails (e.g. older Sage version).
         """
         try:
-            from wallet_sage import (
+            from wallet import (
                 get_next_address,
                 get_spendable_coins_rpc,
                 send_transaction,
@@ -3391,7 +3948,9 @@ class CoinPrepWorker:
                         f"fee={fee_mojos:,}); waiting for wallet to reach <= "
                         f"{target_count} coins before the next batch..."
                     )
-                    result = send_transaction(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.consolidate_staged_batch",
+                        send_transaction,
                         wallet_id=wallet_id,
                         amount_mojos=int(send_amount),
                         address=address,
@@ -3444,7 +4003,9 @@ class CoinPrepWorker:
                     f"({before_count} input coins, amount={send_amount:,} mojos, "
                     f"fee={fee_mojos:,})..."
                 )
-                result = send_transaction(
+                result = self._call_wallet_mutation(
+                    "coin_prep.consolidate_final_batch",
+                    send_transaction,
                     wallet_id=wallet_id,
                     amount_mojos=int(send_amount),
                     address=address,
@@ -3478,7 +4039,9 @@ class CoinPrepWorker:
                 f"({before_count} input coins, amount={send_amount:,} mojos, "
                 f"fee={fee_mojos:,})..."
             )
-            result = send_transaction(
+            result = self._call_wallet_mutation(
+                "coin_prep.consolidate_balance",
+                send_transaction,
                 wallet_id=wallet_id,
                 amount_mojos=int(send_amount),
                 address=address,
@@ -3549,6 +4112,7 @@ class CoinPrepWorker:
         self.log("Submitting pool creation transaction...")
 
         try:
+            self._require_cli_mutation("coin_prep.cli_create_pool")
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -3577,7 +4141,7 @@ class CoinPrepWorker:
     ) -> bool:
         """Create trading pool via Sage RPC — send exact amount to self."""
         try:
-            from wallet_sage import get_next_address, send_transaction
+            from wallet import get_next_address, send_transaction
 
             # Get receive address
             addr_result = get_next_address(wallet_id, new_address=False)
@@ -3596,8 +4160,13 @@ class CoinPrepWorker:
             self.log(
                 f"Submitting pool creation transaction ({amount} {name} = {mojos} mojos)..."
             )
-            result = send_transaction(
-                wallet_id, mojos, address, fee_mojos=self._tx_fee_mojos()
+            result = self._call_wallet_mutation(
+                "coin_prep.create_pool",
+                send_transaction,
+                wallet_id,
+                mojos,
+                address,
+                fee_mojos=self._tx_fee_mojos(),
             )
 
             if self._sage_submit_succeeded(result):
@@ -3721,11 +4290,10 @@ class CoinPrepWorker:
         NO DB DESIGNATION: The bot identifies tiers by coin size at runtime.
         Inner=1.6 XCH, mid=0.8, outer=0.4, extreme=0.16 — sizes are unique per tier.
         """
-        from wallet_sage import (
+        from wallet import (
             get_next_address,
+            create_transaction_rpc,
             send_transaction,
-            send_transaction_multi,
-            send_cat_multi,
             split_coins_rpc,
             sage_topup_split,
             get_pending_transactions,
@@ -3757,9 +4325,21 @@ class CoinPrepWorker:
         tier_info = []  # legacy combined view (only used for the empty-check below)
         xch_tier_info = []
         cat_tier_info = []
+        xch_plan_already_satisfied = bool(
+            getattr(self, "_xch_plan_already_satisfied", False)
+        )
+        cat_plan_already_satisfied = bool(
+            getattr(self, "_cat_plan_already_satisfied", False)
+        )
         for tier_name in tier_order:
-            xch_count = int(self.xch_tier_counts.get(tier_name, 0) or 0)
-            cat_count = int(self.cat_tier_counts.get(tier_name, 0) or 0)
+            xch_count = self._tier_count_for_reprep(
+                xch_plan_already_satisfied,
+                self.xch_tier_counts.get(tier_name, 0),
+            )
+            cat_count = self._tier_count_for_reprep(
+                cat_plan_already_satisfied,
+                self.cat_tier_counts.get(tier_name, 0),
+            )
             xch_size = self.tier_xch_sizes.get(tier_name, Decimal("0"))
             cat_size = self.tier_cat_sizes.get(tier_name, Decimal("0"))
             if xch_count <= 0 and cat_count <= 0:
@@ -3913,7 +4493,8 @@ class CoinPrepWorker:
                 pending = get_pending_transactions()
                 if len(pending) == 0:
                     self.log(
-                        f"      ✅ {label} confirmed on-chain ({(poll + 1) * poll_interval}s)"
+                        f"      ✅ Sage pending queue clear for {label} "
+                        f"({(poll + 1) * poll_interval}s)"
                     )
                     return True
                 if (poll + 1) % 6 == 0:
@@ -3971,7 +4552,9 @@ class CoinPrepWorker:
             send_ok = False
             for attempt in range(3):
                 try:
-                    result = send_transaction(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.create_tier_pool",
+                        send_transaction,
                         wallet_id=wallet_id,
                         amount_mojos=pool_mojos,
                         address=address,
@@ -4098,15 +4681,37 @@ class CoinPrepWorker:
             )
 
             split_ok = False
+            split_fee_mojos = self._split_tx_fee_mojos(is_cat=is_cat)
+            source_amount_mojos = pool_coin.get("amount")
+            source_fee_mojos = 0 if is_cat else split_fee_mojos
+            prep_contract = (
+                self._build_split_prep_contract(
+                    wallet_id=wallet_id,
+                    purpose=self._purpose_for_tier(tier_name),
+                    source_amount_mojos=source_amount_mojos,
+                    count=count,
+                    amount_per_coin=(source_amount_mojos - source_fee_mojos) // count,
+                    fee_mojos=source_fee_mojos,
+                    sage_native_even_split=True,
+                )
+                if type(source_amount_mojos) is int and count > 0
+                else None
+            )
             for attempt in range(3):
                 try:
-                    result = split_coins_rpc(
+                    result = self._call_wallet_mutation(
+                        "coin_prep.split_tier_pool",
+                        split_coins_rpc,
                         wallet_id=wallet_id,
                         target_coin_id=coin_id,
                         num_coins=count,
                         amount_per_coin=0,  # Sage splits equally
-                        fee_mojos=self._split_tx_fee_mojos(),
+                        fee_mojos=split_fee_mojos,
                         is_cat=is_cat,
+                        _authority_fee_coin_ids=(
+                            [coin_id] if split_fee_mojos > 0 and not is_cat else None
+                        ),
+                        _prep_contract=prep_contract,
                     )
                     if result is None:
                         self.log(
@@ -4225,7 +4830,10 @@ class CoinPrepWorker:
                                     try:
                                         upsert_coin(cid, wallet_type, coin_size_mojos)
                                         set_coin_designation(
-                                            cid, "tier_spare", assigned_tier=tier_name
+                                            cid,
+                                            "tier_spare",
+                                            assigned_tier=tier_name,
+                                            purpose=self._purpose_for_tier(tier_name),
                                         )
                                         db_recorded += 1
                                     except Exception as dbe:
@@ -4375,12 +4983,187 @@ class CoinPrepWorker:
             for attempt in range(3):
                 try:
                     if is_cat:
-                        result = send_cat_multi(
-                            payments, fee_mojos=self._tx_fee_mojos()
+                        asset_id = str(os.getenv("CAT_ASSET_ID", "")).strip()
+                        if not asset_id:
+                            self.log(
+                                "      Exact-source CAT pool creation has no asset id"
+                            )
+                            return None
+                        candidates = sorted(
+                            self._get_coins_via_rpc(
+                                wallet_id,
+                                "cat-tier-pool-exact-source",
+                                selectable_only=True,
+                            )
+                            or [],
+                            key=lambda coin: int(coin.get("amount", 0) or 0),
+                            reverse=True,
+                        )
+                        selected_coin_ids = []
+                        selected_total = 0
+                        for coin in candidates:
+                            coin_id = str(coin.get("coin_id") or "").replace("0x", "")
+                            amount = int(coin.get("amount", 0) or 0)
+                            if len(coin_id) != 64 or amount <= 0:
+                                continue
+                            selected_coin_ids.append(coin_id)
+                            selected_total += amount
+                            if selected_total >= total_mojos:
+                                break
+                        if selected_total < total_mojos:
+                            self.log(
+                                "      Exact-source CAT pool creation has insufficient "
+                                f"selectable inputs ({selected_total:,} < {total_mojos:,})"
+                            )
+                            return None
+
+                        actions = [
+                            {
+                                "type": "send",
+                                "id": {
+                                    "type": "existing",
+                                    "asset_id": asset_id,
+                                },
+                                "address": payment["address"],
+                                "amount": str(int(payment["amount"])),
+                                "memos": [],
+                            }
+                            for payment in payments
+                        ]
+                        change_mojos = selected_total - total_mojos
+                        output_contract = [
+                            (
+                                pool_mojos,
+                                self._purpose_for_tier(tier_name),
+                            )
+                            for tier_name, _count, pool_mojos in tier_details
+                        ]
+                        if change_mojos > 0:
+                            output_contract.append((change_mojos, "top_up"))
+                        prep_contract = self._build_coin_prep_contract(
+                            wallet_id=wallet_id,
+                            operation_kind="split",
+                            purpose="replacement",
+                            output_amounts_and_purposes=output_contract,
+                        )
+                        if prep_contract is None:
+                            self.log(
+                                "      Exact-source CAT pool contract could not be captured"
+                            )
+                            return None
+
+                        def _create_exact_cat_pools(
+                            selected_coin_ids,
+                            actions,
+                            auto_submit=True,
+                            fee_mojos=0,
+                        ):
+                            return create_transaction_rpc(
+                                selected_coin_ids=selected_coin_ids,
+                                actions=actions,
+                                auto_submit=auto_submit,
+                            )
+
+                        result = self._call_wallet_mutation(
+                            "coin_prep.create_tier_pools_exact",
+                            _create_exact_cat_pools,
+                            selected_coin_ids=selected_coin_ids,
+                            actions=actions,
+                            auto_submit=True,
+                            # A CAT source cannot pay an XCH fee. Keeping this
+                            # exact-source creation fee-free prevents Sage from
+                            # silently selecting an unrelated XCH coin.
+                            fee_mojos=0,
+                            _prep_contract=prep_contract,
                         )
                     else:
-                        result = send_transaction_multi(
-                            payments, fee_mojos=self._tx_fee_mojos()
+                        fee_mojos = self._tx_fee_mojos()
+                        required_mojos = total_mojos + fee_mojos
+                        candidates = sorted(
+                            self._get_coins_via_rpc(
+                                wallet_id,
+                                "xch-tier-pool-exact-source",
+                                selectable_only=True,
+                            )
+                            or [],
+                            key=lambda coin: int(coin.get("amount", 0) or 0),
+                            reverse=True,
+                        )
+                        selected_coin_ids = []
+                        selected_total = 0
+                        for coin in candidates:
+                            coin_id = str(coin.get("coin_id") or "").replace("0x", "")
+                            amount = int(coin.get("amount", 0) or 0)
+                            if len(coin_id) != 64 or amount <= 0:
+                                continue
+                            selected_coin_ids.append(coin_id)
+                            selected_total += amount
+                            if selected_total >= required_mojos:
+                                break
+                        if selected_total < required_mojos:
+                            self.log(
+                                "      Exact-source XCH pool creation has insufficient "
+                                f"selectable inputs ({selected_total:,} < {required_mojos:,})"
+                            )
+                            return None
+
+                        actions = [
+                            {
+                                "type": "send",
+                                "id": {"type": "xch"},
+                                "address": payment["address"],
+                                "amount": str(int(payment["amount"])),
+                                "memos": [],
+                            }
+                            for payment in payments
+                        ]
+                        if fee_mojos > 0:
+                            actions.append({"type": "fee", "amount": str(fee_mojos)})
+                        change_mojos = selected_total - required_mojos
+                        output_contract = [
+                            (
+                                pool_mojos,
+                                self._purpose_for_tier(tier_name),
+                            )
+                            for tier_name, _count, pool_mojos in tier_details
+                        ]
+                        if change_mojos > 0:
+                            output_contract.append((change_mojos, "top_up"))
+                        prep_contract = self._build_coin_prep_contract(
+                            wallet_id=wallet_id,
+                            operation_kind="split",
+                            purpose="replacement",
+                            output_amounts_and_purposes=output_contract,
+                        )
+                        if prep_contract is None:
+                            self.log(
+                                "      Exact-source XCH pool contract could not be captured"
+                            )
+                            return None
+
+                        def _create_exact_xch_pools(
+                            selected_coin_ids,
+                            actions,
+                            auto_submit=True,
+                            fee_mojos=0,
+                        ):
+                            return create_transaction_rpc(
+                                selected_coin_ids=selected_coin_ids,
+                                actions=actions,
+                                auto_submit=auto_submit,
+                            )
+
+                        result = self._call_wallet_mutation(
+                            "coin_prep.create_tier_pools_exact",
+                            _create_exact_xch_pools,
+                            selected_coin_ids=selected_coin_ids,
+                            actions=actions,
+                            auto_submit=True,
+                            fee_mojos=fee_mojos,
+                            _authority_fee_coin_ids=(
+                                selected_coin_ids if fee_mojos > 0 else None
+                            ),
+                            _prep_contract=prep_contract,
                         )
                     if result is None:
                         self.log(
@@ -4446,20 +5229,36 @@ class CoinPrepWorker:
             cat_tx_logged = False
             xch_owned_logged = False
             cat_owned_logged = False
+            deadline_s = timeout_s
+            grace_extension_s = 300
+            grace_extensions_used = 0
 
             self.log(
                 f"\n   🔍 Polling for ALL pool coins simultaneously (up to {timeout_s}s)..."
             )
 
-            for poll in range(timeout_s // 5):
+            poll = 0
+            while True:
+                xch_tx_state = {
+                    "known": False,
+                    "confirmed": False,
+                    "height": 0,
+                }
+                cat_tx_state = {
+                    "known": False,
+                    "confirmed": False,
+                    "height": 0,
+                }
+                xch_expected_outputs_owned = False
+                cat_expected_outputs_owned = False
                 if not xch_confirmed:
-                    tx_state = self._get_transaction_confirmation_state(xch_tx_ids)
-                    if tx_state["confirmed"] and not xch_tx_logged:
+                    xch_tx_state = self._get_transaction_confirmation_state(xch_tx_ids)
+                    if xch_tx_state["confirmed"] and not xch_tx_logged:
                         self.log(
                             "      ✅ XCH pool transaction confirmed"
                             + (
-                                f" at height {tx_state['height']}"
-                                if tx_state["height"]
+                                f" at height {xch_tx_state['height']}"
+                                if xch_tx_state["height"]
                                 else ""
                             )
                         )
@@ -4476,6 +5275,9 @@ class CoinPrepWorker:
                             owned_coins, xch_tiers
                         )
                         if assigned_map:
+                            xch_expected_outputs_owned = len(assigned_map) == len(
+                                xch_tiers
+                            )
                             if not xch_owned_logged:
                                 self.log(
                                     "      ✅ XCH pool outputs are present in owned wallet view"
@@ -4505,13 +5307,13 @@ class CoinPrepWorker:
                                 )
 
                 if not cat_confirmed:
-                    tx_state = self._get_transaction_confirmation_state(cat_tx_ids)
-                    if tx_state["confirmed"] and not cat_tx_logged:
+                    cat_tx_state = self._get_transaction_confirmation_state(cat_tx_ids)
+                    if cat_tx_state["confirmed"] and not cat_tx_logged:
                         self.log(
                             "      ✅ CAT pool transaction confirmed"
                             + (
-                                f" at height {tx_state['height']}"
-                                if tx_state["height"]
+                                f" at height {cat_tx_state['height']}"
+                                if cat_tx_state["height"]
                                 else ""
                             )
                         )
@@ -4528,6 +5330,9 @@ class CoinPrepWorker:
                             owned_coins, cat_tiers
                         )
                         if assigned_map:
+                            cat_expected_outputs_owned = len(assigned_map) == len(
+                                cat_tiers
+                            )
                             if not cat_owned_logged:
                                 self.log(
                                     "      ✅ CAT pool outputs are present in owned wallet view"
@@ -4564,11 +5369,50 @@ class CoinPrepWorker:
                     )
                     return True
 
+                elapsed = int(time.time() - poll_started_at)
+                if elapsed >= deadline_s:
+                    extend_xch = (
+                        not xch_confirmed
+                        and should_extend_pending_pool_confirmation_grace(
+                            tx_known=bool(xch_tx_state["known"]),
+                            tx_confirmed=bool(xch_tx_state["confirmed"]),
+                            expected_outputs_owned=xch_expected_outputs_owned,
+                            outputs_selectable=xch_confirmed,
+                            extensions_used=grace_extensions_used,
+                        )
+                    )
+                    extend_cat = (
+                        not cat_confirmed
+                        and should_extend_pending_pool_confirmation_grace(
+                            tx_known=bool(cat_tx_state["known"]),
+                            tx_confirmed=bool(cat_tx_state["confirmed"]),
+                            expected_outputs_owned=cat_expected_outputs_owned,
+                            outputs_selectable=cat_confirmed,
+                            extensions_used=grace_extensions_used,
+                        )
+                    )
+                    if extend_xch or extend_cat:
+                        pending_label = "XCH" if extend_xch else "CAT"
+                        deadline_s += grace_extension_s
+                        grace_extensions_used += 1
+                        self.log(
+                            f"      ⏱️ {pending_label} pool transaction is accepted and all exact outputs are owned "
+                            f"but not selectable — extending confirmation grace by {grace_extension_s}s"
+                        )
+                        self.update_status(
+                            PrepPhase.SPLITTING,
+                            0.45 if pending_label == "CAT" else 0.30,
+                            f"Waiting for accepted {pending_label} pool transaction to confirm...",
+                        )
+                    else:
+                        break
+
                 if poll > 0 and poll % 4 == 0:
                     sx = "✅" if xch_confirmed else "⏳"
                     sc = "✅" if cat_confirmed else "⏳"
                     elapsed = int(time.time() - poll_started_at)
                     self.log(f"      ⏳ {elapsed}s — XCH: {sx}, CAT: {sc}")
+                poll += 1
                 time.sleep(5)
 
             # Check if Sage lost peer connectivity — the most common cause
@@ -4587,7 +5431,7 @@ class CoinPrepWorker:
             except Exception:
                 pass
             self.log(
-                f"      ❌ Pool coins not all spendable after {timeout_s}s!{_peer_hint}"
+                f"      ❌ Pool coins not all spendable after {int(deadline_s)}s!{_peer_hint}"
             )
             if _peer_hint:
                 self.update_status(
@@ -4697,11 +5541,27 @@ class CoinPrepWorker:
                     f"      Using dedicated XCH fee coin {_fee_coin_short}... for CAT {tier_name}"
                 )
 
+            split_fee_mojos = self._split_tx_fee_mojos() if not is_cat else 0
+            amount_per_coin = (
+                pool_mojos // count
+                if is_cat
+                else (pool_mojos - split_fee_mojos) // count
+            )
+            prep_contract = self._build_split_prep_contract(
+                wallet_id=wallet_id,
+                purpose=self._purpose_for_tier(tier_name),
+                source_amount_mojos=pool_mojos,
+                count=count,
+                amount_per_coin=amount_per_coin,
+                fee_mojos=split_fee_mojos,
+                sage_native_even_split=not is_cat,
+            )
             for attempt in range(3):
                 try:
                     if is_cat:
-                        amount_per_coin = pool_mojos // count
-                        result = sage_topup_split(
+                        result = self._call_wallet_mutation(
+                            "coin_prep.split_cat_pool",
+                            sage_topup_split,
                             source_coin_id=coin_id,
                             num_coins=count,
                             trading_size_mojos=amount_per_coin,
@@ -4709,15 +5569,22 @@ class CoinPrepWorker:
                             fee_mojos=cat_fee_mojos,
                             is_cat=True,
                             fee_coin_id=fee_coin_id,
+                            _prep_contract=prep_contract,
                         )
                     else:
-                        result = split_coins_rpc(
+                        result = self._call_wallet_mutation(
+                            "coin_prep.split_xch_pool",
+                            split_coins_rpc,
                             wallet_id=wallet_id,
                             target_coin_id=coin_id,
                             num_coins=count,
                             amount_per_coin=0,
-                            fee_mojos=self._split_tx_fee_mojos(),
+                            fee_mojos=split_fee_mojos,
                             is_cat=False,
+                            _authority_fee_coin_ids=(
+                                [coin_id] if split_fee_mojos > 0 else None
+                            ),
+                            _prep_contract=prep_contract,
                         )
                     if result is None:
                         self.log(f"      Split returned None (attempt {attempt + 1}/3)")
@@ -4759,6 +5626,8 @@ class CoinPrepWorker:
                         "pool_coin_id": coin_id,
                         "tx_ids": tx_ids,
                     }
+                except CoinPrepAuthorityUnresolved:
+                    raise
                 except Exception as e:
                     self.log(f"      Split exception: {e} (attempt {attempt + 1}/3)")
                     _wait_for_pending_clear(
@@ -4811,8 +5680,83 @@ class CoinPrepWorker:
                 {"address": address, "amount": fee_coin_mojos}
                 for _ in range(needed_count)
             ]
+            required_mojos = (needed_count * fee_coin_mojos) + cat_fee_mojos
+            candidates = sorted(
+                self._get_coins_via_rpc(
+                    self.xch_wallet_id,
+                    "cat-fee-input-exact-source",
+                    selectable_only=True,
+                )
+                or [],
+                key=lambda coin: int(coin.get("amount", 0) or 0),
+                reverse=True,
+            )
+            selected_coin_ids = []
+            selected_total = 0
+            for coin in candidates:
+                coin_id = str(coin.get("coin_id") or "").replace("0x", "")
+                amount = int(coin.get("amount", 0) or 0)
+                if len(coin_id) != 64 or amount <= 0:
+                    continue
+                selected_coin_ids.append(coin_id)
+                selected_total += amount
+                if selected_total >= required_mojos:
+                    break
+            if selected_total < required_mojos:
+                self.log(
+                    "   Exact-source CAT fee-input creation has insufficient "
+                    f"selectable XCH ({selected_total:,} < {required_mojos:,})"
+                )
+                return []
+
+            actions = [
+                {
+                    "type": "send",
+                    "id": {"type": "xch"},
+                    "address": payment["address"],
+                    "amount": str(int(payment["amount"])),
+                    "memos": [],
+                }
+                for payment in payments
+            ]
+            actions.append({"type": "fee", "amount": str(cat_fee_mojos)})
+            change_mojos = selected_total - required_mojos
+            output_contract = [(fee_coin_mojos, "fee_reserve")] * needed_count
+            if change_mojos > 0:
+                output_contract.append((change_mojos, "top_up"))
+            prep_contract = self._build_coin_prep_contract(
+                wallet_id=self.xch_wallet_id,
+                operation_kind="split",
+                purpose="fee_reserve",
+                output_amounts_and_purposes=output_contract,
+            )
+            if prep_contract is None:
+                self.log("   Exact-source CAT fee-input contract could not be captured")
+                return []
+
+            def _create_exact_cat_fee_inputs(
+                selected_coin_ids,
+                actions,
+                auto_submit=True,
+                fee_mojos=0,
+            ):
+                return create_transaction_rpc(
+                    selected_coin_ids=selected_coin_ids,
+                    actions=actions,
+                    auto_submit=auto_submit,
+                )
+
             try:
-                result = send_transaction_multi(payments, fee_mojos=cat_fee_mojos)
+                result = self._call_wallet_mutation(
+                    "coin_prep.create_tier_pools_exact",
+                    _create_exact_cat_fee_inputs,
+                    selected_coin_ids=selected_coin_ids,
+                    actions=actions,
+                    auto_submit=True,
+                    fee_mojos=cat_fee_mojos,
+                    _authority_fee_coin_ids=selected_coin_ids,
+                    _prep_contract=prep_contract,
+                )
             except Exception as e:
                 self.log(f"   Dedicated CAT fee-input multi_send exception: {e}")
                 return []
@@ -5005,14 +5949,6 @@ class CoinPrepWorker:
             poll = 0
             next_progress_log_s = 20
             while True:
-                elapsed_before_cycle_s = int(time.time() - poll_started_at)
-                active_deadline_s = max(
-                    split_deadlines.get(idx, timeout_s)
-                    for idx in range(len(pending_splits))
-                    if idx not in confirmed
-                )
-                if poll > 0 and elapsed_before_cycle_s >= active_deadline_s:
-                    break
                 # --- BULK FETCH: one RPC call per wallet type per cycle ---
                 owned_coin_cache = {}
                 selectable_coin_cache = {}
@@ -5295,6 +6231,22 @@ class CoinPrepWorker:
                         retry_counts[idx] = retry_counts.get(idx, 0) + 1
                         try:
                             cat_retry_fee_mojos = self._tx_fee_mojos() if ic else 0
+                            xch_retry_fee_mojos = (
+                                0 if ic else self._split_tx_fee_mojos()
+                            )
+                            retry_prep_contract = self._build_split_prep_contract(
+                                wallet_id=wid,
+                                purpose=self._purpose_for_tier(tn),
+                                source_amount_mojos=pm,
+                                count=cnt,
+                                amount_per_coin=(
+                                    pm // cnt
+                                    if ic
+                                    else (pm - xch_retry_fee_mojos) // cnt
+                                ),
+                                fee_mojos=xch_retry_fee_mojos,
+                                sage_native_even_split=not ic,
+                            )
                             if should_wait_for_pending_fee_inputs_before_split(
                                 is_cat=ic,
                                 fee_mojos=cat_retry_fee_mojos,
@@ -5310,22 +6262,33 @@ class CoinPrepWorker:
                                     )
                                     continue
                             if ic:
-                                result = sage_topup_split(
+                                result = self._call_wallet_mutation(
+                                    "coin_prep.retry_cat_split",
+                                    sage_topup_split,
                                     source_coin_id=split_state["pool_coin_id"],
                                     num_coins=cnt,
                                     trading_size_mojos=pm // cnt,
                                     own_address=address,
                                     fee_mojos=cat_retry_fee_mojos,
                                     is_cat=True,
+                                    _prep_contract=retry_prep_contract,
                                 )
                             else:
-                                result = split_coins_rpc(
+                                result = self._call_wallet_mutation(
+                                    "coin_prep.retry_xch_split",
+                                    split_coins_rpc,
                                     wallet_id=wid,
                                     target_coin_id=split_state["pool_coin_id"],
                                     num_coins=cnt,
                                     amount_per_coin=0,
-                                    fee_mojos=self._split_tx_fee_mojos(),
+                                    fee_mojos=xch_retry_fee_mojos,
                                     is_cat=False,
+                                    _authority_fee_coin_ids=(
+                                        [split_state["pool_coin_id"]]
+                                        if xch_retry_fee_mojos > 0
+                                        else None
+                                    ),
+                                    _prep_contract=retry_prep_contract,
                                 )
                             if result is None:
                                 self.log(
@@ -5417,7 +6380,11 @@ class CoinPrepWorker:
                     )
                     next_progress_log_s += 20
 
-                remaining_sleep_s = active_deadline_s - (time.time() - poll_started_at)
+                remaining_sleep_s = remaining_pending_split_poll_seconds(
+                    elapsed_s=time.time() - poll_started_at,
+                    split_deadlines=split_deadlines,
+                    confirmed_indices=confirmed,
+                )
                 if remaining_sleep_s <= 0:
                     break
                 time.sleep(min(5, remaining_sleep_s))
@@ -6269,6 +7236,56 @@ class CoinPrepWorker:
             )
         return coins
 
+    def _get_confirmed_owned_coins_via_rpc(self, wallet_id: int, name: str) -> list:
+        """Return only owned Sage coins whose creation is confirmed on-chain.
+
+        Sage's broad owned view may expose a predicted addition while its
+        transaction is still in the mempool.  That is useful for display, but
+        it cannot prove a Coin Prep post-effect.  Reconciliation therefore
+        requires the detailed view and a positive ``created_height``.
+        """
+
+        if not self.is_sage:
+            return self._get_owned_coins_via_rpc(wallet_id, name)
+
+        try:
+            from wallet_sage import get_owned_coins_detailed
+
+            owned = get_owned_coins_detailed(wallet_id)
+        except Exception as exc:
+            self.log(f"⚠️ Confirmed owned coin view unavailable for {name}: {exc}")
+            return []
+        if type(owned) is not dict:
+            return []
+
+        coins = []
+        for raw_coin_id, details in owned.items():
+            if type(details) is not dict:
+                continue
+            try:
+                created_height = int(details.get("created_height") or 0)
+                spent_height = int(details.get("spent_height") or 0)
+                amount = int(details.get("amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if created_height <= 0 or spent_height > 0 or amount <= 0:
+                continue
+            coin_id = str(raw_coin_id or "").strip().lower()
+            if not coin_id:
+                continue
+            if not coin_id.startswith("0x"):
+                coin_id = "0x" + coin_id
+            coins.append(
+                {
+                    "coin_id": coin_id,
+                    "id": coin_id,
+                    "amount": amount,
+                    "amount_mojos": amount,
+                    "created_height": created_height,
+                }
+            )
+        return coins
+
     def _get_strict_selectable_coin_id_set(self, wallet_id: int, name: str) -> set:
         """Return the exact Sage selectable coin ids for a wallet.
 
@@ -6701,19 +7718,37 @@ class CoinPrepWorker:
         if self.is_sage:
             # --- Sage RPC split ---
             try:
-                from wallet_sage import split_coins_rpc as sage_split
+                from wallet import split_coins_rpc as sage_split
 
                 bare_coin_id = coin_id.replace("0x", "")
                 self.log(
                     f"   🔄 Sage RPC split: {num_coins} coins of {coin_size} from {bare_coin_id[:16]}..."
                 )
-                result = sage_split(
+                split_fee_mojos = self._split_tx_fee_mojos(is_cat=is_cat)
+                source_fee_mojos = 0 if is_cat else split_fee_mojos
+                tier_name = str(name).rsplit("-", 1)[-1].lower()
+                prep_contract = self._build_split_prep_contract(
+                    wallet_id=wallet_id,
+                    purpose=self._purpose_for_tier(tier_name),
+                    source_amount_mojos=coin_amount,
+                    count=num_coins,
+                    amount_per_coin=mojos_per_coin,
+                    fee_mojos=source_fee_mojos,
+                    sage_native_even_split=True,
+                )
+                result = self._call_wallet_mutation(
+                    "coin_prep.split_single_sage",
+                    sage_split,
                     wallet_id=wallet_id,
                     target_coin_id=bare_coin_id,
                     num_coins=num_coins,
                     amount_per_coin=mojos_per_coin,
-                    fee_mojos=self._split_tx_fee_mojos(),
+                    fee_mojos=split_fee_mojos,
                     is_cat=is_cat,
+                    _authority_fee_coin_ids=(
+                        [bare_coin_id] if split_fee_mojos > 0 and not is_cat else None
+                    ),
+                    _prep_contract=prep_contract,
                 )
                 if self._sage_submit_succeeded(result):
                     self.log("   ✅ Sage split submitted")
@@ -6751,6 +7786,7 @@ class CoinPrepWorker:
             )
 
             try:
+                self._require_cli_mutation("coin_prep.cli_split")
                 process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -7493,6 +8529,375 @@ class CoinPrepWorker:
             self.log(f"Post-prep drift status update failed: {status_err}")
         return False
 
+    def _verify_authoritative_post_operation_view(
+        self,
+        *,
+        operation_id: str,
+        source_coin_ids: list[str],
+        expected_outputs: list[dict],
+        authoritative_view: dict,
+        expected_wallet_identity: dict,
+        effect_claim_token: str,
+        effect_claim_generation: int,
+        dispatch_outcome: str,
+    ) -> bool:
+        """Commit success only for one exact, fresh post-effect wallet view."""
+
+        from replacement_capacity import verify_coin_prep_post_view
+
+        decision = verify_coin_prep_post_view(
+            source_coin_ids=source_coin_ids,
+            expected_outputs=expected_outputs,
+            authoritative_view=authoritative_view,
+            expected_wallet_identity=expected_wallet_identity,
+        )
+        outcome = "CONFIRMED" if decision.confirmed else "SUBMITTED_UNKNOWN"
+        evidence = (
+            {
+                "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+                "effect_claim_token": effect_claim_token,
+                "effect_claim_generation": effect_claim_generation,
+                "source_coin_ids": source_coin_ids,
+                "expected_outputs": expected_outputs,
+                "authoritative_view": authoritative_view,
+                "expected_wallet_identity": expected_wallet_identity,
+            }
+            if decision.confirmed
+            else {
+                "reason_code": decision.reason or "AUTHORITATIVE_VIEW_UNRESOLVED",
+                "effect_claim_token": effect_claim_token,
+                "effect_claim_generation": effect_claim_generation,
+                "dispatch_outcome": dispatch_outcome,
+            }
+        )
+        try:
+            record_coin_prep_operation_outcome(
+                operation_id,
+                outcome=outcome,
+                evidence_json=evidence,
+            )
+        except Exception as exc:
+            self.log(f"Coin prep authoritative outcome could not be persisted: {exc}")
+            return False
+        if decision.confirmed:
+            return True
+        error = f"POST_PREP_AUTHORITY_UNRESOLVED: {decision.reason}"
+        self.log(error)
+        try:
+            self.update_status(
+                PrepPhase.ERROR,
+                0.99,
+                "Authoritative post-operation coin view is unresolved",
+                error=error,
+            )
+        except Exception as exc:
+            self.log(f"Post-operation authority status update failed: {exc}")
+        return False
+
+    @staticmethod
+    def _current_coin_prep_wallet_identity() -> dict:
+        """Return the exact Task 5 binding from the active owner/worker authority."""
+
+        runtime = mutation_gate.current_runtime()
+        if runtime is not None:
+            binding = runtime.require_wallet_identity_authority("coin_prep.prepare")
+        else:
+            lease = mutation_gate.worker_identity_lease_binding()
+            binding = lease.get("binding") if type(lease) is dict else None
+        if type(binding) is not mutation_gate.WalletIdentityBinding:
+            raise mutation_gate.MutationBlocked(
+                "WALLET_IDENTITY_BINDING_INVALID", "coin_prep.prepare"
+            )
+        return mutation_gate.wallet_identity_binding_payload(binding)
+
+    def _record_coin_prep_dispatch_outcome(
+        self,
+        operation: dict,
+        *,
+        dispatch_outcome: str,
+        reason_code: str,
+    ) -> None:
+        token = operation["effect_claim_token"]
+        generation = operation["effect_claim_generation"]
+        if dispatch_outcome == "RELEASED_NO_EFFECT":
+            outcome = "FAILED"
+            evidence = {
+                "reason_code": reason_code,
+                "effect_claim_token": token,
+                "effect_claim_generation": generation,
+                "dispatch_outcome": dispatch_outcome,
+                "effect_attempted": False,
+            }
+        else:
+            outcome = "SUBMITTED_UNKNOWN"
+            evidence = {
+                "reason_code": reason_code,
+                "effect_claim_token": token,
+                "effect_claim_generation": generation,
+                "dispatch_outcome": (
+                    dispatch_outcome
+                    if dispatch_outcome in {"SUBMITTED", "UNKNOWN"}
+                    else "ADAPTER_EXCEPTION"
+                ),
+            }
+        record_coin_prep_operation_outcome(
+            operation["operation_id"], outcome=outcome, evidence_json=evidence
+        )
+
+    def _observe_coin_prep_post_effect(self, operation: dict):
+        """Perform one read-only exact observation after an attempted effect."""
+
+        return self._observe_recoverable_coin_prep_operation(operation)
+
+    def _wait_for_coin_prep_post_effect(
+        self,
+        operation: dict,
+        *,
+        timeout_s: int,
+        poll_interval_s: int,
+    ):
+        """Wait for one submitted split to resolve before another can dispatch."""
+
+        started_at = time.monotonic()
+        next_progress_log_s = 30
+        while time.monotonic() - started_at < timeout_s:
+            time.sleep(poll_interval_s)
+            observation = self._observe_coin_prep_post_effect(operation)
+            if type(observation) is dict:
+                return observation
+            elapsed_s = int(time.monotonic() - started_at)
+            if elapsed_s >= next_progress_log_s:
+                self.log(
+                    "      Waiting for authoritative confirmation of submitted "
+                    f"split ({elapsed_s}s)"
+                )
+                next_progress_log_s += 30
+        return None
+
+    def _recover_coin_prep_operations_read_only(self, observer) -> bool:
+        """Resolve PREPARED/effect-unknown rows by observation, never replay."""
+
+        if not callable(observer):
+            raise TypeError("coin prep recovery observer must be callable")
+        try:
+            operations = get_recoverable_coin_prep_operations()
+        except Exception as exc:
+            self.log(f"Coin prep recovery inventory unavailable: {exc}")
+            return False
+        all_confirmed = True
+        for operation in operations:
+            try:
+                source_coin_ids = json.loads(operation["source_coin_ids_json"])
+                expected_identity = json.loads(operation["wallet_identity_json"])
+                observation = observer(dict(operation))
+                if type(observation) is not dict:
+                    if operation.get("outcome") == "PREPARED":
+                        record_coin_prep_operation_outcome(
+                            operation["operation_id"],
+                            outcome="SUBMITTED_UNKNOWN",
+                            evidence_json={
+                                "reason_code": "authoritative_observation_unavailable",
+                                "effect_claim_token": operation["effect_claim_token"],
+                                "effect_claim_generation": operation[
+                                    "effect_claim_generation"
+                                ],
+                                "dispatch_outcome": "PREPARED",
+                            },
+                        )
+                    all_confirmed = False
+                    continue
+                expected_outputs = observation.get("expected_outputs")
+                authoritative_view = observation.get("authoritative_view")
+                if not self._verify_authoritative_post_operation_view(
+                    operation_id=operation["operation_id"],
+                    source_coin_ids=source_coin_ids,
+                    expected_outputs=expected_outputs,
+                    authoritative_view=authoritative_view,
+                    expected_wallet_identity=expected_identity,
+                    effect_claim_token=operation["effect_claim_token"],
+                    effect_claim_generation=operation["effect_claim_generation"],
+                    dispatch_outcome=(
+                        "PREPARED"
+                        if operation.get("outcome") == "PREPARED"
+                        else "SUBMITTED"
+                    ),
+                ):
+                    all_confirmed = False
+            except Exception as exc:
+                self.log(
+                    "Coin prep recovery observation was malformed for "
+                    f"{operation.get('operation_id', '?')}: {exc}"
+                )
+                all_confirmed = False
+        return all_confirmed
+
+    def _observe_recoverable_coin_prep_operation(self, operation: dict):
+        """Build exact outputs from a complete pre/post owned-coin difference."""
+
+        try:
+            target = json.loads(operation["target_contract_json"])
+            prepared_evidence = json.loads(operation["prepared_evidence_json"])
+            expected_identity = json.loads(operation["wallet_identity_json"])
+            identity_binding = mutation_gate.WalletIdentityBinding(**expected_identity)
+            if (
+                mutation_gate.wallet_identity_binding_payload(identity_binding)
+                != expected_identity
+            ):
+                return None
+            identity_decision = mutation_gate.validate_wallet_identity(
+                identity_binding,
+                get_wallet_identity(),
+            )
+            if identity_decision.get("allowed") is not True:
+                return None
+            pre_ids = {
+                self._canonical_coin_id(value)
+                for value in prepared_evidence["pre_view_coin_ids"]
+            }
+            wallet_id = (
+                self.xch_wallet_id
+                if target["wallet_type"] == "xch"
+                else self.cat_wallet_id
+            )
+            observed = self._get_confirmed_owned_coins_via_rpc(
+                wallet_id, "coin-prep-authoritative-post-view"
+            )
+            if type(observed) is not list:
+                return None
+            by_id = {}
+            for coin in observed:
+                coin_id = self._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
+                amount = coin.get("amount_mojos", coin.get("amount"))
+                if (
+                    not coin_id
+                    or type(amount) is not int
+                    or amount <= 0
+                    or coin_id in by_id
+                ):
+                    return None
+                by_id[coin_id] = amount
+            source_ids = {
+                self._canonical_coin_id(value)
+                for value in json.loads(operation["source_coin_ids_json"])
+            }
+            if source_ids.intersection(by_id):
+                return None
+            new_coins = sorted(
+                (
+                    {"coin_id": coin_id, "amount_mojos": amount}
+                    for coin_id, amount in by_id.items()
+                    if coin_id not in pre_ids
+                ),
+                key=lambda item: (item["amount_mojos"], item["coin_id"]),
+            )
+            outputs = sorted(
+                target["outputs"],
+                key=lambda item: (item["amount_mojos"], item["output_index"]),
+            )
+            purposes_by_amount = {}
+            for output in outputs:
+                purposes_by_amount.setdefault(output["amount_mojos"], set()).add(
+                    output["purpose"]
+                )
+            if any(len(purposes) != 1 for purposes in purposes_by_amount.values()):
+                return None
+            exact_amounts_match = len(new_coins) == len(outputs) and [
+                item["amount_mojos"] for item in new_coins
+            ] == [item["amount_mojos"] for item in outputs]
+            if exact_amounts_match:
+                expected_outputs = [
+                    {
+                        "coin_id": coin["coin_id"],
+                        "amount_mojos": coin["amount_mojos"],
+                        "purpose": output["purpose"],
+                    }
+                    for coin, output in zip(new_coins, outputs)
+                ]
+            else:
+                legacy_purpose = self._legacy_sage_even_split_recovery_purpose(
+                    operation=operation,
+                    source_ids=source_ids,
+                    target_outputs=outputs,
+                    observed_outputs=new_coins,
+                )
+                if legacy_purpose is None:
+                    return None
+                expected_outputs = [
+                    {
+                        "coin_id": coin["coin_id"],
+                        "amount_mojos": coin["amount_mojos"],
+                        "purpose": legacy_purpose,
+                    }
+                    for coin in new_coins
+                ]
+            observed_text = identity_decision["observed_at_utc"]
+            observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
+            expires_at = observed_at + timedelta(
+                seconds=expected_identity["maximum_age_seconds"]
+            )
+            expires_text = expires_at.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            )
+            return {
+                "expected_outputs": expected_outputs,
+                "authoritative_view": {
+                    "fresh": True,
+                    "complete": True,
+                    "wallet_identity": expected_identity,
+                    "observed_at": observed_text,
+                    "expires_at": expires_text,
+                    "coins": expected_outputs,
+                },
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _legacy_sage_even_split_recovery_purpose(
+        *,
+        operation: dict,
+        source_ids: set[str],
+        target_outputs: list[dict],
+        observed_outputs: list[dict],
+    ) -> str | None:
+        """Recognize the exact Sage /split partition journaled by old builds."""
+
+        if operation.get("operation_kind") != "split" or len(source_ids) != 1:
+            return None
+        purpose = operation.get("purpose")
+        if type(purpose) is not str or not purpose:
+            return None
+        primary = [item for item in target_outputs if item.get("purpose") == purpose]
+        remainder = [item for item in target_outputs if item.get("purpose") == "top_up"]
+        if (
+            len(primary) < 2
+            or len(remainder) != 1
+            or len(primary) + 1 != len(target_outputs)
+            or len(observed_outputs) != len(primary)
+        ):
+            return None
+        primary_amounts = {item.get("amount_mojos") for item in primary}
+        if len(primary_amounts) != 1:
+            return None
+        primary_amount = next(iter(primary_amounts))
+        remainder_amount = remainder[0].get("amount_mojos")
+        if (
+            type(primary_amount) is not int
+            or primary_amount <= 0
+            or type(remainder_amount) is not int
+            or not 0 < remainder_amount < len(primary)
+        ):
+            return None
+        total = primary_amount * len(primary) + remainder_amount
+        max_individual = (total + len(primary) - 1) // len(primary)
+        sage_amounts = [max_individual] * (len(primary) - 1)
+        sage_amounts.append(total - max_individual * (len(primary) - 1))
+        if sage_amounts[-1] <= 0 or sorted(sage_amounts) != sorted(
+            item.get("amount_mojos") for item in observed_outputs
+        ):
+            return None
+        return purpose
+
     def run_full_preparation(self) -> bool:
         """
         Execute complete coin preparation flow with PARALLEL OPTIMIZATION
@@ -7507,6 +8912,21 @@ class CoinPrepWorker:
         Total time: ~1.7 minutes (was ~3 minutes)
         """
         try:
+            # A successfully imported repository must always be recovered,
+            # even when its per-run bootstrap flag is false.  When the
+            # repository itself is unavailable every wallet-effect path below
+            # is already denied by `_call_wallet_mutation`, so a genuinely
+            # read-only/prepared run may still report its state.
+            if DB_AVAILABLE and not self._recover_coin_prep_operations_read_only(
+                self._observe_recoverable_coin_prep_operation
+            ):
+                self.update_status(
+                    PrepPhase.ERROR,
+                    0.0,
+                    "Unresolved prior coin-prep operation requires observation",
+                    error="COIN_PREP_RECOVERY_UNRESOLVED",
+                )
+                return False
             self.update_status(PrepPhase.ANALYZING, 0.05, "Analyzing current state...")
 
             # Get initial state
@@ -7530,14 +8950,11 @@ class CoinPrepWorker:
             # only the coins that actually exist after prep, keeping the DB clean.
             if self._db_ready:
                 try:
-                    from database import get_connection
-
-                    conn = get_connection()
-                    result = conn.execute(
-                        "UPDATE coins SET status='gone' WHERE status='free'"
+                    from database import (
+                        mark_unreserved_free_coins_gone_for_preparation,
                     )
-                    conn.commit()
-                    stale_count = result.rowcount
+
+                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
                     if stale_count > 0:
                         self.log(
                             f"   DB: marked {stale_count} stale coins as 'gone' (fresh start)"
@@ -7759,6 +9176,8 @@ class CoinPrepWorker:
             self._set_status_coin_counts(xch_total=xch_coins, cat_total=cat_coins)
             self.update_status(message=f"Post-cancel: XCH={xch_coins}, CAT={cat_coins}")
 
+            xch_prepared_ok = False
+            cat_prepared_ok = False
             if self.tier_enabled:
                 xch_prepared_ok, xch_prepared_detail = (
                     self._tier_plan_satisfied_by_wallet(self.xch_wallet_id, "xch")
@@ -7777,6 +9196,9 @@ class CoinPrepWorker:
                     )
                     return self._complete_existing_tier_preparation()
 
+            self._xch_plan_already_satisfied = xch_prepared_ok
+            self._cat_plan_already_satisfied = cat_prepared_ok
+
             self.log(f"\n{'=' * 60}")
             self.log("⚡ PARALLEL CONSOLIDATION")
             self.log(f"{'=' * 60}")
@@ -7785,8 +9207,12 @@ class CoinPrepWorker:
             xch_success_max = self._sage_consolidation_success_max_count(
                 self.xch_wallet_id
             )
-            xch_needs_consolidation = xch_coins > xch_success_max or xch_coins == 0
-            cat_needs_consolidation = cat_coins > 1
+            xch_needs_consolidation = self._side_needs_consolidation(
+                xch_prepared_ok, xch_coins, xch_success_max
+            )
+            cat_needs_consolidation = self._side_needs_consolidation(
+                cat_prepared_ok, cat_coins, 1
+            )
 
             # Track whether consolidation was actually submitted
             xch_consolidation_submitted = False
@@ -7864,7 +9290,10 @@ class CoinPrepWorker:
                 PrepPhase.CONSOLIDATING, 0.20, "Verifying both wallets consolidated..."
             )
 
-            max_verify_wait = 300  # 5 minute timeout - don't wait forever
+            max_verify_wait = self._consolidation_verify_timeout_seconds(
+                xch_submitted=xch_consolidation_submitted,
+                cat_submitted=cat_consolidation_submitted,
+            )
             verify_interval = 5
             elapsed_verify = 0
             xch_target_label = f"1-{xch_success_max}" if xch_success_max > 1 else "1"
@@ -7894,10 +9323,16 @@ class CoinPrepWorker:
                     message=f"Consolidating: XCH={xch_check}, CAT={cat_check}"
                 )
 
-                xch_ready = 1 <= xch_check <= xch_success_max
-                if xch_ready and cat_check == 1:
+                xch_ready = self._side_consolidation_ready(
+                    xch_prepared_ok, xch_check, xch_success_max
+                )
+                cat_ready = self._side_consolidation_ready(
+                    cat_prepared_ok, cat_check, 1
+                )
+                if xch_ready and cat_ready:
                     self.log(
-                        f"Consolidation verified! XCH: {xch_check} coin(s), CAT: 1 coin"
+                        f"Consolidation verified! XCH: {xch_check} coin(s), "
+                        f"CAT: {cat_check} coin(s)"
                     )
                     break
 
@@ -7911,7 +9346,11 @@ class CoinPrepWorker:
                 prev_cat_check = cat_check
 
                 if stuck_count >= 12:
-                    if xch_check > xch_success_max and not xch_consolidation_submitted:
+                    if (
+                        not xch_prepared_ok
+                        and xch_check > xch_success_max
+                        and not xch_consolidation_submitted
+                    ):
                         self.log(
                             f"\nXCH has {xch_check} coins but no consolidation was submitted!"
                         )
@@ -7922,7 +9361,11 @@ class CoinPrepWorker:
                         else:
                             self.log("   XCH consolidation failed - will retry")
 
-                    if cat_check > 1 and not cat_consolidation_submitted:
+                    if (
+                        not cat_prepared_ok
+                        and cat_check > 1
+                        and not cat_consolidation_submitted
+                    ):
                         self.log(
                             f"\nCAT has {cat_check} coins but no consolidation was submitted!"
                         )
@@ -7978,12 +9421,15 @@ class CoinPrepWorker:
                 f"Consolidation complete! XCH: {final_xch} coin(s), CAT: {final_cat} coin(s)",
             )
 
-            xch_final_ready = (
-                1
-                <= final_xch
-                <= self._sage_consolidation_success_max_count(self.xch_wallet_id)
+            xch_final_ready = self._side_consolidation_ready(
+                xch_prepared_ok,
+                final_xch,
+                self._sage_consolidation_success_max_count(self.xch_wallet_id),
             )
-            if not xch_final_ready or final_cat != 1:
+            cat_final_ready = self._side_consolidation_ready(
+                cat_prepared_ok, final_cat, 1
+            )
+            if not xch_final_ready or not cat_final_ready:
                 message = (
                     f"Consolidation did not complete: XCH={final_xch}, CAT={final_cat}. "
                     "Wait for Sage transactions to settle, then retry coin prep."
@@ -7996,8 +9442,10 @@ class CoinPrepWorker:
 
             # Designate consolidated coins as reserve in DB
             # (they'll get consumed by pool creation, but this establishes the DB record)
-            self._designate_reserve_after_consolidation(self.xch_wallet_id, "xch")
-            self._designate_reserve_after_consolidation(self.cat_wallet_id, "cat")
+            if not xch_prepared_ok:
+                self._designate_reserve_after_consolidation(self.xch_wallet_id, "xch")
+            if not cat_prepared_ok:
+                self._designate_reserve_after_consolidation(self.cat_wallet_id, "cat")
 
             # ---------------------------------------------------------------
             # CRITICAL: Wait for consolidated coins to become SPENDABLE.
@@ -8244,10 +9692,8 @@ class CoinPrepWorker:
                 self.log(
                     "\n⏳ Spendability gate: waiting for consolidated coins to become selectable..."
                 )
-                from wallet_sage import (
-                    get_pending_transactions,
-                    get_selectable_coins_only,
-                )
+                from wallet import get_pending_transactions
+                from wallet_sage import get_selectable_coins_only
 
                 gate_timeout = 120  # 2 minutes max
                 gate_poll = 5
@@ -8653,7 +10099,7 @@ def _safe_path_status(path: str) -> str:
 
 
 def _run_sage_rpc_smoke() -> int:
-    """Exercise the worker's Sage RPC path without touching funds."""
+    """Exercise only noninitializing Sage reads without touching wallet state."""
     try:
         import wallet_sage
 
@@ -8671,11 +10117,14 @@ def _run_sage_rpc_smoke() -> int:
             f"key={_safe_path_status(key_path)}"
         )
 
-        if not wallet_sage.ensure_initialized(force_retry=True):
-            print("[SAGE_RPC_SMOKE] initialize failed")
+        from wallet import get_current_key, rpc
+
+        version = rpc("get_version", {}, timeout=5)
+        if type(version) is not dict or not version.get("version"):
+            print("[SAGE_RPC_SMOKE] get_version failed")
             return 1
 
-        key = wallet_sage.get_current_key()
+        key = get_current_key()
         fingerprint = key.get("fingerprint") if isinstance(key, dict) else None
         if not fingerprint:
             print(f"[SAGE_RPC_SMOKE] get_key failed: {key!r}")
@@ -8686,6 +10135,55 @@ def _run_sage_rpc_smoke() -> int:
     except Exception as exc:
         print(f"[SAGE_RPC_SMOKE] failed: {exc}")
         return 1
+
+
+def recover_coin_prep_operations_at_startup() -> bool:
+    """Resolve prior prep effects from exact wallet observations, never replay."""
+
+    try:
+        if not get_recoverable_coin_prep_operations():
+            return False
+    except Exception as exc:
+        slog(
+            "COIN_PREP",
+            "Startup coin-prep recovery inventory was unavailable",
+            {"error_type": type(exc).__name__},
+            level="warning",
+        )
+        return False
+
+    worker = CoinPrepWorker.__new__(CoinPrepWorker)
+    worker.wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
+    worker.is_sage = worker.wallet_type == "sage"
+    worker.xch_wallet_id = _env_int("CHIA_WALLET_ID_XCH", 1)
+    worker.cat_wallet_id = _env_int("CAT_WALLET_ID", 2)
+    worker._is_subprocess = False
+
+    def _recovery_log(message: str, severity: str | None = None) -> None:
+        level = (
+            severity if severity in {"debug", "info", "warning", "error"} else "info"
+        )
+        slog(
+            "COIN_PREP",
+            message,
+            {"mode": "startup_recovery"},
+            level=level,
+        )
+
+    worker.log = _recovery_log
+    worker.update_status = lambda *_args, **_kwargs: None
+    try:
+        return worker._recover_coin_prep_operations_read_only(
+            worker._observe_recoverable_coin_prep_operation
+        )
+    except Exception as exc:
+        slog(
+            "COIN_PREP",
+            "Startup coin-prep recovery remained unresolved",
+            {"error_type": type(exc).__name__},
+            level="warning",
+        )
+        return False
 
 
 def main():
@@ -8716,6 +10214,17 @@ def main():
 
     if args.sage_rpc_smoke:
         sys.exit(_run_sage_rpc_smoke())
+
+    try:
+        _validate_coin_prep_worker_delegation(args)
+    except mutation_gate.MutationBlocked as exc:
+        slog(
+            "SAFETY",
+            "Coin prep worker blocked before wallet access",
+            {"reason_code": exc.reason_code},
+            level="critical",
+        )
+        sys.exit(2)
 
     # Only set env vars when a value was EXPLICITLY passed on command line.
     # Without this guard, stale .env defaults would override the smart

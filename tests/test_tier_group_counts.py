@@ -1,4 +1,5 @@
 import importlib
+import contextlib
 import sys
 import types
 import unittest
@@ -67,6 +68,14 @@ class TierGroupCountTests(unittest.TestCase):
         fake_database.get_open_offers = lambda *args, **kwargs: []
         fake_database.get_offer = lambda *args, **kwargs: None
         fake_database.lock_coin = lambda *args, **kwargs: None
+        fake_database.claim_wallet_effect = lambda *args, **kwargs: None
+        fake_database.begin_wallet_effect_dispatch = lambda *args, **kwargs: None
+        fake_database.complete_wallet_effect_dispatch = lambda *args, **kwargs: None
+        fake_database.retain_wallet_effect_claim_for_reconciliation = (
+            lambda *args, **kwargs: None
+        )
+        fake_database.wallet_effect_claim_is_current = lambda *args, **kwargs: True
+        fake_database.wallet_effect_adapter_dispatch_authority = contextlib.nullcontext
         sys.modules["database"] = fake_database
 
         fake_wallet = types.ModuleType("wallet")

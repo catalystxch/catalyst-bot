@@ -139,10 +139,8 @@ def _fetch_wallet_sync_once() -> dict:
         from config import cfg
 
         wallet_type = getattr(cfg, "WALLET_TYPE", "sage")
-        if wallet_type == "sage":
-            from wallet_sage import get_wallet_sync_status
-        else:
-            from wallet_chia import get_wallet_sync_status
+        from wallet import get_wallet_sync_status
+
         result = get_wallet_sync_status()
         result["_wallet_type"] = wallet_type
         return result
@@ -471,10 +469,7 @@ def _check_cat_wallet_mapping() -> DoctorCheck:
             )
 
         wallet_type = getattr(cfg, "WALLET_TYPE", "sage")
-        if wallet_type == "sage":
-            from wallet_sage import get_wallets
-        else:
-            from wallet_chia import get_wallets
+        from wallet import get_wallets
 
         raw_wallets = get_wallets()
         if not raw_wallets:

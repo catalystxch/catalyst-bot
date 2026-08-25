@@ -31,6 +31,27 @@ def test_splash_node_prefers_user_data_binary(monkeypatch):
     assert os.path.abspath(node.find_binary()) == os.path.abspath(binary_path)
 
 
+def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    submit_calls = []
+
+    def unexpected_get(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+        raise AssertionError("disabled Splash must not make a network health probe")
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", False, raising=False)
+    monkeypatch.setattr(splash_node.requests, "get", unexpected_get)
+
+    node = splash_node.SplashNode()
+    result = node.check_health()
+
+    assert result["process_running"] is False
+    assert result["api_reachable"] is False
+    assert submit_calls == []
+
+
 def test_splash_download_refuses_release_without_checksum(monkeypatch):
     import splash_setup
 
@@ -57,7 +78,7 @@ def test_splash_download_refuses_release_without_checksum(monkeypatch):
         requested_urls.append(url)
         raise AssertionError("binary download should not start without checksum")
 
-    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get, raising=False)
 
     result = splash_setup.download_splash()
 

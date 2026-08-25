@@ -10,9 +10,34 @@ retry policy can be unit-tested in isolation.
 
 Key responsibilities:
     - should_retry_unconsumed_split: detect a silently-missed split
+    - should_extend_pending_pool_confirmation_grace: keep an accepted pool
+      transaction alive while its exact outputs remain pending
     - should_extend_pending_consumed_split_grace: detect in-flight progress
     - Remain completely stateless and side-effect free
 """
+
+
+def remaining_pending_split_poll_seconds(
+    *,
+    elapsed_s: float,
+    split_deadlines: dict[int, float],
+    confirmed_indices: set[int],
+) -> float:
+    """Return time left for the latest still-pending split deadline.
+
+    The caller may extend an individual deadline while evaluating the current
+    wallet snapshot. Recomputing from the mutable deadline map prevents that
+    fresh grace window from being discarded in favour of a stale pre-poll
+    deadline.
+    """
+    pending_deadlines = [
+        float(deadline)
+        for idx, deadline in split_deadlines.items()
+        if idx not in confirmed_indices
+    ]
+    if not pending_deadlines:
+        return 0.0
+    return max(0.0, max(pending_deadlines) - float(elapsed_s))
 
 
 def should_retry_unconsumed_split(
@@ -69,6 +94,32 @@ def should_wait_for_pending_fee_inputs_before_split(
     except (TypeError, ValueError):
         fee = 0
     return bool(is_cat and fee > 0 and not has_dedicated_fee_coin)
+
+
+def should_extend_pending_pool_confirmation_grace(
+    *,
+    tx_known: bool,
+    tx_confirmed: bool,
+    expected_outputs_owned: bool,
+    outputs_selectable: bool,
+    extensions_used: int,
+    max_extensions: int = 1,
+) -> bool:
+    """Return True for an exact, accepted pool transaction still awaiting a block.
+
+    Sage exposes the outputs of an accepted transaction in its owned view before
+    they become selectable.  A fixed confirmation timeout must not turn that
+    authoritative in-flight state into a false hard failure.  The caller keeps
+    the extension bounded and continues to require selectable outputs before it
+    spends any of them.
+    """
+    if extensions_used >= max_extensions:
+        return False
+    if tx_confirmed or not tx_known:
+        return False
+    if outputs_selectable:
+        return False
+    return bool(expected_outputs_owned)
 
 
 def should_extend_pending_consumed_split_grace(

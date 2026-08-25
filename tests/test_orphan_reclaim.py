@@ -16,6 +16,7 @@ Two parts wired together:
 import sys
 import types
 import unittest
+from contextlib import ExitStack, nullcontext
 from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
@@ -93,6 +94,39 @@ def _coin(coin_id: str, amount_mojos: int) -> dict:
 
 
 class OrphanReclaimTests(unittest.TestCase):
+    def setUp(self):
+        self._wallet_effect_authority = ExitStack()
+        for authority_patch in (
+            patch.object(
+                coin_manager,
+                "claim_wallet_effect",
+                return_value={"claim_token": "a" * 64, "generation": 1},
+            ),
+            patch.object(
+                coin_manager, "wallet_effect_claim_is_current", return_value=True
+            ),
+            patch.object(
+                coin_manager, "begin_wallet_effect_dispatch", return_value=object()
+            ),
+            patch.object(
+                coin_manager,
+                "wallet_effect_adapter_dispatch_authority",
+                side_effect=nullcontext,
+            ),
+            patch.object(
+                coin_manager,
+                "complete_wallet_effect_dispatch",
+                return_value="SUBMITTED",
+            ),
+            patch.object(
+                coin_manager,
+                "retain_wallet_effect_claim_for_reconciliation",
+                return_value=True,
+            ),
+        ):
+            self._wallet_effect_authority.enter_context(authority_patch)
+        self.addCleanup(self._wallet_effect_authority.close)
+
     @classmethod
     def tearDownClass(cls):
         # Leave shared modules loaded — popping config would force reimport
@@ -105,6 +139,14 @@ class OrphanReclaimTests(unittest.TestCase):
             coin_manager.CoinManager, "_resolve_fingerprint", return_value="123456789"
         ):
             return coin_manager.CoinManager()
+
+    @staticmethod
+    def _submitted_absorb_receipt(_operation, callback, **_kwargs):
+        return coin_manager._PreparedWalletEffectReceipt(
+            result=callback(),
+            operation={"operation_id": "coin-prep:" + "ab" * 32},
+            dispatch_outcome="SUBMITTED",
+        )
 
     # ==================================================================
     # Part 1: Absorber now sweeps the 'small' bucket
@@ -141,7 +183,10 @@ class OrphanReclaimTests(unittest.TestCase):
 
         def _fake_combine(coin_ids, fee_mojos):
             gathered["ids"] = list(coin_ids)
-            return {"coin_spends": [{}] * len(coin_ids)}
+            return {
+                "transaction_id": "a" * 64,
+                "coin_spends": [{}] * len(coin_ids),
+            }
 
         def _fake_fresh(wallet_id):
             # Return the reserve + all small coins as still selectable.
@@ -151,7 +196,7 @@ class OrphanReclaimTests(unittest.TestCase):
         cfg = coin_manager.cfg
         with (
             patch("wallet.get_wallet_type", return_value="sage"),
-            patch("wallet_sage.combine_coins", side_effect=_fake_combine),
+            patch("wallet.combine_coins", side_effect=_fake_combine),
             patch("coin_manager._get_free_coins_rpc", side_effect=_fake_fresh),
             patch.object(cfg, "COIN_MAX_SIZE_RATIO", "1.5"),
             patch.object(cfg, "CAT_DECIMALS", 3),
@@ -161,6 +206,14 @@ class OrphanReclaimTests(unittest.TestCase):
             ),
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
             ),
         ):
             result = m._absorb_misfits_to_reserve(
@@ -208,7 +261,7 @@ class OrphanReclaimTests(unittest.TestCase):
 
         def _fake_combine(coin_ids, fee_mojos):
             gathered["ids"] = list(coin_ids)
-            return {"coin_spends": [{}]}
+            return {"transaction_id": "b" * 64, "coin_spends": [{}]}
 
         def _fake_fresh(wallet_id):
             return {"confirmed_records": [reserve_coin] + small_bucket}
@@ -216,7 +269,7 @@ class OrphanReclaimTests(unittest.TestCase):
         cfg = coin_manager.cfg
         with (
             patch("wallet.get_wallet_type", return_value="sage"),
-            patch("wallet_sage.combine_coins", side_effect=_fake_combine),
+            patch("wallet.combine_coins", side_effect=_fake_combine),
             patch("coin_manager._get_free_coins_rpc", side_effect=_fake_fresh),
             patch.object(cfg, "COIN_MAX_SIZE_RATIO", "1.5"),
             patch.object(cfg, "CAT_DECIMALS", 3),
@@ -226,6 +279,14 @@ class OrphanReclaimTests(unittest.TestCase):
             ),
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
             ),
         ):
             m._absorb_misfits_to_reserve(
@@ -271,7 +332,7 @@ class OrphanReclaimTests(unittest.TestCase):
 
         def _fake_combine(coin_ids, fee_mojos):
             gathered["ids"] = list(coin_ids)
-            return {"coin_spends": [{}]}
+            return {"transaction_id": "c" * 64, "coin_spends": [{}]}
 
         def _fake_fresh(wallet_id):
             return {"confirmed_records": [reserve_coin] + small_bucket}
@@ -279,7 +340,7 @@ class OrphanReclaimTests(unittest.TestCase):
         cfg = coin_manager.cfg
         with (
             patch("wallet.get_wallet_type", return_value="sage"),
-            patch("wallet_sage.combine_coins", side_effect=_fake_combine),
+            patch("wallet.combine_coins", side_effect=_fake_combine),
             patch("coin_manager._get_free_coins_rpc", side_effect=_fake_fresh),
             patch.object(cfg, "COIN_MAX_SIZE_RATIO", "1.5"),
             patch.object(m, "_tx_fee_mojos", return_value=10_000_000_000),
@@ -288,6 +349,14 @@ class OrphanReclaimTests(unittest.TestCase):
             ),
             patch.object(
                 m, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(m, "_get_owned_coin_amount_map", return_value={"seen": 1}),
+            patch.object(m, "_build_runtime_absorb_prep_contract", return_value={}),
+            patch.object(m, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=self._submitted_absorb_receipt,
             ),
         ):
             m._absorb_misfits_to_reserve(

@@ -18,6 +18,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
 
@@ -41,6 +43,7 @@ class PublicReadinessSmokeTests(unittest.TestCase):
         self.client = api_server.app.test_client()
         self.auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()

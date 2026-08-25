@@ -24,9 +24,36 @@ import inspect
 import json
 import traceback
 from decimal import Decimal
+from functools import wraps
+from types import FunctionType, MappingProxyType
 
 
 _LOOPBACK_ENVIRON = {"REMOTE_ADDR": "127.0.0.1"}
+_mutation_guarded_functions: set[object] = set()
+_MISSING_STATIC_ATTRIBUTE = object()
+
+
+def _bridge_runtime_api(instance):
+    """Resolve the private API reference without invoking public descriptors."""
+
+    api = _APP_BRIDGE_API_SLOT.__get__(instance, AppBridge)
+    if api is None:
+        import api_server
+
+        api = api_server
+        _APP_BRIDGE_API_SLOT.__set__(instance, api)
+    return api
+
+
+def _has_static_descriptor_protocol(value) -> bool:
+    """Inspect descriptor capability without calling hostile object hooks."""
+
+    try:
+        value_type = type(value)
+        mro = type.__getattribute__(value_type, "__mro__")
+        return any("__get__" in type.__getattribute__(base, "__dict__") for base in mro)
+    except Exception:
+        return True
 
 
 def _loopback_environ():
@@ -77,6 +104,7 @@ def _safe(func):
     max_positional = sum(1 for p in params if p.kind in _POSITIONAL_KINDS)
     has_var_positional = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
 
+    @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             if not has_var_positional and len(args) > max_positional:
@@ -93,8 +121,39 @@ def _safe(func):
                 "error": "Internal error — check bot logs for details",
             }
 
-    wrapper.__name__ = func.__name__
+    if func in _mutation_guarded_functions:
+        _mutation_guarded_functions.add(wrapper)
     return wrapper
+
+
+def _mutation_guard(operation: str):
+    """Fail closed before direct bridge calls that bypass Flask hooks."""
+
+    def decorate(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            api = _bridge_runtime_api(self)
+            api._ensure_mutation_runtime()
+            permit = None
+            try:
+                permit = api.mutation_gate.enter_mutation(operation)
+            except api.mutation_gate.MutationBlocked as exc:
+                return {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                    "operation": operation,
+                }
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                api.mutation_gate.exit_mutation(permit)
+
+        wrapper._mutation_operation = operation
+        _mutation_guarded_functions.add(wrapper)
+        return wrapper
+
+    return decorate
 
 
 class AppBridge:
@@ -105,21 +164,71 @@ class AppBridge:
         window.pywebview.api.method_name(args)
     """
 
+    __slots__ = ("_api", "__dict__")
+
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError(
+            "AppBridge is final; subclasses cannot replace __getattribute__"
+        )
+
     def __init__(self):
         """
         Initialize the bridge. Bot and modules are accessed lazily through
         api_server to avoid circular imports.
         """
-        self._api = None
+        _APP_BRIDGE_API_SLOT.__set__(self, None)
+
+    def __getattribute__(self, name):
+        """Default every future public callable to mutation-guarded access."""
+
+        if name.startswith("_"):
+            return object.__getattribute__(self, name)
+        static_value = inspect.getattr_static(self, name, _MISSING_STATIC_ATTRIBUTE)
+        if static_value is _APP_BRIDGE_API_PROPERTY:
+            return object.__getattribute__(self, name)
+        if isinstance(static_value, FunctionType) and (
+            static_value in _APP_BRIDGE_ACCESS_BY_FUNCTION
+        ):
+            return object.__getattribute__(self, name)
+        if (
+            static_value is not _MISSING_STATIC_ATTRIBUTE
+            and not callable(static_value)
+            and not _has_static_descriptor_protocol(static_value)
+        ):
+            return object.__getattribute__(self, name)
+
+        def guarded_future_method(*args, **kwargs):
+            api = _bridge_runtime_api(self)
+            api._ensure_mutation_runtime()
+            operation = f"app_bridge:{name}"
+            permit = None
+            try:
+                permit = api.mutation_gate.enter_mutation(operation)
+            except api.mutation_gate.MutationBlocked as exc:
+                return {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                    "operation": operation,
+                }
+            try:
+                try:
+                    target = object.__getattribute__(self, name)
+                except AttributeError:
+                    fallback = getattr(type(self), "__getattr__", None)
+                    if fallback is None:
+                        raise
+                    target = fallback(self, name)
+                return target(*args, **kwargs)
+            finally:
+                api.mutation_gate.exit_mutation(permit)
+
+        return guarded_future_method
 
     @property
     def api(self):
         """Lazy import of api_server to avoid circular imports."""
-        if self._api is None:
-            import api_server
-
-            self._api = api_server
-        return self._api
+        return _bridge_runtime_api(self)
 
     # -----------------------------------------------------------------------
     # Clipboard (WebView2 blocks execCommand paste — read from Python side)
@@ -167,6 +276,7 @@ class AppBridge:
     # -----------------------------------------------------------------------
 
     @_safe
+    @_mutation_guard("app_bridge:start_bot")
     def start_bot(self, _body=None):
         """Start the bot loop. Maps to POST /api/bot/start.
         Delegates fully to api_server.api_bot_start() which runs all pre-start
@@ -249,6 +359,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:update_config")
     def update_config(self, body=None):
         """
         Update configuration. Maps to POST /api/config.
@@ -267,6 +378,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:live_config")
     def live_config(self, body=None):
         """Apply a live config change. Maps to POST /api/config/live."""
         import api_server
@@ -282,6 +394,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reload_config")
     def reload_config(self, _body=None):
         """Reload config from disk. Maps to POST /api/config/reload."""
         import api_server
@@ -296,6 +409,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:apply_config")
     def apply_config(self, body=None):
         """Apply config changes. Maps to POST /api/config/apply."""
         import api_server
@@ -424,6 +538,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cancel_all_offers")
     def cancel_all_offers(self, _body=None):
         """Cancel all offers. Maps to POST /api/offers/cancel_all."""
         import api_server
@@ -447,6 +562,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cancel_offer")
     def cancel_offer(self, body=None):
         """Cancel a single offer. Maps to POST /api/offers/cancel."""
         import api_server
@@ -462,6 +578,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:cleanup_orphans")
     def cleanup_orphans(self, _body=None):
         """Clean up orphaned offers. Maps to POST /api/offers/cleanup_orphans."""
         import api_server
@@ -498,6 +615,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:purge_fills")
     def purge_fills(self, _body=None):
         """Purge fill history. Maps to POST /api/fills/purge."""
         import api_server
@@ -553,6 +671,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_pnl")
     def reset_pnl(self, body=None):
         """Reset PnL counters. Maps to POST /api/pnl/reset."""
         import api_server
@@ -568,6 +687,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_offer_history")
     def reset_offer_history(self, body=None):
         """Clear terminal offer-history rows. Maps to POST /api/reset/offer-history."""
         import api_server
@@ -583,6 +703,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_full")
     def reset_full(self, body=None):
         """Run the combined data reset. Maps to POST /api/reset/full."""
         import api_server
@@ -602,6 +723,7 @@ class AppBridge:
     # -----------------------------------------------------------------------
 
     @_safe
+    @_mutation_guard("app_bridge:fresh_start")
     def fresh_start(self, body=None):
         """Clear session state. Maps to POST /api/session/fresh-start."""
         import api_server
@@ -639,6 +761,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:trigger_topup")
     def trigger_topup(self, _body=None):
         """Trigger coin topup. Maps to POST /api/coins/topup."""
         import api_server
@@ -662,6 +785,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:trigger_coin_prep")
     def trigger_coin_prep(self, _body=None):
         """Trigger coin prep. Maps to POST /api/coin-prep/trigger."""
         import api_server
@@ -676,6 +800,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reset_coin_prep")
     def reset_coin_prep(self, _body=None):
         """Reset coin prep state. Maps to POST /api/coin-prep/reset."""
         import api_server
@@ -717,6 +842,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:activate_boost")
     def activate_boost(self, body=None):
         """Activate boost. Maps to POST /api/boost/activate."""
         import api_server
@@ -732,6 +858,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:deactivate_boost")
     def deactivate_boost(self, _body=None):
         """Deactivate boost. Maps to POST /api/boost/deactivate."""
         import api_server
@@ -804,6 +931,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:dismiss_alert")
     def dismiss_alert(self, body=None):
         """Dismiss an alert. Maps to POST /api/alerts/dismiss."""
         import api_server
@@ -837,6 +965,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:clear_logs")
     def clear_logs(self, _body=None):
         """Clear logs. Maps to POST /api/logs/clear."""
         import api_server
@@ -961,6 +1090,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_update_install")
     def start_update_install(self, _body=None):
         """Start secure updater. Maps to POST /api/update/install."""
         import api_server
@@ -1030,6 +1160,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:select_cat")
     def select_cat(self, body=None):
         """Select active CAT. Maps to POST /api/cat/select."""
         import api_server
@@ -1045,6 +1176,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:refresh_cat")
     def refresh_cat(self, _body=None):
         """Refresh CAT data. Maps to POST /api/cat/refresh."""
         import api_server
@@ -1082,6 +1214,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:begin_startup")
     def begin_startup(self, body=None):
         """Begin wallet startup. Maps to POST /api/wallet/begin-startup."""
         import api_server
@@ -1106,6 +1239,18 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def get_safety_status(self):
+        """Get redacted startup safety status without crossing HTTP."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/safety/status"):
+            resp = api_server.api_safety_status()
+        result = _unwrap_flask_response(resp)
+        if type(result) is not dict:
+            raise RuntimeError("malformed safety status response")
+        return result
+
+    @_safe
     def get_fingerprints(self):
         """List wallet fingerprints. Maps to GET /api/sage/fingerprints."""
         import api_server
@@ -1115,6 +1260,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_with_fingerprint")
     def start_with_fingerprint(self, body=None):
         """Start with fingerprint. Maps to POST /api/sage/start-with-fingerprint."""
         import api_server
@@ -1130,6 +1276,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:set_sage_fingerprint")
     def set_sage_fingerprint(self, body=None):
         """Persist and start Sage fingerprint. Maps to POST /api/sage/fingerprint."""
         import api_server
@@ -1183,6 +1330,7 @@ class AppBridge:
             return {"success": False, "error": "File picker unavailable"}
 
     @_safe
+    @_mutation_guard("app_bridge:setup_certs")
     def setup_certs(self, body=None):
         """Setup Sage certificates. Maps to POST /api/sage/setup-certs."""
         import api_server
@@ -1228,6 +1376,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:repost_dexie")
     def repost_dexie(self, _body=None):
         """Repost to Dexie. Maps to POST /api/dexie/repost."""
         import api_server
@@ -1273,6 +1422,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:download_splash_setup")
     def download_splash_setup(self, _body=None):
         """Download Splash binary. Maps to POST /api/splash/setup/download."""
         import api_server
@@ -1296,6 +1446,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:start_splash_node")
     def start_splash_node(self, _body=None):
         """Start Splash node. Maps to POST /api/splash/node/start."""
         import api_server
@@ -1319,6 +1470,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:set_splash_receive")
     def set_splash_receive(self, body=None):
         """Set Splash receive enabled. Maps to POST /api/splash/receive."""
         import api_server
@@ -1347,6 +1499,7 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:setup_spacescan")
     def setup_spacescan(self, body=None):
         """Setup Spacescan. Maps to POST /api/spacescan/setup."""
         import api_server
@@ -1567,6 +1720,159 @@ class AppBridge:
         ):
             resp = api_server.api_open_external()
         return _unwrap_flask_response(resp)
+
+
+# Explicit PyWebView authority inventory.  Adding a method to AppBridge without
+# placing it in exactly one set makes import fail; a callable attached later at
+# runtime is still mutation-guarded by __getattribute__.
+_APP_BRIDGE_API_PROPERTY = vars(AppBridge)["api"]
+_APP_BRIDGE_API_SLOT = vars(AppBridge)["_api"]
+_APP_BRIDGE_MUTATION_METHODS = {
+    "activate_boost",
+    "apply_config",
+    "begin_startup",
+    "cancel_all_offers",
+    "cancel_offer",
+    "cleanup_orphans",
+    "clear_logs",
+    "deactivate_boost",
+    "dismiss_alert",
+    "download_splash_setup",
+    "fresh_start",
+    "live_config",
+    "purge_fills",
+    "refresh_cat",
+    "reload_config",
+    "repost_dexie",
+    "reset_coin_prep",
+    "reset_full",
+    "reset_offer_history",
+    "reset_pnl",
+    "select_cat",
+    "set_sage_fingerprint",
+    "set_splash_receive",
+    "setup_certs",
+    "setup_spacescan",
+    "start_bot",
+    "start_splash_node",
+    "start_update_install",
+    "start_with_fingerprint",
+    "trigger_coin_prep",
+    "trigger_topup",
+    "update_config",
+}
+_APP_BRIDGE_CONTROL_METHODS = {
+    "browse_sage_cert",
+    "close_window",
+    "confirm_close_window",
+    "download_logs",
+    "export_fills",
+    "maximize_window",
+    "minimize_window",
+    "move_window",
+    "open_external",
+    "resize_window",
+    "restart_sage",
+    "shutdown",
+    "stop_bot",
+    "toggle_console",
+}
+_APP_BRIDGE_READ_ONLY_METHODS = {
+    "check_resume",
+    "check_splash_setup",
+    "check_update",
+    "get_alerts",
+    "get_app_info",
+    "get_boost_state",
+    "get_bot_state",
+    "get_cancel_all_status",
+    "get_cats",
+    "get_coin_prep_status",
+    "get_coins",
+    "get_config",
+    "get_console_status",
+    "get_dashboard",
+    "get_dexie_stats",
+    "get_fees_status",
+    "get_fills",
+    "get_fingerprint",
+    "get_fingerprints",
+    "get_health",
+    "get_inventory",
+    "get_logs",
+    "get_market_intel",
+    "get_market_orderbook",
+    "get_market_slippage",
+    "get_market_summary",
+    "get_offers",
+    "get_offers_diagnostic",
+    "get_pnl",
+    "get_pnl_reset_preview",
+    "get_price",
+    "get_price_info",
+    "get_reservations",
+    "get_risk_spreads",
+    "get_runtime_diagnostics",
+    "get_sage_cert_candidates",
+    "get_settings_defaults",
+    "get_smart_defaults",
+    "get_spacescan_status",
+    "get_splash_node",
+    "get_splash_receive",
+    "get_splash_setup_progress",
+    "get_splash_stats",
+    "get_safety_status",
+    "get_startup_status",
+    "get_stats",
+    "get_status",
+    "get_update_status",
+    "get_window_pos",
+    "get_window_size",
+    "is_sage_running",
+    "read_clipboard",
+    "refresh_balances",
+    "run_doctor",
+    "validate_config",
+    "validate_settings",
+    "verify_coin_prep",
+}
+
+_APP_BRIDGE_ACCESS_SETS = (
+    ("mutation", _APP_BRIDGE_MUTATION_METHODS),
+    ("read_only", _APP_BRIDGE_READ_ONLY_METHODS),
+    ("control", _APP_BRIDGE_CONTROL_METHODS),
+)
+_classified_bridge_methods: set[str] = set()
+_bridge_access_by_function: dict[object, str] = {}
+for _access, _names in _APP_BRIDGE_ACCESS_SETS:
+    if _classified_bridge_methods.intersection(_names):
+        raise RuntimeError("AppBridge access classification overlaps")
+    _classified_bridge_methods.update(_names)
+    for _name in _names:
+        _method = vars(AppBridge).get(_name)
+        if not callable(_method):
+            raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
+        if _access == "mutation" and _method not in _mutation_guarded_functions:
+            raise RuntimeError(
+                f"AppBridge mutation callable lacks mutation guard: {_name}"
+            )
+        if _method in _bridge_access_by_function:
+            raise RuntimeError(
+                f"AppBridge callable identity is classified twice: {_name}"
+            )
+        _bridge_access_by_function[_method] = _access
+
+_public_bridge_methods = {
+    _name
+    for _name, _value in vars(AppBridge).items()
+    if not _name.startswith("_") and callable(_value)
+}
+if _public_bridge_methods != _classified_bridge_methods:
+    raise RuntimeError("AppBridge public-callable access classification is incomplete")
+
+_APP_BRIDGE_ACCESS_BY_FUNCTION = MappingProxyType(_bridge_access_by_function)
+_TRUSTED_MUTATION_FUNCTIONS = frozenset(_mutation_guarded_functions)
+del _bridge_access_by_function
 
 
 # ---------------------------------------------------------------------------

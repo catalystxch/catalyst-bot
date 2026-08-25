@@ -11,7 +11,6 @@ can still inspect it.
 
 from __future__ import annotations
 
-import threading
 import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -19,6 +18,7 @@ from decimal import Decimal
 from flask import Blueprint, current_app, jsonify, request
 
 import api_server
+import database
 from config import cfg
 from database import log_event, get_stats, get_connection
 from super_log import slog
@@ -47,6 +47,39 @@ def _decimal_or_none(value) -> Decimal | None:
 
 _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
+
+
+def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
+    """Return exact retry authority for wallet-active, no-effect failures."""
+
+    exact_open_ids = {
+        trade_id for trade_id in open_ids if type(trade_id) is str and trade_id
+    }
+    try:
+        candidates = database.get_retryable_failed_offer_cancels()
+    except Exception as exc:
+        log_event(
+            "error",
+            "cancel_all_retry_journal_unavailable",
+            f"Could not read durable failed cancellations: {type(exc).__name__}",
+        )
+        return {}
+    retries: dict[str, int] = {}
+    for row in candidates if type(candidates) is list else []:
+        if type(row) is not dict:
+            continue
+        trade_id = row.get("trade_id")
+        attempt = row.get("attempt")
+        if (
+            trade_id in exact_open_ids
+            and row.get("operation_id") == f"cancel:{trade_id}"
+            and type(attempt) is int
+            and not isinstance(attempt, bool)
+            and attempt >= 1
+            and trade_id not in retries
+        ):
+            retries[trade_id] = attempt
+    return retries
 
 
 def _norm_offer_state(value) -> str:
@@ -333,14 +366,9 @@ def api_cancel_all():
             api_server.events.emit(
                 "offers_cancelled", {"count": cancelled, "reason": "manual_cancel_all"}
             )
-            # Reset gap closer state if active (cancel_all includes gap-closer offers)
-            if bot.boost_manager._boost_active:
-                bot.boost_manager._boost_active = False
-                bot.boost_manager._active_boost_ids.clear()
-                bot.boost_manager._boost_mid_price = Decimal("0")
-                bot.boost_manager._gap_spread_bps = 0
-                bot.boost_manager._convergence_factor = Decimal("1.0")
-                api_server.events.emit("boost", {"active": False})
+            # Cancel submission is not terminal proof.  Boost protection stays
+            # materialized until its normal reconciliation/prune path observes
+            # an authoritative Task 9 terminal journal.
         except Exception as e:
             _set_cancel_all_state(
                 running=False,
@@ -361,11 +389,7 @@ def api_cancel_all():
         # and the GUI can poll /api/offers/cancel_all/status for live progress
         # instead of hanging for 2-3 minutes with no feedback.
         try:
-            from wallet import (
-                get_all_offers,
-                cancel_offers_batch,
-                is_offer_time_expired,
-            )
+            from wallet import get_all_offers
 
             all_offers = get_all_offers(include_completed=False, end=500)
             if not all_offers:
@@ -411,10 +435,9 @@ def api_cancel_all():
                     isinstance(raw_status, int) and raw_status <= 1
                 )
                 if is_open:
-                    if not is_offer_time_expired(o):
-                        tid = o.get("trade_id", "") or o.get("offer_id", "")
-                        if tid:
-                            open_ids.append(tid)
+                    tid = o.get("trade_id", "") or o.get("offer_id", "")
+                    if tid:
+                        open_ids.append(tid)
 
             if not open_ids:
                 if bot and getattr(bot, "offer_manager", None):
@@ -437,6 +460,30 @@ def api_cancel_all():
                     }
                 )
 
+            durable_manager = (
+                getattr(bot, "offer_manager", None) if bot is not None else None
+            )
+            if durable_manager is None:
+                coordinator_error = "Offer cancellation coordinator is unavailable"
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=coordinator_error,
+                    phase="error",
+                    message=coordinator_error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": coordinator_error,
+                            "reason": "DURABLE_CANCEL_COORDINATOR_UNAVAILABLE",
+                        }
+                    ),
+                    503,
+                )
+
             # Set initial progress state — frontend polls this immediately.
             _set_cancel_all_state(
                 running=True,
@@ -449,43 +496,47 @@ def api_cancel_all():
                 current_batch=1,
                 cancelled=0,
                 failed=0,
-                message=f"Cancelling {len(open_ids)} offers directly from the wallet...",
+                message=f"Journaling {len(open_ids)} offer cancellation requests...",
             )
             log_event(
                 "info",
-                "cancel_all_direct",
-                f"Cancelling {len(open_ids)} offers directly via wallet "
-                f"(bot stopped, bypassing DB)",
+                "cancel_all_durable",
+                f"Journaling {len(open_ids)} offer cancellation requests "
+                "while the bot is stopped",
             )
 
             # ---- Background worker ----
             _cancel_open_ids = list(open_ids)  # snapshot
+            _retry_failed_attempts = _durable_failed_cancel_retry_attempts(
+                _cancel_open_ids
+            )
 
             def _cancel_all_worker():
-                _w_cancelled = 0
+                _w_pending = 0
                 _w_failed = 0
                 try:
-                    _results = cancel_offers_batch(_cancel_open_ids, secure=True)
-                    _cancelled_ids = []
-                    for _tid, _res in _results.items():
-                        if _res and _res.get("success"):
-                            _w_cancelled += 1
-                            _cancelled_ids.append(_tid)
-                        else:
+                    _cancel_kwargs = {
+                        "reason": "manual_cancel_all",
+                        "force_storm": True,
+                    }
+                    if _retry_failed_attempts:
+                        _cancel_kwargs["_retry_failed_attempts"] = (
+                            _retry_failed_attempts
+                        )
+                    _results = durable_manager.cancel_offers(
+                        _cancel_open_ids, **_cancel_kwargs
+                    )
+                    for _tid in _cancel_open_ids:
+                        _res = _results.get(_tid) if type(_results) is dict else None
+                        if (
+                            type(_res) is dict
+                            and _res.get("outcome") == "CANCEL_FAILED"
+                        ):
                             _w_failed += 1
-                    # Sync DB: mark cancelled offers so they don't reappear
-                    if _cancelled_ids:
-                        try:
-                            conn = get_connection()
-                            for _tid in _cancelled_ids:
-                                conn.execute(
-                                    "UPDATE offers SET status='cancelled' "
-                                    "WHERE trade_id=? AND status='open'",
-                                    (_tid,),
-                                )
-                            conn.commit()
-                        except Exception:
-                            pass  # DB sync is best-effort
+                        else:
+                            # Submitted, unknown, malformed, and any claimed
+                            # confirmation all remain nonterminal here.
+                            _w_pending += 1
                     _set_cancel_all_state(
                         running=False,
                         complete=True,
@@ -495,43 +546,33 @@ def api_cancel_all():
                         batch_size=len(_cancel_open_ids),
                         total_batches=1,
                         current_batch=1,
-                        batch_cancelled=_w_cancelled,
+                        batch_cancelled=0,
                         batch_failed=_w_failed,
-                        cancelled=_w_cancelled,
+                        cancelled=0,
+                        pending=_w_pending,
                         failed=_w_failed,
                         finished_at=datetime.now(timezone.utc).isoformat(),
-                        message=f"Cancel all complete: {_w_cancelled} succeeded, {_w_failed} failed.",
+                        message=(
+                            "Cancellation requests journaled: "
+                            f"{_w_pending} pending reconciliation, "
+                            f"{_w_failed} rejected without effect."
+                        ),
                     )
                     api_server.events.emit(
-                        "offers_cancelled",
-                        {"count": _w_cancelled, "reason": "manual_cancel_all"},
+                        "offer_cancels_journaled",
+                        {
+                            "count": len(_cancel_open_ids),
+                            "pending": _w_pending,
+                            "failed": _w_failed,
+                            "reason": "manual_cancel_all",
+                        },
                     )
-                    if (
-                        _w_cancelled > 0
-                        and _w_failed == 0
-                        and bot
-                        and getattr(bot, "offer_manager", None)
-                    ):
-                        bot.offer_manager.expect_empty_wallet_offer_book(
-                            "manual_cancel_all"
-                        )
                     log_event(
                         "info",
-                        "cancel_all_complete",
-                        f"Cancel all finished: {_w_cancelled} succeeded, {_w_failed} failed",
+                        "cancel_all_journaled",
+                        f"Cancel all journaled: {_w_pending} pending, "
+                        f"{_w_failed} failed",
                     )
-                    # Reset gap closer state if active
-                    if bot and getattr(bot, "boost_manager", None):
-                        try:
-                            if bot.boost_manager._boost_active:
-                                bot.boost_manager._boost_active = False
-                                bot.boost_manager._active_boost_ids.clear()
-                                bot.boost_manager._boost_mid_price = Decimal("0")
-                                bot.boost_manager._gap_spread_bps = 0
-                                bot.boost_manager._convergence_factor = Decimal("1.0")
-                                api_server.events.emit("boost", {"active": False})
-                        except Exception:
-                            pass
                 except Exception as _e:
                     _set_cancel_all_state(
                         running=False,
@@ -547,10 +588,32 @@ def api_cancel_all():
                         f"Cancel all background worker failed: {_e}",
                     )
 
-            _t = threading.Thread(
-                target=_cancel_all_worker, name="cancel-all-bg", daemon=True
-            )
-            _t.start()
+            try:
+                _t = api_server.start_mutation_thread(
+                    operation="api:offers:cancel_all_worker",
+                    target=_cancel_all_worker,
+                    name="cancel-all-bg",
+                )
+            except api_server.mutation_gate.MutationBlocked as exc:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="Mutation shutdown is in progress",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message="Cancel all did not start because shutdown is in progress.",
+                )
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": "mutation_gate_blocked",
+                            "reason": exc.reason_code,
+                        }
+                    ),
+                    423,
+                )
+            api_server._cancel_all_thread = _t
 
             # Return immediately — frontend polls /api/offers/cancel_all/status
             return jsonify(
@@ -635,9 +698,84 @@ def api_cancel_offer():
     except Exception:
         return api_server._api_exception(request.path)
     # cancel_offers returns a dict; surface any storm-protection refusal
-    if isinstance(result, dict) and result.get("error"):
+    if type(result) is dict and result.get("error"):
         return jsonify({"success": False, "trade_id": trade_id, **result}), 400
-    return jsonify({"success": True, "status": "cancelled", "trade_id": trade_id})
+    trade_result = result.get(trade_id) if type(result) is dict else None
+    outcome = trade_result.get("outcome") if type(trade_result) is dict else None
+    if outcome == "CANCEL_SUBMITTED_UNCONFIRMED":
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "status": "pending_reconciliation",
+                    "confirmed": False,
+                    "outcome": outcome,
+                    "trade_id": trade_id,
+                }
+            ),
+            202,
+        )
+    if outcome in {"CANCEL_UNKNOWN", "CANCEL_CONFIRMED"}:
+        # A manager-side confirmation claim is not authoritative in Task 8;
+        # expose the same fail-closed reconciliation state as an unknown.
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "status": "pending_reconciliation",
+                    "confirmed": False,
+                    "outcome": "CANCEL_UNKNOWN",
+                    "trade_id": trade_id,
+                }
+            ),
+            202,
+        )
+    if type(trade_result) is not dict or trade_result.get("success") is not True:
+        reason_value = (
+            trade_result.get("reason") if type(trade_result) is dict else None
+        )
+        reason = (
+            reason_value
+            if type(reason_value) is str and reason_value
+            else "WALLET_MUTATION_FAILED"
+        )
+        identity_reasons = {
+            "WALLET_BACKEND_UNSUPPORTED",
+            "WALLET_IDENTITY_BINDING_INVALID",
+            "WALLET_IDENTITY_MALFORMED",
+            "WALLET_IDENTITY_MISMATCH",
+            "WALLET_IDENTITY_NON_SIGNING",
+            "WALLET_IDENTITY_STALE",
+            "WALLET_IDENTITY_UNAVAILABLE",
+        }
+        if reason in identity_reasons:
+            error = "Wallet mutation blocked by identity safety check"
+        else:
+            error = "Offer cancellation failed"
+            reason = "WALLET_MUTATION_FAILED"
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "trade_id": trade_id,
+                    "error": error,
+                    "reason": reason,
+                }
+            ),
+            400,
+        )
+    # Legacy truthy success without a typed outcome is never terminal proof.
+    return (
+        jsonify(
+            {
+                "success": False,
+                "trade_id": trade_id,
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            }
+        ),
+        400,
+    )
 
 
 @bp.route("/api/fills")
@@ -674,7 +812,7 @@ def api_fills_classified():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
         from fill_classifier import FillType
 
         classification_filter = request.args.get("type") or None
@@ -689,44 +827,47 @@ def api_fills_classified():
         cat_asset_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
 
         params = [cat_asset_id]
-        where = [
-            "cat_asset_id = ?",
-            "COALESCE(verification_status, 'legacy') LIKE 'verified%'",
-        ]
+        where = ["f.cat_asset_id = ?"]
 
         if classification_filter:
             if classification_filter == "arb":
                 # Any arb-flavoured classification
                 where.append(
-                    "fill_classification IN ('arb_sweep_buy','arb_sweep_sell','dexie_combined')"
+                    "f.fill_classification IN "
+                    "('arb_sweep_buy','arb_sweep_sell','dexie_combined')"
                 )
             else:
-                where.append("COALESCE(fill_classification,'unknown') = ?")
+                where.append("COALESCE(f.fill_classification,'unknown') = ?")
                 params.append(classification_filter)
 
         if side_filter in ("buy", "sell"):
-            where.append("side = ?")
+            where.append("f.side = ?")
             params.append(side_filter)
 
         if since:
-            where.append("filled_at >= ?")
+            where.append("f.filled_at >= ?")
             params.append(since)
 
         where_clause = " AND ".join(where)
 
         # Total count for pagination metadata
         count_row = conn.execute(
-            f"SELECT COUNT(*) FROM fills WHERE {where_clause}", params
+            "SELECT COUNT(*) FROM fills AS f "
+            + _economic_fill_authority_join()
+            + f" WHERE {where_clause}",
+            params,
         ).fetchone()
         total = count_row[0] if count_row else 0
 
         rows = conn.execute(
-            f"""SELECT fill_id, trade_id, side, price_xch, size_xch, size_cat,
-                       tier, filled_at, fill_classification, taker_puzzle_hash,
-                       spent_block_index, sweep_group_id, round_trip_id
-                FROM fills
+            f"""SELECT f.fill_id, f.trade_id, f.side, f.price_xch,
+                       f.size_xch, f.size_cat, f.tier, f.filled_at,
+                       f.fill_classification, f.taker_puzzle_hash,
+                       f.spent_block_index, f.sweep_group_id, f.round_trip_id
+                FROM fills AS f
+                {_economic_fill_authority_join()}
                 WHERE {where_clause}
-                ORDER BY filled_at DESC
+                ORDER BY f.filled_at DESC
                 LIMIT ? OFFSET ?""",
             params + [limit, offset],
         ).fetchall()
@@ -792,21 +933,21 @@ def api_fills_arb_wallets():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
 
         conn = get_connection()
         cat_asset_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
 
         # Fetch all fills that have a taker_puzzle_hash recorded
         rows = conn.execute(
-            """SELECT taker_puzzle_hash, fill_classification, sweep_group_id,
-                      side, filled_at
-               FROM fills
-               WHERE taker_puzzle_hash IS NOT NULL
-                 AND taker_puzzle_hash != ''
-                 AND cat_asset_id = ?
-                 AND COALESCE(verification_status, 'legacy') LIKE 'verified%'
-               ORDER BY filled_at DESC""",
+            """SELECT f.taker_puzzle_hash, f.fill_classification,
+                      f.sweep_group_id, f.side, f.filled_at
+               FROM fills AS f """
+            + _economic_fill_authority_join()
+            + """ WHERE f.taker_puzzle_hash IS NOT NULL
+                 AND f.taker_puzzle_hash != ''
+                 AND f.cat_asset_id = ?
+               ORDER BY f.filled_at DESC""",
             (cat_asset_id,),
         ).fetchall()
 
@@ -939,7 +1080,7 @@ def api_market_fill_intel():
     bot = api_server.bot
     cfg = api_server.cfg
     try:
-        from database import get_connection
+        from database import get_connection, _economic_fill_authority_join
 
         days = min(int(request.args.get("days", 7)), 90)
         tz_offset = float(request.args.get("tz_offset_hours", 0))
@@ -949,12 +1090,12 @@ def api_market_fill_intel():
 
         # ── Fetch fills within window ──────────────────────────────────────────
         rows = conn.execute(
-            """SELECT fill_classification, sweep_group_id, side, filled_at
-               FROM fills
-               WHERE cat_asset_id = ?
-                 AND COALESCE(verification_status, 'legacy') LIKE 'verified%'
-                 AND filled_at >= datetime('now', ? || ' days')
-               ORDER BY filled_at ASC""",
+            """SELECT f.fill_classification, f.sweep_group_id, f.side, f.filled_at
+               FROM fills AS f """
+            + _economic_fill_authority_join()
+            + """ WHERE f.cat_asset_id = ?
+                 AND f.filled_at >= datetime('now', ? || ' days')
+               ORDER BY f.filled_at ASC""",
             (cat_asset_id, f"-{days}"),
         ).fetchall()
 
@@ -1281,30 +1422,16 @@ def api_purge_fills():
     slog("GUI_ACTION", ">>> BUTTON: Purge Fill Records")
 
     try:
-        from database import get_connection, log_event
+        from database import guarded_reset_authoritative_state, log_event
 
-        conn = get_connection()
-
-        # Count before purge
-        fill_count = conn.execute("SELECT COUNT(*) as cnt FROM fills").fetchone()["cnt"]
-        rt_count = (
-            conn.execute("SELECT COUNT(*) as cnt FROM round_trips").fetchone()["cnt"]
-            if conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-            ).fetchone()
-            else 0
+        reset = guarded_reset_authoritative_state(
+            clear_fills=True,
+            clear_round_trips=True,
         )
-
-        # Purge fills
-        conn.execute("DELETE FROM fills")
-        conn.commit()
-
-        # Purge round_trips if table exists
-        if conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-        ).fetchone():
-            conn.execute("DELETE FROM round_trips")
-            conn.commit()
+        if not reset["success"]:
+            return jsonify(reset), 409
+        fill_count = int(reset["fills_cleared"])
+        rt_count = int(reset["round_trips_cleared"])
 
         log_event(
             "info",
@@ -1464,6 +1591,8 @@ def api_pnl_reset():
             preserve_history=False,
             reason="pnl_reset_stats",
         )
+        if not summary["success"]:
+            return jsonify(api_server._serialize_dict(summary)), 409
         return jsonify(
             {
                 "success": True,
@@ -1515,31 +1644,13 @@ def api_reset_offer_history():
                 }
             ), 400
 
-        conn = get_connection()
-        try:
-            # Count before delete for the summary.
-            before = conn.execute(
-                "SELECT COUNT(*) AS n FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            ).fetchone()
-            n_before = int((before["n"] if before else 0) or 0)
+        from database import guarded_reset_authoritative_state
 
-            cur = conn.execute(
-                "DELETE FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            )
-            deleted = int(cur.rowcount or 0)
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
+        reset = guarded_reset_authoritative_state(clear_terminal_offers=True)
+        if not reset["success"]:
+            return jsonify(reset), 409
+        deleted = int(reset["offers_deleted"])
+        n_before = deleted
 
         log_event(
             "info",
@@ -1603,24 +1714,16 @@ def api_reset_full():
             preserve_history=False,
             reason="full_reset",
         )
+        if not summary["success"]:
+            return jsonify(api_server._serialize_dict(summary)), 409
 
         # Step 2: delete terminal-state offer rows.
-        conn = get_connection()
-        offers_deleted = 0
-        try:
-            cur = conn.execute(
-                "DELETE FROM offers "
-                "WHERE status IN ('cancelled', 'filled', 'expired') "
-                "   OR lifecycle_state IN ('cancelled', 'filled', 'expired', "
-                "                          'phantom_rejected', 'user_cancelled')"
-            )
-            offers_deleted = int(cur.rowcount or 0)
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        from database import guarded_reset_authoritative_state
+
+        offer_reset = guarded_reset_authoritative_state(clear_terminal_offers=True)
+        if not offer_reset["success"]:
+            return jsonify(offer_reset), 409
+        offers_deleted = int(offer_reset["offers_deleted"])
 
         # Step 3: reset in-memory counters on bot components. The bot is
         # not running at this point (gate above), so we reset whatever
@@ -1762,6 +1865,7 @@ def api_pnl():
             "pending_verification_count": server._get_session_pending_verification_count(),
             "avg_spread_capture": stats.get("avg_spread_capture", "0"),
             "net_position_cat": inventory.get("net_position_cat", "0"),
+            "max_position_xch": str(cfg.MAX_POSITION_XCH),
             "circuit_breaker_active": inventory.get("circuit_breaker_active", False),
             "sniper": sniper_stats,
             # Extended statistics

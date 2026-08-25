@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 import types
@@ -490,6 +491,46 @@ class SpacescanCollectorTests(unittest.TestCase):
 
 
 class MarketAnalysisCacheTests(unittest.TestCase):
+    def test_partial_refresh_preserves_last_good_expired_spacescan_cache(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE market_analysis_cache ("
+            "asset_id TEXT, analysis_type TEXT, data_json TEXT, "
+            "expires_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            "INSERT INTO market_analysis_cache "
+            "(asset_id, analysis_type, data_json, expires_at, created_at) "
+            "VALUES (?, ?, ?, datetime('now', '-1 minute'), datetime('now', '-31 minutes'))",
+            (
+                "asset123",
+                "spacescan",
+                json.dumps(
+                    {
+                        "has_data": True,
+                        "holder_count": 3477,
+                        "activity_count": 912,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+
+        partial_refresh = {
+            "has_data": True,
+            "holder_count": 0,
+            "activity_count": 0,
+            "activity_fetch_failed": True,
+        }
+        with patch.object(database, "get_connection", return_value=conn):
+            merged = mdc._merge_partial_spacescan(partial_refresh, "asset123")
+
+        self.assertEqual(merged["holder_count"], 3477)
+        self.assertEqual(merged["activity_count"], 912)
+        self.assertTrue(merged["holder_count_from_prior_cache"])
+        self.assertTrue(merged["activity_count_from_prior_cache"])
+
     def test_clear_market_analysis_cache_can_keep_spacescan(self):
         conn = sqlite3.connect(":memory:")
         conn.execute(

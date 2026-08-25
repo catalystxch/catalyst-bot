@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -19,11 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import api_server
+    from blueprints import bot as bot_blueprint
     from blueprints import coin_prep as coin_prep_blueprint
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    bot_blueprint = None
     coin_prep_blueprint = None
     _SKIP = str(exc)
 
@@ -37,8 +40,22 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        self._gate_patchers = [
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate,
+                "enter_mutation",
+                return_value="coin-prep-unit-permit",
+            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+            patch("wallet.get_spendable_coin_count", return_value=0),
+        ]
+        for patcher in self._gate_patchers:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self._gate_patchers):
+            patcher.stop()
         api_server._rate_limit_log.clear()
         api_server._coin_prep_state["running"] = False
         api_server._coin_prep_state["complete"] = False
@@ -339,6 +356,7 @@ class TestCoinPrepVerify(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCoinPrepTrigger(_FlaskBase):
     _FAKE_SUMMARY = {
+        "success": True,
         "fills_cleared": 0,
         "round_trips_cleared": 0,
         "price_history_cleared": False,
@@ -423,7 +441,10 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertEqual(second.status_code, 200)
         self.assertTrue(first.get_json().get("success"))
         self.assertEqual(second.get_json().get("status"), "already_running")
-        self.assertEqual(mock_thread.call_count, 1)
+        # The first guarded mutation also starts the lease-heartbeat thread.
+        # The duplicate request must add no second coin-prep worker.
+        names = [call.kwargs.get("name") for call in mock_thread.call_args_list]
+        self.assertEqual(names.count("coin-prep-api-worker"), 1)
 
     def test_trigger_passes_sage_active_cat_wallet_to_worker(self):
         captured = {}
@@ -466,6 +487,14 @@ class TestCoinPrepTrigger(_FlaskBase):
                     "coin_manager._coin_prep_worker_command", return_value=["worker"]
                 ),
                 patch("coin_manager._coin_prep_worker_environment", return_value=env),
+                patch(
+                    "coin_manager._issue_coin_prep_worker_delegation",
+                    return_value=MagicMock(to_environment=lambda: {}),
+                ),
+                patch(
+                    "coin_manager._revoke_coin_prep_worker_delegation",
+                    return_value={"revoked": True},
+                ),
                 patch("subprocess.Popen", side_effect=fake_popen),
                 patch.object(
                     coin_prep_blueprint,
@@ -489,6 +518,103 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertIn("--cat-wallet", captured["cmd"])
         index = captured["cmd"].index("--cat-wallet")
         self.assertEqual(captured["cmd"][index + 1], "2")
+
+    def test_trigger_delegation_outlives_legitimate_chain_confirmation_waits(self):
+        """The worker must not lose mutation authority during normal mainnet waits."""
+
+        class ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class DoneProcess:
+            pid = 12345
+            returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+        delegation = MagicMock(to_environment=lambda: {})
+        issue_delegation = MagicMock(return_value=delegation)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "coin_prep_output.log")
+            env = {
+                "WALLET_TYPE": "sage",
+                "CAT_ASSET_ID": "abc123",
+                "CAT_WALLET_ID": "2",
+            }
+            with (
+                patch.object(
+                    api_server,
+                    "_reset_fresh_run_session",
+                    return_value=self._FAKE_SUMMARY,
+                ),
+                patch.object(api_server, "bot", None),
+                patch.object(coin_prep_blueprint.threading, "Thread", ImmediateThread),
+                patch(
+                    "coin_manager._coin_prep_worker_command", return_value=["worker"]
+                ),
+                patch("coin_manager._coin_prep_worker_environment", return_value=env),
+                patch(
+                    "coin_manager._issue_coin_prep_worker_delegation",
+                    issue_delegation,
+                ),
+                patch(
+                    "coin_manager._revoke_coin_prep_worker_delegation",
+                    return_value={"revoked": True},
+                ),
+                patch("subprocess.Popen", return_value=DoneProcess()),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_runtime_dir",
+                    return_value=temp_dir,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_output_log_file",
+                    return_value=log_path,
+                ),
+                patch.object(api_server, "_get_live_mid_price_str", return_value=None),
+                patch.object(coin_prep_blueprint.cfg, "WALLET_TYPE", "sage"),
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "abc123"),
+                patch.object(coin_prep_blueprint.cfg, "CAT_WALLET_ID", 2),
+                patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", False),
+                patch.object(
+                    coin_prep_blueprint.cfg,
+                    "COIN_PREP_MAX_RUNTIME_SECS",
+                    600,
+                    create=True,
+                ),
+            ):
+                response = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(issue_delegation.call_args.kwargs["ttl_seconds"], 3600)
+
+    def test_live_price_handoff_uses_fresh_prebot_status_price(self):
+        """Coin Prep must use the price shown before the bot is created."""
+        asset_id = "b8edcc6a7cf3738a3806fdbadb1bbcfc"
+        cached_price = "0.0000798400"
+        prebot_cache = {
+            "fetched_at": time.time(),
+            "pricing": {"mid": cached_price},
+            "asset_id": asset_id,
+        }
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(api_server, "_active_cat", {"asset_id": asset_id}),
+            patch.object(
+                bot_blueprint,
+                "_prebot_price_cache",
+                prebot_cache,
+                create=True,
+            ),
+        ):
+            self.assertEqual(api_server._get_live_mid_price_str(), cached_price)
 
 
 # ---------------------------------------------------------------------------

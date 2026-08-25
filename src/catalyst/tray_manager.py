@@ -18,6 +18,7 @@ The module imports `pystray` and `PIL` behind try/except so the rest of the
 app still starts in headless or reduced-dependency environments.
 """
 
+import os
 import sys
 import threading
 
@@ -28,7 +29,12 @@ try:
     from PIL import Image, ImageDraw
 
     PYSTRAY_AVAILABLE = True
-except ImportError:
+except Exception:
+    pystray = None
+    MenuItem = None
+    Menu = None
+    Image = None
+    ImageDraw = None
     PYSTRAY_AVAILABLE = False
 
 # HTTP client for calling Flask API actions from tray
@@ -50,7 +56,47 @@ COLOUR_RED = (239, 68, 68)  # Error, critical
 COLOUR_GREY = (107, 114, 128)  # Stopped, unknown
 COLOUR_INDIGO = (99, 102, 241)  # Brand accent (used for default icon)
 
-FLASK_BASE = "http://127.0.0.1:5000"
+
+def _flask_base() -> str:
+    """Return the exact loopback server port selected by the desktop owner."""
+
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        port = 5000
+    if not 1 <= port <= 65535:
+        port = 5000
+    return f"http://127.0.0.1:{port}"
+
+
+def _local_api_context() -> tuple[str, dict[str, str]] | None:
+    """Return the exact owner endpoint/auth pair, or deny the fallback call."""
+
+    try:
+        environment = os.environ
+        token = environment.get("BOT_LOCAL_WRITE_TOKEN")
+        port_value = environment.get("CATALYST_FLASK_PORT")
+    except BaseException:
+        return None
+    if type(token) is not str or not 1 <= len(token) <= 256:
+        return None
+    if any(ord(character) < 33 or ord(character) > 126 for character in token):
+        return None
+    if type(port_value) is not str:
+        return None
+    try:
+        port = int(port_value)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return (
+        f"http://127.0.0.1:{port}",
+        {
+            "Content-Type": "application/json",
+            "X-Bot-Local-Token": token,
+        },
+    )
 
 
 class TrayManager:
@@ -328,13 +374,17 @@ class TrayManager:
         Call a local Flask API endpoint.  Runs in a background thread.
         Failures are silently ignored — the tray is a convenience, not critical path.
         """
-        url = f"{FLASK_BASE}{path}"
         try:
+            context = _local_api_context()
+            if context is None:
+                return
+            base_url, headers = context
+            url = f"{base_url}{path}"
             req = urllib.request.Request(
                 url,
                 data=b"{}",
                 method=method,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 _ = resp.read()  # Consume response

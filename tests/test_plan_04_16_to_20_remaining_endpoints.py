@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
 
@@ -60,6 +62,7 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -147,9 +150,102 @@ class TestMarketIntel(_FlaskBase):
             amount_xch=Decimal("1"), side="buy"
         )
 
+    def test_slippage_endpoint_reports_provider_unavailable_without_http_error(self):
+        bot = _make_bot()
+        bot._startup_self_test_results = {}
+        bot.price_engine.get_tibet_quote.return_value = None
+        with patch.object(api_server, "bot", bot):
+            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "available": False,
+                "error": "TibetSwap quote unavailable",
+                "provider": "tibetswap",
+            },
+        )
+
+    def test_slippage_endpoint_identifies_confirmed_tibetswap_outage(self):
+        """A TibetSwap HTTP failure must not be presented as an absent pool."""
+        bot = _make_bot()
+        bot._startup_self_test_results = {
+            "tibet": {
+                "ok": False,
+                "status_code": 502,
+                "error": "HTTP 502 (server error)",
+            }
+        }
+        bot.price_engine.get_tibet_quote.return_value = None
+
+        with patch.object(api_server, "bot", bot):
+            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "available": False,
+                "error": "TibetSwap quote unavailable",
+                "message": (
+                    "TibetSwap outage (HTTP 502): pool depth and slippage are "
+                    "unavailable. CATalyst is using Dexie-only pricing; AMM drift "
+                    "protection is unavailable."
+                ),
+                "provider": "tibetswap",
+                "reason": "provider_outage",
+                "status_code": 502,
+            },
+        )
+
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestMarketSummary(_FlaskBase):
+    def test_identifies_tibetswap_outage_instead_of_zero_pool_and_gap(self):
+        """A confirmed TibetSwap outage must be machine-readable to the UI."""
+        bot = _make_bot()
+        bot._startup_self_test_results = {
+            "tibet": {
+                "ok": False,
+                "status_code": 502,
+                "error": "HTTP 502 (server error)",
+            }
+        }
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {
+                "asset_id": "abc123cat",
+                "ticker_id": "ABC_XCH",
+                "decimals": 3,
+                "name": "ABC",
+            }
+        )
+
+        class EmptyResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"tickers": [], "offers": []}
+
+        try:
+            with (
+                patch.object(api_server, "bot", bot),
+                patch("requests.get", return_value=EmptyResponse()),
+                patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+            ):
+                body = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                ).get_json()
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertIs(body["tibet_available"], False)
+        self.assertEqual(body["tibet_reason"], "provider_outage")
+        self.assertEqual(body["tibet_status_code"], 502)
+
     def test_reuses_tibet_pairs_for_immediate_dashboard_polls(self):
         from blueprints import market as market_routes
 

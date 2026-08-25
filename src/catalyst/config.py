@@ -122,6 +122,10 @@ _PRESERVED_PROCESS_ENV_KEYS = {
     "SAGE_CERT_PATH",
     "SAGE_KEY_PATH",
     "SAGE_DATA_DIR",
+    "SAGE_FINGERPRINT",
+    "WALLET_EXPECTED_NAME",
+    "WALLET_EXPECTED_KEY_KIND",
+    "CATALYST_NETWORK_ID",
 }
 
 
@@ -159,6 +163,20 @@ def _int(key: str, default: int = 0) -> int:
         return int(val) if val else default
     except (ValueError, TypeError):
         return default
+
+
+def _identity_max_age(key: str, default: int = 10):
+    """Parse identity freshness without turning malformed input into a default."""
+
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    if type(raw) is not str or not raw or not raw.isascii() or not raw.isdigit():
+        return None
+    value = int(raw)
+    if str(value) != raw or not 1 <= value <= 300:
+        return None
+    return value
 
 
 def _decimal(key: str, default: str = "0") -> Decimal:
@@ -239,6 +257,16 @@ class Config:
         with self._lock:
             return bool(self._pending_restart_changes)
 
+    def sage_connection_settings(self) -> tuple[str, str, str, str]:
+        """Return the typed Sage RPC and TLS settings used by its adapter."""
+        with self._lock:
+            return (
+                self.SAGE_RPC_URL,
+                self.SAGE_CERT_PATH,
+                self.SAGE_KEY_PATH,
+                self.SAGE_DATA_DIR,
+            )
+
     def _reload_inner(self):
         """Internal reload — called under lock."""
         # Force re-read of .env
@@ -261,6 +289,11 @@ class Config:
         self.WALLET_ID_XCH = _int("CHIA_WALLET_ID_XCH", 1)
         self.WALLET_FINGERPRINT = _str("WALLET_FINGERPRINT")
         self.WALLET_DEBUG = _bool("WALLET_DEBUG", False)
+        self.WALLET_EXPECTED_NAME = _str("WALLET_EXPECTED_NAME")
+        self.WALLET_EXPECTED_KEY_KIND = _str("WALLET_EXPECTED_KEY_KIND", "bls")
+        self.WALLET_IDENTITY_MAX_AGE_SECONDS = _identity_max_age(
+            "WALLET_IDENTITY_MAX_AGE_SECONDS", 10
+        )
 
         # ----- Sage Wallet (alternative backend) -----
         self.SAGE_RPC_URL = _str("SAGE_RPC_URL", "https://localhost:9257")

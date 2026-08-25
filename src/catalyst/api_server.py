@@ -19,6 +19,7 @@ origin or token checks must preserve that invariant.
 """
 
 import os
+import re
 import sys
 import io
 import json
@@ -29,6 +30,7 @@ import logging
 import threading
 import secrets
 import webbrowser
+import hashlib
 
 # When run as the entry point (`python api_server.py`), Python loads this file
 # as the `__main__` module — `sys.modules` has no `api_server` key. Any
@@ -39,6 +41,34 @@ import webbrowser
 # subsequent `import api_server` calls return the already-initialized object.
 if __name__ == "__main__":
     sys.modules.setdefault("api_server", sys.modules[__name__])
+
+    import atexit as _early_atexit
+    import read_only_diagnostics as _early_diagnostics
+
+    _early_startup_arbiter = _early_diagnostics.acquire_startup_arbiter()
+    _early_atexit.register(_early_startup_arbiter.release)
+    _early_diagnostics_only = not _early_startup_arbiter.acquired
+    if not _early_diagnostics_only:
+        _early_diagnostics_only = _early_diagnostics.preflight_requires_diagnostics()
+    if _early_diagnostics_only:
+        _early_startup_arbiter.release()
+        try:
+            _early_preferred_port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+        except (TypeError, ValueError):
+            _early_preferred_port = 5000
+        if not 1 <= _early_preferred_port <= 65535:
+            _early_preferred_port = 5000
+        try:
+            _early_reservation = _early_diagnostics.reserve_loopback_port(
+                _early_preferred_port,
+                include_preferred=False,
+            )
+        except Exception:
+            raise SystemExit(1)
+        _early_diagnostics.serve(reservation=_early_reservation)
+        raise SystemExit(0)
+
+import database
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -75,7 +105,8 @@ if sys.platform == "win32":
                     setattr(sys, _attr, _wrapped)
             except Exception:
                 pass
-from flask import Flask, jsonify, request, send_from_directory, send_file, Response
+from flask import Flask, jsonify, request, send_from_directory, send_file, Response, g
+from werkzeug.exceptions import MethodNotAllowed
 
 # ---- Super Log: capture EVERYTHING to terminal + file ----
 from super_log import init_super_log, slog, intercept_log_event
@@ -93,6 +124,7 @@ from database import (
     get_live_tier_group_counts,
 )
 from tx_fees import get_fee_settings_snapshot
+import mutation_gate
 
 # ---------------------------------------------------------------------------
 # Bundle-aware path resolution.
@@ -144,7 +176,7 @@ _SPACESCAN_PUBLIC_PLANS = {
 intercept_log_event()
 
 from bot_loop import BotLoop
-from wallet import get_wallet_type
+from wallet import get_wallet_adapter_authority, get_wallet_type
 
 # ---- Super Log: hook ALL module methods for complete visibility ----
 try:
@@ -185,6 +217,90 @@ _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
     "/api/log",  # GUI flushes buffered log entries in bursts
 }
+
+# Every state-changing HTTP verb is classified explicitly. Only the first
+# group may initiate wallet/signing effects; safety/diagnostic and stop/abort
+# controls remain usable while another process owns the mutation lease.
+_MUTATING_API_ENDPOINTS = {
+    "api_update_install",
+    "api_update_relaunch_intent",
+    "boost.api_boost_activate",
+    "boost.api_boost_deactivate",
+    "bot.api_bot_start",
+    "cat.api_cat_refresh",
+    "cat.api_cat_select",
+    "cat.api_deposit_advisory_allocate",
+    "coin_prep.api_coin_prep",
+    "coin_prep.api_coin_prep_reset",
+    "coin_prep.api_coin_prep_trigger",
+    "coin_prep.api_coin_topup",
+    "coin_prep.api_db_backup",
+    "coin_prep.api_logs_clear",
+    "config_bp.api_config_apply",
+    "config_bp.api_config_live",
+    "config_bp.api_config_reload",
+    "config_bp.api_config_update",
+    "market.api_dbx_claim",
+    "market.api_debug_sage_single_offer_test",
+    "market.api_dexie_repost",
+    "offers.api_cancel_all",
+    "offers.api_cancel_offer",
+    "offers.api_cleanup_orphans",
+    "offers.api_pnl_reset",
+    "offers.api_purge_fills",
+    "offers.api_reset_full",
+    "offers.api_reset_offer_history",
+    "sage.api_chia_start_with_fingerprint",
+    "sage.api_sage_daemon_start",
+    "sage.api_sage_set_fingerprint",
+    "sage.api_sage_setup_certs",
+    "sage.api_wallet_begin_startup",
+    "sage.api_wallet_retry_sage_connect",
+    "session.api_session_fresh_start",
+    "session.api_session_resume_chosen",
+    "spacescan.api_spacescan_setup",
+    "splash.api_splash_incoming",
+    "splash.api_splash_node_start",
+    "splash.api_splash_receive",
+    "splash.api_splash_setup_download",
+    "superlog.api_superlog_level",
+    "system.api_wallets_switch",
+    "watchdog.api_watchdog_cancel_mismatched_offers",
+    "watchdog.api_dismiss_alert",
+}
+
+_READ_ONLY_WRITE_API_ENDPOINTS = {
+    "cat.api_balances_refresh",
+    # Subprocess telemetry persists diagnostics and emits SSE only.  It must
+    # remain available while a wallet effect is being reconciled and must not
+    # sample a transient safety latch into this process's local mutation fence.
+    "coin_prep.api_log_event",
+    "config_bp.api_settings_validate",
+}
+
+_CONTROL_WRITE_API_ENDPOINTS = {
+    "api_safety_release_resolved",
+    "api_safety_quarantine",
+    "api_safety_quarantine_resolve",
+    "api_open_data_folder",
+    "api_open_external",
+    "bot.api_bot_stop",
+    "bot.api_shutdown",
+    "coin_prep.api_coin_prep_cancel",
+    "system.api_console_toggle",
+    "watchdog.api_watchdog_shape_fix_abort",
+}
+
+_read_only_diagnostics_active = False
+
+
+def _write_endpoint_requires_mutation(endpoint: str) -> bool:
+    """Default every unrecognized write endpoint to mutation-protected."""
+
+    return endpoint not in (
+        _READ_ONLY_WRITE_API_ENDPOINTS | _CONTROL_WRITE_API_ENDPOINTS
+    )
+
 
 # Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
 # webhook flood cannot amplify into runaway DB writes.
@@ -902,13 +1018,15 @@ def _get_sage_signing_block_reason():
         return None
 
     try:
-        from wallet_sage import get_current_key
+        from wallet import get_wallet_identity
 
-        key = get_current_key() or {}
-        if not key.get("has_secrets", False):
-            fp = key.get("fingerprint")
+        identity = get_wallet_identity()
+        if type(identity) is not dict or identity.get("success") is not True:
+            return None
+        if identity.get("has_secrets") is not True:
+            fp = identity.get("fingerprint")
             msg = "Active Sage wallet is watch-only and cannot sign offers"
-            if fp:
+            if type(fp) is int and fp > 0:
                 msg += f" (fingerprint {fp})"
             return msg
     except Exception:
@@ -1034,11 +1152,10 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
         return result
 
     trade_ids = None
-    if _live_wallet_reads_allowed(bot) and getattr(bot, "offer_manager", None):
+    offer_manager = getattr(bot, "offer_manager", None)
+    if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
-            wallet_open_buys, wallet_open_sells, _ = (
-                bot.offer_manager.sync_from_wallet()
-            )
+            wallet_open_buys, wallet_open_sells, _ = offer_manager.sync_from_wallet()
             trade_ids = [
                 o.get("trade_id", "")
                 for o in (wallet_open_buys + wallet_open_sells)
@@ -1047,6 +1164,28 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
             result["our_open_buys"] = len(wallet_open_buys)
             result["our_open_sells"] = len(wallet_open_sells)
             result["source"] = "wallet_sync"
+        except Exception:
+            trade_ids = None
+    elif offer_manager:
+        try:
+            snapshot_getter = getattr(offer_manager, "get_wallet_sync_snapshot", None)
+            wallet_snapshot = snapshot_getter() if callable(snapshot_getter) else {}
+            wallet_meta = (wallet_snapshot or {}).get("meta") or {}
+            if (
+                wallet_meta.get("fresh") is True
+                and wallet_meta.get("using_cache") is not True
+                and float(wallet_meta.get("last_success_at", 0) or 0) > 0
+            ):
+                wallet_open_buys = list(wallet_snapshot.get("buy") or [])
+                wallet_open_sells = list(wallet_snapshot.get("sell") or [])
+                trade_ids = [
+                    o.get("trade_id", "")
+                    for o in (wallet_open_buys + wallet_open_sells)
+                    if o.get("trade_id")
+                ]
+                result["our_open_buys"] = len(wallet_open_buys)
+                result["our_open_sells"] = len(wallet_open_sells)
+                result["source"] = "wallet_snapshot"
         except Exception:
             trade_ids = None
 
@@ -1087,6 +1226,1676 @@ app.config["_CATALYST_API_SERVER_MODULE"] = sys.modules[__name__]
 
 # The bot loop instance (created at startup)
 bot: BotLoop = None
+_mutation_runtime = None
+_mutation_runtime_db_path = None
+_mutation_runtime_init_lock = threading.RLock()
+_runtime_recovery_lock = threading.RLock()
+_stability_startup_status = {
+    "allowed": False,
+    "reason_code": "STARTUP_RECOVERY_NOT_RUN",
+    "source": "startup_recovery",
+    "failed_check": "not_started",
+    "checks": [],
+    "blocker_counts": {},
+    "source_ages_seconds": {},
+}
+
+_STABILITY_STARTUP_CHECKS = (
+    "lease",
+    "wallet_identity_freshness",
+    "unresolved_operations",
+    "reservations",
+    "publication_claims",
+    "authority_revalidation",
+)
+
+_STABILITY_BLOCKER_COUNT_KEYS = (
+    "operations",
+    "prepared_creations",
+    "submitted_cancels",
+    "contradictory_history",
+    "reservations",
+    "publication_claims",
+)
+
+_STABILITY_PUBLIC_SOURCES = frozenset(
+    {
+        "startup_recovery",
+        "durable_latch",
+        "durable_read",
+        "operation_journal",
+        "lease",
+        "process",
+    }
+)
+
+_STABILITY_CHECK_SOURCES = frozenset(
+    {"durable_snapshot", "configured_binding", "authorized_snapshot"}
+)
+
+_STABILITY_EMPTY_DURABLE_COUNTS = {
+    "registry": 0,
+    "lineage": 0,
+    "reserve": 0,
+    "publication": 0,
+}
+_STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS = 30
+
+
+def _bounded_stability_count(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        return 0
+    return min(value, 2_147_483_647)
+
+
+def _public_stability_durable_counts() -> tuple[dict[str, int], bool]:
+    """Project exact Task 10/11/13 repository counts without exposing rows."""
+
+    try:
+        # Before the first database initialization there cannot be durable
+        # rows to count.  Treat the absent file as the exact empty snapshot;
+        # never create/migrate storage from this read-only status endpoint.
+        database_path = getattr(database, "DB_PATH", None)
+        if type(database_path) is str and not os.path.isfile(database_path):
+            return dict(_STABILITY_EMPTY_DURABLE_COUNTS), True
+        raw_counts = database.get_stability_diagnostic_counts()
+        if type(raw_counts) is not dict or set(raw_counts) != set(
+            _STABILITY_EMPTY_DURABLE_COUNTS
+        ):
+            return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+        counts = {}
+        for key in _STABILITY_EMPTY_DURABLE_COUNTS:
+            value = raw_counts.get(key)
+            if type(value) is not int or value < 0 or value > 2_147_483_647:
+                return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+            counts[key] = value
+        return counts, True
+    except Exception:
+        return dict(_STABILITY_EMPTY_DURABLE_COUNTS), False
+
+
+def _public_stability_timestamp(value: Any) -> Optional[str]:
+    if type(value) is not str or len(value) > 40:
+        return None
+    if (
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
+        is None
+    ):
+        return None
+    return value
+
+
+def _public_stability_reason(value: Any) -> Optional[str]:
+    if type(value) is not str:
+        return None
+    if value == "":
+        return value
+    return value if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", value) is not None else None
+
+
+def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
+    if allowed:
+        return "NONE"
+    if reason_code in {"DATABASE_INTEGRITY_FAILED", "DURABLE_STATE_UNAVAILABLE"}:
+        return "RESTORE_DATABASE_BACKUP"
+    if reason_code == "LEASE_OWNED_BY_OTHER":
+        return "USE_ACTIVE_CATALYST_INSTANCE"
+    if reason_code in {"LEASE_EXPIRED", "LEASE_LOST", "STARTUP_AUTHORITY_CHANGED"}:
+        return "RESTART_CATALYST"
+    if reason_code.startswith("WALLET_IDENTITY_"):
+        return "VERIFY_WALLET_IDENTITY"
+    if reason_code == "RESERVATION_RECONCILIATION_REQUIRED":
+        return "RECONCILE_COIN_RESERVATIONS"
+    if reason_code == "PUBLICATION_CLAIM_RECOVERY_REQUIRED":
+        return "RETRY_PUBLICATION_RECOVERY"
+    if reason_code in {
+        "UNRESOLVED_OPERATIONS",
+        "RECONCILIATION_REQUIRED",
+        "CONTRADICTORY_HISTORY",
+    }:
+        return "RUN_AUTHORITATIVE_RECONCILIATION"
+    return "REVIEW_SAFETY_DIAGNOSTICS"
+
+
+def get_public_stability_status() -> dict:
+    """Return the stable, redacted Task 10 diagnostics contract."""
+
+    live = mutation_gate.read_only_status().to_dict()
+    startup = _stability_startup_status
+    if type(live) is not dict or type(startup) is not dict:
+        raise RuntimeError("malformed stability status")
+
+    malformed = False
+    startup_allowed = startup.get("allowed") is True
+    live_allowed = live.get("allowed") is True
+    allowed = startup_allowed and live_allowed
+    authority = live if startup_allowed else startup
+    raw_reason_code = authority.get("reason_code")
+    public_reason_code = _public_stability_reason(raw_reason_code)
+    if public_reason_code is None:
+        malformed = True
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+    else:
+        reason_code = public_reason_code
+    if allowed and reason_code:
+        malformed = True
+    if not allowed and not reason_code:
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+    raw_source = authority.get("source")
+    if type(raw_source) is not str or raw_source not in _STABILITY_PUBLIC_SOURCES:
+        malformed = True
+        source = "durable_read"
+    else:
+        source = raw_source
+
+    raw_counts = startup.get("blocker_counts")
+    if type(raw_counts) is not dict:
+        malformed = True
+        raw_counts = {}
+    for key in _STABILITY_BLOCKER_COUNT_KEYS:
+        value = raw_counts.get(key)
+        if type(value) is not int or value < 0:
+            malformed = True
+    blocker_counts = {
+        key: _bounded_stability_count(raw_counts.get(key))
+        for key in _STABILITY_BLOCKER_COUNT_KEYS
+    }
+
+    checks = startup.get("checks")
+    if type(checks) is not list:
+        malformed = True
+        checks = []
+    source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
+    public_checks = []
+    seen_checks = set()
+    if len(checks) > len(_STABILITY_STARTUP_CHECKS):
+        malformed = True
+    for raw_check in checks[: len(_STABILITY_STARTUP_CHECKS)]:
+        if type(raw_check) is not dict:
+            malformed = True
+            continue
+        name = raw_check.get("name")
+        if name not in _STABILITY_STARTUP_CHECKS or name in seen_checks:
+            malformed = True
+            continue
+        seen_checks.add(name)
+        age = raw_check.get("source_age_seconds")
+        if age is None:
+            public_age = None
+        elif type(age) is int and age >= 0:
+            public_age = _bounded_stability_count(age)
+        else:
+            malformed = True
+            continue
+        age = public_age
+        source_ages[name] = age
+        raw_check_reason = raw_check.get("reason_code")
+        public_check_reason = _public_stability_reason(raw_check_reason)
+        if public_check_reason is None:
+            malformed = True
+            continue
+        check_reason = public_check_reason
+        raw_check_source = raw_check.get("source", "durable_snapshot")
+        if (
+            type(raw_check_source) is not str
+            or raw_check_source not in _STABILITY_CHECK_SOURCES
+        ):
+            malformed = True
+            continue
+        check_source = raw_check_source
+        if type(raw_check.get("ok")) is not bool:
+            malformed = True
+            continue
+        if raw_check.get("ok") is True and check_reason:
+            malformed = True
+            continue
+        if raw_check.get("ok") is not True and not check_reason:
+            malformed = True
+            continue
+        if check_source not in _STABILITY_CHECK_SOURCES:
+            check_source = "durable_snapshot"
+        public_checks.append(
+            {
+                "name": name,
+                "ok": raw_check.get("ok") is True,
+                "reason_code": check_reason,
+                "source_age_seconds": age,
+                "source": check_source,
+            }
+        )
+
+    wallet_hash, network = _configured_mutation_binding()
+    if (
+        type(wallet_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", wallet_hash) is None
+    ):
+        malformed = True
+        redacted_fingerprint = None
+    else:
+        redacted_fingerprint = f"sha256:{wallet_hash[:12]}…"
+    if (
+        type(network) is not str
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", network) is None
+    ):
+        malformed = True
+        network = "unknown"
+
+    raw_lease = live.get("lease")
+    if type(raw_lease) is not dict:
+        malformed = True
+        raw_lease = {}
+    if type(raw_lease.get("active")) is not bool:
+        malformed = True
+    lease_active = raw_lease.get("active") is True
+    if type(raw_lease.get("owned_by_this_run")) is not bool:
+        malformed = True
+    owned_by_this_run = lease_active and raw_lease.get("owned_by_this_run") is True
+    lease_owner = (
+        "this_run" if owned_by_this_run else "other_run" if lease_active else None
+    )
+    lease_version = raw_lease.get("version")
+    if type(lease_version) is not int or lease_version < 0:
+        malformed = True
+    lease_expiry = _public_stability_timestamp(raw_lease.get("expires_at"))
+    if lease_active and lease_expiry is None:
+        malformed = True
+    lease = {
+        "active": lease_active,
+        "owner": lease_owner,
+        "version": _bounded_stability_count(lease_version),
+        "expires_at": lease_expiry,
+        "owned_by_this_run": owned_by_this_run,
+    }
+    live_blocking_count = live.get("blocking_operation_count")
+    if type(live_blocking_count) is not int or live_blocking_count < 0:
+        malformed = True
+    failed_check = startup.get("failed_check")
+    if failed_check not in {*_STABILITY_STARTUP_CHECKS, "database_integrity", None}:
+        malformed = True
+        failed_check = "startup_recovery"
+
+    durable_counts, counts_valid = _public_stability_durable_counts()
+    if not counts_valid:
+        malformed = True
+
+    # This observation is taken only after both per-request authority reads:
+    # the live mutation gate snapshot and the fixed durable-count aggregate.
+    # It deliberately does not relabel the static startup-check ages as fresh.
+    observed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    freshness = {
+        "observed_at_utc": observed_at_utc,
+        "age_seconds": 0,
+        "max_age_seconds": _STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS,
+        "provenance": "live_gate_and_durable_snapshot",
+        "valid": True,
+    }
+
+    if malformed:
+        allowed = False
+        reason_code = "DURABLE_STATE_UNAVAILABLE"
+        source = "durable_read"
+        lease = {
+            "active": False,
+            "owner": None,
+            "version": 0,
+            "expires_at": None,
+            "owned_by_this_run": False,
+        }
+        lease_owner = None
+        failed_check = "startup_recovery"
+        public_checks = []
+        source_ages = {name: None for name in _STABILITY_STARTUP_CHECKS}
+        freshness = {
+            "observed_at_utc": None,
+            "age_seconds": None,
+            "max_age_seconds": _STABILITY_PUBLIC_FRESHNESS_MAX_AGE_SECONDS,
+            "provenance": "unavailable",
+            "valid": False,
+        }
+        durable_counts = dict(_STABILITY_EMPTY_DURABLE_COUNTS)
+        blocker_counts = {key: 0 for key in _STABILITY_BLOCKER_COUNT_KEYS}
+
+    return {
+        "allowed": allowed,
+        "reason_code": reason_code,
+        "source": source,
+        "blocking_operation_count": max(
+            blocker_counts["operations"],
+            _bounded_stability_count(live.get("blocking_operation_count")),
+        ),
+        "blocker_counts": blocker_counts,
+        "identity": {
+            "wallet_fingerprint": redacted_fingerprint,
+            "network": network,
+            "lease_owner": lease_owner,
+        },
+        "lease": lease,
+        "source_ages_seconds": source_ages,
+        "recommended_action": _stability_recommended_action(
+            reason_code, allowed=allowed
+        ),
+        "recovery": {
+            "failed_check": failed_check,
+            "checks": public_checks,
+            "freshness": freshness,
+            "durable_counts": durable_counts,
+        },
+    }
+
+
+def _configured_mutation_binding() -> tuple[str, str]:
+    """Return a deterministic config-only binding without wallet RPC."""
+
+    backend = str(getattr(cfg, "WALLET_TYPE", "") or "").strip().lower()
+    configured_fingerprint = (
+        getattr(cfg, "SAGE_FINGERPRINT", "")
+        if backend == "sage"
+        else getattr(cfg, "WALLET_FINGERPRINT", "")
+        if backend == "chia"
+        else ""
+    )
+    raw_fingerprint = str(configured_fingerprint or "unconfigured").strip()
+    fingerprint_hash = hashlib.sha256(
+        f"fingerprint:{raw_fingerprint}".encode("utf-8")
+    ).hexdigest()
+    network = str(
+        os.environ.get("CATALYST_NETWORK_ID")
+        or os.environ.get("CHIA_NETWORK")
+        or "mainnet"
+    ).strip()
+    if not network or len(network) > 64:
+        network = "mainnet"
+    return fingerprint_hash, network
+
+
+def _configured_wallet_identity_binding(
+    network: str,
+) -> Optional[mutation_gate.WalletIdentityBinding]:
+    """Build exact expected identity from canonical config without wallet RPC."""
+
+    try:
+        raw_backend = getattr(cfg, "WALLET_TYPE", "")
+        if type(raw_backend) is not str:
+            return None
+        backend = raw_backend.strip().lower()
+        if backend not in {"sage", "chia"}:
+            return None
+        raw_fingerprint = (
+            getattr(cfg, "SAGE_FINGERPRINT", "")
+            if backend == "sage"
+            else getattr(cfg, "WALLET_FINGERPRINT", "")
+        )
+        if type(raw_fingerprint) is not str:
+            return None
+        if not raw_fingerprint.isascii() or not raw_fingerprint.isdigit():
+            return None
+        fingerprint = int(raw_fingerprint)
+        if str(fingerprint) != raw_fingerprint:
+            return None
+        raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
+        if type(raw_expected_name) is not str:
+            return None
+        expected_name = raw_expected_name.strip()
+        if not expected_name:
+            return None
+        raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+        if type(raw_expected_kind) is not str:
+            return None
+        expected_kind = raw_expected_kind.strip()
+        if not expected_kind:
+            return None
+        maximum_age = getattr(cfg, "WALLET_IDENTITY_MAX_AGE_SECONDS", None)
+        if type(maximum_age) is not int:
+            return None
+        bound_at = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        return mutation_gate.WalletIdentityBinding(
+            backend=backend,
+            name=expected_name,
+            fingerprint=fingerprint,
+            network_id=network,
+            kind=expected_kind,
+            has_secrets=True,
+            bound_at_utc=bound_at,
+            maximum_age_seconds=maximum_age,
+        )
+    except Exception:
+        return None
+
+
+def _mutation_stop_handler(reason_code: str) -> None:
+    """Stop a running bot immediately after the mutation lease fails."""
+
+    current_bot = bot
+    if current_bot is None:
+        return
+    try:
+        if current_bot.is_running():
+            defer_reader = getattr(current_bot, "can_defer_mutation_safety_stop", None)
+            if reason_code == "UNRESOLVED_OPERATIONS" and callable(defer_reader):
+                try:
+                    if defer_reader(reason_code) is True:
+                        slog(
+                            "SAFETY",
+                            "Bot cancel settlement remains read-only pending exact proof",
+                            {"reason_code": reason_code},
+                            level="warning",
+                        )
+                        return
+                except Exception:
+                    pass
+            try:
+                current_bot.stop(wait=False)
+            except TypeError:
+                current_bot.stop()
+        slog(
+            "SAFETY",
+            "Bot switched to read-only after mutation safety stop",
+            {"reason_code": str(reason_code or "MUTATION_GATE_SAFETY_STOP")},
+            level="critical",
+        )
+    except Exception:
+        slog(
+            "SAFETY",
+            "Could not confirm bot stop after mutation safety event",
+            {"reason_code": "MUTATION_GATE_SAFETY_STOP"},
+            level="critical",
+        )
+
+
+def _startup_source_age_seconds(value: Any) -> Optional[int]:
+    if type(value) is not str or not value.endswith("Z"):
+        return None
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            return None
+        age = (
+            datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
+        ).total_seconds()
+        if age < 0:
+            return None
+        return min(int(age), 2_147_483_647)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _startup_check_result(
+    ok: bool,
+    reason_code: str = "",
+    *,
+    source: str = "durable_snapshot",
+    source_age_seconds: Optional[int] = None,
+    blocker_counts: Optional[dict] = None,
+) -> dict:
+    safe_source = source if source in _STABILITY_CHECK_SOURCES else "durable_snapshot"
+    return {
+        "ok": ok is True,
+        "reason_code": str(reason_code or "")[:64],
+        "source": safe_source,
+        "source_age_seconds": (
+            source_age_seconds
+            if type(source_age_seconds) is int and source_age_seconds >= 0
+            else None
+        ),
+        "blocker_counts": dict(blocker_counts or {}),
+    }
+
+
+def _configured_startup_identity_authority(
+    binding: Any,
+    wallet_fingerprint_hash: Any,
+    network: Any,
+) -> Optional[dict[str, str]]:
+    """Validate the immutable config binding without importing a wallet adapter."""
+
+    try:
+        if type(binding) is not mutation_gate.WalletIdentityBinding:
+            return None
+        if type(wallet_fingerprint_hash) is not str:
+            return None
+        if type(network) is not str or not network.strip():
+            return None
+        if (
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+            != wallet_fingerprint_hash
+            or binding.network_id != network.strip().lower()
+        ):
+            return None
+        return {
+            "binding_digest": mutation_gate.wallet_identity_binding_digest(binding),
+            "wallet_fingerprint_hash": wallet_fingerprint_hash,
+            "network": binding.network_id,
+            "bound_at_utc": binding.bound_at_utc,
+        }
+    except Exception:
+        return None
+
+
+def _run_stability_startup_check(name: str, **context) -> dict:
+    """Run one allowlisted read-only Task 10 recovery check."""
+
+    if name not in _STABILITY_STARTUP_CHECKS:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+    state = context.get("state")
+    runtime = context.get("runtime")
+    binding = context.get("wallet_identity_binding")
+    if type(state) is not dict or runtime is None:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+
+    if name == "lease":
+        snapshot = database.get_stability_startup_recovery_snapshot()
+        state["initial_snapshot"] = snapshot
+        lease = snapshot.get("lease")
+        if type(lease) is not dict:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        heartbeat_age = _startup_source_age_seconds(lease.get("heartbeat_at"))
+        if lease.get("active") not in {0, 1, False, True}:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        if bool(lease.get("active")):
+            recovery_epoch = context.get("recovery_epoch")
+            exact_current_owner = (
+                type(recovery_epoch) is dict
+                and lease.get("owner_run_id") == runtime.run_id
+                and lease.get("owner_pid") == runtime.owner_pid
+                and lease.get("owner_host") == runtime.owner_host
+                and lease.get("wallet_fingerprint_hash")
+                == recovery_epoch.get("wallet_fingerprint_hash")
+                and lease.get("network") == recovery_epoch.get("network")
+                and context.get(
+                    "recovery_owner_run_id", recovery_epoch.get("owner_run_id")
+                )
+                == runtime.run_id
+            )
+            if exact_current_owner:
+                return _startup_check_result(True, source_age_seconds=heartbeat_age)
+            try:
+                expiry = datetime.fromisoformat(
+                    str(lease.get("expires_at") or "").replace("Z", "+00:00")
+                )
+                expired = (
+                    expiry.tzinfo is not None
+                    and expiry.utcoffset() is not None
+                    and expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+                )
+            except (TypeError, ValueError, OverflowError):
+                expired = False
+            if not expired:
+                return _startup_check_result(
+                    False,
+                    "LEASE_OWNED_BY_OTHER",
+                    source_age_seconds=heartbeat_age,
+                )
+            try:
+                prior_alive = runtime._pid_liveness(
+                    int(lease.get("owner_pid") or 0),
+                    str(lease.get("owner_host") or ""),
+                )
+            except Exception:
+                prior_alive = None
+            if prior_alive is not False:
+                return _startup_check_result(
+                    False,
+                    "LEASE_EXPIRED",
+                    source_age_seconds=heartbeat_age,
+                )
+        return _startup_check_result(True, source_age_seconds=heartbeat_age)
+
+    initial = state.get("initial_snapshot")
+    if type(initial) is not dict:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+
+    if name == "wallet_identity_freshness":
+        configured_authority = _configured_startup_identity_authority(
+            binding,
+            context.get("wallet_fingerprint_hash"),
+            context.get("network"),
+        )
+        if configured_authority is None:
+            return _startup_check_result(
+                False,
+                "WALLET_IDENTITY_BINDING_INVALID",
+                source="configured_binding",
+            )
+        state["configured_identity_authority"] = configured_authority
+        if "cached_wallet_identity_snapshot" not in context:
+            state["identity_source"] = "configured_binding"
+            return _startup_check_result(True, source="configured_binding")
+
+        identity = context.get("cached_wallet_identity_snapshot")
+        decision = mutation_gate.validate_wallet_identity(binding, identity)
+        if decision.get("allowed") is not True:
+            return _startup_check_result(
+                False,
+                str(decision.get("reason") or "WALLET_IDENTITY_MALFORMED"),
+                source="authorized_snapshot",
+                source_age_seconds=_startup_source_age_seconds(
+                    identity.get("observed_at_utc") if type(identity) is dict else None
+                ),
+            )
+        state["identity_source"] = "authorized_snapshot"
+        state["identity_observed_at_utc"] = str(decision["observed_at_utc"])
+        return _startup_check_result(
+            True,
+            source="authorized_snapshot",
+            source_age_seconds=_startup_source_age_seconds(decision["observed_at_utc"]),
+        )
+
+    counts = initial.get("blocker_counts")
+    if type(counts) is not dict:
+        return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+    if name == "unresolved_operations":
+        latch = initial.get("latch")
+        blockers = initial.get("blockers")
+        if type(latch) is not dict or type(blockers) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        recovery_epoch = context.get("recovery_epoch")
+        recovery_latch = (
+            type(recovery_epoch) is dict
+            and latch.get("state") == "tripped"
+            and int(latch.get("generation") or -1)
+            == recovery_epoch.get("latch_generation")
+            and latch.get("wallet_fingerprint_hash")
+            == recovery_epoch.get("wallet_fingerprint_hash")
+            and latch.get("network") == recovery_epoch.get("network")
+            and json.loads(latch.get("blocking_operation_ids_json") or "null")
+            == [recovery_epoch.get("blocker_id")]
+        )
+        if latch.get("state") != "resolved" and not recovery_latch:
+            reason = str(latch.get("reason_code") or "RECONCILIATION_REQUIRED")
+            return _startup_check_result(False, reason, blocker_counts=counts)
+        if blockers:
+            return _startup_check_result(
+                False,
+                "UNRESOLVED_OPERATIONS",
+                source_age_seconds=_startup_source_age_seconds(
+                    initial.get("source_timestamps", {}).get("operations")
+                ),
+                blocker_counts=counts,
+            )
+        return _startup_check_result(True, blocker_counts=counts)
+
+    if name == "reservations":
+        issues = initial.get("reservation_issues")
+        if type(issues) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        return _startup_check_result(
+            not issues,
+            "RESERVATION_RECONCILIATION_REQUIRED" if issues else "",
+            source_age_seconds=_startup_source_age_seconds(
+                initial.get("source_timestamps", {}).get("reservations")
+            ),
+            blocker_counts=counts,
+        )
+
+    if name == "publication_claims":
+        issues = initial.get("publication_issues")
+        if type(issues) is not list:
+            return _startup_check_result(False, "DURABLE_STATE_UNAVAILABLE")
+        return _startup_check_result(
+            not issues,
+            "PUBLICATION_CLAIM_RECOVERY_REQUIRED" if issues else "",
+            source_age_seconds=_startup_source_age_seconds(
+                initial.get("source_timestamps", {}).get("publication_claims")
+            ),
+            blocker_counts=counts,
+        )
+
+    current = database.get_stability_startup_recovery_snapshot()
+    if current.get("authority_digest") != initial.get("authority_digest"):
+        return _startup_check_result(
+            False,
+            "STARTUP_AUTHORITY_CHANGED",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    configured_authority = _configured_startup_identity_authority(
+        binding,
+        context.get("wallet_fingerprint_hash"),
+        context.get("network"),
+    )
+    if configured_authority is None or configured_authority != state.get(
+        "configured_identity_authority"
+    ):
+        return _startup_check_result(
+            False,
+            "STARTUP_AUTHORITY_CHANGED",
+            source="configured_binding",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    if state.get("identity_source") == "configured_binding":
+        return _startup_check_result(
+            True,
+            source="configured_binding",
+            blocker_counts=current.get("blocker_counts"),
+        )
+    if state.get("identity_source") != "authorized_snapshot":
+        return _startup_check_result(
+            False,
+            "WALLET_IDENTITY_UNAVAILABLE",
+            source="authorized_snapshot",
+            blocker_counts=current.get("blocker_counts"),
+        )
+
+    identity = context.get("cached_wallet_identity_revalidation_snapshot")
+    decision = mutation_gate.validate_wallet_identity(
+        binding,
+        identity,
+        last_observed_at_utc=state.get("identity_observed_at_utc"),
+    )
+    if decision.get("allowed") is not True:
+        return _startup_check_result(
+            False,
+            str(decision.get("reason") or "WALLET_IDENTITY_MALFORMED"),
+            source="authorized_snapshot",
+            source_age_seconds=_startup_source_age_seconds(
+                identity.get("observed_at_utc") if type(identity) is dict else None
+            ),
+            blocker_counts=current.get("blocker_counts"),
+        )
+    return _startup_check_result(
+        True,
+        source="authorized_snapshot",
+        source_age_seconds=_startup_source_age_seconds(decision["observed_at_utc"]),
+        blocker_counts=current.get("blocker_counts"),
+    )
+
+
+def _read_distinct_wallet_identity_snapshots(reader: Any) -> tuple[Any, Any]:
+    """Boundedly avoid equal timestamp observations on coarse Windows clocks."""
+
+    first = reader()
+    first_observed = first.get("observed_at_utc") if type(first) is dict else None
+    second = reader()
+    for _attempt in range(4):
+        second_observed = (
+            second.get("observed_at_utc") if type(second) is dict else None
+        )
+        if (
+            type(first_observed) is not str
+            or not first_observed
+            or second_observed != first_observed
+        ):
+            break
+        time.sleep(0.002)
+        second = reader()
+    return first, second
+
+
+def _complete_runtime_recovery_epoch(
+    runtime: Any,
+    epoch: dict[str, Any],
+    *,
+    recovery_owner_run_id: Optional[str] = None,
+) -> dict:
+    """Run and promote the ordered checks for one already-frozen epoch."""
+
+    global _stability_startup_status
+    wallet_hash, network = _configured_mutation_binding()
+    binding = runtime.wallet_identity_binding
+    try:
+        from wallet import get_wallet_identity
+
+        first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
+            get_wallet_identity
+        )
+    except Exception:
+        first_identity = None
+        second_identity = None
+    state: dict[str, Any] = {}
+    checks: list[dict] = []
+    for check_name in _STABILITY_STARTUP_CHECKS:
+        check = _run_stability_startup_check(
+            check_name,
+            state=state,
+            runtime=runtime,
+            recovery_epoch=epoch,
+            recovery_owner_run_id=(
+                recovery_owner_run_id
+                if recovery_owner_run_id is not None
+                else epoch.get("owner_run_id")
+            ),
+            wallet_identity_binding=binding,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            cached_wallet_identity_snapshot=first_identity,
+            cached_wallet_identity_revalidation_snapshot=second_identity,
+        )
+        recorded = {"name": check_name, **check}
+        checks.append(recorded)
+        if check.get("ok") is not True:
+            result = _blocked_startup_recovery_status(
+                check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
+                check_name,
+                checks,
+                runtime,
+            )
+            result["blocker_counts"] = dict(check.get("blocker_counts") or {})
+            _stability_startup_status = _redacted_startup_status(result)
+            return result
+    try:
+        initial = state["initial_snapshot"]
+        database.record_runtime_recovery_pass(
+            recovery_id=epoch["recovery_id"],
+            expected_latch_generation=int(epoch["latch_generation"]),
+            authority_digest=initial["authority_digest"],
+            checks=checks,
+            passed_at=datetime.now(timezone.utc),
+        )
+        rotate = getattr(mutation_gate, "_rotate_owner_identity_authority", None)
+        if not callable(rotate) or rotate(runtime) is not True:
+            raise RuntimeError("mutation authority rotation unavailable")
+        released = runtime.release_resolved(
+            int(epoch["latch_generation"]), [epoch["blocker_id"]]
+        )
+        if released.get("released") is not True:
+            raise RuntimeError("runtime recovery latch release failed")
+    except Exception:
+        return {"allowed": False, "reason_code": "RECOVERY_PROMOTION_FAILED"}
+    result = released["status"]
+    result.update(
+        {
+            "allowed": True,
+            "reason_code": "RECOVERY_COMPLETE",
+            "source": "startup_recovery",
+            "failed_check": None,
+            "checks": checks,
+            "blocker_counts": dict(checks[-1].get("blocker_counts") or {}),
+        }
+    )
+    _stability_startup_status = _redacted_startup_status(result)
+    return result
+
+
+def _run_runtime_recovery(decision: Any, sample: Any) -> dict:
+    """Fence one discontinuity and reuse the exact ordered Task 10 checks."""
+
+    global _stability_startup_status
+    with _runtime_recovery_lock:
+        runtime = mutation_gate.current_runtime()
+        if runtime is None:
+            return {"allowed": False, "reason_code": "MUTATION_RUNTIME_NOT_INITIALIZED"}
+        clock_evidence = {
+            "reason_code": decision.reason_code,
+            "monotonic_delta_seconds": decision.monotonic_delta_seconds,
+            "wall_delta_seconds": decision.wall_delta_seconds,
+            "sample_monotonic_seconds": str(sample.monotonic_seconds),
+            "sample_wall_utc": sample.wall_utc.isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z"),
+        }
+        try:
+            try:
+                lease_version = runtime.require_allowed(
+                    "runtime_recovery:boundary"
+                ).lease_version
+                existing_epoch = None
+            except Exception:
+                # A failed read-only recovery pass deliberately leaves the durable
+                # latch tripped.  Only the exact same owner/binding/lease may retry
+                # that epoch; this neither clears the gate nor acquires a lease.
+                existing_epoch = database.get_current_runtime_recovery()
+                lease = database.get_runtime_mutation_lease()
+                if (
+                    type(existing_epoch) is not dict
+                    or type(lease) is not dict
+                    or existing_epoch.get("owner_run_id") != runtime.run_id
+                    or existing_epoch.get("wallet_fingerprint_hash")
+                    != runtime.wallet_fingerprint_hash
+                    or existing_epoch.get("network") != runtime.network
+                    or lease.get("owner_run_id") != runtime.run_id
+                    or lease.get("wallet_fingerprint_hash")
+                    != runtime.wallet_fingerprint_hash
+                    or lease.get("network") != runtime.network
+                    or type(lease.get("lease_version")) is not int
+                    or lease["lease_version"] < 1
+                    or type(existing_epoch.get("lease_version")) is not int
+                    or existing_epoch["lease_version"] < 1
+                ):
+                    raise
+                # Recovery identity is bound to the captured lease incarnation,
+                # not its expected monotonic heartbeat renewals.  The database
+                # transaction below verifies the current renewal floors.
+                lease_version = existing_epoch["lease_version"]
+            recovery_material = json.dumps(
+                {
+                    "owner_run_id": runtime.run_id,
+                    "lease_version": lease_version,
+                    "clock_evidence": clock_evidence,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            recovery_id = (
+                "recovery:"
+                + hashlib.sha256(recovery_material.encode("utf-8")).hexdigest()
+            )
+            if (
+                existing_epoch is not None
+                and existing_epoch.get("recovery_id") != recovery_id
+            ):
+                raise ValueError("runtime recovery replay does not match current epoch")
+            epoch_result = database.begin_runtime_recovery_epoch(
+                recovery_id=recovery_id,
+                reason_code=decision.reason_code,
+                clock_evidence=clock_evidence,
+                wallet_fingerprint_hash=runtime.wallet_fingerprint_hash,
+                network=runtime.network,
+                owner_run_id=runtime.run_id,
+                started_at=sample.wall_utc,
+            )
+            epoch = epoch_result["record"]
+        except Exception:
+            return {"allowed": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+        return _complete_runtime_recovery_epoch(runtime, epoch)
+
+
+def run_runtime_recovery(decision: Any, sample: Any) -> dict:
+    """Public coordinator boundary for a detected runtime discontinuity."""
+
+    return _run_runtime_recovery(decision, sample)
+
+
+def _blocked_startup_recovery_status(
+    reason_code: str,
+    failed_check: str,
+    checks: list[dict],
+    runtime,
+) -> dict:
+    try:
+        raw_status = runtime.status().to_dict() if runtime is not None else {}
+    except Exception:
+        raw_status = {}
+    raw_lease = raw_status.get("lease")
+    if type(raw_lease) is not dict:
+        raw_lease = {}
+    return {
+        "allowed": False,
+        "reason_code": str(reason_code or "DURABLE_STATE_UNAVAILABLE")[:64],
+        "source": "startup_recovery",
+        "failed_check": failed_check,
+        "checks": [dict(item) for item in checks],
+        "blocker_counts": {},
+        "blocking_operation_count": _bounded_stability_count(
+            raw_status.get("blocking_operation_count")
+        ),
+        "lease": {
+            "active": raw_lease.get("active") is True,
+            "version": _bounded_stability_count(raw_lease.get("version")),
+            "expires_at": (
+                str(raw_lease.get("expires_at"))[:40]
+                if type(raw_lease.get("expires_at")) is str
+                else None
+            ),
+            "owned_by_this_run": raw_lease.get("owned_by_this_run") is True,
+        },
+    }
+
+
+def _redacted_startup_status(status: Any) -> dict:
+    """Retain diagnostics without durable owner, PID, or operation identities."""
+
+    if type(status) is not dict:
+        status = {}
+    raw_lease = status.get("lease")
+    if type(raw_lease) is not dict:
+        raw_lease = {}
+    raw_counts = status.get("blocker_counts")
+    if type(raw_counts) is not dict:
+        raw_counts = {}
+    raw_checks = status.get("checks")
+    if type(raw_checks) is not list:
+        raw_checks = []
+    return {
+        "allowed": status.get("allowed") is True,
+        "reason_code": str(status.get("reason_code") or "")[:64],
+        "source": "startup_recovery",
+        "failed_check": status.get("failed_check"),
+        "checks": [dict(item) for item in raw_checks[: len(_STABILITY_STARTUP_CHECKS)]],
+        "blocker_counts": {
+            key: _bounded_stability_count(raw_counts.get(key))
+            for key in _STABILITY_BLOCKER_COUNT_KEYS
+        },
+        "blocking_operation_count": _bounded_stability_count(
+            status.get("blocking_operation_count")
+        ),
+        "lease": {
+            "active": raw_lease.get("active") is True,
+            "version": _bounded_stability_count(raw_lease.get("version")),
+            "expires_at": (
+                str(raw_lease.get("expires_at"))[:40]
+                if type(raw_lease.get("expires_at")) is str
+                else None
+            ),
+            "owned_by_this_run": raw_lease.get("owned_by_this_run") is True,
+        },
+    }
+
+
+def _discard_failed_owner_startup_runtime(runtime: Any) -> None:
+    """Detach a failed pre-owner runtime without releasing any durable lease."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    if mutation_gate.current_runtime() is runtime and runtime is not None:
+        mutation_gate.shutdown_runtime(release_owned_lease=False)
+    _mutation_runtime = None
+    _mutation_runtime_db_path = None
+
+
+def initialize_mutation_runtime(
+    *, start_heartbeat: bool = True, acquire_lease: bool = True
+) -> dict:
+    """Complete ordered read-only recovery before acquiring mutation ownership."""
+
+    global _mutation_runtime, _mutation_runtime_db_path, _stability_startup_status
+    with _mutation_runtime_init_lock:
+        current_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        current_runtime = mutation_gate.current_runtime()
+        if (
+            current_runtime is not None
+            and _mutation_runtime is current_runtime
+            and _mutation_runtime_db_path == current_path
+        ):
+            result = current_runtime.status().to_dict()
+            startup = _stability_startup_status
+            if type(startup) is dict:
+                raw_checks = startup.get("checks")
+                raw_counts = startup.get("blocker_counts")
+                result["failed_check"] = startup.get("failed_check")
+                result["checks"] = (
+                    [dict(item) for item in raw_checks]
+                    if type(raw_checks) is list
+                    and all(type(item) is dict for item in raw_checks)
+                    else []
+                )
+                result["blocker_counts"] = (
+                    dict(raw_counts) if type(raw_counts) is dict else {}
+                )
+                if startup.get("allowed") is True and result.get("allowed") is True:
+                    result["source"] = "startup_recovery"
+            return result
+
+        wallet_hash, network = _configured_mutation_binding()
+        wallet_identity_binding = _configured_wallet_identity_binding(network)
+        if acquire_lease:
+            try:
+                integrity = database.check_db_integrity()
+            except Exception:
+                integrity = {"ok": False}
+            if type(integrity) is not dict or integrity.get("ok") is not True:
+                result = _blocked_startup_recovery_status(
+                    "DATABASE_INTEGRITY_FAILED",
+                    "database_integrity",
+                    [],
+                    None,
+                )
+                _discard_failed_owner_startup_runtime(mutation_gate.current_runtime())
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
+        _mutation_runtime = mutation_gate.initialize(
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            wallet_identity_binding=wallet_identity_binding,
+            wallet_adapter_authority=get_wallet_adapter_authority(),
+            start_heartbeat=False if acquire_lease else start_heartbeat,
+            acquire_lease=False if acquire_lease else False,
+        )
+        _mutation_runtime_db_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        _mutation_runtime.register_stop_handler(_mutation_stop_handler)
+        if acquire_lease:
+            try:
+                frozen_recovery = database.get_current_runtime_recovery()
+            except Exception:
+                frozen_recovery = None
+            if type(frozen_recovery) is dict:
+                adopted = _mutation_runtime.acquire_recovery_successor(frozen_recovery)
+                if adopted.get("acquired") is not True:
+                    result = _blocked_startup_recovery_status(
+                        "RUNTIME_DISCONTINUITY",
+                        "lease",
+                        [],
+                        _mutation_runtime,
+                    )
+                    _discard_failed_owner_startup_runtime(_mutation_runtime)
+                    _stability_startup_status = _redacted_startup_status(result)
+                    return result
+                result = _complete_runtime_recovery_epoch(
+                    _mutation_runtime,
+                    frozen_recovery,
+                    recovery_owner_run_id=_mutation_runtime.run_id,
+                )
+                if result.get("allowed") is True:
+                    if start_heartbeat:
+                        _mutation_runtime.start_heartbeat()
+                    return result
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
+            state: dict[str, Any] = {}
+            checks = []
+            try:
+                for check_name in _STABILITY_STARTUP_CHECKS:
+                    check = _run_stability_startup_check(
+                        check_name,
+                        state=state,
+                        runtime=_mutation_runtime,
+                        wallet_identity_binding=wallet_identity_binding,
+                        wallet_fingerprint_hash=wallet_hash,
+                        network=network,
+                    )
+                    if type(check) is not dict or type(check.get("ok")) is not bool:
+                        raise RuntimeError(
+                            "startup recovery check returned malformed data"
+                        )
+                    recorded = {"name": check_name, **check}
+                    checks.append(recorded)
+                    if check["ok"] is not True:
+                        result = _blocked_startup_recovery_status(
+                            check.get("reason_code") or "DURABLE_STATE_UNAVAILABLE",
+                            check_name,
+                            checks,
+                            _mutation_runtime,
+                        )
+                        result["blocker_counts"] = dict(
+                            check.get("blocker_counts") or {}
+                        )
+                        failed_runtime = _mutation_runtime
+                        _discard_failed_owner_startup_runtime(failed_runtime)
+                        _stability_startup_status = _redacted_startup_status(result)
+                        return result
+                _mutation_runtime = mutation_gate.initialize(
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    wallet_identity_binding=wallet_identity_binding,
+                    wallet_adapter_authority=get_wallet_adapter_authority(),
+                    start_heartbeat=start_heartbeat,
+                    acquire_lease=True,
+                )
+                _mutation_runtime.register_stop_handler(_mutation_stop_handler)
+            except Exception:
+                result = _blocked_startup_recovery_status(
+                    "DURABLE_STATE_UNAVAILABLE",
+                    checks[-1]["name"] if checks else "startup_recovery",
+                    checks,
+                    _mutation_runtime,
+                )
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+                _stability_startup_status = _redacted_startup_status(result)
+                return result
+        result = _mutation_runtime.status().to_dict()
+        if acquire_lease:
+            result["failed_check"] = (
+                None if result.get("allowed") else "lease_promotion"
+            )
+            result["checks"] = checks
+            result["source"] = (
+                "startup_recovery" if result.get("allowed") else result.get("source")
+            )
+            result["blocker_counts"] = dict(
+                checks[-1].get("blocker_counts") if checks else {}
+            )
+            if result.get("allowed") is not True:
+                failed_runtime = _mutation_runtime
+                _discard_failed_owner_startup_runtime(failed_runtime)
+            _stability_startup_status = _redacted_startup_status(result)
+    slog(
+        "SAFETY",
+        "Mutation runtime initialized",
+        {
+            "allowed": result["allowed"],
+            "reason_code": result["reason_code"],
+            "lease_owner_pid": result["lease"]["owner_pid"],
+        },
+        level="info" if result["allowed"] else "warning",
+    )
+    return result
+
+
+def _start_owned_runtime_services(startup_authorization: dict) -> dict:
+    """Start tracked background services only from an actual owner entry path."""
+
+    if not isinstance(startup_authorization, dict) or (
+        startup_authorization.get("allowed") is not True
+    ):
+        return {"cat_resolver_started": False}
+    starter = globals().get("_start_background_cat_resolver")
+    if not callable(starter):
+        return {"cat_resolver_started": False}
+    try:
+        return {"cat_resolver_started": starter() is not None}
+    except Exception:
+        slog(
+            "SAFETY",
+            "Owned CAT resolver startup failed closed",
+            {"reason_code": "CAT_RESOLVER_START_FAILED"},
+            level="warning",
+        )
+        return {"cat_resolver_started": False}
+
+
+def _ensure_mutation_runtime() -> None:
+    global _mutation_runtime, _mutation_runtime_db_path
+    with _mutation_runtime_init_lock:
+        current_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+        if (
+            mutation_gate.current_runtime() is not None
+            and _mutation_runtime_db_path == current_path
+        ):
+            return
+        try:
+            if mutation_gate.current_runtime() is not None:
+                mutation_gate.shutdown_runtime()
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+            init_database()
+            initialize_mutation_runtime()
+        except Exception:
+            # The request guard below still fails closed with the stable
+            # MUTATION_RUNTIME_NOT_INITIALIZED result.
+            slog(
+                "SAFETY",
+                "Mutation runtime initialization failed",
+                {"reason_code": "DURABLE_STATE_UNAVAILABLE"},
+                level="error",
+            )
+
+
+def release_mutation_runtime() -> dict:
+    global _mutation_runtime, _mutation_runtime_db_path
+    with _mutation_runtime_init_lock:
+        result = mutation_gate.shutdown_runtime(release_owned_lease=True)
+        _mutation_runtime = None
+        _mutation_runtime_db_path = None
+        return result
+
+
+_background_mutation_threads_lock = threading.Lock()
+_background_mutation_threads: dict[int, threading.Thread] = {}
+
+
+def start_mutation_thread(*, operation: str, target, name: str) -> threading.Thread:
+    """Start one tracked async mutator with a permit held for its lifetime."""
+
+    permit = mutation_gate.enter_mutation(operation)
+    holder: dict[str, threading.Thread] = {}
+
+    def run() -> None:
+        try:
+            target()
+        finally:
+            mutation_gate.exit_mutation(permit)
+            thread = holder.get("thread")
+            if thread is not None:
+                with _background_mutation_threads_lock:
+                    _background_mutation_threads.pop(id(thread), None)
+
+    thread = threading.Thread(target=run, name=str(name)[:128], daemon=True)
+    holder["thread"] = thread
+    with _background_mutation_threads_lock:
+        _background_mutation_threads[id(thread)] = thread
+    try:
+        thread.start()
+    except Exception:
+        with _background_mutation_threads_lock:
+            _background_mutation_threads.pop(id(thread), None)
+        mutation_gate.exit_mutation(permit)
+        raise
+    return thread
+
+
+def _shutdown_thread_refs(bot_instance) -> list[Any]:
+    """Return a de-duplicated snapshot of mutation-producing threads."""
+
+    class _UnverifiableThreadInventory:
+        name = "mutation-thread-inventory"
+
+        @staticmethod
+        def is_alive():
+            raise RuntimeError("mutation thread inventory unavailable")
+
+    refs: list[Any] = []
+    owners = [bot_instance]
+    if bot_instance is not None:
+        owners.extend(
+            [
+                getattr(bot_instance, "coin_manager", None),
+                getattr(bot_instance, "runtime_monitor", None),
+                getattr(bot_instance, "amm_monitor", None),
+                getattr(bot_instance, "shape_fix_orchestrator", None),
+            ]
+        )
+    for owner in owners:
+        if owner is None:
+            continue
+        for attr in (
+            "_thread",
+            "_topup_thread",
+            "_splash_receive_thread",
+            "_health_thread",
+            "_watcher_thread",
+            "_coin_watcher_thread",
+            "_startup_repost_thread",
+            "_stop_finalize_thread",
+            "_graceful_cancel_thread",
+        ):
+            candidate = getattr(owner, attr, None)
+            if candidate is not None and callable(getattr(candidate, "is_alive", None)):
+                refs.append(candidate)
+        for collection_name in ("_ladder_threads", "_sniper_threads"):
+            ladder_threads = getattr(owner, collection_name, None)
+            if not isinstance(ladder_threads, (list, tuple, set)):
+                continue
+            refs.extend(
+                candidate
+                for candidate in ladder_threads
+                if callable(getattr(candidate, "is_alive", None))
+            )
+        worker_threads = getattr(owner, "_threads", None)
+        if isinstance(worker_threads, dict):
+            owner_lock = getattr(owner, "_lock", None)
+            try:
+                if owner_lock is None:
+                    worker_snapshot = tuple(worker_threads.values())
+                else:
+                    with owner_lock:
+                        worker_snapshot = tuple(worker_threads.values())
+            except Exception:
+                refs.append(_UnverifiableThreadInventory())
+                continue
+            refs.extend(
+                candidate
+                for candidate in worker_snapshot
+                if callable(getattr(candidate, "is_alive", None))
+            )
+    for global_name in (
+        "_coin_prep_thread",
+        "_cancel_all_thread",
+        "_boost_activation_thread",
+    ):
+        candidate = globals().get(global_name)
+        if candidate is not None and callable(getattr(candidate, "is_alive", None)):
+            refs.append(candidate)
+    with _background_mutation_threads_lock:
+        refs.extend(_background_mutation_threads.values())
+    return list({id(item): item for item in refs}.values())
+
+
+def _stop_child_process(process, *, timeout_seconds: float) -> bool:
+    """Stop one child and prove it exited; uncertainty is a hard failure."""
+
+    if process is None:
+        return True
+    try:
+        if process.poll() is not None:
+            return True
+    except Exception:
+        return False
+    try:
+        process.terminate()
+        process.wait(timeout=max(0.0, timeout_seconds))
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=max(0.0, timeout_seconds))
+        except Exception:
+            return False
+    try:
+        return process.poll() is not None
+    except Exception:
+        return False
+
+
+def _thread_name(thread) -> str:
+    name = getattr(thread, "name", None)
+    return str(name)[:128] if name else "unnamed-mutation-thread"
+
+
+def quiesce_and_release_mutation_runtime(
+    *, bot_instance=None, wait_seconds: float = 30.0
+) -> dict[str, Any]:
+    """Release ownership only after every local mutation source is proven stopped."""
+
+    global _coin_prep_proc, _coin_prep_thread
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return {"released": False, "reason": "not_initialized"}
+
+    runtime.begin_quiesce()
+    target_bot = bot if bot_instance is None else bot_instance
+    manager = (
+        getattr(target_bot, "coin_manager", None) if target_bot is not None else None
+    )
+    known_threads = _shutdown_thread_refs(target_bot)
+    stop_failed = False
+
+    if target_bot is not None:
+        try:
+            target_bot.stop(wait=True)
+        except Exception:
+            stop_failed = True
+
+    shape_fix = (
+        getattr(target_bot, "shape_fix_orchestrator", None)
+        if target_bot is not None
+        else None
+    )
+    if shape_fix is not None and callable(getattr(shape_fix, "abort_flow", None)):
+        for side in ("buy", "sell"):
+            try:
+                shape_fix.abort_flow(side)
+            except Exception:
+                stop_failed = True
+
+    for monitor_name in ("runtime_monitor", "amm_monitor"):
+        monitor = (
+            getattr(target_bot, monitor_name, None) if target_bot is not None else None
+        )
+        if monitor is not None and callable(getattr(monitor, "stop", None)):
+            try:
+                monitor.stop()
+            except Exception:
+                stop_failed = True
+
+    manager_process = getattr(manager, "_prep_process", None) if manager else None
+    blueprint_process = _coin_prep_proc
+    process_results: list[tuple[Any, bool]] = []
+    unique_processes = {
+        id(item): item
+        for item in (manager_process, blueprint_process)
+        if item is not None
+    }
+    for process in unique_processes.values():
+        process_results.append(
+            (process, _stop_child_process(process, timeout_seconds=wait_seconds))
+        )
+    if any(not stopped for _process, stopped in process_results):
+        stop_failed = True
+
+    manager_process_stopped = manager_process is None or any(
+        process is manager_process and stopped for process, stopped in process_results
+    )
+    blueprint_process_stopped = blueprint_process is None or any(
+        process is blueprint_process and stopped for process, stopped in process_results
+    )
+    if manager_process_stopped and manager is not None:
+        delegation = getattr(manager, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                revoke = _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                revoke = {"revoked": False, "reason": "delegation_revoke_failed"}
+            if not revoke.get("revoked") and revoke.get("reason") not in {
+                "delegation_not_active",
+                "delegation_not_found",
+            }:
+                stop_failed = True
+            else:
+                manager._prep_delegation = None
+        manager._prep_process = None
+        manager._prep_running = False
+    if blueprint_process_stopped:
+        _coin_prep_proc = None
+        _coin_prep_state["running"] = False
+
+    live_child_pids = sorted(
+        {
+            int(getattr(process, "pid", 0) or 0)
+            for process, stopped in process_results
+            if not stopped and int(getattr(process, "pid", 0) or 0) > 0
+        }
+    )
+    if live_child_pids:
+        stop_failed = True
+
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    all_threads = list(
+        {
+            id(item): item for item in known_threads + _shutdown_thread_refs(target_bot)
+        }.values()
+    )
+    for thread in all_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive() and callable(getattr(thread, "join", None)):
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            stop_failed = True
+
+    all_threads = list(
+        {
+            id(item): item for item in all_threads + _shutdown_thread_refs(target_bot)
+        }.values()
+    )
+    live_threads: list[str] = []
+    unverified_threads: list[str] = []
+    for thread in all_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            alive = bool(thread.is_alive())
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+            continue
+        if alive:
+            live_threads.append(_thread_name(thread))
+    live_threads = sorted(set(live_threads))
+    unverified_threads = sorted(set(unverified_threads))
+    if live_threads:
+        stop_failed = True
+    if manager is not None and (
+        bool(getattr(manager, "_prep_running", False))
+        or bool(getattr(manager, "_topup_running", False))
+    ):
+        stop_failed = True
+
+    if not runtime.wait_for_quiescence(max(0.0, deadline - time.monotonic())):
+        runtime.stop_heartbeat()
+        return {
+            "released": False,
+            "reason": "mutations_in_flight",
+            "live_threads": live_threads,
+            "unverified_threads": unverified_threads,
+            "live_child_pids": live_child_pids,
+        }
+
+    # A permitted launcher may publish its subprocess handle immediately
+    # before returning. Re-snapshot children only after permits have drained.
+    final_manager_process = getattr(manager, "_prep_process", None) if manager else None
+    final_blueprint_process = _coin_prep_proc
+    known_process_ids = {id(process) for process, _stopped in process_results}
+    for process in (final_manager_process, final_blueprint_process):
+        if process is not None and id(process) not in known_process_ids:
+            process_results.append(
+                (process, _stop_child_process(process, timeout_seconds=wait_seconds))
+            )
+            known_process_ids.add(id(process))
+    if any(not stopped for _process, stopped in process_results):
+        stop_failed = True
+
+    final_manager_stopped = final_manager_process is None or any(
+        process is final_manager_process and stopped
+        for process, stopped in process_results
+    )
+    if final_manager_stopped and manager is not None:
+        delegation = getattr(manager, "_prep_delegation", None)
+        if delegation is not None:
+            try:
+                from coin_manager import _revoke_coin_prep_worker_delegation
+
+                revoke = _revoke_coin_prep_worker_delegation(delegation)
+            except Exception:
+                revoke = {"revoked": False, "reason": "delegation_revoke_failed"}
+            if not revoke.get("revoked") and revoke.get("reason") not in {
+                "delegation_not_active",
+                "delegation_not_found",
+            }:
+                stop_failed = True
+            else:
+                manager._prep_delegation = None
+        manager._prep_process = None
+        manager._prep_running = False
+    final_blueprint_stopped = final_blueprint_process is None or any(
+        process is final_blueprint_process and stopped
+        for process, stopped in process_results
+    )
+    if final_blueprint_stopped:
+        _coin_prep_proc = None
+        _coin_prep_state["running"] = False
+    live_child_pids = sorted(
+        {
+            int(getattr(process, "pid", 0) or 0)
+            for process, stopped in process_results
+            if not stopped and int(getattr(process, "pid", 0) or 0) > 0
+        }
+    )
+
+    # A request that already held a permit when quiescence began may publish
+    # its worker reference immediately before exiting that permit.  Drain
+    # permits first, then take the definitive producer snapshot.
+    final_threads = _shutdown_thread_refs(target_bot)
+    for thread in final_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive() and callable(getattr(thread, "join", None)):
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+    for thread in final_threads:
+        if thread is threading.current_thread():
+            continue
+        try:
+            if thread.is_alive():
+                live_threads.append(_thread_name(thread))
+                stop_failed = True
+        except Exception:
+            unverified_threads.append(_thread_name(thread))
+            stop_failed = True
+    live_threads = sorted(set(live_threads))
+    unverified_threads = sorted(set(unverified_threads))
+    if stop_failed:
+        runtime.stop_heartbeat()
+        return {
+            "released": False,
+            "reason": "mutation_producers_not_stopped",
+            "live_threads": live_threads,
+            "unverified_threads": unverified_threads,
+            "live_child_pids": live_child_pids,
+        }
+
+    return release_mutation_runtime()
+
 
 # Active CAT selection — updated when user picks a CAT from the dropdown.
 # Stores wallet_id, asset_id, name, decimals so /api/status can fetch
@@ -1328,11 +3137,33 @@ def _background_cat_resolve():
         print(f"[STARTUP] CAT metadata resolve failed (non-critical): {e}")
 
 
-import threading as _threading
+_startup_cat_resolver_thread = None
+_startup_cat_resolver_lock = threading.Lock()
 
-_threading.Thread(
-    target=_background_cat_resolve, daemon=True, name="cat-resolver"
-).start()
+
+def _start_background_cat_resolver():
+    """Start the CAT resolver only under an owned mutation permit."""
+
+    global _startup_cat_resolver_thread
+    with _startup_cat_resolver_lock:
+        current = _startup_cat_resolver_thread
+        if current is not None:
+            try:
+                if current.is_alive():
+                    return current
+            except Exception:
+                return None
+        try:
+            current = start_mutation_thread(
+                operation="startup:cat_metadata_resolve",
+                target=_background_cat_resolve,
+                name="cat-resolver",
+            )
+        except mutation_gate.MutationBlocked:
+            return None
+        _startup_cat_resolver_thread = current
+        return current
+
 
 # Track when the GUI log panel was last cleared.
 # Events older than this timestamp are hidden from the GUI but still
@@ -1517,31 +3348,60 @@ except Exception as e:
 
 
 def _get_live_mid_price_str() -> Optional[str]:
-    """Return the bot's current weighted mid as a decimal string, or None.
+    """Return the current displayed mid as a decimal string, or None.
 
     Used to seed the coin-prep subprocess with the same price the bot trades
-    against, so CAT-coin sizes align with live ladder sizes. Tries the cached
-    last_price first, then a fresh fetch via get_price() if the cache is empty
-    or stale (common when prep is triggered before the bot loop has started
-    and no cycle has populated the cache yet).
+    against, so CAT-coin sizes align with live ladder sizes. When the bot exists,
+    tries its cached weighted price first and then a fresh price-engine fetch.
+    Before the bot is created, uses the fresh pre-start price already displayed
+    by ``/api/status`` instead of silently falling back to a different oracle.
 
-    Returns None only when both paths fail; the worker then falls back to
+    Returns None only when all paths fail; the worker then falls back to
     Dexie's last_price ticker, which may lag on thin markets.
     """
     try:
         pe = getattr(bot, "price_engine", None) if "bot" in globals() else None
-        if pe is None:
-            return None
-        p = pe.get_last_price()
+        p = None
+        if pe is not None:
+            p = pe.get_last_price()
+            if p is None or Decimal(str(p)) <= 0:
+                # Cache miss — force a fresh fetch of the weighted mid so prep
+                # and the bot agree on price even on first run.
+                try:
+                    fresh = pe.get_price()
+                    if isinstance(fresh, dict):
+                        p = (
+                            fresh.get("mid_price")
+                            or fresh.get("mid")
+                            or fresh.get("price")
+                        )
+                    else:
+                        p = fresh
+                except Exception:
+                    p = None
+
         if p is None or Decimal(str(p)) <= 0:
-            # Cache miss — force a fresh fetch of the weighted mid so prep
-            # and the bot agree on price even on first run.
+            # /api/status owns the stopped-bot market lookup and caches it for
+            # 60 seconds. Reuse that exact price so the Smart Settings preview
+            # and the worker cannot size the CAT pool from different markets.
             try:
-                fresh = pe.get_price()
-                if isinstance(fresh, dict):
-                    p = fresh.get("mid_price") or fresh.get("mid") or fresh.get("price")
-                else:
-                    p = fresh
+                from blueprints import bot as bot_blueprint
+
+                cache = getattr(bot_blueprint, "_prebot_price_cache", {}) or {}
+                active_asset_id = str(
+                    _active_cat.get("asset_id")
+                    or getattr(cfg, "CAT_ASSET_ID", "")
+                    or ""
+                ).strip()
+                cached_asset_id = str(cache.get("asset_id") or "").strip()
+                cache_age = time.time() - float(cache.get("fetched_at", 0.0) or 0.0)
+                pricing = cache.get("pricing") or {}
+                if (
+                    active_asset_id
+                    and cached_asset_id == active_asset_id
+                    and 0 <= cache_age < 60.0
+                ):
+                    p = pricing.get("mid") or pricing.get("mid_price")
             except Exception:
                 p = None
         if p is None:
@@ -1557,7 +3417,14 @@ def _get_live_mid_price_str() -> Optional[str]:
 def create_bot() -> BotLoop:
     """Create and return the bot loop instance."""
     global bot
+    # Database initialization is completed by both desktop and Flask entry
+    # points before this function. Acquire the lease before constructing any
+    # background component that could eventually reach a wallet mutation.
+    if mutation_gate.current_runtime() is None:
+        initialize_mutation_runtime()
+    mutation_gate.require_allowed("startup:create_bot")
     bot = BotLoop()
+    bot.set_runtime_recovery_coordinator(run_runtime_recovery)
     # Wire up event bus to bot loop for push updates
     bot._event_bus = events
     # Inject spacescan getter so SSE dashboard_update events include spacescan metrics.
@@ -1575,6 +3442,11 @@ def create_bot() -> BotLoop:
         print(f"  [SHAPE-FIX] ⚠️  Could not init orchestrator: {_sf_err}", flush=True)
         bot.shape_fix_orchestrator = None
     bot.runtime_monitor.start()
+    # A latch may have tripped before the bot existed. Late registration
+    # immediately observes it and stops the new loop before it can trade.
+    runtime = mutation_gate.current_runtime()
+    if runtime is not None:
+        runtime.register_stop_handler(_mutation_stop_handler)
     return bot
 
 
@@ -1629,6 +3501,19 @@ def enforce_local_runtime_guard():
     if path.startswith("/api/debug/"):
         return jsonify({"error": "debug_routes_disabled"}), 404
 
+    if (
+        _read_only_diagnostics_active
+        and path.startswith("/api/")
+        and path != "/api/safety/status"
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "error": "diagnostics_read_only",
+                "reason": "DIAGNOSTICS_READ_ONLY",
+            }
+        ), 423
+
     protected_pages = {"/", "/console", "/api/events"}
     if path.startswith("/api/") or path in protected_pages:
         if not _is_loopback_addr(request.remote_addr):
@@ -1660,11 +3545,558 @@ def enforce_local_runtime_guard():
                 {"error": "rate_limited", "message": "Too many requests"}
             ), 429
 
+        # Preserve Flask's method contract once the write request has passed
+        # the local-origin and token guards.  A POST to a GET-only endpoint is
+        # not an executable mutation and must not consult or acquire a wallet
+        # mutation permit before Flask returns its authoritative 405.
+        if isinstance(request.routing_exception, MethodNotAllowed):
+            raise request.routing_exception
+
+        endpoint = request.endpoint or ""
+        requires_mutation = bool(
+            {"POST", "PUT", "PATCH", "DELETE"}.intersection({request.method})
+        ) and _write_endpoint_requires_mutation(endpoint)
+        if endpoint == "bot.api_shutdown":
+            try:
+                requires_mutation = bool(
+                    (request.get_json(silent=True) or {}).get("cancel_offers", False)
+                )
+            except Exception:
+                requires_mutation = False
+        if requires_mutation:
+            _ensure_mutation_runtime()
+            operation = f"api:{endpoint}"
+            try:
+                g._mutation_permit = mutation_gate.enter_mutation(operation)
+            except mutation_gate.MutationBlocked as exc:
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": exc.reason_code,
+                        "operation": operation,
+                    }
+                ), 423
+
+
+@app.teardown_request
+def release_local_runtime_guard(_error=None):
+    """Always retire the exact in-flight permit, including exceptional routes."""
+
+    permit = getattr(g, "_mutation_permit", None)
+    if permit:
+        mutation_gate.exit_mutation(permit)
+
 
 @app.route("/")
 def serve_gui():
     """Serve the bot GUI HTML file."""
     return _serve_bootstrapped_html("bot_gui.html")
+
+
+@app.route("/api/safety/status")
+def api_safety_status():
+    """Return bounded, non-secret startup and live safety diagnostics."""
+
+    try:
+        return jsonify({"success": True, "safety": get_public_stability_status()})
+    except Exception:
+        return jsonify(
+            {
+                "success": False,
+                "error": "safety_status_unavailable",
+                "safety": {
+                    "allowed": False,
+                    "reason_code": "DURABLE_STATE_UNAVAILABLE",
+                    "recommended_action": "RESTORE_DATABASE_BACKUP",
+                },
+            }
+        ), 503
+
+
+@app.route("/api/safety/release-resolved", methods=["POST"])
+def api_safety_release_resolved():
+    """Release only the exact runtime latch already resolved durably.
+
+    Authoritative reconciliation is deliberately separate from this control
+    endpoint.  The caller supplies the latch generation and the complete set
+    of operation IDs it reconciled; ``MutationGate.release_resolved`` performs
+    the durable compare-and-swap and refuses stale, partial, or mismatched
+    authority.
+    """
+
+    if request.content_length is not None and request.content_length > 16384:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "RELEASE_REQUEST_TOO_LARGE",
+                }
+            ),
+            413,
+        )
+    payload = request.get_json(silent=True)
+    expected_keys = {"expected_generation", "resolved_operation_ids"}
+    generation = payload.get("expected_generation") if type(payload) is dict else None
+    operation_ids = (
+        payload.get("resolved_operation_ids") if type(payload) is dict else None
+    )
+    valid_operation_ids = (
+        type(operation_ids) is list
+        and 1 <= len(operation_ids) <= 128
+        and len(operation_ids) == len(set(operation_ids))
+        and all(
+            type(operation_id) is str
+            and re.fullmatch(r"(?:create|cancel):[0-9a-f]{64}", operation_id)
+            is not None
+            for operation_id in operation_ids
+        )
+    )
+    if (
+        type(payload) is not dict
+        or set(payload) != expected_keys
+        or type(generation) is not int
+        or isinstance(generation, bool)
+        or generation < 1
+        or not valid_operation_ids
+    ):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "RELEASE_REQUEST_MALFORMED",
+                }
+            ),
+            400,
+        )
+
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "MUTATION_RUNTIME_NOT_INITIALIZED",
+                }
+            ),
+            503,
+        )
+    try:
+        released = runtime.release_resolved(generation, operation_ids)
+    except Exception:
+        released = None
+    if type(released) is not dict:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": "DURABLE_STATE_UNAVAILABLE",
+                }
+            ),
+            503,
+        )
+    if released.get("released") is not True:
+        reason_codes = {
+            "durable_state_unavailable": "DURABLE_STATE_UNAVAILABLE",
+            "generation_mismatch": "LATCH_GENERATION_MISMATCH",
+            "latch_binding_mismatch": "LATCH_BINDING_MISMATCH",
+            "not_resolved": "OPERATIONS_NOT_RESOLVED",
+            "not_tripped": "LATCH_NOT_TRIPPED",
+            "terminal_process_fence": "TERMINAL_PROCESS_FENCE",
+        }
+        reason_code = reason_codes.get(
+            str(released.get("reason") or ""), "LATCH_RELEASE_REJECTED"
+        )
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "released": False,
+                    "reason_code": reason_code,
+                }
+            ),
+            409,
+        )
+    return jsonify({"success": True, "released": True, "reason_code": "RELEASED"})
+
+
+def _quarantine_runtime_request(payload: Any) -> dict:
+    """Validate a bounded operator CAS and archive server-derived evidence."""
+
+    if type(payload) is not dict:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    required = {
+        "confirmation",
+        "quarantine_id",
+        "blocker_ids",
+        "expected_latch_generation",
+        "expected_recovery_id",
+    }
+    if set(payload) != required or type(payload.get("confirmation")) is not bool:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    if payload["confirmation"] is not True:
+        return {"success": False, "reason_code": "QUARANTINE_CONFIRMATION_REQUIRED"}
+    try:
+        epoch = database.get_runtime_recovery_epoch(payload["expected_recovery_id"])
+        if type(epoch) is not dict:
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        archived = database.quarantine_runtime_blockers(
+            confirmation=payload["confirmation"],
+            quarantine_id=payload["quarantine_id"],
+            blocker_ids=payload["blocker_ids"],
+            expected_latch_generation=payload["expected_latch_generation"],
+            expected_recovery_id=payload["expected_recovery_id"],
+            owner_run_id=epoch["owner_run_id"],
+            wallet_fingerprint_hash=epoch["wallet_fingerprint_hash"],
+            network=epoch["network"],
+            quarantined_at=datetime.now(timezone.utc),
+        )
+        return {
+            "success": True,
+            "quarantine_id": archived["quarantine_id"],
+            "reason_code": "QUARANTINE_ARCHIVED_MUTATION_BLOCKED",
+            "manifest_sha256": archived["manifest_sha256"],
+        }
+    except (TypeError, ValueError):
+        return {"success": False, "reason_code": "QUARANTINE_AUTHORITY_CONFLICT"}
+    except Exception:
+        return {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+
+def _bounded_quarantine_json_request() -> tuple[Any, Optional[dict]]:
+    maximum_bytes = 16384
+    raw_content_length = request.headers.get("Content-Length")
+    content_length = None
+    if raw_content_length is not None:
+        if (
+            type(raw_content_length) is not str
+            or not raw_content_length
+            or len(raw_content_length) > 5
+            or re.fullmatch(r"(?:0|[1-9][0-9]*)", raw_content_length) is None
+        ):
+            return None, {
+                "success": False,
+                "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+            }
+        content_length = int(raw_content_length)
+    if content_length is not None and content_length > maximum_bytes:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+        }
+
+    chunks = []
+    remaining = maximum_bytes + 1
+    try:
+        while remaining > 0:
+            chunk = request.stream.read(remaining)
+            if type(chunk) is not bytes:
+                return None, {
+                    "success": False,
+                    "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+                }
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                return None, {
+                    "success": False,
+                    "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+                }
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except Exception:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
+    raw = b"".join(chunks)
+    if len(raw) > maximum_bytes:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_TOO_LARGE",
+        }
+    if content_length is not None and len(raw) != content_length:
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
+    try:
+        return json.loads(raw), None
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None, {
+            "success": False,
+            "reason_code": "QUARANTINE_REQUEST_MALFORMED",
+        }
+
+
+@app.route("/api/safety/quarantine", methods=["POST"])
+def api_safety_quarantine():
+    """Archive one exact recovery epoch without restoring mutation."""
+
+    payload, error = _bounded_quarantine_json_request()
+    result = error or _quarantine_runtime_request(payload)
+    return jsonify(result), (200 if result.get("success") is True else 409)
+
+
+@app.route("/api/safety/quarantine/<quarantine_id>")
+def api_safety_quarantine_status(quarantine_id: str):
+    """Return bounded, redacted quarantine status."""
+
+    try:
+        row = database.get_runtime_quarantine_manifest(quarantine_id)
+        if row is None:
+            return jsonify(
+                {"success": False, "reason_code": "QUARANTINE_NOT_FOUND"}
+            ), 404
+        latch = database.get_runtime_safety_latch()
+        current_blocked = type(latch) is dict and latch.get("state") == "tripped"
+        return jsonify(
+            {
+                "success": True,
+                "quarantine": {
+                    "quarantine_id": row["quarantine_id"],
+                    "recovery_id": row["recovery_id"],
+                    "latch_generation": int(row["latch_generation"]),
+                    "manifest_sha256": row["manifest_sha256"],
+                    "quarantined_at": row["quarantined_at"],
+                    "archival_blocked_at_capture": True,
+                    "current_mutation_blocked": current_blocked,
+                    "current_latch_generation": (
+                        int(latch["generation"])
+                        if type(latch) is dict and type(latch.get("generation")) is int
+                        else None
+                    ),
+                },
+            }
+        )
+    except (TypeError, ValueError):
+        return jsonify(
+            {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+        ), 400
+    except Exception:
+        return jsonify(
+            {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+        ), 503
+
+
+def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
+    """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
+
+    from offer_reconciliation import (
+        load_authoritative_evidence,
+        load_sage_offer_history,
+    )
+
+    absent_offer_ids: list[str] = []
+    coins_by_id: dict[str, dict] = {}
+    observed_at = None
+    complete = True
+    authoritative_read_performed = False
+    history_provenance = "wallet.get_all_offers"
+    identity_provenance = "wallet.get_wallet_identity"
+    for offer in requirements.get("offers", []):
+        evidence = load_authoritative_evidence(offer["intent"])
+        authoritative_read_performed = True
+        if (
+            type(evidence) is not dict
+            or evidence.get("wallet_fingerprint_hash")
+            != requirements["wallet_fingerprint_hash"]
+            or evidence.get("network") != requirements["network"]
+        ):
+            complete = False
+            continue
+        history = evidence.get("offer_history")
+        transactions = evidence.get("transaction_history")
+        coin_records = evidence.get("coin_records")
+        identity = evidence.get("wallet_identity")
+        if any(
+            type(section) is not dict or section.get("complete") is not True
+            for section in (history, transactions, coin_records, identity)
+        ):
+            complete = False
+            continue
+        if (
+            history.get("provenance") != history_provenance
+            or identity.get("provenance") != identity_provenance
+        ):
+            complete = False
+            continue
+        records = history.get("records")
+        if type(records) is not list:
+            complete = False
+            continue
+        trade_id = offer["trade_id"]
+        if any(
+            type(row) is dict
+            and str(row.get("trade_id") or row.get("offer_id") or "").lower()
+            == trade_id.lower()
+            for row in records
+        ):
+            complete = False
+        else:
+            absent_offer_ids.append(trade_id)
+        raw_coins = coin_records.get("records")
+        if type(raw_coins) is not dict:
+            complete = False
+            continue
+        for coin_id in offer["selected_coin_ids"]:
+            row = raw_coins.get(coin_id)
+            if type(row) is not dict:
+                complete = False
+                continue
+            owned = row.get("owned") is True
+            unlocked = (
+                row.get("spent_height") in (None, 0)
+                and row.get("locked") is not True
+                and not row.get("offer_id")
+            )
+            candidate = {"coin_id": coin_id, "owned": owned, "unlocked": unlocked}
+            if coin_id in coins_by_id and coins_by_id[coin_id] != candidate:
+                complete = False
+            coins_by_id[coin_id] = candidate
+        candidate_observed = evidence.get("observed_at")
+        if type(candidate_observed) is str and (
+            observed_at is None or candidate_observed > observed_at
+        ):
+            observed_at = candidate_observed
+    if not requirements.get("offers"):
+        import wallet
+
+        try:
+            identity = wallet.get_wallet_identity()
+        except Exception:
+            identity = None
+        try:
+            history = load_sage_offer_history(
+                get_all_offers=getattr(
+                    wallet,
+                    "get_authoritative_offer_history",
+                    wallet.get_all_offers,
+                ),
+                include_completed=True,
+            )
+            authoritative_read_performed = True
+        except Exception:
+            history = None
+        identity_hash = (
+            identity.get("wallet_fingerprint_hash") if type(identity) is dict else None
+        )
+        if (
+            type(identity) is dict
+            and identity_hash is None
+            and type(identity.get("fingerprint")) is int
+            and identity["fingerprint"] > 0
+        ):
+            identity_hash = hashlib.sha256(
+                f"fingerprint:{identity['fingerprint']}".encode("utf-8")
+            ).hexdigest()
+        identity_network = (
+            identity.get("network_id") if type(identity) is dict else None
+        )
+        if identity_network is None and type(identity) is dict:
+            identity_network = identity.get("network")
+        identity_ok = bool(
+            type(identity) is dict
+            and identity.get("success") is True
+            and identity_hash == requirements["wallet_fingerprint_hash"]
+            and identity_network == requirements["network"]
+            and type(identity.get("observed_at_utc")) is str
+        )
+        history_ok = bool(
+            type(history) is dict
+            and history.get("complete") is True
+            and history.get("provenance") == history_provenance
+            and type(history.get("records")) is list
+        )
+        complete = identity_ok and history_ok
+        observed_at = history.get("observed_at") if history_ok else None
+    return {
+        "version": 1,
+        "quarantine_id": requirements["quarantine_id"],
+        "recovery_id": requirements["recovery_id"],
+        "latch_generation": requirements["latch_generation"],
+        "wallet_fingerprint_hash": requirements["wallet_fingerprint_hash"],
+        "network": requirements["network"],
+        "authority_digest": requirements["authority_digest"],
+        "observed_at": observed_at,
+        "history_complete": complete,
+        "authoritative_read_performed": authoritative_read_performed,
+        "history_provenance": history_provenance,
+        "identity_provenance": identity_provenance,
+        "absent_offer_ids": sorted(absent_offer_ids),
+        "coins": [coins_by_id[key] for key in sorted(coins_by_id)],
+    }
+
+
+def _resolve_runtime_quarantine_request(payload: Any) -> dict:
+    """Resolve from fresh server-collected evidence, never request booleans."""
+
+    required = {
+        "confirmation",
+        "quarantine_id",
+        "expected_recovery_id",
+        "expected_latch_generation",
+    }
+    if type(payload) is not dict or set(payload) != required:
+        return {"success": False, "reason_code": "QUARANTINE_REQUEST_MALFORMED"}
+    if (
+        type(payload.get("confirmation")) is not bool
+        or payload["confirmation"] is not True
+    ):
+        return {"success": False, "reason_code": "QUARANTINE_CONFIRMATION_REQUIRED"}
+    try:
+        requirements = database.get_runtime_quarantine_resolution_requirements(
+            payload["quarantine_id"]
+        )
+        if (
+            requirements["recovery_id"] != payload["expected_recovery_id"]
+            or requirements["latch_generation"] != payload["expected_latch_generation"]
+        ):
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        proof = _collect_quarantine_resolution_proof(requirements)
+        from runtime_recovery import validate_quarantine_resolution_proof
+
+        decision = validate_quarantine_resolution_proof(
+            requirements,
+            proof,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )
+        if decision.get("allowed") is not True:
+            return {"success": False, "reason_code": decision["reason_code"]}
+        epoch = database.get_runtime_recovery_epoch(requirements["recovery_id"])
+        if type(epoch) is not dict:
+            return {"success": False, "reason_code": "RECOVERY_EPOCH_NOT_CURRENT"}
+        result = database.resolve_runtime_quarantine(
+            quarantine_id=requirements["quarantine_id"],
+            expected_recovery_id=requirements["recovery_id"],
+            expected_latch_generation=requirements["latch_generation"],
+            expected_owner_run_id=epoch["owner_run_id"],
+            proof_decision=decision,
+            resolved_at=datetime.now(timezone.utc),
+        )
+        return {
+            "success": True,
+            "quarantine_id": requirements["quarantine_id"],
+            "reason_code": "QUARANTINE_PROOF_ARCHIVED_RECOVERY_REQUIRED",
+            "proof_sha256": result["record"]["proof_sha256"],
+            "mutation_blocked": True,
+        }
+    except (TypeError, ValueError):
+        return {"success": False, "reason_code": "QUARANTINE_RESOLUTION_BLOCKED"}
+    except Exception:
+        return {"success": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+
+
+@app.route("/api/safety/quarantine/resolve", methods=["POST"])
+def api_safety_quarantine_resolve():
+    payload, error = _bounded_quarantine_json_request()
+    result = error or _resolve_runtime_quarantine_request(payload)
+    return jsonify(result), (200 if result.get("success") is True else 409)
 
 
 @app.route("/console")
@@ -1931,29 +4363,27 @@ def _reset_fresh_run_session(
 ) -> Dict:
     """Reset session-facing bot state.
 
-    Two modes controlled by ``preserve_history``:
+    Two request modes are retained for client compatibility:
 
     * ``preserve_history=False`` (default / legacy / "Start Fresh"):
-        Clears fills, round-trips, position baseline, and runtime stats
-        in addition to anything the caller opted into via the other flags.
-        Equivalent to "wipe everything and start over" — used when the
-        operator explicitly picks Start Fresh or when switching CATs.
+        Requests the broad legacy reset. The database guard refuses the
+        operation without mutation whenever authoritative fills, protected
+        offers, intents, or reservations exist; proof and fill history are
+        never deleted. Empty legacy state remains reset-compatible.
 
     * ``preserve_history=True`` (coin-prep re-run):
         Keeps the fills / round-trips tables and the position baseline.
-        Coin prep can still opt into ``clear_coins`` and
-        ``cancel_open_offers`` because those records refer to coin IDs
-        that are about to be destroyed by the re-split — but the user's
-        trading history survives the re-prep. This is the 2026-04-19
-        default for the Prepare Coins flow; users who actually want a
-        full wipe can pick the explicit Start Fresh button.
+        Coin prep can still request coin and offer cleanup, but the same
+        authority guard preserves every protected row and lock. This is the
+        default Prepare Coins flow.
     """
     global _run_history_cutoff, _session_start_time
 
-    from database import _sqlite_ts
+    from database import _sqlite_ts, guarded_reset_authoritative_state
 
     reset_at = _sqlite_ts(datetime.now(timezone.utc))
     summary = {
+        "success": True,
         "reset_at": reset_at,
         "preserve_history": bool(preserve_history),
         "fills_cleared": 0,
@@ -1964,66 +4394,19 @@ def _reset_fresh_run_session(
         "inventory_cleared": False,
     }
 
-    conn = get_connection()
-    try:
-        has_round_trips = bool(
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='round_trips'"
-            ).fetchone()
-        )
-
-        if not preserve_history:
-            # Only count rows we're actually going to delete.
-            summary["fills_cleared"] = int(
-                (conn.execute("SELECT COUNT(*) as cnt FROM fills").fetchone()["cnt"])
-                or 0
-            )
-            if has_round_trips:
-                summary["round_trips_cleared"] = int(
-                    (
-                        conn.execute(
-                            "SELECT COUNT(*) as cnt FROM round_trips"
-                        ).fetchone()["cnt"]
-                    )
-                    or 0
-                )
-
-        if clear_coins:
-            summary["coins_cleared"] = int(
-                (conn.execute("SELECT COUNT(*) as cnt FROM coins").fetchone()["cnt"])
-                or 0
-            )
-
-        if not preserve_history:
-            conn.execute("DELETE FROM fills")
-            if has_round_trips:
-                conn.execute("DELETE FROM round_trips")
-        if clear_coins:
-            conn.execute("DELETE FROM coins")
-        if cancel_open_offers:
-            cursor = conn.execute(
-                "UPDATE offers SET status='cancelled' WHERE status='open'"
-            )
-            summary["open_offers_cancelled"] = int(cursor.rowcount or 0)
-        if clear_price_history:
-            try:
-                conn.execute("DELETE FROM price_history")
-                summary["price_history_cleared"] = True
-            except Exception:
-                summary["price_history_cleared"] = False
-        if clear_inventory:
-            try:
-                conn.execute("DELETE FROM inventory_snapshots")
-                summary["inventory_cleared"] = True
-            except Exception:
-                summary["inventory_cleared"] = False
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
+    db_summary = guarded_reset_authoritative_state(
+        clear_fills=not preserve_history,
+        clear_round_trips=not preserve_history,
+        clear_coins=clear_coins,
+        cancel_open_offers=cancel_open_offers,
+        clear_price_history=clear_price_history,
+        clear_inventory=clear_inventory,
+    )
+    summary.update(db_summary)
+    if not summary["success"]:
+        summary["reset_at"] = reset_at
+        summary["preserve_history"] = bool(preserve_history)
+        return summary
 
     if not preserve_history:
         # Advance the run-history cutoff so dashboard queries (/api/logs,
@@ -3032,6 +5415,9 @@ _coin_prep_state = {
     "xch_needed": 0,
     "cat_needed": 0,
 }
+_coin_prep_thread = None
+_cancel_all_thread = None
+_boost_activation_thread = None
 _coin_prep_proc = (
     None  # Global ref to subprocess — used to kill old worker on re-trigger
 )
@@ -3188,51 +5574,21 @@ def _serialize_dict(d: dict) -> dict:
 
 
 def _graceful_shutdown(signum, _frame):
-    """Handle Ctrl+C or terminal close — stop bot cleanly before exit."""
+    """Handle Ctrl+C without releasing ownership ahead of live producers."""
     sig_name = (
         signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
     )
-    print(f"\n🛑 Received {sig_name} — shutting down gracefully...", flush=True)
-
-    if bot and bot.is_running():
-        print("   Stopping bot loop...", flush=True)
-        bot.stop()
-        print("   ✅ Bot loop stopped", flush=True)
-
-    try:
-        backup_database()
-        print("   ✅ Database backed up", flush=True)
-    except Exception:
-        pass
-
-    # Stop Splash node (in case bot.stop() didn't cover it)
-    try:
-        if bot and hasattr(bot, "splash_node") and bot.splash_node.is_running():
-            bot.splash_node.stop()
-            print("   ✅ Splash node stopped", flush=True)
-    except Exception:
-        pass
-
-    try:
-        if bot and hasattr(bot, "runtime_monitor"):
-            bot.runtime_monitor.stop()
-    except Exception:
-        pass
-
-    # Stop Chia services
-    print("   Stopping Chia services...", flush=True)
-    try:
-        import chia_node
-
-        result = chia_node.stop_chia("all")
-        if result.get("success"):
-            print("   ✅ Chia services stopped", flush=True)
-        else:
-            print(f"   ⚠️ Chia stop: {result.get('error', 'unknown')}", flush=True)
-    except Exception as e:
-        print(f"   ⚠️ Could not stop Chia: {e}", flush=True)
-
-    print("   Goodbye!", flush=True)
+    slog("SAFETY", "Shutdown requested", {"signal": sig_name})
+    result = quiesce_and_release_mutation_runtime(bot_instance=bot)
+    slog(
+        "SAFETY",
+        "Shutdown quiescence complete",
+        {
+            "released": bool(result.get("released")),
+            "reason": str(result.get("reason") or "")[:128],
+        },
+        level="info" if result.get("released") else "error",
+    )
     sys.exit(0)
 
 
@@ -3443,6 +5799,31 @@ app.register_blueprint(_smart_defaults_bp)
 app.register_blueprint(_bot_bp)
 
 
+def _validate_write_route_classification() -> None:
+    classified = (
+        _MUTATING_API_ENDPOINTS
+        | _READ_ONLY_WRITE_API_ENDPOINTS
+        | _CONTROL_WRITE_API_ENDPOINTS
+    )
+    write_endpoints = {
+        rule.endpoint
+        for rule in app.url_map.iter_rules()
+        if {"POST", "PUT", "PATCH", "DELETE"}.intersection(rule.methods)
+    }
+    overlaps = (
+        (_MUTATING_API_ENDPOINTS & _READ_ONLY_WRITE_API_ENDPOINTS)
+        | (_MUTATING_API_ENDPOINTS & _CONTROL_WRITE_API_ENDPOINTS)
+        | (_READ_ONLY_WRITE_API_ENDPOINTS & _CONTROL_WRITE_API_ENDPOINTS)
+    )
+    if overlaps or classified != write_endpoints:
+        raise RuntimeError(
+            "API write-route mutation classification is incomplete or ambiguous"
+        )
+
+
+_validate_write_route_classification()
+
+
 # Re-export helpers that moved into blueprint modules so tests doing
 # `patch.object(api_server, "_xxx", ...)` keep working unchanged.
 from blueprints.market import _fetch_dbx_pair_status  # noqa: E402
@@ -3454,44 +5835,132 @@ from blueprints.smart_defaults import (  # noqa: E402
 from blueprints.offers import _build_fill_history_for_gui  # noqa: E402
 
 
+def _configured_flask_port() -> int:
+    try:
+        port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+    except (TypeError, ValueError):
+        return 5000
+    return port if 1 <= port <= 65535 else 5000
+
+
+def _build_flask_server_on_reservation(reservation):
+    """Build Werkzeug around the exact pre-bound socket without a bind gap."""
+
+    from werkzeug.serving import make_server
+
+    server = None
+    try:
+        server = make_server(
+            "127.0.0.1",
+            int(reservation.port),
+            app,
+            threaded=True,
+            fd=reservation.fileno(),
+        )
+        server.server_activate()
+    except BaseException:
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        reservation.release()
+        raise
+    reservation.release()
+    return server
+
+
+def _serve_flask_app_on_reservation(reservation) -> None:
+    server = _build_flask_server_on_reservation(reservation)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def _reserve_standalone_server_port(preferred_port: int):
+    """Atomically select the preferred or nearest bounded owner port."""
+
+    import read_only_diagnostics
+
+    return read_only_diagnostics.reserve_loopback_port(
+        preferred_port, include_preferred=True
+    )
+
+
+def _read_only_diagnostics_shutdown(_signum, _frame) -> None:
+    """Exit a non-owner diagnostics process without touching shared services."""
+
+    mutation_gate.shutdown_runtime()
+    raise SystemExit(0)
+
+
+def _serve_read_only_diagnostics(reservation) -> None:
+    """Serve a fail-closed view using only the existing database in read-only mode."""
+
+    global _read_only_diagnostics_active
+    previous_mode = _read_only_diagnostics_active
+    _read_only_diagnostics_active = True
+    try:
+        initialize_mutation_runtime(start_heartbeat=False, acquire_lease=False)
+        slog(
+            "SAFETY",
+            "Read-only diagnostics server starting",
+            {
+                "port": int(reservation.port),
+                "reason_code": "DIAGNOSTICS_READ_ONLY",
+            },
+            level="warning",
+        )
+        _serve_flask_app_on_reservation(reservation)
+    finally:
+        reservation.release()
+        _read_only_diagnostics_active = previous_mode
+        release_mutation_runtime()
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  CATalyst V2 - The Smart One")
     print("=" * 60)
 
-    # --- Check for stale instance already running on port 5000 ---
-    import socket as _socket
-
-    _port = 5000
-    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    _reservation = None
     try:
-        _sock.settimeout(1)
-        _sock.connect(("127.0.0.1", _port))
-        _sock.close()
-        # Port is in use — another instance is running
-        print(f"\n  ⚠️  Port {_port} is already in use!")
-        print("  Another bot instance appears to be running.")
-        print("  Please close the other instance first (Ctrl+C in its terminal),")
-        print("  or kill it via Task Manager (look for 'python api_server.py').")
-        print("\n  Exiting to avoid running multiple instances.\n")
-        sys.exit(1)
-    except (ConnectionRefusedError, OSError, _socket.timeout):
-        pass  # Port is free — good to go
+        init_database()
+        _startup_authorization = initialize_mutation_runtime()
+    except Exception:
+        _startup_authorization = {
+            "allowed": False,
+            "reason_code": "DURABLE_STATE_UNAVAILABLE",
+        }
+    try:
+        _reservation = _reserve_standalone_server_port(_configured_flask_port())
+    except Exception:
+        if _startup_authorization.get("allowed"):
+            quiesce_and_release_mutation_runtime(bot_instance=None)
+        raise
     finally:
-        try:
-            _sock.close()
-        except Exception:
-            pass
+        _early_startup_arbiter.release()
 
-    # Register signal handlers for clean shutdown
-    signal.signal(signal.SIGINT, _graceful_shutdown)  # Ctrl+C
-    signal.signal(signal.SIGTERM, _graceful_shutdown)  # kill / task manager
+    if not _startup_authorization.get("allowed"):
+        signal.signal(signal.SIGINT, _read_only_diagnostics_shutdown)
+        signal.signal(signal.SIGTERM, _read_only_diagnostics_shutdown)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _read_only_diagnostics_shutdown)
+        _early_diagnostics.serve(reservation=_reservation)
+        sys.exit(0)
+
+    _port = int(_reservation.port)
+    os.environ["CATALYST_FLASK_PORT"] = str(_port)
+    _start_owned_runtime_services(_startup_authorization)
+
+    # A non-owner diagnostic process must never stop shared wallet services.
+    _shutdown_handler = _graceful_shutdown
+    signal.signal(signal.SIGINT, _shutdown_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, _shutdown_handler)  # kill / task manager
     # SIGBREAK is Windows-only (terminal close / Ctrl+Break)
     if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _graceful_shutdown)
-
-    # Initialise
-    init_database()
+        signal.signal(signal.SIGBREAK, _shutdown_handler)
 
     # One-shot migration: mark all currently-designated reserve coins as
     # already-advised. Earlier coin-prep runs designated these coins but
@@ -3583,11 +6052,11 @@ if __name__ == "__main__":
     # disclosure, via POST /api/wallet/begin-startup.  This ensures no wallet
     # RPC calls are made before the user has acknowledged the disclaimer.
 
-    try:
-        _port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
-    except (TypeError, ValueError):
-        _port = 5000
-
     log_event("info", "server_started", f"API server starting on port {_port}")
 
-    app.run(host="127.0.0.1", port=_port, debug=False, threaded=True)
+    try:
+        _serve_flask_app_on_reservation(_reservation)
+    except BaseException:
+        _reservation.release()
+        quiesce_and_release_mutation_runtime()
+        raise

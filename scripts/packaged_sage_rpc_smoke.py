@@ -3,7 +3,7 @@
 
 This catches release packaging regressions where the GUI starts but the
 PyInstaller coin-prep worker cannot import its helpers, load its Sage client
-certificate, or complete the authenticated Sage initialize/get_key path.
+certificate, or complete authenticated read-only Sage probes.
 """
 
 from __future__ import annotations
@@ -127,8 +127,8 @@ class MockSageHandler(BaseHTTPRequestHandler):
         if self.connection.getpeercert():
             self.server.saw_client_cert = True
 
-        if self.path == "/initialize":
-            payload = {"success": True}
+        if self.path == "/get_version":
+            payload = {"success": True, "version": "1.2.3"}
         elif self.path == "/get_key":
             payload = {
                 "success": True,
@@ -249,11 +249,19 @@ def run_smoke(exe_path: Path, timeout_s: int) -> int:
             file=sys.stderr,
         )
         return 1
-    required_paths = {"/initialize", "/get_key"}
+    required_paths = {"/get_version", "/get_key"}
     missing = required_paths.difference(server.request_paths)
     if missing:
         print(
             f"ERROR: mock Sage server did not receive required calls: {sorted(missing)}",
+            file=sys.stderr,
+        )
+        return 1
+    forbidden_paths = {"/initialize", "/login", "/resync"}
+    unexpected = forbidden_paths.intersection(server.request_paths)
+    if unexpected:
+        print(
+            f"ERROR: read-only smoke made wallet-mutating calls: {sorted(unexpected)}",
             file=sys.stderr,
         )
         return 1

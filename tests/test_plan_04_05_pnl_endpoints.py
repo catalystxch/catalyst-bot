@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
 
@@ -103,6 +105,7 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -154,8 +157,19 @@ class TestPnlGet(_FlaskBase):
             "circuit_breaker_active",
             "volume_xch",
             "fill_rate_per_hour",
+            "max_position_xch",
         ):
             self.assertIn(key, body)
+
+    def test_response_exposes_live_position_limit(self):
+        with (
+            patch.object(api_server, "bot", _make_bot()),
+            patch("api_server.get_stats", return_value=_fake_stats()),
+            patch.object(api_server.cfg, "MAX_POSITION_XCH", Decimal("63.3")),
+        ):
+            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.get_json()["max_position_xch"], "63.3")
 
     def test_fill_counts_match_stats(self):
         with (
@@ -355,6 +369,7 @@ class TestPnlResetPreview(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestPnlReset(_FlaskBase):
     _FAKE_SUMMARY = {
+        "success": True,
         "fills_cleared": 0,
         "round_trips_cleared": 0,
         "price_history_cleared": False,

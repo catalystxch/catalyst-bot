@@ -11,9 +11,10 @@ Key responsibilities:
     - Preserve backward compatibility with the legacy 4-value `status` column
       through `coarse_status()`
 
-The `REFRESH_POSTED` signal transitions `REFRESH_DUE -> CANCELLED` because the
-refreshed offer is a new row that replaces the old one; the old ID is treated
-as cancelled rather than filled or expired.
+Legacy transitions remain available for existing callers.  New stability-kernel
+callers must route terminal-looking signals through
+``signal_requires_registry_proof()`` and the stricter :mod:`offer_registry`
+authorization policy before persisting a terminal registry state.
 """
 
 from __future__ import annotations
@@ -329,6 +330,17 @@ def coarse_status(lifecycle_state: str) -> str:
         "expired": "expired",
         "not_submitted": "expired",  # no live offer exists; unlock local coin
         "phantom_rejected": "cancelled",  # treat as cancelled for legacy
+        # Stability-kernel states preserve the legacy four-value projection.
+        "prepared": "open",
+        "submitted_unconfirmed": "open",
+        "creation_unknown": "open",
+        "creation_failed": "expired",
+        "created": "open",
+        "visible": "open",
+        "unknown": "open",
+        "conflicted": "open",
+        "quarantined": "open",
+        "terminal": "expired",
     }
     return _map.get(lifecycle_state, "open")
 
@@ -341,4 +353,47 @@ def is_terminal(state: str) -> bool:
         "expired",
         "not_submitted",
         "phantom_rejected",
+        "creation_failed",
+        "terminal",
+    }
+
+
+def registry_state(lifecycle_state: str) -> str:
+    """Project legacy/coarse lifecycle values into strict registry states.
+
+    This adapter intentionally does not infer a terminal outcome.  The registry
+    stores that classification only after its separate proof policy succeeds.
+    """
+
+    mapping = {
+        "open": "visible",
+        "refresh_due": "visible",
+        "cancel_requested": "cancel_requested",
+        "mempool_observed": "visible",
+        "filled": "terminal",
+        "cancelled": "terminal",
+        "expired": "terminal",
+        "not_submitted": "terminal",
+        "phantom_rejected": "terminal",
+        "prepared": "prepared",
+        "submitted_unconfirmed": "submitted_unconfirmed",
+        "creation_unknown": "unknown",
+        "creation_failed": "terminal",
+        "created": "created",
+        "visible": "visible",
+        "unknown": "unknown",
+        "conflicted": "conflicted",
+        "quarantined": "quarantined",
+        "terminal": "terminal",
+    }
+    return mapping.get(str(lifecycle_state).strip().lower(), "unknown")
+
+
+def signal_requires_registry_proof(signal: OfferSignal) -> bool:
+    """Return whether a legacy signal is insufficient terminal proof alone."""
+
+    return signal in {
+        OfferSignal.FILL_DETECTED,
+        OfferSignal.TIME_EXPIRED,
+        OfferSignal.REFRESH_POSTED,
     }

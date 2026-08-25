@@ -48,11 +48,34 @@ def _load_startup_expiry_helper():
     return namespace["collect_locally_expired_stale_offer_ids"]
 
 
+def _load_startup_fill_baseline_helper():
+    source_path = (
+        Path(__file__).resolve().parent.parent / "src" / "catalyst" / "bot_loop.py"
+    )
+    module = ast.parse(
+        source_path.read_text(encoding="utf-8"), filename=str(source_path)
+    )
+    fn_node = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "build_startup_fill_baseline"
+    )
+    isolated = ast.Module(body=[fn_node], type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    namespace = {}
+    exec(compile(isolated, str(source_path), "exec"), namespace)
+    return namespace["build_startup_fill_baseline"]
+
+
 class TestBotLoopSageStatusMapping(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.map_status = staticmethod(_load_mapping_helper())
         cls.collect_local_expired = staticmethod(_load_startup_expiry_helper())
+        cls.build_startup_fill_baseline = staticmethod(
+            _load_startup_fill_baseline_helper()
+        )
 
     def test_confirmed_maps_to_filled(self):
         self.assertEqual(
@@ -104,6 +127,21 @@ class TestBotLoopSageStatusMapping(unittest.TestCase):
             ),
             {"expired-trade"},
         )
+
+    def test_startup_fill_baseline_includes_wallet_absent_database_offers(self):
+        buys, sells = self.build_startup_fill_baseline(
+            wallet_buy_ids={"wallet-buy"},
+            wallet_sell_ids={"wallet-sell"},
+            database_open_offers=[
+                {"trade_id": "offline-buy", "side": "buy"},
+                {"trade_id": "offline-sell", "side": "sell"},
+                {"trade_id": "", "side": "sell"},
+                {"trade_id": "unknown-side", "side": "other"},
+            ],
+        )
+
+        self.assertEqual(buys, {"wallet-buy", "offline-buy"})
+        self.assertEqual(sells, {"wallet-sell", "offline-sell"})
 
 
 if __name__ == "__main__":

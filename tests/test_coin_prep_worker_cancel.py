@@ -1,5 +1,4 @@
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import coin_prep_worker
 
@@ -11,75 +10,21 @@ def _worker():
     return worker
 
 
-def test_coin_prep_cancel_all_cancels_every_open_offer(tmp_path):
+def test_coin_prep_cancel_all_denies_unjournaled_worker_cancellation():
     worker = _worker()
     worker.get_all_open_offers_rpc = MagicMock(
-        side_effect=[
-            [{"id": "trade-a"}, {"id": "trade-b"}],
-            [],
-        ]
+        return_value=[{"id": "trade-a"}, {"id": "trade-b"}]
     )
-    cancelled_file = tmp_path / "worker_cancelled_ids.json"
+    worker._call_wallet_mutation = MagicMock()
 
-    with (
-        patch("user_paths.worker_cancelled_ids_file", return_value=str(cancelled_file)),
-        patch(
-            "coin_prep_worker.cancel_offers_batch",
-            return_value={
-                "trade-a": {"success": True},
-                "trade-b": {"success": True},
-            },
-        ) as batch,
-        patch("coin_prep_worker.time.sleep"),
-    ):
-        assert worker.cancel_all_offers() is True
-
-    batch.assert_called_once_with(["trade-a", "trade-b"], secure=True)
-    payload = json.loads(cancelled_file.read_text(encoding="utf-8"))
-    assert payload["cancelled_ids"] == ["trade-a", "trade-b"]
+    assert worker.cancel_all_offers() is False
+    worker._call_wallet_mutation.assert_not_called()
 
 
-def test_coin_prep_cancel_all_fails_if_offers_remain_open(tmp_path):
+def test_coin_prep_cancel_all_succeeds_when_no_open_offers():
     worker = _worker()
-    worker.get_all_open_offers_rpc = MagicMock(return_value=[{"id": "trade-a"}])
+    worker.get_all_open_offers_rpc = MagicMock(return_value=[])
+    worker._call_wallet_mutation = MagicMock()
 
-    with (
-        patch(
-            "user_paths.worker_cancelled_ids_file",
-            return_value=str(tmp_path / "worker_cancelled_ids.json"),
-        ),
-        patch(
-            "coin_prep_worker.cancel_offers_batch",
-            return_value={"trade-a": {"success": True}},
-        ),
-        patch("coin_prep_worker.time.sleep"),
-    ):
-        assert worker.cancel_all_offers() is False
-
-
-def test_coin_prep_cancel_all_aborts_when_batch_cancel_is_only_pending(tmp_path):
-    worker = _worker()
-    worker.get_all_open_offers_rpc = MagicMock(
-        side_effect=[
-            [{"id": "trade-a"}],
-            [],
-        ]
-    )
-
-    with (
-        patch(
-            "user_paths.worker_cancelled_ids_file",
-            return_value=str(tmp_path / "worker_cancelled_ids.json"),
-        ),
-        patch(
-            "coin_prep_worker.cancel_offers_batch",
-            return_value={
-                "trade-a": {
-                    "success": True,
-                    "method": "submitted_pending_confirm",
-                },
-            },
-        ),
-        patch("coin_prep_worker.time.sleep"),
-    ):
-        assert worker.cancel_all_offers() is False
+    assert worker.cancel_all_offers() is True
+    worker._call_wallet_mutation.assert_not_called()

@@ -31,6 +31,23 @@ from database import (
 )
 from offer_manager import xch_to_mojos, cat_to_mojos, mojos_to_cat
 from amount_utils import format_cat_display_amount
+from cancel_outcomes import (
+    CANCEL_CONFIRMED,
+    CANCEL_FAILED,
+    CANCEL_UNKNOWN,
+    validate_cancel_result,
+)
+
+
+_CANCEL_RESULT_METADATA_KEYS = frozenset(
+    {
+        "_catalyst_effect_attempted",
+        "_catalyst_idempotent_replay",
+        "_catalyst_operation_id",
+        "_catalyst_intent_id",
+        "_catalyst_attempt",
+    }
+)
 
 
 def _bps_to_pct(val):
@@ -42,6 +59,143 @@ def _bps_to_pct(val):
         return f"{n:.1f}%"
     except (ValueError, TypeError):
         return str(val)
+
+
+def _canonical_replacement_cancel_identity(offer_manager, trade_id):
+    """Read the exact cancellation identity the OfferManager will request."""
+
+    if type(trade_id) is not str or len(trade_id) != 64 or trade_id.lower() != trade_id:
+        raise ValueError("replacement cancellation trade identity is invalid")
+    try:
+        bytes.fromhex(trade_id)
+    except ValueError as exc:
+        raise ValueError("replacement cancellation trade identity is invalid") from exc
+    canonicalizer = getattr(offer_manager, "_canonical_cancel_intent", None)
+    if not callable(canonicalizer):
+        raise ValueError("replacement cancellation identity provider is unavailable")
+    identity = canonicalizer(trade_id)
+    operation_id = getattr(identity, "operation_id", None)
+    intent_id = getattr(identity, "intent_id", None)
+    if type(operation_id) is not str or operation_id != f"cancel:{trade_id}":
+        raise ValueError("replacement cancellation operation identity is invalid")
+    fallback_intent = f"cancel-target:{trade_id}"
+    if intent_id != fallback_intent:
+        if (
+            type(intent_id) is not str
+            or len(intent_id) != 64
+            or intent_id.lower() != intent_id
+        ):
+            raise ValueError("replacement cancellation intent identity is invalid")
+        try:
+            bytes.fromhex(intent_id)
+        except ValueError as exc:
+            raise ValueError(
+                "replacement cancellation intent identity is invalid"
+            ) from exc
+    return operation_id, intent_id
+
+
+def _validated_replacement_cancel_envelope(
+    value,
+    *,
+    expected_identity,
+    expected_authority,
+):
+    """Validate an exact Task 2 result with optional complete manager metadata."""
+
+    if type(value) is not dict:
+        raise ValueError("replacement cancellation result envelope is invalid")
+    metadata_keys = set(value) & _CANCEL_RESULT_METADATA_KEYS
+    if not metadata_keys:
+        typed_value = validate_cancel_result(value)
+        if typed_value["outcome"] == CANCEL_CONFIRMED:
+            raise ValueError("bare cancellation confirmation is not authoritative")
+        return typed_value
+    if (
+        metadata_keys != _CANCEL_RESULT_METADATA_KEYS
+        or expected_identity is None
+        or type(expected_authority) is not dict
+        or set(expected_authority)
+        != {"trade_id", "operation_id", "intent_id", "attempt", "outcome"}
+    ):
+        raise ValueError("replacement cancellation result envelope is invalid")
+    operation_id, intent_id = expected_identity
+    trade_id = operation_id.removeprefix("cancel:")
+    if (
+        type(expected_authority["trade_id"]) is not str
+        or expected_authority["trade_id"] != trade_id
+        or type(expected_authority["operation_id"]) is not str
+        or expected_authority["operation_id"] != operation_id
+        or type(expected_authority["intent_id"]) is not str
+        or expected_authority["intent_id"] != intent_id
+        or type(expected_authority["attempt"]) is not int
+        or expected_authority["attempt"] < 1
+        or type(expected_authority["outcome"]) is not str
+        or type(value["_catalyst_effect_attempted"]) is not bool
+        or type(value["_catalyst_idempotent_replay"]) is not bool
+        or (
+            value["_catalyst_effect_attempted"] is True
+            and value["_catalyst_idempotent_replay"] is True
+        )
+        or type(value["_catalyst_operation_id"]) is not str
+        or value["_catalyst_operation_id"] != operation_id
+        or type(value["_catalyst_intent_id"]) is not str
+        or value["_catalyst_intent_id"] != intent_id
+        or type(value["_catalyst_attempt"]) is not int
+        or value["_catalyst_attempt"] != expected_authority["attempt"]
+    ):
+        raise ValueError("replacement cancellation result metadata is invalid")
+    typed_value = {
+        key: item
+        for key, item in value.items()
+        if key not in _CANCEL_RESULT_METADATA_KEYS
+    }
+    typed_value = validate_cancel_result(typed_value)
+    if typed_value["outcome"] != expected_authority["outcome"]:
+        raise ValueError("replacement cancellation result authority is inconsistent")
+    return typed_value
+
+
+def _typed_replacement_cancel_outcomes(
+    results,
+    trade_ids,
+    expected_identities=None,
+    expected_authorities=None,
+):
+    """Return exact Task 2 outcomes, treating missing/malformed data as unknown."""
+    if type(results) is not dict:
+        results = {}
+    if type(expected_identities) is not dict:
+        expected_identities = {}
+    if type(expected_authorities) is not dict:
+        expected_authorities = {}
+    outcomes = {}
+    for trade_id in trade_ids:
+        try:
+            outcomes[trade_id] = _validated_replacement_cancel_envelope(
+                results.get(trade_id),
+                expected_identity=expected_identities.get(trade_id),
+                expected_authority=expected_authorities.get(trade_id),
+            )["outcome"]
+        except (TypeError, ValueError):
+            outcomes[trade_id] = CANCEL_UNKNOWN
+    return outcomes
+
+
+def _has_authoritative_terminal_proof(trade_id: str) -> bool:
+    """Require the Task 9 proof journal in addition to Task 2 cancellation."""
+
+    try:
+        from database import get_authoritative_terminal_record
+
+        record = get_authoritative_terminal_record(trade_id)
+    except Exception:
+        return False
+    return bool(
+        type(record) is dict
+        and record.get("sage_trade_id") == trade_id
+        and record.get("terminal_state") in {"cancelled", "filled", "expired"}
+    )
 
 
 class BoostManager:
@@ -148,6 +302,34 @@ class BoostManager:
         # one of our probes (and thus an arb, not just a stale cancel).
         self._buy_probe_tid_history: set = set()
         self._sell_probe_tid_history: set = set()
+        # Fill-keyed durable effects let a recreated manager materialize the
+        # exact settled side and proven floor, as well as distinguish a replay
+        # from a new Boost effect. Database startup can be unavailable in
+        # narrow unit contexts, so an empty cache remains retry-safe.
+        self._authoritative_boost_fill_ids: set[int] = set()
+        self._authoritative_boost_effects: dict[int, dict] = {}
+        try:
+            from database import authoritative_boost_restore_effect_authority
+
+            with authoritative_boost_restore_effect_authority() as commands:
+                for command in commands:
+                    fill_id = command["fill_id"]
+                    effect = command["effect"]
+                    side = effect["side"]
+                    self._authoritative_boost_fill_ids.add(fill_id)
+                    self._authoritative_boost_effects[fill_id] = dict(effect)
+                    if side == "buy":
+                        self._buy_settled = True
+                        self._buy_offset_bps = effect["offset_bps"]
+                        self._buy_floor_bps = effect["floor_bps"]
+                        self._buy_last_safe_offset_bps = effect["last_safe_offset_bps"]
+                    else:
+                        self._sell_settled = True
+                        self._sell_offset_bps = effect["offset_bps"]
+                        self._sell_floor_bps = effect["floor_bps"]
+                        self._sell_last_safe_offset_bps = effect["last_safe_offset_bps"]
+        except Exception:
+            pass
         # Alternation flag — only push one side per cycle to avoid
         # mempool conflicts caused by simultaneous cancel+create on
         # both sides at once (Sage/mempool stress test 2026-04-25).
@@ -191,10 +373,10 @@ class BoostManager:
 
         Returns dict with results and any warnings.
         """
-        if self._boost_active and self._active_boost_ids:
+        if self._active_boost_ids:
             return {
                 "success": False,
-                "error": "Close the Gap already active",
+                "error": "Close the Gap already has protected offers",
                 "active_count": len(self._active_boost_ids),
             }
 
@@ -407,6 +589,56 @@ class BoostManager:
             return False
         return False
 
+    def _request_replacement_cancels(self, trade_ids, *, reason, **kwargs):
+        """Request typed cancels without treating submission as terminal proof."""
+        trade_ids = list(dict.fromkeys(tid for tid in trade_ids if tid))
+        if not trade_ids or not self._offer_manager:
+            return {}
+        expected_identities = {}
+        for trade_id in trade_ids:
+            try:
+                expected_identities[trade_id] = _canonical_replacement_cancel_identity(
+                    self._offer_manager, trade_id
+                )
+            except (AttributeError, TypeError, ValueError):
+                expected_identities[trade_id] = None
+        for trade_id in trade_ids:
+            self._offer_manager._bot_cancelled_ids.add(trade_id)
+        try:
+            raw_results = self._offer_manager.cancel_offers(
+                trade_ids,
+                reason=reason,
+                **kwargs,
+            )
+        except Exception:
+            raw_results = {}
+        expected_authorities = {}
+        authority_reader = getattr(
+            self._offer_manager, "get_cancel_result_authority", None
+        )
+        if callable(authority_reader):
+            for trade_id in trade_ids:
+                try:
+                    expected_authorities[trade_id] = authority_reader(trade_id)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    expected_authorities[trade_id] = None
+        outcomes = _typed_replacement_cancel_outcomes(
+            raw_results,
+            trade_ids,
+            expected_identities,
+            expected_authorities,
+        )
+        for trade_id in trade_ids:
+            if outcomes.get(trade_id) == CANCEL_CONFIRMED and not (
+                _has_authoritative_terminal_proof(trade_id)
+            ):
+                outcomes[trade_id] = CANCEL_UNKNOWN
+        for trade_id, outcome in outcomes.items():
+            if outcome == CANCEL_FAILED:
+                # A proved no-effect failure leaves the old offer active.
+                self._offer_manager._bot_cancelled_ids.discard(trade_id)
+        return outcomes
+
     def deactivate(self, preserve_convergence: bool = False) -> Dict:
         """Turn gap-closer OFF — cancel boost offers and reset state.
 
@@ -422,35 +654,50 @@ class BoostManager:
             if not self._boost_active and not self._active_boost_ids:
                 return {"success": True, "message": "Close the Gap already inactive"}
 
-            cancelled = 0
-            failed = 0
-
             # Snapshot IDs under the lock so the network cancel runs on a
             # stable list (we release the lock for the cancel RPC below to
             # avoid holding it across a wallet call).
             to_cancel = list(self._active_boost_ids)
             offer_mgr = self._offer_manager
 
+        outcomes = {}
         if to_cancel and offer_mgr:
-            for tid in to_cancel:
-                offer_mgr._bot_cancelled_ids.add(tid)
-            result = offer_mgr.cancel_offers(
+            outcomes = self._request_replacement_cancels(
                 to_cancel,
                 reason="gap_closer_deactivate",
                 skip_confirmation=True,
             )
-            # cancel_offers returns {trade_id: {"success": bool, ...}, ...}
-            # — NOT {"cancelled": N, "failed": N}. Count by iterating values.
-            if isinstance(result, dict):
-                for _tid, _res in result.items():
-                    if isinstance(_res, dict) and _res.get("success"):
-                        cancelled += 1
-                    else:
-                        failed += 1
+        confirmed_ids = {
+            trade_id
+            for trade_id in to_cancel
+            if outcomes.get(trade_id) == CANCEL_CONFIRMED
+        }
+        cancelled = len(confirmed_ids)
+        failed = sum(outcomes.get(trade_id) == CANCEL_FAILED for trade_id in to_cancel)
+        pending = len(to_cancel) - cancelled - failed
 
         with self._lock:
+            self._active_boost_ids = [
+                trade_id
+                for trade_id in self._active_boost_ids
+                if trade_id not in confirmed_ids
+            ]
+            if self._active_boost_ids:
+                self._boost_active = True
+                log_event(
+                    "warning",
+                    "gap_closer_deactivate_pending",
+                    "Close the Gap cancellation remains pending authoritative "
+                    f"reconciliation for {len(self._active_boost_ids)} offer(s)",
+                )
+                return {
+                    "success": False,
+                    "cancelled": cancelled,
+                    "pending": len(self._active_boost_ids),
+                    "failed": failed,
+                }
+
             self._boost_active = False
-            self._active_boost_ids.clear()
             self._boost_mid_price = Decimal("0")
             self._gap_spread_bps = 0
             self._start_spread_bps = 0
@@ -493,6 +740,7 @@ class BoostManager:
         return {
             "success": True,
             "cancelled": cancelled,
+            "pending": pending,
             "failed": failed,
         }
 
@@ -575,7 +823,17 @@ class BoostManager:
                     o["_distance"] = Decimal("0")
             inner_offers.sort(key=lambda o: o.get("_distance", 0), reverse=True)
 
-            # --- Step 2: Create the new inner offer at the proven price ---
+            cancel_tid = inner_offers[0].get("trade_id") if inner_offers else ""
+            if cancel_tid:
+                outcomes = self._request_replacement_cancels(
+                    [cancel_tid],
+                    reason="gap_closer_handoff_swap",
+                    skip_confirmation=True,
+                )
+                if outcomes.get(cancel_tid) != CANCEL_CONFIRMED:
+                    continue
+
+            # --- Step 2: Create after the replaced slot is terminal. ---
             try:
                 # Use normal ladder create for a single inner-tier offer
                 new_offers = om.create_ladder(
@@ -614,29 +872,19 @@ class BoostManager:
 
             handoff_count += created
 
-            # --- Step 3: Cancel the furthest inner offer to maintain count ---
-            if inner_offers:
-                furthest = inner_offers[0]
-                cancel_tid = furthest.get("trade_id")
-                if cancel_tid:
-                    om._bot_cancelled_ids.add(cancel_tid)
-                    om.cancel_offers(
-                        [cancel_tid],
-                        reason="gap_closer_handoff_swap",
-                        skip_confirmation=True,
-                    )
-                    log_event(
-                        "info",
-                        "gap_closer_handoff_swap",
-                        f"📈 Handoff {side}: planted inner offer at "
-                        f"{_bps_to_pct(proven_spread_bps)}, "
-                        f"cancelled furthest inner {cancel_tid[:16]}…",
-                    )
-                    print(
-                        f"📈 Handoff {side}: swapped furthest inner for "
-                        f"new offer at {_bps_to_pct(proven_spread_bps)}",
-                        flush=True,
-                    )
+            if cancel_tid:
+                log_event(
+                    "info",
+                    "gap_closer_handoff_swap",
+                    f"📈 Handoff {side}: planted inner offer at "
+                    f"{_bps_to_pct(proven_spread_bps)}, "
+                    f"cancelled furthest inner {cancel_tid[:16]}…",
+                )
+                print(
+                    f"📈 Handoff {side}: swapped furthest inner for "
+                    f"new offer at {_bps_to_pct(proven_spread_bps)}",
+                    flush=True,
+                )
             else:
                 log_event(
                     "info",
@@ -760,17 +1008,18 @@ class BoostManager:
             new_buy_offset = min(self._buy_offset_bps + step_bps, ceiling)
             if new_buy_offset > self._buy_offset_bps:
                 old_off = self._buy_offset_bps
+                old_trade_id = self._buy_probe_tid
+                outcomes = self._request_replacement_cancels(
+                    [old_trade_id],
+                    reason="gap_closer_buy_step",
+                    skip_confirmation=True,
+                )
+                if outcomes.get(old_trade_id) != CANCEL_CONFIRMED:
+                    return False
                 self._buy_offset_bps = new_buy_offset
-                # Cancel just the buy probe (fire-and-forget)
-                if self._buy_probe_tid and self._offer_manager:
-                    self._offer_manager._bot_cancelled_ids.add(self._buy_probe_tid)
-                    self._offer_manager.cancel_offers(
-                        [self._buy_probe_tid],
-                        reason="gap_closer_buy_step",
-                        skip_confirmation=True,
-                    )
-                    if self._buy_probe_tid in self._active_boost_ids:
-                        self._active_boost_ids.remove(self._buy_probe_tid)
+                if old_trade_id:
+                    if old_trade_id in self._active_boost_ids:
+                        self._active_boost_ids.remove(old_trade_id)
                     self._buy_probe_tid = ""
                 # Brief pause so the cancel tx propagates to Sage's mempool
                 # before we create the new offer (avoids MEMPOOL_CONFLICT
@@ -825,16 +1074,18 @@ class BoostManager:
             new_sell_offset = min(self._sell_offset_bps + step_bps, ceiling)
             if new_sell_offset > self._sell_offset_bps:
                 old_off = self._sell_offset_bps
+                old_trade_id = self._sell_probe_tid
+                outcomes = self._request_replacement_cancels(
+                    [old_trade_id],
+                    reason="gap_closer_sell_step",
+                    skip_confirmation=True,
+                )
+                if outcomes.get(old_trade_id) != CANCEL_CONFIRMED:
+                    return False
                 self._sell_offset_bps = new_sell_offset
-                if self._sell_probe_tid and self._offer_manager:
-                    self._offer_manager._bot_cancelled_ids.add(self._sell_probe_tid)
-                    self._offer_manager.cancel_offers(
-                        [self._sell_probe_tid],
-                        reason="gap_closer_sell_step",
-                        skip_confirmation=True,
-                    )
-                    if self._sell_probe_tid in self._active_boost_ids:
-                        self._active_boost_ids.remove(self._sell_probe_tid)
+                if old_trade_id:
+                    if old_trade_id in self._active_boost_ids:
+                        self._active_boost_ids.remove(old_trade_id)
                     self._sell_probe_tid = ""
                 # Same mempool-propagation pause as the BUY path
                 time.sleep(2.0)
@@ -903,6 +1154,148 @@ class BoostManager:
                 self._on_inverted_arb("sell")
                 return True
         return False
+
+    def capture_authoritative_boost_fill_materialization(
+        self, fill_id: int, trade_id: str, side: str
+    ) -> dict | bool:
+        """Snapshot the exact side state before a durable fill command exists."""
+
+        if (
+            type(fill_id) is not int
+            or fill_id <= 0
+            or type(trade_id) is not str
+            or not trade_id
+            or type(side) is not str
+            or side not in {"buy", "sell"}
+        ):
+            return False
+        with self._lock:
+            if side == "buy":
+                probe_matched = (
+                    trade_id == self._buy_probe_tid
+                    or trade_id in self._buy_probe_tid_history
+                )
+                offset_bps = self._buy_offset_bps
+                current_floor_bps = self._buy_floor_bps
+                last_safe_offset_bps = self._buy_last_safe_offset_bps
+                settled_before = self._buy_settled
+            else:
+                probe_matched = (
+                    trade_id == self._sell_probe_tid
+                    or trade_id in self._sell_probe_tid_history
+                )
+                offset_bps = self._sell_offset_bps
+                current_floor_bps = self._sell_floor_bps
+                last_safe_offset_bps = self._sell_last_safe_offset_bps
+                settled_before = self._sell_settled
+            if (
+                not probe_matched
+                or type(offset_bps) is not int
+                or offset_bps < 0
+                or type(current_floor_bps) is not int
+                or current_floor_bps < 0
+                or type(last_safe_offset_bps) is not int
+                or last_safe_offset_bps < 0
+                or last_safe_offset_bps > offset_bps
+            ):
+                return False
+            floor_bps = current_floor_bps if settled_before else offset_bps
+            if floor_bps != offset_bps:
+                return False
+            return {
+                "schema_version": 1,
+                "fill_id": fill_id,
+                "trade_id": trade_id,
+                "side": side,
+                "probe_trade_id": trade_id,
+                "probe_matched": True,
+                "settled_before": settled_before,
+                "offset_bps": offset_bps,
+                "floor_bps": floor_bps,
+                "last_safe_offset_bps": last_safe_offset_bps,
+            }
+
+    def notify_authoritative_boost_fill(
+        self,
+        fill_id: int,
+        trade_id: str,
+        side: str,
+        materialization: dict,
+        durable_effect: Optional[dict] = None,
+    ) -> dict | bool:
+        """Apply one fill-keyed command and return its exact materialized state."""
+
+        if (
+            type(fill_id) is not int
+            or fill_id <= 0
+            or type(trade_id) is not str
+            or not trade_id.strip()
+            or type(side) is not str
+            or side not in {"buy", "sell"}
+        ):
+            return False
+        try:
+            from database import (
+                _boost_effect_from_materialization,
+                _canonical_authoritative_boost_effect,
+                _canonical_authoritative_boost_materialization,
+            )
+
+            materialization, _encoded, _digest = (
+                _canonical_authoritative_boost_materialization(
+                    materialization, fill_id, trade_id, side
+                )
+            )
+            expected_effect, _effect_json = _boost_effect_from_materialization(
+                materialization, side
+            )
+            if durable_effect is None:
+                effect = expected_effect
+            else:
+                effect, _effect_json = _canonical_authoritative_boost_effect(
+                    durable_effect, side
+                )
+                if effect != expected_effect:
+                    return False
+        except Exception:
+            return False
+        with self._lock:
+            if fill_id in self._authoritative_boost_fill_ids:
+                existing = self._authoritative_boost_effects[fill_id]
+                return dict(existing) if existing == effect else False
+            if side == "buy":
+                self._buy_probe_tid_history.add(materialization["probe_trade_id"])
+                self._buy_offset_bps = materialization["offset_bps"]
+                self._buy_last_safe_offset_bps = materialization["last_safe_offset_bps"]
+                self._buy_settled = True
+                self._buy_floor_bps = materialization["floor_bps"]
+                if self._buy_probe_tid == trade_id:
+                    self._buy_probe_tid = ""
+                offset_bps = self._buy_offset_bps
+                floor_bps = self._buy_floor_bps
+                last_safe_offset_bps = self._buy_last_safe_offset_bps
+            else:
+                self._sell_probe_tid_history.add(materialization["probe_trade_id"])
+                self._sell_offset_bps = materialization["offset_bps"]
+                self._sell_last_safe_offset_bps = materialization[
+                    "last_safe_offset_bps"
+                ]
+                self._sell_settled = True
+                self._sell_floor_bps = materialization["floor_bps"]
+                if self._sell_probe_tid == trade_id:
+                    self._sell_probe_tid = ""
+                offset_bps = self._sell_offset_bps
+                floor_bps = self._sell_floor_bps
+                last_safe_offset_bps = self._sell_last_safe_offset_bps
+            if (
+                offset_bps != materialization["offset_bps"]
+                or floor_bps != materialization["floor_bps"]
+                or last_safe_offset_bps != materialization["last_safe_offset_bps"]
+            ):
+                return False
+            self._authoritative_boost_fill_ids.add(fill_id)
+            self._authoritative_boost_effects[fill_id] = dict(effect)
+            return dict(effect)
 
     def _on_inverted_arb(self, side: str):
         """Called from prune_active_boosts when a probe vanishes pre-expiry.
@@ -1106,14 +1499,34 @@ class BoostManager:
                     o["_distance"] = Decimal("0")
             inner_offers.sort(key=lambda o: o.get("_distance", 0), reverse=True)
 
-            # Plant new tight offers FIRST, then cancel furthest old ones.
+            cancel_ids = [
+                offer.get("trade_id")
+                for offer in inner_offers[:num_to_swap]
+                if offer.get("trade_id")
+            ]
+            if not cancel_ids:
+                continue
+            outcomes = self._request_replacement_cancels(
+                cancel_ids,
+                reason="gap_closer_cascade_swap",
+                skip_confirmation=True,
+            )
+            confirmed_cancel_ids = [
+                trade_id
+                for trade_id in cancel_ids
+                if outcomes.get(trade_id) == CANCEL_CONFIRMED
+            ]
+            if not confirmed_cancel_ids:
+                continue
+
+            # Plant only the slots released by authoritative terminal proof.
             new_offers = []
             try:
                 new_offers = (
                     om.create_ladder(
                         mid_price,
                         side,
-                        num_offers=num_to_swap,
+                        num_offers=len(confirmed_cancel_ids),
                         spread_fraction=tight_spread_fraction,
                         risk_manager=self._risk_manager,
                         coin_ids_enabled=cfg.COIN_IDS_ENABLED,
@@ -1149,28 +1562,8 @@ class BoostManager:
                         ):
                             self._splash_manager.queue_post(bech32, trade_id)
 
-            # Cancel matching number of furthest inner offers (fire-and-forget)
-            cancel_ids = []
-            for o in inner_offers[:created_n]:
-                tid = o.get("trade_id")
-                if tid:
-                    cancel_ids.append(tid)
-            if cancel_ids:
-                for tid in cancel_ids:
-                    om._bot_cancelled_ids.add(tid)
-                try:
-                    om.cancel_offers(
-                        cancel_ids,
-                        reason="gap_closer_cascade_swap",
-                        skip_confirmation=True,
-                    )
-                except Exception as e:
-                    log_event(
-                        "warning",
-                        "gap_closer_cascade_cancel_fail",
-                        f"📈 Cascade {side} cancel failed: {e}",
-                    )
-
+            # The cancel happened before creation; never resubmit it here.
+            cancel_ids = confirmed_cancel_ids[:created_n]
             cascade_total += created_n
             self._session_total_cascade_swaps += created_n
             log_event(
@@ -1234,21 +1627,23 @@ class BoostManager:
             already_subprobed = getattr(self, "_subprobe_attempted", False)
 
             if not already_subprobed and below_spread < self._gap_spread_bps:
-                # Fire one sub-probe below the calculated floor
-                self._subprobe_attempted = True
                 old_spread = self._gap_spread_bps
-                self._gap_spread_bps = below_spread
-                self._steps_taken += 1
-                self._last_step_time = now
-
                 if self._active_boost_ids and self._offer_manager:
-                    for tid in self._active_boost_ids:
-                        self._offer_manager._bot_cancelled_ids.add(tid)
-                    self._offer_manager.cancel_offers(
-                        self._active_boost_ids,
+                    old_ids = list(self._active_boost_ids)
+                    outcomes = self._request_replacement_cancels(
+                        old_ids,
                         reason="gap_closer_subprobe",
                         skip_confirmation=True,
                     )
+                    if any(
+                        outcomes.get(trade_id) != CANCEL_CONFIRMED
+                        for trade_id in old_ids
+                    ):
+                        return False
+                self._subprobe_attempted = True
+                self._gap_spread_bps = below_spread
+                self._steps_taken += 1
+                self._last_step_time = now
                 self._active_boost_ids.clear()
                 self._create_gap_closer_pair(self._boost_mid_price)
                 self._stable_since = time.time()
@@ -1320,28 +1715,20 @@ class BoostManager:
         if new_spread >= old_spread:
             return False
 
-        # ---- Execute the step: cancel old offers, create new at tighter spread ----
-        self._gap_spread_bps = new_spread
-        self._steps_taken += 1
-        self._last_step_time = now
-
-        # Fire-and-forget cancel old offers, then immediately create the new
-        # probe pair using DIFFERENT sniper coins. Why fire-and-forget:
-        # Sage's cancel-confirm path waits up to 90s for the cancel tx to
-        # confirm and the original coin to return — during that window the
-        # inside of the book is EMPTY because the new probes haven't been
-        # placed yet. Probes are sniper-tier (we have 25 in the pool) so the
-        # selector picks a fresh coin for the new probe; the old coin is
-        # still mid-cancel but we don't need it. The cancel will confirm in
-        # the background and free its coin back into the pool.
+        # Cancel first. Task 9 terminal proof must release every old slot
+        # before this method advances the spread or creates a new probe pair.
         if self._active_boost_ids and self._offer_manager:
-            for tid in self._active_boost_ids:
-                self._offer_manager._bot_cancelled_ids.add(tid)
-            self._offer_manager.cancel_offers(
-                self._active_boost_ids,
+            old_ids = list(self._active_boost_ids)
+            outcomes = self._request_replacement_cancels(
+                old_ids,
                 reason="gap_closer_step",
                 skip_confirmation=True,
             )
+            if any(outcomes.get(trade_id) != CANCEL_CONFIRMED for trade_id in old_ids):
+                return False
+        self._gap_spread_bps = new_spread
+        self._steps_taken += 1
+        self._last_step_time = now
         self._active_boost_ids.clear()
 
         # Recreate at new tighter spread
@@ -1446,8 +1833,7 @@ class BoostManager:
         if not needs_refresh:
             return False
 
-        # ---- Refresh: CREATE NEW first, THEN cancel old ----
-        # Same pattern as cascade: never leave a gap in the orderbook.
+        # Refresh is cancel-first; a nonterminal outcome keeps the old pair.
         print(f"📈 Gap closer refresh: {refresh_reason}", flush=True)
         log_event(
             "info", "gap_closer_refresh", f"📈 Gap closer refreshing — {refresh_reason}"
@@ -1455,7 +1841,16 @@ class BoostManager:
 
         old_ids = list(self._active_boost_ids) if self._active_boost_ids else []
 
-        # Step 1: Create new offers FIRST (before cancelling old ones).
+        if old_ids and self._offer_manager:
+            outcomes = self._request_replacement_cancels(
+                old_ids,
+                reason="gap_closer_refresh",
+                skip_confirmation=True,
+            )
+            if any(outcomes.get(trade_id) != CANCEL_CONFIRMED for trade_id in old_ids):
+                return False
+
+        # Create only after every replaced probe has authoritative proof.
         # In inverted-probe mode use the new pair builder which respects
         # the per-side offsets and tracks BUY/SELL probe TIDs separately.
         # Only clear the side(s) that need re-creation — the OTHER side's
@@ -1470,17 +1865,6 @@ class BoostManager:
         ):
             self._sell_probe_tid = ""
         created = self._create_inverted_probe_pair(current_mid_price)
-
-        # Step 2: Cancel old offers AFTER new ones exist
-        if old_ids and self._offer_manager:
-            time.sleep(0.5)
-            for tid in old_ids:
-                self._offer_manager._bot_cancelled_ids.add(tid)
-            self._offer_manager.cancel_offers(
-                old_ids,
-                reason="gap_closer_refresh",
-                skip_confirmation=True,
-            )
 
         if created:
             self._total_refreshes += 1
@@ -1510,58 +1894,41 @@ class BoostManager:
     # -------------------------------------------------------------------
 
     def prune_active_boosts(self, open_trade_ids: set):
-        """Remove gap-closer IDs no longer open (filled or cancelled).
+        """Prune only offers carrying exact Task 9 terminal proof."""
+        import database
 
-        Also detects arb fills: if an offer disappeared but was NOT
-        bot-cancelled, it was arbed. This triggers spread widening.
-        """
         with self._lock:
             before = len(self._active_boost_ids)
-
-            bot_cancelled = set()
-            if self._offer_manager:
-                bot_cancelled = self._offer_manager._bot_cancelled_ids
-
             now = time.time()
+            terminal_ids = set()
             # Iterate over a snapshot so _on_inverted_arb() cannot mutate the
             # list out from under us.
             for tid in list(self._active_boost_ids):
-                if tid not in open_trade_ids and tid not in bot_cancelled:
-                    # Before declaring arb, check if this offer simply expired.
-                    expiry_time = self._boost_id_expiry.get(tid, 0)
-                    if expiry_time > 0 and now >= (expiry_time - 5):
-                        log_event(
-                            "debug",
-                            "gap_closer_offer_expired",
-                            f"Gap closer offer {tid[:16]}… expired naturally (not arbed)",
-                        )
-                    else:
-                        # Inverted-mode arb detection: identify which side the
-                        # missing trade_id belongs to. Check both the CURRENT
-                        # probe TID and the per-side HISTORY set (a fill can
-                        # arrive late, after the bot rotated to a new probe
-                        # whose TID we now hold as the "current" one). The
-                        # history catches that race.
-                        if (
-                            tid == self._buy_probe_tid
-                            or tid in self._buy_probe_tid_history
-                        ):
-                            self._on_inverted_arb("buy")
-                        elif (
-                            tid == self._sell_probe_tid
-                            or tid in self._sell_probe_tid_history
-                        ):
-                            self._on_inverted_arb("sell")
-                        else:
-                            self._arb_count += 1
-                            log_event(
-                                "warning",
-                                "gap_closer_arb_unknown_side",
-                                f"Probe {tid[:16]}… arbed but didn't match any tracked probe TID",
-                            )
+                if tid in open_trade_ids:
+                    continue
+                try:
+                    terminal = database.get_authoritative_terminal_record(tid)
+                except Exception:
+                    terminal = None
+                if terminal is None:
+                    continue
+                terminal_ids.add(tid)
+                if terminal.get("terminal_state") != "filled":
+                    continue
+                if tid == self._buy_probe_tid or tid in self._buy_probe_tid_history:
+                    self._on_inverted_arb("buy")
+                elif tid == self._sell_probe_tid or tid in self._sell_probe_tid_history:
+                    self._on_inverted_arb("sell")
+                else:
+                    self._arb_count += 1
+                    log_event(
+                        "warning",
+                        "gap_closer_arb_unknown_side",
+                        f"Probe {tid[:16]}… filled but did not match a tracked side",
+                    )
 
             self._active_boost_ids = [
-                tid for tid in self._active_boost_ids if tid in open_trade_ids
+                tid for tid in self._active_boost_ids if tid not in terminal_ids
             ]
             # Clean up stale expiry entries older than 5 minutes
             self._boost_id_expiry = {
@@ -2122,14 +2489,14 @@ class BoostManager:
     ) -> Dict:
         """Cascade the main book behind the proven probe level.
 
-        CRITICAL: Creates new offers FIRST, then cancels stale ones.
-        Never wipes the orderbook. Works in batches using spare coins.
+        Replacement is cancel-first and requires authoritative terminal proof.
+        Nonterminal members remain active and get no replacement.
 
         Strategy per side:
           1. Find which existing offers are "stale" (furthest from mid)
           2. Check how many spare coins we have for new offers
-          3. Create new tighter offers (up to batch_size or spare coin count)
-          4. Cancel the same number of stale offers we just replaced
+          3. Request typed cancellation for the stale offers
+          4. Create only slots with authoritative terminal cancellation proof
           5. If more stale offers remain, they'll be handled next cycle
 
         Args:
@@ -2184,9 +2551,23 @@ class BoostManager:
             # Limit to batch_size
             to_replace = stale[:batch_size]
 
-            # Step 1: CREATE new offers at tighter prices FIRST
-            # Use the offer_manager's create_ladder with a small count
-            new_count = len(to_replace)
+            cancel_ids = [
+                offer.get("trade_id") for offer in to_replace if offer.get("trade_id")
+            ]
+            outcomes = self._request_replacement_cancels(
+                cancel_ids,
+                reason="cascade_replace",
+            )
+            confirmed_cancel_ids = [
+                trade_id
+                for trade_id in cancel_ids
+                if outcomes.get(trade_id) == CANCEL_CONFIRMED
+            ]
+            if not confirmed_cancel_ids:
+                continue
+
+            # Create only the slots released by authoritative terminal proof.
+            new_count = len(confirmed_cancel_ids)
             try:
                 new_offers = self._offer_manager.create_ladder(
                     mid_price,
@@ -2224,21 +2605,7 @@ class BoostManager:
                     if bech32 and trade_id:
                         self._dexie_manager.queue_post(bech32, trade_id)
 
-            # Step 2: CANCEL the stale offers we just replaced
-            # Only cancel as many as we successfully created
-            cancel_ids = [
-                o.get("trade_id") for o in to_replace[:created] if o.get("trade_id")
-            ]
-            if cancel_ids:
-                for tid in cancel_ids:
-                    self._offer_manager._bot_cancelled_ids.add(tid)
-                cancel_result = self._offer_manager.cancel_offers(
-                    cancel_ids, reason="cascade_replace"
-                )
-                cancelled = sum(
-                    1 for r in (cancel_result or {}).values() if r and r.get("success")
-                )
-                results[side]["cancelled"] = cancelled
+            results[side]["cancelled"] = len(confirmed_cancel_ids)
 
             log_event(
                 "info",

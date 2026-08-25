@@ -57,14 +57,22 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
-def _live_wallet_reads_allowed(bot_obj=None) -> bool:
-    """Only poll wallet RPC while an authorised bot run is active."""
+def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:
+    """Only poll wallet RPC while an authorised bot run is active.
+
+    Callers that already hold a bot-state snapshot should pass it so this
+    lightweight gate does not rebuild the full dashboard state.
+    """
     if bot_obj is None:
         return False
     state_running = False
     try:
-        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
-        state_running = bool((state or {}).get("running", False))
+        current_state = (
+            state
+            if state is not None
+            else (bot_obj.get_state() if hasattr(bot_obj, "get_state") else {})
+        )
+        state_running = bool((current_state or {}).get("running", False))
     except Exception:
         state_running = False
     try:
@@ -294,6 +302,52 @@ def api_bot_start():
             )
             warnings.append("Coin-prep gate skipped - check logs before trading")
 
+    # Give API/AppBridge callers an early, stable identity error after cheap
+    # validation but before the bot starts orchestration. Every adapter effect
+    # still performs its own fresh authoritative recheck to close the
+    # preflight-to-call race.
+    if not errors:
+        try:
+            from wallet import preflight_wallet_identity
+
+            identity_preflight = preflight_wallet_identity()
+        except Exception:
+            identity_preflight = {
+                "success": False,
+                "reason": "WALLET_IDENTITY_UNAVAILABLE",
+            }
+        if (
+            type(identity_preflight) is not dict
+            or identity_preflight.get("success") is not True
+        ):
+            safe_reasons = {
+                "WALLET_BACKEND_UNSUPPORTED",
+                "WALLET_IDENTITY_BINDING_INVALID",
+                "WALLET_IDENTITY_MALFORMED",
+                "WALLET_IDENTITY_MISMATCH",
+                "WALLET_IDENTITY_NON_SIGNING",
+                "WALLET_IDENTITY_STALE",
+                "WALLET_IDENTITY_UNAVAILABLE",
+            }
+            reason = (
+                identity_preflight.get("reason")
+                if type(identity_preflight) is dict
+                else None
+            )
+            if reason not in safe_reasons:
+                reason = "WALLET_IDENTITY_MALFORMED"
+            error = "Wallet mutation blocked by identity safety check"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "error": error,
+                    "reason": reason,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 400
+
     # Block start on critical errors
     if errors:
         payload = {
@@ -379,8 +433,34 @@ def api_shutdown():
     def _do_shutdown():
         """Run shutdown sequence in background thread so the HTTP response returns first."""
         time.sleep(0.5)  # Let the response reach the browser
+        cancel_permit = None
+        perform_cancel = cancel_first
+        if perform_cancel:
+            try:
+                cancel_permit = api_server.mutation_gate.enter_mutation(
+                    "api:bot.api_shutdown.background_cancel"
+                )
+            except api_server.mutation_gate.MutationBlocked:
+                perform_cancel = False
 
         print("\n🛑 SHUTDOWN sequence starting...", flush=True)
+
+        # Stop offer creation/repost loops before wallet-wide cancellation.
+        # Central cleanup repeats this stop and proves it before lease release.
+        if bot is not None:
+            try:
+                bot.stop(wait=True)
+            except Exception:
+                perform_cancel = False
+            if perform_cancel:
+                for producer in api_server._shutdown_thread_refs(bot):
+                    try:
+                        if producer.is_alive():
+                            perform_cancel = False
+                            break
+                    except Exception:
+                        perform_cancel = False
+                        break
 
         # 0. Kill coin prep subprocess if it's still running
         try:
@@ -406,15 +486,10 @@ def api_shutdown():
         except Exception as e:
             print(f"   ⚠️ Coin prep cleanup: {e}", flush=True)
 
-        # 1. Stop the bot loop
-        if bot and bot.is_running():
-            print("   Stopping bot loop...", flush=True)
-            bot.stop()
-            print("   ✅ Bot loop stopped", flush=True)
-
         # 2. Cancel all offers if requested
-        if cancel_first and bot and bot.offer_manager:
+        if perform_cancel and bot and bot.offer_manager:
             print("   Cancelling all offers...", flush=True)
+            cancelled = 0
             try:
                 result = bot.offer_manager.cancel_all()
                 cancelled = sum(1 for r in result.values() if r and r.get("success"))
@@ -422,52 +497,19 @@ def api_shutdown():
             except Exception as e:
                 print(f"   ⚠️ Cancel failed: {e}", flush=True)
 
-            # Cancel TXs submitted to mempool take a few seconds to leave the
-            # wallet's open-offer view. cancel_all keeps DB status as "open"
-            # for those (so a racing fill isn't misclassified) — but if we
-            # exit immediately the DB stays stale, and the next startup
-            # shows offers that no longer exist on-chain. Poll briefly until
-            # the wallet confirms they're gone, then write through to the DB
-            # so the next session boots with a clean book.
-            try:
-                import time as _t
-                from database import get_open_offers, update_offer_status
+            # A wallet row disappearing after a submitted cancellation is not
+            # authoritative terminal evidence: it could also be a partial RPC
+            # response or a racing fill.  Keep the durable offer and coin lock
+            # intact until reconciliation proves the terminal outcome.
+            if cancelled:
+                print(
+                    f"   ⏳ {cancelled} cancellation request(s) submitted; "
+                    "authoritative terminal reconciliation remains pending",
+                    flush=True,
+                )
 
-                submitted_tids = [
-                    tid for tid, r in (result or {}).items() if r and r.get("success")
-                ]
-                deadline = _t.time() + 30
-                final_open: list = []
-                while _t.time() < deadline:
-                    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
-                    final_open = open_buys + open_sells
-                    if not final_open:
-                        break
-                    _t.sleep(2)
-
-                # Anything in our submitted set that's no longer in the wallet
-                # has cleared on-chain — mark it cancelled in the DB.
-                still_open_tids = {o.get("trade_id") for o in final_open}
-                cleared = [tid for tid in submitted_tids if tid not in still_open_tids]
-                for tid in cleared:
-                    try:
-                        update_offer_status(tid, "cancelled")
-                    except Exception:
-                        pass
-                if cleared:
-                    print(
-                        f"   ✅ {len(cleared)} cancellation(s) confirmed; "
-                        f"DB marked cancelled",
-                        flush=True,
-                    )
-                if final_open:
-                    print(
-                        f"   ⚠️ {len(final_open)} offer(s) still pending after "
-                        f"30s — next startup reconcile will catch them",
-                        flush=True,
-                    )
-            except Exception as e:
-                print(f"   ⚠️ Cancel settle wait failed: {e}", flush=True)
+        if cancel_permit is not None:
+            api_server.mutation_gate.exit_mutation(cancel_permit)
 
         # 3. Stop Splash node (in case bot.stop() didn't cover it)
         try:
@@ -508,7 +550,8 @@ def api_shutdown():
         print("   Shutting down server...", flush=True)
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
-        # 5. Kill the process
+        # 5. Release ownership only after every producer is proven quiescent.
+        api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()
@@ -581,7 +624,7 @@ def api_bot_state():
                 if (
                     int(coins.get("xch_coins", 0) or 0) == 0
                     and int(coins.get("xch_total_coins", 0) or 0) == 0
-                    and _live_wallet_reads_allowed(bot)
+                    and _live_wallet_reads_allowed(bot, state)
                 ):
                     from wallet import get_spendable_coin_count, WALLET_ID_XCH
 
@@ -1132,7 +1175,7 @@ def api_status():
         }
 
         # If balances are all zero during an active run, try direct wallet RPC.
-        if balances_out["xch"]["total"] == 0 and _live_wallet_reads_allowed(bot):
+        if balances_out["xch"]["total"] == 0 and _live_wallet_reads_allowed(bot, raw):
             try:
                 from wallet import get_wallet_balance, WALLET_ID_XCH
 
@@ -1149,7 +1192,7 @@ def api_status():
             except Exception:
                 pass
 
-        if balances_out["cat"]["total"] == 0 and _live_wallet_reads_allowed(bot):
+        if balances_out["cat"]["total"] == 0 and _live_wallet_reads_allowed(bot, raw):
             try:
                 from wallet import get_wallet_balance
 
@@ -1295,80 +1338,48 @@ def api_status():
                 offers_buy = []
                 offers_sell = []
         else:
-            # Bot stopped — fetch from wallet RPC and classify properly
-            # to get real prices, sizes, and side detection
-            offers_buy = []
-            offers_sell = []
+            # Bot stopped — never poll the wallet from this five-second route.
+            # A resume check or explicit /api/offers refresh may already have
+            # produced a fresh wallet-authoritative snapshot, though. Prefer
+            # that snapshot so an externally filled/cancelled offer is not
+            # resurrected in the UI by an older durable DB row.
+            used_wallet_snapshot = False
             try:
-                if not _live_wallet_reads_allowed(bot):
-                    raise StopIteration
-                from wallet import get_all_offers, classify_offers_from_list
-
-                asset_id_for_classify = api_server._active_cat.get(
-                    "asset_id"
-                ) or getattr(cfg, "CAT_ASSET_ID", "")
-                cat_decimals = api_server._active_cat.get("decimals") or getattr(
-                    cfg, "CAT_DECIMALS", 3
+                offer_manager = getattr(bot, "offer_manager", None)
+                snapshot_getter = getattr(
+                    offer_manager, "get_wallet_sync_snapshot", None
                 )
-                all_offers = get_all_offers(end=200)
-                if (
-                    all_offers
-                    and isinstance(all_offers, list)
-                    and asset_id_for_classify
-                ):
-                    buys_raw, sells_raw, _ = classify_offers_from_list(
-                        all_offers, asset_id_for_classify
-                    )
-
-                    def _extract_offer_data(tr, side):
-                        """Extract price/size from a classified offer's normalized summary."""
-                        summary = tr.get("summary") or {}
-                        offered = summary.get("offered") or {}
-                        requested = summary.get("requested") or {}
-                        tid = tr.get("trade_id", "")
-
-                        xch_mojos = 0
-                        cat_mojos = 0
-                        if side == "buy":
-                            # Buying CAT: offering XCH, requesting CAT
-                            xch_mojos = offered.get("xch", 0)
-                            cat_mojos = requested.get(asset_id_for_classify, 0)
-                        else:
-                            # Selling CAT: offering CAT, requesting XCH
-                            cat_mojos = offered.get(asset_id_for_classify, 0)
-                            xch_mojos = requested.get("xch", 0)
-
-                        # Convert mojos to display units
-                        xch_val = abs(float(xch_mojos)) / 1e12
-                        cat_val = abs(float(cat_mojos)) / (10**cat_decimals)
-
-                        # Calculate price (XCH per CAT)
-                        price = xch_val / cat_val if cat_val > 0 else 0
-
-                        return {
-                            "trade_id": tid,
-                            "side": side,
-                            "price_xch": str(price),
-                            "size_xch": str(xch_val),
-                            "size_cat": str(cat_val),
-                            "status": "open",
-                            "created_at": tr.get("created_at_time")
-                            or api_server._sage_ts_to_iso(tr.get("creation_timestamp")),
-                        }
-
-                    for tr in buys_raw:
-                        offers_buy.append(_extract_offer_data(tr, "buy"))
-                    for tr in sells_raw:
-                        offers_sell.append(_extract_offer_data(tr, "sell"))
-
-            except StopIteration:
-                pass
+                if callable(snapshot_getter):
+                    wallet_snapshot = snapshot_getter() or {}
+                    wallet_meta = wallet_snapshot.get("meta") or {}
+                    if wallet_meta.get("fresh") is True:
+                        offers_buy = list(wallet_snapshot.get("buy") or [])
+                        offers_sell = list(wallet_snapshot.get("sell") or [])
+                        used_wallet_snapshot = True
             except Exception as e:
                 slog(
                     "API_STATUS",
-                    f"Wallet offer fetch (bot stopped): {e}",
+                    f"Fresh wallet offer snapshot unavailable: {e}",
                     level="warning",
                 )
+
+            if not used_wallet_snapshot:
+                # Fall back to the durable snapshot when no explicit live read
+                # has completed in this process.
+                try:
+                    cat_id = api_server._active_cat.get("asset_id") or getattr(
+                        cfg, "CAT_ASSET_ID", ""
+                    )
+                    offers_buy = get_open_offers(side="buy", cat_asset_id=cat_id)
+                    offers_sell = get_open_offers(side="sell", cat_asset_id=cat_id)
+                except Exception as e:
+                    offers_buy = []
+                    offers_sell = []
+                    slog(
+                        "API_STATUS",
+                        f"Durable offer snapshot (bot stopped): {e}",
+                        level="warning",
+                    )
 
         # Enrich wallet-sourced offers with Dexie links from bot's dexie_manager
         # and/or database records (prices, sizes, tier, expiry)
@@ -1390,6 +1401,19 @@ def api_status():
 
                 db_offers = db_get_open_offers()
                 db_map = {o["trade_id"]: o for o in db_offers if o.get("trade_id")}
+
+                def _missing_offer_display_value(value):
+                    """Return True for absent or numerically-zero display fields."""
+                    if value is None:
+                        return True
+                    text = str(value).strip()
+                    if not text or text.upper() in {"N/A", "UNKNOWN"}:
+                        return True
+                    try:
+                        return Decimal(text) == Decimal("0")
+                    except (ArithmeticError, ValueError):
+                        return False
+
                 # One-shot diagnostic — check how many DB offers have dexie_id
                 if not hasattr(api_status, "_dexie_diag_done"):
                     api_status._dexie_diag_done = True
@@ -1415,12 +1439,12 @@ def api_status():
                         if db_o.get("dexie_posted"):
                             o["dexie_posted"] = True
                         # Copy price/size if wallet didn't provide them
-                        if o.get("price_xch") in ("0", 0, None, ""):
-                            o["price_xch"] = db_o.get("price_xch", o["price_xch"])
-                        if o.get("size_xch") in ("0", 0, None, ""):
-                            o["size_xch"] = db_o.get("size_xch", o["size_xch"])
-                        if o.get("size_cat") in ("0", 0, None, ""):
-                            o["size_cat"] = db_o.get("size_cat", o["size_cat"])
+                        for field in ("price_xch", "size_xch", "size_cat"):
+                            db_value = db_o.get(field)
+                            if _missing_offer_display_value(
+                                o.get(field)
+                            ) and not _missing_offer_display_value(db_value):
+                                o[field] = db_value
                         # Copy tier and expiry info if available
                         if db_o.get("tier"):
                             o["tier"] = db_o["tier"]
@@ -1524,7 +1548,7 @@ def api_status():
 
             # Status description
             status = o.get("status", "open")
-            if status == "open":
+            if status in {"open", "active"}:
                 o["status"] = "PENDING_ACCEPT"
                 o["status_description"] = "Offer is active and waiting for a taker"
 
@@ -1668,7 +1692,7 @@ def api_status():
         if (
             coin_tracking["xch_free"] == 0
             and coin_tracking["xch_total"] == 0
-            and _live_wallet_reads_allowed(bot)
+            and _live_wallet_reads_allowed(bot, raw)
         ):
             try:
                 from wallet import rpc as wallet_rpc

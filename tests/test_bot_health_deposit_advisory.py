@@ -223,9 +223,23 @@ class UnclaimedDepositsTests(unittest.TestCase):
                 return settings[key]
             return default
 
+        def _fake_get_free_coins(wallet_type):
+            free_rows = []
+            for row in rows:
+                if str(row.get("wallet_type", "cat")).lower() != wallet_type:
+                    continue
+                item = dict(row)
+                item.setdefault("designation", "reserve")
+                free_rows.append(item)
+            return free_rows
+
         cfg = bot_health.cfg
         patchers = [
             patch("database.get_connection", return_value=_FakeConn(rows)),
+            patch(
+                "database.get_free_coins",
+                side_effect=_fake_get_free_coins,
+            ),
             patch("database.get_setting", side_effect=_fake_get_setting),
             patch.object(cfg, "ENABLE_BUY", True),
             patch.object(cfg, "ENABLE_SELL", True),
@@ -470,6 +484,14 @@ class UnclaimedDepositsTests(unittest.TestCase):
         cfg = bot_health.cfg
         patchers = [
             patch("database.get_connection", return_value=_FakeConn([row])),
+            patch(
+                "database.get_free_coins",
+                side_effect=lambda wallet_type: (
+                    [{**dict(row), "designation": row.get("designation", "reserve")}]
+                    if str(row.get("wallet_type", "cat")).lower() == wallet_type
+                    else []
+                ),
+            ),
             patch(
                 "database.get_setting",
                 side_effect=lambda k, d="": (

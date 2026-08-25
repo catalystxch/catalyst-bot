@@ -47,7 +47,6 @@ import pytest
 # Avoid clashing with the developer's local CATalyst install on port 5000.
 _E2E_PORT = int(os.environ.get("CATALYST_E2E_PORT", "5099"))
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DATA_DIR = _REPO_ROOT / ".e2e_data"
 
 
 def pytest_addoption(parser):
@@ -82,22 +81,53 @@ def _wait_for_port(port: int, timeout: float = 30.0) -> bool:
 
 
 @pytest.fixture(scope="session")
-def flask_server():
+def flask_server(tmp_path_factory):
     """Spawn the CATalyst Flask server in a subprocess for the test session.
 
-    Uses a dedicated data dir (`.e2e_data/`) so the test bot has its own DB
-    and doesn't pollute the developer's real wallet state. The server runs in
-    `--flask` mode (no PyWebView window) on a non-default port.
+    Uses a fresh temporary data dir so durable run ownership from an earlier
+    test session cannot redirect the server into diagnostics mode. The legacy
+    migration marker prevents a developer checkout's live `.env` or `bot.db`
+    from being copied into that isolated directory. The server runs in
+    a read-only Flask shell (no PyWebView window) on a non-default port.
     """
-    _DATA_DIR.mkdir(exist_ok=True)
+    data_dir = tmp_path_factory.mktemp("catalyst-e2e")
+    (data_dir / ".migration_complete").write_text(
+        "E2E isolation: do not import legacy runtime state.\n",
+        encoding="utf-8",
+    )
     env = os.environ.copy()
-    env["CMM_DATA_DIR"] = str(_DATA_DIR)
+    env["CMM_DATA_DIR"] = str(data_dir)
     env["CATALYST_FLASK_PORT"] = str(_E2E_PORT)
     # Explicitly avoid pulling the user's real wallet — tests should run
     # against an unconfigured app and exercise the disclaimer/connect flow.
     env.pop("SAGE_FINGERPRINT", None)
 
-    cmd = [sys.executable, "desktop_app.py", "--flask"]
+    # The desktop entry point intentionally refuses a second mutation owner,
+    # even for an isolated data directory whose wallet identity is not yet
+    # configured. E2E smoke tests need only Flask's read-only UI/API shell, so
+    # start that shell directly instead of weakening production ownership.
+    entrypoint = (
+        "import os,sys;"
+        f"sys.path.insert(0, {str(_REPO_ROOT / 'src' / 'catalyst')!r});"
+        "from types import SimpleNamespace;"
+        "import api_server;"
+        "from database import init_database;"
+        "init_database();"
+        "_boost=SimpleNamespace(get_state=lambda:{'active':False});"
+        "api_server.bot=SimpleNamespace("
+        "_start_time=None,_bot_state={},boost_manager=_boost,"
+        "coin_manager=None,coinset_client=None,dexie_manager=None,"
+        "offer_manager=None,price_engine=None,risk_manager=None,"
+        "runtime_monitor=None,splash_manager=None,splash_node=None,"
+        "get_price_info=lambda:{},get_splash_receive_stats=lambda:{},"
+        "get_state=lambda:{'running':False,'coins':{},'stats':{},'loop_count':0},"
+        "is_running=lambda:False);"
+        "app=api_server.app;"
+        "app.run(host='127.0.0.1', "
+        "port=int(os.environ['CATALYST_FLASK_PORT']), "
+        "debug=False, use_reloader=False)"
+    )
+    cmd = [sys.executable, "-c", entrypoint]
     proc = subprocess.Popen(
         cmd,
         cwd=str(_REPO_ROOT),
@@ -138,7 +168,9 @@ def dismiss_disclaimer(page) -> bool:
     btn = page.locator("#startupDisclaimerContinueBtn")
     if btn.count() == 0:
         return False
-    if not btn.is_visible():
+    try:
+        btn.wait_for(state="visible", timeout=10_000)
+    except Exception:
         return False
     btn.click()
     return True

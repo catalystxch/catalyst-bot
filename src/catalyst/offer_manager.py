@@ -16,10 +16,13 @@ Thread-safe via `_lock`. All mutating operations should be called while holding
 the lock, and any coin reservation crosses through shared state guarded here.
 """
 
+import hashlib
 import json
 import os
 import time
 import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
@@ -29,7 +32,6 @@ from database import (
     add_offer,
     update_offer_status,
     transition_offer,
-    mark_cancel_attempted,
     get_open_offers,
     log_event,
     lock_coin,
@@ -37,8 +39,6 @@ from database import (
 )
 from wallet import (
     create_offer,
-    cancel_offer,
-    cancel_offers_batch,
     get_all_offers,
     classify_offers_from_list,
     get_offer_bech32,
@@ -47,6 +47,76 @@ from wallet import (
     get_wallet_type,
     get_owned_coins_detailed,
 )
+import database
+import mutation_gate
+import offer_registry
+from refresh_safety import RefreshPlan, plan_refresh
+from sage_offer_wire import canonical_sage_offer_text
+import wallet
+from cancel_outcomes import (
+    CANCEL_CONFIRMED,
+    CANCEL_FAILED,
+    CANCEL_SUBMITTED_UNCONFIRMED,
+    CANCEL_UNKNOWN,
+    cancellation_result,
+    normalize_cancel_response,
+    validate_cancel_result,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalOfferCreationIntent:
+    intent_id: str
+    operation_id: str
+    offer_items: tuple[tuple[str, int], ...]
+    offered_amount_atomic: str
+    requested_amount_atomic: str
+    selected_coin_id: str
+    asset_id: str
+    side: str
+    tier: str
+    purpose: str
+    slot_key: str
+    generation: int
+    authority_run_id: Optional[str]
+    parent_intent_id: Optional[str]
+    offer_size_uniqueness_json: str
+    expiry_seconds: int
+    expiry_offset: int
+    stagger_seconds: int
+    offer_max_time: int
+    min_coin_hint: Optional[int]
+    max_coin_hint: Optional[int]
+    canonical_intent_sha256: str
+
+    def offer_dict(self) -> dict[str, int]:
+        return dict(self.offer_items)
+
+    def offer_size_uniqueness(self) -> dict[str, Any]:
+        return json.loads(self.offer_size_uniqueness_json)
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalOfferCancelIntent:
+    trade_id: str
+    intent_id: str
+    operation_id: str
+    authority_run_id: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OfferCancelResultProjection:
+    result: Optional[dict]
+    latch_binding: Optional[tuple[str, str]]
+    authoritative: bool
+
+
+class _OfferCreationClaimLost(Exception):
+    """Another exact slot or selected-coin claim committed first."""
+
+
+def _wallet_mutation_count(result) -> int:
+    return result if type(result) is int and result >= 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -76,27 +146,6 @@ def mojos_to_cat(mojos: int, decimals: int) -> Decimal:
     return Decimal(mojos) / scale
 
 
-# Methods that indicate Sage ACCEPTED the cancel submission but the cancel
-# transaction is NOT yet confirmed on-chain. The offer may still be live
-# and could still fill if the cancel TX fails in the mempool. DB status
-# MUST NOT be flipped to "cancelled" for these — a later cancel-confirm
-# poll or fill-detector is what authoritatively closes the offer.
-CANCEL_PENDING_METHODS = frozenset(
-    {
-        "submitted_pending_confirm",
-        "already_in_mempool",
-        "mempool_conflict_inflight",
-        # "already_gone_ambiguous" represents a Sage 404 on the cancel RPC:
-        # the offer is no longer in the wallet but Sage does NOT tell us
-        # whether it was cancelled, filled, or expired. DB status must stay
-        # open so fill_tracker (Spacescan) and bot_health (Dexie reconcile)
-        # can settle the real state — writing `cancelled` here would silently
-        # misclassify any fills that raced the cancel.
-        "already_gone_ambiguous",
-    }
-)
-
-
 # ---------------------------------------------------------------------------
 # Offer Manager
 # ---------------------------------------------------------------------------
@@ -110,6 +159,299 @@ class OfferManager:
     - Manage offer expiry (staggered expiry to avoid cascades)
     - Queue offers for Dexie posting
     """
+
+    @staticmethod
+    def plan_staged_refresh(
+        targets: List[Dict[str, Any]],
+        *,
+        overlap_capacity: int,
+        batch_size: int,
+        operator_mass_cancel: bool = False,
+    ) -> RefreshPlan:
+        """Return the pure Task 11 plan before any requote wallet effect.
+
+        Capacity is deliberately supplied by the caller's authoritative
+        snapshot.  This manager boundary must not guess or repurpose Task 12
+        capacity accounting.
+        """
+
+        return plan_refresh(
+            targets,
+            overlap_capacity=overlap_capacity,
+            batch_size=batch_size,
+            operator_mass_cancel=operator_mass_cancel,
+        )
+
+    @staticmethod
+    def _trip_refresh_lineage_latch(
+        *,
+        operation_id: str,
+        parent: Optional[Dict[str, Any]] = None,
+        cohort_trade_ids: Optional[List[str]] = None,
+        side: Optional[str] = None,
+        malformed_snapshot_entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Latch any malformed refresh boundary before another mutation."""
+
+        wallet_hash = parent.get("wallet_fingerprint_hash") if parent else None
+        network = parent.get("network") if parent else None
+        if not isinstance(wallet_hash, str) or not isinstance(network, str):
+            lease = database.get_runtime_mutation_lease()
+            wallet_hash = lease.get("wallet_fingerprint_hash")
+            network = lease.get("network")
+        if (
+            not isinstance(wallet_hash, str)
+            or not wallet_hash
+            or not isinstance(network, str)
+            or not network
+        ):
+            raise RuntimeError("refresh lineage cannot bind the runtime safety latch")
+        cohort = cohort_trade_ids or ([parent.get("sage_trade_id")] if parent else [])
+        malformed = malformed_snapshot_entries or []
+        if not cohort and not malformed:
+            raise RuntimeError("refresh lineage blocker lacks exact snapshot authority")
+        incident_id = database.refresh_lineage_blocker_operation_id(
+            reason_code=operation_id,
+            cohort_trade_ids=cohort,
+            malformed_snapshot_entries=malformed,
+        )
+        database.record_refresh_lineage_blocker(
+            operation_id=incident_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            side=side or (parent.get("side") if parent else ""),
+            asset_id=parent.get("asset_id") if parent else cfg.CAT_ASSET_ID,
+            cohort_trade_ids=cohort,
+            malformed_snapshot_entries=malformed,
+            reason_code=operation_id,
+        )
+
+    def _resume_pending_refresh_lineage_completions(self, side: str) -> Optional[str]:
+        """Commit one proof-complete lineage even when its parent left open offers.
+
+        The query and completion check are durable/read-only until the final
+        database commit; neither branch performs a wallet or network effect.
+        """
+
+        parent_ids = database.get_pending_refresh_lineage_parent_ids(
+            asset_id=cfg.CAT_ASSET_ID, side=side, limit=64
+        )
+        for parent_id in parent_ids:
+            completion = database.refresh_lineage_completion(
+                parent_id, require_visible=True
+            )
+            if completion.get("complete"):
+                committed = database.commit_refresh_lineage_completion(parent_id)
+                if committed.get("committed"):
+                    return "awaiting_terminal_projection"
+                if committed.get("reason") in {
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
+                }:
+                    parent = database.get_offer_intent(parent_id)
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_id}:resume",
+                        parent=parent,
+                    )
+                    return "lineage_resume_inconsistent"
+                return "awaiting_task8_task9"
+            if completion.get("reason") in {
+                "invalid_lineage",
+                "parent_missing",
+                "parent_identity_missing",
+            }:
+                parent = database.get_offer_intent(parent_id)
+                self._trip_refresh_lineage_latch(
+                    operation_id=f"refresh-lineage:{parent_id}:resume",
+                    parent=parent,
+                )
+                return "lineage_resume_inconsistent"
+        return None
+
+    def _collect_staged_refresh_parents(
+        self, open_offers: List[Dict[str, Any]], side: str
+    ) -> tuple[Dict[str, tuple[Dict[str, Any], Dict[str, Any], int]], Optional[str]]:
+        """Validate a complete cohort before resuming one durable lineage edge.
+
+        The first phase contains no wallet effect: it classifies every selected
+        row before a Task 8 cancellation may be invoked.  This makes a later
+        malformed row fail closed even when an earlier parent is cancel-ready.
+        """
+
+        candidates: Dict[str, tuple[Dict[str, Any], Dict[str, Any], int]] = {}
+        resume_actions: List[tuple[str, Dict[str, Any], str]] = []
+        issues: List[tuple[str, Optional[Dict[str, Any]]]] = []
+        canonical_trade_ids: Dict[int, str] = {}
+        malformed_snapshot_entries = []
+        for index, offer in enumerate(open_offers):
+            candidate = offer.get("trade_id") if type(offer) is dict else None
+            canonical = self._canonical_sage_trade_id(candidate)
+            if canonical is None:
+                malformed_snapshot_entries.append(
+                    self._malformed_refresh_identity_entry(index, candidate)
+                )
+            else:
+                canonical_trade_ids[index] = canonical
+        cohort_trade_ids = list(canonical_trade_ids.values())
+        slot_prefix = f"ladder:{cfg.CAT_ASSET_ID}:{side}:"
+        for index, offer in enumerate(open_offers):
+            trade_id = canonical_trade_ids.get(index)
+            intent = (
+                database.get_offer_intent_by_trade_id(trade_id)
+                if trade_id is not None
+                else None
+            )
+            if type(intent) is not dict:
+                issues.append(("registry_parent_missing", None))
+                continue
+            if intent.get("asset_id") != cfg.CAT_ASSET_ID or intent.get("side") != side:
+                issues.append(("registry_parent_conflict", intent))
+                continue
+            if intent.get("child_intent_id"):
+                completion = database.refresh_lineage_completion(
+                    intent["intent_id"], require_visible=True
+                )
+                if completion.get("complete"):
+                    resume_actions.append(
+                        ("commit", intent, "awaiting_terminal_projection")
+                    )
+                    continue
+                reason = completion.get("reason")
+                if reason in {
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
+                }:
+                    issues.append(("lineage_resume_inconsistent", intent))
+                    continue
+                eligibility = database.refresh_parent_cancel_eligibility(
+                    intent["intent_id"], require_visible=True
+                )
+                if eligibility.get("eligible"):
+                    events = database.get_offer_operation_events(f"cancel:{trade_id}")
+                    if events:
+                        latest = events[-1]
+                        if int(latest.get("blocks_mutation") or 0) == 1 or (
+                            latest.get("phase") == "RECONCILED"
+                            and latest.get("outcome") == CANCEL_CONFIRMED
+                        ):
+                            resume_actions.append(
+                                ("wait", intent, "awaiting_task8_task9")
+                            )
+                        else:
+                            resume_actions.append(
+                                ("cancel", intent, "awaiting_task8_task9")
+                            )
+                    else:
+                        resume_actions.append(
+                            ("cancel", intent, "awaiting_task8_task9")
+                        )
+                    continue
+                if eligibility.get("reason") in {"invalid_lineage", "parent_missing"}:
+                    issues.append(("lineage_resume_inconsistent", intent))
+                    continue
+                resume_actions.append(
+                    ("wait", intent, "awaiting_visibility_or_terminal_proof")
+                )
+                continue
+            if intent.get("parent_intent_id"):
+                if (
+                    database.get_refresh_lineage_commit_for_child(intent["intent_id"])
+                    is None
+                ):
+                    resume_actions.append(
+                        ("wait", intent, "awaiting_parent_completion")
+                    )
+                    continue
+            if intent.get("lifecycle_state") not in {"created", "visible"}:
+                issues.append(("registry_parent_conflict", intent))
+                continue
+            slot_key = intent.get("slot_key")
+            if not isinstance(slot_key, str) or not slot_key.startswith(slot_prefix):
+                issues.append(("registry_parent_conflict", intent))
+                continue
+            try:
+                slot = int(slot_key[len(slot_prefix) :])
+            except ValueError:
+                issues.append(("registry_parent_conflict", intent))
+                continue
+            if intent["intent_id"] in candidates:
+                issues.append(("registry_parent_coverage_incomplete", intent))
+                continue
+            candidates[intent["intent_id"]] = (offer, intent, slot)
+        slots = [slot for _offer, _intent, slot in candidates.values()]
+        if len(cohort_trade_ids) != len(open_offers) or len(cohort_trade_ids) != len(
+            set(cohort_trade_ids)
+        ):
+            issues.append(("registry_parent_coverage_incomplete", None))
+        if len(slots) != len(set(slots)):
+            issues.append(("registry_parent_coverage_incomplete", None))
+        if issues:
+            pause, parent = issues[0]
+            operation_id = f"refresh-lineage:{side}:coverage"
+            if parent is not None:
+                operation_id = (
+                    f"refresh-lineage:{parent['intent_id']}:resume"
+                    if pause == "lineage_resume_inconsistent"
+                    else f"refresh-lineage:{parent['intent_id']}:coverage"
+                )
+            self._trip_refresh_lineage_latch(
+                operation_id=operation_id,
+                parent=parent,
+                cohort_trade_ids=cohort_trade_ids,
+                side=side,
+                malformed_snapshot_entries=malformed_snapshot_entries,
+            )
+            return {}, pause
+        # Phase two begins only after the whole selected/open cohort passed
+        # exact identity, state, and slot validation.  Task 8 remains the
+        # only cancellation authority and owns its wallet effect.
+        for action, parent, pause in sorted(
+            resume_actions, key=lambda item: item[1]["intent_id"]
+        ):
+            if action == "wait":
+                return {}, pause
+            if action == "commit":
+                completion = database.commit_refresh_lineage_completion(
+                    parent["intent_id"]
+                )
+                if completion.get("committed"):
+                    return {}, pause
+                if completion.get("reason") in {
+                    "invalid_lineage",
+                    "parent_missing",
+                    "parent_identity_missing",
+                }:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{side}:coverage",
+                        parent=parent,
+                        cohort_trade_ids=cohort_trade_ids,
+                        side=side,
+                    )
+                    return {}, "lineage_resume_inconsistent"
+                return {}, "awaiting_task8_task9"
+            # Re-read Task 8 eligibility immediately before its cancellation
+            # boundary: the validation snapshot never grants mutation rights.
+            eligibility = database.refresh_parent_cancel_eligibility(
+                parent["intent_id"], require_visible=True
+            )
+            if not eligibility.get("eligible"):
+                return {}, "awaiting_visibility_or_terminal_proof"
+            trade_id = parent.get("sage_trade_id")
+            events = database.get_offer_operation_events(f"cancel:{trade_id}")
+            if events:
+                latest = events[-1]
+                if int(latest.get("blocks_mutation") or 0) == 1 or (
+                    latest.get("phase") == "RECONCILED"
+                    and latest.get("outcome") == CANCEL_CONFIRMED
+                ):
+                    return {}, "awaiting_task8_task9"
+            self.cancel_offers(
+                [trade_id], reason="refresh_lineage", skip_confirmation=False
+            )
+            return {}, "awaiting_task8_task9"
+        return candidates, None
 
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
@@ -125,10 +467,25 @@ class OfferManager:
         # Lock for thread safety during offer operations
         self._lock = threading.Lock()
 
+        # Sage creation authority requires strictly newer identity evidence for
+        # every continuation. Parallel ladder workers can observe identities in
+        # one order and enter the authority gate in another, causing valid
+        # creates to fail closed as stale. Keep the complete journal + wallet
+        # effect on one ordered lane per manager while leaving ladder planning
+        # and result processing parallel.
+        self._sage_creation_authority_lock = threading.Lock()
+
         # ----- V1 Parity: Retry failed cancels -----
         # Dict of trade_id -> {"attempts": int, "first_failed": float}
         self._pending_cancel_retries: Dict[str, Dict] = {}
         self._max_cancel_retries: int = 5
+        self._cancel_retry_backoff_seconds: int = 30
+        # A retry that submits a Sage cancellation must remain the sole
+        # mutation owner while Task 9 proves the resulting spend.  The API
+        # safety callback reads this exact operation ID so it can defer its
+        # stop notification without ever reopening the mutation gate.
+        self._cancel_settlement_lock = threading.Lock()
+        self._cancel_settlement_operation_id: Optional[str] = None
 
         # ----- V1 Parity: Recently created offers (anti-overcount) -----
         # Dict of trade_id -> creation_time — offers created this cycle
@@ -179,6 +536,12 @@ class OfferManager:
         # not re-select a coin that is still pending on-chain confirmation.
         # Cleared at the start of every cycle via clear_cycle_coins().
         self._cycle_used_coin_ids: set = set()
+
+        # Test-only crash boundary hook. Production leaves this unset; the
+        # immutable intent argument lets tests simulate process loss without
+        # weakening or branching the durable state machine.
+        self._offer_creation_crash_hook = None
+        self._offer_cancel_crash_hook = None
 
         # ----- Fix F: Slot suspension for coin exhaustion self-heal -----
         # When a specific slot fails to get a unique coin 3 consecutive times,
@@ -1152,13 +1515,8 @@ class OfferManager:
         replenishment toward inner/outer tiers.
 
         Args:
-            live_offer_ids: Set of trade_ids currently confirmed open in the
-                wallet (from this loop's sync_from_wallet call).  When provided,
-                DB offers whose trade_id is NOT in this set are treated as
-                already-expired and their tier slot is counted as empty.  This
-                fixes a 1-cycle reconciliation lag where expired offers still
-                show as 'open' in the DB when replenishment runs, causing new
-                offers to land in the wrong tier position.
+            live_offer_ids: Diagnostic wallet snapshot retained for API
+                compatibility. Wallet omission never opens a durable slot.
         """
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
 
@@ -1170,35 +1528,64 @@ class OfferManager:
             tier = self._classify_tier(slot, total_slots, side=side)
             tier_slots.setdefault(tier, []).append(slot)
 
+        occupied_slots: set[int] = set()
+        slot_reader = getattr(database, "get_active_offer_slot_keys", None)
+        if slot_reader is not None:
+            try:
+                slot_prefix = f"ladder:{asset_id}:{side}:"
+                for slot_key in slot_reader(
+                    asset_id=asset_id,
+                    side=side,
+                ):
+                    if not isinstance(slot_key, str) or not slot_key.startswith(
+                        slot_prefix
+                    ):
+                        raise ValueError("active ladder slot key is not canonical")
+                    suffix = slot_key[len(slot_prefix) :]
+                    slot = int(suffix)
+                    if str(slot) != suffix or slot < 0 or slot >= total_slots:
+                        raise ValueError("active ladder slot key is out of range")
+                    occupied_slots.add(slot)
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "replenishment_slot_authority_unavailable",
+                    "Durable ladder slot authority is unavailable; replenishment paused",
+                    {"side": side, "asset_id": asset_id, "error": str(exc)},
+                )
+                return []
+
         if not cfg.TIER_ENABLED:
-            return list(tier_slots.get("mid", []))
+            return [
+                slot
+                for slot in tier_slots.get("mid", [])
+                if slot not in occupied_slots and not self.is_slot_suspended(side, slot)
+            ]
 
         live_counts = {tier: 0 for tier in tier_slots}
         for offer in get_open_offers(side=side, cat_asset_id=asset_id):
             tier = (offer.get("tier") or "mid").lower()
             if tier not in live_counts:
                 continue
-            # If we have live wallet IDs, only count offers that are still
-            # confirmed open in the wallet.  Offers in DB but gone from the
-            # wallet have expired/been filled and their slot is available.
-            if live_offer_ids is not None:
-                trade_id = offer.get("trade_id") or ""
-                if trade_id and trade_id not in live_offer_ids:
-                    continue  # expired — don't count, the slot is free
             live_counts[tier] += 1
 
         planned_slots: List[int] = []
         for tier in ("inner", "mid", "outer", "extreme"):
-            slots = tier_slots.get(tier, [])
-            if not slots:
+            tier_candidates = tier_slots.get(tier, [])
+            if not tier_candidates:
                 continue
-            slots = [slot for slot in slots if not self.is_slot_suspended(side, slot)]
-            if not slots:
+            eligible_slots = [
+                slot
+                for slot in tier_candidates
+                if not self.is_slot_suspended(side, slot)
+            ]
+            if not eligible_slots:
                 continue
             live_count = live_counts.get(tier, 0)
-            needed = len(slots) - live_count
+            needed = len(eligible_slots) - live_count
             if needed <= 0:
                 continue
+            slots = [slot for slot in eligible_slots if slot not in occupied_slots]
             # Fill from the INNERMOST slots (front of the list, closest to mid)
             # so that replenishments after fills land back at the tightest
             # price position rather than the outermost end of the tier.
@@ -1369,6 +1756,1114 @@ class OfferManager:
     # Offer Creation
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _canonical_creation_json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _canonical_sage_trade_id(value: Any) -> Optional[str]:
+        if type(value) is not str or len(value) != 64:
+            return None
+        if any(character not in "0123456789abcdef" for character in value):
+            return None
+        return value
+
+    @staticmethod
+    def _malformed_refresh_identity_entry(index: int, value: Any) -> Dict[str, Any]:
+        """Return bounded, redacted incident material for an invalid trade ID."""
+
+        digest = hashlib.sha256()
+        if isinstance(value, str):
+            for offset in range(0, len(value), 4096):
+                digest.update(
+                    str.encode(value[offset : offset + 4096], "utf-8", "surrogatepass")
+                )
+        else:
+            type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+            try:
+                representation = repr(value)
+            except Exception:
+                representation = "<unrepresentable>"
+            digest.update(
+                f"{type_name}:{representation[:4096]}".encode(
+                    "utf-8", "backslashreplace"
+                )
+            )
+        return {"entry_index": index, "entry_sha256": digest.hexdigest()}
+
+    @staticmethod
+    def _canonical_sage_offer_text(value: Any) -> Optional[str]:
+        return canonical_sage_offer_text(value)
+
+    @staticmethod
+    def _canonical_sage_creation_identity(result: Any) -> Optional[tuple[str, str]]:
+        if type(result) is not dict or result.get("success") is not True:
+            return None
+        for error_key in ("error", "error_message"):
+            error = result.get(error_key)
+            if error is not None and not (type(error) is str and error == ""):
+                return None
+        status = result.get("status")
+        if status is not None and type(status) is not str:
+            return None
+        if type(status) is str and status.strip().lower() in {
+            "error",
+            "failed",
+            "failure",
+            "rejected",
+        }:
+            return None
+        trade_record_value = result.get("trade_record")
+        if trade_record_value is None:
+            trade_record = {}
+        elif type(trade_record_value) is dict:
+            trade_record = trade_record_value
+        else:
+            return None
+
+        def supplied_trade_id(value: Any) -> tuple[bool, Optional[str]]:
+            if value is None or (type(value) is str and value == ""):
+                return False, None
+            return True, OfferManager._canonical_sage_trade_id(value)
+
+        direct_present, direct = supplied_trade_id(result.get("trade_id"))
+        nested_present, nested = supplied_trade_id(trade_record.get("trade_id"))
+        if (direct_present and direct is None) or (nested_present and nested is None):
+            return None
+        if direct is not None and nested is not None and direct != nested:
+            return None
+        trade_id = direct if direct is not None else nested
+        offer_text = OfferManager._canonical_sage_offer_text(result.get("offer"))
+        if trade_id is None or offer_text is None:
+            return None
+        return trade_id, offer_text
+
+    @staticmethod
+    def _canonical_selected_coin_id(value: Any) -> str:
+        if type(value) is not str:
+            raise ValueError("selected coin ID must be canonical text")
+        normalized = value.strip().lower()
+        if normalized.startswith("0x"):
+            normalized = normalized[2:]
+        if (
+            len(normalized) != 64
+            or not normalized.isascii()
+            or any(character not in "0123456789abcdef" for character in normalized)
+        ):
+            raise ValueError("selected coin ID must be exactly 32-byte hex")
+        return normalized
+
+    def _build_canonical_creation_intent(
+        self,
+        *,
+        offer_dict: dict,
+        selected_coin_id: str,
+        preferred_tier: Optional[str],
+        creation_context: Optional[dict],
+        expiry_seconds: int,
+        expiry_offset: int,
+        stagger_seconds: int,
+        offer_max_time: int,
+        min_coin_hint: Optional[int],
+        max_coin_hint: Optional[int],
+    ) -> _CanonicalOfferCreationIntent:
+        if type(offer_dict) is not dict or not offer_dict:
+            raise ValueError("offer_dict must be a non-empty exact object")
+        items = []
+        negative = []
+        positive = []
+        for raw_wallet_id, raw_amount in offer_dict.items():
+            if type(raw_wallet_id) is int and raw_wallet_id > 0:
+                wallet_id = str(raw_wallet_id)
+            elif (
+                type(raw_wallet_id) is str
+                and raw_wallet_id.isascii()
+                and raw_wallet_id.isdigit()
+                and raw_wallet_id == str(int(raw_wallet_id))
+                and int(raw_wallet_id) > 0
+            ):
+                wallet_id = raw_wallet_id
+            else:
+                raise ValueError("wallet IDs must be canonical positive integers")
+            if type(raw_amount) is not int or raw_amount == 0:
+                raise ValueError("offer amounts must be exact non-zero integers")
+            item = (wallet_id, raw_amount)
+            items.append(item)
+            (negative if raw_amount < 0 else positive).append(item)
+        if len(negative) != 1 or len(positive) != 1:
+            raise ValueError("offer intent requires exactly one spend and one request")
+        if len({wallet_id for wallet_id, _amount in items}) != len(items):
+            raise ValueError("wallet IDs must be unique after canonicalization")
+        items.sort(key=lambda item: int(item[0]))
+        coin_id = self._canonical_selected_coin_id(selected_coin_id)
+        for label, value in (
+            ("expiry_seconds", expiry_seconds),
+            ("expiry_offset", expiry_offset),
+            ("stagger_seconds", stagger_seconds),
+            ("offer_max_time", offer_max_time),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{label} must be an exact non-negative integer")
+        for label, value in (
+            ("min_coin_hint", min_coin_hint),
+            ("max_coin_hint", max_coin_hint),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{label} must be an exact non-negative integer")
+        context = {} if creation_context is None else creation_context
+        if type(context) is not dict:
+            raise ValueError("creation_context must be an exact object")
+        generation = context.get("generation", 0)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("creation generation must be a non-negative integer")
+        authority_run_id = context.get("_authority_run_id")
+        if authority_run_id is not None and (
+            type(authority_run_id) is not str
+            or not authority_run_id
+            or authority_run_id != authority_run_id.strip()
+        ):
+            raise ValueError("creation authority run ID must be canonical text")
+        inferred_side = (
+            "buy"
+            if int(negative[0][0]) == int(getattr(cfg, "WALLET_ID_XCH", 1))
+            else "sell"
+        )
+        side = context.get("side", inferred_side)
+        if type(side) is not str or side not in {"buy", "sell"}:
+            raise ValueError("creation side must be buy or sell")
+        tier = context.get("tier", preferred_tier or "unclassified")
+        purpose = context.get("purpose", "normal_lifecycle")
+        asset_id = context.get("asset_id", getattr(cfg, "CAT_ASSET_ID", None))
+        parent_intent_id = context.get("parent_intent_id")
+        for label, value in (
+            ("tier", tier),
+            ("purpose", purpose),
+            ("asset_id", asset_id),
+        ):
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError(f"creation {label} must be canonical text")
+        if parent_intent_id is not None and (
+            type(parent_intent_id) is not str
+            or not parent_intent_id
+            or parent_intent_id != parent_intent_id.strip()
+        ):
+            raise ValueError("parent_intent_id must be canonical text")
+        uniqueness = context.get(
+            "offer_size_uniqueness",
+            {
+                "requested_amount_atomic": str(positive[0][1]),
+                "offer_items_sha256": hashlib.sha256(
+                    self._canonical_creation_json(items).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        if type(uniqueness) is not dict:
+            raise ValueError("offer_size_uniqueness must be an exact object")
+        uniqueness_json = self._canonical_creation_json(uniqueness)
+        if len(uniqueness_json.encode("utf-8")) > 4096:
+            raise ValueError("offer_size_uniqueness exceeds 4096 UTF-8 bytes")
+        provisional_slot = context.get("slot_key")
+        if provisional_slot is None:
+            provisional_slot = (
+                "offer:"
+                + hashlib.sha256(
+                    self._canonical_creation_json(
+                        {
+                            "offer_items": items,
+                            "selected_coin_id": coin_id,
+                            "side": side,
+                            "tier": tier,
+                            "purpose": purpose,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+        if (
+            type(provisional_slot) is not str
+            or not provisional_slot
+            or provisional_slot != provisional_slot.strip()
+        ):
+            raise ValueError("creation slot_key must be canonical text")
+        identity_payload = {
+            "schema_version": 1,
+            "offer_items": items,
+            "selected_coin_id": coin_id,
+            "asset_id": asset_id,
+            "side": side,
+            "tier": tier,
+            "purpose": purpose,
+            "slot_key": provisional_slot,
+            "generation": generation,
+            "authority_run_id": authority_run_id,
+            "parent_intent_id": parent_intent_id,
+            "offer_size_uniqueness": json.loads(uniqueness_json),
+            "wallet_effect": {
+                "validate_only": False,
+                "expiry_seconds": expiry_seconds,
+                "expiry_offset": expiry_offset,
+                "stagger_seconds": stagger_seconds,
+                "min_coin_hint": min_coin_hint,
+                "max_coin_hint": max_coin_hint,
+            },
+        }
+        digest = hashlib.sha256(
+            self._canonical_creation_json(identity_payload).encode("utf-8")
+        ).hexdigest()
+        return _CanonicalOfferCreationIntent(
+            intent_id=digest,
+            operation_id=f"create:{digest}",
+            offer_items=tuple(items),
+            offered_amount_atomic=str(abs(negative[0][1])),
+            requested_amount_atomic=str(positive[0][1]),
+            selected_coin_id=coin_id,
+            asset_id=asset_id,
+            side=side,
+            tier=tier,
+            purpose=purpose,
+            slot_key=provisional_slot,
+            generation=generation,
+            authority_run_id=authority_run_id,
+            parent_intent_id=parent_intent_id,
+            offer_size_uniqueness_json=uniqueness_json,
+            expiry_seconds=expiry_seconds,
+            expiry_offset=expiry_offset,
+            stagger_seconds=stagger_seconds,
+            offer_max_time=offer_max_time,
+            min_coin_hint=min_coin_hint,
+            max_coin_hint=max_coin_hint,
+            canonical_intent_sha256=digest,
+        )
+
+    @staticmethod
+    def _resolve_creation_context_generation(creation_context: Any) -> Any:
+        if (
+            type(creation_context) is not dict
+            or "select_next_generation" not in creation_context
+        ):
+            return creation_context
+        if creation_context["select_next_generation"] is not True:
+            raise ValueError("select_next_generation must be exact true")
+        if "generation" in creation_context or "_authority_run_id" in creation_context:
+            raise ValueError("durable generation selection cannot be overridden")
+        slot_key = creation_context.get("slot_key")
+        if type(slot_key) is not str or not slot_key or slot_key != slot_key.strip():
+            raise ValueError(
+                "durable generation selection requires a canonical slot_key"
+            )
+        selection = database.select_offer_creation_generation(slot_key=slot_key)
+        if type(selection) is not dict:
+            raise ValueError("durable generation selection is malformed")
+        generation = selection.get("generation")
+        run_id = selection.get("run_id")
+        if type(generation) is not int or generation < 0:
+            raise ValueError("durable generation selection is malformed")
+        if type(run_id) is not str or not run_id or run_id != run_id.strip():
+            raise ValueError("durable generation authority is malformed")
+        resolved = dict(creation_context)
+        del resolved["select_next_generation"]
+        parent_intent_id = resolved.get("parent_intent_id")
+        if parent_intent_id is not None:
+            parent = database.get_offer_intent(parent_intent_id)
+            if type(parent) is not dict:
+                raise ValueError("refresh parent intent is missing")
+            if (
+                parent.get("slot_key") != slot_key
+                or type(parent.get("generation")) is not int
+                or generation != parent.get("generation")
+                or selection.get("active_intent_id") != parent_intent_id
+                or selection.get("active_lifecycle_state")
+                != parent.get("lifecycle_state")
+                or parent.get("child_intent_id") is not None
+                or parent.get("lifecycle_state") not in {"created", "visible"}
+            ):
+                raise ValueError("refresh parent generation authority is invalid")
+            generation = int(parent["generation"]) + 1
+        resolved["generation"] = generation
+        resolved["_authority_run_id"] = run_id
+        return resolved
+
+    def _offer_creation_crash_boundary(
+        self,
+        phase: str,
+        intent: _CanonicalOfferCreationIntent,
+    ) -> None:
+        hook = self._offer_creation_crash_hook
+        if hook is not None:
+            hook(phase, intent)
+
+    @staticmethod
+    def _existing_creation_result(
+        intent: _CanonicalOfferCreationIntent,
+        existing: dict,
+    ) -> dict:
+        state = str(existing.get("lifecycle_state") or "")
+        if state == "created":
+            trade_id = str(existing.get("sage_trade_id") or "")
+            offer_max_time = OfferManager._persisted_creation_offer_max_time(
+                intent, existing
+            )
+            if offer_max_time is None:
+                OfferManager._trip_creation_latch(
+                    intent,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    wallet_fingerprint_hash=str(existing["wallet_fingerprint_hash"]),
+                    network=str(existing["network"]),
+                )
+                return OfferManager._creation_reconciliation_result(intent)
+            return {
+                "success": True,
+                "trade_id": trade_id,
+                "trade_record": {"trade_id": trade_id},
+                "locked_coin_id": intent.selected_coin_id,
+                "offer_max_time": offer_max_time,
+                "_catalyst_effect_attempted": False,
+                "_catalyst_idempotent_replay": True,
+                "_catalyst_intent_id": intent.intent_id,
+            }
+        if state in {"prepared", "submitted_unconfirmed", "creation_unknown"}:
+            OfferManager._trip_creation_latch(
+                intent,
+                reason_code="UNRESOLVED_OPERATIONS",
+                wallet_fingerprint_hash=str(existing["wallet_fingerprint_hash"]),
+                network=str(existing["network"]),
+            )
+            return OfferManager._creation_reconciliation_result(intent)
+        return {
+            "success": False,
+            "error": "Offer creation intent is already terminal",
+            "reason": "OFFER_CREATION_ALREADY_FINALIZED",
+            "_catalyst_effect_attempted": False,
+            "_catalyst_intent_id": intent.intent_id,
+        }
+
+    @staticmethod
+    def _persisted_creation_offer_max_time(
+        intent: _CanonicalOfferCreationIntent,
+        existing: dict,
+    ) -> Optional[int]:
+        try:
+            events = database.get_offer_operation_events(intent.operation_id)
+        except Exception:
+            return None
+        for event in events:
+            if type(event) is not dict or event.get("phase") != "PREPARED":
+                continue
+            try:
+                canonical_event = database.validate_offer_operation_event(event)
+                evidence = json.loads(canonical_event["evidence_json"])
+                journal = json.loads(canonical_event["wallet_identity_json"])
+                journal, run_id, wallet_hash, network = (
+                    OfferManager._verified_continuation_journal(journal, intent)
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                canonical_event["event_id"] != f"{intent.operation_id}:prepared"
+                or canonical_event["operation_id"] != intent.operation_id
+                or canonical_event["intent_id"] != intent.intent_id
+                or canonical_event["operation_type"] != "CREATE"
+                or canonical_event["attempt"] != 1
+                or canonical_event["phase"] != "PREPARED"
+                or canonical_event["outcome"] != "PREPARED"
+                or canonical_event["transaction_id"] is not None
+                or canonical_event["spend_identity"] is not None
+                or canonical_event["reason_code"] != "INTENT_PREPARED"
+                or canonical_event["blocks_mutation"] != 1
+                or canonical_event["request_timestamp"] != canonical_event["created_at"]
+                or type(evidence) is not dict
+                or set(evidence)
+                != {
+                    "canonical_intent_sha256",
+                    "continuation_journal_sha256",
+                    "offer_items",
+                    "wallet_effect",
+                    "offer_size_uniqueness",
+                    "selected_coin_ids",
+                }
+                or evidence["canonical_intent_sha256"] != intent.canonical_intent_sha256
+                or evidence["offer_items"]
+                != [list(item) for item in intent.offer_items]
+                or evidence["offer_size_uniqueness"] != intent.offer_size_uniqueness()
+                or evidence["selected_coin_ids"] != [intent.selected_coin_id]
+                or evidence["continuation_journal_sha256"] != journal["snapshot_sha256"]
+                or run_id != existing.get("run_id")
+                or wallet_hash != existing.get("wallet_fingerprint_hash")
+                or network != existing.get("network")
+            ):
+                return None
+            continuation_digest = evidence["continuation_journal_sha256"]
+            if (
+                type(continuation_digest) is not str
+                or len(continuation_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in continuation_digest
+                )
+            ):
+                return None
+            wallet_effect = evidence["wallet_effect"]
+            if type(wallet_effect) is not dict or set(wallet_effect) != {
+                "validate_only",
+                "expiry_seconds",
+                "expiry_offset",
+                "stagger_seconds",
+                "offer_max_time",
+                "min_coin_hint",
+                "max_coin_hint",
+            }:
+                return None
+            expected_effect = {
+                "validate_only": False,
+                "expiry_seconds": intent.expiry_seconds,
+                "expiry_offset": intent.expiry_offset,
+                "stagger_seconds": intent.stagger_seconds,
+                "min_coin_hint": intent.min_coin_hint,
+                "max_coin_hint": intent.max_coin_hint,
+            }
+            if any(
+                wallet_effect[key] != value for key, value in expected_effect.items()
+            ):
+                return None
+            offer_max_time = wallet_effect["offer_max_time"]
+            if type(offer_max_time) is not int or offer_max_time < 0:
+                return None
+            return offer_max_time
+        return None
+
+    @staticmethod
+    def _creation_reconciliation_result(
+        intent: _CanonicalOfferCreationIntent,
+    ) -> dict:
+        return {
+            "success": False,
+            "error": "Offer creation requires reconciliation",
+            "reason": "OFFER_CREATION_RECONCILIATION_REQUIRED",
+            "_catalyst_effect_attempted": False,
+            "_catalyst_intent_id": intent.intent_id,
+        }
+
+    @staticmethod
+    def _trip_creation_latch(
+        intent: _CanonicalOfferCreationIntent,
+        *,
+        reason_code: str,
+        wallet_fingerprint_hash: str,
+        network: str,
+    ) -> bool:
+        try:
+            database.trip_runtime_safety_latch(
+                reason_code=reason_code,
+                reason="Offer creation outcome requires reconciliation",
+                blocking_operation_ids=[intent.operation_id],
+                wallet_fingerprint_hash=wallet_fingerprint_hash,
+                network=network,
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _verified_continuation_journal(
+        journal: Any,
+        intent: _CanonicalOfferCreationIntent | _CanonicalOfferCancelIntent,
+        *,
+        trade_id: Optional[str] = None,
+        allowed_backends: frozenset[str] = frozenset({"sage"}),
+    ) -> tuple[dict, str, str, str]:
+        if type(journal) is not dict or set(journal) != {
+            "snapshot",
+            "snapshot_sha256",
+        }:
+            raise ValueError("offer creation authority journal is malformed")
+        snapshot = journal["snapshot"]
+        expected_snapshot_keys = {
+            "schema_version",
+            "operation_id",
+            "intent_id",
+            "binding",
+            "binding_digest",
+            "observation",
+            "observation_digest",
+            "authority",
+        }
+        if trade_id is not None:
+            expected_snapshot_keys.add("trade_id")
+        if type(snapshot) is not dict or set(snapshot) != expected_snapshot_keys:
+            raise ValueError("offer creation authority journal is malformed")
+        if (
+            type(snapshot["schema_version"]) is not int
+            or snapshot["schema_version"] != 1
+        ):
+            raise ValueError("offer creation authority schema is unsupported")
+        encoded = OfferManager._canonical_creation_json(snapshot)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        if (
+            type(journal["snapshot_sha256"]) is not str
+            or journal["snapshot_sha256"] != digest
+        ):
+            raise ValueError("offer creation authority journal digest mismatch")
+        if (
+            snapshot.get("operation_id") != intent.operation_id
+            or snapshot.get("intent_id") != intent.intent_id
+            or (trade_id is not None and snapshot.get("trade_id") != trade_id)
+        ):
+            raise ValueError("offer creation authority journal scope mismatch")
+        binding_payload = snapshot.get("binding")
+        if type(binding_payload) is not dict:
+            raise ValueError("offer creation authority binding is missing")
+        try:
+            binding = mutation_gate.WalletIdentityBinding(**binding_payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("offer creation authority binding is malformed") from exc
+        if binding_payload != mutation_gate.wallet_identity_binding_payload(binding):
+            raise ValueError("offer creation authority binding is not canonical")
+        binding_digest = mutation_gate.wallet_identity_binding_digest(binding)
+        if snapshot.get("binding_digest") != binding_digest:
+            raise ValueError("offer creation authority binding digest mismatch")
+        if binding.backend not in allowed_backends:
+            raise ValueError("offer authority backend is unsupported")
+        observation = snapshot.get("observation")
+        if type(observation) is not dict or set(observation) != {
+            "backend",
+            "name",
+            "fingerprint",
+            "network_id",
+            "kind",
+            "has_secrets",
+            "observed_at_utc",
+        }:
+            raise ValueError("offer creation observation is missing")
+        observed_at = observation["observed_at_utc"]
+        if (
+            type(observation["backend"]) is not str
+            or type(observation["name"]) is not str
+            or type(observation["fingerprint"]) is not int
+            or type(observation["network_id"]) is not str
+            or type(observation["kind"]) is not str
+            or observation["has_secrets"] is not True
+            or type(observed_at) is not str
+        ):
+            raise ValueError("offer creation observation is malformed")
+        expected_observation_identity = {
+            "backend": binding.backend,
+            "name": binding.name,
+            "fingerprint": binding.fingerprint,
+            "network_id": binding.network_id,
+            "kind": binding.kind,
+            "has_secrets": binding.has_secrets,
+        }
+        if {
+            key: observation[key] for key in expected_observation_identity
+        } != expected_observation_identity:
+            raise ValueError("offer creation observation does not match binding")
+        try:
+            parsed_observed_at = datetime.fromisoformat(
+                observed_at[:-1] + "+00:00" if observed_at.endswith("Z") else ""
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "offer creation observation timestamp is malformed"
+            ) from exc
+        canonical_observed_at = (
+            parsed_observed_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        if observed_at != canonical_observed_at:
+            raise ValueError("offer creation observation timestamp is not canonical")
+        identity_decision = mutation_gate.validate_wallet_identity(
+            binding,
+            {"success": True, **observation},
+            now=parsed_observed_at,
+        )
+        if identity_decision != {
+            "allowed": True,
+            "reason": "identity_verified",
+            "observed_at_utc": observed_at,
+        }:
+            raise ValueError("offer creation observation is not exact identity proof")
+        observation_digest = hashlib.sha256(
+            OfferManager._canonical_creation_json(observation).encode("utf-8")
+        ).hexdigest()
+        if (
+            type(snapshot.get("observation_digest")) is not str
+            or snapshot["observation_digest"] != observation_digest
+        ):
+            raise ValueError("offer creation observation digest mismatch")
+        authority = snapshot.get("authority")
+        if type(authority) is not dict:
+            raise ValueError("offer creation authority proof is missing")
+        runtime_authority_keys = {
+            "mode",
+            "owner_run_id",
+            "owner_pid",
+            "owner_host",
+            "lease_version",
+            "lease_epoch",
+            "authority_generation_digest",
+            "binding_digest",
+        }
+        worker_authority_keys = {
+            "mode",
+            "delegation_id",
+            "parent_run_id",
+            "delegation_operation_id",
+            "purpose",
+            "worker_id",
+            "parent_lease_epoch",
+            "authority_generation_digest",
+            "binding_digest",
+        }
+        mode = authority.get("mode")
+        expected_authority_keys = (
+            runtime_authority_keys
+            if mode == "runtime"
+            else worker_authority_keys
+            if mode == "worker"
+            else set()
+        )
+        if set(authority) != expected_authority_keys:
+            raise ValueError("offer creation authority proof is incomplete")
+        if authority["binding_digest"] != binding_digest:
+            raise ValueError("offer creation authority proof binding mismatch")
+        generation_digest = authority.get("authority_generation_digest")
+        if (
+            type(generation_digest) is not str
+            or len(generation_digest) != 64
+            or any(
+                character not in "0123456789abcdef" for character in generation_digest
+            )
+        ):
+            raise ValueError("offer creation authority generation is malformed")
+        if mode == "runtime":
+            run_id = authority["owner_run_id"]
+            epoch = authority["lease_epoch"]
+            if (
+                type(authority["owner_pid"]) is not int
+                or authority["owner_pid"] <= 0
+                or type(authority["lease_version"]) is not int
+                or authority["lease_version"] <= 0
+                or type(authority["owner_host"]) is not str
+                or not authority["owner_host"]
+            ):
+                raise ValueError("offer creation runtime authority is malformed")
+        elif mode == "worker":
+            run_id = authority["parent_run_id"]
+            epoch = authority["parent_lease_epoch"]
+            if authority["delegation_operation_id"] != intent.operation_id:
+                raise ValueError("worker delegation is bound to another operation")
+            for key in ("delegation_id", "purpose", "worker_id"):
+                if type(authority[key]) is not str or not authority[key]:
+                    raise ValueError("offer creation worker authority is malformed")
+        else:
+            raise ValueError("offer creation authority mode is malformed")
+        if type(run_id) is not str or not run_id or type(epoch) is not str or not epoch:
+            raise ValueError("offer creation authority ownership is malformed")
+        if intent.authority_run_id is not None and run_id != intent.authority_run_id:
+            raise ValueError("offer creation generation authority run mismatch")
+        return (
+            journal,
+            run_id,
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint),
+            binding.network_id,
+        )
+
+    @staticmethod
+    def _bounded_lock_verification(value: Any) -> dict[str, Any]:
+        source = value if type(value) is dict else {}
+        locked = source.get("locked_coin_ids")
+        if type(locked) is not list:
+            locked = []
+        canonical_locked = set()
+        for coin_id in locked[:32]:
+            if type(coin_id) is not str:
+                continue
+            normalized = coin_id.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if len(normalized) != 64 or any(
+                character not in "0123456789abcdef" for character in normalized
+            ):
+                continue
+            canonical_locked.add("0x" + normalized)
+        return {
+            "verified": source.get("verified") is True,
+            "locked_coin_ids": sorted(canonical_locked),
+            "selected_present": source.get("selected_present") is True,
+        }
+
+    @staticmethod
+    def _authorize_prepared_creation(
+        intent: _CanonicalOfferCreationIntent,
+        wallet_hash: str,
+        network: str,
+    ) -> dict[str, Any]:
+        records = tuple(
+            offer_registry.offer_record_from_row(row)
+            for row in database.get_offer_intents_for_registry()
+        )
+        decision = offer_registry.authorize_mutation(
+            offer_registry.RegistrySnapshot(records=records),
+            offer_registry.MutationRequest(
+                kind=offer_registry.MutationKind.CREATE,
+                reference=offer_registry.OfferReference(intent_id=intent.intent_id),
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                selected_coin_ids=(intent.selected_coin_id,),
+            ),
+        )
+        return {
+            "allowed": decision.allowed is True,
+            "code": decision.code.value,
+        }
+
+    def _create_offer_from_journal(
+        self,
+        *,
+        intent: _CanonicalOfferCreationIntent,
+        spend_wallet_id: int,
+    ) -> dict:
+        with self._sage_creation_authority_lock:
+            return self._create_offer_from_journal_serialized(
+                intent=intent,
+                spend_wallet_id=spend_wallet_id,
+            )
+
+    def _create_offer_from_journal_serialized(
+        self,
+        *,
+        intent: _CanonicalOfferCreationIntent,
+        spend_wallet_id: int,
+    ) -> dict:
+        existing = database.get_offer_intent(intent.intent_id)
+        if existing is not None:
+            return self._existing_creation_result(intent, existing)
+        continuation = None
+        journal = None
+        prepared = False
+        wallet_call_started = False
+        wallet_hash = ""
+        network = ""
+        try:
+            continuation = wallet.begin_offer_creation_continuation(
+                operation_id=intent.operation_id,
+                intent_id=intent.intent_id,
+                ttl_seconds=60,
+            )
+            journal = wallet.offer_creation_continuation_journal(continuation)
+            journal, run_id, wallet_hash, network = self._verified_continuation_journal(
+                journal,
+                intent,
+            )
+            prepared_at = datetime.now(timezone.utc).isoformat()
+            prepared_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": journal["snapshot_sha256"],
+                "offer_items": list(intent.offer_items),
+                "wallet_effect": {
+                    "validate_only": False,
+                    "expiry_seconds": intent.expiry_seconds,
+                    "expiry_offset": intent.expiry_offset,
+                    "stagger_seconds": intent.stagger_seconds,
+                    "offer_max_time": intent.offer_max_time,
+                    "min_coin_hint": intent.min_coin_hint,
+                    "max_coin_hint": intent.max_coin_hint,
+                },
+                "offer_size_uniqueness": intent.offer_size_uniqueness(),
+                "selected_coin_ids": [intent.selected_coin_id],
+            }
+            self._offer_creation_crash_boundary("before_intent_commit", intent)
+            try:
+                database.prepare_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:prepared",
+                    run_id=run_id,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    asset_id=intent.asset_id,
+                    side=intent.side,
+                    tier=intent.tier,
+                    purpose=intent.purpose,
+                    slot_key=intent.slot_key,
+                    generation=intent.generation,
+                    parent_intent_id=intent.parent_intent_id,
+                    offered_amount_atomic=intent.offered_amount_atomic,
+                    requested_amount_atomic=intent.requested_amount_atomic,
+                    selected_coin_ids_json=[intent.selected_coin_id],
+                    cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+                    fee_mojos_xch=0,
+                    fee_provenance="EXPLICIT_CREATE_OFFER_FEE_V1",
+                    wallet_identity_json=journal,
+                    evidence_json=prepared_evidence,
+                    prepared_at=prepared_at,
+                    reserve_selected_coins=True,
+                    require_new_intent=True,
+                )
+            except Exception as exc:
+                message = str(exc)
+                if (
+                    "offer intent already exists" in message
+                    or "selected coin is not free" in message
+                    or "UNIQUE constraint failed: offer_intents.run_id" in message
+                    or "UNIQUE constraint failed: offer_intents.slot_key" in message
+                ):
+                    raise _OfferCreationClaimLost from exc
+                raise
+            prepared = True
+            self._offer_creation_crash_boundary("after_intent_commit", intent)
+            registry_authorization = self._authorize_prepared_creation(
+                intent,
+                wallet_hash,
+                network,
+            )
+            if registry_authorization["allowed"] is not True:
+                denied_at = datetime.now(timezone.utc).isoformat()
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:registry-denied",
+                    lifecycle_state="creation_failed",
+                    outcome="FAILED",
+                    wallet_identity_json=journal,
+                    evidence_json={
+                        "canonical_intent_sha256": intent.canonical_intent_sha256,
+                        "continuation_journal_sha256": journal["snapshot_sha256"],
+                        "effect_attempted": False,
+                        "registry_authorization": registry_authorization,
+                    },
+                    reason_code=f"REGISTRY_{registry_authorization['code']}",
+                    finalized_at=denied_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                return {
+                    "success": False,
+                    "error": "Offer creation denied by registry policy",
+                    "reason": "OFFER_CREATION_REGISTRY_DENIED",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            self._offer_creation_crash_boundary("before_wallet_call", intent)
+            wallet_call_started = True
+            result = wallet.create_offer(
+                intent.offer_dict(),
+                validate_only=False,
+                max_time=intent.offer_max_time,
+                min_coin_amount=intent.min_coin_hint,
+                max_coin_amount=intent.max_coin_hint,
+                coin_ids=[intent.selected_coin_id],
+                _creation_continuation=continuation,
+                _creation_operation_id=intent.operation_id,
+                _creation_intent_id=intent.intent_id,
+            )
+            continuation = None
+            self._offer_creation_crash_boundary("after_wallet_response", intent)
+            effect_attempted = (
+                type(result) is dict
+                and result.get("_catalyst_effect_attempted") is True
+            )
+            success = type(result) is dict and result.get("success") is True
+            sage_identity = self._canonical_sage_creation_identity(result)
+            trade_id, offer_text = sage_identity or ("", "")
+            result_reason = result.get("reason") if type(result) is dict else None
+            safe_result_reason = (
+                result_reason[:128]
+                if type(result_reason) is str and result_reason
+                else "MALFORMED_RESULT"
+            )
+            if success and sage_identity is None:
+                safe_result_reason = "MALFORMED_RESULT"
+            finalized_at = datetime.now(timezone.utc).isoformat()
+            base_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": journal["snapshot_sha256"],
+                "effect_attempted": effect_attempted,
+                "offer_size_uniqueness": intent.offer_size_uniqueness(),
+                "registry_authorization": registry_authorization,
+                "wallet_result": {
+                    "success": success,
+                    "trade_id_present": bool(trade_id),
+                    "offer_text_present": bool(offer_text),
+                    "reason": safe_result_reason,
+                },
+            }
+            if success and effect_attempted and trade_id and offer_text:
+                verification = self._bounded_lock_verification(
+                    self._verify_sage_offer_locked_inputs(
+                        spend_wallet_id,
+                        trade_id,
+                        intent.selected_coin_id,
+                    )
+                )
+                offer_hash = hashlib.sha256(offer_text.encode("utf-8")).hexdigest()
+                evidence = dict(base_evidence)
+                evidence.update(
+                    {
+                        "locked_input_verification": verification,
+                        "offer_text_sha256": offer_hash,
+                        "sage_trade_id": trade_id,
+                    }
+                )
+                self._offer_creation_crash_boundary("before_trade_id_commit", intent)
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:confirmed",
+                    lifecycle_state="created",
+                    outcome="CONFIRMED",
+                    sage_trade_id=trade_id,
+                    offer_text_sha256=offer_hash,
+                    wallet_identity_json=journal,
+                    evidence_json=evidence,
+                    finalized_at=finalized_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                self._offer_creation_crash_boundary("after_trade_id_commit", intent)
+                enriched = dict(result)
+                enriched["locked_coin_id"] = intent.selected_coin_id
+                enriched["offer_max_time"] = intent.offer_max_time
+                enriched["_catalyst_intent_id"] = intent.intent_id
+                enriched["_catalyst_locked_input_verification"] = verification
+                return enriched
+            if (
+                type(result) is dict
+                and result.get("_catalyst_effect_attempted") is False
+            ):
+                evidence = dict(base_evidence)
+                database.finalize_offer_intent(
+                    intent_id=intent.intent_id,
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:finalized:failed",
+                    lifecycle_state="creation_failed",
+                    outcome="FAILED",
+                    wallet_identity_json=journal,
+                    evidence_json=evidence,
+                    reason_code=(
+                        safe_result_reason
+                        if safe_result_reason != "MALFORMED_RESULT"
+                        else "CREATE_REJECTED"
+                    ),
+                    finalized_at=finalized_at,
+                    finalize_selected_coin_reservations=True,
+                )
+                failed = dict(result)
+                failed["_catalyst_intent_id"] = intent.intent_id
+                return failed
+            database.finalize_offer_intent(
+                intent_id=intent.intent_id,
+                operation_id=intent.operation_id,
+                event_id=f"{intent.operation_id}:finalized:unknown",
+                lifecycle_state="creation_unknown",
+                outcome="UNKNOWN",
+                wallet_identity_json=journal,
+                evidence_json=base_evidence,
+                reason_code="CREATE_RESPONSE_AMBIGUOUS",
+                finalized_at=finalized_at,
+                finalize_selected_coin_reservations=True,
+            )
+            return self._existing_creation_result(
+                intent,
+                database.get_offer_intent(intent.intent_id),
+            )
+        except _OfferCreationClaimLost:
+            raise
+        except Exception:
+            current = None
+            try:
+                current = database.get_offer_intent(intent.intent_id)
+            except Exception:
+                pass
+            if not prepared:
+                if current is None:
+                    raise
+                self._trip_creation_latch(
+                    intent,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+                return self._creation_reconciliation_result(intent)
+            if current is not None and current.get("lifecycle_state") == "created":
+                return self._existing_creation_result(intent, current)
+            exception_evidence = {
+                "canonical_intent_sha256": intent.canonical_intent_sha256,
+                "continuation_journal_sha256": (
+                    journal.get("snapshot_sha256")
+                    if type(journal) is dict
+                    and type(journal.get("snapshot_sha256")) is str
+                    else ""
+                ),
+                "effect_attempted": wallet_call_started,
+                "failure_stage": (
+                    "post_wallet_call" if wallet_call_started else "pre_wallet_call"
+                ),
+            }
+            finalized = False
+            try:
+                if current is not None and current.get("lifecycle_state") == "prepared":
+                    database.finalize_offer_intent(
+                        intent_id=intent.intent_id,
+                        operation_id=intent.operation_id,
+                        event_id=(
+                            f"{intent.operation_id}:finalized:exception-unknown"
+                            if wallet_call_started
+                            else f"{intent.operation_id}:finalized:pre-effect-exception"
+                        ),
+                        lifecycle_state=(
+                            "creation_unknown"
+                            if wallet_call_started
+                            else "creation_failed"
+                        ),
+                        outcome="UNKNOWN" if wallet_call_started else "FAILED",
+                        wallet_identity_json=journal,
+                        evidence_json=exception_evidence,
+                        reason_code=(
+                            "CREATE_POST_EFFECT_EXCEPTION"
+                            if wallet_call_started
+                            else "CREATE_PRE_EFFECT_EXCEPTION"
+                        ),
+                        finalized_at=datetime.now(timezone.utc).isoformat(),
+                        finalize_selected_coin_reservations=True,
+                    )
+                    finalized = True
+                elif current is not None and current.get("lifecycle_state") in {
+                    "creation_unknown",
+                    "submitted_unconfirmed",
+                }:
+                    wallet_call_started = True
+                    finalized = True
+            except Exception:
+                finalized = False
+            if not wallet_call_started and finalized:
+                return {
+                    "success": False,
+                    "error": "Offer creation failed before wallet effect",
+                    "reason": "OFFER_CREATION_PRE_EFFECT_FAILED",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            self._trip_creation_latch(
+                intent,
+                reason_code="UNRESOLVED_OPERATIONS",
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return self._creation_reconciliation_result(intent)
+        finally:
+            if continuation is not None:
+                try:
+                    wallet.close_offer_creation_continuation(continuation)
+                except Exception:
+                    # Cleanup is best-effort and must never replace the stable
+                    # durable result (or the original pre-prepare exception).
+                    pass
+
     def create_offer_with_retry(
         self,
         offer_dict: dict,
@@ -1380,6 +2875,7 @@ class OfferManager:
         selected_coin_id: str = None,
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
+        creation_context: dict = None,
     ) -> Optional[Dict]:
         """Create a Chia offer with automatic retry on transient errors.
 
@@ -1457,6 +2953,7 @@ class OfferManager:
                 selected_coin_id=selected_coin_id,
                 preferred_tier=preferred_tier,
                 strict_preferred_tier=strict_preferred_tier,
+                creation_context=creation_context,
             )
         finally:
             if _reservation_id:
@@ -1478,6 +2975,7 @@ class OfferManager:
         selected_coin_id: str = None,
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
+        creation_context: dict = None,
     ) -> Optional[Dict]:
         """Internal implementation — called by create_offer_with_retry after
         the reservation lease is acquired.  See create_offer_with_retry for
@@ -1487,6 +2985,7 @@ class OfferManager:
         # handles the phantom fill risk from expired offers.
         # expiry_secs parameter allows override (e.g., shorter for sniper).
         _expiry = expiry_secs if expiry_secs is not None else cfg.OFFER_EXPIRY_SECS
+        stagger = 0
         if _expiry and _expiry > 0:
             # Stagger expiry across offers to avoid mass-expiry cascades
             stagger = expiry_offset * cfg.OFFER_STAGGER_SECS if expiry_offset else 0
@@ -1509,8 +3008,20 @@ class OfferManager:
                     spend_amount = abs(int(amt))
                     spend_wallet_id = int(wid)
         # Hint: use coins between 80% and 200% of the spend amount
-        min_coin_hint = int(spend_amount * 0.8) if spend_amount > 0 else None
-        max_coin_hint = int(spend_amount * 2.0) if spend_amount > 0 else None
+        min_coin_hint = (spend_amount * 8) // 10 if spend_amount > 0 else None
+        max_coin_hint = spend_amount * 2 if spend_amount > 0 else None
+
+        try:
+            authoritative_backend = wallet.get_wallet_backend_authority()
+        except Exception:
+            authoritative_backend = None
+        if authoritative_backend not in {"sage", "chia"}:
+            return {
+                "success": False,
+                "error": "Wallet backend authority unavailable",
+                "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                "_catalyst_effect_attempted": False,
+            }
 
         # --- V3 Coin Selection Mode ---
         # When coin_ids_enabled=True, we pre-select a specific coin and pass it
@@ -1546,7 +3057,11 @@ class OfferManager:
                     f"Using caller-selected coin: {selected_coin_id[:16]}... "
                     f"for {spend_amount} mojos",
                 )
-            elif coin_ids_enabled and spend_wallet_id is not None and spend_amount > 0:
+            elif (
+                (coin_ids_enabled or authoritative_backend == "sage")
+                and spend_wallet_id is not None
+                and spend_amount > 0
+            ):
                 selected_coin_id = self._select_coin_for_offer(
                     spend_wallet_id,
                     spend_amount,
@@ -1582,8 +3097,78 @@ class OfferManager:
                         "Coin selection returned None — falling back to polling mode",
                     )
 
+        if (
+            not use_coin_ids_mode
+            and spend_wallet_id is not None
+            and authoritative_backend == "sage"
+        ):
+            return {
+                "success": False,
+                "error": "no_exact_selected_coin",
+                "reason": "OFFER_CREATION_EXACT_COIN_REQUIRED",
+                "_catalyst_effect_attempted": False,
+            }
+
         # Track which coin was claimed for inflight cleanup
         _inflight_claimed = selected_coin_id if use_coin_ids_mode else None
+
+        if use_coin_ids_mode and selected_coin_id and authoritative_backend == "sage":
+            try:
+                try:
+                    resolved_creation_context = (
+                        self._resolve_creation_context_generation(creation_context)
+                    )
+                except (ValueError, mutation_gate.MutationBlocked):
+                    raise
+                except Exception:
+                    return {
+                        "success": False,
+                        "error": "Durable offer generation unavailable",
+                        "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                        "_catalyst_effect_attempted": False,
+                    }
+                intent = self._build_canonical_creation_intent(
+                    offer_dict=offer_dict,
+                    selected_coin_id=selected_coin_id,
+                    preferred_tier=preferred_tier,
+                    creation_context=resolved_creation_context,
+                    expiry_seconds=_expiry,
+                    expiry_offset=expiry_offset,
+                    stagger_seconds=stagger,
+                    offer_max_time=offer_max_time,
+                    min_coin_hint=min_coin_hint,
+                    max_coin_hint=max_coin_hint,
+                )
+                return self._create_offer_from_journal(
+                    intent=intent,
+                    spend_wallet_id=spend_wallet_id,
+                )
+            except _OfferCreationClaimLost:
+                return {
+                    "success": False,
+                    "error": "Offer creation claim lost",
+                    "reason": "OFFER_CREATION_RACE_LOST",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
+            except mutation_gate.MutationBlocked:
+                return {
+                    "success": False,
+                    "error": "Offer creation authority denied",
+                    "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                    "_catalyst_effect_attempted": False,
+                }
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": str(exc),
+                    "reason": "OFFER_CREATION_INTENT_INVALID",
+                    "_catalyst_effect_attempted": False,
+                }
+            finally:
+                if _inflight_claimed:
+                    with self._lock:
+                        self._inflight_coin_ids.discard(_inflight_claimed)
 
         # --- Before snapshot (V2 polling mode only) ---
         # Only needed when NOT using coin_ids mode.
@@ -1705,10 +3290,16 @@ class OfferManager:
                                     f"Cancelling duplicate offer {dup_trade_id[:12]}... "
                                     f"(attempt {attempt + 1}/{max_retries + 1})",
                                 )
-                                # Cancel the duplicate
+                                # Route duplicate cleanup through the same
+                                # durable cancellation journal as every other
+                                # offer cancellation.
                                 if dup_trade_id:
                                     try:
-                                        cancel_offer(dup_trade_id, secure=False)
+                                        self.cancel_offers(
+                                            [dup_trade_id],
+                                            reason="coin_reuse_detected",
+                                            force_storm=True,
+                                        )
                                         time.sleep(2)
                                     except Exception as e:
                                         log_event(
@@ -1907,6 +3498,7 @@ class OfferManager:
         price_cap: Decimal = None,
         price_floor: Decimal = None,
         interpolate_refill_prices: bool = True,
+        refresh_parent_ids: Dict[int, str] = None,
     ) -> List[Dict]:
         """Create a ladder of offers on one side (buy or sell).
 
@@ -1932,6 +3524,9 @@ class OfferManager:
                 into the surviving tier's price band. Recovery anchor-drift
                 refills set this False so missing slots price from the current
                 grid instead of stale surviving offers.
+            refresh_parent_ids: Exact durable parent intent keyed by ladder
+                slot.  When supplied, creation is a Task 11 child and is
+                bound only after its confirmed Sage identity is durable.
 
         Returns list of created offer details (trade_id, price, size, etc.)
         """
@@ -2547,7 +4142,9 @@ class OfferManager:
         # BAD_AGGREGATE_SIGNATURE when multiple concurrent make_offer RPCs
         # contend for the same fee coin.  Full ladder creates (startup/cold)
         # still benefit from parallelism since they run before any cancels.
-        _is_requote_batch = num is not None and num < total_slots
+        _is_requote_batch = refresh_parent_ids is not None or (
+            num is not None and num < total_slots
+        )
         if _is_requote_batch:
             max_parallel = 1
         else:
@@ -2583,6 +4180,11 @@ class OfferManager:
                     f"— serial mode, letting Sage pick from wallet",
                 )
 
+            parent_intent_id = (
+                refresh_parent_ids.get(int(spec["slot"]))
+                if refresh_parent_ids is not None
+                else None
+            )
             res = self.create_offer_with_retry(
                 spec["offer_dict"],
                 expiry_offset=spec["stagger"],
@@ -2590,7 +4192,48 @@ class OfferManager:
                 coin_ids_enabled=coin_ids_enabled,
                 selected_coin_id=spec.get("coin_id"),
                 preferred_tier=spec["tier"],
+                creation_context={
+                    "slot_key": f"ladder:{asset_id}:{side}:{spec['slot']}",
+                    "select_next_generation": True,
+                    "asset_id": asset_id,
+                    "side": side,
+                    "tier": spec["tier"],
+                    "purpose": "normal_lifecycle",
+                    "parent_intent_id": parent_intent_id,
+                    "offer_size_uniqueness": {
+                        "slot": spec["slot"],
+                        "requested_amount_atomic": str(
+                            next(
+                                int(amount)
+                                for amount in spec["offer_dict"].values()
+                                if int(amount) > 0
+                            )
+                        ),
+                    },
+                },
             )
+            if parent_intent_id is not None and res and res.get("success"):
+                child_intent_id = res.get("_catalyst_intent_id")
+                if type(child_intent_id) is not str or not child_intent_id:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:child-identity",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    return spec["i"], {
+                        "success": False,
+                        "error": "refresh_child_identity_missing",
+                    }
+                try:
+                    database.bind_refresh_lineage(parent_intent_id, child_intent_id)
+                except Exception:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:bind",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    return spec["i"], {
+                        "success": False,
+                        "error": "refresh_lineage_bind_failed",
+                    }
             if res and res.get("success"):
                 locked_coin_id = res.get("locked_coin_id")
                 if locked_coin_id:
@@ -2661,6 +4304,40 @@ class OfferManager:
             if not trade_id:
                 continue
 
+            parent_intent_id = (
+                refresh_parent_ids.get(int(slot))
+                if refresh_parent_ids is not None
+                else None
+            )
+            child_intent_id = res.get("_catalyst_intent_id")
+            if parent_intent_id is not None:
+                if type(child_intent_id) is not str or not child_intent_id:
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:child-identity",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    log_event(
+                        "error",
+                        "refresh_child_identity_missing",
+                        "Confirmed refresh child did not return its durable intent ID",
+                    )
+                    continue
+                try:
+                    database.bind_refresh_lineage(parent_intent_id, child_intent_id)
+                except Exception as exc:
+                    # The child is durable and remains a recovery boundary;
+                    # do not cancel the parent when the reverse edge is not.
+                    self._trip_refresh_lineage_latch(
+                        operation_id=f"refresh-lineage:{parent_intent_id}:bind",
+                        parent=database.get_offer_intent(parent_intent_id),
+                    )
+                    log_event(
+                        "error",
+                        "refresh_lineage_bind_failed",
+                        f"Held parent cancellation after child creation: {exc}",
+                    )
+                    continue
+
             locked_coin_id = res.get("locked_coin_id")
             verified_locked_coin_ids = []
             if coin_ids_enabled and locked_coin_id and get_wallet_type() == "sage":
@@ -2715,7 +4392,15 @@ class OfferManager:
             # it appears in the verified list — this prevents the fee coin from
             # being recorded as the offer's trade coin (bug: fee-coin backed offers).
             if verified_locked_coin_ids:
-                if locked_coin_id and locked_coin_id in verified_locked_coin_ids:
+                normalized_locked_coin_id = self._normalize_coin_ref(locked_coin_id)
+                normalized_verified_coin_ids = {
+                    self._normalize_coin_ref(coin_id)
+                    for coin_id in verified_locked_coin_ids
+                }
+                if (
+                    normalized_locked_coin_id
+                    and normalized_locked_coin_id in normalized_verified_coin_ids
+                ):
                     db_coin_id = locked_coin_id  # pre-selected trade coin confirmed ✓
                 else:
                     # Pre-selected coin not verified (Sage used different coin).
@@ -3199,6 +4884,7 @@ class OfferManager:
 
         Returns dict with offers, fully_replaced, replaced_count, target_count.
         """
+        del force_cancel_storm
         # NOTE: _last_requote_time is set only when we actually do work (create or cancel).
         # Early returns (no spares, create failed) intentionally leave it unchanged so the
         # next cycle's cooldown check doesn't see a false "just requoted" timestamp and
@@ -3207,12 +4893,8 @@ class OfferManager:
         # ── Gather open offers to replace ──
         all_open = get_open_offers(side=side, cat_asset_id=cfg.CAT_ASSET_ID)
         open_offers = [o for o in all_open if o.get("tier") not in ("boost", "sniper")]
-        # Filter against live wallet snapshot — avoid targeting offers that
-        # already filled/expired this cycle (DB lags 1 cycle behind wallet).
-        if live_offer_ids is not None:
-            open_offers = [
-                o for o in open_offers if o.get("trade_id") in live_offer_ids
-            ]
+        # Wallet omission is diagnostic only.  Durable nonterminal rows remain
+        # capacity-owning until Task 9 commits exact terminal proof.
         # Sort most-at-risk first so cancels prioritise the stale-est offers.
         open_offers = self._sort_open_offers_for_requote(
             open_offers, side, mid_price=current_price
@@ -3358,6 +5040,50 @@ class OfferManager:
                 "tier_filter_drained": False,
             }
 
+        pending_lineage_pause = self._resume_pending_refresh_lineage_completions(side)
+        if pending_lineage_pause is not None:
+            log_event(
+                "info",
+                "requote_pending_lineage_paused",
+                f"Requote {side}: {pending_lineage_pause}; holding new children",
+            )
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
+            }
+
+        # Pending children normally consume the overlap coin that makes the
+        # new-child planner pause.  Resume their already-durable lineage
+        # before consulting capacity, otherwise Task 8/9 closure could be
+        # stranded forever at zero spares.
+        refresh_by_parent, refresh_pause = self._collect_staged_refresh_parents(
+            open_offers, side
+        )
+        if refresh_pause is not None:
+            log_event(
+                "info",
+                "requote_staged_refresh_paused",
+                f"Requote {side}: {refresh_pause}; holding new children",
+            )
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": target_count,
+                "original_target_count": original_target_count,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
+            }
+
         # ── Count spare coins ──
         # Use DB coin tracking (which knows tier designations) rather than the
         # raw wallet RPC so that fee/sniper/reserve coins are not counted as
@@ -3376,29 +5102,16 @@ class OfferManager:
                 if c.get("designation", "") in _TRADING_DESIGS
                 and c.get("assigned_tier", "none") not in _SKIP_TIERS
             )
-        except Exception:
-            # Fallback to raw RPC count if DB query fails
-            try:
-                wallet_id = cfg.CAT_WALLET_ID if side == "sell" else cfg.WALLET_ID_XCH
-                _resp = get_exact_spendable_coins_rpc(wallet_id)
-                if _resp:
-                    _coins = _resp.get(
-                        "confirmed_records",
-                        _resp.get("coin_records", _resp.get("records", [])),
-                    )
-                    spare_count = len(_coins) if _coins else 0
-                    if get_wallet_type() != "sage":
-                        try:
-                            _open = len(
-                                get_open_offers(
-                                    side=side, cat_asset_id=cfg.CAT_ASSET_ID
-                                )
-                            )
-                            spare_count = max(0, spare_count - _open)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        except Exception as exc:
+            # The durable free-pool query is the reservation authority.  A
+            # wallet count cannot safely replace it because it omits Task 4
+            # selections and could create over a protected offer.
+            log_event(
+                "warning",
+                "requote_spare_query_blocked",
+                f"Requote {side}: durable spare query failed closed: {exc}",
+            )
+            spare_count = 0
 
         log_event(
             "info",
@@ -3424,35 +5137,28 @@ class OfferManager:
                 "tier_filter_drained": False,
             }
 
-        # Cancel old offers first. Creating before cancellation briefly
-        # over-stacks the side whenever Sage keeps cancelled offers
-        # wallet-active for another cycle.
-        create_count = min(target_count, spare_count)
-        log_event(
-            "info",
-            "requote_cancel_first",
-            f"Requote {side}: cancelling {create_count} old offers "
-            f"({spare_count} spares, target {target_count})",
+        # Task 11 refresh is create-child-first.  The exact cohort was
+        # validated above; Task 12 still owns purpose-separated capacity.
+        refresh_plan = self.plan_staged_refresh(
+            [
+                {
+                    "intent_id": intent_id,
+                    "severity": max(0, target_count - index),
+                    "slot_key": parent["slot_key"],
+                    "generation": parent["generation"],
+                }
+                for index, (intent_id, (_offer, parent, _slot)) in enumerate(
+                    refresh_by_parent.items()
+                )
+            ],
+            overlap_capacity=spare_count,
+            batch_size=target_count,
         )
-
-        cancel_targets = self._select_requote_cancel_targets(
-            open_offers, create_count, mid_price=current_price
-        )
-        if cancel_targets != open_offers[:create_count]:
+        if refresh_plan.mode != "stage":
             log_event(
                 "info",
-                "requote_stale_survivor_targets",
-                f"Requote {side}: included "
-                f"{len([o for o in cancel_targets if o not in open_offers[:create_count]])} "
-                "old/far survivor offer(s) in this partial pass",
-            )
-
-        cancel_ids = [o["trade_id"] for o in cancel_targets if o.get("trade_id")]
-        if not cancel_ids:
-            log_event(
-                "info",
-                "requote_no_cancel_ids",
-                f"Requote {side}: no cancellable trade IDs found",
+                "requote_staged_refresh_paused",
+                f"Requote {side}: {refresh_plan.reason}",
             )
             return {
                 "offers": [],
@@ -3463,134 +5169,51 @@ class OfferManager:
                 "pending_cancel_count": 0,
                 "failed_cancel_count": 0,
                 "tier_filter_drained": False,
+                "refresh_paused": True,
             }
-
-        cancel_results = self.cancel_offers(
-            cancel_ids,
-            reason="requote",
-            skip_confirmation=False,
-            force_storm=force_cancel_storm,
-        )
-        confirmed_cancel_ids = []
-        pending_cancel_ids = []
-        failed_cancel_ids = []
-        for tid in cancel_ids:
-            result = (cancel_results or {}).get(tid) or {}
-            if result.get("success"):
-                method = str(result.get("method") or "")
-                if method in CANCEL_PENDING_METHODS:
-                    pending_cancel_ids.append(tid)
-                else:
-                    confirmed_cancel_ids.append(tid)
-            else:
-                failed_cancel_ids.append(tid)
-
-        if not confirmed_cancel_ids:
-            log_event(
-                "info",
-                "requote_waiting_for_cancel_settle",
-                f"Requote {side}: {len(pending_cancel_ids)} cancel(s) "
-                f"still pending, {len(failed_cancel_ids)} failed; "
-                "replacement creation held to avoid over-stacking",
-            )
-            with self._lock:
-                self._last_requote_time[side] = time.time()
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": len(pending_cancel_ids),
-                "failed_cancel_count": len(failed_cancel_ids),
-                "tier_filter_drained": False,
-            }
-
-        create_count = len(confirmed_cancel_ids)
-        log_event(
-            "info",
-            "requote_creating",
-            f"Requote {side}: creating {create_count} replacement "
-            f"offers after confirmed cancels",
-        )
-
-        # Use the full ladder size for tier classification so that
-        # each replacement offer lands in the correct tier (inner/mid/outer/
-        # extreme) with the right coin-size cap.  Using target_count (the
-        # number of offers being replaced) caused all slots to classify as
-        # "inner" whenever target_count ≤ BUY_INNER_TIER_COUNT, which forced
-        # an inner-sized coin cap on every offer regardless of its real
-        # position — rejecting all available larger coins and returning 0.
-        _full_slots = (
-            cfg.MAX_ACTIVE_BUY_OFFERS if side == "buy" else cfg.MAX_ACTIVE_SELL_OFFERS
-        )
+        staged = [
+            refresh_by_parent[parent_id] for parent_id in refresh_plan.stage_parent_ids
+        ]
+        refresh_parent_ids = {
+            slot: parent["intent_id"] for _offer, parent, slot in staged
+        }
         new_offers = self.create_ladder(
             current_price,
             side,
-            num_offers=create_count,
-            slot_start=0,
-            total_slots=_full_slots,
+            num_offers=len(staged),
+            slot_sequence=sorted(refresh_parent_ids),
+            total_slots=(
+                cfg.MAX_ACTIVE_BUY_OFFERS
+                if side == "buy"
+                else cfg.MAX_ACTIVE_SELL_OFFERS
+            ),
             risk_manager=risk_manager,
             spread_fraction=spread_fraction,
             coin_ids_enabled=cfg.COIN_IDS_ENABLED,
             price_cap=price_cap,
             price_floor=price_floor,
+            refresh_parent_ids=refresh_parent_ids,
         )
-
-        if not new_offers:
-            log_event(
-                "info",
-                "requote_create_failed",
-                f"Requote {side}: create_ladder returned 0 offers "
-                f"— keeping old offers in place",
-            )
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": len(pending_cancel_ids),
-                "failed_cancel_count": len(failed_cancel_ids),
-                "tier_filter_drained": False,
-            }
-
-        # ── Step 2: Post new offers to Dexie ──
         if dexie_manager:
             for offer in new_offers:
                 bech32 = offer.get("offer_bech32", "")
                 trade_id = offer.get("trade_id", "")
                 if bech32 and trade_id:
                     dexie_manager.queue_post(bech32, trade_id)
-
-        log_event(
-            "info",
-            "requote_done",
-            f"Requote {side} complete: created {len(new_offers)} new, "
-            f"confirmed {len(confirmed_cancel_ids)} old cancel(s), "
-            f"pending {len(pending_cancel_ids)}, "
-            f"failed {len(failed_cancel_ids)}",
-        )
-        # Requote did real work — stamp the cooldown timer now (not at entry)
+        # Queueing publication is not visibility.  The parent remains intact
+        # until the registry visibility boundary is durably recorded and Task
+        # 8 independently authorizes cancellation.
         with self._lock:
             self._last_requote_time[side] = time.time()
-        # fully_replaced is True only when we replaced every offer we
-        # INTENDED to replace BEFORE the per-cycle budget cap truncated
-        # the list. Using the truncated target_count here used to mark a
-        # capped FULL requote as "fully replaced" while 20+ old offers
-        # sat exposed at the stale mid — the caller then advanced its
-        # drift baseline and skipped them until another trigger fired.
         return {
             "offers": new_offers,
-            "fully_replaced": (
-                len(new_offers) >= original_target_count
-                and len(confirmed_cancel_ids) >= original_target_count
-            ),
+            "fully_replaced": False,
             "replaced_count": len(new_offers),
             "target_count": target_count,
             "original_target_count": original_target_count,
-            "pending_cancel_count": len(pending_cancel_ids),
-            "failed_cancel_count": len(failed_cancel_ids),
+            "pending_cancel_count": 0,
+            "failed_cancel_count": 0,
+            "lineage_pending_count": len(new_offers),
             "tier_filter_drained": False,
         }
 
@@ -3598,12 +5221,1095 @@ class OfferManager:
     # Cancellation
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _is_canonical_cancel_digest_id(value: Any, prefix: str) -> bool:
+        if (
+            type(value) is not str
+            or type(prefix) is not str
+            or not value.startswith(prefix)
+            or len(value) != len(prefix) + 64
+        ):
+            return False
+        suffix = value[len(prefix) :]
+        if suffix.lower() != suffix:
+            return False
+        try:
+            bytes.fromhex(suffix)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _canonical_cancel_intent(trade_id: Any) -> _CanonicalOfferCancelIntent:
+        if (
+            type(trade_id) is not str
+            or len(trade_id) != 64
+            or trade_id.lower() != trade_id
+        ):
+            raise ValueError("cancellation trade_id must be canonical lowercase hex")
+        try:
+            bytes.fromhex(trade_id)
+        except ValueError as exc:
+            raise ValueError(
+                "cancellation trade_id must be canonical lowercase hex"
+            ) from exc
+        creation_intent = database.get_offer_intent_by_trade_id(trade_id)
+        intent_id = (
+            creation_intent["intent_id"]
+            if type(creation_intent) is dict
+            and type(creation_intent.get("intent_id")) is str
+            and creation_intent["intent_id"]
+            else f"cancel-target:{trade_id}"
+        )
+        return _CanonicalOfferCancelIntent(
+            trade_id=trade_id,
+            intent_id=intent_id,
+            operation_id=f"cancel:{trade_id}",
+        )
+
+    def _offer_cancel_crash_boundary(
+        self,
+        phase: str,
+        intent: _CanonicalOfferCancelIntent,
+    ) -> None:
+        hook = self._offer_cancel_crash_hook
+        if hook is not None:
+            hook(phase, intent)
+
+    @staticmethod
+    def _cancel_reconciliation_result(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        idempotent_replay: bool,
+        effect_attempted: bool = False,
+        attempt: int = 1,
+    ) -> dict:
+        result = cancellation_result(
+            CANCEL_UNKNOWN,
+            method="journal_replay",
+            raw_response={"operation_id": intent.operation_id},
+        )
+        result["_catalyst_effect_attempted"] = effect_attempted
+        result["_catalyst_idempotent_replay"] = idempotent_replay
+        result["_catalyst_operation_id"] = intent.operation_id
+        result["_catalyst_intent_id"] = intent.intent_id
+        result["_catalyst_attempt"] = attempt
+        return result
+
+    @staticmethod
+    def _trip_cancel_latch(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        wallet_fingerprint_hash: str,
+        network: str,
+    ) -> None:
+        database.trip_runtime_safety_latch(
+            reason_code="UNRESOLVED_OPERATIONS",
+            reason="Cancellation outcome requires authoritative reconciliation",
+            blocking_operation_ids=[intent.operation_id],
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+            network=network,
+        )
+
+    @staticmethod
+    def _trip_cancel_replay_latch(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        wallet_fingerprint_hash: str,
+        network: str,
+    ) -> None:
+        """Let the durable effect owner finish before fencing a replay."""
+
+        deadline = time.monotonic() + 65.0
+        while time.monotonic() < deadline:
+            try:
+                events = database.get_offer_operation_events(intent.operation_id)
+                if any(
+                    event.get("attempt") == attempt
+                    and event.get("phase") in {"FINALIZED", "RECONCILED"}
+                    for event in events
+                ):
+                    break
+            except Exception:
+                break
+            time.sleep(0.01)
+        OfferManager._trip_cancel_latch(
+            intent,
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+            network=network,
+        )
+
+    @staticmethod
+    def _acquire_cancel_authority(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> tuple[Any, dict, str, str]:
+        continuation = wallet.begin_offer_cancel_continuation(
+            operation_id=intent.operation_id,
+            intent_id=intent.intent_id,
+            trade_id=intent.trade_id,
+            ttl_seconds=60,
+        )
+        try:
+            journal = wallet.offer_cancel_continuation_journal(continuation)
+            journal, _run_id, wallet_hash, network = (
+                OfferManager._verified_continuation_journal(
+                    journal,
+                    intent,
+                    trade_id=intent.trade_id,
+                    allowed_backends=frozenset({"sage", "chia"}),
+                )
+            )
+            return continuation, journal, wallet_hash, network
+        except BaseException:
+            wallet.close_offer_cancel_continuation(continuation)
+            raise
+
+    @staticmethod
+    def _cancel_prepared_evidence(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        reason: str,
+        cohort_id: str,
+        cohort_size: int,
+        member_id: str,
+        journal: dict,
+    ) -> dict:
+        safe_reason = reason if type(reason) is str else "manual"
+        safe_reason = safe_reason.strip()[:128] or "manual"
+        evidence = {
+            "trade_id": intent.trade_id,
+            "intent_id": intent.intent_id,
+            "operation_id": intent.operation_id,
+            "attempt": attempt,
+            "cohort_id": cohort_id,
+            "member_id": member_id,
+            "reason": safe_reason,
+            "continuation_journal_sha256": journal["snapshot_sha256"],
+            "wallet_effect": {
+                "secure": True,
+                "timeout": 60,
+                "fee_mojos": None,
+            },
+        }
+        if cohort_size > 1:
+            evidence["cohort_size"] = cohort_size
+            evidence["effect_claim_protocol"] = "durable_cohort_claim_v1"
+        return evidence
+
+    @staticmethod
+    def _prepare_cancel_member(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        reason: str,
+        cohort_id: str,
+        cohort_size: int = 1,
+        member_id: str,
+        journal: dict,
+        claim_effect: bool = True,
+    ) -> bool:
+        claim = database.prepare_offer_cancel(
+            operation_id=intent.operation_id,
+            event_id=f"{intent.operation_id}:attempt:{attempt}:prepared",
+            trade_id=intent.trade_id,
+            intent_id=intent.intent_id,
+            attempt=attempt,
+            wallet_identity_json=journal,
+            evidence_json=OfferManager._cancel_prepared_evidence(
+                intent,
+                attempt=attempt,
+                reason=reason,
+                cohort_id=cohort_id,
+                cohort_size=cohort_size,
+                member_id=member_id,
+                journal=journal,
+            ),
+            claim_effect=claim_effect,
+        )
+        if not claim_effect:
+            if type(claim) is not dict:
+                raise ValueError("cancellation prepared event is invalid")
+            database.validate_offer_operation_event(claim)
+            return True
+        if (
+            type(claim) is not dict
+            or set(claim) != {"event", "effect_claimed"}
+            or type(claim["event"]) is not dict
+            or type(claim["effect_claimed"]) is not bool
+        ):
+            raise ValueError("cancellation effect claim result is invalid")
+        return claim["effect_claimed"]
+
+    @staticmethod
+    def _recoverable_unclaimed_cohort_cancel(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        cohort_id: str,
+        cohort_size: int,
+        member_id: str,
+    ) -> Optional[dict]:
+        """Validate proof that a cohort member never crossed the effect boundary."""
+
+        rows = database.get_offer_operation_events(intent.operation_id)
+        if not rows:
+            return None
+        events = [database.validate_offer_operation_event(row) for row in rows]
+        if len(events) != attempt * 2 - 1:
+            return None
+        for prior_attempt in range(1, attempt):
+            prepared_prior, finalized_prior = events[
+                (prior_attempt - 1) * 2 : prior_attempt * 2
+            ]
+            if (
+                prepared_prior["attempt"] != prior_attempt
+                or prepared_prior["phase"] != "PREPARED"
+                or prepared_prior["outcome"] != "PREPARED"
+                or finalized_prior["attempt"] != prior_attempt
+                or finalized_prior["phase"] != "FINALIZED"
+                or finalized_prior["outcome"] != CANCEL_FAILED
+                or finalized_prior["blocks_mutation"] != 0
+            ):
+                return None
+        prepared = events[-1]
+        if (
+            prepared["event_id"] != f"{intent.operation_id}:attempt:{attempt}:prepared"
+            or prepared["operation_id"] != intent.operation_id
+            or prepared["intent_id"] != intent.intent_id
+            or prepared["operation_type"] != "CANCEL"
+            or prepared["attempt"] != attempt
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or prepared["transaction_id"] is not None
+            or prepared["spend_identity"] is not None
+            or prepared["reason_code"] != "CANCEL_PREPARED"
+            or prepared["blocks_mutation"] != 1
+            or prepared["request_timestamp"] != prepared["created_at"]
+        ):
+            return None
+        journal = json.loads(prepared["wallet_identity_json"])
+        journal, _run_id, wallet_hash, network = (
+            OfferManager._verified_continuation_journal(
+                journal,
+                intent,
+                trade_id=intent.trade_id,
+                allowed_backends=frozenset({"sage", "chia"}),
+            )
+        )
+        evidence = json.loads(prepared["evidence_json"])
+        required_keys = {
+            "trade_id",
+            "intent_id",
+            "operation_id",
+            "attempt",
+            "cohort_id",
+            "cohort_size",
+            "member_id",
+            "reason",
+            "continuation_journal_sha256",
+            "wallet_effect",
+            "effect_claim_protocol",
+        }
+        if type(evidence) is not dict or frozenset(evidence) not in {
+            frozenset(required_keys),
+            frozenset(required_keys | {"prior_lifecycle_state"}),
+        }:
+            return None
+        if (
+            evidence["trade_id"] != intent.trade_id
+            or evidence["intent_id"] != intent.intent_id
+            or evidence["operation_id"] != intent.operation_id
+            or evidence["attempt"] != attempt
+            or evidence["cohort_id"] != cohort_id
+            or evidence["cohort_size"] != cohort_size
+            or evidence["member_id"] != member_id
+            or evidence["effect_claim_protocol"] != "durable_cohort_claim_v1"
+            or type(evidence["reason"]) is not str
+            or not 1 <= len(evidence["reason"]) <= 128
+            or evidence["continuation_journal_sha256"] != journal["snapshot_sha256"]
+            or evidence["wallet_effect"]
+            != {"secure": True, "timeout": 60, "fee_mojos": None}
+            or (
+                "prior_lifecycle_state" in evidence
+                and (
+                    type(evidence["prior_lifecycle_state"]) is not str
+                    or not evidence["prior_lifecycle_state"]
+                    or evidence["prior_lifecycle_state"]
+                    in {"cancel_requested", "cancel_sent", "mempool_observed"}
+                )
+            )
+        ):
+            return None
+        if (
+            database.get_offer_cancel_effect_claim(
+                operation_id=intent.operation_id,
+                attempt=attempt,
+            )
+            is not None
+        ):
+            return None
+        return {
+            "journal": journal,
+            "wallet_hash": wallet_hash,
+            "network": network,
+        }
+
+    @staticmethod
+    def _finalize_unattempted_cohort_cancel(
+        intent: _CanonicalOfferCancelIntent,
+        *,
+        attempt: int,
+        cohort_id: str,
+        cohort_size: int,
+        member_id: str,
+        context: dict,
+        reason_code: str,
+        blocking_operation_id: str = "",
+    ) -> dict:
+        raw_response = {"reason_code": reason_code}
+        if blocking_operation_id:
+            raw_response["blocking_operation_id"] = blocking_operation_id
+        result = cancellation_result(
+            CANCEL_FAILED,
+            method=(
+                "batch_abort_ambiguous"
+                if reason_code == "BATCH_ABORTED_BY_AMBIGUOUS_PEER"
+                else "cohort_recovery_unattempted"
+            ),
+            raw_response=raw_response,
+            error="CANCEL_REJECTED",
+        )
+        evidence = {
+            "trade_id": intent.trade_id,
+            "attempt": attempt,
+            "cohort_id": cohort_id,
+            "member_id": member_id,
+            "effect_attempted": False,
+            "cancel_result": result,
+        }
+        if blocking_operation_id:
+            evidence["aborted_by_operation_id"] = blocking_operation_id
+        try:
+            database.finalize_offer_cancel(
+                operation_id=intent.operation_id,
+                event_id=f"{intent.operation_id}:attempt:{attempt}:finalized",
+                trade_id=intent.trade_id,
+                intent_id=intent.intent_id,
+                attempt=attempt,
+                cancel_result=result,
+                wallet_identity_json=context["journal"],
+                evidence_json=evidence,
+                require_unclaimed=True,
+            )
+        except Exception:
+            existing = OfferManager._existing_cancel_result(intent)
+            if existing is not None:
+                return existing
+            return OfferManager._cancel_reconciliation_result(
+                intent,
+                idempotent_replay=False,
+                effect_attempted=False,
+                attempt=attempt,
+            )
+        result["_catalyst_effect_attempted"] = False
+        result["_catalyst_idempotent_replay"] = False
+        result["_catalyst_operation_id"] = intent.operation_id
+        result["_catalyst_intent_id"] = intent.intent_id
+        result["_catalyst_attempt"] = attempt
+        return result
+
+    def _recover_persisted_cancel_cohorts(self) -> Dict[str, dict]:
+        """Close every discoverable manifest member that provably had no effect."""
+
+        recovered = {}
+        for manifest in database.get_unresolved_offer_cancel_cohort_manifests():
+            cohort_id = manifest["cohort_id"]
+            cohort_size = manifest["member_count"]
+            for member in manifest["members"]:
+                intent = self._canonical_cancel_intent(member["trade_id"])
+                if (
+                    intent.operation_id != member["operation_id"]
+                    or intent.intent_id != member["intent_id"]
+                ):
+                    raise ValueError("durable cancellation manifest identity changed")
+                context = self._recoverable_unclaimed_cohort_cancel(
+                    intent,
+                    attempt=member["attempt"],
+                    cohort_id=cohort_id,
+                    cohort_size=cohort_size,
+                    member_id=member["member_id"],
+                )
+                if context is None:
+                    result = self._existing_cancel_result(intent)
+                    if result is None:
+                        result = self._cancel_reconciliation_result(
+                            intent,
+                            idempotent_replay=True,
+                            effect_attempted=False,
+                            attempt=member["attempt"],
+                        )
+                else:
+                    result = self._finalize_unattempted_cohort_cancel(
+                        intent,
+                        attempt=member["attempt"],
+                        cohort_id=cohort_id,
+                        cohort_size=cohort_size,
+                        member_id=member["member_id"],
+                        context=context,
+                        reason_code="COHORT_RECOVERY_UNATTEMPTED",
+                    )
+                recovered[intent.trade_id] = result
+        return recovered
+
+    def _abort_cancel_after_ambiguous_peer(
+        self,
+        *,
+        intent: _CanonicalOfferCancelIntent,
+        attempt: int,
+        reason: str,
+        cohort_id: str,
+        member_id: str,
+        ambiguous_operation_id: str,
+        continuation: Any,
+        journal: dict,
+        wallet_hash: str,
+        network: str,
+    ) -> dict:
+        """Durably close a pre-authorized batch tail without a wallet effect."""
+
+        try:
+            effect_claimed = self._prepare_cancel_member(
+                intent,
+                attempt=attempt,
+                reason=reason,
+                cohort_id=cohort_id,
+                member_id=member_id,
+                journal=journal,
+            )
+            if not effect_claimed:
+                self._trip_cancel_replay_latch(
+                    intent,
+                    attempt=attempt,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+                return self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=True,
+                    effect_attempted=False,
+                    attempt=attempt,
+                )
+            result = cancellation_result(
+                CANCEL_FAILED,
+                method="batch_abort_ambiguous",
+                raw_response={
+                    "reason_code": "BATCH_ABORTED_BY_AMBIGUOUS_PEER",
+                    "blocking_operation_id": ambiguous_operation_id,
+                },
+                error="CANCEL_REJECTED",
+            )
+            database.finalize_offer_cancel(
+                operation_id=intent.operation_id,
+                event_id=f"{intent.operation_id}:attempt:{attempt}:finalized",
+                trade_id=intent.trade_id,
+                intent_id=intent.intent_id,
+                attempt=attempt,
+                cancel_result=result,
+                wallet_identity_json=journal,
+                evidence_json={
+                    "trade_id": intent.trade_id,
+                    "attempt": attempt,
+                    "cohort_id": cohort_id,
+                    "member_id": member_id,
+                    "effect_attempted": False,
+                    "cancel_result": result,
+                    "aborted_by_operation_id": ambiguous_operation_id,
+                },
+            )
+            result["_catalyst_effect_attempted"] = False
+            result["_catalyst_idempotent_replay"] = False
+            result["_catalyst_operation_id"] = intent.operation_id
+            result["_catalyst_intent_id"] = intent.intent_id
+            result["_catalyst_attempt"] = attempt
+            return result
+        except Exception:
+            self._trip_cancel_latch(
+                intent,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return self._cancel_reconciliation_result(
+                intent,
+                idempotent_replay=False,
+                effect_attempted=False,
+                attempt=attempt,
+            )
+        finally:
+            wallet.close_offer_cancel_continuation(continuation)
+
+    @staticmethod
+    def _read_existing_cancel_result(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> _OfferCancelResultProjection:
+        """Read and validate a durable cancel result without mutating state."""
+
+        rows = database.get_offer_operation_events(intent.operation_id)
+        if not rows:
+            return _OfferCancelResultProjection(None, None, False)
+        wallet_hash = ""
+        network = ""
+        latest_attempt = 1
+        try:
+            events = [database.validate_offer_operation_event(row) for row in rows]
+            if not events:
+                raise ValueError("cancellation journal has an invalid event count")
+            latest_attempt = events[-1]["attempt"]
+            if latest_attempt < 1 or len(events) not in {
+                latest_attempt * 2 - 1,
+                latest_attempt * 2,
+            }:
+                raise ValueError("cancellation journal has an invalid event count")
+            for prior_attempt in range(1, latest_attempt):
+                prior_prepared, prior_finalized = events[
+                    (prior_attempt - 1) * 2 : prior_attempt * 2
+                ]
+                if (
+                    prior_prepared["attempt"] != prior_attempt
+                    or prior_prepared["phase"] != "PREPARED"
+                    or prior_prepared["outcome"] != "PREPARED"
+                    or prior_finalized["attempt"] != prior_attempt
+                    or prior_finalized["phase"] != "FINALIZED"
+                    or prior_finalized["outcome"] != CANCEL_FAILED
+                    or prior_finalized["blocks_mutation"] != 0
+                ):
+                    raise ValueError(
+                        "cancellation attempts are not contiguous failures"
+                    )
+            events = events[(latest_attempt - 1) * 2 :]
+            prepared = events[0]
+            journal = json.loads(prepared["wallet_identity_json"])
+            journal, _run_id, wallet_hash, network = (
+                OfferManager._verified_continuation_journal(
+                    journal,
+                    intent,
+                    trade_id=intent.trade_id,
+                    allowed_backends=frozenset({"sage", "chia"}),
+                )
+            )
+            prepared_evidence = json.loads(prepared["evidence_json"])
+            if type(prepared_evidence) is not dict:
+                raise ValueError("cancellation prepared evidence is not exact")
+            cohort_id = prepared_evidence.get("cohort_id")
+            member_id = prepared_evidence.get("member_id")
+            expected_member_id = (
+                "cancel-member:"
+                + hashlib.sha256(
+                    OfferManager._canonical_creation_json(
+                        {
+                            "cohort_id": cohort_id,
+                            "operation_id": intent.operation_id,
+                            "attempt": latest_attempt,
+                            "trade_id": intent.trade_id,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            if (
+                prepared["event_id"]
+                != f"{intent.operation_id}:attempt:{latest_attempt}:prepared"
+                or prepared["operation_id"] != intent.operation_id
+                or prepared["intent_id"] != intent.intent_id
+                or prepared["operation_type"] != "CANCEL"
+                or prepared["attempt"] != latest_attempt
+                or prepared["phase"] != "PREPARED"
+                or prepared["outcome"] != "PREPARED"
+                or prepared["transaction_id"] is not None
+                or prepared["spend_identity"] is not None
+                or prepared["reason_code"] != "CANCEL_PREPARED"
+                or prepared["blocks_mutation"] != 1
+                or prepared["request_timestamp"] != prepared["created_at"]
+                or type(prepared_evidence) is not dict
+                or prepared_evidence.get("trade_id") != intent.trade_id
+                or prepared_evidence.get("intent_id") != intent.intent_id
+                or prepared_evidence.get("operation_id") != intent.operation_id
+                or prepared_evidence.get("attempt") != latest_attempt
+                or prepared_evidence.get("continuation_journal_sha256")
+                != journal["snapshot_sha256"]
+                or frozenset(prepared_evidence)
+                not in {
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "prior_lifecycle_state",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                            "prior_lifecycle_state",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "cohort_size",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "trade_id",
+                            "intent_id",
+                            "operation_id",
+                            "attempt",
+                            "cohort_id",
+                            "cohort_size",
+                            "member_id",
+                            "reason",
+                            "continuation_journal_sha256",
+                            "wallet_effect",
+                            "effect_claim_protocol",
+                            "prior_lifecycle_state",
+                        }
+                    ),
+                }
+                or (
+                    "prior_lifecycle_state" in prepared_evidence
+                    and (
+                        type(prepared_evidence["prior_lifecycle_state"]) is not str
+                        or not prepared_evidence["prior_lifecycle_state"]
+                        or prepared_evidence["prior_lifecycle_state"]
+                        in {"cancel_requested", "cancel_sent", "mempool_observed"}
+                    )
+                )
+                or not OfferManager._is_canonical_cancel_digest_id(
+                    cohort_id,
+                    "cancel-cohort:",
+                )
+                or type(member_id) is not str
+                or member_id != expected_member_id
+                or type(prepared_evidence.get("reason")) is not str
+                or not 1 <= len(prepared_evidence["reason"]) <= 128
+                or prepared_evidence.get("wallet_effect")
+                != {"secure": True, "timeout": 60, "fee_mojos": None}
+                or (
+                    "effect_claim_protocol" in prepared_evidence
+                    and (
+                        prepared_evidence["effect_claim_protocol"]
+                        != "durable_cohort_claim_v1"
+                        or (
+                            prepared_evidence.get("cohort_size") is not None
+                            and (
+                                type(prepared_evidence["cohort_size"]) is not int
+                                or isinstance(prepared_evidence["cohort_size"], bool)
+                                or prepared_evidence["cohort_size"] < 2
+                            )
+                        )
+                    )
+                )
+            ):
+                raise ValueError("cancellation prepared event is not exact")
+            if len(events) == 1:
+                return _OfferCancelResultProjection(
+                    result=OfferManager._cancel_reconciliation_result(
+                        intent,
+                        idempotent_replay=True,
+                        attempt=latest_attempt,
+                    ),
+                    latch_binding=(wallet_hash, network),
+                    authoritative=False,
+                )
+            finalized = events[1]
+            final_evidence = json.loads(finalized["evidence_json"])
+            if type(final_evidence) is not dict:
+                raise ValueError("cancellation final evidence is not exact")
+            result = validate_cancel_result(final_evidence["cancel_result"])
+            final_evidence_keys = {
+                "trade_id",
+                "attempt",
+                "cohort_id",
+                "member_id",
+                "effect_attempted",
+                "cancel_result",
+            }
+            is_batch_abort = result["method"] == "batch_abort_ambiguous"
+            if is_batch_abort:
+                final_evidence_keys.add("aborted_by_operation_id")
+            expected_blocks = int(
+                result["outcome"] in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+            )
+            if (
+                finalized["event_id"]
+                != f"{intent.operation_id}:attempt:{latest_attempt}:finalized"
+                or finalized["operation_id"] != intent.operation_id
+                or finalized["intent_id"] != intent.intent_id
+                or finalized["operation_type"] != "CANCEL"
+                or finalized["attempt"] != latest_attempt
+                or finalized["phase"] != "FINALIZED"
+                or finalized["outcome"] != result["outcome"]
+                or finalized["transaction_id"] != (result["transaction_id"] or None)
+                or finalized["spend_identity"] != (result["spend_identity"] or None)
+                or finalized["blocks_mutation"] != expected_blocks
+                or finalized["reason_code"] != result["outcome"]
+                or finalized["request_timestamp"] != finalized["created_at"]
+                or finalized["wallet_identity_json"] != prepared["wallet_identity_json"]
+                or type(final_evidence) is not dict
+                or set(final_evidence) != final_evidence_keys
+                or final_evidence.get("trade_id") != intent.trade_id
+                or final_evidence.get("attempt") != latest_attempt
+                or final_evidence.get("cohort_id") != cohort_id
+                or final_evidence.get("member_id") != member_id
+                or type(final_evidence.get("effect_attempted")) is not bool
+                or final_evidence.get("cancel_result") != result
+                or (
+                    is_batch_abort
+                    and (
+                        result["outcome"] != CANCEL_FAILED
+                        or final_evidence["effect_attempted"] is not False
+                        or not OfferManager._is_canonical_cancel_digest_id(
+                            final_evidence.get("aborted_by_operation_id"),
+                            "cancel:",
+                        )
+                    )
+                )
+            ):
+                raise ValueError("cancellation final event is not exact")
+            result["_catalyst_effect_attempted"] = False
+            result["_catalyst_idempotent_replay"] = True
+            result["_catalyst_operation_id"] = intent.operation_id
+            result["_catalyst_intent_id"] = intent.intent_id
+            result["_catalyst_attempt"] = latest_attempt
+            return _OfferCancelResultProjection(
+                result=result,
+                latch_binding=(wallet_hash, network) if expected_blocks else None,
+                authoritative=not bool(expected_blocks),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return _OfferCancelResultProjection(
+                result=OfferManager._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=True,
+                    attempt=latest_attempt,
+                ),
+                latch_binding=(
+                    (wallet_hash, network) if wallet_hash and network else None
+                ),
+                authoritative=False,
+            )
+
+    @staticmethod
+    def _existing_cancel_result(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> Optional[dict]:
+        projection = OfferManager._read_existing_cancel_result(intent)
+        if projection.latch_binding is not None and type(projection.result) is dict:
+            attempt = projection.result.get("_catalyst_attempt")
+            try:
+                events = database.get_offer_operation_events(intent.operation_id)
+                latest = events[-1] if events else None
+            except Exception:
+                latest = None
+            if (
+                type(attempt) is int
+                and type(latest) is dict
+                and latest.get("attempt") == attempt
+                and latest.get("phase") == "PREPARED"
+            ):
+                # Another exact caller owns (or already claimed) this effect.
+                # Returning the durable PREPARED projection is fail-closed and
+                # must not advance the recovery generation underneath the
+                # owner before it can append FINALIZED. Startup recovery still
+                # fences a genuinely stranded PREPARED row.
+                return projection.result
+        if projection.latch_binding is not None:
+            wallet_hash, network = projection.latch_binding
+            OfferManager._trip_cancel_latch(
+                intent,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+        return projection.result
+
+    def get_cancel_result_authority(self, trade_id: Any) -> Optional[dict]:
+        """Project the latest exact durable cancellation result for one trade."""
+
+        intent = self._canonical_cancel_intent(trade_id)
+        projection = self._read_existing_cancel_result(intent)
+        result = projection.result
+        if type(result) is not dict or not projection.authoritative:
+            return None
+        metadata_keys = frozenset(
+            {
+                "_catalyst_effect_attempted",
+                "_catalyst_idempotent_replay",
+                "_catalyst_operation_id",
+                "_catalyst_intent_id",
+                "_catalyst_attempt",
+            }
+        )
+        if not metadata_keys.issubset(result):
+            return None
+        typed_result = {
+            key: value for key, value in result.items() if key not in metadata_keys
+        }
+        try:
+            typed_result = validate_cancel_result(typed_result)
+        except (TypeError, ValueError):
+            return None
+        attempt = result["_catalyst_attempt"]
+        effect_attempted = result["_catalyst_effect_attempted"]
+        idempotent_replay = result["_catalyst_idempotent_replay"]
+        if (
+            type(effect_attempted) is not bool
+            or type(idempotent_replay) is not bool
+            or (effect_attempted and idempotent_replay)
+            or result["_catalyst_operation_id"] != intent.operation_id
+            or result["_catalyst_intent_id"] != intent.intent_id
+            or type(attempt) is not int
+            or attempt < 1
+        ):
+            return None
+        return {
+            "trade_id": intent.trade_id,
+            "operation_id": intent.operation_id,
+            "intent_id": intent.intent_id,
+            "attempt": attempt,
+            "outcome": typed_result["outcome"],
+        }
+
+    def _cancel_one_from_journal(
+        self,
+        *,
+        intent: _CanonicalOfferCancelIntent,
+        reason: str,
+        cohort_id: str,
+        member_id: str,
+        continuation: Any = None,
+        journal: Optional[dict] = None,
+        wallet_hash: str = "",
+        network: str = "",
+        attempt: int = 1,
+        prepared_for_cohort: bool = False,
+    ) -> dict:
+        existing = None if prepared_for_cohort else self._existing_cancel_result(intent)
+        may_advance_failed_attempt = (
+            existing is not None
+            and attempt > 1
+            and existing.get("outcome") == CANCEL_FAILED
+            and existing.get("_catalyst_attempt") == attempt - 1
+        )
+        if (
+            existing is not None
+            and not may_advance_failed_attempt
+            and not prepared_for_cohort
+        ):
+            if continuation is not None:
+                wallet.close_offer_cancel_continuation(continuation)
+            return existing
+        try:
+            if continuation is None:
+                continuation, journal, wallet_hash, network = (
+                    self._acquire_cancel_authority(intent)
+                )
+            if type(journal) is not dict:
+                raise ValueError("cancellation authority journal is missing")
+            if prepared_for_cohort:
+                self._offer_cancel_crash_boundary("after_prepare", intent)
+                try:
+                    effect_claimed = database.claim_offer_cancel_effect(
+                        operation_id=intent.operation_id,
+                        trade_id=intent.trade_id,
+                        attempt=attempt,
+                    )
+                except (TypeError, ValueError):
+                    existing = self._existing_cancel_result(intent)
+                    if existing is not None:
+                        return existing
+                    raise
+            else:
+                self._offer_cancel_crash_boundary("before_prepare", intent)
+                try:
+                    effect_claimed = self._prepare_cancel_member(
+                        intent,
+                        attempt=attempt,
+                        reason=reason,
+                        cohort_id=cohort_id,
+                        member_id=member_id,
+                        journal=journal,
+                    )
+                except (TypeError, ValueError):
+                    existing = self._existing_cancel_result(intent)
+                    if existing is not None:
+                        return existing
+                    raise
+                self._offer_cancel_crash_boundary("after_prepare", intent)
+            if not effect_claimed:
+                self._trip_cancel_replay_latch(
+                    intent,
+                    attempt=attempt,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+                return self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=True,
+                    effect_attempted=False,
+                    attempt=attempt,
+                )
+            self._offer_cancel_crash_boundary("before_wallet", intent)
+            raw_result = wallet.cancel_offer(
+                intent.trade_id,
+                secure=True,
+                timeout=60,
+                fee_mojos=None,
+                _cancel_continuation=continuation,
+                _cancel_operation_id=intent.operation_id,
+                _cancel_intent_id=intent.intent_id,
+            )
+            continuation = None
+            effect_attempted = (
+                type(raw_result) is dict
+                and raw_result.get("_catalyst_effect_attempted") is True
+            )
+            typed_candidate = (
+                {
+                    key: value
+                    for key, value in raw_result.items()
+                    if key != "_catalyst_effect_attempted"
+                }
+                if type(raw_result) is dict
+                else raw_result
+            )
+            try:
+                result = validate_cancel_result(typed_candidate)
+            except (TypeError, ValueError):
+                result = cancellation_result(
+                    CANCEL_UNKNOWN,
+                    method="wallet_facade",
+                    raw_response={
+                        "invalid_result_schema": type(typed_candidate).__name__
+                    },
+                )
+            if result["outcome"] == CANCEL_CONFIRMED:
+                result = cancellation_result(
+                    CANCEL_UNKNOWN,
+                    method="wallet_facade",
+                    raw_response={"claimed_outcome": CANCEL_CONFIRMED},
+                )
+            self._offer_cancel_crash_boundary("after_response", intent)
+            final_evidence = {
+                "trade_id": intent.trade_id,
+                "attempt": attempt,
+                "cohort_id": cohort_id,
+                "member_id": member_id,
+                "effect_attempted": effect_attempted,
+                "cancel_result": result,
+            }
+            self._offer_cancel_crash_boundary("before_final_commit", intent)
+            try:
+                database.finalize_offer_cancel(
+                    operation_id=intent.operation_id,
+                    event_id=f"{intent.operation_id}:attempt:{attempt}:finalized",
+                    trade_id=intent.trade_id,
+                    intent_id=intent.intent_id,
+                    attempt=attempt,
+                    cancel_result=result,
+                    wallet_identity_json=journal,
+                    evidence_json=final_evidence,
+                )
+            except Exception:
+                self._trip_cancel_latch(
+                    intent,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+                return self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=False,
+                    effect_attempted=effect_attempted,
+                    attempt=attempt,
+                )
+            if result["outcome"] in {
+                CANCEL_SUBMITTED_UNCONFIRMED,
+                CANCEL_UNKNOWN,
+            }:
+                self._trip_cancel_latch(
+                    intent,
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                )
+            self._offer_cancel_crash_boundary("after_final_commit", intent)
+            result["_catalyst_effect_attempted"] = effect_attempted
+            result["_catalyst_idempotent_replay"] = False
+            result["_catalyst_operation_id"] = intent.operation_id
+            result["_catalyst_intent_id"] = intent.intent_id
+            result["_catalyst_attempt"] = attempt
+            return result
+        finally:
+            if continuation is not None:
+                wallet.close_offer_cancel_continuation(continuation)
+
     def cancel_offers(
         self,
         trade_ids: List[str],
         reason: str = "manual",
         force_storm: bool = False,
         skip_confirmation: bool = False,
+        _retry_failed_attempts: Optional[Dict[str, int]] = None,
     ) -> Dict:
         """Cancel a list of offers.
 
@@ -3619,6 +6325,7 @@ class OfferManager:
         Routine requote/expiry/sniper paths do NOT — so a bug there
         that tries to nuke the book gets caught here instead of executing.
         """
+        del skip_confirmation
         if not trade_ids:
             return {}
 
@@ -3647,153 +6354,445 @@ class OfferManager:
                         f"reserve floor breach, shutdown).",
                     )
                     return {
-                        tid: {"success": False, "error": "cancel_storm_blocked"}
+                        tid: cancellation_result(
+                            CANCEL_FAILED,
+                            method="cancel_storm_guard",
+                            raw_response={
+                                "reason_code": "CANCEL_STORM_BLOCKED",
+                                "effect_attempted": False,
+                            },
+                            error="CANCEL_REJECTED",
+                        )
                         for tid in trade_ids
                     }
 
-        log_event(
-            "info",
-            "cancel_start",
-            f"Cancelling {len(trade_ids)} offers (reason: {reason})",
+        canonical_intents = [self._canonical_cancel_intent(tid) for tid in trade_ids]
+        self._recover_persisted_cancel_cohorts()
+        unique_intents = []
+        seen_trade_ids = set()
+        for intent in canonical_intents:
+            if intent.trade_id not in seen_trade_ids:
+                seen_trade_ids.add(intent.trade_id)
+                unique_intents.append(intent)
+        canonical_trade_ids = sorted(seen_trade_ids)
+        retry_failed_attempts = (
+            {} if _retry_failed_attempts is None else _retry_failed_attempts
         )
-
-        # Mark as bot-cancelled BEFORE cancelling (for fill detection)
-        for tid in trade_ids:
-            self._bot_cancelled_ids.add(tid)
-            # Lifecycle: CANCEL_SENT signal transitions open → cancel_requested
-            # so the dashboard can distinguish "in progress" from "confirmed".
-            try:
-                transition_offer(tid, "cancel_sent")
-            except Exception:
-                pass  # lifecycle update is additive — never block cancel
-            # Stamp cancel attempt time so bot_health.check_pending_cancels()
-            # can throttle retries (don't re-cancel a still-pending offer
-            # every cycle — wait the configured backoff first).
-            try:
-                mark_cancel_attempted(tid)
-            except Exception:
-                pass
-
-        # NOTE: Sage's cancel endpoints don't accept coin_ids — fee coin
-        # is always auto-selected.  Bulk cancel (≥3 offers) uses a single
-        # transaction so only 1 fee coin is consumed.  Creates DO get
-        # dedicated fee coins via make_offer's coin_ids to prevent overlap.
-        results = cancel_offers_batch(
-            trade_ids, secure=True, skip_confirmation=skip_confirmation
+        if type(retry_failed_attempts) is not dict or any(
+            type(trade_id) is not str
+            or trade_id not in seen_trade_ids
+            or type(prior_attempt) is not int
+            or isinstance(prior_attempt, bool)
+            or prior_attempt < 1
+            for trade_id, prior_attempt in retry_failed_attempts.items()
+        ):
+            raise ValueError("failed cancel retry authority is invalid")
+        cohort_id = (
+            "cancel-cohort:"
+            + hashlib.sha256(
+                self._canonical_creation_json(canonical_trade_ids).encode("utf-8")
+            ).hexdigest()
         )
+        members = []
+        for intent in unique_intents:
+            attempt = retry_failed_attempts.get(intent.trade_id, 0) + 1
+            member_id = (
+                "cancel-member:"
+                + hashlib.sha256(
+                    self._canonical_creation_json(
+                        {
+                            "cohort_id": cohort_id,
+                            "operation_id": intent.operation_id,
+                            "attempt": attempt,
+                            "trade_id": intent.trade_id,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            members.append((intent, attempt, member_id))
 
-        # Log results summary
-        successes = sum(1 for r in results.values() if r and r.get("success"))
-        failures = len(results) - successes
-        log_event(
-            "info",
-            "cancel_result",
-            f"Cancel results: {successes} succeeded, {failures} failed "
-            f"(reason: {reason})",
-        )
-
-        # Update database status + coin tracking. Per-offer failures
-        # accumulate into a single rolled-up warning at the end so we don't
-        # spam the operator with N near-identical "cancel failed for X"
-        # warnings when one Sage outage knocks out an entire ladder.
-        newly_queued_failures: list[tuple[str, str]] = []
-        for tid, result in results.items():
-            if result and result.get("success"):
-                method = str(result.get("method") or "")
-                if method in CANCEL_PENDING_METHODS:
-                    # Submission accepted but not on-chain yet. Leave DB
-                    # status alone — a later cancel reconcile or fill
-                    # detection will catch the true state once the TX
-                    # confirms (or times out in the mempool). For the
-                    # specific "already_gone_ambiguous" case (Sage 404)
-                    # also drop the local bot-cancel flag so fill_tracker
-                    # does not skip on-chain verification on the next pass.
-                    log_event(
-                        "debug",
-                        "cancel_pending_mempool",
-                        f"Cancel for {tid[:16]}... submitted but not "
-                        f"yet confirmed (method={method}); leaving DB "
-                        f"status open",
+        is_cohort = len(members) > 1
+        recoverable_contexts = {}
+        existing_results = {}
+        for intent, attempt, member_id in members:
+            context = None
+            if is_cohort:
+                try:
+                    context = self._recoverable_unclaimed_cohort_cancel(
+                        intent,
+                        attempt=attempt,
+                        cohort_id=cohort_id,
+                        cohort_size=len(members),
+                        member_id=member_id,
                     )
-                    if method == "already_gone_ambiguous":
-                        self._bot_cancelled_ids.discard(tid)
-                    continue
-                # update_offer_status propagates lifecycle_state → "cancelled" automatically
-                update_offer_status(tid, "cancelled")
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    context = None
+            if context is not None:
+                recoverable_contexts[intent.trade_id] = context
+                existing_results[intent.trade_id] = None
             else:
-                # Cancel failed — queue for retry (V1 parity)
-                # Lifecycle: CANCEL_FAILED signal reverts cancel_requested → open
-                self._bot_cancelled_ids.discard(tid)
-                try:
-                    transition_offer(tid, "cancel_failed")
-                except Exception:
-                    pass
-                if tid not in self._pending_cancel_retries:
-                    self._pending_cancel_retries[tid] = {
-                        "attempts": 1,
-                        "first_failed": time.time(),
-                    }
-                    err = str((result or {}).get("error") or "unknown")
-                    log_event(
-                        "debug",
-                        "cancel_failed_queued",
-                        f"Cancel failed for {tid[:16]}... ({err[:80]}) — queued for retry",
-                    )
-                    newly_queued_failures.append((tid, err))
-
-        if newly_queued_failures:
-            # One warning summarising the batch. Include a sample of the
-            # first error so operators can see the cause without expanding
-            # the debug breadcrumbs.
-            sample_err = newly_queued_failures[0][1][:120]
-            log_event(
-                "warning",
-                "cancel_failed_queued",
-                f"{len(newly_queued_failures)} offer cancel(s) failed and queued "
-                f"for retry (reason: {reason}; first error: {sample_err})",
+                existing_results[intent.trade_id] = self._existing_cancel_result(intent)
+        recovering_interrupted_cohort = bool(recoverable_contexts)
+        retry_eligible = {
+            intent.trade_id: (
+                intent.trade_id in retry_failed_attempts
+                and existing_results[intent.trade_id] is not None
+                and existing_results[intent.trade_id].get("outcome") == CANCEL_FAILED
+                and existing_results[intent.trade_id].get("_catalyst_attempt")
+                == attempt - 1
             )
+            for intent, attempt, _member_id in members
+        }
+        if not recovering_interrupted_cohort and any(
+            result is not None
+            and result["outcome"] in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+            for result in existing_results.values()
+        ):
+            return {
+                intent.trade_id: existing_results[intent.trade_id]
+                or self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=False,
+                    effect_attempted=False,
+                )
+                for intent, _attempt, _member_id in members
+            }
 
-        if successes > 0:
-            log_event(
-                "info",
-                "offers_cancelled",
-                f"Cancelled {successes} offers (reason: {reason})",
-            )
-            # F75: request a fast reconcile so the returned coins are
-            # picked up into their tier pools before the next rebuild
-            # attempt. Without this, the normal 2-cycle reconcile
-            # cadence races the rebuild and the bot tries to create
-            # ladder slots before seeing the newly-freed backing coins.
-            try:
-                from coin_manager import request_fast_reconcile
-
-                request_fast_reconcile(reason=f"cancel:{reason}")
-            except Exception:
-                pass  # best-effort; the normal cadence still runs
-            # Purge successfully cancelled offers from public post queues so
-            # they don't leak stale/invalid offers on the next flush.
-            cancelled_ids = [
-                tid for tid, r in results.items() if r and r.get("success")
+        ordered_members = list(members)
+        if not recovering_interrupted_cohort:
+            participating = [
+                (intent, attempt)
+                for intent, attempt, _member_id in members
+                if existing_results[intent.trade_id] is None
+                or retry_eligible[intent.trade_id]
             ]
-            if self.dexie_manager is not None:
-                try:
-                    self.dexie_manager.purge_trade_ids(cancelled_ids)
-                except Exception:
-                    pass  # non-critical — flush will handle the 400 gracefully
-            if self.splash_manager is not None:
-                try:
-                    self.splash_manager.purge_trade_ids(cancelled_ids)
-                except Exception:
-                    pass  # non-critical - flush will retry/skip invalid offers
-        if failures > 0:
-            log_event(
-                "warning",
-                "offers_cancel_pending",
-                f"{failures} offers failed to cancel and remain queued for retry "
-                f"(reason: {reason})",
-            )
+            manifest = None
+            if len(participating) > 1:
+                manifest = database.canonical_offer_cancel_cohort_manifest(
+                    [
+                        {
+                            "trade_id": intent.trade_id,
+                            "operation_id": intent.operation_id,
+                            "intent_id": intent.intent_id,
+                            "attempt": attempt,
+                            "prepared_event_id": (
+                                f"{intent.operation_id}:attempt:{attempt}:prepared"
+                            ),
+                        }
+                        for intent, attempt in participating
+                    ]
+                )
+                cohort_id = manifest["cohort_id"]
+                intents_by_trade_id = {
+                    intent.trade_id: intent for intent, _attempt in participating
+                }
+                members = [
+                    (
+                        intents_by_trade_id[member["trade_id"]],
+                        member["attempt"],
+                        member["member_id"],
+                    )
+                    for member in manifest["members"]
+                ]
+            else:
+                participating_trade_ids = sorted(
+                    intent.trade_id for intent, _attempt in participating
+                )
+                cohort_id = (
+                    "cancel-cohort:"
+                    + hashlib.sha256(
+                        self._canonical_creation_json(participating_trade_ids).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                )
+                members = []
+                for intent, attempt in participating:
+                    member_id = (
+                        "cancel-member:"
+                        + hashlib.sha256(
+                            self._canonical_creation_json(
+                                {
+                                    "cohort_id": cohort_id,
+                                    "operation_id": intent.operation_id,
+                                    "attempt": attempt,
+                                    "trade_id": intent.trade_id,
+                                }
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
+                    members.append((intent, attempt, member_id))
+            is_cohort = len(members) > 1
+        else:
+            manifest = None
 
-        return results
+        authorities = {}
+        try:
+            for intent, _attempt, _member_id in members:
+                if (
+                    existing_results[intent.trade_id] is None
+                    and intent.trade_id not in recoverable_contexts
+                ) or retry_eligible[intent.trade_id]:
+                    authorities[intent.trade_id] = self._acquire_cancel_authority(
+                        intent
+                    )
+
+            if is_cohort:
+                if manifest is not None:
+                    requests = []
+                    for intent, attempt, member_id in members:
+                        self._offer_cancel_crash_boundary(
+                            "before_cohort_prepare", intent
+                        )
+                        authority = authorities.get(intent.trade_id)
+                        if authority is None:
+                            raise ValueError(
+                                "cancellation cohort authority is incomplete"
+                            )
+                        _continuation, journal, _wallet_hash, _network = authority
+                        requests.append(
+                            {
+                                "operation_id": intent.operation_id,
+                                "event_id": (
+                                    f"{intent.operation_id}:attempt:{attempt}:prepared"
+                                ),
+                                "trade_id": intent.trade_id,
+                                "intent_id": intent.intent_id,
+                                "attempt": attempt,
+                                "wallet_identity_json": journal,
+                                "evidence_json": self._cancel_prepared_evidence(
+                                    intent,
+                                    attempt=attempt,
+                                    reason=reason,
+                                    cohort_id=cohort_id,
+                                    cohort_size=len(members),
+                                    member_id=member_id,
+                                    journal=journal,
+                                ),
+                            }
+                        )
+                    cohort_prepare = database.prepare_offer_cancel_cohort(
+                        manifest_json=manifest,
+                        member_requests_json=requests,
+                    )
+                    if cohort_prepare["inserted"] is False:
+                        replay_results = {}
+                        for (
+                            replay_intent,
+                            replay_attempt,
+                            _member_id,
+                        ) in ordered_members:
+                            replay_result = existing_results[replay_intent.trade_id]
+                            if replay_result is None:
+                                replay_result = self._read_existing_cancel_result(
+                                    replay_intent
+                                ).result
+                            if replay_result is None:
+                                replay_result = self._cancel_reconciliation_result(
+                                    replay_intent,
+                                    idempotent_replay=True,
+                                    effect_attempted=False,
+                                    attempt=replay_attempt,
+                                )
+                            replay_results[replay_intent.trade_id] = replay_result
+                        return replay_results
+                else:
+                    for intent, attempt, member_id in members:
+                        authority = authorities.get(intent.trade_id)
+                        if authority is None:
+                            continue
+                        _continuation, journal, _wallet_hash, _network = authority
+                        self._offer_cancel_crash_boundary(
+                            "before_cohort_prepare", intent
+                        )
+                        try:
+                            self._prepare_cancel_member(
+                                intent,
+                                attempt=attempt,
+                                reason=reason,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                                journal=journal,
+                                claim_effect=False,
+                            )
+                        except (TypeError, ValueError):
+                            context = self._recoverable_unclaimed_cohort_cancel(
+                                intent,
+                                attempt=attempt,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                            )
+                            if context is None:
+                                raise
+                            recoverable_contexts[intent.trade_id] = context
+                            recovering_interrupted_cohort = True
+                self._offer_cancel_crash_boundary(
+                    "after_cohort_prepare",
+                    members[0][0],
+                )
+
+            if recovering_interrupted_cohort:
+                processed_results = {}
+                for intent, attempt, member_id in members:
+                    existing = existing_results[intent.trade_id]
+                    if existing is not None:
+                        result = existing
+                    else:
+                        context = recoverable_contexts.get(intent.trade_id)
+                        if context is None:
+                            context = self._recoverable_unclaimed_cohort_cancel(
+                                intent,
+                                attempt=attempt,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                            )
+                        if context is None:
+                            result = self._cancel_reconciliation_result(
+                                intent,
+                                idempotent_replay=True,
+                                effect_attempted=False,
+                                attempt=attempt,
+                            )
+                        else:
+                            result = self._finalize_unattempted_cohort_cancel(
+                                intent,
+                                attempt=attempt,
+                                cohort_id=cohort_id,
+                                cohort_size=len(members),
+                                member_id=member_id,
+                                context=context,
+                                reason_code="COHORT_RECOVERY_UNATTEMPTED",
+                            )
+                    processed_results[intent.trade_id] = result
+                results = {}
+                for intent, attempt, _member_id in ordered_members:
+                    result = processed_results.get(intent.trade_id)
+                    if result is None:
+                        result = existing_results[intent.trade_id]
+                    if result is None:
+                        result = self._cancel_reconciliation_result(
+                            intent,
+                            idempotent_replay=True,
+                            effect_attempted=False,
+                            attempt=attempt,
+                        )
+                    results[intent.trade_id] = result
+                    if result.get("outcome") == CANCEL_FAILED:
+                        prior_retry = self._pending_cancel_retries.get(
+                            intent.trade_id, {}
+                        )
+                        self._pending_cancel_retries[intent.trade_id] = {
+                            "attempts": result.get("_catalyst_attempt", attempt),
+                            "first_failed": prior_retry.get(
+                                "first_failed", time.time()
+                            ),
+                        }
+                    else:
+                        self._pending_cancel_retries.pop(intent.trade_id, None)
+                return results
+
+            processed_results = {}
+            ambiguous_operation_id = ""
+            for intent, attempt, member_id in members:
+                existing = existing_results[intent.trade_id]
+                if existing is not None and not retry_eligible[intent.trade_id]:
+                    result = existing
+                else:
+                    continuation, journal, wallet_hash, network = authorities.pop(
+                        intent.trade_id
+                    )
+                    if ambiguous_operation_id:
+                        if is_cohort:
+                            try:
+                                context = self._recoverable_unclaimed_cohort_cancel(
+                                    intent,
+                                    attempt=attempt,
+                                    cohort_id=cohort_id,
+                                    cohort_size=len(members),
+                                    member_id=member_id,
+                                )
+                                if context is None:
+                                    result = self._existing_cancel_result(intent)
+                                    if result is None:
+                                        result = self._cancel_reconciliation_result(
+                                            intent,
+                                            idempotent_replay=True,
+                                            effect_attempted=False,
+                                            attempt=attempt,
+                                        )
+                                else:
+                                    result = self._finalize_unattempted_cohort_cancel(
+                                        intent,
+                                        attempt=attempt,
+                                        cohort_id=cohort_id,
+                                        cohort_size=len(members),
+                                        member_id=member_id,
+                                        context=context,
+                                        reason_code="BATCH_ABORTED_BY_AMBIGUOUS_PEER",
+                                        blocking_operation_id=ambiguous_operation_id,
+                                    )
+                            finally:
+                                wallet.close_offer_cancel_continuation(continuation)
+                        else:
+                            result = self._abort_cancel_after_ambiguous_peer(
+                                intent=intent,
+                                attempt=attempt,
+                                reason=reason,
+                                cohort_id=cohort_id,
+                                member_id=member_id,
+                                ambiguous_operation_id=ambiguous_operation_id,
+                                continuation=continuation,
+                                journal=journal,
+                                wallet_hash=wallet_hash,
+                                network=network,
+                            )
+                    else:
+                        result = self._cancel_one_from_journal(
+                            intent=intent,
+                            attempt=attempt,
+                            reason=reason,
+                            cohort_id=cohort_id,
+                            member_id=member_id,
+                            continuation=continuation,
+                            journal=journal,
+                            wallet_hash=wallet_hash,
+                            network=network,
+                            prepared_for_cohort=is_cohort,
+                        )
+                processed_results[intent.trade_id] = result
+                if not ambiguous_operation_id and result["outcome"] in {
+                    CANCEL_SUBMITTED_UNCONFIRMED,
+                    CANCEL_UNKNOWN,
+                }:
+                    ambiguous_operation_id = intent.operation_id
+            results = {}
+            for intent, attempt, _member_id in ordered_members:
+                result = processed_results.get(intent.trade_id)
+                if result is None:
+                    result = existing_results[intent.trade_id]
+                if result is None:
+                    result = self._cancel_reconciliation_result(
+                        intent,
+                        idempotent_replay=True,
+                        effect_attempted=False,
+                        attempt=attempt,
+                    )
+                results[intent.trade_id] = result
+                if result.get("outcome") == CANCEL_FAILED:
+                    prior_retry = self._pending_cancel_retries.get(intent.trade_id, {})
+                    self._pending_cancel_retries[intent.trade_id] = {
+                        "attempts": result.get("_catalyst_attempt", attempt),
+                        "first_failed": prior_retry.get("first_failed", time.time()),
+                    }
+                else:
+                    self._pending_cancel_retries.pop(intent.trade_id, None)
+            return results
+        finally:
+            for continuation, _journal, _wallet_hash, _network in authorities.values():
+                wallet.close_offer_cancel_continuation(continuation)
 
     def cancel_all(
         self,
@@ -3830,37 +6829,6 @@ class OfferManager:
                     "cancel_progress_callback_failed",
                     f"Cancel progress callback raised: {e}",
                 )
-
-        def apply_batch_results(batch_results: Dict[str, Dict]) -> None:
-            for tid, result in batch_results.items():
-                if result and result.get("success"):
-                    method = str(result.get("method") or "")
-                    if method in CANCEL_PENDING_METHODS:
-                        # Submission accepted but not on-chain yet. Leave
-                        # DB status alone — a later cancel reconcile or
-                        # fill detection will catch the true state once
-                        # the TX confirms (or times out in the mempool).
-                        # For Sage 404 ("already_gone_ambiguous") also drop
-                        # the local bot-cancel marker so fill_tracker does
-                        # not skip on-chain verification.
-                        log_event(
-                            "debug",
-                            "cancel_pending_mempool",
-                            f"Cancel for {tid[:16]}... submitted but "
-                            f"not yet confirmed (method={method}); "
-                            f"leaving DB status open",
-                        )
-                        if method == "already_gone_ambiguous":
-                            self._bot_cancelled_ids.discard(tid)
-                    else:
-                        update_offer_status(tid, "cancelled")
-                else:
-                    self._bot_cancelled_ids.discard(tid)
-                    if tid not in self._pending_cancel_retries:
-                        self._pending_cancel_retries[tid] = {
-                            "attempts": 1,
-                            "first_failed": time.time(),
-                        }
 
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
         open_offers = get_open_offers(cat_asset_id=asset_id)
@@ -3925,155 +6893,70 @@ class OfferManager:
             )
             return {}
 
-        # Mark all as bot-cancelled BEFORE starting (for fill detection)
-        # and stamp cancel_sent / cancel_last_attempt_at via the lifecycle
-        # helpers so the bot_health pending-cancel verifier can re-drive
-        # zombie recoveries if Sage doesn't confirm. Without these stamps
-        # a fee-starved bulk cancel (stop, CB, or >20-offer cancel storm)
-        # leaves stale offers live with no automatic retry/escalation
-        # because the verifier only acts on rows whose cancel-attempt
-        # timestamp is set.
-        for tid in trade_ids:
-            self._bot_cancelled_ids.add(tid)
-            try:
-                transition_offer(tid, "cancel_sent")
-            except Exception:
-                pass  # lifecycle update is additive — never block cancel
-            try:
-                mark_cancel_attempted(tid)
-            except Exception:
-                pass
-
-        # Send ALL offers in a single bulk cancel RPC to Sage, then
-        # wait for on-chain confirmation. Sage handles bulk cancels natively
-        # and batching just adds unnecessary delay.
-        total = len(trade_ids)
-        all_results = {}
-
-        log_event(
-            "info",
-            "cancel_all_bulk",
-            f"Cancelling all {total} offers in one bulk request",
-        )
-        emit_progress(
-            running=True,
-            complete=False,
-            phase="cancelling",
-            total=total,
-            batch_size=total,
-            total_batches=1,
-            current_batch=1,
-            cancelled=0,
-            failed=0,
-            message=f"Cancelling {total} offers...",
-        )
-
         try:
-            bulk_results = cancel_offers_batch(trade_ids, secure=True)
-            all_results.update(bulk_results)
-            apply_batch_results(bulk_results)
-        except Exception as e:
-            log_event("warning", "cancel_all_error", f"Bulk cancel error: {e}")
-            for tid in trade_ids:
-                if tid not in all_results:
-                    all_results[tid] = {"success": False, "error": str(e)}
-            apply_batch_results(
-                {
-                    tid: all_results[tid]
-                    for tid in trade_ids
-                    if not (all_results.get(tid, {}).get("success"))
-                }
+            results = self.cancel_offers(
+                trade_ids,
+                reason="cancel_all",
+                force_storm=True,
             )
-
-        # F50 (2026-04-09): summarise by confirmed vs pending vs failed.
-        # Previously we lumped confirmed + pending together as "succeeded"
-        # which misled the operator into thinking cancels completed on-chain
-        # when they were actually stuck in a congested mempool. The user hit
-        # this after a stop-then-cancel-all flow where only ~half the cancels
-        # made it into a block — the UI cheerfully reported "46 succeeded"
-        # but Sage still showed 23 active. Now we distinguish.
-        CONFIRMED_METHODS = {
-            "confirmed_by_status",
-            "confirmed_by_unlock",
-            "confirmed_coins_returned",
-            "confirmed_by_coin_delta",
-            "bulk",
-        }
-        # Reuse the module-level constant to avoid drift.
-        PENDING_METHODS = CANCEL_PENDING_METHODS
-
-        def _classify(r):
-            if not isinstance(r, dict):
-                return "failed"
-            if not r.get("success"):
-                return "failed"
-            method = r.get("method", "")
-            if method in CONFIRMED_METHODS:
-                return "confirmed"
-            if method in PENDING_METHODS:
-                return "pending"
-            return "confirmed"
-
-        confirmed_count = sum(
-            1 for r in all_results.values() if _classify(r) == "confirmed"
-        )
-        pending_count = sum(
-            1 for r in all_results.values() if _classify(r) == "pending"
-        )
-        failed_count = sum(1 for r in all_results.values() if _classify(r) == "failed")
-        # successes = anything accepted by Sage (confirmed + pending) for
-        # backwards-compat with callers that don't know about pending.
-        successes = confirmed_count + pending_count
-        failures = failed_count
-
-        if pending_count > 0:
-            # Some cancels are still in the mempool — warn the operator to
-            # wait a block or two and re-check before concluding.
+        except Exception as exc:
+            # No wallet effect is issued outside ``cancel_offers``.  If the
+            # durable dispatcher itself is unavailable, keep every offer
+            # non-terminal and return the same typed fail-closed shape callers
+            # receive for an ambiguous journal outcome.
             log_event(
-                "warning",
-                "cancel_all_done",
-                f"Cancel all finished: {confirmed_count} confirmed on-chain, "
-                f"{pending_count} PENDING in mempool (may still fail due to "
-                f"mempool conflict or fee rejection), {failed_count} failed. "
-                f"Re-check offers in 1-2 minutes to verify pending cancels "
-                f"actually confirmed.",
+                "error",
+                "cancel_all_journal_unavailable",
+                f"Durable cancellation dispatcher failed: {type(exc).__name__}",
             )
-            final_message = (
-                f"Cancel all finished: {confirmed_count} confirmed, "
-                f"{pending_count} pending on-chain, {failed_count} failed. "
-                f"Wait 1-2 minutes then re-check."
-            )
-        else:
-            log_event(
-                "info",
-                "cancel_all_done",
-                f"Cancel all complete: {confirmed_count} confirmed on-chain, "
-                f"{failed_count} failed",
-            )
-            final_message = (
-                f"Cancel all complete: {confirmed_count} confirmed"
-                + (f", {failed_count} failed" if failed_count else "")
-                + "."
-            )
-
+            results = {}
+            for trade_id in trade_ids:
+                result = cancellation_result(
+                    CANCEL_UNKNOWN,
+                    method="journal_dispatch",
+                    raw_response={
+                        "reason_code": "DURABLE_CANCEL_UNAVAILABLE",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                result["_catalyst_effect_attempted"] = False
+                result["_catalyst_idempotent_replay"] = False
+                result["_catalyst_operation_id"] = f"cancel:{trade_id}"
+                result["_catalyst_intent_id"] = f"cancel-target:{trade_id}"
+                results[trade_id] = result
+        submitted = sum(
+            result.get("outcome") == CANCEL_SUBMITTED_UNCONFIRMED
+            for result in results.values()
+            if type(result) is dict
+        )
+        unknown = sum(
+            result.get("outcome") == CANCEL_UNKNOWN
+            for result in results.values()
+            if type(result) is dict
+        )
+        failed = sum(
+            result.get("outcome") == CANCEL_FAILED
+            for result in results.values()
+            if type(result) is dict
+        )
         emit_progress(
             running=False,
             complete=True,
             phase="complete",
-            total=total,
-            batch_size=total,
+            total=len(trade_ids),
+            batch_size=len(trade_ids),
             total_batches=1,
             current_batch=1,
-            cancelled=successes,
-            confirmed=confirmed_count,
-            pending=pending_count,
-            failed=failures,
-            message=final_message,
+            cancelled=0,
+            confirmed=0,
+            pending=submitted + unknown,
+            failed=failed,
+            message=(
+                "Cancellation requests journaled; authoritative terminal "
+                "reconciliation remains pending."
+            ),
         )
-        if confirmed_count > 0 and pending_count == 0:
-            self.expect_empty_wallet_offer_book("cancel_all_confirmed")
-
-        return all_results
+        return results
 
     # -------------------------------------------------------------------
     # -------------------------------------------------------------------
@@ -4128,19 +7011,20 @@ class OfferManager:
     # -------------------------------------------------------------------
 
     def cleanup_expired(self) -> int:
-        """Find and cancel expired offers.
+        """Observe locally expired offers without inferring terminality.
 
-        The Chia wallet doesn't auto-expire offers — they stay "open" forever.
-        We must check valid_times.max_time manually and cancel stale ones.
+        Adapter and database compatibility helpers are both fail-closed. They
+        may report diagnostics, but Task 9 owns cancellation/expiry proof and
+        the associated reservation mutation.
         """
         count = cleanup_expired_offers()
-        return count + len(self.cleanup_expired_db_offers())
+        return _wallet_mutation_count(count) + len(self.cleanup_expired_db_offers())
 
     def cleanup_expired_db_offers(self) -> List[str]:
-        """Retire DB-open offers whose local expires_at has elapsed.
+        """Run the guarded legacy expiry probe for observability.
 
-        Pending-cancel rows deliberately stay open until Dexie/Spacescan
-        verification resolves them as cancelled, expired, or filled.
+        All durable offer rows remain open until authoritative Task 9 proof;
+        local time and pending-cancel observations cannot retire them.
         """
         try:
             from database import expire_open_offers_by_time
@@ -4200,9 +7084,23 @@ class OfferManager:
             refresh_before_secs = getattr(cfg, "OFFER_REFRESH_BEFORE", 1800)
 
         now = int(time.time())
+        # Sniper and boost probes intentionally use short expiries. Wallet
+        # records do not carry CATalyst's DB-only ``tier`` label, while this
+        # input commonly contains both wallet and DB copies of the same offer.
+        # Discover protected IDs across the complete merged view first so an
+        # unlabeled wallet copy cannot be selected before its labeled DB copy.
+        protected_ids = {
+            offer.get("trade_id")
+            for offer in open_offers
+            if (offer.get("tier") or "").lower() in {"sniper", "boost"}
+            and offer.get("trade_id")
+        }
         expiring = []
 
         for offer in open_offers:
+            trade_id = offer.get("trade_id", "")
+            if trade_id in protected_ids:
+                continue
             # Check valid_times.max_time from the wallet RPC record
             valid_times = offer.get("valid_times") or {}
             max_time = (
@@ -4232,9 +7130,8 @@ class OfferManager:
             if max_time_int > 0:
                 time_left = max_time_int - now
                 if 0 < time_left < refresh_before_secs:
-                    tid = offer.get("trade_id", "")
-                    if tid:
-                        expiring.append(tid)
+                    if trade_id:
+                        expiring.append(trade_id)
 
         expiring = list(dict.fromkeys(expiring))
 
@@ -4423,150 +7320,366 @@ class OfferManager:
     # Retry failed cancels (V1 parity: retry_failed_cancels)
     # -------------------------------------------------------------------
 
-    def retry_failed_cancels(self) -> int:
-        """Retry cancel requests that previously failed.
+    def get_active_cancel_settlement_operation(self) -> Optional[str]:
+        """Return the exact retry operation currently awaiting Task 9 proof."""
 
-        V1 tracked these in _pending_retries and retried each loop.
-        Without this, failed cancels leave "ghost offers" that fill max slots
-        and the bot gradually degrades.
+        with self._cancel_settlement_lock:
+            return self._cancel_settlement_operation_id
 
-        Returns number of successfully retried cancels.
+    def _begin_cancel_settlement(self, operation_id: str) -> bool:
+        if type(operation_id) is not str or not operation_id:
+            return False
+        with self._cancel_settlement_lock:
+            if self._cancel_settlement_operation_id is not None:
+                return False
+            self._cancel_settlement_operation_id = operation_id
+            return True
+
+    def _end_cancel_settlement(self, operation_id: str) -> None:
+        with self._cancel_settlement_lock:
+            if self._cancel_settlement_operation_id == operation_id:
+                self._cancel_settlement_operation_id = None
+
+    @staticmethod
+    def _settle_submitted_cancel(
+        intent: _CanonicalOfferCancelIntent,
+    ) -> bool:
+        """Release one cancel latch only after exact authoritative proof.
+
+        A successful Sage submission is not a terminal outcome.  Retry callers
+        must therefore wait for Task 9 reconciliation before attempting the
+        next wallet mutation; otherwise the next retry collides with the latch
+        raised for this operation and stops the bot.
         """
-        if not self._pending_cancel_retries:
-            return 0
 
-        success_count = 0
-        to_remove = []
-        success_details = []
+        import offer_reconciliation
 
-        for trade_id, info in list(self._pending_cancel_retries.items()):
-            attempts = info.get("attempts", 0)
-
-            try:
-                from database import get_offer
-
-                existing = get_offer(trade_id)
-            except Exception:
-                existing = None
-
-            if existing and (
-                existing.get("status") == "filled" or existing.get("filled_at")
+        try:
+            latch = database.get_runtime_safety_latch()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            blocker_ids = [row.get("operation_id") for row in blockers]
+            generation = latch.get("generation")
+            if (
+                latch.get("state") != "tripped"
+                or type(generation) is not int
+                or isinstance(generation, bool)
+                or generation < 1
+                or blocker_ids != [intent.operation_id]
             ):
-                log_event(
-                    "info",
-                    "cancel_retry_skipped_filled",
-                    f"Skipping cancel retry for {trade_id[:16]}... because the offer is already recorded as filled",
+                return False
+        except Exception:
+            return False
+
+        max_wait = max(0.0, float(cfg.CANCEL_MAX_WAIT_SECS))
+        poll_interval = max(0.05, float(cfg.CANCEL_POLL_INTERVAL_SECS))
+        deadline = time.monotonic() + max_wait
+        while True:
+            try:
+                intent_row = database.get_offer_intent(intent.intent_id)
+                if (
+                    type(intent_row) is not dict
+                    or intent_row.get("sage_trade_id") != intent.trade_id
+                ):
+                    return False
+                evidence = offer_reconciliation.load_authoritative_evidence(intent_row)
+                observed_at = offer_reconciliation._clock_utc()
+                cancel_context = offer_reconciliation._derive_single_cancel_context(
+                    intent_row,
+                    evidence,
+                    database_module=database,
+                    observed_at=observed_at,
                 )
-                self._bot_cancelled_ids.discard(trade_id)
-                to_remove.append(trade_id)
-                continue
-
-            if attempts >= self._max_cancel_retries:
-                # Give up after max attempts — mark as cancelled anyway
-                log_event(
-                    "warning",
-                    "cancel_retry_exhausted",
-                    f"Giving up cancel retry for {trade_id[:16]}... "
-                    f"after {attempts} attempts; leaving status unchanged "
-                    f"until wallet sync proves the offer is gone",
+                classification = offer_reconciliation.classify_terminal_evidence(
+                    intent_row,
+                    evidence,
+                    cancel_context=cancel_context,
+                    now=observed_at,
                 )
-                self._bot_cancelled_ids.discard(trade_id)
-                to_remove.append(trade_id)
-                continue
-
-            # Try cancelling again
-            res = cancel_offer(trade_id, secure=True, timeout=30)
-            info["attempts"] = attempts + 1
-
-            if res and res.get("success"):
-                method = str(res.get("method") or "")
-                if method in CANCEL_PENDING_METHODS:
-                    # Submission accepted but not on-chain yet. Don't mark
-                    # DB cancelled — a later bot_health cancel reconcile or
-                    # fill_tracker sweep will settle the true state once
-                    # the TX confirms (or the mempool entry times out).
-                    log_event(
-                        "debug",
-                        "cancel_retry_pending_mempool",
-                        f"Cancel retry for {trade_id[:16]}... submitted but "
-                        f"not yet confirmed (method={method}); leaving DB "
-                        f"status open for bot_health to verify",
+                if (
+                    cancel_context is not None
+                    and classification.get("classification")
+                    == offer_reconciliation.CANCELLED_PROVEN
+                ):
+                    reconciled = offer_reconciliation.reconcile_offer(
+                        intent.intent_id,
+                        evidence=evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
                     )
-                    try:
-                        mark_cancel_attempted(trade_id)
-                    except Exception:
-                        pass
-                    # Keep in retry list but reset attempt counter so we
-                    # don't re-fire before the pending TX has a chance to
-                    # confirm. bot_health.check_pending_cancels will close
-                    # the loop when Dexie reports the final state.
-                    to_remove.append(trade_id)
-                    continue
-                if res.get("already_gone") or res.get("uncertain"):
-                    # Sage returned 404 "Missing offer" or an uncertain HTTP
-                    # status. "Missing offer" can mean filled, cancelled or
-                    # expired — we DO NOT know which. Leave DB status open
-                    # so fill_tracker (Spacescan golden gate) or bot_health
-                    # (Dexie reconcile) can decide. Keep _bot_cancelled_ids
-                    # cleared so fill_tracker doesn't short-circuit on it.
-                    log_event(
-                        "warning",
-                        "cancel_retry_ambiguous",
-                        f"Cancel retry for {trade_id[:16]}... returned "
-                        f"ambiguous Sage response (already_gone={bool(res.get('already_gone'))}, "
-                        f"uncertain={bool(res.get('uncertain'))}); deferring "
-                        f"to fill/cancel reconcile",
-                        data={"trade_id": trade_id, "res_method": method},
-                    )
-                    self._bot_cancelled_ids.discard(trade_id)
-                    try:
-                        mark_cancel_attempted(trade_id)
-                    except Exception:
-                        pass
-                    to_remove.append(trade_id)
-                    continue
-                success_details.append(
-                    {
-                        "trade_id": trade_id,
-                        "attempt": info["attempts"],
-                        "method": method or "unspecified",
-                    }
-                )
-                update_offer_status(trade_id, "cancelled")
-                success_count += 1
-                to_remove.append(trade_id)
-            else:
-                log_event(
-                    "debug",
-                    "cancel_retry_failed",
-                    f"Cancel retry failed for {trade_id[:16]}... "
-                    f"(attempt {info['attempts']}/{self._max_cancel_retries})",
-                )
+                    if (
+                        reconciled.get("classification")
+                        == offer_reconciliation.CANCELLED_PROVEN
+                        and reconciled.get("applied") is True
+                    ):
+                        runtime = mutation_gate.current_runtime()
+                        if runtime is None:
+                            return False
+                        released = runtime.release_resolved(
+                            generation,
+                            [intent.operation_id],
+                        )
+                        if released.get("released") is True:
+                            return True
+                        # The transactional reconciliation may have resolved
+                        # the durable latch itself.  In that case, accept the
+                        # transition only when this exact generation is clear
+                        # and the live runtime independently reports allowed.
+                        post_latch = database.get_runtime_safety_latch()
+                        post_blockers = (
+                            database.get_unresolved_offer_operation_blockers()
+                        )
+                        status_reader = getattr(runtime, "status", None)
+                        runtime_status = (
+                            status_reader() if callable(status_reader) else None
+                        )
+                        runtime_allowed = (
+                            runtime_status.get("allowed") is True
+                            if type(runtime_status) is dict
+                            else getattr(runtime_status, "allowed", False) is True
+                        )
+                        return bool(
+                            post_latch.get("state") == "resolved"
+                            and post_latch.get("generation") == generation
+                            and not post_blockers
+                            and runtime_allowed
+                        )
+            except Exception:
+                # Read-only evidence can be briefly incomplete while Sage is
+                # confirming the spend.  Never infer success from that gap.
+                pass
 
-        if len(success_details) == 1:
-            detail = success_details[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
+    @staticmethod
+    def _reconcile_elapsed_cancel_retry(
+        intent: _CanonicalOfferCancelIntent,
+        offer: Any,
+        *,
+        now_timestamp: float,
+    ) -> Optional[bool]:
+        """Reconcile an already-terminal offer before retrying its cancel.
+
+        A failed batch peer can naturally expire while another member awaits
+        confirmation.  Retrying the stale peer through Sage creates a second,
+        redundant wallet spend and immediately closes the safety gate.  Once
+        the durable expiry has elapsed (or the DB is already terminal), use
+        Task 9 evidence instead.  ``None`` means the offer is still eligible
+        for an ordinary retry; ``False`` means proof is not ready and the
+        wallet effect must be skipped this pass.
+        """
+
+        if type(offer) is not dict:
+            return None
+        status = str(offer.get("status") or "").strip().lower()
+        should_reconcile = status in {"cancelled", "expired"}
+        expires_at = offer.get("expires_at")
+        if not should_reconcile and expires_at:
+            try:
+                expiry = datetime.fromisoformat(
+                    str(expires_at).strip().replace("Z", "+00:00")
+                )
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                should_reconcile = expiry <= datetime.fromtimestamp(
+                    now_timestamp, tz=timezone.utc
+                )
+            except (OverflowError, OSError, TypeError, ValueError):
+                should_reconcile = False
+        if not should_reconcile:
+            return None
+
+        try:
+            import offer_reconciliation
+
+            intent_row = database.get_offer_intent(intent.intent_id)
+            if (
+                type(intent_row) is not dict
+                or intent_row.get("sage_trade_id") != intent.trade_id
+            ):
+                return False
+            terminal = {
+                offer_reconciliation.FILLED_PROVEN,
+                offer_reconciliation.CANCELLED_PROVEN,
+                offer_reconciliation.EXPIRED_PROVEN,
+            }
+            if intent_row.get("lifecycle_state") == "terminal":
+                authoritative = database.get_authoritative_terminal_record(
+                    intent.trade_id
+                )
+                if (
+                    type(authoritative) is dict
+                    and authoritative.get("intent_id") == intent.intent_id
+                    and authoritative.get("sage_trade_id") == intent.trade_id
+                    and authoritative.get("operation_id")
+                    == f"reconcile:{intent.intent_id}"
+                    and authoritative.get("outcome") in terminal
+                ):
+                    return True
+                return False
+            result = offer_reconciliation.reconcile_offer(intent.intent_id)
+            if (
+                result.get("applied") is True
+                and result.get("classification") in terminal
+            ):
+                return True
             log_event(
                 "info",
-                "cancel_retry_success",
-                f"Cancel retry succeeded for {detail['trade_id'][:16]}... "
-                f"(attempt {detail['attempt']}, method={detail['method']})",
-            )
-        elif len(success_details) > 1:
-            log_event(
-                "debug",
-                "cancel_retry_success_batch",
-                f"Cancel retry succeeded for {len(success_details)} offers",
+                "cancel_retry_terminal_reconciliation_pending",
+                f"Offer {intent.trade_id[:16]}... is past its terminal bound; "
+                "awaiting authoritative reconciliation instead of submitting "
+                "another cancel",
                 data={
-                    "count": len(success_details),
-                    "trade_ids": [detail["trade_id"] for detail in success_details],
+                    "trade_id": intent.trade_id,
+                    "classification": result.get("classification"),
+                    "reason_code": result.get("reason_code"),
                 },
             )
+        except Exception as exc:
+            log_event(
+                "warning",
+                "cancel_retry_terminal_reconciliation_failed",
+                f"Could not reconcile elapsed offer {intent.trade_id[:16]}...: "
+                f"{type(exc).__name__}",
+                data={"trade_id": intent.trade_id},
+            )
+        return False
 
-        # Clean up completed/exhausted retries
-        for tid in to_remove:
-            self._pending_cancel_retries.pop(tid, None)
+    def retry_failed_cancels(self) -> int:
+        """Retry exact durable failures; memory is only a health-reporting cache."""
+        # A batch deliberately aborts later members after one cancellation
+        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
+        # blocker before reading or retrying failed peers; otherwise the retry
+        # attempts a second wallet mutation behind a closed safety gate.
+        try:
+            blockers = database.get_unresolved_offer_operation_blockers()
+        except Exception as exc:
+            log_event(
+                "error",
+                "cancel_settlement_journal_unavailable",
+                f"Could not read unresolved cancellations: {type(exc).__name__}",
+            )
+            return -1
+        if blockers:
+            if len(blockers) != 1:
+                return -1
+            operation_id = blockers[0].get("operation_id")
+            if not self._is_canonical_cancel_digest_id(operation_id, "cancel:"):
+                return -1
+            intent = self._canonical_cancel_intent(operation_id.removeprefix("cancel:"))
+            if not self._begin_cancel_settlement(intent.operation_id):
+                return -1
+            try:
+                if not self._settle_submitted_cancel(intent):
+                    return -1
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
 
-        return success_count
+        try:
+            candidates = database.get_retryable_failed_offer_cancels()
+        except Exception as exc:
+            log_event(
+                "error",
+                "cancel_retry_journal_unavailable",
+                f"Could not read durable failed cancellations: {type(exc).__name__}",
+            )
+            return 0
+
+        durable_ids = set()
+        now = time.time()
+        for candidate in candidates:
+            try:
+                trade_id = candidate["trade_id"]
+                attempt = candidate["attempt"]
+                intent = self._canonical_cancel_intent(trade_id)
+                if (
+                    candidate["operation_id"] != intent.operation_id
+                    or type(attempt) is not int
+                    or isinstance(attempt, bool)
+                    or attempt < 1
+                ):
+                    raise ValueError("durable cancellation retry candidate is invalid")
+                existing_result = self._existing_cancel_result(intent)
+                if (
+                    existing_result is None
+                    or existing_result.get("outcome") != CANCEL_FAILED
+                    or existing_result.get("_catalyst_attempt") != attempt
+                ):
+                    raise ValueError("durable cancellation retry candidate is stale")
+                failed_at = datetime.fromisoformat(
+                    candidate["created_at"].replace("Z", "+00:00")
+                )
+                if failed_at.tzinfo is None:
+                    failed_at = failed_at.replace(tzinfo=timezone.utc)
+                failed_timestamp = failed_at.astimezone(timezone.utc).timestamp()
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            durable_ids.add(trade_id)
+            self._bot_cancelled_ids.discard(trade_id)
+            prior_retry = self._pending_cancel_retries.get(trade_id, {})
+            self._pending_cancel_retries[trade_id] = {
+                "attempts": attempt,
+                "first_failed": prior_retry.get("first_failed", failed_timestamp),
+            }
+            try:
+                offer = database.get_offer(trade_id)
+            except Exception:
+                offer = None
+            if offer and (offer.get("status") == "filled" or offer.get("filled_at")):
+                self._pending_cancel_retries.pop(trade_id, None)
+                continue
+            terminal_reconciled = self._reconcile_elapsed_cancel_retry(
+                intent,
+                offer,
+                now_timestamp=now,
+            )
+            if terminal_reconciled is not None:
+                if terminal_reconciled:
+                    self._pending_cancel_retries.pop(trade_id, None)
+                    self._bot_cancelled_ids.discard(trade_id)
+                # Even incomplete terminal proof is a reason to wait, never
+                # to submit a redundant wallet mutation for an elapsed offer.
+                continue
+            if attempt >= self._max_cancel_retries:
+                continue
+            retry_after = self._cancel_retry_backoff_seconds * (2 ** (attempt - 1))
+            if now < failed_timestamp + retry_after:
+                continue
+            if not self._begin_cancel_settlement(intent.operation_id):
+                return -1
+            try:
+                results = self.cancel_offers(
+                    [trade_id],
+                    reason="retry_failed_cancel",
+                    force_storm=True,
+                    _retry_failed_attempts={trade_id: attempt},
+                )
+                result = results.get(trade_id)
+                if type(result) is not dict:
+                    return -1
+                outcome = result.get("outcome")
+                if outcome == CANCEL_SUBMITTED_UNCONFIRMED:
+                    if not self._settle_submitted_cancel(intent):
+                        log_event(
+                            "warning",
+                            "cancel_retry_confirmation_pending",
+                            "A submitted cancel still requires exact authoritative "
+                            "confirmation; no further wallet mutation will run this cycle",
+                            data={"operation_id": intent.operation_id},
+                        )
+                        return -1
+                elif outcome == CANCEL_UNKNOWN:
+                    return -1
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
+
+        for trade_id in set(self._pending_cancel_retries) - durable_ids:
+            self._pending_cancel_retries.pop(trade_id, None)
+            self._bot_cancelled_ids.discard(trade_id)
+        return 0
 
     # -------------------------------------------------------------------
     # Recently-created tracking (V1 parity: prevents over-creation)
@@ -4641,6 +7754,15 @@ class OfferManager:
         """Return lightweight metadata about the last wallet offer sync."""
         return dict(self._wallet_sync_meta)
 
+    def get_wallet_sync_snapshot(self) -> Dict[str, Any]:
+        """Return a defensive copy of the last wallet-authoritative offer book."""
+        return {
+            "buy": [dict(o) for o in self._wallet_sync_cache.get("buy", [])],
+            "sell": [dict(o) for o in self._wallet_sync_cache.get("sell", [])],
+            "closed": [dict(o) for o in self._wallet_sync_cache.get("closed", [])],
+            "meta": dict(self._wallet_sync_meta),
+        }
+
     def expect_empty_wallet_offer_book(
         self, reason: str, ttl_seconds: int = 180
     ) -> None:
@@ -4712,7 +7834,28 @@ class OfferManager:
             return ""
         if not active_offers:
             return "db_no_active_offers"
-        return ""
+
+        # Sage can retain an offer's open-looking status after its max-time
+        # has elapsed, while omitting that max-time from get_offers.  The
+        # durable row still has the exact expiry written when CATalyst created
+        # the offer.  If every protected row is locally expired, accepting the
+        # wallet's empty book is safe and avoids pinning a stale resume cache.
+        now_dt = datetime.now(timezone.utc)
+        for offer in active_offers:
+            expires_at = offer.get("expires_at")
+            if not expires_at:
+                return ""
+            try:
+                expiry_dt = datetime.fromisoformat(
+                    str(expires_at).replace("Z", "+00:00")
+                )
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                return ""
+            if expiry_dt > now_dt:
+                return ""
+        return "db_all_offers_expired"
 
     def _expected_empty_wallet_reason(self, now_ts: float, cached_ids: set) -> str:
         expected_until = float(

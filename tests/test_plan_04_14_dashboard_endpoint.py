@@ -66,6 +66,12 @@ class _FlaskBase(unittest.TestCase):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
+        self._fiat_price_patcher = patch(
+            "market_data_collector.get_cached_xch_usd_price",
+            return_value=None,
+        )
+        self._fiat_price_patcher.start()
+        self.addCleanup(self._fiat_price_patcher.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -185,6 +191,163 @@ class TestDashboard(_FlaskBase):
         resp = self._get_dashboard()
         body = resp.get_json()
         self.assertIn("status", body["market_health"])
+
+    def test_market_health_does_not_claim_stopped_bot_is_operating(self):
+        risk_manager = MagicMock()
+        risk_manager.get_inventory_state.return_value = {}
+        risk_manager.get_circuit_breaker_blocked_side.return_value = ""
+        risk_manager.get_market_health.return_value = {
+            "status": "green",
+            "message": "Market healthy — bot operating normally",
+            "conditions": [],
+            "metrics": {},
+        }
+        stopped_bot = types.SimpleNamespace(
+            risk_manager=risk_manager,
+            _loop_count=127,
+            _bot_state={},
+            _last_live_offer_edges={},
+            _probe_state={},
+            _start_time=0,
+            market_intel=None,
+            price_engine=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+            get_state=lambda: {"running": False},
+            is_running=lambda: False,
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 0,
+            "cat_free_count": 0,
+            "xch_total": 0,
+            "cat_total": 0,
+        }
+
+        with (
+            patch("database.get_stats", return_value=fake_stats),
+            patch("database.get_coin_summary", return_value=fake_summary),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp,
+                "_dashboard_wallet_reads_allowed",
+                return_value=False,
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(api_server, "bot", stopped_bot),
+        ):
+            resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json()["market_health"]["message"],
+            "Market conditions healthy — bot stopped",
+        )
+
+    def test_market_health_reports_tibetswap_outage_as_degraded(self):
+        risk_manager = MagicMock()
+        risk_manager.get_inventory_state.return_value = {}
+        risk_manager.get_circuit_breaker_blocked_side.return_value = ""
+        risk_manager.get_market_health.return_value = {
+            "status": "green",
+            "message": "Market healthy — bot operating normally",
+            "conditions": [],
+            "metrics": {},
+        }
+        running_bot = types.SimpleNamespace(
+            risk_manager=risk_manager,
+            _loop_count=127,
+            _bot_state={},
+            _last_live_offer_edges={},
+            _probe_state={},
+            _start_time=0,
+            _startup_self_test_results={
+                "tibet": {
+                    "name": "TibetSwap API",
+                    "ok": False,
+                    "status_code": 502,
+                    "error": "HTTP 502 (server error)",
+                    "missing_if_down": "AMM reference price and drift protection",
+                    "critical": False,
+                }
+            },
+            market_intel=None,
+            price_engine=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 0,
+            "cat_free_count": 0,
+            "xch_total": 0,
+            "cat_total": 0,
+        }
+
+        with (
+            patch("database.get_stats", return_value=fake_stats),
+            patch("database.get_coin_summary", return_value=fake_summary),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp,
+                "_dashboard_wallet_reads_allowed",
+                return_value=False,
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(api_server, "bot", running_bot),
+        ):
+            resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        market_health = resp.get_json()["market_health"]
+        self.assertEqual(market_health["status"], "amber")
+        self.assertIn("TibetSwap", market_health["message"])
+        self.assertIn("Dexie-only", market_health["message"])
+        self.assertTrue(
+            any(
+                condition.get("level") == "amber"
+                and "AMM drift protection" in condition.get("text", "")
+                for condition in market_health["conditions"]
+            )
+        )
 
     def test_wallet_has_balance_keys(self):
         resp = self._get_dashboard()
@@ -484,6 +647,86 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(float(wallet["cat_total"]), 6_500_000.0)
         self.assertEqual(float(wallet["cat_spendable"]), 6_400_000.0)
 
+    def test_stopped_dashboard_prefers_fresh_wallet_offer_snapshot(self):
+        """Expired durable rows must not resurrect offers after a fresh empty sync."""
+        stale_buys = [{"trade_id": f"buy-{index}"} for index in range(24)]
+        stale_sells = [{"trade_id": f"sell-{index}"} for index in range(13)]
+
+        def stale_db_offers(*, side=None, **_kwargs):
+            if side == "buy":
+                return list(stale_buys)
+            if side == "sell":
+                return list(stale_sells)
+            return list(stale_buys + stale_sells)
+
+        stopped_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": False},
+            is_running=lambda: False,
+            offer_manager=types.SimpleNamespace(
+                get_wallet_sync_snapshot=lambda: {
+                    "buy": [],
+                    "sell": [],
+                    "closed": [],
+                    "meta": {"fresh": True, "using_cache": False},
+                }
+            ),
+            risk_manager=None,
+            market_intel=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+            price_engine=None,
+            _bot_state={},
+            _last_live_offer_edges={},
+            _loop_count=0,
+            _start_time=0,
+            _probe_state={},
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 12,
+            "buy_fills": 0,
+            "sell_fills": 12,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "24.9828",
+        }
+        fake_summary = {
+            "xch_free_count": 92,
+            "cat_free_count": 43,
+            "xch_total": 116,
+            "cat_total": 56,
+        }
+
+        with (
+            patch("database.get_stats", return_value=fake_stats),
+            patch("database.get_coin_summary", return_value=fake_summary),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_open_offers", side_effect=stale_db_offers),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp,
+                "_dashboard_wallet_reads_allowed",
+                return_value=False,
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(api_server, "bot", stopped_bot),
+        ):
+            resp = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        performance = resp.get_json()["performance"]
+        self.assertEqual(performance["open_buys"], 0)
+        self.assertEqual(performance["open_sells"], 0)
+        self.assertEqual(performance["open_offers"], 0)
+
     def test_market_health_uses_live_offer_edges_for_inner_spread(self):
         risk_manager = MagicMock()
         risk_manager.get_inventory_state.return_value = {}
@@ -593,6 +836,52 @@ class TestDashboard(_FlaskBase):
 
         sync_from_wallet.assert_not_called()
         self.assertEqual(result["source"], "db_open_offers")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_open_sells"], 0)
+
+    def test_live_offer_edges_prefers_fresh_stopped_wallet_snapshot_over_stale_db(self):
+        """A stopped app must not present stale DB rows as live offers."""
+        stale_conn = MagicMock()
+        stale_conn.execute.return_value.fetchall.return_value = [
+            {
+                "side": "buy",
+                "min_price": 0.000064,
+                "max_price": 0.000065,
+                "cnt": 24,
+            },
+            {
+                "side": "sell",
+                "min_price": 0.000067,
+                "max_price": 0.000068,
+                "cnt": 13,
+            },
+        ]
+        stopped_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": False},
+            is_running=lambda: False,
+            offer_manager=types.SimpleNamespace(
+                get_wallet_sync_snapshot=lambda: {
+                    "buy": [],
+                    "sell": [],
+                    "closed": [],
+                    "meta": {
+                        "fresh": True,
+                        "using_cache": False,
+                        "last_success_at": 123.0,
+                    },
+                }
+            ),
+        )
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch.object(api_server, "get_connection", return_value=stale_conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_snapshot")
+        self.assertEqual(result["our_best_bid"], api_server.Decimal("0"))
+        self.assertEqual(result["our_best_ask"], api_server.Decimal("0"))
         self.assertEqual(result["our_open_buys"], 0)
         self.assertEqual(result["our_open_sells"], 0)
 
@@ -711,7 +1000,7 @@ class TestDashboard(_FlaskBase):
         status_sync = status_sync.split("let _sseConnection")[0]
         self.assertIn("ensureFiatPricesFromDashboard", status_sync)
 
-    def test_frontend_preserves_verified_balances_only_when_status_omits_fields(self):
+    def test_frontend_preserves_verified_balances_when_status_zero_is_placeholder(self):
         with open(
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "bot_gui.html"),
             encoding="utf-8",
@@ -722,8 +1011,13 @@ class TestDashboard(_FlaskBase):
         self.assertIn("function _walletBalanceFieldIsPresent", html)
         self.assertIn("function hasVerifiedWalletBalance", html)
         self.assertIn("function resetSmartBalanceSnapshot", html)
-        self.assertIn("!live[sideName] && cached.live?.[sideName]", html)
+        self.assertIn("options.preserveVerifiedOnZero", html)
+        self.assertIn("transientStatusZero", html)
         self.assertNotIn("_walletBalanceSideIsZero(merged[sideName])", html)
+
+        fetch_status = html.split("async function fetchStatus()")[1]
+        fetch_status = fetch_status.split("function updateUI(data)")[0]
+        self.assertIn("{ preserveVerifiedOnZero: true }", fetch_status)
 
         reset_pair = html.split("function resetPairSelectionState")[1]
         reset_pair = reset_pair.split("function shouldRequireExplicitPairSelection")[0]

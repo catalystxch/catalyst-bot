@@ -1,3 +1,5 @@
+import builtins
+import importlib
 import sys
 import types
 from pathlib import Path
@@ -24,6 +26,22 @@ class _FakeMenuItem:
 
     def __str__(self):
         return self.text
+
+
+def test_tray_import_degrades_when_backend_initialization_raises(monkeypatch):
+    real_import = builtins.__import__
+
+    def import_without_display(name, *args, **kwargs):
+        if name == "pystray":
+            raise RuntimeError("display unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_display)
+    sys.modules.pop("tray_manager", None)
+
+    tray_manager = importlib.import_module("tray_manager")
+
+    assert tray_manager.PYSTRAY_AVAILABLE is False
 
 
 def test_tray_tooltips_and_menu_labels_are_x11_latin1_safe(monkeypatch):

@@ -41,43 +41,50 @@ class TestCoinPrepWorkerCli(unittest.TestCase):
 
 
 class TestSageRpcSmoke(unittest.TestCase):
-    def test_returns_success_when_sage_initialize_and_key_succeed(self):
+    def test_returns_success_when_read_only_version_and_key_succeed(self):
         calls = []
         fake_wallet_sage = types.ModuleType("wallet_sage")
         fake_wallet_sage.WALLET_URL = "https://127.0.0.1:9257"
         fake_wallet_sage.CERT_PATH = __file__
         fake_wallet_sage.KEY_PATH = __file__
         fake_wallet_sage.reload_connection_settings = lambda: calls.append("reload")
-        fake_wallet_sage.ensure_initialized = lambda force_retry=False: (
-            calls.append(("initialize", force_retry)) or True
+        fake_wallet = types.ModuleType("wallet")
+        fake_wallet.rpc = lambda endpoint, payload, timeout=10: (
+            calls.append((endpoint, payload, timeout))
+            or {"success": True, "version": "1.2.3"}
         )
-        fake_wallet_sage.get_current_key = lambda: (
+        fake_wallet.get_current_key = lambda: (
             calls.append("get_key") or {"fingerprint": 123456}
         )
 
-        with patch.dict(sys.modules, {"wallet_sage": fake_wallet_sage}):
+        with patch.dict(
+            sys.modules, {"wallet_sage": fake_wallet_sage, "wallet": fake_wallet}
+        ):
             self.assertEqual(_worker_module._run_sage_rpc_smoke(), 0)
 
-        self.assertEqual(calls, ["reload", ("initialize", True), "get_key"])
+        self.assertEqual(calls, ["reload", ("get_version", {}, 5), "get_key"])
 
-    def test_returns_failure_when_sage_initialize_fails(self):
+    def test_returns_failure_when_read_only_version_probe_fails(self):
         calls = []
         fake_wallet_sage = types.ModuleType("wallet_sage")
         fake_wallet_sage.WALLET_URL = "https://127.0.0.1:9257"
         fake_wallet_sage.CERT_PATH = __file__
         fake_wallet_sage.KEY_PATH = __file__
         fake_wallet_sage.reload_connection_settings = lambda: calls.append("reload")
-        fake_wallet_sage.ensure_initialized = lambda force_retry=False: (
-            calls.append(("initialize", force_retry)) or False
+        fake_wallet = types.ModuleType("wallet")
+        fake_wallet.rpc = lambda endpoint, payload, timeout=10: (
+            calls.append((endpoint, payload, timeout)) or None
         )
-        fake_wallet_sage.get_current_key = lambda: (
+        fake_wallet.get_current_key = lambda: (
             calls.append("get_key") or {"fingerprint": 123456}
         )
 
-        with patch.dict(sys.modules, {"wallet_sage": fake_wallet_sage}):
+        with patch.dict(
+            sys.modules, {"wallet_sage": fake_wallet_sage, "wallet": fake_wallet}
+        ):
             self.assertEqual(_worker_module._run_sage_rpc_smoke(), 1)
 
-        self.assertEqual(calls, ["reload", ("initialize", True)])
+        self.assertEqual(calls, ["reload", ("get_version", {}, 5)])
 
 
 class TestWalletBalanceResponseParsing(unittest.TestCase):
@@ -350,6 +357,14 @@ class TestPrepPhase(unittest.TestCase):
 
 
 class TestCoinPrepStatus(unittest.TestCase):
+    def test_worker_status_sidecar_uses_user_data_dir(self):
+        import user_paths
+
+        self.assertEqual(
+            _worker_module._coin_prep_status_file(),
+            user_paths.coin_prep_status_file(),
+        )
+
     def _make(self, **kw):
         defaults = dict(
             phase="idle",
@@ -576,6 +591,29 @@ class TestComputeCoinId(unittest.TestCase):
 
 
 class TestPartitionCoinsForDesignation(unittest.TestCase):
+    def test_cat_coins_outside_relative_tolerance_do_not_match_tier(self):
+        worker = object.__new__(CoinPrepWorker)
+        worker.tier_enabled = True
+        worker.tier_order = ["sniper"]
+        worker.xch_tier_counts = {}
+        worker.cat_tier_counts = {"sniper": 13}
+        worker.tier_xch_sizes = {}
+        worker.tier_cat_sizes = {"sniper": Decimal("6263.408")}
+        worker.cat_decimals = 3
+
+        coins = [
+            {"coin_id": f"wrong-{index}", "amount": 2_363_648} for index in range(13)
+        ]
+
+        assigned, unmatched = CoinPrepWorker._partition_coins_for_designation(
+            worker,
+            coins,
+            "cat",
+        )
+
+        self.assertEqual(assigned, {})
+        self.assertEqual(len(unmatched), 13)
+
     def test_xch_fee_outputs_with_full_fee_delta_still_match_fee_tier(self):
         worker = object.__new__(CoinPrepWorker)
         worker.tier_enabled = True

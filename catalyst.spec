@@ -95,7 +95,23 @@ _env_example_files = [(_env_example_path, '.')] if os.path.isfile(_env_example_p
 _worker_path = os.path.join(_SRC, 'coin_prep_worker.py')
 _worker_files = [(_worker_path, '.')] if os.path.isfile(_worker_path) else []
 
-_datas = _html_files + _image_files + _splash_files + _env_example_files + _worker_files
+# Third-party source notices and complete upstream license texts used by the
+# vendored Sage Offer wire codec.
+_license_dir = os.path.join(_HERE, 'licenses')
+_license_files = [
+    (os.path.join(_HERE, 'THIRD_PARTY_NOTICES.md'), '.'),
+    (os.path.join(_license_dir, 'Pieter-Wuille-bech32-MIT.txt'), 'licenses'),
+    (os.path.join(_license_dir, 'Chia-Network-chia-blockchain-Apache-2.0.txt'), 'licenses'),
+]
+
+_datas = (
+    _html_files
+    + _image_files
+    + _splash_files
+    + _env_example_files
+    + _worker_files
+    + _license_files
+)
 
 # ---------------------------------------------------------------------------
 # Hidden imports
@@ -164,6 +180,10 @@ _hiddenimports = [
     'json',
     'sqlite3',
 
+    # Exact Sage Offer wire parsing (native extension plus package facade)
+    'chia_rs',
+    'chia_rs.chia_rs',
+
     # Bot modules (all referenced by string or lazy import)
     'api_server',
     'app_bridge',
@@ -174,6 +194,7 @@ _hiddenimports = [
     'config',
     'price_engine',
     'offer_manager',
+    'sage_offer_wire',
     'fill_tracker',
     'risk_manager',
     'coin_manager',

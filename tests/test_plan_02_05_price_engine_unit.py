@@ -603,6 +603,18 @@ class TestPoolDepthRatio(unittest.TestCase):
         ratio = eng.get_pool_depth_ratio(Decimal("10"))
         self.assertEqual(ratio, Decimal("0"))
 
+    def test_drained_pair_is_not_reported_as_available_pool_depth(self):
+        eng = _make_engine()
+        eng._find_tibet_pair = lambda _asset_id: {
+            "pair_id": "drained-pair",
+            "xch_reserve": 1,
+            "token_reserve": 0,
+        }
+
+        pool = eng.get_tibet_pool_info("asset-id")
+
+        self.assertIsNone(pool)
+
     def test_zero_depth_returns_one(self):
         eng = _make_engine()
         eng.get_tibet_pool_info = lambda: {"xch_reserve": Decimal("0")}

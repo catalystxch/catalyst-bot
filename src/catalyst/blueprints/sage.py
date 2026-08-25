@@ -93,6 +93,22 @@ def _safe_digit_text(value):
     return str(number) if number > 0 else ""
 
 
+def _canonical_fingerprint_text(value):
+    if type(value) is not str or not value.isascii() or not value.isdigit():
+        return ""
+    try:
+        number = int(value)
+    except ValueError:
+        return ""
+    return value if number > 0 and str(number) == value else ""
+
+
+def _runtime_fingerprint_decision(fingerprint: str):
+    from wallet import validate_runtime_target_fingerprint
+
+    return validate_runtime_target_fingerprint(int(fingerprint))
+
+
 def _safe_int(value, default=0):
     try:
         number = int(value)
@@ -168,7 +184,7 @@ def api_fingerprint():
 
             wtype = get_wallet_type()
             if wtype == "sage":
-                from wallet_sage import get_current_key
+                from wallet import get_current_key
 
                 key = get_current_key()
                 if key and key.get("fingerprint"):
@@ -408,9 +424,13 @@ def api_chia_start_with_fingerprint():
 
         if not isinstance(data, dict):
             return jsonify({"success": False, "error": "Invalid request body"}), 400
-        fingerprint = str(data.get("fingerprint", "")).strip()
-        if not fingerprint or not fingerprint.isdigit():
+        fingerprint = _canonical_fingerprint_text(data.get("fingerprint"))
+        if not fingerprint:
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
+
+        identity_decision = _runtime_fingerprint_decision(fingerprint)
+        if identity_decision.get("success") is not True:
+            return jsonify(identity_decision), 409
 
         result = chia_node.trigger_start(fingerprint)
         if result.get("success"):
@@ -431,8 +451,8 @@ def api_sage_set_fingerprint():
         if not isinstance(data, dict):
             return jsonify({"success": False, "error": "Invalid request body"}), 400
 
-        fingerprint = str(data.get("fingerprint", "")).strip()
-        if not fingerprint or not fingerprint.isdigit():
+        fingerprint = _canonical_fingerprint_text(data.get("fingerprint"))
+        if not fingerprint:
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
 
         bot = api_server.bot
@@ -458,6 +478,10 @@ def api_sage_set_fingerprint():
                     "error": "Selected Sage fingerprint is not available",
                 }
             ), 400
+
+        identity_decision = _runtime_fingerprint_decision(fingerprint)
+        if identity_decision.get("success") is not True:
+            return jsonify(identity_decision), 409
 
         result = chia_node.trigger_start(fingerprint)
         if not result.get("success"):

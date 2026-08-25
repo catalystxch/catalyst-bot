@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from api_test_support import permit_api_mutations
+
 try:
     import api_server
 
@@ -35,6 +37,7 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -294,10 +297,56 @@ class TestSageStartWithFingerprint(_FlaskBase):
             )
         self.assertEqual(resp.status_code, 400)
 
+    def test_non_text_or_noncanonical_fingerprint_returns_400(self):
+        for fingerprint in (12345678, True, " 12345678", "012345678"):
+            with (
+                self.subTest(fingerprint=fingerprint),
+                patch("chia_node.trigger_start") as mock_trigger,
+            ):
+                resp = self._post(
+                    "/api/sage/start-with-fingerprint",
+                    {"fingerprint": fingerprint},
+                )
+            self.assertEqual(resp.status_code, 400)
+            mock_trigger.assert_not_called()
+
+    def test_active_runtime_rejects_different_fingerprint_before_start(self):
+        import mutation_gate
+
+        binding = mutation_gate.WalletIdentityBinding(
+            backend="sage",
+            name="Test 7",
+            fingerprint=12345678,
+            network_id="mainnet",
+            kind="bls",
+            has_secrets=True,
+            bound_at_utc="2026-08-16T12:00:00Z",
+            maximum_age_seconds=10,
+        )
+        runtime = MagicMock()
+        runtime.require_wallet_identity_authority.return_value = binding
+        with (
+            patch.object(mutation_gate, "current_runtime", return_value=runtime),
+            patch("chia_node.trigger_start") as mock_trigger,
+        ):
+            resp = self._post(
+                "/api/sage/start-with-fingerprint", {"fingerprint": "87654321"}
+            )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "WALLET_IDENTITY_MISMATCH")
+        mock_trigger.assert_not_called()
+
     def test_valid_fingerprint_calls_trigger_start(self):
-        with patch(
-            "chia_node.trigger_start", return_value={"success": True}
-        ) as mock_trigger:
+        with (
+            patch(
+                "chia_node.trigger_start", return_value={"success": True}
+            ) as mock_trigger,
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
+        ):
             self._post("/api/sage/start-with-fingerprint", {"fingerprint": "12345678"})
         mock_trigger.assert_called_once_with("12345678")
 
@@ -305,6 +354,10 @@ class TestSageStartWithFingerprint(_FlaskBase):
         with (
             patch("chia_node.trigger_start", return_value={"success": True}),
             patch.object(api_server, "clear_balance_snapshot") as clear_snapshot,
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
         ):
             resp = self._post(
                 "/api/sage/start-with-fingerprint", {"fingerprint": "12345678"}
@@ -317,6 +370,10 @@ class TestSageStartWithFingerprint(_FlaskBase):
         with (
             patch("chia_node.trigger_start", return_value={"success": False}),
             patch.object(api_server, "clear_balance_snapshot") as clear_snapshot,
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
         ):
             resp = self._post(
                 "/api/sage/start-with-fingerprint", {"fingerprint": "12345678"}
@@ -370,6 +427,36 @@ class TestSageFingerprintPersistence(_FlaskBase):
         self.assertEqual(resp.status_code, 409, body)
         self.assertFalse(body.get("success"))
 
+    def test_active_runtime_rejects_different_available_fingerprint(self):
+        import mutation_gate
+
+        binding = mutation_gate.WalletIdentityBinding(
+            backend="sage",
+            name="Test 7",
+            fingerprint=12345678,
+            network_id="mainnet",
+            kind="bls",
+            has_secrets=True,
+            bound_at_utc="2026-08-16T12:00:00Z",
+            maximum_age_seconds=10,
+        )
+        runtime = MagicMock()
+        runtime.require_wallet_identity_authority.return_value = binding
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(mutation_gate, "current_runtime", return_value=runtime),
+            patch(
+                "chia_node.get_available_fingerprints",
+                return_value=[{"fingerprint": "87654321"}],
+            ),
+            patch("chia_node.trigger_start") as mock_trigger,
+        ):
+            resp = self._post("/api/sage/fingerprint", {"fingerprint": "87654321"})
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "WALLET_IDENTITY_MISMATCH")
+        mock_trigger.assert_not_called()
+
     def test_valid_fingerprint_persists_and_triggers_start(self):
         fake_cfg = MagicMock()
         fake_cfg.update.return_value = True
@@ -384,6 +471,10 @@ class TestSageFingerprintPersistence(_FlaskBase):
             patch(
                 "chia_node.trigger_start", return_value={"success": True}
             ) as mock_trigger,
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
         ):
             resp = self._post("/api/sage/fingerprint", {"fingerprint": "12345678"})
 
@@ -413,6 +504,10 @@ class TestSageFingerprintPersistence(_FlaskBase):
                 "chia_node.trigger_start",
                 return_value={"success": False, "error": "unsupported"},
             ) as mock_trigger,
+            patch(
+                "blueprints.sage._runtime_fingerprint_decision",
+                return_value={"success": True},
+            ),
         ):
             resp = self._post("/api/sage/fingerprint", {"fingerprint": "12345678"})
 

@@ -37,7 +37,10 @@ class _FakeCfg:
     SNIPER_BUFFER_BPS = Decimal("50")
     OFFER_EXPIRY_SECS = 86400
     OFFER_REFRESH_BEFORE = 1800
-    ADAPTIVE_LADDER_TARGETS = True
+    # This file isolates probe anchoring. Adaptive capacity has its own tests;
+    # leaving it enabled here makes the dummy coin inventory cap every target
+    # at the current live count before the probe behavior can run.
+    ADAPTIVE_LADDER_TARGETS = False
     DB_ONLY_OFFER_CONFIRM_GRACE_SECS = 90
     DB_ONLY_OFFER_RETRY_BACKOFF_SECS = 300
 
@@ -79,6 +82,7 @@ fake_database.get_events_since = lambda *args, **kwargs: []
 fake_database.get_open_offers = lambda *args, **kwargs: []
 fake_database.get_stats = lambda: {}
 fake_database.get_offer = lambda tid, *args, **kwargs: {"dexie_id": f"dexie-{tid}"}
+fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.backfill_verified_fills_from_offers = lambda *args, **kwargs: 0
 sys.modules["database"] = fake_database
@@ -403,6 +407,92 @@ class ProbeAnchorTests(unittest.TestCase):
     def tearDown(self):
         self._cfg_patcher.stop()
 
+    def test_submitted_cancel_retry_ends_cycle_before_later_wallet_mutations(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager.retry_failed_cancels = lambda: -1
+        events = []
+        stop_calls = []
+
+        with (
+            patch.object(loop, "_enter_runtime_effect_phase", return_value=True),
+            patch.object(
+                loop,
+                "stop",
+                side_effect=lambda wait=True: stop_calls.append(wait),
+            ),
+            patch.object(
+                bot_loop,
+                "log_event",
+                side_effect=lambda level, event, message, data=None: events.append(
+                    (level, event, message, data)
+                ),
+            ),
+        ):
+            self.assertFalse(loop._run_cancel_retry_pass())
+
+        self.assertTrue(
+            any(
+                event == "cancel_retry_waiting_for_confirmation"
+                for _, event, _, _ in events
+            )
+        )
+        self.assertEqual(stop_calls, [False])
+
+    def test_exact_cancel_settlement_window_is_the_only_deferred_safety_stop(self):
+        import database as runtime_database
+
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        operation_id = "cancel:" + ("a" * 64)
+        loop.offer_manager.get_active_cancel_settlement_operation = lambda: operation_id
+
+        with (
+            patch.object(
+                runtime_database,
+                "get_runtime_safety_latch",
+                return_value={
+                    "state": "tripped",
+                    "generation": 7,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                },
+                create=True,
+            ),
+            patch.object(
+                runtime_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": operation_id}],
+                create=True,
+            ),
+        ):
+            self.assertTrue(
+                loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
+            )
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("WALLET_IDENTITY_MISMATCH")
+            )
+
+        with (
+            patch.object(
+                runtime_database,
+                "get_runtime_safety_latch",
+                return_value={
+                    "state": "tripped",
+                    "generation": 7,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                },
+                create=True,
+            ),
+            patch.object(
+                runtime_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[{"operation_id": "cancel:" + ("b" * 64)}],
+                create=True,
+            ),
+        ):
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
+            )
+
     def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
         self,
     ):
@@ -650,11 +740,12 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        targets = loop._get_adaptive_offer_targets(
-            Decimal("1.10"),
-            current_buy_count=4,
-            current_sell_count=2,
-        )
+        with patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True):
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=2,
+            )
 
         self.assertEqual(targets["buy"], 4)
         self.assertEqual(targets["sell"], 2)
@@ -666,11 +757,12 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 2, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        targets = loop._get_adaptive_offer_targets(
-            Decimal("1.10"),
-            current_buy_count=4,
-            current_sell_count=2,
-        )
+        with patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True):
+            targets = loop._get_adaptive_offer_targets(
+                Decimal("1.10"),
+                current_buy_count=4,
+                current_sell_count=2,
+            )
 
         self.assertEqual(targets["sell"], 4)
 
@@ -683,6 +775,7 @@ class ProbeAnchorTests(unittest.TestCase):
         loop._adaptive_target_backoff_until["sell"] = 1300.0
 
         with (
+            patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True),
             patch.object(bot_loop.time, "time", return_value=1000.0),
             patch.object(
                 bot_loop,
@@ -713,7 +806,10 @@ class ProbeAnchorTests(unittest.TestCase):
             "cat": {"inner": 2, "mid": 0, "outer": 0, "extreme": 0},
         }
 
-        with patch.object(bot_loop.time, "time", return_value=1000.0):
+        with (
+            patch.object(fake_config.cfg, "ADAPTIVE_LADDER_TARGETS", True),
+            patch.object(bot_loop.time, "time", return_value=1000.0),
+        ):
             loop._clear_adaptive_target_backoff_for_confirmed_fills(
                 buy_fills=[],
                 sell_fills=[{"trade_id": "filled-sell"}],
@@ -727,7 +823,7 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
         self.assertEqual(targets["sell"], 4)
 
-    def test_wallet_missing_db_offers_are_retired_after_confirmation_grace(self):
+    def test_wallet_missing_db_offers_are_parked_after_confirmation_grace(self):
         loop = bot_loop.BotLoop()
         now_ts = 1000.0
         old_created = datetime.fromtimestamp(now_ts - 180, timezone.utc).isoformat()
@@ -741,12 +837,7 @@ class ProbeAnchorTests(unittest.TestCase):
             "fresh-sell": {"side": "sell"},
         }
 
-        with (
-            patch.object(
-                bot_loop, "update_offer_status", return_value=True
-            ) as update_mock,
-            patch.object(bot_loop, "log_event") as log_event_mock,
-        ):
+        with patch.object(bot_loop, "log_event") as log_event_mock:
             result = loop._retire_wallet_missing_db_offers(
                 db_buy_offers=[],
                 db_sell_offers=[
@@ -772,30 +863,21 @@ class ProbeAnchorTests(unittest.TestCase):
                 now_ts=now_ts,
             )
 
-        update_mock.assert_called_once_with("old-sell", "not_submitted")
-        self.assertEqual(result["sell"], {"old-sell"})
+        self.assertEqual(result["sell"], set())
         self.assertEqual(result["buy"], set())
-        self.assertNotIn("old-sell", loop.offer_manager._recently_created)
+        self.assertIn("old-sell", loop.offer_manager._recently_created)
         self.assertIn("fresh-sell", loop.offer_manager._recently_created)
-        self.assertGreater(loop._adaptive_target_backoff_until["sell"], now_ts)
-        not_submitted_events = [
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
+        parked_events = [
             call
             for call in log_event_mock.call_args_list
-            if call.args[1] == "db_only_offer_not_submitted"
+            if call.args[1] == "db_only_offer_unproven"
         ]
-        self.assertEqual(len(not_submitted_events), 1)
-        self.assertEqual(not_submitted_events[0].args[0], "info")
+        self.assertEqual(len(parked_events), 1)
+        self.assertEqual(parked_events[0].args[0], "warning")
 
-    def test_orphan_offer_cleanup_sets_adaptive_backoff_for_closed_side(self):
+    def test_orphan_offer_cleanup_relocks_without_absence_terminalization(self):
         loop = bot_loop.BotLoop()
-
-        class _Conn:
-            def execute(self, *args, **kwargs):
-                return self
-
-            def fetchall(self):
-                return [{"trade_id": "dead-sell", "coin_id": "0xcoin", "side": "sell"}]
-
         updates = []
 
         def _update_offer_status(trade_id, status):
@@ -805,9 +887,16 @@ class ProbeAnchorTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"database": fake_database, "wallet": fake_wallet}),
             patch.object(
-                fake_database, "get_connection", return_value=_Conn(), create=True
+                fake_database,
+                "get_unlinked_open_offer_coins",
+                return_value=[
+                    {"trade_id": "dead-sell", "coin_id": "0xcoin", "side": "sell"}
+                ],
+                create=True,
             ),
-            patch.object(fake_database, "lock_coin", return_value=True, create=True),
+            patch.object(
+                fake_database, "lock_coin", return_value=True, create=True
+            ) as lock_coin,
             patch.object(
                 fake_database, "update_offer_status", side_effect=_update_offer_status
             ),
@@ -817,8 +906,9 @@ class ProbeAnchorTests(unittest.TestCase):
         ):
             loop._repair_unlinked_offer_coins()
 
-        self.assertEqual(updates, [("dead-sell", "cancelled")])
-        self.assertGreaterEqual(loop._adaptive_target_backoff_until["sell"], 1300.0)
+        self.assertEqual(updates, [])
+        lock_coin.assert_called_once_with("0xcoin", "dead-sell")
+        self.assertEqual(loop._adaptive_target_backoff_until["sell"], 0.0)
         self.assertEqual(loop._adaptive_target_backoff_until["buy"], 0.0)
 
     def test_daily_reconcile_recent_db_only_offers_are_visibility_info(self):
@@ -840,9 +930,6 @@ class ProbeAnchorTests(unittest.TestCase):
 
         with (
             patch.dict(sys.modules, {"database": fake_database}),
-            patch.object(
-                bot_loop, "backfill_verified_fills_from_offers", return_value=[]
-            ),
             patch.object(fake_database, "get_open_offers", return_value=db_open),
             patch.object(bot_loop, "get_all_offers", return_value=wallet_open),
             patch.object(bot_loop.time, "time", return_value=now_ts),
@@ -1167,7 +1254,7 @@ class ProbeAnchorTests(unittest.TestCase):
             Decimal("1.18") / Decimal("1.03"),
         )
 
-    def test_create_offers_if_needed_excludes_live_confirmed_probes_from_slots(self):
+    def test_create_offers_if_needed_counts_live_confirmed_probes_in_hard_cap(self):
         loop = bot_loop.BotLoop()
         loop._probe_state.update(
             {
@@ -1194,8 +1281,8 @@ class ProbeAnchorTests(unittest.TestCase):
         sell_call = next(
             call for call in loop.offer_manager.create_calls if call[0] == "sell"
         )
-        self.assertEqual(buy_call[2]["num_offers"], 4)
-        self.assertEqual(sell_call[2]["num_offers"], 4)
+        self.assertEqual(buy_call[2]["num_offers"], 3)
+        self.assertEqual(sell_call[2]["num_offers"], 3)
 
     def test_create_offers_if_needed_waits_for_wallet_active_pending_cancels(self):
         loop = bot_loop.BotLoop()

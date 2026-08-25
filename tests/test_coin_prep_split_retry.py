@@ -1,7 +1,10 @@
 import unittest
 from pathlib import Path
 
+from coin_prep_worker import CoinPrepWorker
 from coin_prep_utils import (
+    remaining_pending_split_poll_seconds,
+    should_extend_pending_pool_confirmation_grace,
     should_extend_pending_consumed_split_grace,
     should_wait_for_pending_fee_inputs_before_split,
     should_retry_unconsumed_split,
@@ -9,6 +12,46 @@ from coin_prep_utils import (
 
 
 class TestCoinPrepSplitRetry(unittest.TestCase):
+    def test_extends_pool_wait_when_exact_outputs_are_owned_and_tx_is_pending(self):
+        self.assertTrue(
+            should_extend_pending_pool_confirmation_grace(
+                tx_known=True,
+                tx_confirmed=False,
+                expected_outputs_owned=True,
+                outputs_selectable=False,
+                extensions_used=0,
+            )
+        )
+
+    def test_does_not_extend_pool_wait_without_authoritative_pending_evidence(self):
+        self.assertFalse(
+            should_extend_pending_pool_confirmation_grace(
+                tx_known=False,
+                tx_confirmed=False,
+                expected_outputs_owned=True,
+                outputs_selectable=False,
+                extensions_used=0,
+            )
+        )
+
+    def test_sage_xch_split_uses_configured_fee_from_source_coin(self):
+        worker = CoinPrepWorker.__new__(CoinPrepWorker)
+        worker.is_sage = True
+        worker._tx_fee_mojos = lambda: 13_079_100
+
+        self.assertEqual(worker._split_tx_fee_mojos(is_cat=False), 13_079_100)
+        self.assertEqual(worker._split_tx_fee_mojos(is_cat=True), 0)
+
+    def test_pending_grace_extension_replaces_exhausted_base_deadline(self):
+        self.assertEqual(
+            remaining_pending_split_poll_seconds(
+                elapsed_s=300,
+                split_deadlines={0: 360},
+                confirmed_indices=set(),
+            ),
+            60,
+        )
+
     def test_retries_when_source_coin_is_still_free_after_threshold(self):
         self.assertTrue(
             should_retry_unconsumed_split(
@@ -197,7 +240,7 @@ class TestCoinPrepSplitRetry(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("sage_topup_split", source)
         self.assertIn("if is_cat:", source)
-        self.assertIn("amount_per_coin = pool_mojos // count", source)
+        self.assertIn("pool_mojos // count", source)
 
     def test_fee_paid_cat_splits_wait_for_fee_inputs(self):
         self.assertTrue(

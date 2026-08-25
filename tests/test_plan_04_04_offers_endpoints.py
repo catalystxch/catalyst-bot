@@ -9,12 +9,20 @@ Tests /api/offers, /api/offers/cancel_all/status, /api/offers/open_count,
 """
 
 import os
+import json
+import shutil
+import subprocess
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from api_test_support import permit_api_mutations
+
+ROOT = Path(__file__).resolve().parents[1]
 
 try:
     import api_server
@@ -39,6 +47,7 @@ class _FlaskBase(unittest.TestCase):
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         api_server._rate_limit_log.clear()
+        permit_api_mutations(self, api_server)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -61,6 +70,48 @@ def _make_bot(offers=([], [], [])):
     bot.offer_manager.cancel_offers.return_value = {"success": True}
     bot.coin_manager.is_busy.return_value = False
     return bot
+
+
+def test_generic_cancel_all_progress_consumer_never_claims_terminal_confirmation():
+    node = shutil.which("node")
+    if node is None:
+        raise AssertionError("Node.js is required for the bounded GUI consumer test")
+    gui_source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    helper_source = (
+        "function cancelAllProgressView"
+        + gui_source.split("function cancelAllProgressView", 1)[1].split(
+            "function renderCancelAllProgress", 1
+        )[0]
+    )
+    status = {
+        "phase": "complete",
+        "total": 3,
+        "pending": 2,
+        "failed": 1,
+        "cancelled": 99,
+        "message": "Cancellation requests journaled",
+    }
+    script = (
+        helper_source
+        + "\nconsole.log(JSON.stringify(cancelAllProgressView(JSON.parse(process.argv[1]), 0)));"
+    )
+    completed = subprocess.run(
+        [node, "-e", script, json.dumps(status)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    view = json.loads(completed.stdout)
+
+    assert view["total"] == 3
+    assert view["pending"] == 2
+    assert view["failed"] == 1
+    assert view["processed"] == 3
+    assert view["isDone"] is True
+    assert view["severity"] == "warning"
+    assert "pending authoritative reconciliation" in view["message"]
+    assert "confirmed" not in json.dumps(view).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -196,22 +247,85 @@ class TestCancelOffer(_FlaskBase):
             resp = self._post("/api/offers/cancel", {"trade_id": ""})
         self.assertEqual(resp.status_code, 400)
 
-    def test_successful_cancel_returns_200(self):
+    def test_legacy_truthy_cancel_is_denied_without_typed_outcome(self):
         bot = _make_bot()
-        bot.offer_manager.cancel_offers.return_value = {}
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {"success": True}
+        }
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 400)
         body = resp.get_json()
-        self.assertTrue(body.get("success"))
+        self.assertFalse(body.get("success"))
 
     def test_cancel_response_has_trade_id(self):
         bot = _make_bot()
-        bot.offer_manager.cancel_offers.return_value = {}
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {"success": True}
+        }
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
         body = resp.get_json()
         self.assertEqual(body.get("trade_id"), "trade-abc-001")
+
+    def test_submitted_cancel_is_reported_pending_not_cancelled(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "success": True,
+            }
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": True,
+                "status": "pending_reconciliation",
+                "confirmed": False,
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "trade_id": "trade-abc-001",
+            },
+        )
+
+    def test_missing_requested_trade_result_fails_closed(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "different-trade": {"success": True}
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
+
+    def test_malformed_requested_trade_result_fails_closed(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {"trade-abc-001": ["hostile"]}
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
 
     def test_cancel_result_error_returns_400(self):
         bot = _make_bot()
@@ -219,6 +333,52 @@ class TestCancelOffer(_FlaskBase):
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
         self.assertEqual(resp.status_code, 400)
+
+    def test_identity_denial_is_not_reported_as_cancelled(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {
+                "success": False,
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+            }
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Wallet mutation blocked by identity safety check",
+                "reason": "WALLET_IDENTITY_MISMATCH",
+            },
+        )
+
+    def test_cancel_denial_does_not_echo_hostile_wallet_reason_or_error(self):
+        bot = _make_bot()
+        bot.offer_manager.cancel_offers.return_value = {
+            "trade-abc-001": {
+                "success": False,
+                "error": "secret backend traceback",
+                "reason": "WALLET_HOSTILE_REASON",
+            }
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/offers/cancel", {"trade_id": "trade-abc-001"})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "trade_id": "trade-abc-001",
+                "error": "Offer cancellation failed",
+                "reason": "WALLET_MUTATION_FAILED",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +421,226 @@ class TestCancelAllPost(_FlaskBase):
         ):
             resp = self._post("/api/offers/cancel_all")
         self.assertIn(resp.status_code, (200, 202))
+
+    def test_stopped_bot_routes_active_offer_through_durable_manager(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "success": True,
+                "submitted": True,
+                "confirmed": False,
+                "failed": False,
+                "unknown": False,
+                "method": "single_rpc",
+                "transaction_id": "b" * 64,
+                "spend_bundle_id": None,
+                "error": None,
+                "http_status": None,
+                "raw_response": {"transaction_id": "b" * 64},
+                "evidence_sha256": "c" * 64,
+            }
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch("wallet.cancel_offers_batch") as direct_batch,
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            resp = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": True,
+                "async": True,
+                "total": 1,
+                "message": "Cancelling 1 offers in background...",
+            },
+        )
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [trade_id], reason="manual_cancel_all", force_storm=True
+        )
+        direct_batch.assert_not_called()
+
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(
+            {
+                key: status[key]
+                for key in (
+                    "success",
+                    "running",
+                    "complete",
+                    "phase",
+                    "total",
+                    "cancelled",
+                    "pending",
+                    "failed",
+                )
+            },
+            {
+                "success": True,
+                "running": False,
+                "complete": True,
+                "phase": "complete",
+                "total": 1,
+                "cancelled": 0,
+                "pending": 1,
+                "failed": 0,
+            },
+        )
+
+    def test_stopped_cancel_all_retries_exact_durable_failed_attempt(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_UNKNOWN",
+                "success": False,
+                "submitted": False,
+                "reconciliation_required": True,
+            }
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_retryable_failed_offer_cancels",
+                return_value=[
+                    {
+                        "trade_id": trade_id,
+                        "operation_id": f"cancel:{trade_id}",
+                        "attempt": 1,
+                    }
+                ],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            resp = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(resp.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [trade_id],
+            reason="manual_cancel_all",
+            force_storm=True,
+            _retry_failed_attempts={trade_id: 1},
+        )
+
+        gui_source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+        status_consumer = gui_source.split(
+            "async function pollShutdownCancelAllStatusOnce()", 1
+        )[1].split("function startShutdownCancelAllPoll()", 1)[0]
+        assert "const pending = Number(state.pending || 0);" in status_consumer
+        assert "pending authoritative reconciliation" in status_consumer
+        assert "const cancelled =" not in status_consumer
+        shutdown_source = gui_source.split("async function confirmShutdown()", 1)[1]
+        shutdown_source = shutdown_source.split("// Wallet Picker Modal", 1)[0]
+        assert "cancelResult.async === true" in shutdown_source
+        assert "cancelResult.total" in shutdown_source
+        assert "await waitForShutdownCancelAllCompletion" in shutdown_source
+        assert "pending + failed !== count" in shutdown_source
+        assert "throw e;" in shutdown_source
+        assert "/offers/open_count" not in shutdown_source
+        assert "pending authoritative reconciliation" in shutdown_source
+        assert "confirmed cancelled" not in shutdown_source
+
+    def test_uninitialised_bot_denial_clears_state_and_allows_coordinator_retry(self):
+        trade_id = "a" * 64
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_FAILED",
+                "success": False,
+                "submitted": False,
+                "confirmed": False,
+                "failed": True,
+                "unknown": False,
+                "method": "single_rpc",
+                "transaction_id": None,
+                "spend_bundle_id": None,
+                "error": "not found",
+                "http_status": 404,
+                "raw_response": {"error": "not found"},
+                "evidence_sha256": "c" * 64,
+            }
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch("wallet.cancel_offers_batch") as direct_batch,
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread") as start_thread,
+        ):
+            resp = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(
+            resp.get_json().get("reason"),
+            "DURABLE_CANCEL_COORDINATOR_UNAVAILABLE",
+        )
+        direct_batch.assert_not_called()
+        start_thread.assert_not_called()
+
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["running"])
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(
+            status["error"], "Offer cancellation coordinator is unavailable"
+        )
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch("wallet.cancel_offers_batch") as retry_direct_batch,
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            retry = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(retry.status_code, 200)
+        self.assertTrue(retry.get_json()["async"])
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [trade_id], reason="manual_cancel_all", force_storm=True
+        )
+        retry_direct_batch.assert_not_called()
 
 
 if __name__ == "__main__":

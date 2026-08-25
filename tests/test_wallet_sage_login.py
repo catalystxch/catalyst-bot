@@ -105,6 +105,59 @@ class TestWalletSageLogin(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("initialize", calls)
 
+    def test_optional_initialize_404_is_logged_as_compatibility_info(self):
+        """Sage versions without /initialize must not raise an operator warning."""
+        diagnostic = wallet_sage._build_sage_diagnostic(
+            endpoint="initialize",
+            payload={},
+            error_code="SAGE_HTTP_ERROR",
+            elapsed=0.01,
+            http_status=404,
+            response_summary={"type": "text", "size": 0},
+        )
+
+        with (
+            patch.object(wallet_sage, "_console") as console,
+            patch("database.log_event") as log_event,
+        ):
+            wallet_sage._emit_sage_diagnostic(diagnostic, "initialize")
+
+        console.assert_called_once()
+        args, kwargs = log_event.call_args
+        self.assertEqual(args[0], "info")
+        self.assertEqual(args[1], "sage_initialize_not_required")
+        self.assertNotIn("warning", args)
+        self.assertEqual(kwargs["data"]["http_status"], 404)
+
+    def test_non_optional_sage_http_errors_remain_warnings(self):
+        """Only the exact optional /initialize 404 may be downgraded."""
+        cases = (
+            ("get_version", 404),
+            ("initialize", 500),
+        )
+
+        for endpoint, http_status in cases:
+            with self.subTest(endpoint=endpoint, http_status=http_status):
+                diagnostic = wallet_sage._build_sage_diagnostic(
+                    endpoint=endpoint,
+                    payload={},
+                    error_code="SAGE_HTTP_ERROR",
+                    elapsed=0.01,
+                    http_status=http_status,
+                    response_summary={"type": "text", "size": 0},
+                )
+
+                with (
+                    patch.object(wallet_sage, "_console"),
+                    patch("database.log_event") as log_event,
+                ):
+                    wallet_sage._emit_sage_diagnostic(diagnostic, endpoint)
+
+                args, kwargs = log_event.call_args
+                self.assertEqual(args[0], "warning")
+                self.assertEqual(args[1], "sage_sage_http_error")
+                self.assertEqual(kwargs["data"]["http_status"], http_status)
+
     def test_login_returns_false_when_sage_unreachable(self):
         """If get_version returns None, sage_login should return False immediately."""
         calls = []

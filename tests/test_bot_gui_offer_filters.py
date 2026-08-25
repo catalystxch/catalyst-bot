@@ -29,3 +29,4 @@ def test_offer_filter_targets_stable_buy_and_sell_sections():
     assert "getElementById('sellOffersSection')" in body
     assert "#activeTab .offers-section:first-child" not in body
     assert "#activeTab .offers-section:last-child" not in body
+    assert "safetyDiagnostics" not in body

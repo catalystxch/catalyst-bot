@@ -155,6 +155,9 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
     """Status endpoint must surface worker crash state without hiding it."""
 
     def setUp(self):
+        import database
+
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
@@ -174,7 +177,10 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
         api_server._coin_prep_state["error"] = None
 
     def _get_status(self, bot=None):
-        with patch.object(api_server, "bot", bot):
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("wallet.get_spendable_coin_count", return_value=0),
+        ):
             return self.client.get(
                 "/api/coin-prep/status",
                 environ_base=_LOOPBACK,
@@ -253,13 +259,29 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
     """After a crash, the trigger endpoint must reset state cleanly."""
 
     def setUp(self):
+        import database
+
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._coin_prep_proc = None  # no stale process
+        self._gate_patchers = [
+            patch.object(api_server, "_ensure_mutation_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate,
+                "enter_mutation",
+                return_value="coin-prep-crash-unit-permit",
+            ),
+            patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+        ]
+        for patcher in self._gate_patchers:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self._gate_patchers):
+            patcher.stop()
         api_server._rate_limit_log.clear()
         api_server._coin_prep_state["running"] = False
         api_server._coin_prep_state["complete"] = False

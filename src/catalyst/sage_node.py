@@ -75,7 +75,7 @@ def is_startup_authorised() -> bool:
 def _get_live_sage_fingerprint() -> Optional[str]:
     """Return the currently logged-in Sage fingerprint, if any."""
     try:
-        from wallet_sage import get_current_key
+        from wallet import get_current_key
 
         key = get_current_key()
         if key and key.get("fingerprint") is not None:
@@ -246,6 +246,15 @@ def trigger_start(fingerprint: str) -> Dict:
     Chia: starts daemon + logs in via RPC.
     Sage: calls resync + login via RPC (no daemon to start).
     """
+    if (
+        type(fingerprint) is not str
+        or not fingerprint.isascii()
+        or not fingerprint.isdigit()
+        or str(int(fingerprint)) != fingerprint
+        or int(fingerprint) <= 0
+    ):
+        return {"success": False, "error": "Invalid fingerprint"}
+
     wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
     tag = "[Sage]" if wallet_type == "sage" else "[Chia]"
 
@@ -266,6 +275,12 @@ def trigger_start(fingerprint: str) -> Dict:
                     "minimum_required_version", MIN_SUPPORTED_SAGE_VERSION
                 ),
             }
+
+    from wallet import validate_runtime_target_fingerprint
+
+    identity_decision = validate_runtime_target_fingerprint(int(fingerprint))
+    if identity_decision.get("success") is not True:
+        return identity_decision
 
     global _selected_fingerprint
     _selected_fingerprint = fingerprint
@@ -411,9 +426,13 @@ def _log_in_fingerprint(fingerprint: str) -> bool:
 
             # Sage: use the resync → login → verify sequence
             try:
-                from wallet_sage import sage_login
+                from wallet import sage_login
 
-                success = sage_login(int(fingerprint))
+                login_result = sage_login(int(fingerprint))
+                success = login_result is True or (
+                    isinstance(login_result, dict)
+                    and login_result.get("success") is True
+                )
                 if success:
                     with _phase_lock:
                         _sage_startup_phase = (
@@ -500,12 +519,29 @@ def _resolve_startup_fingerprint() -> Optional[str]:
             )
         return None
 
-    # Optional .env override for legacy Chia startup.
+    # Optional .env override for legacy Chia startup. The active runtime remains
+    # authoritative; persisted process configuration cannot select another key.
     for env_key in ("SAGE_FINGERPRINT", "WALLET_FINGERPRINT"):
-        fp = os.getenv(env_key, "").strip()
-        if fp and fp.isdigit():
-            print(f"{tag} Using {env_key} from .env: {fp}", flush=True)
-            return fp
+        fp = os.getenv(env_key, "")
+        if (
+            type(fp) is str
+            and fp.isascii()
+            and fp.isdigit()
+            and int(fp) > 0
+            and str(int(fp)) == fp
+        ):
+            from wallet import validate_runtime_target_fingerprint
+
+            decision = validate_runtime_target_fingerprint(int(fp))
+            if decision.get("success") is True:
+                print(f"{tag} Using {env_key} from .env: {fp}", flush=True)
+                return fp
+            log_event(
+                "warning",
+                "wallet_startup_identity_blocked",
+                f"Ignored {env_key}: it does not match the active wallet authority",
+            )
+            return None
 
     print(f"{tag} No fingerprint in .env - waiting for GUI selection", flush=True)
     return None
@@ -2075,7 +2111,7 @@ def get_wallet_status() -> Dict:
         # Sage uses get_current_key(), Chia uses get_logged_in_fingerprint
         _wtype = os.getenv("WALLET_TYPE", "sage").lower().strip()
         if _wtype == "sage":
-            from wallet_sage import get_current_key as _get_key
+            from wallet import get_current_key as _get_key
 
             futures["fingerprint"] = executor.submit(_get_key)
         else:
@@ -2479,8 +2515,66 @@ def get_coins_for_display(
 
 
 # ---------------------------------------------------------------------------
-# Coin Operations (split via CLI — proven pattern from coin_prep_worker)
+# Coin Operations (identity-bound wallet facade)
 # ---------------------------------------------------------------------------
+
+
+def _split_coin_via_wallet_facade(
+    wallet_id: int,
+    coin_id: str,
+    num_pieces: int,
+    is_cat: bool,
+) -> Dict:
+    """Resolve the requested coin, then submit only through ``wallet.py``."""
+
+    from wallet import get_spendable_coins_rpc, split_coins_rpc
+
+    normalized_coin_id = coin_id if coin_id.startswith("0x") else f"0x{coin_id}"
+    rpc_result = get_spendable_coins_rpc(wallet_id)
+    amount_mojos = 0
+    if type(rpc_result) is dict and rpc_result.get("success") is True:
+        records = rpc_result.get("confirmed_records")
+        if type(records) is list:
+            for record in records:
+                coin_data = record.get("coin") if type(record) is dict else None
+                if type(coin_data) is not dict:
+                    continue
+                parent = coin_data.get("parent_coin_info")
+                puzzle = coin_data.get("puzzle_hash")
+                amount = coin_data.get("amount")
+                if not parent or not puzzle or type(amount) is not int or amount <= 0:
+                    continue
+                computed_id = _compute_coin_id(parent, puzzle, amount)
+                if computed_id.lower().removeprefix(
+                    "0x"
+                ) == normalized_coin_id.lower().removeprefix("0x"):
+                    amount_mojos = amount
+                    break
+
+    if amount_mojos <= 0:
+        return {
+            "success": False,
+            "error": f"Coin {normalized_coin_id[:16]}... not found or not spendable",
+        }
+
+    result = split_coins_rpc(
+        wallet_id,
+        normalized_coin_id,
+        num_pieces,
+        amount_mojos // num_pieces,
+        0,
+        is_cat,
+    )
+    if type(result) is dict and result.get("success") is True:
+        return {
+            "success": True,
+            "message": f"Split submitted! Creating {num_pieces} coins.",
+        }
+    reason = result.get("reason") if type(result) is dict else None
+    failure = {"success": False, "error": "Wallet split failed"}
+    if type(reason) is str and reason.isascii() and 1 <= len(reason) <= 64:
+        failure["reason"] = reason
+    return failure
 
 
 def split_coin(
@@ -2492,8 +2586,7 @@ def split_coin(
 ) -> Dict:
     """Split a specific coin into multiple pieces.
 
-    Chia: Uses `chia wallet coins split` CLI (proven reliable method).
-    Sage: Uses wallet adapter's split_coins_rpc (native RPC split).
+    Both backends route submission through ``wallet.split_coins_rpc``.
 
     Args:
         wallet_id: Wallet ID
@@ -2513,156 +2606,7 @@ def split_coin(
     if num_pieces > 50:
         return {"success": False, "error": "Maximum 50 pieces per split"}
 
-    # Sage: use native RPC split instead of CLI
-    wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
-    if wallet_type == "sage":
-        try:
-            from wallet import split_coins_rpc
-
-            log_event(
-                "info",
-                "coin_split_manual",
-                f"[Sage] Splitting coin {coin_id[:16]}... into {num_pieces} pieces",
-            )
-            result = split_coins_rpc(
-                wallet_id, num_pieces, coin_id, is_cat=is_cat, fee_mojos=0
-            )
-            if result and (result.get("success") or isinstance(result, dict)):
-                log_event(
-                    "success",
-                    "coin_split_manual",
-                    f"[Sage] Split submitted: {coin_id[:16]}... → {num_pieces} pieces",
-                )
-                return {
-                    "success": True,
-                    "message": f"Split submitted via Sage RPC! Creating {num_pieces} coins.",
-                    "output": str(result)[:500],
-                }
-            else:
-                error = (result or {}).get("error", "Unknown error")
-                return {"success": False, "error": f"Sage split failed: {error}"}
-        except Exception as e:
-            log_event("error", "coin_split_manual", f"[Sage] Split error: {e}")
-            return {"success": False, "error": f"Sage split error: {e}"}
-
-    # Get fingerprint from env
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    fingerprint = os.getenv("CHIA_FINGERPRINT", "")
-    if not fingerprint:
-        return {
-            "success": False,
-            "error": "Select a wallet fingerprint in the app before starting Chia",
-        }
-
-    # Normalize coin_id
-    if not coin_id.startswith("0x"):
-        coin_id = "0x" + coin_id
-
-    # Get the coin's amount from the wallet to calculate split size
-    # get_spendable_coins_rpc returns raw RPC dict with confirmed_records
-    rpc_result = get_spendable_coins_rpc(wallet_id)
-    target_coin = None
-    amount_mojos = 0
-    if rpc_result and rpc_result.get("success"):
-        for record in rpc_result.get("confirmed_records", []):
-            coin_data = record.get("coin", {})
-            parent = coin_data.get("parent_coin_info", "")
-            puzzle = coin_data.get("puzzle_hash", "")
-            amt = coin_data.get("amount", 0)
-            if parent and puzzle:
-                computed_id = _compute_coin_id(parent, puzzle, amt)
-                if (
-                    computed_id.lower() == coin_id.lower()
-                    or computed_id.lower().replace("0x", "")
-                    == coin_id.lower().replace("0x", "")
-                ):
-                    target_coin = record
-                    amount_mojos = amt
-                    break
-
-    if not target_coin:
-        return {
-            "success": False,
-            "error": f"Coin {coin_id[:16]}... not found or not spendable",
-        }
-    if amount_mojos <= 0:
-        return {"success": False, "error": "Coin has zero or negative amount"}
-
-    # Calculate amount per piece (even split, remainder stays as change)
-    amount_per_piece = amount_mojos // num_pieces
-
-    if is_cat:
-        # CAT: amount in token units for CLI
-        amount_str = str(Decimal(str(amount_per_piece)) / Decimal(10**decimals))
-    else:
-        # XCH: amount in XCH for CLI
-        amount_str = str(Decimal(str(amount_per_piece)) / Decimal("1000000000000"))
-
-    # Build CLI command
-    cmd = [
-        "chia",
-        "wallet",
-        "coins",
-        "split",
-        "-f",
-        fingerprint,
-        "-i",
-        str(wallet_id),
-        "-n",
-        str(num_pieces),
-        "-a",
-        amount_str,
-        "-t",
-        coin_id,
-        "-m",
-        "0",
-    ]
-
-    log_event(
-        "info",
-        "coin_split_manual",
-        f"Splitting coin {coin_id[:16]}... into {num_pieces} × {amount_str} "
-        f"({'CAT' if is_cat else 'XCH'})",
-    )
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            **hidden_subprocess_kwargs(),
-        )
-
-        output = result.stdout + result.stderr
-        if result.returncode == 0 and "transaction submitted" in output.lower():
-            log_event(
-                "success",
-                "coin_split_manual",
-                f"Split submitted: {coin_id[:16]}... → {num_pieces} pieces",
-            )
-            return {
-                "success": True,
-                "message": f"Split submitted! Creating {num_pieces} coins of {amount_str} each.",
-                "output": output[:500],
-            }
-        else:
-            log_event(
-                "warning", "coin_split_manual", f"Split may have failed: {output[:200]}"
-            )
-            return {
-                "success": False,
-                "error": f"CLI returned: {output[:300]}",
-            }
-
-    except subprocess.TimeoutExpired:
-        log_event("error", "coin_split_manual", "Split command timed out after 120s")
-        return {"success": False, "error": "Command timed out after 120 seconds"}
-    except Exception as e:
-        log_event("error", "coin_split_manual", f"Split error: {e}")
-        return {"success": False, "error": str(e)}
+    return _split_coin_via_wallet_facade(wallet_id, coin_id, num_pieces, is_cat)
 
 
 # ---------------------------------------------------------------------------

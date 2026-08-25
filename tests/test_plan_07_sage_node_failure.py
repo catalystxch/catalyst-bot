@@ -69,13 +69,55 @@ class TestSageRPCDisconnected(unittest.TestCase):
                 self.fail(f"rpc() propagated: {exc}")
 
     def test_rpc_returns_none_on_unexpected_exception(self):
-        """Any non-ConnectionError exception returns None (not raise)."""
+        """The historical regression node now asserts the stable contract."""
         with (
             patch("wallet_sage.ensure_initialized", return_value=True),
             patch("wallet_sage._sage_post", side_effect=RuntimeError("weird")),
+            patch("wallet_sage._console"),
+            patch("wallet_sage.time.time", side_effect=[10.0, 10.25]),
         ):
             result = wallet_sage.rpc("get_wallets", {})
-        self.assertIsNone(result)
+        self.assertEqual(
+            result,
+            {
+                "success": False,
+                "error": "SAGE_RPC_ERROR",
+                "error_code": "SAGE_RPC_ERROR",
+                "message": "The Sage RPC request failed.",
+                "endpoint": "get_wallets",
+                "http_status": None,
+                "elapsed_secs": 0.25,
+                "payload_summary": {
+                    "type": "object",
+                    "size": 0,
+                    "fields": {},
+                },
+            },
+        )
+        self.assertNotIn("weird", repr(result))
+
+    def test_sync_status_treats_stable_failure_dict_as_rpc_failed(self):
+        failure = {
+            "success": False,
+            "error": "SAGE_RPC_ERROR",
+            "error_code": "SAGE_RPC_ERROR",
+            "message": "The Sage RPC request failed.",
+        }
+        with (
+            patch("wallet_sage.ensure_initialized", return_value=True),
+            patch("wallet_sage.rpc", return_value=failure),
+        ):
+            status = wallet_sage.get_wallet_sync_status()
+
+        self.assertEqual(
+            status,
+            {
+                "reachable": False,
+                "synced": False,
+                "syncing": False,
+                "sync_state": "rpc_failed",
+            },
+        )
 
     def test_rpc_succeeded_false_on_none(self):
         """_rpc_succeeded(None) returns False — callers detect RPC failure."""
@@ -98,13 +140,18 @@ class TestSageRPCDisconnected(unittest.TestCase):
             result = wallet_sage.ensure_initialized(force_retry=True)
         self.assertFalse(result)
 
-    def test_get_wallet_sync_status_returns_offline_when_not_initialized(self):
-        """If ensure_initialized() fails, sync status is offline."""
-        with patch("wallet_sage.ensure_initialized", return_value=False):
+    def test_get_wallet_sync_status_does_not_initialize_before_read(self):
+        """The read-only sync probe must never initialize the wallet."""
+        failure = {"success": False, "error": "SAGE_CONNECTION_ERROR"}
+        with (
+            patch("wallet_sage.ensure_initialized") as ensure_initialized,
+            patch("wallet_sage.rpc", return_value=failure),
+        ):
             status = wallet_sage.get_wallet_sync_status()
+        ensure_initialized.assert_not_called()
         self.assertFalse(status.get("reachable"))
         self.assertFalse(status.get("synced"))
-        self.assertEqual(status.get("sync_state"), "offline")
+        self.assertEqual(status.get("sync_state"), "rpc_failed")
 
     def test_get_wallet_sync_status_returns_offline_on_exception(self):
         """Exception from rpc() returns offline status (not raise)."""

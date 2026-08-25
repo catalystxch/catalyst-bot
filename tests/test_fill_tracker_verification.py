@@ -77,6 +77,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         fake_wallet = types.ModuleType("wallet")
         fake_wallet.get_wallet_type = lambda: "sage"
+        fake_wallet.get_all_offers = lambda **kwargs: []
         sys.modules["wallet"] = fake_wallet
 
         self.fake_wallet_sage = types.ModuleType("wallet_sage")
@@ -220,19 +221,12 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertEqual(tracker._pending_reverify[trade_id]["attempts"], 0)
         self.assertNotIn((trade_id, "cancelled"), self.status_updates)
 
-    def test_verified_spacescan_result_records_fill(self):
+    def test_verified_spacescan_result_waits_for_authoritative_reconciliation(self):
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-verified"
         tracker._previous_ids["sell"] = {trade_id}
         tracker._previous_ids["buy"] = set()
-
-        fill_detail = {
-            "trade_id": trade_id,
-            "side": "sell",
-            "price": "0.1",
-        }
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
 
         result = tracker.detect_fills(
             set(),
@@ -248,8 +242,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["sell_fills"], [fill_detail])
-        self.assertTrue(any(evt == "fill_verified" for _, evt, _, _ in self.logged))
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
 
     def test_spacescan_disabled_does_not_record_fill(self):
         sys.modules["config"].cfg.SPACESCAN_ENABLED = False
@@ -280,7 +275,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
         )
 
     def test_wallet_cancelled_status_blocks_fill_recording(self):
-        self.fake_wallet_sage.rpc = lambda *args, **kwargs: {"status": "CANCELLED"}
+        sys.modules["wallet"].get_all_offers = lambda **kwargs: [
+            {"trade_id": "trade-cancelled", "status": "CANCELLED"}
+        ]
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-cancelled"
@@ -291,7 +288,8 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         self.assertEqual(result["sell_fills"], [])
         self.assertEqual(self.recorded, [])
-        self.assertIn((trade_id, "cancelled"), self.status_updates)
+        self.assertEqual(self.status_updates, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(evt == "fill_wallet_closed_nonfill" for _, evt, _, _ in self.logged)
         )
@@ -300,7 +298,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
         )
 
     def test_wallet_pending_cancel_stays_open_for_reconcile(self):
-        self.fake_wallet_sage.rpc = lambda *args, **kwargs: {"status": "PENDING_CANCEL"}
+        sys.modules["wallet"].get_all_offers = lambda **kwargs: [
+            {"trade_id": "trade-pending-cancel", "status": "PENDING_CANCEL"}
+        ]
         spacescan_calls = []
 
         def _spacescan_should_not_run(*args, **kwargs):
@@ -349,7 +349,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
             any(evt == "fill_dexie_still_open" for _, evt, _, _ in self.logged)
         )
 
-    def test_expired_dexie_open_offer_defers_to_spacescan_and_retires_nonfill(self):
+    def test_expired_dexie_open_offer_stays_nonterminal_without_exact_proof(self):
         past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)
         self.db_offer = {
             "coin_id": "0xcoin123",
@@ -379,7 +379,8 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertEqual(result["buy_fills"], [])
         self.assertEqual(self.recorded, [])
         self.assertEqual(spacescan_calls, [("0xcoin123", "xch1ourwalletaddress")])
-        self.assertIn((trade_id, "expired"), self.status_updates)
+        self.assertEqual(self.status_updates, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(evt == "fill_dexie_open_expired_defer" for _, evt, _, _ in self.logged)
         )
@@ -387,10 +388,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
             any(evt == "offer_closed_nonfill" for _, evt, _, _ in self.logged)
         )
 
-    def test_dexie_trade_mismatch_defers_to_spacescan(self):
-        # New policy: Spacescan is the golden gate. A Dexie trade_id mismatch
-        # (likely stale Dexie data) must not veto a Spacescan-confirmed fill;
-        # it merely logs a defer message and lets Spacescan decide.
+    def test_dexie_trade_mismatch_cannot_authorize_spacescan_fill(self):
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-mismatch"}
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
         self.fake_dexie_manager.get_offer_detail = lambda dexie_id: {
@@ -400,20 +398,19 @@ class FillTrackerVerificationTests(unittest.TestCase):
         }
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-mismatch"
-        fill_detail = {"trade_id": trade_id, "side": "sell", "price": "0.1"}
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["sell"] = {trade_id}
         tracker._previous_ids["buy"] = set()
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(result["sell_fills"], [fill_detail])
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(
                 evt == "fill_dexie_trade_mismatch_defer" for _, evt, _, _ in self.logged
             )
         )
-        self.assertTrue(any(evt == "fill_verified" for _, evt, _, _ in self.logged))
 
     def test_reused_coin_spacescan_fill_without_trade_confirmation_is_parked(self):
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-reused"}
@@ -448,7 +445,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
             )
         )
 
-    def test_reused_coin_spacescan_fill_records_when_dexie_confirms_trade(self):
+    def test_reused_coin_third_party_fill_waits_for_authoritative_proof(self):
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-reused-filled"}
         sys.modules["database"].get_offer_coin_usage_summary = (
             lambda coin_id, cat_asset_id=None: {
@@ -466,19 +463,19 @@ class FillTrackerVerificationTests(unittest.TestCase):
         }
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-reused-filled"
-        fill_detail = {"trade_id": trade_id, "side": "sell", "price": "0.1"}
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["sell"] = {trade_id}
         tracker._previous_ids["buy"] = set()
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(result["sell_fills"], [fill_detail])
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(evt == "fill_reused_coin_confirmed" for _, evt, _, _ in self.logged)
         )
 
-    def test_reused_coin_with_prior_fill_records_when_dexie_confirms_trade(self):
+    def test_reused_coin_prior_fill_still_requires_authoritative_proof(self):
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-reused-filled"}
         sys.modules["database"].get_offer_coin_usage_summary = (
             lambda coin_id, cat_asset_id=None: {
@@ -496,19 +493,19 @@ class FillTrackerVerificationTests(unittest.TestCase):
         }
         tracker = self.fill_tracker.FillTracker()
         trade_id = "trade-reused-filled"
-        fill_detail = {"trade_id": trade_id, "side": "sell", "price": "0.1"}
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["sell"] = {trade_id}
         tracker._previous_ids["buy"] = set()
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(result["sell_fills"], [fill_detail])
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(evt == "fill_reused_coin_confirmed" for _, evt, _, _ in self.logged)
         )
 
-    def test_reused_coin_exact_confirmation_records_exact_status(self):
+    def test_reused_coin_exact_third_party_confirmation_cannot_record(self):
         trade_id = "trade-reused-filled"
         self.db_offer = {
             "trade_id": trade_id,
@@ -540,8 +537,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(len(result["sell_fills"]), 1)
-        self.assertEqual(self.recorded[0][1]["verification_status"], "verified_exact")
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
 
     def test_reused_coin_with_prior_fill_waits_without_exact_confirmation(self):
         self.db_offer = {"coin_id": "0xcoin123", "dexie_id": "dexie-reused-open"}
@@ -617,12 +615,13 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertEqual(result["buy_fills"], [])
         self.assertEqual(self.recorded, [])
         self.assertEqual(spacescan_calls, [])
-        self.assertIn((trade_id, "cancelled"), self.status_updates)
+        self.assertEqual(self.status_updates, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertTrue(
             any(evt == "offer_closed_nonfill" for _, evt, _, _ in self.logged)
         )
 
-    def test_bot_cancelled_dexie_fill_records_without_spacescan(self):
+    def test_bot_cancelled_dexie_fill_waits_for_authoritative_proof(self):
         self.db_offer = {
             "coin_id": "0xcoin123",
             "dexie_id": "dexie-filled",
@@ -640,18 +639,17 @@ class FillTrackerVerificationTests(unittest.TestCase):
             "trade_id": trade_id,
             "involved_coins": ["0xcoin123"],
         }
-        fill_detail = {"trade_id": trade_id, "side": "sell", "price": "0.1"}
-
         tracker = self.fill_tracker.FillTracker(
             offer_manager=_FakeOfferManager({trade_id})
         )
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["buy"] = set()
         tracker._previous_ids["sell"] = {trade_id}
 
         result = tracker.detect_fills(set(), set(), {})
 
-        self.assertEqual(result["sell_fills"], [fill_detail])
+        self.assertEqual(result["sell_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
         self.assertEqual(spacescan_calls, [])
         self.assertTrue(
             any(evt == "fill_beat_cancel_dexie" for _, evt, _, _ in self.logged)
@@ -802,7 +800,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
             any(evt == "fill_rejected_sage_checked" for _, evt, _, _ in self.logged)
         )
 
-    def test_recently_created_offer_missing_from_wallet_snapshot_can_record_fill(self):
+    def test_recently_created_offer_absence_cannot_record_fill(self):
         self.db_offer = {
             "coin_id": "0xcoin123",
             "dexie_id": "dexie-newborn-filled",
@@ -815,11 +813,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
             "trade_id": trade_id,
             "involved_coins": ["0xcoin123"],
         }
-        fill_detail = {"trade_id": trade_id, "side": "buy", "price": "0.1"}
         manager = _FakeOfferManager(recently_created={"buy": {trade_id}, "sell": set()})
 
         tracker = self.fill_tracker.FillTracker(offer_manager=manager)
-        tracker._record_fill = lambda trade_id, side, details_cache: fill_detail
         tracker._previous_ids["buy"] = {older_trade_id}
         tracker._previous_ids["sell"] = set()
 
@@ -837,10 +833,12 @@ class FillTrackerVerificationTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["buy_fills"], [fill_detail])
-        self.assertIn(trade_id, manager.forgot_recently_created)
+        self.assertEqual(result["buy_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertNotIn(trade_id, manager.forgot_recently_created)
 
-    def test_retry_resolved_newborn_fill_is_not_processed_twice(self):
+    def test_retry_third_party_fill_remains_parked_without_authoritative_proof(self):
         self.db_offer = {
             "coin_id": "0xcoin123",
             "dexie_id": "dexie-newborn-retry-filled",
@@ -848,16 +846,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
         trade_id = "trade-newborn-retry-filled"
         older_trade_id = "trade-already-baselined"
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
-        fill_detail = {"trade_id": trade_id, "side": "buy", "price": "0.1"}
         manager = _FakeOfferManager(recently_created={"buy": {trade_id}, "sell": set()})
-        record_calls = []
-
-        def _record_once(trade_id_arg, side, details_cache):
-            record_calls.append((trade_id_arg, side))
-            return fill_detail
 
         tracker = self.fill_tracker.FillTracker(offer_manager=manager)
-        tracker._record_fill = _record_once
         tracker._previous_ids["buy"] = {older_trade_id}
         tracker._previous_ids["sell"] = set()
         tracker._pending_reverify[trade_id] = {
@@ -868,10 +859,10 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         result = tracker.detect_fills({older_trade_id}, set(), {})
 
-        self.assertEqual(result["buy_fills"], [fill_detail])
-        self.assertEqual(record_calls, [(trade_id, "buy")])
-        self.assertNotIn(trade_id, tracker._pending_reverify)
-        self.assertIn(trade_id, manager.forgot_recently_created)
+        self.assertEqual(result["buy_fills"], [])
+        self.assertEqual(self.recorded, [])
+        self.assertIn(trade_id, tracker._pending_reverify)
+        self.assertNotIn(trade_id, manager.forgot_recently_created)
 
 
 if __name__ == "__main__":

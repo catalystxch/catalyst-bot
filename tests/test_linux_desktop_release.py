@@ -139,6 +139,7 @@ def test_linux_notification_runtime_dependencies_are_declared():
 def test_linux_initial_desktop_url_uses_loopback(monkeypatch):
     sys.modules.pop("desktop_app", None)
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("CATALYST_FLASK_PORT", "5000")
     desktop_app = importlib.import_module("desktop_app")
 
     assert desktop_app._initial_desktop_url() == "http://127.0.0.1:5000/"
