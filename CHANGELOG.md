@@ -5,6 +5,27 @@ All notable changes to CATalyst are recorded here.
 This changelog was added during public-readiness work. Earlier release notes may
 be reconstructed from GitHub Releases and tag history where available.
 
+## v1.3.0 - 2026-08-25
+
+- Added a durable stability kernel for wallet mutation ownership, offer
+  creation/cancellation journals, publication outbox recovery, authoritative
+  reconciliation, and fail-closed restart handling.
+- Hardened Sage wallet identity, signing, cancellation, balance caching, and
+  diagnostic redaction, including recovery coverage for ambiguous or rejected
+  transaction outcomes.
+- Improved coin preparation with confirmed-view checks, bounded retry and
+  consolidation recovery, one-sided preparation, live top-up journals, and
+  dedicated fee-coin reliability.
+- Corrected Dashboard, Logs, Offers, P&L, Market Intel, Settings, Help, About,
+  reload, and existing-ladder resume behavior; a running session now stays
+  behind a neutral status probe instead of flashing first-run Risk Disclosure.
+- Added explicit TibetSwap-outage degraded mode: CATalyst reports the external
+  outage, falls back to Dexie-only pricing, marks AMM-only metrics unavailable,
+  and does not present stale TibetSwap data as live.
+- Expanded automated and packaged acceptance coverage around mainnet Sage TEST
+  7, offer/fill lifecycle behavior, MZ market state, safety diagnostics, and
+  Windows release builds.
+
 ## v1.2.5
 
 - Fixed offer replacement after sweep fills so confirmed fills clear stale DB-only
