@@ -1302,6 +1302,119 @@ class Config:
         "SAGE_FINGERPRINT",
     }
 
+    def bind_wallet_identity(
+        self,
+        *,
+        backend: str,
+        fingerprint: str,
+        name: str,
+        kind: str,
+        network_id: str,
+    ) -> bool:
+        """Atomically persist the exact first-run Sage mutation identity."""
+
+        values = {
+            "backend": backend,
+            "fingerprint": fingerprint,
+            "name": name,
+            "kind": kind,
+            "network_id": network_id,
+        }
+        if any(type(value) is not str for value in values.values()):
+            return False
+        safe_backend = backend.strip().lower()
+        safe_fingerprint = fingerprint.strip()
+        safe_name = name.strip()
+        safe_kind = kind.strip().lower()
+        safe_network = network_id.strip().lower()
+        configured_network = (
+            str(
+                os.environ.get("CATALYST_NETWORK_ID")
+                or os.environ.get("CHIA_NETWORK")
+                or "mainnet"
+            )
+            .strip()
+            .lower()
+        )
+        if (
+            safe_backend != "sage"
+            or str(getattr(self, "WALLET_TYPE", "")).strip().lower() != "sage"
+            or not safe_fingerprint.isascii()
+            or not safe_fingerprint.isdigit()
+            or safe_fingerprint.startswith("0")
+            or int(safe_fingerprint) < 1
+            or str(int(safe_fingerprint)) != safe_fingerprint
+            or not safe_name
+            or len(safe_name) > 128
+            or not safe_kind
+            or len(safe_kind) > 64
+            or not safe_network
+            or len(safe_network) > 64
+            or safe_network != configured_network
+            or any(
+                character in value
+                for value in (safe_name, safe_kind, safe_network)
+                for character in ("\n", "\r", "\x00")
+            )
+        ):
+            return False
+
+        current_fingerprint = str(getattr(self, "SAGE_FINGERPRINT", "") or "")
+        current_name = str(getattr(self, "WALLET_EXPECTED_NAME", "") or "")
+        current_kind = str(getattr(self, "WALLET_EXPECTED_KEY_KIND", "") or "")
+        if current_fingerprint and current_name and current_kind:
+            return (
+                current_fingerprint == safe_fingerprint
+                and current_name == safe_name
+                and current_kind.lower() == safe_kind
+            )
+
+        import shutil
+
+        temp_path = f"{_ENV_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
+        updates = {
+            "SAGE_FINGERPRINT": safe_fingerprint,
+            "WALLET_EXPECTED_NAME": safe_name,
+            "WALLET_EXPECTED_KEY_KIND": safe_kind,
+        }
+        try:
+            with self._lock:
+                if os.path.exists(_ENV_PATH):
+                    shutil.copy2(_ENV_PATH, temp_path)
+                else:
+                    with open(temp_path, "w", encoding="utf-8"):
+                        pass
+                for key, value in updates.items():
+                    set_key(temp_path, key, value)
+                os.replace(temp_path, _ENV_PATH)
+                _restrict_env_file_permissions(_ENV_PATH)
+                self.reload()
+                for key, value in updates.items():
+                    os.environ[key] = value
+                    try:
+                        from database import record_config_change
+
+                        record_config_change(
+                            key,
+                            "",
+                            value,
+                            source="wallet_identity_bootstrap",
+                            note="Exact Sage identity selected during first launch",
+                        )
+                    except Exception:
+                        # Audit telemetry must not roll back a binding that was
+                        # already persisted atomically to the protected env file.
+                        pass
+            return True
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except OSError:
+                # Preserve the original persistence failure for the caller.
+                pass
+            return False
+
     def update(self, key: str, value: str, source: str = "api", note: str = "") -> bool:
         """Update a setting: writes to .env and refreshes in-memory value.
 

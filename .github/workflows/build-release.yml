@@ -167,6 +167,9 @@ jobs:
 
           python scripts/packaged_api_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
 
+          Write-Host "Smoke test Windows clean desktop first launch"
+          python scripts/packaged_desktop_first_launch_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
+
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (Test-Path $uninstaller) {
             Start-Process -FilePath $uninstaller -ArgumentList @(

@@ -455,6 +455,79 @@ def api_sage_set_fingerprint():
         if not fingerprint:
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
 
+        if api_server.wallet_setup_bootstrap_active():
+            identities = chia_node.get_available_wallet_identities()
+            identity = next(
+                (
+                    item
+                    for item in identities
+                    if isinstance(item, dict) and item.get("fingerprint") == fingerprint
+                ),
+                None,
+            )
+            if identity is None:
+                return jsonify(
+                    {
+                        "success": False,
+                        "fingerprint": fingerprint,
+                        "error": "Selected Sage signing identity is not available",
+                    }
+                ), 400
+            bound = api_server.cfg.bind_wallet_identity(
+                backend=str(identity.get("backend") or ""),
+                fingerprint=fingerprint,
+                name=str(identity.get("name") or ""),
+                kind=str(identity.get("kind") or ""),
+                network_id=str(identity.get("network_id") or ""),
+            )
+            if not bound:
+                return jsonify(
+                    {
+                        "success": False,
+                        "fingerprint": fingerprint,
+                        "error": "Could not bind the selected Sage identity",
+                    }
+                ), 500
+            promotion = api_server.promote_wallet_setup_bootstrap()
+            if promotion.get("allowed") is not True:
+                return jsonify(
+                    {
+                        "success": False,
+                        "fingerprint": fingerprint,
+                        "error": "Wallet identity was saved but owner startup remained blocked",
+                        "reason": str(
+                            promotion.get("reason_code")
+                            or "WALLET_IDENTITY_SETUP_PROMOTION_FAILED"
+                        ),
+                    }
+                ), 423
+            permit = None
+            try:
+                permit = api_server.mutation_gate.enter_mutation(
+                    "api:sage.bootstrap_wallet_selection"
+                )
+                result = chia_node.trigger_start(fingerprint)
+            finally:
+                if permit is not None:
+                    api_server.mutation_gate.exit_mutation(permit)
+            if not result.get("success"):
+                safe_result = _safe_wallet_start_result(result)
+                return jsonify(
+                    {
+                        "success": False,
+                        "fingerprint": fingerprint,
+                        **safe_result,
+                    }
+                ), 400
+            api_server.clear_balance_snapshot()
+            return jsonify(
+                {
+                    "success": True,
+                    "fingerprint": fingerprint,
+                    "message": "Sage identity bound and wallet start requested",
+                }
+            )
+
         bot = api_server.bot
         if bot and bot.is_running():
             return jsonify(

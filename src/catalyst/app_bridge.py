@@ -133,6 +133,8 @@ def _mutation_guard(operation: str):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             api = _bridge_runtime_api(self)
+            if api.wallet_setup_bootstrap_allows(operation):
+                return func(self, *args, **kwargs)
             api._ensure_mutation_runtime()
             permit = None
             try:

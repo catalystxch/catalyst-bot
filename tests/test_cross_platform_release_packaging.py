@@ -34,6 +34,16 @@ def test_release_workflow_uses_identity_aware_packaged_smoke_only():
     assert "curl -sf http://127.0.0.1:5000/api/health" not in workflow
 
 
+def test_windows_release_installer_runs_clean_desktop_first_launch_smoke():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Smoke test Windows clean desktop first launch" in workflow
+    assert "packaged_desktop_first_launch_smoke.py --exe" in workflow
+    assert (ROOT / "scripts" / "packaged_desktop_first_launch_smoke.py").exists()
+
+
 def test_release_workflow_does_not_publish_macos_assets():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"

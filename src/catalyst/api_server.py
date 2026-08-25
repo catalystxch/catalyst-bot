@@ -292,6 +292,110 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 }
 
 _read_only_diagnostics_active = False
+_wallet_setup_bootstrap_active = False
+
+# A first-run desktop has no immutable wallet identity yet, so it cannot own
+# the trading mutation lease. These are the only local setup operations that
+# may run in the separate bootstrap mode. None can create, cancel, or publish
+# an offer, split coins, or start the trading bot.
+_WALLET_SETUP_BOOTSTRAP_OPERATIONS = frozenset(
+    {
+        "api:sage.api_sage_daemon_start",
+        "api:sage.api_sage_set_fingerprint",
+        "api:sage.api_sage_setup_certs",
+        "api:sage.api_wallet_begin_startup",
+        "api:sage.api_wallet_retry_sage_connect",
+        "app_bridge:begin_startup",
+        "app_bridge:set_sage_fingerprint",
+        "app_bridge:setup_certs",
+    }
+)
+
+
+def wallet_setup_bootstrap_active() -> bool:
+    """Return whether this process is serving the fail-closed setup shell."""
+
+    return _wallet_setup_bootstrap_active is True
+
+
+def wallet_setup_bootstrap_allows(operation: str) -> bool:
+    """Authorize one exact non-trading setup operation in bootstrap mode."""
+
+    return wallet_setup_bootstrap_active() and (
+        type(operation) is str and operation in _WALLET_SETUP_BOOTSTRAP_OPERATIONS
+    )
+
+
+def deactivate_wallet_setup_bootstrap() -> None:
+    """Close the setup-only authority after successful owner promotion."""
+
+    global _wallet_setup_bootstrap_active
+    _wallet_setup_bootstrap_active = False
+
+
+def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
+    """Enter setup-only mode for an unconfigured wallet with clean state.
+
+    The normal mutation runtime has already failed closed at this point. We
+    independently verify that no lease, safety latch, unresolved operation,
+    coin reservation, or publication claim exists before exposing the narrow
+    wallet-setup allowlist.
+    """
+
+    global _wallet_setup_bootstrap_active
+    _wallet_setup_bootstrap_active = False
+    if type(startup_authorization) is not dict or (
+        startup_authorization.get("allowed") is not False
+        or startup_authorization.get("failed_check") != "wallet_identity_freshness"
+        or startup_authorization.get("reason_code") != "WALLET_IDENTITY_BINDING_INVALID"
+    ):
+        return False
+    raw_backend = getattr(cfg, "WALLET_TYPE", "")
+    raw_fingerprint = getattr(cfg, "SAGE_FINGERPRINT", "")
+    raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
+    raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+    if (
+        type(raw_backend) is not str
+        or raw_backend.strip().lower() != "sage"
+        or type(raw_fingerprint) is not str
+        or bool(raw_fingerprint.strip())
+        or type(raw_expected_name) is not str
+        or bool(raw_expected_name.strip())
+        or type(raw_expected_kind) is not str
+        or raw_expected_kind.strip().lower() not in {"", "bls"}
+    ):
+        return False
+    _wallet_hash, network = _configured_mutation_binding()
+    if _configured_wallet_identity_binding(network) is not None:
+        return False
+    try:
+        snapshot = database.get_stability_startup_recovery_snapshot()
+        lease = snapshot.get("lease")
+        latch = snapshot.get("latch")
+        counts = snapshot.get("blocker_counts")
+        clean = (
+            type(lease) is dict
+            and not bool(lease.get("active"))
+            and type(latch) is dict
+            and latch.get("state") == "resolved"
+            and snapshot.get("blockers") == []
+            and snapshot.get("reservation_issues") == []
+            and snapshot.get("publication_issues") == []
+            and type(counts) is dict
+            and all(type(value) is int and value == 0 for value in counts.values())
+        )
+    except Exception:
+        clean = False
+    if not clean:
+        return False
+    _wallet_setup_bootstrap_active = True
+    slog(
+        "SAFETY",
+        "First-run wallet setup shell enabled; trading remains blocked",
+        {"reason_code": "WALLET_IDENTITY_SETUP_REQUIRED"},
+        level="warning",
+    )
+    return True
 
 
 def _write_endpoint_requires_mutation(endpoint: str) -> bool:
@@ -3450,6 +3554,36 @@ def create_bot() -> BotLoop:
     return bot
 
 
+def promote_wallet_setup_bootstrap() -> dict:
+    """Promote an exact persisted Sage identity into normal owner mode."""
+
+    if not wallet_setup_bootstrap_active():
+        return {
+            "allowed": False,
+            "reason_code": "WALLET_IDENTITY_SETUP_NOT_ACTIVE",
+        }
+    authorization = initialize_mutation_runtime()
+    if authorization.get("allowed") is not True:
+        return authorization
+    try:
+        create_bot()
+        _start_owned_runtime_services(authorization)
+    except Exception:
+        release_mutation_runtime()
+        return {
+            "allowed": False,
+            "reason_code": "WALLET_IDENTITY_SETUP_PROMOTION_FAILED",
+        }
+    deactivate_wallet_setup_bootstrap()
+    slog(
+        "SAFETY",
+        "First-run wallet identity bound; trading owner runtime enabled",
+        {"reason_code": "WALLET_IDENTITY_BOUND"},
+        level="info",
+    )
+    return authorization
+
+
 # ---------------------------------------------------------------------------
 # GUI Route
 # ---------------------------------------------------------------------------
@@ -3556,6 +3690,8 @@ def enforce_local_runtime_guard():
         requires_mutation = bool(
             {"POST", "PUT", "PATCH", "DELETE"}.intersection({request.method})
         ) and _write_endpoint_requires_mutation(endpoint)
+        if wallet_setup_bootstrap_allows(f"api:{endpoint}"):
+            requires_mutation = False
         if endpoint == "bot.api_shutdown":
             try:
                 requires_mutation = bool(
