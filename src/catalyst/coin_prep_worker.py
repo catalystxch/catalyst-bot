@@ -987,6 +987,7 @@ class CoinPrepWorker:
         list_cohort_operations = {
             "coin_prep.combine_batch": "coin_ids",
             "coin_prep.combine": "coin_ids",
+            "coin_prep.combine_cat_with_fee": "coin_ids",
             "coin_prep.create_tier_pools_exact": "selected_coin_ids",
         }
         exact_pool_operations = {"coin_prep.create_tier_pools_exact"}
@@ -1079,6 +1080,7 @@ class CoinPrepWorker:
         fee_coin_id = kwargs.get("fee_coin_id")
         fee_coin_ids: list[str] = []
         sage_topup_operations = {
+            "coin_prep.combine_cat_with_fee",
             "coin_prep.split_cat_pool",
             "coin_prep.retry_cat_split",
         }
@@ -3289,18 +3291,28 @@ class CoinPrepWorker:
           • 50-99 coins → 4× base
           • ≥ 100 coins → 6× base
 
-        The multipliers cap at 6× so even a 500-coin combine only pays a
-        very small absolute amount (base fee is the user's
-        TRANSACTION_FEE_XCH which defaults to ~0.0000131 XCH).
+        When fees are enabled, consolidation uses at least 0.0001 XCH so a
+        locally accepted Sage transaction is not predictably rejected by a
+        busy full-node mempool. The configured fee still wins when its scaled
+        value is higher; an explicitly configured zero remains zero.
         """
         base = max(0, int(self._tx_fee_mojos()))
+        if base == 0:
+            return 0
         if coin_count >= 100:
-            return base * 6
-        if coin_count >= 50:
-            return base * 4
-        if coin_count >= 20:
-            return base * 2
-        return base
+            scaled = base * 6
+        elif coin_count >= 50:
+            scaled = base * 4
+        elif coin_count >= 20:
+            scaled = base * 2
+        else:
+            scaled = base
+
+        # A TEST 7 Sage transaction paying 13,079,100 mojos was accepted by
+        # the local RPC and then rejected by every peer with
+        # INVALID_FEE_TOO_CLOSE_TO_ZERO.  Chia's operator guidance uses
+        # 100,000,000 mojos as the generally sufficient standard-tx fee.
+        return max(scaled, 100_000_000)
 
     def _sage_consolidation_max_inputs_per_tx(self) -> int:
         """Maximum inputs to put in one Sage consolidation transaction."""
@@ -3374,17 +3386,23 @@ class CoinPrepWorker:
         return self._consolidate_wallet_sage_combine(wallet_id, name)
 
     def _consolidate_wallet_sage_combine(self, wallet_id: int, name: str) -> bool:
-        """Consolidate via Sage's /combine endpoint with explicit coin IDs.
+        """Consolidate through Sage with explicit CAT/XCH and fee coin IDs.
 
-        Source: sage-api struct Combine { coin_ids, fee, auto_submit }
-        The /combine endpoint is generic — works for both XCH and CAT coins.
+        XCH and fee-free CAT combines use Sage's generic /combine endpoint.
+        Fee-paid CAT combines use /create_transaction so the separate XCH fee
+        input is explicit and cannot be auto-selected from unrelated coins.
         """
         submitted_any = False
         try:
-            from wallet import combine_coins, get_spendable_coins_rpc
+            from wallet import (
+                combine_coins,
+                get_spendable_coins_rpc,
+            )
 
-            def _spendable_inputs() -> list[tuple[str, int]] | None:
-                coins_result = get_spendable_coins_rpc(wallet_id)
+            def _spendable_inputs(
+                target_wallet_id=wallet_id,
+            ) -> list[tuple[str, int]] | None:
+                coins_result = get_spendable_coins_rpc(target_wallet_id)
                 if not coins_result or not coins_result.get("success"):
                     return None
 
@@ -3412,20 +3430,35 @@ class CoinPrepWorker:
                     inputs.append((str(coin_id), amount))
                 return inputs
 
+            def _exact_xch_fee_input(fee_mojos: int) -> tuple[str, int] | None:
+                candidates = _spendable_inputs(self.xch_wallet_id)
+                if not candidates:
+                    return None
+                safe_candidates = candidates
+                if self.tier_enabled:
+                    _assigned, unmatched = self._partition_coins_for_designation(
+                        [
+                            {"coin_id": coin_id, "amount": amount}
+                            for coin_id, amount in candidates
+                        ],
+                        "xch",
+                    )
+                    safe_candidates = [
+                        (str(coin.get("coin_id") or ""), int(coin.get("amount") or 0))
+                        for coin in unmatched
+                        if coin.get("coin_id")
+                    ]
+                sufficient = [item for item in safe_candidates if item[1] >= fee_mojos]
+                if not sufficient:
+                    return None
+                return min(sufficient, key=lambda item: item[1])
+
             def _submit_combine(
                 inputs: list[tuple[str, int]], operation_name: str
             ) -> bool:
                 nonlocal submitted_any
                 coin_ids = [coin_id for coin_id, _amount in inputs]
-                # Sage's CAT /combine endpoint does not expose a way to bind the
-                # XCH coin that would pay its fee.  Keep CAT consolidation
-                # fee-free so the mutation gate never permits implicit fee-coin
-                # selection outside the authoritative source cohort.
-                combine_fee = (
-                    self._priority_combine_fee_mojos(len(inputs))
-                    if wallet_id == self.xch_wallet_id
-                    else 0
-                )
+                combine_fee = self._priority_combine_fee_mojos(len(inputs))
                 output_amount = sum(amount for _coin_id, amount in inputs)
                 if wallet_id == self.xch_wallet_id:
                     output_amount -= combine_fee
@@ -3433,25 +3466,88 @@ class CoinPrepWorker:
                     self.log(f"ERROR: {name} /combine output would not be positive")
                     return False
 
-                result = self._call_wallet_mutation(
-                    operation_name,
-                    combine_coins,
-                    coin_ids=coin_ids,
-                    fee_mojos=combine_fee,
-                    _authority_fee_coin_ids=(
-                        coin_ids
-                        if combine_fee > 0 and wallet_id == self.xch_wallet_id
-                        else None
-                    ),
-                    _prep_contract=self._build_coin_prep_contract(
-                        wallet_id=wallet_id,
-                        operation_kind="combine",
-                        purpose="top_up",
-                        output_amounts_and_purposes=[(output_amount, "top_up")],
-                    ),
+                prep_contract = self._build_coin_prep_contract(
+                    wallet_id=wallet_id,
+                    operation_kind="combine",
+                    purpose="top_up",
+                    output_amounts_and_purposes=[(output_amount, "top_up")],
                 )
+                if wallet_id == self.cat_wallet_id and combine_fee > 0:
+                    from wallet import create_transaction_rpc, get_next_address
+
+                    fee_input = _exact_xch_fee_input(combine_fee)
+                    if fee_input is None:
+                        self.log(
+                            f"ERROR: Sage {name} combine needs one safe unmatched "
+                            f"XCH fee input of at least {combine_fee:,} mojos"
+                        )
+                        return False
+                    fee_coin_id, _fee_coin_amount = fee_input
+                    address_result = get_next_address(wallet_id, new_address=False)
+                    own_address = (
+                        address_result.get("address")
+                        if isinstance(address_result, Mapping)
+                        else None
+                    )
+                    asset_id = str(os.getenv("CAT_ASSET_ID", "")).strip()
+                    if not own_address or not asset_id:
+                        self.log(
+                            f"ERROR: Sage {name} combine could not bind its CAT "
+                            "address or asset identity"
+                        )
+                        return False
+
+                    def _combine_cat_with_exact_fee(
+                        coin_ids,
+                        amount_mojos,
+                        own_address,
+                        asset_id,
+                        fee_coin_id,
+                        fee_mojos,
+                    ):
+                        actions = [
+                            {
+                                "type": "send",
+                                "id": {"type": "existing", "asset_id": asset_id},
+                                "address": own_address,
+                                "amount": str(int(amount_mojos)),
+                                "memos": [],
+                            },
+                            {"type": "fee", "amount": str(int(fee_mojos))},
+                        ]
+                        return create_transaction_rpc(
+                            selected_coin_ids=[*coin_ids, fee_coin_id],
+                            actions=actions,
+                            auto_submit=True,
+                        )
+
+                    result = self._call_wallet_mutation(
+                        "coin_prep.combine_cat_with_fee",
+                        _combine_cat_with_exact_fee,
+                        coin_ids=coin_ids,
+                        amount_mojos=output_amount,
+                        own_address=own_address,
+                        asset_id=asset_id,
+                        fee_coin_id=fee_coin_id,
+                        fee_mojos=combine_fee,
+                        _authority_fee_coin_ids=[fee_coin_id],
+                        _prep_contract=prep_contract,
+                    )
+                else:
+                    result = self._call_wallet_mutation(
+                        operation_name,
+                        combine_coins,
+                        coin_ids=coin_ids,
+                        fee_mojos=combine_fee,
+                        _authority_fee_coin_ids=(
+                            coin_ids
+                            if combine_fee > 0 and wallet_id == self.xch_wallet_id
+                            else None
+                        ),
+                        _prep_contract=prep_contract,
+                    )
                 if not self._sage_submit_succeeded(result):
-                    self.log(f"ERROR: Sage {name} /combine was not accepted")
+                    self.log(f"ERROR: Sage {name} exact combine was not accepted")
                     return False
                 submitted_any = True
                 self._sage_consolidation_submitted = True
@@ -3476,9 +3572,14 @@ class CoinPrepWorker:
             initial_count = len(target_inputs)
             max_inputs = self._sage_consolidation_max_inputs_per_tx()
             if initial_count > max_inputs:
+                combine_route = (
+                    "exact transactions"
+                    if wallet_id == self.cat_wallet_id and self._tx_fee_mojos() > 0
+                    else "/combine transactions"
+                )
                 self.log(
-                    f"Combining {initial_count} {name} coins via staged /combine "
-                    f"transactions (max {max_inputs} inputs each)..."
+                    f"Combining {initial_count} {name} coins via staged "
+                    f"{combine_route} (max {max_inputs} inputs each)..."
                 )
 
             while len(target_inputs) > max_inputs:
@@ -3487,11 +3588,7 @@ class CoinPrepWorker:
                 if before_count - batch_size == 1:
                     batch_size -= 1
                 batch = target_inputs[:batch_size]
-                combine_fee = (
-                    self._priority_combine_fee_mojos(len(batch))
-                    if wallet_id == self.xch_wallet_id
-                    else 0
-                )
+                combine_fee = self._priority_combine_fee_mojos(len(batch))
                 target_count = before_count - len(batch) + 1
                 self.log(
                     f"Combining staged {name} batch ({len(batch)} coins, "
@@ -3526,13 +3623,14 @@ class CoinPrepWorker:
                 )
                 return True
 
-            combine_fee = (
-                self._priority_combine_fee_mojos(len(target_inputs))
-                if wallet_id == self.xch_wallet_id
-                else 0
+            combine_fee = self._priority_combine_fee_mojos(len(target_inputs))
+            combine_route = (
+                "exact transaction"
+                if wallet_id == self.cat_wallet_id and combine_fee > 0
+                else "/combine"
             )
             self.log(
-                f"Combining final {len(target_inputs)} {name} coins via /combine "
+                f"Combining final {len(target_inputs)} {name} coins via {combine_route} "
                 f"(fee={combine_fee:,} mojos)..."
             )
             if not _submit_combine(target_inputs, "coin_prep.combine"):

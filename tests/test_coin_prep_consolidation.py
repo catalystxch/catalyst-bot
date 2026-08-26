@@ -824,35 +824,76 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         self.assertEqual(waits, [(2, "CAT", 74, 25)])
         self.assertEqual(calls[1][0], "0x" + "ff" * 32)
 
-    def test_sage_cat_combine_does_not_request_auto_selected_xch_fee(self):
-        fee_calls = []
+    def test_sage_cat_combine_binds_an_exact_xch_fee_coin(self):
+        exact_calls = []
+        native_calls = []
+        asset_id = "bb" * 32
+        os.environ["CAT_ASSET_ID"] = asset_id
         records = [
             {"coin_id": "0x" + f"{i:064x}", "spent_block_index": 0, "amount": 100}
             for i in range(1, 3)
+        ]
+        fee_coin_id = "0x" + "aa" * 32
+        prepared_tier_coin_id = "0x" + "cc" * 32
+        xch_records = [
+            {
+                "coin_id": prepared_tier_coin_id,
+                "spent_block_index": 0,
+                "amount": 200_000_000,
+            },
+            {
+                "coin_id": fee_coin_id,
+                "spent_block_index": 0,
+                "amount": 500_000_000,
+            },
         ]
 
         fake_wallet_sage = types.ModuleType("wallet_sage")
         fake_wallet_sage.get_current_key = lambda: {"fingerprint": "123"}
         fake_wallet_sage.get_spendable_coins_rpc = lambda wallet_id: {
             "success": True,
-            "confirmed_records": records,
+            "confirmed_records": (records if wallet_id == 2 else list(xch_records)),
+        }
+        fake_wallet_sage.get_next_address = lambda wallet_id, new_address=False: {
+            "address": "xch1exactfee"
         }
 
         def combine_coins(coin_ids, fee_mojos=0):
-            fee_calls.append(fee_mojos)
+            native_calls.append({"coin_ids": list(coin_ids), "fee_mojos": fee_mojos})
             return {
                 "success": True,
                 "submitted": True,
                 "transaction_id": "1" * 64,
             }
 
+        def create_transaction_rpc(selected_coin_ids, actions, auto_submit=True):
+            exact_calls.append(
+                {
+                    "selected_coin_ids": list(selected_coin_ids),
+                    "actions": list(actions),
+                    "auto_submit": auto_submit,
+                }
+            )
+            return {
+                "success": True,
+                "submitted": True,
+                "transaction_id": "2" * 64,
+            }
+
         fake_wallet_sage.combine_coins = combine_coins
+        fake_wallet_sage.create_transaction_rpc = create_transaction_rpc
         sys.modules["wallet_sage"] = fake_wallet_sage
 
         worker = self.coin_prep_worker.CoinPrepWorker()
         worker.xch_wallet_id = 1
         worker.cat_wallet_id = 2
         worker._tx_fee_mojos = lambda: 13_079_100
+        worker.tier_enabled = True
+        worker.tier_order = ["inner"]
+        worker.xch_tier_counts = {"inner": 1}
+        worker.tier_xch_sizes = {"inner": Decimal("0.0002")}
+        logs = []
+        worker.log = lambda message: logs.append(str(message))
 
         def dispatch(_operation, callback, *args, **kwargs):
             callback_kwargs = {
@@ -863,7 +904,38 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker._call_wallet_mutation = dispatch
 
         self.assertTrue(worker._consolidate_wallet_sage_combine(2, "CAT"))
-        self.assertEqual(fee_calls, [0])
+        self.assertEqual(native_calls, [])
+        self.assertTrue(any("fee=100,000,000 mojos" in message for message in logs))
+        self.assertEqual(
+            exact_calls,
+            [
+                {
+                    "selected_coin_ids": [
+                        *[record["coin_id"] for record in records],
+                        fee_coin_id,
+                    ],
+                    "actions": [
+                        {
+                            "type": "send",
+                            "id": {"type": "existing", "asset_id": asset_id},
+                            "address": "xch1exactfee",
+                            "amount": "200",
+                            "memos": [],
+                        },
+                        {"type": "fee", "amount": "100000000"},
+                    ],
+                    "auto_submit": True,
+                }
+            ],
+        )
+
+        xch_records[:] = [xch_records[0]]
+        exact_calls.clear()
+        self.assertFalse(worker._consolidate_wallet_sage_combine(2, "CAT"))
+        self.assertEqual(exact_calls, [])
+        self.assertTrue(
+            any("safe unmatched XCH fee input" in message for message in logs)
+        )
 
     def test_sage_large_combine_never_leaves_singleton_batch(self):
         initial_records = [
