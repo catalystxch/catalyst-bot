@@ -1757,6 +1757,14 @@ def _authorize_desktop_startup() -> bool:
         )
         return False
     except Exception:
+        _startup_diagnostics_status = _diagnostics_status_from_authorization(
+            {
+                "allowed": False,
+                "reason_code": "STARTUP_INITIALIZATION_FAILED",
+                "failed_check": "startup_initialization",
+                "blocker_counts": {},
+            }
+        )
         return False
     finally:
         arbiter.release()
