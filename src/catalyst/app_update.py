@@ -54,6 +54,7 @@ _UPDATE_STATUS: Dict[str, Any] = {
 }
 _RELAUNCH_INTENT_FILE = "update_relaunch_intent.json"
 _RELAUNCH_INTENT_MAX_AGE_SECONDS = 6 * 3600
+_WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7F7C8A3-5E1A-4D9B-9F43-CC51A3B9D2E7}_is1"
 
 
 def _ensure_v_tag(tag: str) -> str:
@@ -612,8 +613,46 @@ def _windows_path_is_within(path: str, root: str) -> bool:
         return False
 
 
+def _registered_windows_install_scope(app_exe: str) -> Optional[str]:
+    """Return the scope whose uninstall registration owns ``app_exe``."""
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    views = [0]
+    for flag_name in ("KEY_WOW64_32KEY", "KEY_WOW64_64KEY"):
+        flag = int(getattr(winreg, flag_name, 0) or 0)
+        if flag and flag not in views:
+            views.append(flag)
+
+    for root, scope in (
+        (winreg.HKEY_CURRENT_USER, "/CURRENTUSER"),
+        (winreg.HKEY_LOCAL_MACHINE, "/ALLUSERS"),
+    ):
+        for view in views:
+            try:
+                access = int(getattr(winreg, "KEY_READ", 0) or 0) | view
+                with winreg.OpenKey(
+                    root,
+                    _WINDOWS_UNINSTALL_KEY,
+                    0,
+                    access,
+                ) as key:
+                    location, _value_type = winreg.QueryValueEx(key, "InstallLocation")
+            except OSError:
+                continue
+            if location and _windows_path_is_within(app_exe, str(location)):
+                return scope
+    return None
+
+
 def _windows_installer_scope_arg(app_exe: str) -> str:
     """Keep an in-app upgrade in the running executable's install scope."""
+    registered_scope = _registered_windows_install_scope(app_exe)
+    if registered_scope:
+        return registered_scope
+
     local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
     if local_app_data and _windows_path_is_within(app_exe, local_app_data):
         return "/CURRENTUSER"

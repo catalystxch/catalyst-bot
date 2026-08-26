@@ -303,6 +303,18 @@ class TestAppUpdateSecurity(unittest.TestCase):
         self.assertIn("/CURRENTUSER", helper_text)
         self.assertNotIn("/ALLUSERS", helper_text)
 
+    def test_installer_scope_uses_registration_for_custom_machine_directory(self):
+        with patch.object(
+            app_update,
+            "_registered_windows_install_scope",
+            return_value="/ALLUSERS",
+        ):
+            scope = app_update._windows_installer_scope_arg(
+                r"D:\Apps\CATalyst\Catalyst.exe"
+            )
+
+        self.assertEqual(scope, "/ALLUSERS")
+
     def test_launch_installer_verifies_target_version_before_relaunch(self):
         with (
             tempfile.TemporaryDirectory() as td,
