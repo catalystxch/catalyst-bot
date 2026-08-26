@@ -127,6 +127,7 @@ WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1000
 WINDOW_MIN_WIDTH = 1000
 WINDOW_MIN_HEIGHT = 700
+_startup_diagnostics_status = None
 
 
 def _configure_linux_webengine_env() -> None:
@@ -1315,17 +1316,21 @@ def _reserve_diagnostics_server_port():
 
 
 def run_read_only_diagnostics_mode(
-    reservation, *, ready_callback=None, lifetime_seconds=300
+    reservation, *, ready_callback=None, lifetime_seconds=300, status_override=None
 ) -> None:
     """Serve diagnostics without constructing the bot or acquiring a lease."""
 
     import read_only_diagnostics
 
-    read_only_diagnostics.serve(
-        reservation=reservation,
-        ready_callback=ready_callback,
-        lifetime_seconds=lifetime_seconds,
-    )
+    serve_kwargs = {
+        "reservation": reservation,
+        "ready_callback": ready_callback,
+        "lifetime_seconds": lifetime_seconds,
+    }
+    denial = _startup_diagnostics_status if status_override is None else status_override
+    if denial is not None:
+        serve_kwargs["startup_denial"] = denial
+    read_only_diagnostics.serve(**serve_kwargs)
 
 
 def run_read_only_diagnostics_desktop_mode(reservation) -> None:
@@ -1696,11 +1701,29 @@ def _initialize_startup_ownership() -> dict:
             # Provider readback recovery is exact and fail-closed. Keep the
             # diagnostics blocker when the public offer cannot be proven.
             pass
+    if authorization.get("allowed") is False and authorization.get(
+        "reason_code"
+    ) in {
+        "RESERVATION_RECONCILIATION_REQUIRED",
+        "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
+        "UNRESOLVED_OPERATIONS",
+    }:
+        try:
+            recovery = api_server.recover_legacy_startup_reservations()
+            if recovery.get("recovered", 0) > 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Legacy migration is proof-bound and fail-closed. Preserve the
+            # original durable startup reason when Sage evidence is missing.
+            pass
     return authorization
 
 
 def _authorize_desktop_startup() -> bool:
     """Serialize durable inspection through schema and lease acquisition."""
+
+    global _startup_diagnostics_status
+    _startup_diagnostics_status = None
 
     from read_only_diagnostics import (
         acquire_startup_arbiter,
@@ -1727,13 +1750,57 @@ def _authorize_desktop_startup() -> bool:
         try:
             import api_server
 
-            return api_server.activate_wallet_setup_bootstrap(authorization)
+            if api_server.activate_wallet_setup_bootstrap(authorization):
+                return True
         except Exception:
-            return False
+            pass
+        _startup_diagnostics_status = _diagnostics_status_from_authorization(
+            authorization
+        )
+        return False
     except Exception:
         return False
     finally:
         arbiter.release()
+
+
+def _diagnostics_status_from_authorization(authorization) -> dict:
+    """Keep only bounded, non-secret fields from a failed startup decision."""
+
+    reason = str(authorization.get("reason_code") or "")
+    if not (reason.isascii() and reason.isupper() and len(reason) <= 64):
+        reason = "STARTUP_AUTHORIZATION_FAILED"
+    failed_check = str(authorization.get("failed_check") or "")
+    if not (
+        failed_check.isascii()
+        and len(failed_check) <= 64
+        and failed_check.replace("_", "").isalnum()
+    ):
+        failed_check = "startup_authorization"
+    allowed_count_names = {
+        "operations",
+        "prepared_creations",
+        "submitted_cancels",
+        "contradictory_history",
+        "reservations",
+        "publication_claims",
+    }
+    counts = {}
+    supplied_counts = authorization.get("blocker_counts")
+    if isinstance(supplied_counts, dict):
+        for name in allowed_count_names:
+            value = supplied_counts.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counts[name] = min(value, 1_000_000)
+    return {
+        "allowed": False,
+        "reason_code": reason,
+        "source": failed_check,
+        "recovery": {
+            "failed_check": failed_check,
+            "blocker_counts": counts,
+        },
+    }
 
 
 def main(argv=None):

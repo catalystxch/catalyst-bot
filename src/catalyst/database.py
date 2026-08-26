@@ -9772,6 +9772,47 @@ def get_coin_state(coin_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
+def get_legacy_startup_reservation_candidates(
+    *, limit: int = 128
+) -> List[Dict[str, Any]]:
+    """Return bounded legacy open offers that exactly own a locked coin.
+
+    This is a read-only migration inventory. It never treats the legacy
+    projection as terminal evidence; callers must prove the offer's state
+    through the wallet before Task 9 may mutate the row or release its coin.
+    """
+
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    if safe_limit > 128:
+        raise ValueError("legacy startup reservation limit exceeds hard limit")
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT o.*, c.purpose AS coin_purpose
+            FROM offers AS o
+            JOIN coins AS c ON c.coin_id=o.coin_id
+            WHERE o.status='open'
+              AND c.status='locked'
+              AND c.trade_id=o.trade_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM offer_intents AS i
+                  WHERE (i.sage_trade_id=o.trade_id
+                         OR i.intent_id='legacy-startup:' || o.trade_id)
+                    AND i.purpose<>'legacy_startup_migration'
+              )
+            ORDER BY o.created_at, o.trade_id
+            LIMIT ?
+            """,
+            (safe_limit + 1,),
+        )
+        .fetchall()
+    )
+    if len(rows) > safe_limit:
+        raise RuntimeError("legacy startup reservation inventory exceeds hard limit")
+    return [dict(row) for row in rows]
+
+
 def get_unlinked_open_offer_coins(*, limit: int = 50) -> List[Dict[str, Any]]:
     """Return open offers whose selected legacy coin lock needs re-linking."""
 
@@ -23117,6 +23158,17 @@ def commit_offer_reconciliation(
                 UPDATE coins
                 SET status='spent', designation='unknown', assigned_tier='none', purpose=NULL,
                     last_seen=?
+                WHERE coin_id IN ({placeholders}) AND status='locked'
+                  AND trade_id=?
+                """,
+                (when, *selected_registry, trade_id),
+            )
+        elif safe_classification == "EXPIRED_PROVEN" and safe_height is not None:
+            conn.execute(
+                f"""
+                UPDATE coins
+                SET status='spent', designation='unknown', assigned_tier='none',
+                    purpose=NULL, last_seen=?
                 WHERE coin_id IN ({placeholders}) AND status='locked'
                   AND trade_id=?
                 """,

@@ -636,6 +636,66 @@ def read_safety_status(path: Path | None = None) -> dict[str, Any]:
                 pass
 
 
+def merge_startup_denial(
+    durable_status: dict[str, Any], startup_denial: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay a specific failed startup check on a generic idle-lease result."""
+
+    if durable_status.get("reason_code") != "LEASE_UNAVAILABLE":
+        return durable_status
+    if not isinstance(startup_denial, dict) or startup_denial.get("allowed") is not False:
+        return durable_status
+    reason = startup_denial.get("reason_code")
+    source = startup_denial.get("source")
+    if not (
+        isinstance(reason, str)
+        and reason.isascii()
+        and reason.isupper()
+        and len(reason) <= 64
+    ):
+        return durable_status
+    if not (
+        isinstance(source, str)
+        and source.isascii()
+        and len(source) <= 64
+        and source.replace("_", "").isalnum()
+    ):
+        return durable_status
+    merged = dict(durable_status)
+    merged.update(
+        {
+            "allowed": False,
+            "reason_code": reason,
+            "source": source,
+        }
+    )
+    recovery = startup_denial.get("recovery")
+    if isinstance(recovery, dict):
+        safe_counts = {}
+        supplied_counts = recovery.get("blocker_counts")
+        if isinstance(supplied_counts, dict):
+            for name in (
+                "operations",
+                "prepared_creations",
+                "submitted_cancels",
+                "contradictory_history",
+                "reservations",
+                "publication_claims",
+            ):
+                value = supplied_counts.get(name)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
+                    safe_counts[name] = min(value, 1_000_000)
+        merged["recovery"] = {
+            "failed_check": source,
+            "blocker_counts": safe_counts,
+        }
+    return merged
+
+
 _DIAGNOSTICS_HTML = b"""<!doctype html>
 <html lang="en">
 <head>
@@ -709,7 +769,7 @@ _DIAGNOSTICS_HTML = b"""<!doctype html>
 """
 
 
-def _handler(database: Path):
+def _handler(database: Path, startup_denial: dict[str, Any] | None = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "CATalystDiagnostics"
         sys_version = ""
@@ -749,8 +809,11 @@ def _handler(database: Path):
                 self._html(200, _DIAGNOSTICS_HTML)
                 return
             if request_path == "/api/safety/status":
+                safety = merge_startup_denial(
+                    read_safety_status(database), startup_denial
+                )
                 self._json(
-                    200, {"success": True, "safety": read_safety_status(database)}
+                    200, {"success": True, "safety": safety}
                 )
                 return
             self._locked()
@@ -794,6 +857,7 @@ def serve(
     reservation: LoopbackPortReservation | None = None,
     ready_callback=None,
     lifetime_seconds: float | None = None,
+    startup_denial: dict[str, Any] | None = None,
 ) -> None:
     if reservation is None:
         if port is None:
@@ -801,7 +865,7 @@ def serve(
         reservation = reserve_loopback_port(port, search_limit=0)
     target = Path(path) if path is not None else database_path()
     try:
-        server = reservation.into_http_server(_handler(target))
+        server = reservation.into_http_server(_handler(target, startup_denial))
     except BaseException:
         reservation.release()
         raise

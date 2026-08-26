@@ -456,6 +456,18 @@ def api_sage_set_fingerprint():
             return jsonify({"success": False, "error": "Invalid fingerprint"}), 400
 
         if api_server.wallet_setup_bootstrap_active():
+            pinned_fingerprint = api_server.wallet_setup_bootstrap_fingerprint()
+            if pinned_fingerprint and fingerprint != pinned_fingerprint:
+                return jsonify(
+                    {
+                        "success": False,
+                        "fingerprint": fingerprint,
+                        "error": (
+                            "Existing CATalyst data is bound to a different "
+                            "Sage fingerprint"
+                        ),
+                    }
+                ), 409
             identities = chia_node.get_available_wallet_identities()
             identity = next(
                 (

@@ -9001,6 +9001,40 @@ def test_exact_expiry_proof_persists_terminal_and_releases_selected_coin(
     )
 
 
+def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(
+    isolated_database,
+):
+    """An expired offer's source may have been reused after it unlocked."""
+
+    _persist_created_offer()
+    evidence = _evidence(
+        offers=[_offer(status="expired", transaction_id="")],
+        transactions=[],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                offer_id=None,
+                spent_height=99,
+            )
+        },
+    )
+
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+
+    assert result["classification"] == EXPIRED_PROVEN
+    assert result["reason_code"] == (
+        "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF"
+    )
+    assert result["subsequent_spent_height"] == 99
+    assert result["applied"] is True
+    assert database.get_offer(TRADE)["status"] == "expired"
+    coin = database.get_coin_state(COIN)
+    assert coin["status"] == "spent"
+    assert coin["trade_id"] == TRADE
+
+
 def test_expired_selected_coin_requires_exact_release_then_may_be_reserved_again(
     isolated_database,
 ):
