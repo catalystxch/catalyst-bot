@@ -7027,6 +7027,14 @@ def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> d
     """Build an isolated process environment without starting real CAT resolution."""
 
     data_dir.mkdir()
+    # These tests exercise first database/lease ownership, not legacy install-dir
+    # migration.  A developer worktree may legitimately contain ignored runtime
+    # state from packaged-app testing; prevent that state from being copied into
+    # the isolated child profile and changing its startup authorization.
+    (data_dir / ".migration_complete").write_text(
+        "Standalone mutation-gate test profile; legacy migration disabled.\n",
+        encoding="utf-8",
+    )
     (data_dir / ".env").write_text(
         "WALLET_TYPE=sage\n"
         "SAGE_FINGERPRINT=161616161\n"

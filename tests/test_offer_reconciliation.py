@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import sqlite3
 import socket
 import sys
 import threading
@@ -9031,6 +9032,198 @@ def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(
     coin = database.get_coin_state(COIN)
     assert coin["status"] == "spent"
     assert coin["trade_id"] == TRADE
+    outcome = (
+        database.get_connection()
+        .execute(
+            "SELECT outcome, disposition FROM offer_reconciliation_coin_outcomes "
+            "WHERE coin_id=? AND terminal_event_id=?",
+            (
+                database.norm_coin_id(COIN),
+                "reconcile:intent-task9:attempt:1:finalized",
+            ),
+        )
+        .fetchone()
+    )
+    assert dict(outcome) == {
+        "outcome": EXPIRED_PROVEN,
+        "disposition": "spent",
+    }
+
+    # The immutable subsequent-spend proof must remain authoritative even if a
+    # damaged mutable projection later makes the coin look free.
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE coins SET status='free', trade_id=NULL WHERE coin_id=?",
+        (database.norm_coin_id(COIN),),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="authoritative terminal coin outcome"):
+        _prepare_replacement_with_coin(COIN, "expired-subsequent-spend")
+
+
+def test_schema_upgrade_promotes_legacy_subsequent_spend_authority(tmp_path):
+    """Upgrade the pre-fix released row without breaking quarantine FKs."""
+
+    conn = sqlite3.connect(tmp_path / "legacy-coin-outcomes.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE offer_operation_journal (
+            event_id TEXT PRIMARY KEY,
+            reason_code TEXT,
+            evidence_json TEXT NOT NULL
+        );
+        CREATE TABLE offer_reconciliation_coin_outcomes (
+            outcome_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id TEXT NOT NULL,
+            intent_id TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(
+                outcome IN (
+                    'FILLED_PROVEN', 'CANCELLED_PROVEN', 'EXPIRED_PROVEN'
+                )
+            ),
+            disposition TEXT NOT NULL CHECK(
+                disposition IN ('spent', 'released')
+            ),
+            terminal_event_id TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+            recorded_at TEXT NOT NULL,
+            UNIQUE(terminal_event_id, coin_id),
+            CHECK(
+                (outcome IN ('FILLED_PROVEN', 'CANCELLED_PROVEN')
+                    AND disposition='spent')
+                OR (outcome='EXPIRED_PROVEN' AND disposition='released')
+            )
+        );
+        CREATE TABLE offer_reconciliation_coin_outcome_quarantine (
+            outcome_sequence INTEGER PRIMARY KEY,
+            reason_code TEXT NOT NULL,
+            FOREIGN KEY(outcome_sequence)
+                REFERENCES offer_reconciliation_coin_outcomes(outcome_sequence)
+        );
+        """
+    )
+    evidence_json = json.dumps(
+        {
+            "classification": {
+                "classification": EXPIRED_PROVEN,
+                "reason_code": ("AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF"),
+                "input_coins_owned_unlocked": False,
+                "subsequent_spent_height": 99,
+                "block_height": 99,
+            }
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    event_id = "reconcile:legacy:attempt:1:finalized"
+    conn.execute(
+        "INSERT INTO offer_operation_journal VALUES (?,?,?)",
+        (
+            event_id,
+            "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF",
+            evidence_json,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO offer_reconciliation_coin_outcomes "
+        "(coin_id,intent_id,trade_id,outcome,disposition,terminal_event_id,"
+        "evidence_sha256,recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+        (COIN, "legacy", TRADE, EXPIRED_PROVEN, "released", event_id, "a" * 64, AT),
+    )
+    conn.execute(
+        "INSERT INTO offer_reconciliation_coin_outcome_quarantine VALUES (?,?)",
+        (1, "fixture"),
+    )
+
+    database._upgrade_expired_subsequent_spend_outcome_schema(conn)
+
+    upgraded = conn.execute(
+        "SELECT disposition FROM offer_reconciliation_coin_outcomes "
+        "WHERE outcome_sequence=1"
+    ).fetchone()
+    assert upgraded["disposition"] == "spent"
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    foreign_key = conn.execute(
+        "PRAGMA foreign_key_list(offer_reconciliation_coin_outcome_quarantine)"
+    ).fetchone()
+    assert foreign_key["table"] == "offer_reconciliation_coin_outcomes"
+    conn.close()
+
+
+def test_subsequent_spend_expiry_can_follow_existing_permanent_outcome(tmp_path):
+    """Historical expiry recovery must not overwrite or reject a later spend."""
+
+    conn = sqlite3.connect(tmp_path / "existing-permanent-spend.db")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE offer_reconciliation_coin_outcomes (
+            outcome_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin_id TEXT NOT NULL,
+            intent_id TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            terminal_event_id TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(terminal_event_id, coin_id)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO offer_reconciliation_coin_outcomes "
+        "(coin_id,intent_id,trade_id,outcome,disposition,terminal_event_id,"
+        "evidence_sha256,recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            database.norm_coin_id(COIN),
+            "later-fill",
+            OTHER_TRADE,
+            FILLED_PROVEN,
+            "spent",
+            "reconcile:later-fill:attempt:1:finalized",
+            "b" * 64,
+            AFTER,
+        ),
+    )
+    classification = {
+        "classification": EXPIRED_PROVEN,
+        "reason_code": "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF",
+        "input_coins_owned_unlocked": False,
+        "subsequent_spent_height": 99,
+        "block_height": 99,
+    }
+    database._insert_authoritative_coin_outcomes(
+        conn,
+        intent_id="legacy-expiry",
+        trade_id=TRADE,
+        selected_coin_ids=[database.norm_coin_id(COIN)],
+        event={
+            "outcome": EXPIRED_PROVEN,
+            "reason_code": "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF",
+            "event_id": "reconcile:legacy-expiry:attempt:1:finalized",
+            "evidence_sha256": "c" * 64,
+            "evidence_json": json.dumps(
+                {"classification": classification},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+        recorded_at=RECONCILED,
+    )
+
+    outcomes = conn.execute(
+        "SELECT intent_id, disposition FROM offer_reconciliation_coin_outcomes "
+        "ORDER BY outcome_sequence"
+    ).fetchall()
+    assert [tuple(row) for row in outcomes] == [
+        ("later-fill", "spent"),
+        ("legacy-expiry", "spent"),
+    ]
+    conn.close()
 
 
 def test_expired_selected_coin_requires_exact_release_then_may_be_reserved_again(

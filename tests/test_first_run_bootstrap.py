@@ -7,6 +7,8 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import api_server
+
 
 def _import_desktop_app(monkeypatch):
     """Import without letting Windows stream setup detach pytest capture."""

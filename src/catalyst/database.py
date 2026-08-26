@@ -1694,7 +1694,10 @@ CREATE TABLE IF NOT EXISTS offer_reconciliation_coin_outcomes (
     UNIQUE(terminal_event_id, coin_id),
     CHECK(
         (outcome IN ('FILLED_PROVEN', 'CANCELLED_PROVEN') AND disposition='spent')
-        OR (outcome='EXPIRED_PROVEN' AND disposition='released')
+        OR (
+            outcome='EXPIRED_PROVEN'
+            AND disposition IN ('released', 'spent')
+        )
     )
 );
 CREATE INDEX IF NOT EXISTS idx_offer_reconciliation_coin_outcomes_latest
@@ -1746,6 +1749,54 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'coin outcome lacks canonical selected-cohort proof');
+END;
+
+CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_disposition_guard_v3
+BEFORE INSERT ON offer_reconciliation_coin_outcomes
+WHEN NOT (
+    (NEW.outcome IN ('FILLED_PROVEN', 'CANCELLED_PROVEN')
+        AND NEW.disposition='spent')
+    OR (
+        NEW.outcome='EXPIRED_PROVEN'
+        AND NEW.disposition=CASE WHEN EXISTS (
+            SELECT 1
+              FROM offer_operation_journal AS event
+             WHERE event.event_id=NEW.terminal_event_id
+               AND event.reason_code=
+                   'AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+               AND json_valid(event.evidence_json)
+               AND json_extract(
+                       event.evidence_json,
+                       '$.classification.classification'
+                   )='EXPIRED_PROVEN'
+               AND json_extract(
+                       event.evidence_json,
+                       '$.classification.reason_code'
+                   )='AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+               AND json_type(
+                       event.evidence_json,
+                       '$.classification.block_height'
+                   )='integer'
+               AND json_extract(
+                       event.evidence_json,
+                       '$.classification.block_height'
+                   )>0
+               AND json_extract(
+                       event.evidence_json,
+                       '$.classification.subsequent_spent_height'
+                   )=json_extract(
+                       event.evidence_json,
+                       '$.classification.block_height'
+                   )
+               AND json_extract(
+                       event.evidence_json,
+                       '$.classification.input_coins_owned_unlocked'
+                   )=0
+        ) THEN 'spent' ELSE 'released' END
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'coin outcome disposition lacks terminal proof');
 END;
 
 CREATE TABLE IF NOT EXISTS offer_reconciliation_coin_outcome_quarantine (
@@ -4838,6 +4889,33 @@ def _backfill_authoritative_sweep_active_queues(
 
 
 _MAX_AUTHORITATIVE_COIN_OUTCOME_BACKFILL = 4096
+_EXPIRY_SUBSEQUENT_SPEND_REASON = "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF"
+
+
+def _expired_outcome_has_subsequent_spend_proof(event: Dict[str, Any]) -> bool:
+    """Return whether an expired terminal event also proves its input spent later."""
+
+    if (
+        event.get("outcome") != "EXPIRED_PROVEN"
+        or event.get("reason_code") != _EXPIRY_SUBSEQUENT_SPEND_REASON
+    ):
+        return False
+    try:
+        evidence = json.loads(event["evidence_json"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    classification = evidence.get("classification")
+    if type(classification) is not dict:
+        return False
+    block_height = classification.get("block_height")
+    return (
+        classification.get("classification") == "EXPIRED_PROVEN"
+        and classification.get("reason_code") == _EXPIRY_SUBSEQUENT_SPEND_REASON
+        and type(block_height) is int
+        and block_height > 0
+        and classification.get("subsequent_spent_height") == block_height
+        and classification.get("input_coins_owned_unlocked") is False
+    )
 
 
 def _insert_authoritative_coin_outcomes(
@@ -4858,6 +4936,9 @@ def _insert_authoritative_coin_outcomes(
         "CANCELLED_PROVEN": "spent",
         "EXPIRED_PROVEN": "released",
     }.get(outcome)
+    expired_subsequent_spend = _expired_outcome_has_subsequent_spend_proof(event)
+    if expired_subsequent_spend:
+        disposition = "spent"
     if disposition is None:
         raise ValueError("coin outcome requires authoritative terminal proof")
     if (
@@ -4895,7 +4976,9 @@ def _insert_authoritative_coin_outcomes(
             "ORDER BY outcome_sequence DESC LIMIT 1",
             (coin_id,),
         ).fetchone()
-        if permanent is not None and not allow_historical_conflict:
+        if permanent is not None and not (
+            allow_historical_conflict or expired_subsequent_spend
+        ):
             raise RuntimeError(
                 "permanent authoritative coin spend cannot be superseded"
             )
@@ -5384,6 +5467,129 @@ def _reassert_unresolved_wallet_effect_claims(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _upgrade_expired_subsequent_spend_outcome_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """Permit proof-bound spent outcomes for historically expired inputs."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='offer_reconciliation_coin_outcomes'"
+    ).fetchone()
+    if row is None:
+        return
+    schema_sql = "".join(str(row["sql"] or "").lower().split())
+    if "dispositionin('released','spent')" in schema_sql:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute(
+            """
+            CREATE TABLE offer_reconciliation_coin_outcomes_v3 (
+                outcome_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                intent_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(
+                    outcome IN (
+                        'FILLED_PROVEN', 'CANCELLED_PROVEN', 'EXPIRED_PROVEN'
+                    )
+                ),
+                disposition TEXT NOT NULL CHECK(
+                    disposition IN ('spent', 'released')
+                ),
+                terminal_event_id TEXT NOT NULL,
+                evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+                recorded_at TEXT NOT NULL,
+                UNIQUE(terminal_event_id, coin_id),
+                CHECK(
+                    (outcome IN ('FILLED_PROVEN', 'CANCELLED_PROVEN')
+                        AND disposition='spent')
+                    OR (
+                        outcome='EXPIRED_PROVEN'
+                        AND disposition IN ('released', 'spent')
+                    )
+                )
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO offer_reconciliation_coin_outcomes_v3 (
+                outcome_sequence, coin_id, intent_id, trade_id, outcome,
+                disposition, terminal_event_id, evidence_sha256, recorded_at
+            )
+            SELECT
+                outcome.outcome_sequence,
+                outcome.coin_id,
+                outcome.intent_id,
+                outcome.trade_id,
+                outcome.outcome,
+                CASE
+                    WHEN outcome.outcome='EXPIRED_PROVEN'
+                     AND EXISTS (
+                        SELECT 1
+                          FROM offer_operation_journal AS event
+                         WHERE event.event_id=outcome.terminal_event_id
+                           AND event.reason_code=
+                               'AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+                           AND json_valid(event.evidence_json)
+                           AND json_extract(
+                                   event.evidence_json,
+                                   '$.classification.classification'
+                               )='EXPIRED_PROVEN'
+                           AND json_extract(
+                                   event.evidence_json,
+                                   '$.classification.reason_code'
+                               )=
+                               'AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+                           AND json_type(
+                                   event.evidence_json,
+                                   '$.classification.block_height'
+                               )='integer'
+                           AND json_extract(
+                                   event.evidence_json,
+                                   '$.classification.block_height'
+                               )>0
+                           AND json_extract(
+                                   event.evidence_json,
+                                   '$.classification.subsequent_spent_height'
+                               )=json_extract(
+                                   event.evidence_json,
+                                   '$.classification.block_height'
+                               )
+                           AND json_extract(
+                                   event.evidence_json,
+                                   '$.classification.input_coins_owned_unlocked'
+                               )=0
+                    ) THEN 'spent'
+                    ELSE outcome.disposition
+                END,
+                outcome.terminal_event_id,
+                outcome.evidence_sha256,
+                outcome.recorded_at
+              FROM offer_reconciliation_coin_outcomes AS outcome
+             ORDER BY outcome.outcome_sequence
+            """
+        )
+        conn.execute("DROP TABLE offer_reconciliation_coin_outcomes")
+        conn.execute(
+            "ALTER TABLE offer_reconciliation_coin_outcomes_v3 "
+            "RENAME TO offer_reconciliation_coin_outcomes"
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("coin outcome schema upgrade broke foreign keys")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -5392,6 +5598,7 @@ def _migrate_stability_schema() -> None:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
+        _upgrade_expired_subsequent_spend_outcome_schema(conn)
         existing_tables = {
             str(row[0])
             for row in conn.execute(
@@ -8518,10 +8725,43 @@ def _validated_coin_outcome_predicate(alias: str = "permanent_outcome") -> str:
                 AND intent.sage_trade_id={alias}.trade_id
                 AND intent.selected_coin_ids_sha256=
                     catalyst_selected_coin_digest(intent.selected_coin_ids_json)
-                AND {alias}.disposition=CASE {alias}.outcome
-                    WHEN 'FILLED_PROVEN' THEN 'spent'
-                    WHEN 'CANCELLED_PROVEN' THEN 'spent'
-                    WHEN 'EXPIRED_PROVEN' THEN 'released'
+                AND {alias}.disposition=CASE
+                    WHEN {alias}.outcome IN (
+                        'FILLED_PROVEN', 'CANCELLED_PROVEN'
+                    ) THEN 'spent'
+                    WHEN {alias}.outcome='EXPIRED_PROVEN'
+                     AND event.reason_code=
+                        'AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+                     AND json_extract(
+                            event.evidence_json,
+                            '$.classification.classification'
+                         )='EXPIRED_PROVEN'
+                     AND json_extract(
+                            event.evidence_json,
+                            '$.classification.reason_code'
+                         )=
+                        'AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF'
+                     AND json_type(
+                            event.evidence_json,
+                            '$.classification.block_height'
+                         )='integer'
+                     AND json_extract(
+                            event.evidence_json,
+                            '$.classification.block_height'
+                         )>0
+                     AND json_extract(
+                            event.evidence_json,
+                            '$.classification.subsequent_spent_height'
+                         )=json_extract(
+                            event.evidence_json,
+                            '$.classification.block_height'
+                         )
+                     AND json_extract(
+                            event.evidence_json,
+                            '$.classification.input_coins_owned_unlocked'
+                         )=0
+                    THEN 'spent'
+                    WHEN {alias}.outcome='EXPIRED_PROVEN' THEN 'released'
                     ELSE '' END
          )"""
 
@@ -10040,6 +10280,8 @@ def _authoritative_coin_outcome(
         "CANCELLED_PROVEN": "spent",
         "EXPIRED_PROVEN": "released",
     }.get(event["outcome"])
+    if _expired_outcome_has_subsequent_spend_proof(event):
+        expected_disposition = "spent"
     selected_json = intent["selected_coin_ids_json"]
     if (
         type(selected_json) is not str

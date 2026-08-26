@@ -3632,8 +3632,13 @@ def promote_wallet_setup_bootstrap() -> dict:
             recovery = recover_legacy_startup_reservations()
             if recovery.get("recovered", 0) > 0:
                 authorization = initialize_mutation_runtime()
-        except Exception:
-            pass
+        except Exception as recovery_error:
+            slog(
+                "SAFETY",
+                "Legacy startup reservation recovery could not complete",
+                {"error_type": type(recovery_error).__name__},
+                level="warning",
+            )
     if authorization.get("allowed") is not True:
         return authorization
     try:
