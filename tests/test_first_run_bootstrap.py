@@ -490,6 +490,116 @@ def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(monkeypatch):
     assert api_server.wallet_setup_bootstrap_active() is False
 
 
+def test_bootstrap_promotion_retries_legacy_recovery_while_sage_restarts(
+    monkeypatch,
+):
+    """A just-upgraded Sage may become ready after the first promotion read."""
+
+    import api_server
+
+    calls = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "RESERVATION_RECONCILIATION_REQUIRED",
+            },
+            {"allowed": True, "reason_code": ""},
+        ]
+    )
+    recoveries = iter(
+        [
+            {"examined": 2, "recovered": 0, "remaining": 2},
+            {"examined": 2, "recovered": 2, "remaining": 0},
+        ]
+    )
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: calls.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: calls.append("legacy_recovery") or next(recoveries),
+    )
+    monkeypatch.setattr(
+        api_server.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+    monkeypatch.setattr(api_server, "create_bot", lambda: calls.append("bot"))
+    monkeypatch.setattr(
+        api_server,
+        "_start_owned_runtime_services",
+        lambda authorization: calls.append(("services", authorization["allowed"])),
+    )
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    result = api_server.promote_wallet_setup_bootstrap()
+
+    assert result["allowed"] is True
+    assert calls == [
+        "authorize",
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+        "authorize",
+        "bot",
+        ("services", True),
+    ]
+    assert api_server.wallet_setup_bootstrap_active() is False
+
+
+def test_bootstrap_promotion_legacy_retry_is_bounded_and_fail_closed(monkeypatch):
+    import api_server
+
+    calls = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "RESERVATION_RECONCILIATION_REQUIRED",
+    }
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: calls.append("authorize") or blocked,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            calls.append("legacy_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "create_bot",
+        lambda: (_ for _ in ()).throw(AssertionError("blocked promotion made a bot")),
+    )
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    result = api_server.promote_wallet_setup_bootstrap()
+
+    assert result == blocked
+    assert calls == [
+        "authorize",
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+    ]
+    assert api_server.wallet_setup_bootstrap_active() is True
+
+
 def test_bootstrap_server_skips_bot_construction_until_identity_is_bound(monkeypatch):
     import api_server
     import database

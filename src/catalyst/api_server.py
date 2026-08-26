@@ -294,6 +294,8 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 _read_only_diagnostics_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
+_LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
+_LEGACY_BOOTSTRAP_RECOVERY_RETRY_DELAY_SECONDS = 1.0
 
 # A first-run desktop has no immutable wallet identity yet, so it cannot own
 # the trading mutation lease. These are the only local setup operations that
@@ -3621,24 +3623,40 @@ def promote_wallet_setup_bootstrap() -> dict:
             "reason_code": "WALLET_IDENTITY_SETUP_NOT_ACTIVE",
         }
     authorization = initialize_mutation_runtime()
-    if authorization.get("allowed") is not True and authorization.get(
-        "reason_code"
-    ) in {
+    legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
-    }:
-        try:
-            recovery = recover_legacy_startup_reservations()
-            if recovery.get("recovered", 0) > 0:
-                authorization = initialize_mutation_runtime()
-        except Exception as recovery_error:
-            slog(
-                "SAFETY",
-                "Legacy startup reservation recovery could not complete",
-                {"error_type": type(recovery_error).__name__},
-                level="warning",
+    }
+    if (
+        authorization.get("allowed") is not True
+        and authorization.get("reason_code") in legacy_recovery_reasons
+    ):
+        for attempt in range(_LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS):
+            recovery = None
+            try:
+                recovery = recover_legacy_startup_reservations()
+                if recovery.get("recovered", 0) > 0:
+                    authorization = initialize_mutation_runtime()
+            except Exception as recovery_error:
+                slog(
+                    "SAFETY",
+                    "Legacy startup reservation recovery could not complete",
+                    {"error_type": type(recovery_error).__name__},
+                    level="warning",
+                )
+            if (
+                authorization.get("allowed") is True
+                or authorization.get("reason_code") not in legacy_recovery_reasons
+            ):
+                break
+            remaining = (
+                recovery.get("remaining") if isinstance(recovery, dict) else None
             )
+            if remaining == 0:
+                break
+            if attempt + 1 < _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
+                time.sleep(_LEGACY_BOOTSTRAP_RECOVERY_RETRY_DELAY_SECONDS)
     if authorization.get("allowed") is not True:
         return authorization
     try:
