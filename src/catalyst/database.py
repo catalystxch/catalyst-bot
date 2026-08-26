@@ -5485,6 +5485,21 @@ def _upgrade_expired_subsequent_spend_outcome_schema(
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
         conn.execute("BEGIN EXCLUSIVE")
+        dependent_trigger_names = (
+            "authoritative_fill_receipts_proof_guard",
+            "offer_reconciliation_coin_outcome_quarantine_guard",
+        )
+        dependent_triggers = conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='trigger' AND name IN (?,?) ORDER BY name",
+            dependent_trigger_names,
+        ).fetchall()
+        for trigger in dependent_triggers:
+            if (
+                trigger[0] not in dependent_trigger_names
+                or not str(trigger[1] or "").strip()
+            ):
+                raise RuntimeError("dependent coin outcome trigger is invalid")
         conn.execute(
             """
             CREATE TABLE offer_reconciliation_coin_outcomes_v3 (
@@ -5574,11 +5589,18 @@ def _upgrade_expired_subsequent_spend_outcome_schema(
              ORDER BY outcome.outcome_sequence
             """
         )
+        # These triggers belong to other tables but read the outcomes table.
+        # SQLite validates their bodies while the replacement table is renamed,
+        # so preserve and rebuild the exact installed definitions atomically.
+        for trigger in dependent_triggers:
+            conn.execute(f'DROP TRIGGER "{trigger[0]}"')
         conn.execute("DROP TABLE offer_reconciliation_coin_outcomes")
         conn.execute(
             "ALTER TABLE offer_reconciliation_coin_outcomes_v3 "
             "RENAME TO offer_reconciliation_coin_outcomes"
         )
+        for trigger in dependent_triggers:
+            conn.execute(str(trigger[1]))
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("coin outcome schema upgrade broke foreign keys")
         conn.commit()

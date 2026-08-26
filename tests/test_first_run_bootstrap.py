@@ -139,6 +139,43 @@ def test_failed_bootstrap_preserves_exact_authorization_for_diagnostics(monkeypa
     }
 
 
+def test_startup_initialization_exception_is_not_reported_as_lease_unavailable(
+    monkeypatch,
+):
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+
+    class Arbiter:
+        acquired = True
+
+        @staticmethod
+        def release():
+            return None
+
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: (_ for _ in ()).throw(RuntimeError("sensitive database detail")),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert desktop_app._startup_diagnostics_status == {
+        "allowed": False,
+        "reason_code": "STARTUP_INITIALIZATION_FAILED",
+        "source": "startup_initialization",
+        "recovery": {
+            "failed_check": "startup_initialization",
+            "blocker_counts": {},
+        },
+    }
+
+
 def test_bootstrap_candidate_requires_unconfigured_identity_and_clean_durable_state(
     monkeypatch,
 ):

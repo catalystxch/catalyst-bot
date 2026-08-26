@@ -9100,9 +9100,33 @@ def test_schema_upgrade_promotes_legacy_subsequent_spend_authority(tmp_path):
         CREATE TABLE offer_reconciliation_coin_outcome_quarantine (
             outcome_sequence INTEGER PRIMARY KEY,
             reason_code TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL,
+            quarantined_at TEXT NOT NULL,
             FOREIGN KEY(outcome_sequence)
                 REFERENCES offer_reconciliation_coin_outcomes(outcome_sequence)
         );
+        CREATE TRIGGER offer_reconciliation_coin_outcome_quarantine_guard
+        BEFORE INSERT ON offer_reconciliation_coin_outcome_quarantine
+        WHEN NOT EXISTS (
+            SELECT 1 FROM offer_reconciliation_coin_outcomes AS outcome
+             WHERE outcome.outcome_sequence=NEW.outcome_sequence
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'coin outcome quarantine evidence is invalid');
+        END;
+        CREATE TABLE authoritative_fill_receipts (
+            terminal_event_id TEXT PRIMARY KEY
+        );
+        CREATE TRIGGER authoritative_fill_receipts_proof_guard
+        BEFORE INSERT ON authoritative_fill_receipts
+        WHEN NOT EXISTS (
+            SELECT 1 FROM offer_reconciliation_coin_outcomes AS outcome
+             WHERE outcome.terminal_event_id=NEW.terminal_event_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'authoritative receipt requires terminal proof');
+        END;
         """
     )
     evidence_json = json.dumps(
@@ -9134,8 +9158,8 @@ def test_schema_upgrade_promotes_legacy_subsequent_spend_authority(tmp_path):
         (COIN, "legacy", TRADE, EXPIRED_PROVEN, "released", event_id, "a" * 64, AT),
     )
     conn.execute(
-        "INSERT INTO offer_reconciliation_coin_outcome_quarantine VALUES (?,?)",
-        (1, "fixture"),
+        "INSERT INTO offer_reconciliation_coin_outcome_quarantine VALUES (?,?,?,?,?)",
+        (1, "fixture", "{}", "b" * 64, AT),
     )
 
     database._upgrade_expired_subsequent_spend_outcome_schema(conn)
@@ -9150,6 +9174,18 @@ def test_schema_upgrade_promotes_legacy_subsequent_spend_authority(tmp_path):
         "PRAGMA foreign_key_list(offer_reconciliation_coin_outcome_quarantine)"
     ).fetchone()
     assert foreign_key["table"] == "offer_reconciliation_coin_outcomes"
+    triggers = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (?,?) "
+        "ORDER BY name",
+        (
+            "authoritative_fill_receipts_proof_guard",
+            "offer_reconciliation_coin_outcome_quarantine_guard",
+        ),
+    ).fetchall()
+    assert [row["name"] for row in triggers] == [
+        "authoritative_fill_receipts_proof_guard",
+        "offer_reconciliation_coin_outcome_quarantine_guard",
+    ]
     conn.close()
 
 
