@@ -1324,6 +1324,42 @@ def _selected_inputs_are_exactly_owned_and_linked(
     return selected_total >= intent["offered_amount"]
 
 
+def _expired_inputs_were_subsequently_spent(
+    intent: dict[str, Any], coins: dict[str, dict[str, Any]]
+) -> int | None:
+    """Prove an expired offer unlocked before its exact inputs were reused.
+
+    Sage retains an authoritative ``expired`` offer row after the formerly
+    locked coin is spent by later wallet activity. In that case the old offer
+    reservation must be retired as spent, never made free again.
+    """
+
+    offered_asset = "xch" if intent["side"] == "buy" else intent["asset_id"]
+    selected_total = 0
+    spent_heights = []
+    for coin_id in intent["selected_coin_ids"]:
+        record = coins.get(coin_id)
+        if record is None:
+            return None
+        amount = _positive_int(record.get("amount"))
+        spent_height = _positive_int(record.get("spent_height"))
+        asset = _asset(record.get("asset_id"))
+        offer_link = _norm_id(record.get("offer_id"))
+        if (
+            record.get("owned") is not True
+            or amount is None
+            or spent_height is None
+            or (asset and asset != offered_asset)
+            or offer_link
+        ):
+            return None
+        selected_total += amount
+        spent_heights.append(spent_height)
+    if selected_total < intent["offered_amount"] or not spent_heights:
+        return None
+    return max(spent_heights)
+
+
 def _classify_terminal_evidence(
     intent: Any,
     evidence: Any,
@@ -1527,17 +1563,28 @@ def _classify_terminal_evidence(
         # exact coin ID and the already-validated authoritative offer summary
         # still bind the asset and amount, so a missing field is acceptable
         # here.  An explicit different asset or link still fails closed.
-        if not _selected_inputs_are_exactly_owned_and_linked(
+        if _selected_inputs_are_exactly_owned_and_linked(
             exact_intent,
             coins,
             allow_released_link=True,
             allow_missing_asset=True,
         ):
+            return {
+                "classification": EXPIRED_PROVEN,
+                "reason_code": "AUTHORITATIVE_EXPIRY_PROOF",
+                "input_coins_owned_unlocked": True,
+            }
+        subsequent_spent_height = _expired_inputs_were_subsequently_spent(
+            exact_intent, coins
+        )
+        if subsequent_spent_height is None:
             return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
         return {
             "classification": EXPIRED_PROVEN,
-            "reason_code": "AUTHORITATIVE_EXPIRY_PROOF",
-            "input_coins_owned_unlocked": True,
+            "reason_code": "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF",
+            "input_coins_owned_unlocked": False,
+            "subsequent_spent_height": subsequent_spent_height,
+            "block_height": subsequent_spent_height,
         }
     if status in _ACTIVE_STATUSES:
         if not _selected_inputs_are_exactly_owned_and_linked(exact_intent, coins):

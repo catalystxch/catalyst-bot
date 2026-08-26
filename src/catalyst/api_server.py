@@ -293,6 +293,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 
 _read_only_diagnostics_active = False
 _wallet_setup_bootstrap_active = False
+_wallet_setup_bootstrap_fingerprint: Optional[str] = None
 
 # A first-run desktop has no immutable wallet identity yet, so it cannot own
 # the trading mutation lease. These are the only local setup operations that
@@ -318,6 +319,13 @@ def wallet_setup_bootstrap_active() -> bool:
     return _wallet_setup_bootstrap_active is True
 
 
+def wallet_setup_bootstrap_fingerprint() -> Optional[str]:
+    """Return the immutable legacy fingerprint pinned for this setup shell."""
+
+    value = _wallet_setup_bootstrap_fingerprint
+    return value if type(value) is str and value else None
+
+
 def wallet_setup_bootstrap_allows(operation: str) -> bool:
     """Authorize one exact non-trading setup operation in bootstrap mode."""
 
@@ -329,8 +337,9 @@ def wallet_setup_bootstrap_allows(operation: str) -> bool:
 def deactivate_wallet_setup_bootstrap() -> None:
     """Close the setup-only authority after successful owner promotion."""
 
-    global _wallet_setup_bootstrap_active
+    global _wallet_setup_bootstrap_active, _wallet_setup_bootstrap_fingerprint
     _wallet_setup_bootstrap_active = False
+    _wallet_setup_bootstrap_fingerprint = None
 
 
 def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
@@ -342,8 +351,9 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
     wallet-setup allowlist.
     """
 
-    global _wallet_setup_bootstrap_active
+    global _wallet_setup_bootstrap_active, _wallet_setup_bootstrap_fingerprint
     _wallet_setup_bootstrap_active = False
+    _wallet_setup_bootstrap_fingerprint = None
     if type(startup_authorization) is not dict or (
         startup_authorization.get("allowed") is not False
         or startup_authorization.get("failed_check") != "wallet_identity_freshness"
@@ -354,15 +364,22 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
     raw_fingerprint = getattr(cfg, "SAGE_FINGERPRINT", "")
     raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
     raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
+    fingerprint = raw_fingerprint.strip() if type(raw_fingerprint) is str else ""
+    expected_name = raw_expected_name.strip() if type(raw_expected_name) is str else ""
+    expected_kind = (
+        raw_expected_kind.strip().lower() if type(raw_expected_kind) is str else ""
+    )
+    setup_identity = (
+        not fingerprint or (fingerprint.isascii() and fingerprint.isdigit())
+    ) and not expected_name
     if (
         type(raw_backend) is not str
         or raw_backend.strip().lower() != "sage"
         or type(raw_fingerprint) is not str
-        or bool(raw_fingerprint.strip())
         or type(raw_expected_name) is not str
-        or bool(raw_expected_name.strip())
         or type(raw_expected_kind) is not str
-        or raw_expected_kind.strip().lower() not in {"", "bls"}
+        or expected_kind not in {"", "bls"}
+        or not setup_identity
     ):
         return False
     _wallet_hash, network = _configured_mutation_binding()
@@ -373,22 +390,51 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
         lease = snapshot.get("lease")
         latch = snapshot.get("latch")
         counts = snapshot.get("blocker_counts")
+        reservation_issues = snapshot.get("reservation_issues")
+
+        def is_coin_reservation_issue(issue: Any) -> bool:
+            if type(issue) is not str or not issue.startswith("coin:"):
+                return False
+            coin_id = issue[5:].lower()
+            if coin_id.startswith("0x"):
+                coin_id = coin_id[2:]
+            return len(coin_id) == 64 and all(
+                character in "0123456789abcdef" for character in coin_id
+            )
+
+        recoverable_legacy_reservations = bool(
+            fingerprint
+            and type(reservation_issues) is list
+            and reservation_issues
+            and all(is_coin_reservation_issue(issue) for issue in reservation_issues)
+        )
+        counts_are_clean = bool(
+            type(counts) is dict
+            and all(
+                type(value) is int and value == 0
+                for key, value in counts.items()
+                if key != "reservations"
+            )
+            and type(counts.get("reservations")) is int
+            and counts["reservations"]
+            == (len(set(reservation_issues)) if recoverable_legacy_reservations else 0)
+        )
         clean = (
             type(lease) is dict
             and not bool(lease.get("active"))
             and type(latch) is dict
             and latch.get("state") == "resolved"
             and snapshot.get("blockers") == []
-            and snapshot.get("reservation_issues") == []
+            and (reservation_issues == [] or recoverable_legacy_reservations)
             and snapshot.get("publication_issues") == []
-            and type(counts) is dict
-            and all(type(value) is int and value == 0 for value in counts.values())
+            and counts_are_clean
         )
     except Exception:
         clean = False
     if not clean:
         return False
     _wallet_setup_bootstrap_active = True
+    _wallet_setup_bootstrap_fingerprint = fingerprint or None
     slog(
         "SAFETY",
         "First-run wallet setup shell enabled; trading remains blocked",
@@ -3554,6 +3600,18 @@ def create_bot() -> BotLoop:
     return bot
 
 
+def recover_legacy_startup_reservations() -> dict[str, int]:
+    """Run the bounded, read-only-Sage legacy reservation migration."""
+
+    from legacy_startup_recovery import recover_legacy_sage_reservations
+
+    wallet_hash, network = _configured_mutation_binding()
+    return recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=wallet_hash,
+        network=network,
+    )
+
+
 def promote_wallet_setup_bootstrap() -> dict:
     """Promote an exact persisted Sage identity into normal owner mode."""
 
@@ -3563,6 +3621,24 @@ def promote_wallet_setup_bootstrap() -> dict:
             "reason_code": "WALLET_IDENTITY_SETUP_NOT_ACTIVE",
         }
     authorization = initialize_mutation_runtime()
+    if authorization.get("allowed") is not True and authorization.get(
+        "reason_code"
+    ) in {
+        "RESERVATION_RECONCILIATION_REQUIRED",
+        "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
+        "UNRESOLVED_OPERATIONS",
+    }:
+        try:
+            recovery = recover_legacy_startup_reservations()
+            if recovery.get("recovered", 0) > 0:
+                authorization = initialize_mutation_runtime()
+        except Exception as recovery_error:
+            slog(
+                "SAFETY",
+                "Legacy startup reservation recovery could not complete",
+                {"error_type": type(recovery_error).__name__},
+                level="warning",
+            )
     if authorization.get("allowed") is not True:
         return authorization
     try:

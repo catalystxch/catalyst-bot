@@ -180,9 +180,21 @@ def _restore_isolation_guarded_modules():
     forgets to restore it, this fixture catches the damage at the end
     of the module so the next file starts clean.
     """
-    saved = {name: sys.modules.get(name) for name in _ISOLATION_GUARDED}
+    blueprint_modules = {
+        name
+        for name in sys.modules
+        if name == "blueprints" or name.startswith("blueprints.")
+    }
+    guarded = set(_ISOLATION_GUARDED) | blueprint_modules
+    saved = {name: sys.modules.get(name) for name in guarded}
     yield
-    for name, original in saved.items():
+    current_blueprints = {
+        name
+        for name in sys.modules
+        if name == "blueprints" or name.startswith("blueprints.")
+    }
+    for name in guarded | current_blueprints:
+        original = saved.get(name)
         current = sys.modules.get(name)
         if original is None:
             # Wasn't loaded before this file; drop any stub installed.

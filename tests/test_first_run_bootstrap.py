@@ -96,6 +96,49 @@ def test_unconfigured_clean_install_enters_desktop_bootstrap_instead_of_json(
     ]
 
 
+def test_failed_bootstrap_preserves_exact_authorization_for_diagnostics(monkeypatch):
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+
+    class Arbiter:
+        acquired = True
+
+        @staticmethod
+        def release():
+            return None
+
+    authorization = _unconfigured_authorization()
+    authorization["blocker_counts"] = {
+        "operations": 0,
+        "reservations": 2,
+    }
+    authorization["wallet_id"] = "must-not-leak"
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app, "_initialize_startup_ownership", lambda: authorization
+    )
+    monkeypatch.setattr(
+        api_server, "activate_wallet_setup_bootstrap", lambda _authorization: False
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert desktop_app._startup_diagnostics_status == {
+        "allowed": False,
+        "reason_code": "WALLET_IDENTITY_BINDING_INVALID",
+        "source": "wallet_identity_freshness",
+        "recovery": {
+            "failed_check": "wallet_identity_freshness",
+            "blocker_counts": {"operations": 0, "reservations": 2},
+        },
+    }
+
+
 def test_bootstrap_candidate_requires_unconfigured_identity_and_clean_durable_state(
     monkeypatch,
 ):
@@ -147,6 +190,75 @@ def test_bootstrap_rejects_malformed_complete_identity_settings(monkeypatch):
         api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
         is False
     )
+    assert api_server.wallet_setup_bootstrap_active() is False
+
+
+def test_bootstrap_accepts_clean_legacy_sage_profile_missing_expected_name(
+    monkeypatch,
+):
+    """Catch upgrades trapping a valid legacy fingerprint outside setup UI."""
+
+    import api_server
+
+    monkeypatch.setattr(api_server.cfg, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(api_server.cfg, "SAGE_FINGERPRINT", "736588221")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_NAME", "")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_KEY_KIND", "bls")
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        _clean_snapshot,
+    )
+
+    assert api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
+    assert api_server.wallet_setup_bootstrap_active() is True
+
+    api_server.deactivate_wallet_setup_bootstrap()
+
+
+def test_bootstrap_accepts_only_coin_reservations_for_pinned_legacy_profile(
+    monkeypatch,
+):
+    import api_server
+
+    snapshot = _clean_snapshot()
+    snapshot["reservation_issues"] = ["coin:0x" + "a" * 64]
+    snapshot["blocker_counts"]["reservations"] = 1
+    monkeypatch.setattr(api_server.cfg, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(api_server.cfg, "SAGE_FINGERPRINT", "736588221")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_NAME", "")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_KEY_KIND", "bls")
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        lambda: snapshot,
+    )
+
+    assert api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
+    assert api_server.wallet_setup_bootstrap_fingerprint() == "736588221"
+
+    api_server.deactivate_wallet_setup_bootstrap()
+
+
+def test_bootstrap_rejects_reservations_without_a_pinned_legacy_fingerprint(
+    monkeypatch,
+):
+    import api_server
+
+    snapshot = _clean_snapshot()
+    snapshot["reservation_issues"] = ["coin:" + "a" * 64]
+    snapshot["blocker_counts"]["reservations"] = 1
+    monkeypatch.setattr(api_server.cfg, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(api_server.cfg, "SAGE_FINGERPRINT", "")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_NAME", "")
+    monkeypatch.setattr(api_server.cfg, "WALLET_EXPECTED_KEY_KIND", "bls")
+    monkeypatch.setattr(
+        api_server.database,
+        "get_stability_startup_recovery_snapshot",
+        lambda: snapshot,
+    )
+
+    assert not api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
     assert api_server.wallet_setup_bootstrap_active() is False
 
 
@@ -247,6 +359,98 @@ def test_bootstrap_fingerprint_binds_exact_sage_identity_before_promotion(monkey
         ("start", "736588221"),
         ("exit", "permit"),
     ]
+
+
+def test_legacy_bootstrap_rejects_switching_away_from_pinned_fingerprint(monkeypatch):
+    import api_server
+    import chia_node
+    from blueprints import sage
+
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(
+        api_server, "_wallet_setup_bootstrap_fingerprint", "736588221", raising=False
+    )
+    monkeypatch.setattr(
+        chia_node,
+        "get_available_wallet_identities",
+        lambda: [
+            {
+                "backend": "sage",
+                "fingerprint": "123456789",
+                "name": "Different wallet",
+                "kind": "bls",
+                "has_secrets": True,
+                "network_id": "mainnet",
+            }
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(api_server.cfg),
+        "bind_wallet_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a different wallet must not be bound")
+        ),
+    )
+
+    with api_server.app.test_request_context(
+        "/api/sage/fingerprint",
+        method="POST",
+        json={"fingerprint": "123456789"},
+    ):
+        response, status = sage.api_sage_set_fingerprint()
+
+    assert status == 409
+    assert response.get_json() == {
+        "success": False,
+        "fingerprint": "123456789",
+        "error": "Existing CATalyst data is bound to a different Sage fingerprint",
+    }
+
+
+def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(monkeypatch):
+    import api_server
+
+    calls = []
+    authorizations = iter(
+        [
+            {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"},
+            {"allowed": True, "reason_code": ""},
+        ]
+    )
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: calls.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            calls.append("legacy_recovery")
+            or {"examined": 1, "recovered": 1, "remaining": 0}
+        ),
+    )
+    monkeypatch.setattr(api_server, "create_bot", lambda: calls.append("bot"))
+    monkeypatch.setattr(
+        api_server,
+        "_start_owned_runtime_services",
+        lambda authorization: calls.append(("services", authorization["allowed"])),
+    )
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    result = api_server.promote_wallet_setup_bootstrap()
+
+    assert result["allowed"] is True
+    assert calls == [
+        "authorize",
+        "legacy_recovery",
+        "authorize",
+        "bot",
+        ("services", True),
+    ]
+    assert api_server.wallet_setup_bootstrap_active() is False
 
 
 def test_bootstrap_server_skips_bot_construction_until_identity_is_bound(monkeypatch):

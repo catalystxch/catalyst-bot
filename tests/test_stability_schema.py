@@ -289,6 +289,7 @@ def test_authoritative_coin_outcomes_are_append_only_and_coin_indexed(
         "offer_reconciliation_coin_outcomes_no_update",
         "offer_reconciliation_coin_outcomes_no_delete",
         "offer_reconciliation_coin_outcomes_proof_guard_v2",
+        "offer_reconciliation_coin_outcomes_disposition_guard_v3",
     }
 
 

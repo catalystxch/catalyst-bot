@@ -5924,6 +5924,60 @@ def test_minimal_diagnostics_root_is_branded_html_not_raw_safety_json(tmp_path):
         thread.join(timeout=2)
 
 
+def test_diagnostics_preserves_specific_startup_denial_over_generic_lease():
+    import read_only_diagnostics
+
+    durable = {
+        "allowed": False,
+        "reason_code": "LEASE_UNAVAILABLE",
+        "source": "lease",
+        "lease": {"active": False, "owner_pid": None},
+    }
+    startup_denial = {
+        "allowed": False,
+        "reason_code": "WALLET_IDENTITY_BINDING_INVALID",
+        "source": "wallet_identity_freshness",
+        "recovery": {
+            "failed_check": "wallet_identity_freshness",
+            "blocker_counts": {"reservations": 2},
+            "wallet_id": "must-not-leak",
+        },
+    }
+
+    merged = read_only_diagnostics.merge_startup_denial(durable, startup_denial)
+
+    assert merged == {
+        "allowed": False,
+        "reason_code": "WALLET_IDENTITY_BINDING_INVALID",
+        "source": "wallet_identity_freshness",
+        "lease": {"active": False, "owner_pid": None},
+        "recovery": {
+            "failed_check": "wallet_identity_freshness",
+            "blocker_counts": {"reservations": 2},
+        },
+    }
+
+
+def test_diagnostics_never_overrides_a_stronger_durable_reason():
+    import read_only_diagnostics
+
+    durable = {
+        "allowed": False,
+        "reason_code": "LEASE_OWNED_BY_OTHER",
+        "source": "lease",
+        "lease": {"active": True, "owner_pid": 1234},
+    }
+    startup_denial = {
+        "allowed": False,
+        "reason_code": "WALLET_IDENTITY_BINDING_INVALID",
+        "source": "wallet_identity_freshness",
+    }
+
+    assert (
+        read_only_diagnostics.merge_startup_denial(durable, startup_denial) == durable
+    )
+
+
 @pytest.mark.parametrize(
     "method",
     ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "BREW"],
@@ -6412,6 +6466,47 @@ def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
         "database",
         "authorize",
         "dexie_publication_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "UNRESOLVED_OPERATIONS",
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 1, "recovered": 1, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "legacy_recovery",
         "authorize",
     ]
 
@@ -6932,6 +7027,14 @@ def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> d
     """Build an isolated process environment without starting real CAT resolution."""
 
     data_dir.mkdir()
+    # These tests exercise first database/lease ownership, not legacy install-dir
+    # migration.  A developer worktree may legitimately contain ignored runtime
+    # state from packaged-app testing; prevent that state from being copied into
+    # the isolated child profile and changing its startup authorization.
+    (data_dir / ".migration_complete").write_text(
+        "Standalone mutation-gate test profile; legacy migration disabled.\n",
+        encoding="utf-8",
+    )
     (data_dir / ".env").write_text(
         "WALLET_TYPE=sage\n"
         "SAGE_FINGERPRINT=161616161\n"
