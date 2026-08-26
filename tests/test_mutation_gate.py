@@ -6511,6 +6511,105 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
     ]
 
 
+def test_desktop_retries_transient_legacy_recovery_while_sage_restarts(monkeypatch):
+    """Sage becoming ready moments later must not strand safe legacy locks."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "RESERVATION_RECONCILIATION_REQUIRED",
+                "failed_check": "reservations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    recoveries = iter(
+        [
+            {"examined": 2, "recovered": 0, "remaining": 2},
+            {"examined": 2, "recovered": 2, "remaining": 0},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: events.append("legacy_recovery") or next(recoveries),
+    )
+    monkeypatch.setattr(
+        desktop_app.time,
+        "sleep",
+        lambda seconds: events.append(("sleep", seconds)),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_legacy_recovery_retry_is_bounded_and_fail_closed(monkeypatch):
+    """Missing Sage evidence must still stop after the bounded retry window."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "RESERVATION_RECONCILIATION_REQUIRED",
+        "failed_check": "reservations",
+    }
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or blocked,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
+    )
+    monkeypatch.setattr(
+        desktop_app.time,
+        "sleep",
+        lambda seconds: events.append(("sleep", seconds)),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result == blocked
+    assert events == [
+        "database",
+        "authorize",
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+        ("sleep", 1.0),
+        "legacy_recovery",
+    ]
+
+
 def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
     import read_only_diagnostics
 

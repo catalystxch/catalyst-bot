@@ -128,6 +128,8 @@ WINDOW_HEIGHT = 1000
 WINDOW_MIN_WIDTH = 1000
 WINDOW_MIN_HEIGHT = 700
 _startup_diagnostics_status = None
+_LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS = 3
+_LEGACY_STARTUP_RECOVERY_RETRY_DELAY_SECONDS = 1.0
 
 
 def _configure_linux_webengine_env() -> None:
@@ -1701,19 +1703,37 @@ def _initialize_startup_ownership() -> dict:
             # Provider readback recovery is exact and fail-closed. Keep the
             # diagnostics blocker when the public offer cannot be proven.
             pass
-    if authorization.get("allowed") is False and authorization.get("reason_code") in {
+    legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
-    }:
-        try:
-            recovery = api_server.recover_legacy_startup_reservations()
-            if recovery.get("recovered", 0) > 0:
-                authorization = api_server.initialize_mutation_runtime()
-        except Exception:
-            # Legacy migration is proof-bound and fail-closed. Preserve the
-            # original durable startup reason when Sage evidence is missing.
-            pass
+    }
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("reason_code") in legacy_recovery_reasons
+    ):
+        for attempt in range(_LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS):
+            recovery = None
+            try:
+                recovery = api_server.recover_legacy_startup_reservations()
+                if recovery.get("recovered", 0) > 0:
+                    authorization = api_server.initialize_mutation_runtime()
+            except Exception:
+                # Legacy migration is proof-bound and fail-closed. A Sage
+                # restart can make its read-only evidence briefly unavailable.
+                pass
+            if (
+                authorization.get("allowed") is True
+                or authorization.get("reason_code") not in legacy_recovery_reasons
+            ):
+                break
+            remaining = (
+                recovery.get("remaining") if isinstance(recovery, dict) else None
+            )
+            if remaining == 0:
+                break
+            if attempt + 1 < _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS:
+                time.sleep(_LEGACY_STARTUP_RECOVERY_RETRY_DELAY_SECONDS)
     return authorization
 
 
