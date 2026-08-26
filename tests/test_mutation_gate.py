@@ -5944,9 +5944,7 @@ def test_diagnostics_preserves_specific_startup_denial_over_generic_lease():
         },
     }
 
-    merged = read_only_diagnostics.merge_startup_denial(
-        durable, startup_denial
-    )
+    merged = read_only_diagnostics.merge_startup_denial(durable, startup_denial)
 
     assert merged == {
         "allowed": False,
@@ -5976,8 +5974,7 @@ def test_diagnostics_never_overrides_a_stronger_durable_reason():
     }
 
     assert (
-        read_only_diagnostics.merge_startup_denial(durable, startup_denial)
-        == durable
+        read_only_diagnostics.merge_startup_denial(durable, startup_denial) == durable
     )
 
 
@@ -6497,8 +6494,10 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
     monkeypatch.setattr(
         api_server,
         "recover_legacy_startup_reservations",
-        lambda: events.append("legacy_recovery")
-        or {"examined": 1, "recovered": 1, "remaining": 0},
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 1, "recovered": 1, "remaining": 0}
+        ),
     )
 
     result = desktop_app._initialize_startup_ownership()

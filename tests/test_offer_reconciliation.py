@@ -9024,9 +9024,7 @@ def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(
     result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
 
     assert result["classification"] == EXPIRED_PROVEN
-    assert result["reason_code"] == (
-        "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF"
-    )
+    assert result["reason_code"] == ("AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF")
     assert result["subsequent_spent_height"] == 99
     assert result["applied"] is True
     assert database.get_offer(TRADE)["status"] == "expired"

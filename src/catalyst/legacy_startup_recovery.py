@@ -26,7 +26,9 @@ def _hex_id(value: Any) -> str:
     text = value.strip().lower()
     if text.startswith("0x"):
         text = text[2:]
-    return text if len(text) == 64 and all(character in _HEX for character in text) else ""
+    return (
+        text if len(text) == 64 and all(character in _HEX for character in text) else ""
+    )
 
 
 def _canonical_utc(value: Any) -> str:
@@ -34,7 +36,9 @@ def _canonical_utc(value: Any) -> str:
         raise ValueError("legacy offer timestamp is unavailable")
     text = value.strip()
     try:
-        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        parsed = datetime.fromisoformat(
+            text[:-1] + "+00:00" if text.endswith("Z") else text
+        )
     except ValueError as exc:
         raise ValueError("legacy offer timestamp is invalid") from exc
     if parsed.tzinfo is None:
@@ -53,7 +57,9 @@ def _atomic_amount(value: Any, scale: Decimal, label: str) -> str:
     return str(int(integral))
 
 
-def _legacy_intent(candidate: Any, wallet_hash: str, network: str, decimals: int) -> dict:
+def _legacy_intent(
+    candidate: Any, wallet_hash: str, network: str, decimals: int
+) -> dict:
     if type(candidate) is not dict:
         raise ValueError("legacy reservation candidate is malformed")
     trade_id = _hex_id(candidate.get("trade_id"))
@@ -144,13 +150,16 @@ def recover_legacy_sage_reservations(
             evidence_target = (
                 existing
                 if type(existing) is dict
-                and existing.get("lifecycle_state") in {"created", "unknown", "conflicted"}
+                and existing.get("lifecycle_state")
+                in {"created", "unknown", "conflicted"}
                 else synthetic
             )
             evidence = reconciliation_module.load_authoritative_evidence(
                 evidence_target, wallet_facade=wallet_facade
             )
-            observed_at = evidence.get("observed_at") if type(evidence) is dict else None
+            observed_at = (
+                evidence.get("observed_at") if type(evidence) is dict else None
+            )
             classification = reconciliation_module.classify_terminal_evidence(
                 evidence_target, evidence, now=observed_at
             )

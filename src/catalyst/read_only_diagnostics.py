@@ -643,7 +643,10 @@ def merge_startup_denial(
 
     if durable_status.get("reason_code") != "LEASE_UNAVAILABLE":
         return durable_status
-    if not isinstance(startup_denial, dict) or startup_denial.get("allowed") is not False:
+    if (
+        not isinstance(startup_denial, dict)
+        or startup_denial.get("allowed") is not False
+    ):
         return durable_status
     reason = startup_denial.get("reason_code")
     source = startup_denial.get("source")
@@ -812,9 +815,7 @@ def _handler(database: Path, startup_denial: dict[str, Any] | None = None):
                 safety = merge_startup_denial(
                     read_safety_status(database), startup_denial
                 )
-                self._json(
-                    200, {"success": True, "safety": safety}
-                )
+                self._json(200, {"success": True, "safety": safety})
                 return
             self._locked()
 

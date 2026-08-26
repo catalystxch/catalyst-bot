@@ -258,9 +258,7 @@ def test_bootstrap_rejects_reservations_without_a_pinned_legacy_fingerprint(
         lambda: snapshot,
     )
 
-    assert not api_server.activate_wallet_setup_bootstrap(
-        _unconfigured_authorization()
-    )
+    assert not api_server.activate_wallet_setup_bootstrap(_unconfigured_authorization())
     assert api_server.wallet_setup_bootstrap_active() is False
 
 
@@ -429,8 +427,10 @@ def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(monkeypatch):
     monkeypatch.setattr(
         api_server,
         "recover_legacy_startup_reservations",
-        lambda: calls.append("legacy_recovery")
-        or {"examined": 1, "recovered": 1, "remaining": 0},
+        lambda: (
+            calls.append("legacy_recovery")
+            or {"examined": 1, "recovered": 1, "remaining": 0}
+        ),
     )
     monkeypatch.setattr(api_server, "create_bot", lambda: calls.append("bot"))
     monkeypatch.setattr(

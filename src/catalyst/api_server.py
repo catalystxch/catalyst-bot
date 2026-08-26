@@ -365,13 +365,9 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
     raw_expected_name = getattr(cfg, "WALLET_EXPECTED_NAME", "")
     raw_expected_kind = getattr(cfg, "WALLET_EXPECTED_KEY_KIND", "")
     fingerprint = raw_fingerprint.strip() if type(raw_fingerprint) is str else ""
-    expected_name = (
-        raw_expected_name.strip() if type(raw_expected_name) is str else ""
-    )
+    expected_name = raw_expected_name.strip() if type(raw_expected_name) is str else ""
     expected_kind = (
-        raw_expected_kind.strip().lower()
-        if type(raw_expected_kind) is str
-        else ""
+        raw_expected_kind.strip().lower() if type(raw_expected_kind) is str else ""
     )
     setup_identity = (
         not fingerprint or (fingerprint.isascii() and fingerprint.isdigit())
@@ -415,8 +411,7 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
         counts_are_clean = bool(
             type(counts) is dict
             and all(
-                type(value) is int
-                and value == 0
+                type(value) is int and value == 0
                 for key, value in counts.items()
                 if key != "reservations"
             )
@@ -430,9 +425,7 @@ def activate_wallet_setup_bootstrap(startup_authorization: Any) -> bool:
             and type(latch) is dict
             and latch.get("state") == "resolved"
             and snapshot.get("blockers") == []
-            and (
-                reservation_issues == [] or recoverable_legacy_reservations
-            )
+            and (reservation_issues == [] or recoverable_legacy_reservations)
             and snapshot.get("publication_issues") == []
             and counts_are_clean
         )

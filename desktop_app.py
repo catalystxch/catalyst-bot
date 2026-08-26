@@ -1701,9 +1701,7 @@ def _initialize_startup_ownership() -> dict:
             # Provider readback recovery is exact and fail-closed. Keep the
             # diagnostics blocker when the public offer cannot be proven.
             pass
-    if authorization.get("allowed") is False and authorization.get(
-        "reason_code"
-    ) in {
+    if authorization.get("allowed") is False and authorization.get("reason_code") in {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
