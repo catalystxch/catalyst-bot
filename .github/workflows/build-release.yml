@@ -179,6 +179,61 @@ jobs:
             ) -Wait | Out-Null
           }
 
+          Write-Host "Smoke test Windows existing-install upgrade"
+          $installDir = Join-Path $env:LOCALAPPDATA "Programs\CATalyst"
+          if (Test-Path -LiteralPath $installDir) {
+            throw "Existing-install smoke target unexpectedly exists: $installDir"
+          }
+          $bootstrapArgs = @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/DIR=$installDir"
+          )
+          $bootstrap = Start-Process -FilePath $installer -ArgumentList $bootstrapArgs -Wait -PassThru
+          if ($bootstrap.ExitCode -ne 0) {
+            throw "Initial same-user install exited with code $($bootstrap.ExitCode)"
+          }
+
+          $installedExe = Join-Path $installDir "Catalyst.exe"
+          Set-Content -LiteralPath $installedExe -Value "legacy executable"
+          $upgradeArgs = @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER"
+          )
+          $upgrade = Start-Process -FilePath $installer -ArgumentList $upgradeArgs -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            throw "Existing-install upgrade exited with code $($upgrade.ExitCode)"
+          }
+
+          $expectedVersion = $env:RELEASE_REF.TrimStart("v")
+          $installedVersion = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion
+          if ($installedVersion -ne $expectedVersion) {
+            throw "Existing-install upgrade left version $installedVersion; expected $expectedVersion"
+          }
+
+          $shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\CATalyst.lnk"
+          if (-not (Test-Path -LiteralPath $shortcutPath)) {
+            throw "Existing-install upgrade did not refresh the CATalyst Start Menu shortcut"
+          }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcutTarget = $shell.CreateShortcut($shortcutPath).TargetPath
+          if ($shortcutTarget -ne $installedExe) {
+            throw "CATalyst shortcut targets $shortcutTarget; expected $installedExe"
+          }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (Test-Path -LiteralPath $uninstaller) {
+            Start-Process -FilePath $uninstaller -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART"
+            ) -Wait | Out-Null
+          }
+
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         env:

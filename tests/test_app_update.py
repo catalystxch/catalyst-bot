@@ -254,6 +254,93 @@ class TestAppUpdateSecurity(unittest.TestCase):
         self.assertIn(r'set "APP_DIR=C:\Program Files\CATalyst"', helper_text)
         self.assertIn(r'/DIR="%APP_DIR%"', helper_text)
 
+    def test_launch_installer_preserves_machine_scope_for_program_files(self):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(app_update.sys, "platform", "win32"),
+            patch.object(
+                app_update.sys, "executable", r"C:\Program Files\CATalyst\Catalyst.exe"
+            ),
+            patch.object(app_update.os, "getpid", return_value=4321),
+            patch.object(app_update.subprocess, "Popen") as popen,
+        ):
+            installer = Path(td) / "Catalyst-Setup-v1.2.32.exe"
+            installer.write_bytes(b"fake installer")
+
+            app_update._launch_installer(installer)
+
+            helper_path = Path(popen.call_args.args[0][3])
+            helper_text = helper_path.read_text(encoding="utf-8")
+
+        self.assertIn("/ALLUSERS", helper_text)
+        self.assertNotIn("/CURRENTUSER", helper_text)
+
+    def test_launch_installer_preserves_user_scope_for_local_app_data(self):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.dict(
+                app_update.os.environ,
+                {"LOCALAPPDATA": r"C:\Users\alice\AppData\Local"},
+                clear=False,
+            ),
+            patch.object(app_update.sys, "platform", "win32"),
+            patch.object(
+                app_update.sys,
+                "executable",
+                r"C:\Users\alice\AppData\Local\Programs\CATalyst\Catalyst.exe",
+            ),
+            patch.object(app_update.os, "getpid", return_value=4321),
+            patch.object(app_update.subprocess, "Popen") as popen,
+        ):
+            installer = Path(td) / "Catalyst-Setup-v1.2.32.exe"
+            installer.write_bytes(b"fake installer")
+
+            app_update._launch_installer(installer)
+
+            helper_path = Path(popen.call_args.args[0][3])
+            helper_text = helper_path.read_text(encoding="utf-8")
+
+        self.assertIn("/CURRENTUSER", helper_text)
+        self.assertNotIn("/ALLUSERS", helper_text)
+
+    def test_installer_scope_uses_registration_for_custom_machine_directory(self):
+        with patch.object(
+            app_update,
+            "_registered_windows_install_scope",
+            return_value="/ALLUSERS",
+        ):
+            scope = app_update._windows_installer_scope_arg(
+                r"D:\Apps\CATalyst\Catalyst.exe"
+            )
+
+        self.assertEqual(scope, "/ALLUSERS")
+
+    def test_launch_installer_verifies_target_version_before_relaunch(self):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(app_update.sys, "platform", "win32"),
+            patch.object(
+                app_update.sys, "executable", r"C:\Program Files\CATalyst\Catalyst.exe"
+            ),
+            patch.object(app_update.os, "getpid", return_value=4321),
+            patch.object(app_update.subprocess, "Popen") as popen,
+        ):
+            installer = Path(td) / "Catalyst-Setup-v1.2.32.exe"
+            installer.write_bytes(b"fake installer")
+
+            app_update._launch_installer(installer)
+
+            helper_path = Path(popen.call_args.args[0][3])
+            helper_text = helper_path.read_text(encoding="utf-8")
+
+        self.assertIn('set "EXPECTED_VERSION=1.2.32"', helper_text)
+        self.assertIn("VersionInfo.ProductVersion", helper_text)
+        self.assertIn("installed version mismatch", helper_text)
+        self.assertLess(
+            helper_text.index("installed version mismatch"),
+            helper_text.index(":relaunch"),
+        )
+
     def test_launch_installer_breaks_helper_away_from_parent_job(self):
         with (
             tempfile.TemporaryDirectory() as td,

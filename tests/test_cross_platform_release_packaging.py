@@ -44,6 +44,50 @@ def test_windows_release_installer_runs_clean_desktop_first_launch_smoke():
     assert (ROOT / "scripts" / "packaged_desktop_first_launch_smoke.py").exists()
 
 
+def test_windows_installer_update_contract_is_fail_closed():
+    installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+    assert "PrivilegesRequiredOverridesAllowed=commandline" in installer
+    assert "PrivilegesRequiredOverridesAllowed=dialog" not in installer
+    assert "UsePreviousAppDir=yes" in installer
+    assert "SetupLogging=yes" in installer
+    assert "function PrepareToInstall" in installer
+    assert "different install scope" in installer
+    assert "procedure VerifyInstalledVersion" in installer
+    assert "GetVersionNumbersString" in installer
+    assert "RaiseException" in installer
+
+
+def test_windows_installer_supports_isolated_runtime_smoke_identity():
+    installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+    assert "#ifndef MyAppName" in installer
+    assert "#ifndef MyAppVersion" in installer
+    assert "#ifndef MyAppId" in installer
+    assert "#ifndef MyAppUninstallKey" in installer
+    assert "AppId={#MyAppId}" in installer
+    assert "AppUninstallKey = '{#MyAppUninstallKey}'" in installer
+
+
+def test_windows_release_smoke_reinstalls_over_existing_copy_without_dir_override():
+    workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Smoke test Windows existing-install upgrade" in workflow
+    assert '"/CURRENTUSER"' in workflow
+    assert (
+        'Set-Content -LiteralPath $installedExe -Value "legacy executable"' in workflow
+    )
+    assert "$upgradeArgs" in workflow
+    assert (
+        '"/DIR=$installDir"'
+        not in workflow.split("$upgradeArgs", 1)[1].split("Start-Process", 1)[0]
+    )
+    assert ".VersionInfo.ProductVersion" in workflow
+    assert "CreateShortcut" in workflow
+
+
 def test_release_workflow_does_not_publish_macos_assets():
     workflow = (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
         encoding="utf-8"
