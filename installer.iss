@@ -13,8 +13,18 @@
 ; the installer first, so SmartScreen checks its signature.
 ; ============================================================
 
+#ifndef MyAppName
 #define MyAppName        "CATalyst"
+#endif
+#ifndef MyAppVersion
 #define MyAppVersion     "1.0.0"
+#endif
+#ifndef MyAppId
+#define MyAppId          "{{B7F7C8A3-5E1A-4D9B-9F43-CC51A3B9D2E7}"
+#endif
+#ifndef MyAppUninstallKey
+#define MyAppUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7F7C8A3-5E1A-4D9B-9F43-CC51A3B9D2E7}_is1"
+#endif
 #define MyAppPublisher   "MonkeyZoo"
 #define MyAppURL         "https://github.com/catalystxch/catalyst-bot"
 #define MyAppExeName     "Catalyst.exe"
@@ -23,7 +33,7 @@
 [Setup]
 ; A fresh GUID per product. DO NOT re-use across unrelated products.
 ; Generate your own in Inno Setup: Tools -> Generate GUID.
-AppId={{B7F7C8A3-5E1A-4D9B-9F43-CC51A3B9D2E7}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -40,17 +50,21 @@ VersionInfoVersion={#MyAppVersion}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+UsePreviousAppDir=yes
 
-; Allow both admin (all users) and non-admin (current user) installs.
-; On non-admin installs, {autopf} becomes %LOCALAPPDATA%\Programs.
+; Website downloads stay in current-user mode by default.  Existing in-app
+; upgrades pass /CURRENTUSER or /ALLUSERS explicitly to preserve their scope.
+; Do not offer an easy-to-miss mode dialog: selecting a different scope is how
+; a second CATalyst copy and a stale shortcut can be left behind.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequiredOverridesAllowed=commandline
 
 OutputBaseFilename=Catalyst-Setup-{#MyAppVersion}
 OutputDir=Output
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
+SetupLogging=yes
 
 ; Uninstaller
 UninstallDisplayName={#MyAppName}
@@ -83,7 +97,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
 ; Pack the entire PyInstaller output folder. The wildcard with
@@ -97,9 +110,9 @@ Source: "{#MySourceDir}\.env.example"; DestDir: "{app}"; Flags: ignoreversion on
 
 [Icons]
 ; Start Menu group entry
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon; IconFilename: "{app}\{#MyAppExeName}"
-Name: "{autoprograms}\{#MyAppName} (Help)"; Filename: "{#MyAppURL}"; Tasks: startmenuicon
-Name: "{autoprograms}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"; Tasks: startmenuicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{autoprograms}\{#MyAppName} (Help)"; Filename: "{#MyAppURL}"
+Name: "{autoprograms}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 ; Desktop shortcut (opt-in via task checkbox)
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\{#MyAppExeName}"
@@ -118,18 +131,82 @@ Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent; Check: ShouldA
 ; %APPDATA%\Catalyst\ manually.
 
 [Code]
+const
+  AppUninstallKey = '{#MyAppUninstallKey}';
+
 function ShouldAutoRelaunch: Boolean;
 begin
   Result := ExpandConstant('{param:CATALYST_RELAUNCH|0}') = '1';
 end;
 
-// Friendly message on the install-complete page reminding users
-// where their config and database live.
+function ExistingInstallLocation(RootKey: Integer; var Location: String): Boolean;
+begin
+  Result := RegQueryStringValue(
+    RootKey,
+    AppUninstallKey,
+    'InstallLocation',
+    Location
+  ) and (Location <> '');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  UserLocation: String;
+  MachineLocation: String;
+  HasUserInstall: Boolean;
+  HasMachineInstall: Boolean;
+begin
+  Result := '';
+  HasUserInstall := ExistingInstallLocation(HKCU, UserLocation);
+  HasMachineInstall := ExistingInstallLocation(HKLM, MachineLocation);
+
+  if IsAdminInstallMode and HasUserInstall and not HasMachineInstall then
+  begin
+    Result :=
+      'CATalyst is already installed for the current user at ' + UserLocation +
+      '. This installer was started with a different install scope. ' +
+      'Run it normally (without /ALLUSERS) so the existing copy is updated.';
+  end
+  else if (not IsAdminInstallMode) and HasMachineInstall and not HasUserInstall then
+  begin
+    Result :=
+      'CATalyst is already installed for all users at ' + MachineLocation +
+      '. This installer was started with a different install scope. ' +
+      'Use CATalyst''s in-app updater or rerun this installer with /ALLUSERS.';
+  end;
+end;
+
+procedure VerifyInstalledVersion;
+var
+  InstalledVersion: String;
+  ExpectedVersion: String;
+begin
+  ExpectedVersion := '{#MyAppVersion}.0';
+  if not GetVersionNumbersString(
+    ExpandConstant('{app}\{#MyAppExeName}'),
+    InstalledVersion
+  ) then
+  begin
+    RaiseException(
+      'CATalyst setup could not verify the installed executable version.'
+    );
+  end;
+
+  if InstalledVersion <> ExpectedVersion then
+  begin
+    RaiseException(
+      'CATalyst setup installed the wrong executable version. Expected ' +
+      ExpectedVersion + ', found ' + InstalledVersion + '.'
+    );
+  end;
+  Log('Verified installed CATalyst version ' + InstalledVersion + ' at ' +
+    ExpandConstant('{app}\{#MyAppExeName}'));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Nothing automated yet — reserved for future steps
-    // (e.g. registering URL handlers or creating Start Menu tiles).
+    VerifyInstalledVersion;
   end;
 end;

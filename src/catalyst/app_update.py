@@ -601,6 +601,52 @@ def _is_breakaway_launch_denied(exc: OSError) -> bool:
     }
 
 
+def _windows_path_is_within(path: str, root: str) -> bool:
+    candidate = ntpath.normcase(ntpath.abspath(str(path or "")))
+    parent = ntpath.normcase(ntpath.abspath(str(root or "")))
+    if not candidate or not parent:
+        return False
+    try:
+        return ntpath.commonpath([candidate, parent]) == parent
+    except ValueError:
+        return False
+
+
+def _windows_installer_scope_arg(app_exe: str) -> str:
+    """Keep an in-app upgrade in the running executable's install scope."""
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_app_data and _windows_path_is_within(app_exe, local_app_data):
+        return "/CURRENTUSER"
+
+    drive, _tail = ntpath.splitdrive(ntpath.abspath(str(app_exe or "")))
+    machine_roots = {
+        str(os.environ.get("ProgramFiles") or "").strip(),
+        str(os.environ.get("ProgramFiles(x86)") or "").strip(),
+        str(os.environ.get("ProgramW6432") or "").strip(),
+    }
+    if drive:
+        machine_roots.update(
+            {
+                ntpath.join(drive + ntpath.sep, "Program Files"),
+                ntpath.join(drive + ntpath.sep, "Program Files (x86)"),
+            }
+        )
+    if any(root and _windows_path_is_within(app_exe, root) for root in machine_roots):
+        return "/ALLUSERS"
+    return "/CURRENTUSER"
+
+
+def _windows_installer_target_version(installer_path: Path) -> str:
+    match = re.fullmatch(
+        r"Catalyst-Setup-v(\d+\.\d+\.\d+)\.exe",
+        installer_path.name,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError("installer filename did not contain a valid CATalyst version")
+    return match.group(1)
+
+
 def _launch_installer(installer_path: Path) -> None:
     if sys.platform != "win32":
         raise RuntimeError(
@@ -618,6 +664,10 @@ def _launch_installer(installer_path: Path) -> None:
     safe_installer = _safe_cmd_value(installer_path)
     safe_app_exe = _safe_cmd_value(sys.executable)
     safe_app_dir = _safe_cmd_value(ntpath.dirname(ntpath.abspath(sys.executable)))
+    safe_install_scope = _safe_cmd_value(_windows_installer_scope_arg(sys.executable))
+    safe_target_version = _safe_cmd_value(
+        _windows_installer_target_version(installer_path)
+    )
     safe_update_log = _safe_cmd_value(
         installer_path.parent / f"catalyst-update-{app_pid}.log"
     )
@@ -629,6 +679,8 @@ setlocal
 set "INSTALLER={safe_installer}"
 set "APP_EXE={safe_app_exe}"
 set "APP_DIR={safe_app_dir}"
+set "INSTALL_SCOPE={safe_install_scope}"
+set "EXPECTED_VERSION={safe_target_version}"
 set "UPDATE_LOG={safe_update_log}"
 set "INSTALL_LOG={safe_install_log}"
 echo [%DATE% %TIME%] helper started for pid {app_pid}>"%UPDATE_LOG%"
@@ -640,11 +692,18 @@ if errorlevel 1 (
     goto finish
 )
 echo [%DATE% %TIME%] app pid {app_pid} exited; running installer>>"%UPDATE_LOG%"
-start /wait "" "%INSTALLER%" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /CATALYST_RELAUNCH=1 /DIR="%APP_DIR%" /LOG="%INSTALL_LOG%"
+start /wait "" "%INSTALLER%" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /CATALYST_RELAUNCH=1 %INSTALL_SCOPE% /DIR="%APP_DIR%" /LOG="%INSTALL_LOG%"
 set "INSTALL_EXIT=%ERRORLEVEL%"
 echo [%DATE% %TIME%] installer exit %INSTALL_EXIT%>>"%UPDATE_LOG%"
-if "%INSTALL_EXIT%"=="0" goto relaunch
-if "%INSTALL_EXIT%"=="3010" goto relaunch
+if "%INSTALL_EXIT%"=="0" goto verify_version
+if "%INSTALL_EXIT%"=="3010" goto verify_version
+goto finish
+:verify_version
+set "INSTALLED_VERSION="
+for /f "usebackq delims=" %%V in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$item=Get-Item -LiteralPath $env:APP_EXE -ErrorAction Stop; [Console]::Write($item.VersionInfo.ProductVersion.Trim())"`) do set "INSTALLED_VERSION=%%V"
+if /I "%INSTALLED_VERSION%"=="%EXPECTED_VERSION%" goto relaunch
+echo [%DATE% %TIME%] installed version mismatch: expected %EXPECTED_VERSION%, found %INSTALLED_VERSION%>>"%UPDATE_LOG%"
+set "INSTALL_EXIT=9"
 goto finish
 :relaunch
 ping -n 3 127.0.0.1 >NUL
