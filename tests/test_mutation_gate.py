@@ -6585,8 +6585,10 @@ def test_desktop_legacy_recovery_retry_is_bounded_and_fail_closed(monkeypatch):
     monkeypatch.setattr(
         api_server,
         "recover_legacy_startup_reservations",
-        lambda: events.append("legacy_recovery")
-        or {"examined": 2, "recovered": 0, "remaining": 2},
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
     )
     monkeypatch.setattr(
         desktop_app.time,

@@ -1727,7 +1727,9 @@ def _initialize_startup_ownership() -> dict:
                 or authorization.get("reason_code") not in legacy_recovery_reasons
             ):
                 break
-            remaining = recovery.get("remaining") if isinstance(recovery, dict) else None
+            remaining = (
+                recovery.get("remaining") if isinstance(recovery, dict) else None
+            )
             if remaining == 0:
                 break
             if attempt + 1 < _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS:
