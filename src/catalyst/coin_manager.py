@@ -1079,6 +1079,8 @@ def check_tier_size_drift_standalone(
     low_ratio: Optional[float] = None,
     high_ratio: Optional[float] = None,
     min_sample: int = 2,
+    *,
+    allow_fresh_price: bool = True,
 ) -> List[Dict]:
     """Module-level mirror of CoinManager.check_tier_size_drift.
 
@@ -1091,6 +1093,10 @@ def check_tier_size_drift_standalone(
     selection: the coin-classifier floor tolerance and COIN_MAX_SIZE_RATIO.
     That avoids telling the operator to re-prep while the bot still has
     perfectly usable oversize coins that live topup can reshape normally.
+
+    ``allow_fresh_price=False`` keeps frequent status callers local. When no
+    authoritative CAT price is already cached, CAT drift is omitted instead
+    of performing network I/O or comparing against a fabricated price.
     """
     from database import get_coins_by_designation
 
@@ -1100,7 +1106,12 @@ def check_tier_size_drift_standalone(
         return findings
     for wallet_type, is_cat in (("xch", False), ("cat", True)):
         try:
-            live_sizes = get_tier_sizes_mojos_from_cfg(is_cat=is_cat)
+            if allow_fresh_price:
+                live_sizes = get_tier_sizes_mojos_from_cfg(is_cat=is_cat)
+            else:
+                live_sizes = get_tier_sizes_mojos_from_cfg(
+                    is_cat=is_cat, allow_fresh_price=False
+                )
         except Exception:
             continue
         if not live_sizes:
@@ -1253,7 +1264,9 @@ def reclassify_tier_spare_coins() -> Dict[str, int]:
     return moved
 
 
-def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
+def get_tier_sizes_mojos_from_cfg(
+    is_cat: bool = False, *, allow_fresh_price: bool = True
+) -> Dict[str, int]:
     """Module-level helper that builds the tier_sizes_mojos dict from cfg
     without requiring a CoinManager instance.
 
@@ -1281,8 +1294,9 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
     the selector asks for "extreme", rejecting every eligible coin.
 
     For CAT we derive sizes as ``(xch_tier_size / mid_price) * prep_headroom``
-    scaled to CAT mojos. When mid_price is unknown, falls back to the
-    XCH-denominated size directly.
+    scaled to CAT mojos. When ``allow_fresh_price`` is false, the helper uses
+    cached data only and returns an empty mapping if no authoritative price is
+    available. The default path retains the historical last-resort fallback.
     """
     if not cfg.TIER_ENABLED:
         return {}
@@ -1400,7 +1414,11 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
                                     price = None
                             except Exception:
                                 price = None
-                    if (price is None or price <= 0) and pe is not None:
+                    if (
+                        allow_fresh_price
+                        and (price is None or price <= 0)
+                        and pe is not None
+                    ):
                         try:
                             fresh = pe.get_price()
                             if isinstance(fresh, dict):
@@ -1419,6 +1437,8 @@ def get_tier_sizes_mojos_from_cfg(is_cat: bool = False) -> Dict[str, int]:
                             price = None
             except Exception:
                 price = None
+        if (price is None or price <= 0) and not allow_fresh_price:
+            return {}
         if price is None or price <= 0:
             # Last-resort placeholder. Only happens before the bot is wired
             # up or when the price engine is completely unavailable. Note:
