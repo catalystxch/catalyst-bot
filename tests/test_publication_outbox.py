@@ -1101,6 +1101,87 @@ def test_startup_recovers_expired_dexie_claim_from_exact_active_offer(
     assert isolated_database.get_offer(trade_id)["dexie_id"] == "dexie-readback-1"
 
 
+@pytest.mark.parametrize("publisher", ["dexie", "splash"])
+def test_upgrade_restart_recovers_undispatched_publication_claim_without_active_owner(
+    isolated_database, publisher
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database, publisher=publisher)
+
+    result = isolated_database.recover_undispatched_publication_claims_at_startup(
+        recovered_at=WITHIN_LEASE
+    )
+
+    recovered = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert result == {"examined": 1, "recovered": 1, "remaining": 0}
+    assert recovered["state"] == "retryable"
+    assert recovered["claim_owner_run_id"] is None
+    assert recovered["claim_token"] is None
+    assert recovered["claim_expires_at"] is None
+    assert recovered["next_attempt_at"] == WITHIN_LEASE
+    assert recovered["row_version"] == claim["row_version"] + 1
+    assert json.loads(recovered["last_error_json"]) == {
+        "code": "UPGRADE_RESTART_RECOVERED_UNDISPATCHED_PUBLICATION_CLAIM"
+    }
+    snapshot = isolated_database.get_stability_startup_recovery_snapshot()
+    assert snapshot["publication_issues"] == []
+    assert snapshot["blocker_counts"]["publication_claims"] == 0
+
+
+def test_upgrade_restart_does_not_recover_publication_claim_from_active_owner(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    lease = isolated_database.acquire_runtime_mutation_lease(
+        owner_run_id="live-owner",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        lease_expires_at="2099-01-01T00:05:00.000000Z",
+        now=AT,
+    )
+    assert lease["acquired"] is True
+
+    result = isolated_database.recover_undispatched_publication_claims_at_startup(
+        recovered_at=WITHIN_LEASE
+    )
+
+    retained = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert result == {"examined": 0, "recovered": 0, "remaining": 1}
+    assert retained["state"] == "claimed"
+    assert retained["claim_owner_run_id"] == "worker-a"
+    assert retained["claim_token"] == "claim-a"
+    assert retained["claim_expires_at"] == LEASE_END
+    assert retained["row_version"] == claim["row_version"]
+
+
+def test_upgrade_restart_keeps_dispatched_publication_claim_fail_closed(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+
+    result = isolated_database.recover_undispatched_publication_claims_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    retained = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert result == {"examined": 1, "recovered": 0, "remaining": 1}
+    assert retained == dispatched
+    assert retained["state"] == "claimed"
+
+
 @pytest.mark.parametrize(
     ("module", "manager_name", "publisher", "provider_id"),
     [
