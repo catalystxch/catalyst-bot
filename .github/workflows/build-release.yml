@@ -85,6 +85,10 @@ jobs:
           fi
           python scripts/packaged_api_smoke.py --exe "$exe"
 
+      - name: Smoke test upgrade-interrupted publication recovery (Windows)
+        if: matrix.os == 'windows-latest'
+        run: python scripts/packaged_upgrade_publication_recovery_smoke.py --exe dist/Catalyst/Catalyst.exe
+
       - name: Package (Windows zip)
         if: matrix.os == 'windows-latest'
         shell: pwsh
