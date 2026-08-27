@@ -604,6 +604,78 @@ def offer_cancel_continuation_journal(continuation) -> dict:
     return offer_creation_continuation_journal(continuation)
 
 
+def refresh_offer_cancel_continuation(
+    continuation,
+    *,
+    operation_id: str,
+    intent_id: str,
+    trade_id: str,
+    ttl_seconds: int = 60,
+) -> bool:
+    """Refresh one held cancellation capability immediately before dispatch.
+
+    Large cancellation cohorts acquire every capability before their PREPARED
+    journal is committed.  A slow, definitive wallet failure may outlive the
+    original process-local TTL for a later member.  Renewal is allowed only for
+    the same creator thread and exact operation/intent/trade tuple, while the
+    held permit still passes the mutation gate's exact PREPARED-blocker,
+    current-lease, safety-latch, adapter, and fresh-wallet-identity checks.
+    """
+
+    try:
+        operation = _exact_continuation_text(operation_id, "operation_id")
+        intent = _exact_continuation_text(intent_id, "intent_id")
+        target_trade_id = _exact_continuation_trade_id(trade_id)
+        if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 60:
+            raise ValueError("ttl_seconds must be an exact integer from 1 to 60")
+    except (TypeError, ValueError):
+        return False
+
+    with _offer_creation_continuation_lock:
+        state = _offer_creation_continuations.get(continuation)
+        if (
+            state is None
+            or threading.get_ident() != state.creator_thread_id
+            or operation != state.operation_id
+            or intent != state.intent_id
+            or target_trade_id != state.target_trade_id
+            or state.wallet_operation != "wallet:cancel_offer"
+        ):
+            return False
+
+    try:
+        snapshot = _identity_from_adapter(state.adapter)
+        binding, adapter, _decision = (
+            mutation_gate.require_fresh_wallet_operation_continuation(
+                state.permit,
+                snapshot,
+                state.wallet_operation,
+                operation,
+                intent,
+            )
+        )
+        if (
+            type(binding) is not mutation_gate.WalletIdentityBinding
+            or mutation_gate.wallet_identity_binding_digest(binding)
+            != mutation_gate.wallet_identity_binding_digest(state.binding)
+            or adapter is not state.adapter
+            or binding.backend != WALLET_TYPE
+            or adapter is not _wallet_adapter
+        ):
+            return False
+    except Exception:
+        return False
+
+    with _offer_creation_continuation_lock:
+        if (
+            _offer_creation_continuations.get(continuation) is not state
+            or threading.get_ident() != state.creator_thread_id
+        ):
+            return False
+        state.deadline = time.monotonic() + ttl_seconds
+    return True
+
+
 def close_offer_creation_continuation(continuation) -> bool:
     """Close an unused continuation and release its lifecycle permit exactly once."""
 

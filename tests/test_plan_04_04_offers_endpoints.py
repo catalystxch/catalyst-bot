@@ -567,6 +567,49 @@ class TestCancelAllPost(_FlaskBase):
         assert "pending authoritative reconciliation" in shutdown_source
         assert "confirmed cancelled" not in shutdown_source
 
+    def test_stopped_cancel_all_submits_500_offers_in_one_authority_envelope(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_ids = [f"{index:064x}" for index in range(1, 501)]
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "success": True,
+            }
+            for trade_id in trade_ids
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                ],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            resp = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(resp.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            trade_ids,
+            reason="manual_cancel_all",
+            force_storm=True,
+        )
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["total"], 500)
+        self.assertEqual(status["batch_size"], 500)
+        self.assertEqual(status["total_batches"], 1)
+        self.assertEqual(status["pending"], 500)
+        self.assertEqual(status["failed"], 0)
+
     def test_uninitialised_bot_denial_clears_state_and_allows_coordinator_retry(self):
         trade_id = "a" * 64
         stopped = _make_bot()

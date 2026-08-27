@@ -495,6 +495,7 @@ def api_cancel_all():
                 total_batches=1,
                 current_batch=1,
                 cancelled=0,
+                pending=0,
                 failed=0,
                 message=f"Journaling {len(open_ids)} offer cancellation requests...",
             )
@@ -1945,6 +1946,7 @@ def _new_cancel_all_state():
         "batch_cancelled": 0,
         "batch_failed": 0,
         "cancelled": 0,
+        "pending": 0,
         "failed": 0,
     }
 

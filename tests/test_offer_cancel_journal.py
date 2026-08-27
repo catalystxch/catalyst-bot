@@ -1438,6 +1438,115 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
     ]
 
 
+def test_offer_manager_refreshes_each_prepared_continuation_before_dispatch(
+    isolated_database,
+    monkeypatch,
+):
+    """A slow definitive Sage failure must not expire later cohort members."""
+
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    monotonic_now = [10.0]
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        if len(effects) == 1:
+            monotonic_now[0] += 61.0
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={"success": False, "error": "rejected"},
+        )
+
+    monkeypatch.setattr(wallet.time, "monotonic", lambda: monotonic_now[0])
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=24,
+    )
+
+    results = OfferManager().cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == trade_ids
+    assert [results[trade_id]["outcome"] for trade_id in trade_ids] == [
+        CANCEL_FAILED,
+        CANCEL_FAILED,
+        CANCEL_FAILED,
+    ]
+
+
+@pytest.mark.parametrize("member_count", [71, 129])
+def test_offer_manager_prepares_full_large_book_before_first_wallet_effect(
+    isolated_database,
+    monkeypatch,
+    member_count,
+):
+    """Cancel All must preserve one authority envelope for a large offer book."""
+
+    trade_ids = [f"{index:064x}" for index in range(1, member_count + 1)]
+    canonical_trade_ids = sorted(trade_ids)
+    acquired = []
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        assert acquired == list(reversed(canonical_trade_ids))
+        assert all(
+            [
+                event["phase"]
+                for event in database.get_offer_operation_events(f"cancel:{member}")
+            ]
+            == ["PREPARED"]
+            for member in canonical_trade_ids
+        )
+        effects.append(trade_id)
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True, "transaction_id": "1" * 64},
+            transaction_id="1" * 64,
+        )
+
+    _install_real_cancel_authority(monkeypatch, effect=effect)
+    manager = OfferManager()
+    acquire = manager._acquire_cancel_authority
+
+    def tracked_acquire(intent):
+        acquired.append(intent.trade_id)
+        return acquire(intent)
+
+    monkeypatch.setattr(manager, "_acquire_cancel_authority", tracked_acquire)
+    results = manager.cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == canonical_trade_ids[:1]
+    assert results[canonical_trade_ids[0]]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert all(
+        results[trade_id]["method"] == "batch_abort_ambiguous"
+        for trade_id in canonical_trade_ids[1:]
+    )
+    prepared = [
+        json.loads(
+            database.get_offer_operation_events(f"cancel:{trade_id}")[0][
+                "evidence_json"
+            ]
+        )
+        for trade_id in canonical_trade_ids
+    ]
+    cohort_sizes = {}
+    for evidence in prepared:
+        cohort_sizes.setdefault(evidence["cohort_id"], evidence["cohort_size"])
+    assert list(cohort_sizes.values()) == [member_count]
+    assert all(
+        [
+            event["phase"]
+            for event in database.get_offer_operation_events(f"cancel:{tid}")
+        ]
+        == ["PREPARED", "FINALIZED"]
+        for tid in canonical_trade_ids
+    )
+
+
 def test_offer_manager_restart_closes_atomically_prepared_cohort_without_effect(
     isolated_database,
     monkeypatch,
@@ -1965,12 +2074,24 @@ def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(
             "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
         }
 
-    with pytest.raises(ValueError, match="2 to 64"):
+    with pytest.raises(ValueError, match="2 to 500"):
         database.canonical_offer_cancel_cohort_manifest([member(1)])
-    with pytest.raises(ValueError, match="2 to 64"):
+    with pytest.raises(ValueError, match="2 to 500"):
         database.canonical_offer_cancel_cohort_manifest(
-            [member(index) for index in range(1, 66)]
+            [member(index) for index in range(1, 502)]
         )
+    maximum = database.canonical_offer_cancel_cohort_manifest(
+        [member(index) for index in range(1, 501)]
+    )
+    assert maximum["member_count"] == 500
+    assert (
+        len(
+            json.dumps(
+                maximum, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+        )
+        < 262_144
+    )
 
     manifest = database.canonical_offer_cancel_cohort_manifest([member(1), member(2)])
     tampered_digest = json.loads(json.dumps(manifest))
