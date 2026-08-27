@@ -3175,7 +3175,7 @@ CREATE TABLE IF NOT EXISTS offer_cancel_cohort_manifests (
     cohort_id                   TEXT NOT NULL UNIQUE,
     manifest_sha256             TEXT NOT NULL UNIQUE,
     member_count                INTEGER NOT NULL
-        CHECK(member_count BETWEEN 2 AND 128),
+        CHECK(member_count BETWEEN 2 AND 500),
     manifest_json               TEXT NOT NULL,
     created_at                  TEXT NOT NULL
 );
@@ -4514,7 +4514,7 @@ CREATE TABLE offer_cancel_cohort_manifests (
     cohort_id                   TEXT NOT NULL UNIQUE,
     manifest_sha256             TEXT NOT NULL UNIQUE,
     member_count                INTEGER NOT NULL
-        CHECK(member_count BETWEEN 2 AND 128),
+        CHECK(member_count BETWEEN 2 AND 500),
     manifest_json               TEXT NOT NULL,
     created_at                  TEXT NOT NULL
 )
@@ -4549,9 +4549,13 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
     actual = _normalized_schema_sql(row[0])
     if actual == _normalized_schema_sql(_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL):
         return
-    if actual != _normalized_schema_sql(
-        _LEGACY_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL
-    ):
+    legacy_128_sql = _OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL.replace(
+        "BETWEEN 2 AND 500", "BETWEEN 2 AND 128"
+    )
+    if actual not in {
+        _normalized_schema_sql(_LEGACY_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL),
+        _normalized_schema_sql(legacy_128_sql),
+    }:
         return
 
     expected_triggers = {
@@ -4582,7 +4586,7 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
             conn.execute(f'DROP TRIGGER "{trigger_name}"')
         conn.execute(
             "ALTER TABLE offer_cancel_cohort_manifests "
-            "RENAME TO offer_cancel_cohort_manifests_legacy_64"
+            "RENAME TO offer_cancel_cohort_manifests_legacy_envelope"
         )
         conn.execute(_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL)
         conn.execute(
@@ -4591,10 +4595,10 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
             "manifest_json,created_at) "
             "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
             "manifest_json,created_at "
-            "FROM offer_cancel_cohort_manifests_legacy_64 "
+            "FROM offer_cancel_cohort_manifests_legacy_envelope "
             "ORDER BY manifest_sequence"
         )
-        conn.execute("DROP TABLE offer_cancel_cohort_manifests_legacy_64")
+        conn.execute("DROP TABLE offer_cancel_cohort_manifests_legacy_envelope")
         for trigger_sql in expected_triggers.values():
             conn.execute(trigger_sql)
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -19807,10 +19811,10 @@ def _canonical_cancel_identifiers(
     return trade_id
 
 
-# Smart Defaults may create about 120 active offers across both sides.  Keep one
-# Cancel All request inside a single durable authority envelope so the mutation
-# gate can validate every PREPARED member before the first wallet effect.
-_CANCEL_COHORT_MEMBER_LIMIT = 128
+# Keep the full bounded wallet/API listing inside one durable authority envelope
+# so the mutation gate can validate every PREPARED member before the first
+# wallet effect. Configured books may legitimately exceed 128 offers.
+_CANCEL_COHORT_MEMBER_LIMIT = 500
 
 
 def _canonical_offer_cancel_intent_id(value: Any, trade_id: str) -> str:
@@ -19836,7 +19840,7 @@ def canonical_offer_cancel_cohort_manifest(members: Any) -> Dict[str, Any]:
         type(members) is not list
         or not 2 <= len(members) <= _CANCEL_COHORT_MEMBER_LIMIT
     ):
-        raise ValueError("cancellation cohort must contain 2 to 128 exact members")
+        raise ValueError("cancellation cohort must contain 2 to 500 exact members")
     expected_keys = {
         "trade_id",
         "operation_id",

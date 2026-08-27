@@ -567,10 +567,10 @@ class TestCancelAllPost(_FlaskBase):
         assert "pending authoritative reconciliation" in shutdown_source
         assert "confirmed cancelled" not in shutdown_source
 
-    def test_stopped_cancel_all_submits_71_offers_in_one_authority_envelope(self):
+    def test_stopped_cancel_all_submits_500_offers_in_one_authority_envelope(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False
-        trade_ids = [f"{index:064x}" for index in range(1, 72)]
+        trade_ids = [f"{index:064x}" for index in range(1, 501)]
         stopped.offer_manager.cancel_offers.return_value = {
             trade_id: {
                 "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
@@ -604,10 +604,10 @@ class TestCancelAllPost(_FlaskBase):
         status = self.client.get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
-        self.assertEqual(status["total"], 71)
-        self.assertEqual(status["batch_size"], 71)
+        self.assertEqual(status["total"], 500)
+        self.assertEqual(status["batch_size"], 500)
         self.assertEqual(status["total_batches"], 1)
-        self.assertEqual(status["pending"], 71)
+        self.assertEqual(status["pending"], 500)
         self.assertEqual(status["failed"], 0)
 
     def test_uninitialised_bot_denial_clears_state_and_allows_coordinator_retry(self):

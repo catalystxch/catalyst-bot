@@ -6528,7 +6528,9 @@ class OfferManager:
 
         authorities = {}
         try:
-            for intent, _attempt, _member_id in members:
+            # Acquire in reverse dispatch order so the first wallet effect uses
+            # the freshest continuation even for the 500-member API envelope.
+            for intent, _attempt, _member_id in reversed(members):
                 if (
                     existing_results[intent.trade_id] is None
                     and intent.trade_id not in recoverable_contexts

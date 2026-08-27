@@ -838,8 +838,10 @@ def test_repeated_migration_does_not_rescan_append_only_effect_history(
     )
 
 
+@pytest.mark.parametrize("legacy_limit", [64, 128])
 def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
     isolated_database,
+    legacy_limit,
 ):
     database.init_database()
     database.close_connection()
@@ -851,7 +853,7 @@ def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
             ("cancel-cohort:" + "a" * 64, "b" * 64, 2, "{}", AT),
         )
         conn.executescript(
-            """
+            f"""
             DROP TRIGGER offer_cancel_cohort_manifests_no_update;
             DROP TRIGGER offer_cancel_cohort_manifests_no_delete;
             ALTER TABLE offer_cancel_cohort_manifests
@@ -861,7 +863,7 @@ def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
                 cohort_id TEXT NOT NULL UNIQUE,
                 manifest_sha256 TEXT NOT NULL UNIQUE,
                 member_count INTEGER NOT NULL
-                    CHECK(member_count BETWEEN 2 AND 64),
+                    CHECK(member_count BETWEEN 2 AND {legacy_limit}),
                 manifest_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -899,7 +901,7 @@ def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
             "VALUES (?,?,?,?,?)",
             ("cancel-cohort:" + "c" * 64, "d" * 64, 71, "{}", LATER),
         )
-    assert "BETWEEN 2 AND 128" in schema
+    assert "BETWEEN 2 AND 500" in schema
     assert preserved == [("cancel-cohort:" + "a" * 64, "b" * 64, 2, "{}", AT)]
 
 
