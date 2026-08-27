@@ -28139,23 +28139,74 @@ def recover_undispatched_publication_claims_at_startup(
                 publication_id = _required_stability_text(
                     row.get("publication_id"), "publication_id"
                 )
-                _required_stability_text(
+                if publication_id != row.get("publication_id"):
+                    continue
+                owner_run_id = _required_stability_text(
                     row.get("claim_owner_run_id"), "claim_owner_run_id"
                 )
-                _required_stability_text(row.get("claim_token"), "claim_token")
+                if owner_run_id != row.get("claim_owner_run_id"):
+                    continue
+                claim_token = _required_stability_text(
+                    row.get("claim_token"), "claim_token"
+                )
+                if claim_token != row.get("claim_token"):
+                    continue
                 claim_expiry = _stability_timestamp(
                     row.get("claim_expires_at"), "claim_expires_at"
                 )
                 if claim_expiry != row.get("claim_expires_at"):
                     continue
+                updated_at = _stability_timestamp(row.get("updated_at"), "updated_at")
+                if updated_at != row.get("updated_at"):
+                    continue
+                queued_at = _stability_timestamp(row.get("queued_at"), "queued_at")
+                if queued_at != row.get("queued_at") or updated_at < queued_at:
+                    continue
+                claim_lifetime_seconds = (
+                    _parse_iso_timestamp(
+                        claim_expiry, "claim_expires_at", require_timezone=True
+                    )
+                    - _parse_iso_timestamp(
+                        updated_at, "updated_at", require_timezone=True
+                    )
+                ).total_seconds()
+                if claim_lifetime_seconds <= 0 or claim_lifetime_seconds > 300:
+                    continue
                 _exact_integer(
                     row.get("claim_generation"), "claim_generation", minimum=1
                 )
+                _exact_integer(row.get("attempt_count"), "attempt_count", minimum=1)
                 row_version = _exact_integer(
                     row.get("row_version"), "row_version", minimum=1
                 )
+                recovery_generation = _exact_integer(
+                    row.get("recovery_generation"),
+                    "recovery_generation",
+                    minimum=0,
+                )
+                latch_generation = _exact_integer(
+                    latch["generation"], "safety latch generation", minimum=0
+                )
+                if recovery_generation != latch_generation:
+                    continue
                 publisher = _required_stability_text(row.get("publisher"), "publisher")
-                if publisher not in {"dexie", "splash"}:
+                if publisher != row.get("publisher") or publisher not in {
+                    "dexie",
+                    "splash",
+                }:
+                    continue
+                if any(
+                    row.get(field) is not None
+                    for field in (
+                        "next_attempt_at",
+                        "succeeded_at",
+                        "terminal_at",
+                        "acknowledgement_json",
+                        "acknowledgement_sha256",
+                        "suppression_json",
+                        "suppression_sha256",
+                    )
+                ):
                     continue
             except (TypeError, ValueError):
                 continue
