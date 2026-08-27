@@ -1694,6 +1694,23 @@ def _initialize_startup_ownership() -> dict:
         and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
     ):
         try:
+            from database import (
+                recover_undispatched_publication_claims_at_startup,
+            )
+
+            local_recovery = recover_undispatched_publication_claims_at_startup()
+            if local_recovery.get("recovered", 0) > 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # A claim without dispatch evidence is recoverable only while no
+            # mutation owner exists. Any uncertainty keeps the blocker intact.
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
             from dexie_manager import recover_expired_dexie_publications_at_startup
 
             recovery = recover_expired_dexie_publications_at_startup()

@@ -28078,6 +28078,187 @@ def list_publication_outbox(
     return [dict(row) for row in rows]
 
 
+def recover_undispatched_publication_claims_at_startup(
+    *, recovered_at: Any = None
+) -> Dict[str, int]:
+    """Release claims abandoned before any provider request could begin.
+
+    An app upgrade can terminate a publisher after it acquires a short claim
+    but before ``mark_publication_dispatch_started`` commits the exact request
+    digest. Once the singleton mutation lease is inactive, those rows cannot
+    represent a remote effect and may be made immediately retryable. Any row
+    with dispatch evidence remains fail-closed for provider readback recovery.
+    """
+
+    recovered = _stability_timestamp_or_now(recovered_at, "recovered_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch = conn.execute(
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if (
+            latch is None
+            or latch["state"] != "resolved"
+            or lease is None
+            or bool(lease["active"])
+        ):
+            remaining = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM publication_outbox "
+                    "WHERE state IN ('claimed','unresolved')"
+                ).fetchone()[0]
+            )
+            conn.commit()
+            return {"examined": 0, "recovered": 0, "remaining": remaining}
+
+        rows = conn.execute(
+            "SELECT * FROM publication_outbox WHERE state='claimed' "
+            "ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup publication claim limit exceeded")
+
+        evidence, evidence_sha256 = _bounded_publication_evidence(
+            {"code": "UPGRADE_RESTART_RECOVERED_UNDISPATCHED_PUBLICATION_CLAIM"},
+            "undispatched publication recovery evidence",
+        )
+        recovered_count = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            if (
+                row.get("dispatch_started_at") is not None
+                or row.get("request_sha256") is not None
+            ):
+                continue
+            try:
+                publication_id = _required_stability_text(
+                    row.get("publication_id"), "publication_id"
+                )
+                if publication_id != row.get("publication_id"):
+                    continue
+                owner_run_id = _required_stability_text(
+                    row.get("claim_owner_run_id"), "claim_owner_run_id"
+                )
+                if owner_run_id != row.get("claim_owner_run_id"):
+                    continue
+                claim_token = _required_stability_text(
+                    row.get("claim_token"), "claim_token"
+                )
+                if claim_token != row.get("claim_token"):
+                    continue
+                claim_expiry = _stability_timestamp(
+                    row.get("claim_expires_at"), "claim_expires_at"
+                )
+                if claim_expiry != row.get("claim_expires_at"):
+                    continue
+                updated_at = _stability_timestamp(row.get("updated_at"), "updated_at")
+                if updated_at != row.get("updated_at"):
+                    continue
+                queued_at = _stability_timestamp(row.get("queued_at"), "queued_at")
+                if queued_at != row.get("queued_at") or updated_at < queued_at:
+                    continue
+                claim_lifetime_seconds = (
+                    _parse_iso_timestamp(
+                        claim_expiry, "claim_expires_at", require_timezone=True
+                    )
+                    - _parse_iso_timestamp(
+                        updated_at, "updated_at", require_timezone=True
+                    )
+                ).total_seconds()
+                if claim_lifetime_seconds <= 0 or claim_lifetime_seconds > 300:
+                    continue
+                claim_generation = _exact_integer(
+                    row.get("claim_generation"), "claim_generation", minimum=1
+                )
+                attempt_count = _exact_integer(
+                    row.get("attempt_count"), "attempt_count", minimum=1
+                )
+                row_version = _exact_integer(
+                    row.get("row_version"), "row_version", minimum=1
+                )
+                if claim_generation != attempt_count or row_version < claim_generation:
+                    continue
+                recovery_generation = _exact_integer(
+                    row.get("recovery_generation"),
+                    "recovery_generation",
+                    minimum=0,
+                )
+                latch_generation = _exact_integer(
+                    latch["generation"], "safety latch generation", minimum=0
+                )
+                if recovery_generation != latch_generation:
+                    continue
+                publisher = _required_stability_text(row.get("publisher"), "publisher")
+                if publisher != row.get("publisher") or publisher not in {
+                    "dexie",
+                    "splash",
+                }:
+                    continue
+                if any(
+                    row.get(field) is not None
+                    for field in (
+                        "next_attempt_at",
+                        "succeeded_at",
+                        "terminal_at",
+                        "acknowledgement_json",
+                        "acknowledgement_sha256",
+                        "suppression_json",
+                        "suppression_sha256",
+                    )
+                ):
+                    continue
+            except (TypeError, ValueError):
+                continue
+
+            cursor = conn.execute(
+                """
+                UPDATE publication_outbox
+                SET state='retryable', claim_owner_run_id=NULL, claim_token=NULL,
+                    claim_expires_at=NULL, next_attempt_at=?,
+                    last_error_json=?, last_error_sha256=?, terminal_at=NULL,
+                    row_version=row_version+1, updated_at=?
+                WHERE publication_id=? AND row_version=? AND state='claimed'
+                  AND dispatch_started_at IS NULL AND request_sha256 IS NULL
+                  AND (SELECT active FROM runtime_mutation_lease
+                       WHERE singleton_id=1)=0
+                  AND (SELECT state FROM runtime_safety_latch
+                       WHERE singleton_id=1)='resolved'
+                """,
+                (
+                    recovered,
+                    evidence,
+                    evidence_sha256,
+                    recovered,
+                    publication_id,
+                    row_version,
+                ),
+            )
+            recovered_count += int(cursor.rowcount)
+
+        remaining = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM publication_outbox "
+                "WHERE state IN ('claimed','unresolved')"
+            ).fetchone()[0]
+        )
+        conn.commit()
+        return {
+            "examined": len(rows),
+            "recovered": recovered_count,
+            "remaining": remaining,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _unresolve_publication_candidate(
     conn: sqlite3.Connection,
     row: Dict[str, Any],
