@@ -838,6 +838,71 @@ def test_repeated_migration_does_not_rescan_append_only_effect_history(
     )
 
 
+def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
+    isolated_database,
+):
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        conn.execute(
+            "INSERT INTO offer_cancel_cohort_manifests "
+            "(cohort_id,manifest_sha256,member_count,manifest_json,created_at) "
+            "VALUES (?,?,?,?,?)",
+            ("cancel-cohort:" + "a" * 64, "b" * 64, 2, "{}", AT),
+        )
+        conn.executescript(
+            """
+            DROP TRIGGER offer_cancel_cohort_manifests_no_update;
+            DROP TRIGGER offer_cancel_cohort_manifests_no_delete;
+            ALTER TABLE offer_cancel_cohort_manifests
+                RENAME TO offer_cancel_cohort_manifests_current;
+            CREATE TABLE offer_cancel_cohort_manifests (
+                manifest_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                cohort_id TEXT NOT NULL UNIQUE,
+                manifest_sha256 TEXT NOT NULL UNIQUE,
+                member_count INTEGER NOT NULL
+                    CHECK(member_count BETWEEN 2 AND 64),
+                manifest_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO offer_cancel_cohort_manifests
+            SELECT * FROM offer_cancel_cohort_manifests_current;
+            DROP TABLE offer_cancel_cohort_manifests_current;
+            CREATE TRIGGER offer_cancel_cohort_manifests_no_update
+            BEFORE UPDATE ON offer_cancel_cohort_manifests
+            BEGIN
+                SELECT RAISE(ABORT, 'offer_cancel_cohort_manifests is append-only');
+            END;
+            CREATE TRIGGER offer_cancel_cohort_manifests_no_delete
+            BEFORE DELETE ON offer_cancel_cohort_manifests
+            BEGIN
+                SELECT RAISE(ABORT, 'offer_cancel_cohort_manifests is append-only');
+            END;
+            """
+        )
+        conn.commit()
+
+    database._migrate_stability_schema()
+
+    with sqlite3.connect(isolated_database) as conn:
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='offer_cancel_cohort_manifests'"
+        ).fetchone()[0]
+        preserved = conn.execute(
+            "SELECT cohort_id,manifest_sha256,member_count,manifest_json,created_at "
+            "FROM offer_cancel_cohort_manifests"
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO offer_cancel_cohort_manifests "
+            "(cohort_id,manifest_sha256,member_count,manifest_json,created_at) "
+            "VALUES (?,?,?,?,?)",
+            ("cancel-cohort:" + "c" * 64, "d" * 64, 71, "{}", LATER),
+        )
+    assert "BETWEEN 2 AND 128" in schema
+    assert preserved == [("cancel-cohort:" + "a" * 64, "b" * 64, 2, "{}", AT)]
+
+
 def test_sweep_active_queues_have_indexed_bounded_query_plans(isolated_database):
     database.init_database()
     conn = database.get_connection()

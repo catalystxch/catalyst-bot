@@ -1438,6 +1438,75 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
     ]
 
 
+def test_offer_manager_prepares_all_71_members_before_first_wallet_effect(
+    isolated_database,
+    monkeypatch,
+):
+    """Cancel All must preserve one authority envelope for a 71-offer book."""
+
+    trade_ids = [f"{index:064x}" for index in range(1, 72)]
+    canonical_trade_ids = sorted(trade_ids)
+    acquired = []
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        assert acquired == canonical_trade_ids
+        assert all(
+            [
+                event["phase"]
+                for event in database.get_offer_operation_events(f"cancel:{member}")
+            ]
+            == ["PREPARED"]
+            for member in canonical_trade_ids
+        )
+        effects.append(trade_id)
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True, "transaction_id": "1" * 64},
+            transaction_id="1" * 64,
+        )
+
+    _install_real_cancel_authority(monkeypatch, effect=effect)
+    manager = OfferManager()
+    acquire = manager._acquire_cancel_authority
+
+    def tracked_acquire(intent):
+        acquired.append(intent.trade_id)
+        return acquire(intent)
+
+    monkeypatch.setattr(manager, "_acquire_cancel_authority", tracked_acquire)
+    results = manager.cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == canonical_trade_ids[:1]
+    assert results[canonical_trade_ids[0]]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert all(
+        results[trade_id]["method"] == "batch_abort_ambiguous"
+        for trade_id in canonical_trade_ids[1:]
+    )
+    prepared = [
+        json.loads(
+            database.get_offer_operation_events(f"cancel:{trade_id}")[0][
+                "evidence_json"
+            ]
+        )
+        for trade_id in canonical_trade_ids
+    ]
+    cohort_sizes = {}
+    for evidence in prepared:
+        cohort_sizes.setdefault(evidence["cohort_id"], evidence["cohort_size"])
+    assert list(cohort_sizes.values()) == [71]
+    assert all(
+        [
+            event["phase"]
+            for event in database.get_offer_operation_events(f"cancel:{tid}")
+        ]
+        == ["PREPARED", "FINALIZED"]
+        for tid in canonical_trade_ids
+    )
+
+
 def test_offer_manager_restart_closes_atomically_prepared_cohort_without_effect(
     isolated_database,
     monkeypatch,
@@ -1965,11 +2034,11 @@ def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(
             "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
         }
 
-    with pytest.raises(ValueError, match="2 to 64"):
+    with pytest.raises(ValueError, match="2 to 128"):
         database.canonical_offer_cancel_cohort_manifest([member(1)])
-    with pytest.raises(ValueError, match="2 to 64"):
+    with pytest.raises(ValueError, match="2 to 128"):
         database.canonical_offer_cancel_cohort_manifest(
-            [member(index) for index in range(1, 66)]
+            [member(index) for index in range(1, 130)]
         )
 
     manifest = database.canonical_offer_cancel_cohort_manifest([member(1), member(2)])
