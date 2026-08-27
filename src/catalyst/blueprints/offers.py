@@ -523,9 +523,7 @@ def api_cancel_all():
                 _w_pending = 0
                 _w_failed = 0
                 try:
-                    for _batch_index, _batch_ids in enumerate(
-                        _cancel_batches, start=1
-                    ):
+                    for _batch_index, _batch_ids in enumerate(_cancel_batches, start=1):
                         _set_cancel_all_state(
                             batch_size=len(_batch_ids),
                             total_batches=len(_cancel_batches),

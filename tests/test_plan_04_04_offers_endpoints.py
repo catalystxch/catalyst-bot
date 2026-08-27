@@ -592,8 +592,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
@@ -636,8 +635,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
@@ -676,8 +674,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
