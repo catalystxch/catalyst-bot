@@ -1217,6 +1217,38 @@ def test_upgrade_restart_keeps_malformed_undispatched_claim_fail_closed(
 
 
 @pytest.mark.parametrize(
+    ("claim_generation", "attempt_count", "row_version"),
+    [
+        (2, 1, 2),
+        (1, 2, 2),
+        (2, 2, 1),
+    ],
+)
+def test_upgrade_restart_keeps_impossible_claim_generation_fail_closed(
+    isolated_database, claim_generation, attempt_count, row_version
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET claim_generation=?, attempt_count=?, "
+        "row_version=? WHERE publication_id=?",
+        (claim_generation, attempt_count, row_version, claim["publication_id"]),
+    )
+    conn.commit()
+    corrupted = isolated_database.get_publication_outbox(claim["publication_id"])
+
+    result = isolated_database.recover_undispatched_publication_claims_at_startup(
+        recovered_at=WITHIN_LEASE
+    )
+
+    assert result == {"examined": 1, "recovered": 0, "remaining": 1}
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"]) == corrupted
+    )
+
+
+@pytest.mark.parametrize(
     ("module", "manager_name", "publisher", "provider_id"),
     [
         (dexie_manager, "DexieManager", "dexie", "dexie-response-1"),

@@ -28172,13 +28172,17 @@ def recover_undispatched_publication_claims_at_startup(
                 ).total_seconds()
                 if claim_lifetime_seconds <= 0 or claim_lifetime_seconds > 300:
                     continue
-                _exact_integer(
+                claim_generation = _exact_integer(
                     row.get("claim_generation"), "claim_generation", minimum=1
                 )
-                _exact_integer(row.get("attempt_count"), "attempt_count", minimum=1)
+                attempt_count = _exact_integer(
+                    row.get("attempt_count"), "attempt_count", minimum=1
+                )
                 row_version = _exact_integer(
                     row.get("row_version"), "row_version", minimum=1
                 )
+                if claim_generation != attempt_count or row_version < claim_generation:
+                    continue
                 recovery_generation = _exact_integer(
                     row.get("recovery_generation"),
                     "recovery_generation",
