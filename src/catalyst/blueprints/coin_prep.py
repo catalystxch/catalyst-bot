@@ -472,7 +472,7 @@ def _coin_prep_is_active(bot) -> bool:
     return False
 
 
-def _tier_size_drift_findings() -> list[dict]:
+def _tier_size_drift_findings(*, allow_fresh_price: bool = True) -> list[dict]:
     """Return tier coins whose DB labels no longer match current settings."""
     if not bool(getattr(cfg, "TIER_ENABLED", False)):
         return []
@@ -480,7 +480,12 @@ def _tier_size_drift_findings() -> list[dict]:
     from coin_manager import check_tier_size_drift_standalone
 
     return (
-        check_tier_size_drift_standalone(low_ratio=0.50, high_ratio=2.00, min_sample=2)
+        check_tier_size_drift_standalone(
+            low_ratio=0.50,
+            high_ratio=2.00,
+            min_sample=2,
+            allow_fresh_price=allow_fresh_price,
+        )
         or []
     )
 
@@ -1056,7 +1061,11 @@ def api_coin_prep_status():
         result["tier_size_drift"] = []
         if not result.get("running"):
             try:
-                _drift = _tier_size_drift_findings()
+                # This endpoint is polled every 1.5s by the progress view and
+                # every 2s by its visible log view.  Keep the status path local:
+                # during a TibetSwap outage, a fresh price lookup can take 30s
+                # and overlapping polls otherwise flood the desktop bridge.
+                _drift = _tier_size_drift_findings(allow_fresh_price=False)
                 result["tier_size_drift"] = _drift
                 _mark_payload_needs_coin_prep_for_drift(result, _drift)
             except Exception as _drift_err:

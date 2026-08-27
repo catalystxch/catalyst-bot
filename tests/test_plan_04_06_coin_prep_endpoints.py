@@ -367,6 +367,14 @@ class TestCoinPrepTrigger(_FlaskBase):
         "preserve_history": True,
     }
 
+    def setUp(self):
+        super().setUp()
+        # Trigger contract tests use an empty authoritative offer view without
+        # requiring the full durable offers schema.
+        self._open_offers = patch("database.get_open_offers", return_value=[])
+        self._open_offers.start()
+        self.addCleanup(self._open_offers.stop)
+
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
         self.assertEqual(resp.status_code, 401)
