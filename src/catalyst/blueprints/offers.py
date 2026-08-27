@@ -484,19 +484,28 @@ def api_cancel_all():
                     503,
                 )
 
+            _cancel_open_ids = list(open_ids)  # snapshot
+            _cancel_batches = [
+                _cancel_open_ids[index : index + 64]
+                for index in range(0, len(_cancel_open_ids), 64)
+            ]
+
             # Set initial progress state — frontend polls this immediately.
             _set_cancel_all_state(
                 running=True,
                 complete=False,
                 error=None,
                 phase="running",
-                total=len(open_ids),
-                batch_size=len(open_ids),
-                total_batches=1,
+                total=len(_cancel_open_ids),
+                batch_size=len(_cancel_batches[0]),
+                total_batches=len(_cancel_batches),
                 current_batch=1,
                 cancelled=0,
+                pending=0,
                 failed=0,
-                message=f"Journaling {len(open_ids)} offer cancellation requests...",
+                message=(
+                    f"Journaling {len(_cancel_open_ids)} offer cancellation requests..."
+                ),
             )
             log_event(
                 "info",
@@ -506,7 +515,6 @@ def api_cancel_all():
             )
 
             # ---- Background worker ----
-            _cancel_open_ids = list(open_ids)  # snapshot
             _retry_failed_attempts = _durable_failed_cancel_retry_attempts(
                 _cancel_open_ids
             )
@@ -515,37 +523,69 @@ def api_cancel_all():
                 _w_pending = 0
                 _w_failed = 0
                 try:
-                    _cancel_kwargs = {
-                        "reason": "manual_cancel_all",
-                        "force_storm": True,
-                    }
-                    if _retry_failed_attempts:
-                        _cancel_kwargs["_retry_failed_attempts"] = (
-                            _retry_failed_attempts
+                    for _batch_index, _batch_ids in enumerate(
+                        _cancel_batches, start=1
+                    ):
+                        _set_cancel_all_state(
+                            batch_size=len(_batch_ids),
+                            total_batches=len(_cancel_batches),
+                            current_batch=_batch_index,
+                            message=(
+                                f"Journaling cancellation batch {_batch_index}/"
+                                f"{len(_cancel_batches)} "
+                                f"({len(_batch_ids)} offers)..."
+                            ),
                         )
-                    _results = durable_manager.cancel_offers(
-                        _cancel_open_ids, **_cancel_kwargs
-                    )
-                    for _tid in _cancel_open_ids:
-                        _res = _results.get(_tid) if type(_results) is dict else None
-                        if (
-                            type(_res) is dict
-                            and _res.get("outcome") == "CANCEL_FAILED"
-                        ):
-                            _w_failed += 1
-                        else:
-                            # Submitted, unknown, malformed, and any claimed
-                            # confirmation all remain nonterminal here.
-                            _w_pending += 1
+                        _cancel_kwargs = {
+                            "reason": "manual_cancel_all",
+                            "force_storm": True,
+                        }
+                        _batch_retry_attempts = {
+                            _trade_id: _retry_failed_attempts[_trade_id]
+                            for _trade_id in _batch_ids
+                            if _trade_id in _retry_failed_attempts
+                        }
+                        if _batch_retry_attempts:
+                            _cancel_kwargs["_retry_failed_attempts"] = (
+                                _batch_retry_attempts
+                            )
+                        _batch_results = durable_manager.cancel_offers(
+                            _batch_ids, **_cancel_kwargs
+                        )
+                        _batch_pending = 0
+                        _batch_failed = 0
+                        for _tid in _batch_ids:
+                            _res = (
+                                _batch_results.get(_tid)
+                                if type(_batch_results) is dict
+                                else None
+                            )
+                            if (
+                                type(_res) is dict
+                                and _res.get("outcome") == "CANCEL_FAILED"
+                            ):
+                                _batch_failed += 1
+                            else:
+                                # Submitted, unknown, malformed, and any claimed
+                                # confirmation all remain nonterminal here.
+                                _batch_pending += 1
+                        _w_pending += _batch_pending
+                        _w_failed += _batch_failed
+                        _set_cancel_all_state(
+                            pending=_w_pending,
+                            failed=_w_failed,
+                            batch_cancelled=0,
+                            batch_failed=_batch_failed,
+                        )
                     _set_cancel_all_state(
                         running=False,
                         complete=True,
                         error=None,
                         phase="complete",
                         total=len(_cancel_open_ids),
-                        batch_size=len(_cancel_open_ids),
-                        total_batches=1,
-                        current_batch=1,
+                        batch_size=len(_cancel_batches[-1]),
+                        total_batches=len(_cancel_batches),
+                        current_batch=len(_cancel_batches),
                         batch_cancelled=0,
                         batch_failed=_w_failed,
                         cancelled=0,
@@ -1945,6 +1985,7 @@ def _new_cancel_all_state():
         "batch_cancelled": 0,
         "batch_failed": 0,
         "cancelled": 0,
+        "pending": 0,
         "failed": 0,
     }
 
