@@ -1122,7 +1122,11 @@ class CoinPrepWorker:
             self.log(f"Wallet mutation {operation} supplied a fee cohort without a fee")
             return None
 
-        if canonical_prep is not None and operation in sage_topup_operations:
+        if (
+            canonical_prep is not None
+            and operation in sage_topup_operations
+            and fee_mojos > 0
+        ):
             # CAT effects pay their fee from a separately selected XCH coin.
             # Bind both the fee amount and that exact coin into the immutable
             # prep identity so a changed-fee retry cannot collide with an older

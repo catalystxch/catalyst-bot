@@ -1481,6 +1481,97 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             {"fee_mojos": 100_000_000, "coin_ids": [fee_coin_id]},
         )
 
+    def test_zero_fee_cat_split_keeps_fee_free_prep_contract(self):
+        source = hashlib.sha256(b"zero-fee-cat-source").hexdigest()
+        identity = {
+            "backend": "sage",
+            "name": "Task 16 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": "2026-08-22T00:00:00.000000Z",
+            "maximum_age_seconds": 300,
+        }
+        prepared_calls = []
+        adapter_calls = []
+        claim = {"claim_token": "f" * 64, "generation": 1}
+        self.coin_prep_worker.DB_AVAILABLE = True
+        self.coin_prep_worker.claim_wallet_effect = lambda **_kwargs: claim
+        self.coin_prep_worker.wallet_effect_claim_is_current = (
+            lambda *_args, **_kwargs: True
+        )
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
+        )
+        self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
+            lambda _dispatch: nullcontext()
+        )
+        self.coin_prep_worker.complete_wallet_effect_dispatch = (
+            lambda *_args, **_kwargs: "SUBMITTED"
+        )
+
+        def prepare_coin_prep_operation(**kwargs):
+            prepared_calls.append(kwargs)
+            return {
+                "operation": {
+                    "operation_id": "coin-prep:" + "b" * 64,
+                    "outcome": "PREPARED",
+                    "source_coin_ids_json": json.dumps([source]),
+                    "wallet_identity_json": json.dumps(identity),
+                    "effect_claim_token": claim["claim_token"],
+                    "effect_claim_generation": claim["generation"],
+                }
+            }
+
+        self.coin_prep_worker.prepare_coin_prep_operation = prepare_coin_prep_operation
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda operation_id, **kwargs: {
+                "operation": {"operation_id": operation_id, **kwargs}
+            }
+        )
+        self.worker._current_coin_prep_wallet_identity = lambda: identity
+        self.worker._observe_coin_prep_post_effect = lambda _operation: None
+
+        result = self.worker._call_wallet_mutation(
+            "coin_prep.split_cat_pool",
+            lambda **kwargs: (
+                adapter_calls.append(kwargs) or {"success": True, "submitted": True}
+            ),
+            source_coin_id=source,
+            num_coins=2,
+            trading_size_mojos=100,
+            own_address="xch1zerofee",
+            fee_mojos=0,
+            is_cat=True,
+            fee_coin_id=None,
+            _prep_contract={
+                "operation_kind": "split",
+                "purpose": "top_up",
+                "target_contract": {
+                    "wallet_type": "cat",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "amount_mojos": 100,
+                            "purpose": "top_up",
+                        },
+                        {
+                            "output_index": 1,
+                            "amount_mojos": 100,
+                            "purpose": "top_up",
+                        },
+                    ],
+                },
+                "pre_view_coin_ids": [source],
+            },
+        )
+
+        self.assertEqual(type(result), self.coin_prep_worker.CoinPrepSubmittedUnknown)
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertEqual(len(prepared_calls), 1)
+        self.assertNotIn("external_fee", prepared_calls[0]["target_contract"])
+
     def test_submitted_unknown_fee_reserve_combine_is_mapping_safe(self):
         """Catches an accepted effect crashing a caller that reads result metadata."""
 
