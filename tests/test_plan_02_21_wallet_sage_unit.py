@@ -109,6 +109,21 @@ class TestQueryCoinRecordsFailurePropagation(unittest.TestCase):
         self.assertFalse(_rpc_succeeded(result))
 
 
+@unittest.skipIf(_SKIP is not None, _SKIP_MSG)
+class TestSageTransactionLookupCompatibility(unittest.TestCase):
+    def test_transaction_id_lookup_does_not_call_height_only_sage_endpoint(self):
+        """Sage 0.13 get_transaction accepts a block height, not a tx id."""
+
+        with patch.object(
+            _ws,
+            "rpc",
+            side_effect=AssertionError(
+                "transaction ids must not be sent to Sage's height-only endpoint"
+            ),
+        ):
+            self.assertIsNone(_ws.get_transaction("0x" + "ab" * 32))
+
+
 # ---------------------------------------------------------------------------
 # _is_cat_wallet
 # ---------------------------------------------------------------------------

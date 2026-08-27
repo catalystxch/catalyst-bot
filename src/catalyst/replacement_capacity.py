@@ -50,6 +50,13 @@ class CoinPrepPostViewDecision:
     output_coin_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CoinPrepNoEffectViewDecision:
+    confirmed: bool
+    reason: str | None
+    selectable_coin_ids: tuple[str, ...]
+
+
 def validate_purpose(value: Any) -> str:
     if type(value) is not str:
         raise TypeError("purpose must be an exact purpose string")
@@ -196,7 +203,34 @@ def _canonical_target_contract(target_contract: Any) -> dict[str, Any]:
             }
         )
     canonical_outputs.sort(key=lambda output: output["output_index"])
-    return {"wallet_type": wallet_type, "outputs": canonical_outputs}
+    canonical_target = {"wallet_type": wallet_type, "outputs": canonical_outputs}
+
+    # CAT operations can consume a separately selected XCH coin for their fee.
+    # That cohort is part of the immutable wallet-effect contract: omitting it
+    # lets a retry with a different fee reuse the same operation identity.
+    if "external_fee" in target_contract:
+        external_fee = target_contract.get("external_fee")
+        if wallet_type != "cat" or type(external_fee) is not dict:
+            raise ValueError("target_contract external fee is invalid")
+        if set(external_fee) != {"fee_mojos", "coin_ids"}:
+            raise ValueError("target_contract external fee fields are invalid")
+        fee_mojos = _exact_nonnegative_int(
+            external_fee.get("fee_mojos"), "external fee mojos"
+        )
+        raw_coin_ids = external_fee.get("coin_ids")
+        if fee_mojos <= 0 or type(raw_coin_ids) is not list or not raw_coin_ids:
+            raise ValueError("target_contract external fee is invalid")
+        fee_coin_ids = sorted(
+            _canonical_coin_id(value, "external fee coin id") for value in raw_coin_ids
+        )
+        if len(fee_coin_ids) != len(set(fee_coin_ids)):
+            raise ValueError("target_contract external fee coin identities repeat")
+        canonical_target["external_fee"] = {
+            "fee_mojos": fee_mojos,
+            "coin_ids": fee_coin_ids,
+        }
+
+    return canonical_target
 
 
 def canonical_coin_prep_contract(
@@ -352,14 +386,93 @@ def verify_coin_prep_post_view(
     return CoinPrepPostViewDecision(True, None, tuple(sorted(expected)))
 
 
+def verify_coin_prep_no_effect_view(
+    *,
+    source_coin_ids: list[str],
+    fee_coin_ids: list[str],
+    authoritative_view: dict[str, Any],
+    expected_wallet_identity: dict[str, Any],
+) -> CoinPrepNoEffectViewDecision:
+    """Prove that a submitted prep effect left its exact input cohort untouched."""
+
+    denied = lambda reason: CoinPrepNoEffectViewDecision(False, reason, ())
+    if type(authoritative_view) is not dict or set(authoritative_view) != {
+        "fresh",
+        "complete",
+        "wallet_identity",
+        "observed_at",
+        "expires_at",
+        "selectable_coin_ids",
+        "pending_transaction_ids",
+    }:
+        return denied("authoritative_view_malformed")
+    if authoritative_view.get("fresh") is not True:
+        return denied("authoritative_view_not_fresh")
+    if authoritative_view.get("complete") is not True:
+        return denied("authoritative_view_incomplete")
+    expected_identity = _canonical_wallet_identity(expected_wallet_identity)
+    observed_identity = _canonical_wallet_identity(
+        authoritative_view.get("wallet_identity")
+    )
+    if expected_identity is None or observed_identity is None:
+        return denied("wallet_identity_malformed")
+    if observed_identity != expected_identity:
+        return denied("wallet_identity_mismatch")
+    try:
+        observed_at = _canonical_utc_time(authoritative_view.get("observed_at"))
+        expires_at = _canonical_utc_time(authoritative_view.get("expires_at"))
+        bound_at = _canonical_utc_time(expected_identity["bound_at_utc"])
+    except ValueError:
+        return denied("authoritative_view_time_malformed")
+    if expires_at != observed_at + timedelta(
+        seconds=expected_identity["maximum_age_seconds"]
+    ):
+        return denied("authoritative_view_time_malformed")
+    if observed_at <= bound_at:
+        return denied("wallet_identity_expired")
+    if type(source_coin_ids) is not list or not source_coin_ids:
+        return denied("source_coin_identity_malformed")
+    if type(fee_coin_ids) is not list:
+        return denied("fee_coin_identity_malformed")
+    try:
+        sources = [
+            _canonical_coin_id(value, "source coin id") for value in source_coin_ids
+        ]
+        fees = [_canonical_coin_id(value, "fee coin id") for value in fee_coin_ids]
+    except (TypeError, ValueError):
+        return denied("input_coin_identity_malformed")
+    cohort = sorted(set(sources) | set(fees))
+    if len(sources) != len(set(sources)) or len(fees) != len(set(fees)):
+        return denied("duplicate_input_coin_identity")
+    selectable = authoritative_view.get("selectable_coin_ids")
+    if type(selectable) is not list or len(selectable) > _MAX_CAPACITY_COINS:
+        return denied("selectable_cohort_malformed")
+    try:
+        normalized_selectable = [
+            _canonical_coin_id(value, "selectable coin id") for value in selectable
+        ]
+    except (TypeError, ValueError):
+        return denied("selectable_cohort_malformed")
+    if normalized_selectable != cohort:
+        return denied("selectable_cohort_mismatch")
+    pending = authoritative_view.get("pending_transaction_ids")
+    if type(pending) is not list:
+        return denied("pending_transaction_view_malformed")
+    if pending:
+        return denied("pending_transaction_still_present")
+    return CoinPrepNoEffectViewDecision(True, None, tuple(cohort))
+
+
 __all__ = [
     "COIN_PURPOSES",
     "COIN_PREP_OPERATION_KINDS",
     "CapacityDecision",
+    "CoinPrepNoEffectViewDecision",
     "CoinPrepPostViewDecision",
     "canonical_coin_prep_contract",
     "coin_prep_operation_identity",
     "decide_capacity",
     "validate_purpose",
+    "verify_coin_prep_no_effect_view",
     "verify_coin_prep_post_view",
 ]

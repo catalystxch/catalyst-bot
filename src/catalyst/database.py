@@ -322,6 +322,25 @@ def _authority_sql_wallet_resolution_shape(outcome: Any, evidence_json: Any) -> 
         evidence = json.loads(canonical)
     except (TypeError, ValueError, json.JSONDecodeError):
         return 0
+    predispatch_fields = {
+        "effect_attempted",
+        "reason_code",
+        "authority_sha256",
+        "adapter_operation",
+        "result_type",
+    }
+    if type(evidence) is dict and set(evidence) == predispatch_fields:
+        return int(
+            outcome == "RELEASED_NO_EFFECT"
+            and evidence.get("effect_attempted") is False
+            and evidence.get("reason_code") == "PRE_DISPATCH_RETRY_CONTRACT_COLLISION"
+            and type(evidence.get("authority_sha256")) is str
+            and re.fullmatch(r"[0-9a-f]{64}", evidence["authority_sha256"]) is not None
+            and type(evidence.get("adapter_operation")) is str
+            and bool(evidence["adapter_operation"])
+            and type(evidence.get("result_type")) is str
+            and evidence["result_type"] == "prepare_coin_prep_operation"
+        )
     common_fields = {
         "effect_attempted",
         "reason_code",
@@ -2056,26 +2075,52 @@ BEFORE INSERT ON wallet_effect_claim_resolutions
 WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
   OR catalyst_sha256(NEW.evidence_json) IS NOT NEW.evidence_sha256
   OR catalyst_wallet_resolution_shape(NEW.outcome, NEW.evidence_json)<>1
-  OR NOT EXISTS (
-      SELECT 1
-        FROM wallet_effect_claims AS claim
-        JOIN wallet_effect_claim_authorities AS authority
-          ON authority.claim_token=claim.claim_token
-        JOIN wallet_effect_dispatches AS dispatch
-          ON dispatch.claim_token=claim.claim_token
-         AND dispatch.generation=claim.generation
-         AND dispatch.authority_sha256=authority.authority_sha256
-       WHERE claim.claim_token=NEW.claim_token
-         AND claim.generation=NEW.generation
-         AND dispatch.dispatch_token=json_extract(
-               NEW.evidence_json, '$.dispatch_token'
-             )
-         AND dispatch.adapter_operation=json_extract(
-               NEW.evidence_json, '$.adapter_operation'
-             )
-         AND authority.authority_sha256=json_extract(
-               NEW.evidence_json, '$.authority_sha256'
-             )
+  OR NOT (
+      EXISTS (
+          SELECT 1
+            FROM wallet_effect_claims AS claim
+            JOIN wallet_effect_claim_authorities AS authority
+              ON authority.claim_token=claim.claim_token
+            JOIN wallet_effect_dispatches AS dispatch
+              ON dispatch.claim_token=claim.claim_token
+             AND dispatch.generation=claim.generation
+             AND dispatch.authority_sha256=authority.authority_sha256
+           WHERE claim.claim_token=NEW.claim_token
+             AND claim.generation=NEW.generation
+             AND dispatch.dispatch_token=json_extract(
+                   NEW.evidence_json, '$.dispatch_token'
+                 )
+             AND dispatch.adapter_operation=json_extract(
+                   NEW.evidence_json, '$.adapter_operation'
+                 )
+             AND authority.authority_sha256=json_extract(
+                   NEW.evidence_json, '$.authority_sha256'
+                 )
+      )
+      OR (
+          NEW.outcome='RELEASED_NO_EFFECT'
+          AND json_extract(NEW.evidence_json, '$.effect_attempted')=0
+          AND json_extract(NEW.evidence_json, '$.reason_code')=
+              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_effect_dispatches AS dispatch
+               WHERE dispatch.claim_token=NEW.claim_token
+          )
+          AND EXISTS (
+              SELECT 1
+                FROM wallet_effect_claims AS claim
+                JOIN wallet_effect_claim_authorities AS authority
+                  ON authority.claim_token=claim.claim_token
+               WHERE claim.claim_token=NEW.claim_token
+                 AND claim.generation=NEW.generation
+                 AND claim.operation_id=json_extract(
+                       NEW.evidence_json, '$.adapter_operation'
+                     )
+                 AND authority.authority_sha256=json_extract(
+                       NEW.evidence_json, '$.authority_sha256'
+                     )
+          )
+      )
   )
 BEGIN
     SELECT RAISE(ABORT, 'wallet effect claim resolution is invalid');
@@ -4274,6 +4319,72 @@ BEGIN
 END
 """
 
+_WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL = """
+CREATE TRIGGER wallet_effect_claim_resolutions_guard
+BEFORE INSERT ON wallet_effect_claim_resolutions
+WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
+  OR catalyst_sha256(NEW.evidence_json) IS NOT NEW.evidence_sha256
+  OR catalyst_wallet_resolution_shape(NEW.outcome, NEW.evidence_json)<>1
+  OR NOT (
+      EXISTS (
+          SELECT 1
+            FROM wallet_effect_claims AS claim
+            JOIN wallet_effect_claim_authorities AS authority
+              ON authority.claim_token=claim.claim_token
+            JOIN wallet_effect_dispatches AS dispatch
+              ON dispatch.claim_token=claim.claim_token
+             AND dispatch.generation=claim.generation
+             AND dispatch.authority_sha256=authority.authority_sha256
+           WHERE claim.claim_token=NEW.claim_token
+             AND claim.generation=NEW.generation
+             AND dispatch.dispatch_token=json_extract(
+                   NEW.evidence_json, '$.dispatch_token'
+                 )
+             AND dispatch.adapter_operation=json_extract(
+                   NEW.evidence_json, '$.adapter_operation'
+                 )
+             AND authority.authority_sha256=json_extract(
+                   NEW.evidence_json, '$.authority_sha256'
+                 )
+      )
+      OR (
+          NEW.outcome='RELEASED_NO_EFFECT'
+          AND json_extract(NEW.evidence_json, '$.effect_attempted')=0
+          AND json_extract(NEW.evidence_json, '$.reason_code')=
+              'PRE_DISPATCH_RETRY_CONTRACT_COLLISION'
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_effect_dispatches AS dispatch
+               WHERE dispatch.claim_token=NEW.claim_token
+          )
+          AND EXISTS (
+              SELECT 1
+                FROM wallet_effect_claims AS claim
+                JOIN wallet_effect_claim_authorities AS authority
+                  ON authority.claim_token=claim.claim_token
+               WHERE claim.claim_token=NEW.claim_token
+                 AND claim.generation=NEW.generation
+                 AND claim.operation_id=json_extract(
+                       NEW.evidence_json, '$.adapter_operation'
+                     )
+                 AND authority.authority_sha256=json_extract(
+                       NEW.evidence_json, '$.authority_sha256'
+                     )
+          )
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'wallet effect claim resolution is invalid');
+END
+"""
+
+
+def _upgrade_wallet_effect_claim_resolution_guard(conn: sqlite3.Connection) -> None:
+    """Install the guarded pre-dispatch retry-collision recovery shape."""
+
+    conn.execute("DROP TRIGGER IF EXISTS wallet_effect_claim_resolutions_guard")
+    conn.execute(_WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL)
+
+
 _OFFER_FILL_BOOST_COMMAND_GUARD_SQL = """
 CREATE TRIGGER offer_fill_boost_commands_guarded_update
 BEFORE UPDATE ON offer_fill_boost_commands
@@ -5406,7 +5517,11 @@ def _reassert_unresolved_wallet_effect_claims(conn: sqlite3.Connection) -> None:
                 "JOIN wallet_effect_claims AS claim "
                 "  ON claim.claim_token=prep.effect_claim_token "
                 " AND claim.generation=prep.effect_claim_generation "
-                "WHERE prep.outcome='CONFIRMED' "
+                "WHERE (prep.outcome='CONFIRMED' OR ("
+                "       prep.outcome='FAILED' "
+                "   AND json_extract(prep.outcome_evidence_json, '$.reason_code')="
+                "       'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+                "   AND json_extract(prep.outcome_evidence_json, '$.effect_attempted')=0)) "
                 f"  AND claim.claim_token IN ({placeholders})",
                 tuple(blocker_tokens),
             ).fetchall()
@@ -5419,7 +5534,11 @@ def _reassert_unresolved_wallet_effect_claims(conn: sqlite3.Connection) -> None:
             "LEFT JOIN coin_prep_operations AS prep "
             "  ON prep.effect_claim_token=claim.claim_token "
             " AND prep.effect_claim_generation=claim.generation "
-            " AND prep.outcome='CONFIRMED' "
+            " AND (prep.outcome='CONFIRMED' OR ("
+            "      prep.outcome='FAILED' "
+            "  AND json_extract(prep.outcome_evidence_json, '$.reason_code')="
+            "      'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+            "  AND json_extract(prep.outcome_evidence_json, '$.effect_attempted')=0)) "
             "WHERE prep.operation_id IS NULL "
             "  AND (resolution.claim_token IS NULL "
             "       OR resolution.outcome<>'RELEASED_NO_EFFECT') "
@@ -5438,10 +5557,7 @@ def _reassert_unresolved_wallet_effect_claims(conn: sqlite3.Connection) -> None:
                 wallet_fingerprint_hash=str(row["wallet_fingerprint_hash"]),
                 network=str(row["network"]),
                 reason_code="COIN_PREP_AUTHORITATIVE_RESOLUTION",
-                reason=(
-                    "confirmed coin prep operation authoritatively resolves its "
-                    "wallet effect claim"
-                ),
+                reason="terminal coin prep evidence resolves its wallet effect claim",
                 reconciled_at=audited_at,
                 blocking=False,
                 additionally_resolved=(str(row["operation_id"]),),
@@ -5828,6 +5944,7 @@ def _migrate_stability_schema() -> None:
                 "ALTER TABLE offer_cancel_effect_claims ADD COLUMN "
                 "recovery_generation INTEGER NOT NULL DEFAULT 0"
             )
+        _upgrade_wallet_effect_claim_resolution_guard(conn)
         _upgrade_offer_fill_boost_command_guard(conn)
         _upgrade_offer_intent_slot_indexes(conn)
         _validate_stability_schema(conn)
@@ -5994,6 +6111,22 @@ def _init_database_impl():
 
     conn.commit()
     _migrate_stability_schema()
+    recovered_splash_acknowledgements = recover_legacy_splash_http_acknowledgements()
+    if recovered_splash_acknowledgements:
+        log_event(
+            "success",
+            "publication_recovery",
+            "Recovered %d legacy Splash HTTP acknowledgement(s) without "
+            "redispatch" % recovered_splash_acknowledgements,
+        )
+    recovered_retry_collisions = recover_coin_prep_predispatch_retry_collisions()
+    if recovered_retry_collisions:
+        log_event(
+            "success",
+            "coin_prep_recovery",
+            "Recovered a pre-dispatch coin prep retry identity collision; "
+            "no Sage wallet effect was possible",
+        )
 
     # Migration: add coin_id column to offers table if it doesn't exist.
     # This tracks which specific coin was locked by each offer.
@@ -8805,12 +8938,24 @@ def _authoritative_coin_available_predicate(alias: str = "coins") -> str:
         "  ON effect_resolution.claim_token=effect_coin.claim_token "
         "LEFT JOIN wallet_effect_dispatches AS effect_dispatch "
         "  ON effect_dispatch.claim_token=effect_coin.claim_token "
+        "LEFT JOIN coin_prep_operations AS effect_prep "
+        "  ON effect_prep.effect_claim_token=effect_coin.claim_token "
         f"WHERE effect_coin.coin_id={alias}.coin_id "
         "  AND (effect_resolution.claim_token IS NULL "
         "       OR effect_resolution.outcome<>'RELEASED_NO_EFFECT' "
-        "       OR effect_dispatch.dispatch_token IS NULL "
-        "       OR effect_dispatch.dispatch_token<>json_extract("
-        "              effect_resolution.evidence_json, '$.dispatch_token'))) "
+        "       OR NOT ("
+        "          (effect_dispatch.dispatch_token IS NOT NULL "
+        "           AND effect_dispatch.dispatch_token=json_extract("
+        "                 effect_resolution.evidence_json, '$.dispatch_token')) "
+        "       OR (effect_dispatch.dispatch_token IS NULL "
+        "           AND json_extract(effect_resolution.evidence_json, '$.reason_code')="
+        "               'PRE_DISPATCH_RETRY_CONTRACT_COLLISION' "
+        "           AND json_extract(effect_resolution.evidence_json, '$.effect_attempted')=0)"
+        "      )) "
+        "  AND COALESCE(NOT (effect_prep.outcome='FAILED' "
+        "       AND json_extract(effect_prep.outcome_evidence_json, '$.reason_code')="
+        "           'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+        "       AND json_extract(effect_prep.outcome_evidence_json, '$.effect_attempted')=0), 1)) "
         "AND NOT EXISTS ("
         "SELECT 1 FROM coin_prep_operations AS prep, "
         "json_each(prep.source_coin_ids_json) AS prep_source "
@@ -8849,11 +8994,23 @@ def _active_wallet_effect_coin_ids(conn: sqlite3.Connection) -> set[str]:
         "  ON effect_resolution.claim_token=effect_coin.claim_token "
         "LEFT JOIN wallet_effect_dispatches AS effect_dispatch "
         "  ON effect_dispatch.claim_token=effect_coin.claim_token "
-        "WHERE effect_resolution.claim_token IS NULL "
+        "LEFT JOIN coin_prep_operations AS effect_prep "
+        "  ON effect_prep.effect_claim_token=effect_coin.claim_token "
+        "WHERE (effect_resolution.claim_token IS NULL "
         "   OR effect_resolution.outcome<>'RELEASED_NO_EFFECT' "
-        "   OR effect_dispatch.dispatch_token IS NULL "
-        "   OR effect_dispatch.dispatch_token<>json_extract("
-        "          effect_resolution.evidence_json, '$.dispatch_token') "
+        "   OR NOT ("
+        "       (effect_dispatch.dispatch_token IS NOT NULL "
+        "        AND effect_dispatch.dispatch_token=json_extract("
+        "              effect_resolution.evidence_json, '$.dispatch_token')) "
+        "    OR (effect_dispatch.dispatch_token IS NULL "
+        "        AND json_extract(effect_resolution.evidence_json, '$.reason_code')="
+        "            'PRE_DISPATCH_RETRY_CONTRACT_COLLISION' "
+        "        AND json_extract(effect_resolution.evidence_json, '$.effect_attempted')=0)"
+        "   )) "
+        "  AND COALESCE(NOT (effect_prep.outcome='FAILED' "
+        "       AND json_extract(effect_prep.outcome_evidence_json, '$.reason_code')="
+        "           'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+        "       AND json_extract(effect_prep.outcome_evidence_json, '$.effect_attempted')=0), 1) "
         "ORDER BY effect_coin.coin_id LIMIT ?",
         (_MAX_NONTERMINAL_INTENT_RESERVATIONS + 1,),
     ).fetchall()
@@ -9619,6 +9776,139 @@ def retain_wallet_effect_claim_for_reconciliation(
     finally:
         conn.close()
         _release_wallet_effect_process_authority(state)
+
+
+def recover_coin_prep_predispatch_retry_collisions() -> int:
+    """Release only the historical retry collision that never crossed dispatch.
+
+    Older CAT prep identities omitted their separate XCH fee contract.  A retry
+    after authoritative no-effect recovery could therefore claim the same
+    operation generation and then fail while persisting PREPARED.  The adapter
+    was never reachable on that path.  This recovery requires the old exact
+    no-effect proof, the retained-failure latch, and the durable absence of a
+    dispatch row before releasing the retry claim.
+    """
+
+    import mutation_gate
+
+    conn = _stability_connection()
+    recovered = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if latch_row is None:
+            raise RuntimeError("runtime safety latch singleton is missing")
+        latch = dict(latch_row)
+        if (
+            latch["state"] != "tripped"
+            or latch["reason"]
+            != "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED"
+        ):
+            conn.commit()
+            return 0
+        blockers = set(json.loads(latch["blocking_operation_ids_json"]))
+        rows = conn.execute(
+            """
+            SELECT claim.*, authority.authority_sha256,
+                   operation.effect_claim_token AS prior_claim_token,
+                   operation.effect_claim_generation AS prior_claim_generation,
+                   operation.source_coin_ids_json AS operation_source_coin_ids_json,
+                   operation.wallet_identity_json AS operation_wallet_identity_json,
+                   operation.outcome_evidence_json,
+                   prior_resolution.outcome AS prior_resolution_outcome
+              FROM wallet_effect_claims AS claim
+              JOIN wallet_effect_claim_authorities AS authority
+                ON authority.claim_token=claim.claim_token
+              JOIN coin_prep_operations AS operation
+                ON operation.operation_id=claim.operation_id
+               AND operation.outcome='FAILED'
+              JOIN wallet_effect_claim_resolutions AS prior_resolution
+                ON prior_resolution.claim_token=operation.effect_claim_token
+               AND prior_resolution.generation=operation.effect_claim_generation
+              LEFT JOIN wallet_effect_claim_resolutions AS current_resolution
+                ON current_resolution.claim_token=claim.claim_token
+              LEFT JOIN wallet_effect_dispatches AS dispatch
+                ON dispatch.claim_token=claim.claim_token
+             WHERE current_resolution.claim_token IS NULL
+               AND dispatch.claim_token IS NULL
+               AND claim.claim_token<>operation.effect_claim_token
+            """
+        ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            blocker = f"wallet-effect:{row['claim_token']}"
+            try:
+                prior_evidence = json.loads(row["outcome_evidence_json"] or "null")
+                identity = json.loads(row["operation_wallet_identity_json"])
+                evidence_fee_ids = sorted(
+                    _reconciliation_coin_identity(value, "coin prep no-effect fee")[1]
+                    for value in prior_evidence.get("fee_coin_ids", [])
+                )
+                exact_retry_collision = (
+                    blocker in blockers
+                    and prior_evidence.get("reason_code")
+                    == "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
+                    and prior_evidence.get("effect_attempted") is False
+                    and row["prior_resolution_outcome"] in {"SUBMITTED", "UNKNOWN"}
+                    and int(row["generation"]) > int(row["prior_claim_generation"])
+                    and json.loads(row["source_coin_ids_json"])
+                    == sorted(
+                        norm_coin_id(value)
+                        for value in json.loads(row["operation_source_coin_ids_json"])
+                    )
+                    and json.loads(row["fee_coin_ids_json"]) == evidence_fee_ids
+                    and row["wallet_fingerprint_hash"]
+                    == mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+                    and row["network"] == identity["network_id"]
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                exact_retry_collision = False
+            if not exact_retry_collision:
+                continue
+            evidence = {
+                "effect_attempted": False,
+                "reason_code": "PRE_DISPATCH_RETRY_CONTRACT_COLLISION",
+                "authority_sha256": row["authority_sha256"],
+                "adapter_operation": row["operation_id"],
+                "result_type": "prepare_coin_prep_operation",
+            }
+            evidence_json = _canonical_json_text(
+                evidence,
+                "wallet effect pre-dispatch recovery evidence",
+                expected_type=dict,
+            )
+            conn.execute(
+                "INSERT INTO wallet_effect_claim_resolutions "
+                "(claim_token,generation,outcome,evidence_json,evidence_sha256,"
+                "resolved_at) VALUES (?,?,'RELEASED_NO_EFFECT',?,?,?)",
+                (
+                    row["claim_token"],
+                    row["generation"],
+                    evidence_json,
+                    hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+                    _stability_wall_clock(),
+                ),
+            )
+            _reconciliation_latch_update(
+                conn,
+                operation_id=blocker,
+                wallet_fingerprint_hash=row["wallet_fingerprint_hash"],
+                network=row["network"],
+                reason_code="PRE_DISPATCH_RETRY_CONTRACT_COLLISION",
+                reason="coin prep retry collision never crossed wallet dispatch",
+                reconciled_at=_stability_wall_clock(),
+                blocking=False,
+            )
+            recovered += 1
+        conn.commit()
+        return recovered
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def resolve_wallet_effect_claim(
@@ -20592,6 +20882,15 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
         "SUBMITTED_UNKNOWN": common | {"dispatch_outcome"},
         "FAILED": common | {"dispatch_outcome", "effect_attempted"},
     }[outcome]
+    if outcome == "FAILED" and value.get("reason_code") == (
+        "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
+    ):
+        expected |= {
+            "source_coin_ids",
+            "fee_coin_ids",
+            "authoritative_view",
+            "expected_wallet_identity",
+        }
     if set(value) != expected:
         label = "confirmed evidence" if outcome == "CONFIRMED" else "outcome evidence"
         raise ValueError(f"coin prep {label} fields are invalid")
@@ -20629,11 +20928,26 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
             "ADAPTER_EXCEPTION",
         }:
             raise ValueError("coin prep outcome evidence dispatch is invalid")
-    elif (
-        value.get("dispatch_outcome") != "RELEASED_NO_EFFECT"
-        or value.get("effect_attempted") is not False
-    ):
-        raise ValueError("coin prep failed evidence is invalid")
+    elif outcome == "FAILED":
+        if (
+            value.get("dispatch_outcome") != "RELEASED_NO_EFFECT"
+            or value.get("effect_attempted") is not False
+        ):
+            raise ValueError("coin prep failed evidence is invalid")
+        if reason == "AUTHORITATIVE_NO_EFFECT_CONFIRMED":
+            from replacement_capacity import verify_coin_prep_no_effect_view
+
+            decision = verify_coin_prep_no_effect_view(
+                source_coin_ids=value["source_coin_ids"],
+                fee_coin_ids=value["fee_coin_ids"],
+                authoritative_view=value["authoritative_view"],
+                expected_wallet_identity=value["expected_wallet_identity"],
+            )
+            if decision.confirmed is not True:
+                raise ValueError(
+                    "coin prep authoritative no-effect selectable cohort is invalid: "
+                    f"{decision.reason}"
+                )
     encoded = _canonical_json_text(
         value,
         "coin prep outcome evidence",
@@ -20970,6 +21284,62 @@ def record_coin_prep_operation_outcome(
             != evidence_payload["effect_claim_generation"]
         ):
             raise ValueError("coin prep outcome evidence effect claim differs")
+        authoritative_no_effect = (
+            outcome == "FAILED"
+            and evidence_payload.get("reason_code")
+            == "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
+        )
+        if authoritative_no_effect:
+            import mutation_gate
+
+            stored_sources = json.loads(current["source_coin_ids_json"])
+            supplied_sources = sorted(
+                _reconciliation_coin_identity(value, "coin prep no-effect source")[0]
+                for value in evidence_payload["source_coin_ids"]
+            )
+            stored_identity = json.loads(current["wallet_identity_json"])
+            if supplied_sources != stored_sources:
+                raise ValueError("coin prep no-effect source cohort differs")
+            if evidence_payload["expected_wallet_identity"] != stored_identity:
+                raise ValueError("coin prep no-effect wallet identity differs")
+            claim = conn.execute(
+                "SELECT claim.*, resolution.outcome AS resolution_outcome, "
+                "       dispatch.dispatch_token "
+                "FROM wallet_effect_claims AS claim "
+                "JOIN wallet_effect_claim_resolutions AS resolution "
+                "  ON resolution.claim_token=claim.claim_token "
+                " AND resolution.generation=claim.generation "
+                "JOIN wallet_effect_dispatches AS dispatch "
+                "  ON dispatch.claim_token=claim.claim_token "
+                " AND dispatch.generation=claim.generation "
+                "WHERE claim.claim_token=? AND claim.generation=? "
+                "  AND claim.operation_id=?",
+                (
+                    current["effect_claim_token"],
+                    current["effect_claim_generation"],
+                    safe_operation_id,
+                ),
+            ).fetchone()
+            supplied_fees = sorted(
+                _reconciliation_coin_identity(value, "coin prep no-effect fee")[1]
+                for value in evidence_payload["fee_coin_ids"]
+            )
+            expected_claim_sources = sorted(
+                norm_coin_id(value) for value in stored_sources
+            )
+            if (
+                current["outcome"] != "SUBMITTED_UNKNOWN"
+                or claim is None
+                or claim["resolution_outcome"] not in {"SUBMITTED", "UNKNOWN"}
+                or json.loads(claim["source_coin_ids_json"]) != expected_claim_sources
+                or json.loads(claim["fee_coin_ids_json"]) != supplied_fees
+                or claim["wallet_fingerprint_hash"]
+                != mutation_gate.wallet_fingerprint_hash(stored_identity["fingerprint"])
+                or claim["network"] != stored_identity["network_id"]
+            ):
+                raise ValueError(
+                    "coin prep no-effect proof differs from submitted wallet claim"
+                )
         if outcome == "CONFIRMED":
             stored_sources = json.loads(current["source_coin_ids_json"])
             supplied_sources = sorted(
@@ -21036,7 +21406,11 @@ def record_coin_prep_operation_outcome(
             return {"operation": current, "idempotent": True}
         if current["outcome"] not in {"PREPARED", "SUBMITTED_UNKNOWN"}:
             raise ValueError("coin prep operation is already terminal")
-        if current["outcome"] == "SUBMITTED_UNKNOWN" and outcome != "CONFIRMED":
+        if (
+            current["outcome"] == "SUBMITTED_UNKNOWN"
+            and outcome != "CONFIRMED"
+            and not authoritative_no_effect
+        ):
             raise ValueError(
                 "effect-unknown coin prep may resolve only from confirmation"
             )
@@ -21160,9 +21534,20 @@ def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, 
     conn = get_connection()
     rows = conn.execute(
         """
-            SELECT * FROM coin_prep_operations
-             WHERE outcome IN ('PREPARED', 'SUBMITTED_UNKNOWN')
-             ORDER BY prepared_at, operation_id LIMIT ?
+            SELECT prep.*,
+                   claim.fee_coin_ids_json AS effect_fee_coin_ids_json,
+                   dispatch.dispatch_token AS effect_dispatch_token,
+                   dispatch.authority_sha256 AS effect_authority_sha256,
+                   dispatch.adapter_operation AS effect_adapter_operation
+              FROM coin_prep_operations AS prep
+              JOIN wallet_effect_claims AS claim
+                ON claim.claim_token=prep.effect_claim_token
+               AND claim.generation=prep.effect_claim_generation
+              LEFT JOIN wallet_effect_dispatches AS dispatch
+                ON dispatch.claim_token=claim.claim_token
+               AND dispatch.generation=claim.generation
+             WHERE prep.outcome IN ('PREPARED', 'SUBMITTED_UNKNOWN')
+             ORDER BY prep.prepared_at, prep.operation_id LIMIT ?
             """,
         (safe_limit,),
     ).fetchall()
@@ -27886,7 +28271,7 @@ def unresolve_publication_outbox(
             UPDATE publication_outbox
             SET state='unresolved', claim_owner_run_id=NULL, claim_token=NULL,
                 claim_expires_at=NULL, next_attempt_at=NULL,
-                last_error_json=?, last_error_sha256=?, terminal_at=?,
+                last_error_json=?, last_error_sha256=?, terminal_at=NULL,
                 row_version=row_version+1, updated_at=?
             WHERE publication_id=? AND state='claimed'
               AND claim_owner_run_id=? AND claim_token=?
@@ -27900,7 +28285,6 @@ def unresolve_publication_outbox(
             (
                 error,
                 error_sha256,
-                unresolved,
                 unresolved,
                 publication,
                 owner,
@@ -27921,6 +28305,91 @@ def unresolve_publication_outbox(
         )
         conn.commit()
         return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def recover_legacy_splash_http_acknowledgements(*, recovered_at: Any = None) -> int:
+    """Recover Splash 2xx accepts rejected for lacking a Dexie-style ID.
+
+    CATalyst versions before this recovery treated the local Splash daemon's
+    successful HTTP response as malformed when its JSON did not include an
+    ``id`` or ``offer_id``.  The old classifier could emit this exact error
+    only after a matching Splash request received an HTTP 2xx response.  This
+    bounded migration terminalizes those rows as acknowledged without ever
+    dispatching the offer again.
+    """
+
+    recovered = _stability_timestamp_or_now(recovered_at, "recovered_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT publication_id,row_version,request_sha256,"
+            "dispatch_started_at,last_error_json,last_error_sha256 "
+            "FROM publication_outbox WHERE publisher='splash' "
+            "AND state='unresolved' ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("legacy Splash acknowledgement recovery limit exceeded")
+        recovered_count = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            error_text = row.get("last_error_json")
+            if type(error_text) is not str:
+                continue
+            try:
+                error = json.loads(error_text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            request_sha256 = row.get("request_sha256")
+            if (
+                type(error) is not dict
+                or set(error) != {"code", "provider", "request_sha256"}
+                or error.get("code") != "MALFORMED_PROVIDER_ACKNOWLEDGEMENT"
+                or error.get("provider") != "splash"
+                or error.get("request_sha256") != request_sha256
+                or type(request_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+                or row.get("dispatch_started_at") is None
+                or hashlib.sha256(error_text.encode("utf-8")).hexdigest()
+                != row.get("last_error_sha256")
+            ):
+                continue
+            acknowledgement, acknowledgement_sha256 = _bounded_publication_evidence(
+                {
+                    "code": "LEGACY_SPLASH_HTTP_2XX_ACKNOWLEDGEMENT_RECOVERED",
+                    "provider": "splash",
+                    "request_sha256": request_sha256,
+                },
+                "legacy Splash acknowledgement recovery",
+            )
+            cursor = conn.execute(
+                "UPDATE publication_outbox SET state='succeeded', "
+                "claim_owner_run_id=NULL,claim_token=NULL,claim_expires_at=NULL,"
+                "next_attempt_at=NULL,last_error_json=NULL,last_error_sha256=NULL,"
+                "acknowledgement_json=?,acknowledgement_sha256=?,succeeded_at=?,"
+                "terminal_at=?,row_version=row_version+1,updated_at=? "
+                "WHERE publication_id=? AND publisher='splash' "
+                "AND state='unresolved' AND row_version=? AND request_sha256=?",
+                (
+                    acknowledgement,
+                    acknowledgement_sha256,
+                    recovered,
+                    recovered,
+                    recovered,
+                    row["publication_id"],
+                    row["row_version"],
+                    request_sha256,
+                ),
+            )
+            recovered_count += int(cursor.rowcount)
+        conn.commit()
+        return recovered_count
     except Exception:
         conn.rollback()
         raise

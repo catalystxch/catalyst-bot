@@ -1122,6 +1122,35 @@ class CoinPrepWorker:
             self.log(f"Wallet mutation {operation} supplied a fee cohort without a fee")
             return None
 
+        if (
+            canonical_prep is not None
+            and operation in sage_topup_operations
+            and fee_mojos > 0
+        ):
+            # CAT effects pay their fee from a separately selected XCH coin.
+            # Bind both the fee amount and that exact coin into the immutable
+            # prep identity so a changed-fee retry cannot collide with an older
+            # terminal/no-effect attempt over the same CAT source cohort.
+            try:
+                from replacement_capacity import canonical_coin_prep_contract
+
+                target_contract = dict(canonical_prep["target_contract"])
+                target_contract["external_fee"] = {
+                    "fee_mojos": fee_mojos,
+                    "coin_ids": list(fee_coin_ids),
+                }
+                canonical_prep = canonical_coin_prep_contract(
+                    operation_kind=canonical_prep["operation_kind"],
+                    purpose=canonical_prep["purpose"],
+                    source_coin_ids=list(source_coin_ids),
+                    target_contract=target_contract,
+                )
+            except Exception as exc:
+                self.log(
+                    f"Wallet mutation {operation} external fee contract denied: {exc}"
+                )
+                return None
+
         authority_operation = (
             canonical_prep["operation_id"] if canonical_prep is not None else operation
         )
@@ -3314,6 +3343,30 @@ class CoinPrepWorker:
         # 100,000,000 mojos as the generally sufficient standard-tx fee.
         return max(scaled, 100_000_000)
 
+    def _sage_cat_combine_fee_mojos(self, coin_count: int) -> int:
+        """Return a cost-scaled fee for Sage CAT consolidation.
+
+        Sage v0.13 accepted a TEST 7 transaction containing 50 CAT inputs and
+        one XCH fee input, but every peer rejected its 100,000,000-mojo fee as
+        ``INVALID_FEE_TOO_CLOSE_TO_ZERO``.  The captured signed bundle cost
+        1,523,037,989, so a standard two-input transaction fee cannot be used
+        for a large CAT spend bundle.
+
+        CAT spends measured just under 31 million cost per input.  Include a
+        20-million-cost allowance for the separate XCH fee input and price the
+        conservative estimate at six mojos per cost.  Chia treats fees below
+        five mojos per cost as zero, leaving both estimation and relay margin.
+        An explicitly configured zero remains fee-free.
+        """
+        priority_fee = self._priority_combine_fee_mojos(coin_count)
+        if priority_fee <= 0:
+            return 0
+
+        input_count = max(1, int(coin_count or 0))
+        estimated_cost = 20_000_000 + (input_count * 31_000_000)
+        relay_safe_fee = estimated_cost * 6
+        return max(priority_fee, relay_safe_fee)
+
     def _sage_consolidation_max_inputs_per_tx(self) -> int:
         """Maximum inputs to put in one Sage consolidation transaction."""
         raw = os.getenv("SAGE_CONSOLIDATION_MAX_INPUTS", "50")
@@ -3458,7 +3511,11 @@ class CoinPrepWorker:
             ) -> bool:
                 nonlocal submitted_any
                 coin_ids = [coin_id for coin_id, _amount in inputs]
-                combine_fee = self._priority_combine_fee_mojos(len(inputs))
+                combine_fee = (
+                    self._sage_cat_combine_fee_mojos(len(inputs))
+                    if wallet_id == self.cat_wallet_id
+                    else self._priority_combine_fee_mojos(len(inputs))
+                )
                 output_amount = sum(amount for _coin_id, amount in inputs)
                 if wallet_id == self.xch_wallet_id:
                     output_amount -= combine_fee
@@ -3588,7 +3645,11 @@ class CoinPrepWorker:
                 if before_count - batch_size == 1:
                     batch_size -= 1
                 batch = target_inputs[:batch_size]
-                combine_fee = self._priority_combine_fee_mojos(len(batch))
+                combine_fee = (
+                    self._sage_cat_combine_fee_mojos(len(batch))
+                    if wallet_id == self.cat_wallet_id
+                    else self._priority_combine_fee_mojos(len(batch))
+                )
                 target_count = before_count - len(batch) + 1
                 self.log(
                     f"Combining staged {name} batch ({len(batch)} coins, "
@@ -3623,7 +3684,11 @@ class CoinPrepWorker:
                 )
                 return True
 
-            combine_fee = self._priority_combine_fee_mojos(len(target_inputs))
+            combine_fee = (
+                self._sage_cat_combine_fee_mojos(len(target_inputs))
+                if wallet_id == self.cat_wallet_id
+                else self._priority_combine_fee_mojos(len(target_inputs))
+            )
             combine_route = (
                 "exact transaction"
                 if wallet_id == self.cat_wallet_id and combine_fee > 0
@@ -8806,6 +8871,33 @@ class CoinPrepWorker:
                     continue
                 expected_outputs = observation.get("expected_outputs")
                 authoritative_view = observation.get("authoritative_view")
+                no_effect_view = observation.get("no_effect_view")
+                if type(no_effect_view) is dict:
+                    fee_coin_ids = json.loads(
+                        operation.get("effect_fee_coin_ids_json") or "[]"
+                    )
+                    record_coin_prep_operation_outcome(
+                        operation["operation_id"],
+                        outcome="FAILED",
+                        evidence_json={
+                            "reason_code": "AUTHORITATIVE_NO_EFFECT_CONFIRMED",
+                            "effect_claim_token": operation["effect_claim_token"],
+                            "effect_claim_generation": operation[
+                                "effect_claim_generation"
+                            ],
+                            "dispatch_outcome": "RELEASED_NO_EFFECT",
+                            "effect_attempted": False,
+                            "source_coin_ids": source_coin_ids,
+                            "fee_coin_ids": fee_coin_ids,
+                            "authoritative_view": no_effect_view,
+                            "expected_wallet_identity": expected_identity,
+                        },
+                    )
+                    self.log(
+                        "Coin prep recovery proved the submitted Sage effect had "
+                        "no effect; exact source and fee inputs are selectable"
+                    )
+                    continue
                 if not self._verify_authoritative_post_operation_view(
                     operation_id=operation["operation_id"],
                     source_coin_ids=source_coin_ids,
@@ -8828,6 +8920,35 @@ class CoinPrepWorker:
                 )
                 all_confirmed = False
         return all_confirmed
+
+    def _get_sage_selectable_coin_ids_for_recovery(
+        self, wallet_id: int
+    ) -> set[str] | None:
+        """Return one strict selectable cohort, preserving RPC failure as unknown."""
+
+        try:
+            from wallet_sage import get_selectable_coins_only
+
+            result = get_selectable_coins_only(wallet_id)
+            if type(result) is not dict or result.get("success") is not True:
+                return None
+            records = result.get("confirmed_records")
+            if records is None:
+                records = result.get("records")
+            if type(records) is not list:
+                return None
+            coin_ids: set[str] = set()
+            for record in records:
+                if type(record) is not dict:
+                    return None
+                coin_id = record.get("coin_id") or record.get("name")
+                canonical = self._canonical_coin_id(coin_id)
+                if canonical in coin_ids:
+                    return None
+                coin_ids.add(canonical)
+            return coin_ids
+        except Exception:
+            return None
 
     def _observe_recoverable_coin_prep_operation(self, operation: dict):
         """Build exact outputs from a complete pre/post owned-coin difference."""
@@ -8878,6 +8999,48 @@ class CoinPrepWorker:
                 self._canonical_coin_id(value)
                 for value in json.loads(operation["source_coin_ids_json"])
             }
+            fee_ids = {
+                self._canonical_coin_id(value)
+                for value in json.loads(
+                    operation.get("effect_fee_coin_ids_json") or "[]"
+                )
+            }
+            pending = get_pending_transactions()
+            target_selectable = self._get_sage_selectable_coin_ids_for_recovery(
+                wallet_id
+            )
+            fee_selectable = (
+                target_selectable
+                if target["wallet_type"] == "xch"
+                else self._get_sage_selectable_coin_ids_for_recovery(self.xch_wallet_id)
+            )
+            if (
+                operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                and type(pending) is list
+                and not pending
+                and target_selectable is not None
+                and fee_selectable is not None
+                and source_ids.issubset(target_selectable)
+                and fee_ids.issubset(fee_selectable)
+            ):
+                observed_text = identity_decision["observed_at_utc"]
+                observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
+                expires_at = observed_at + timedelta(
+                    seconds=expected_identity["maximum_age_seconds"]
+                )
+                return {
+                    "no_effect_view": {
+                        "fresh": True,
+                        "complete": True,
+                        "wallet_identity": expected_identity,
+                        "observed_at": observed_text,
+                        "expires_at": expires_at.isoformat(
+                            timespec="microseconds"
+                        ).replace("+00:00", "Z"),
+                        "selectable_coin_ids": sorted(source_ids | fee_ids),
+                        "pending_transaction_ids": [],
+                    }
+                }
             if source_ids.intersection(by_id):
                 return None
             new_coins = sorted(

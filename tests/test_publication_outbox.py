@@ -1156,6 +1156,102 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     )
 
 
+def test_splash_http_2xx_without_remote_id_is_a_durable_acknowledgement(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, fingerprint = _prepare_and_confirm(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_manager.cfg, "MAX_POSTS_PER_LOOP", 1, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    response = _TransportResponse(200, {"success": True})
+    calls = []
+
+    def accepted_without_remote_id(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(splash_manager.requests, "post", accepted_without_remote_id)
+    result = manager.flush_queue()
+
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+    assert result["posted"] == 1
+    assert len(calls) == 1
+    assert calls[0][1]["json"]["offer"] == offer_text
+    assert _sha(calls[0][1]["json"]["offer"]) == fingerprint
+    assert row["state"] == "succeeded"
+    acknowledgement = json.loads(row["acknowledgement_json"])
+    assert acknowledgement["code"] == "SPLASH_HTTP_ACCEPTED"
+    assert acknowledgement["provider_response_id"] == (
+        f"splash-http-200:{_sha(response.content.decode())}"
+    )
+
+
+def test_legacy_splash_missing_id_blocker_recovers_without_redispatch(
+    isolated_database,
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    claim = _claim(isolated_database, publisher="splash")
+    request_sha256 = _sha("legacy-splash-request")
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=request_sha256,
+        dispatched_at=WITHIN_LEASE,
+    )
+    unresolved = isolated_database.unresolve_publication_outbox(
+        publication_id=dispatched["publication_id"],
+        owner_run_id=dispatched["claim_owner_run_id"],
+        claim_token=dispatched["claim_token"],
+        claim_generation=dispatched["claim_generation"],
+        expected_row_version=dispatched["row_version"],
+        error_json={
+            "code": "MALFORMED_PROVIDER_ACKNOWLEDGEMENT",
+            "provider": "splash",
+            "request_sha256": request_sha256,
+        },
+        unresolved_at=WITHIN_LEASE,
+    )
+    assert unresolved["state"] == "unresolved"
+    assert isolated_database.get_stability_startup_recovery_snapshot()[
+        "publication_issues"
+    ] == [claim["publication_id"]]
+
+    recovered = isolated_database.recover_legacy_splash_http_acknowledgements(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert recovered == 1
+    row = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert row["state"] == "succeeded"
+    acknowledgement = json.loads(row["acknowledgement_json"])
+    assert acknowledgement == {
+        "code": "LEGACY_SPLASH_HTTP_2XX_ACKNOWLEDGEMENT_RECOVERED",
+        "provider": "splash",
+        "request_sha256": request_sha256,
+    }
+    assert (
+        isolated_database.get_stability_startup_recovery_snapshot()[
+            "publication_issues"
+        ]
+        == []
+    )
+
+
 @pytest.mark.parametrize("failure", ["mismatched_echo", "timeout"])
 def test_dispatched_ambiguous_response_is_unresolved_and_never_retried(
     isolated_database, monkeypatch, failure
