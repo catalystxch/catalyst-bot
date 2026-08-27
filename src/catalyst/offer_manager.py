@@ -6211,16 +6211,36 @@ class OfferManager:
                     attempt=attempt,
                 )
             self._offer_cancel_crash_boundary("before_wallet", intent)
-            raw_result = wallet.cancel_offer(
-                intent.trade_id,
-                secure=True,
-                timeout=60,
-                fee_mojos=None,
-                _cancel_continuation=continuation,
-                _cancel_operation_id=intent.operation_id,
-                _cancel_intent_id=intent.intent_id,
+            continuation_refreshed = not prepared_for_cohort or (
+                continuation is not None
+                and wallet.refresh_offer_cancel_continuation(
+                    continuation,
+                    operation_id=intent.operation_id,
+                    intent_id=intent.intent_id,
+                    trade_id=intent.trade_id,
+                    ttl_seconds=60,
+                )
             )
-            continuation = None
+            if continuation_refreshed:
+                raw_result = wallet.cancel_offer(
+                    intent.trade_id,
+                    secure=True,
+                    timeout=60,
+                    fee_mojos=None,
+                    _cancel_continuation=continuation,
+                    _cancel_operation_id=intent.operation_id,
+                    _cancel_intent_id=intent.intent_id,
+                )
+                continuation = None
+            else:
+                raw_result = cancellation_result(
+                    CANCEL_UNKNOWN,
+                    method="continuation_refresh",
+                    raw_response={
+                        "reason_code": "CONTINUATION_REFRESH_BLOCKED",
+                    },
+                )
+                raw_result["_catalyst_effect_attempted"] = False
             effect_attempted = (
                 type(raw_result) is dict
                 and raw_result.get("_catalyst_effect_attempted") is True

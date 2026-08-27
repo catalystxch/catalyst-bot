@@ -1438,6 +1438,44 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
     ]
 
 
+def test_offer_manager_refreshes_each_prepared_continuation_before_dispatch(
+    isolated_database,
+    monkeypatch,
+):
+    """A slow definitive Sage failure must not expire later cohort members."""
+
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    monotonic_now = [10.0]
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        if len(effects) == 1:
+            monotonic_now[0] += 61.0
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={"success": False, "error": "rejected"},
+        )
+
+    monkeypatch.setattr(wallet.time, "monotonic", lambda: monotonic_now[0])
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=24,
+    )
+
+    results = OfferManager().cancel_offers(trade_ids, force_storm=True)
+
+    assert effects == trade_ids
+    assert [results[trade_id]["outcome"] for trade_id in trade_ids] == [
+        CANCEL_FAILED,
+        CANCEL_FAILED,
+        CANCEL_FAILED,
+    ]
+
+
 @pytest.mark.parametrize("member_count", [71, 129])
 def test_offer_manager_prepares_full_large_book_before_first_wallet_effect(
     isolated_database,
