@@ -154,6 +154,29 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             900,
         )
 
+    def test_sage_cat_combine_fee_scales_with_measured_large_bundle_cost(self):
+        """Regression: v1.3.12 paid a standard-tx fee for a 51-spend CAT bundle."""
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker._tx_fee_mojos = lambda: 13_079_100
+
+        fee_mojos = worker._sage_cat_combine_fee_mojos(50)
+
+        # TEST 7 / Sage v0.13 evidence: 50 CAT inputs plus the XCH fee input
+        # cost 1,523,037,989.  Chia peers rejected 100,000,000 mojos with
+        # INVALID_FEE_TOO_CLOSE_TO_ZERO.  Keep the computed floor above 5
+        # mojos/cost, with a margin for puzzle/cost variation.
+        self.assertGreaterEqual(fee_mojos, 9_000_000_000)
+        self.assertGreaterEqual(fee_mojos / 1_523_037_989, 6)
+
+    def test_explicit_zero_fee_keeps_sage_cat_combine_fee_free(self):
+        worker = self.coin_prep_worker.CoinPrepWorker()
+        worker._tx_fee_mojos = lambda: 0
+
+        self.assertEqual(
+            worker._sage_cat_combine_fee_mojos(50),
+            0,
+        )
+
     def test_unresolved_submitted_combine_never_dispatches_fallback(self):
         source_ids = ["11" * 32, "22" * 32]
         fake_wallet_sage = types.ModuleType("wallet_sage")
@@ -905,7 +928,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
 
         self.assertTrue(worker._consolidate_wallet_sage_combine(2, "CAT"))
         self.assertEqual(native_calls, [])
-        self.assertTrue(any("fee=100,000,000 mojos" in message for message in logs))
+        self.assertTrue(any("fee=492,000,000 mojos" in message for message in logs))
         self.assertEqual(
             exact_calls,
             [
@@ -922,7 +945,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
                             "amount": "200",
                             "memos": [],
                         },
-                        {"type": "fee", "amount": "100000000"},
+                        {"type": "fee", "amount": "492000000"},
                     ],
                     "auto_submit": True,
                 }

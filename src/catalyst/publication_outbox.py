@@ -247,6 +247,21 @@ def classify_provider_result(
         provider_id = result.get("provider_response_id")
         response_digest = result.get("response_sha256")
         echo = result.get("echoed_idempotency_key")
+        splash_http_ack = (
+            safe_publisher == "splash"
+            and type(status) is int
+            and 200 <= status < 300
+            and provider_id is None
+            and type(response_digest) is str
+            and _FINGERPRINT_RE.fullmatch(response_digest) is not None
+        )
+        if splash_http_ack:
+            # The local Splash daemon acknowledges acceptance with HTTP 2xx
+            # but, unlike Dexie, does not return a durable remote offer ID.
+            # Bind that protocol acknowledgement to the exact response bytes
+            # so it can cross CATalyst's local durability boundary without a
+            # duplicate redispatch on restart.
+            provider_id = f"splash-http-{status}:{response_digest}"
         if (
             type(status) is not int
             or not 200 <= status < 300
@@ -263,7 +278,11 @@ def classify_provider_result(
         return PublicationDecision(
             PublicationState.SUCCEEDED,
             {
-                "code": "SYNCHRONOUS_PROVIDER_ACKNOWLEDGEMENT",
+                "code": (
+                    "SPLASH_HTTP_ACCEPTED"
+                    if splash_http_ack
+                    else "SYNCHRONOUS_PROVIDER_ACKNOWLEDGEMENT"
+                ),
                 "provider": safe_publisher,
                 "provider_response_id": provider_id,
                 "request_sha256": expected_request,

@@ -300,6 +300,28 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         pending.assert_not_called()
         validate_cancel_result(result)
 
+    def test_signed_sage_v013_bare_program_hex_still_derives_identity(self):
+        """Sage v0.13 omits 0x on puzzle_reveal and solution fields."""
+        from chia_rs import Coin, CoinSpend, G2Element, Program, SpendBundle
+        from chia_rs.sized_bytes import bytes32
+
+        coin = Coin(bytes32(b"3" * 32), bytes32(b"4" * 32), 2)
+        coin_spend = CoinSpend(coin, Program.to(1), Program.to([]))
+        spend_bundle = SpendBundle([coin_spend], G2Element())
+        sage_v013_json = spend_bundle.to_json_dict()
+        for spend in sage_v013_json["coin_spends"]:
+            spend["puzzle_reveal"] = spend["puzzle_reveal"].removeprefix("0x")
+            spend["solution"] = spend["solution"].removeprefix("0x")
+
+        self.assertEqual(
+            wallet_sage._spend_bundle_transaction_id(sage_v013_json),
+            spend_bundle.name().hex(),
+        )
+        self.assertFalse(
+            sage_v013_json["coin_spends"][0]["puzzle_reveal"].startswith("0x")
+        )
+        self.assertFalse(sage_v013_json["coin_spends"][0]["solution"].startswith("0x"))
+
     def test_cancel_offer_uses_single_new_pending_txid_when_bundle_name_is_unavailable(
         self,
     ):

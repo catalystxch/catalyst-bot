@@ -591,6 +591,199 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.assertEqual(recorded[0][0], operation_id)
         self.assertEqual(recorded[0][1]["outcome"], "CONFIRMED")
 
+    def test_startup_recovery_releases_rejected_sage_effect_only_from_exact_selectable_cohort(
+        self,
+    ):
+        """Catches a Sage peer rejection permanently latching untouched inputs."""
+
+        now = datetime.now(timezone.utc)
+        cat_source = hashlib.sha256(b"rejected-cat-source").hexdigest()
+        fee_source = hashlib.sha256(b"rejected-fee-source").hexdigest()
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "maximum_age_seconds": 300,
+        }
+        operation_id = (
+            "coin-prep:" + hashlib.sha256(b"rejected-sage-combine").hexdigest()
+        )
+        operation = {
+            "operation_id": operation_id,
+            "operation_kind": "combine",
+            "purpose": "replacement",
+            "source_coin_ids_json": json.dumps([cat_source]),
+            "target_contract_json": json.dumps(
+                {
+                    "wallet_type": "cat",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "amount_mojos": 100,
+                            "purpose": "replacement",
+                        }
+                    ],
+                }
+            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [cat_source]}),
+            "wallet_identity_json": json.dumps(identity),
+            "effect_claim_token": "e" * 64,
+            "effect_claim_generation": 1,
+            "effect_fee_coin_ids_json": json.dumps([fee_source]),
+            "effect_dispatch_token": "d" * 64,
+            "effect_authority_sha256": "a" * 64,
+            "effect_adapter_operation": operation_id,
+            "outcome": "SUBMITTED_UNKNOWN",
+        }
+        recorded = []
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            "success": True,
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "observed_at_utc": now.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [operation]
+        self.coin_prep_worker.get_pending_transactions = lambda: []
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda op_id, **kwargs: (
+                recorded.append((op_id, kwargs))
+                or {"operation": {"operation_id": op_id, **kwargs}}
+            )
+        )
+
+        def selectable(wallet_id):
+            coin_id = fee_source if wallet_id == 1 else cat_source
+            return {
+                "success": True,
+                "records": [
+                    {
+                        "coin": {
+                            "parent_coin_info": "cc" * 32,
+                            "puzzle_hash": "dd" * 32,
+                            "amount": 100,
+                        },
+                        "coin_id": "0x" + coin_id,
+                    }
+                ],
+            }
+
+        sys.modules["wallet_sage"].get_selectable_coins_only = selectable
+
+        recovered = self.coin_prep_worker.recover_coin_prep_operations_at_startup()
+
+        self.assertTrue(recovered)
+        self.assertEqual(recorded[0][0], operation_id)
+        self.assertEqual(recorded[0][1]["outcome"], "FAILED")
+        evidence = recorded[0][1]["evidence_json"]
+        self.assertEqual(evidence["reason_code"], "AUTHORITATIVE_NO_EFFECT_CONFIRMED")
+        self.assertEqual(evidence["source_coin_ids"], [cat_source])
+        self.assertEqual(evidence["fee_coin_ids"], [fee_source])
+        self.assertEqual(
+            evidence["authoritative_view"]["selectable_coin_ids"],
+            sorted([cat_source, fee_source]),
+        )
+        self.assertEqual(evidence["authoritative_view"]["pending_transaction_ids"], [])
+
+    def test_startup_recovery_keeps_rejected_sage_effect_latched_when_fee_is_not_selectable(
+        self,
+    ):
+        """Catches CAT-only evidence releasing an unresolved XCH fee input."""
+
+        now = datetime.now(timezone.utc)
+        cat_source = hashlib.sha256(b"latched-cat-source").hexdigest()
+        fee_source = hashlib.sha256(b"latched-fee-source").hexdigest()
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "maximum_age_seconds": 300,
+        }
+        operation = {
+            "operation_id": "coin-prep:" + "b" * 64,
+            "operation_kind": "combine",
+            "purpose": "replacement",
+            "source_coin_ids_json": json.dumps([cat_source]),
+            "target_contract_json": json.dumps(
+                {
+                    "wallet_type": "cat",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "amount_mojos": 100,
+                            "purpose": "replacement",
+                        }
+                    ],
+                }
+            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [cat_source]}),
+            "wallet_identity_json": json.dumps(identity),
+            "effect_claim_token": "e" * 64,
+            "effect_claim_generation": 1,
+            "effect_fee_coin_ids_json": json.dumps([fee_source]),
+            "effect_dispatch_token": "d" * 64,
+            "effect_authority_sha256": "a" * 64,
+            "effect_adapter_operation": "coin-prep:" + "b" * 64,
+            "outcome": "SUBMITTED_UNKNOWN",
+        }
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            "success": True,
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "observed_at_utc": now.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+        self.coin_prep_worker.get_recoverable_coin_prep_operations = lambda: [operation]
+        self.coin_prep_worker.get_pending_transactions = lambda: []
+        recorded = []
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda *args, **kwargs: recorded.append((args, kwargs))
+        )
+        sys.modules["wallet_sage"].get_selectable_coins_only = lambda wallet_id: {
+            "success": True,
+            "records": (
+                []
+                if wallet_id == 1
+                else [
+                    {
+                        "coin": {
+                            "parent_coin_info": "cc" * 32,
+                            "puzzle_hash": "dd" * 32,
+                            "amount": 100,
+                        },
+                        "coin_id": "0x" + cat_source,
+                    }
+                ]
+            ),
+        }
+
+        recovered = self.coin_prep_worker.recover_coin_prep_operations_at_startup()
+
+        self.assertFalse(recovered)
+        self.assertEqual(recorded, [])
+
     def test_split_dispatch_commits_prepared_before_effect_and_confirms_exact_view(
         self,
     ):
@@ -1208,6 +1401,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "maximum_age_seconds": 300,
         }
         claims = []
+        prepared_calls = []
         adapter_calls = []
         claim = {"claim_token": "c" * 64, "generation": 1}
         self.coin_prep_worker.DB_AVAILABLE = True
@@ -1226,16 +1420,21 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.coin_prep_worker.complete_wallet_effect_dispatch = (
             lambda *_args, **_kwargs: "SUBMITTED"
         )
-        self.coin_prep_worker.prepare_coin_prep_operation = lambda **_kwargs: {
-            "operation": {
-                "operation_id": "coin-prep:" + "a" * 64,
-                "outcome": "PREPARED",
-                "source_coin_ids_json": json.dumps(sources),
-                "wallet_identity_json": json.dumps(identity),
-                "effect_claim_token": claim["claim_token"],
-                "effect_claim_generation": claim["generation"],
+
+        def prepare_coin_prep_operation(**kwargs):
+            prepared_calls.append(kwargs)
+            return {
+                "operation": {
+                    "operation_id": "coin-prep:" + "a" * 64,
+                    "outcome": "PREPARED",
+                    "source_coin_ids_json": json.dumps(sources),
+                    "wallet_identity_json": json.dumps(identity),
+                    "effect_claim_token": claim["claim_token"],
+                    "effect_claim_generation": claim["generation"],
+                }
             }
-        }
+
+        self.coin_prep_worker.prepare_coin_prep_operation = prepare_coin_prep_operation
         self.coin_prep_worker.record_coin_prep_operation_outcome = (
             lambda operation_id, **kwargs: {
                 "operation": {"operation_id": operation_id, **kwargs}
@@ -1277,6 +1476,10 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         self.assertEqual(len(adapter_calls), 1)
         self.assertEqual(claims[0]["source_coin_ids"], sources)
         self.assertEqual(claims[0]["fee_coin_ids"], [fee_coin_id])
+        self.assertEqual(
+            prepared_calls[0]["target_contract"]["external_fee"],
+            {"fee_mojos": 100_000_000, "coin_ids": [fee_coin_id]},
+        )
 
     def test_submitted_unknown_fee_reserve_combine_is_mapping_safe(self):
         """Catches an accepted effect crashing a caller that reads result metadata."""

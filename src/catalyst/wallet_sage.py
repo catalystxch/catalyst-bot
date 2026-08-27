@@ -2845,7 +2845,37 @@ def _spend_bundle_transaction_id(spend_bundle: Any) -> Optional[str]:
     try:
         from chia_rs import SpendBundle
 
-        transaction_id = SpendBundle.from_json_dict(spend_bundle).name().hex()
+        # Sage v0.13 serializes puzzle_reveal and solution as bare hex while
+        # chia_rs expects every bytes field to use a 0x prefix.  Normalize only
+        # the known bytes fields on a copy so callers keep the exact RPC body.
+        def _prefixed_hex(value: Any) -> Any:
+            if not isinstance(value, str) or value.startswith("0x"):
+                return value
+            if re.fullmatch(r"(?:[0-9a-fA-F]{2})*", value):
+                return f"0x{value}"
+            return value
+
+        normalized = dict(spend_bundle)
+        normalized["aggregated_signature"] = _prefixed_hex(
+            normalized.get("aggregated_signature")
+        )
+        normalized_spends = []
+        for raw_spend in normalized.get("coin_spends") or []:
+            if not isinstance(raw_spend, dict):
+                return None
+            spend = dict(raw_spend)
+            raw_coin = spend.get("coin")
+            if isinstance(raw_coin, dict):
+                coin = dict(raw_coin)
+                coin["parent_coin_info"] = _prefixed_hex(coin.get("parent_coin_info"))
+                coin["puzzle_hash"] = _prefixed_hex(coin.get("puzzle_hash"))
+                spend["coin"] = coin
+            spend["puzzle_reveal"] = _prefixed_hex(spend.get("puzzle_reveal"))
+            spend["solution"] = _prefixed_hex(spend.get("solution"))
+            normalized_spends.append(spend)
+        normalized["coin_spends"] = normalized_spends
+
+        transaction_id = SpendBundle.from_json_dict(normalized).name().hex()
     except Exception:
         return None
     if re.fullmatch(r"[0-9a-fA-F]{64}", transaction_id or ""):
@@ -3120,19 +3150,14 @@ def combine_coins(
 def get_transaction(transaction_id: str, timeout: int = 10) -> Optional[Dict]:
     """Get transaction status by ID.
 
-    Sage may not support get_transaction directly. Returns None
-    to signal that coin-count polling should be used as fallback.
+    Sage's ``get_transaction`` request accepts a numeric transaction height,
+    not a spend-bundle transaction id (including in Sage 0.12.9 and 0.13.0).
+    The wallet facade exposes Chia's id-based contract, so there is no safe
+    Sage RPC call to make here.  Return ``None`` to select the existing
+    pending-transaction and exact-coin observation fallback instead of
+    producing a misleading HTTP 422 warning for every submitted split.
     """
-    result = rpc(
-        "get_transaction",
-        {
-            "transaction_id": transaction_id,
-        },
-        timeout=timeout,
-    )
-
-    if result and result.get("success"):
-        return result.get("transaction") or result.get("transaction_record") or result
+    del transaction_id, timeout
     return None
 
 
