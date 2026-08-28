@@ -195,3 +195,26 @@ def test_signed_installer_evidence_is_uploaded_to_both_release_repositories():
     public_upload = named_step("Publish verified public update channel")["run"]
     assert expected in source_upload
     assert expected in public_upload
+
+
+def test_installer_smoke_proves_installed_signature_hash_and_defender_result():
+    smoke = named_step("Smoke test signed Windows installer payload")["run"]
+    assert smoke.count("verify_windows_authenticode.py") == 2
+    assert smoke.count("installed Catalyst.exe hash does not match signed bundle") == 2
+    assert "Get-FileHash" in smoke
+    assert "MpCmdRun.exe" in smoke
+    assert "Defender scan failed for installer" in smoke
+    assert "Defender scan failed for installed application" in smoke
+
+    clean_verify = smoke.index("Verify clean installed CATalyst signature and hash")
+    clean_launch = smoke.index("Smoke test Windows clean desktop first launch")
+    upgrade_verify = smoke.index("Verify upgraded CATalyst signature and hash")
+    assert clean_verify < clean_launch < upgrade_verify
+
+
+def test_installer_smoke_uses_release_version_output_for_signature_checks():
+    smoke = named_step("Smoke test signed Windows installer payload")
+    assert smoke["env"]["RELEASE_VERSION"] == (
+        "${{ steps.release-version.outputs.version }}"
+    )
+    assert smoke["run"].count('--expected-version "$($env:RELEASE_VERSION)"') == 2

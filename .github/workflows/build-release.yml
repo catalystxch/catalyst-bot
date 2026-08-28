@@ -297,8 +297,10 @@ jobs:
         shell: pwsh
         env:
           RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           $installer = Resolve-Path "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signedBundleExe = Resolve-Path "dist/Catalyst/Catalyst.exe"
           $installDir = Join-Path $env:RUNNER_TEMP "CatalystInstall"
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
@@ -314,10 +316,48 @@ jobs:
             throw "Installer exited with code $($install.ExitCode)"
           }
 
-          python scripts/packaged_api_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
+          $cleanInstalledExe = Join-Path $installDir "Catalyst.exe"
+          Write-Host "Verify clean installed CATalyst signature and hash"
+          python scripts/verify_windows_authenticode.py `
+            --file "$cleanInstalledExe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Clean installed CATalyst signature verification failed"
+          }
+          $signedBundleHash = (Get-FileHash -LiteralPath $signedBundleExe -Algorithm SHA256).Hash
+          $cleanInstalledHash = (Get-FileHash -LiteralPath $cleanInstalledExe -Algorithm SHA256).Hash
+          if ($cleanInstalledHash -ne $signedBundleHash) {
+            throw "installed Catalyst.exe hash does not match signed bundle during clean install"
+          }
+
+          $defenderCandidates = @(
+            (Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe")
+          )
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          if (Test-Path -LiteralPath $platformRoot) {
+            $defenderCandidates += Get-ChildItem -LiteralPath $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          }
+          $defender = $defenderCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $defender) {
+            throw "Defender scan failed: MpCmdRun.exe is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installer with code $LASTEXITCODE"
+          }
+          & $defender -Scan -ScanType 3 -File $cleanInstalledExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installed application with code $LASTEXITCODE"
+          }
+
+          python scripts/packaged_api_smoke.py --exe $cleanInstalledExe
 
           Write-Host "Smoke test Windows clean desktop first launch"
-          python scripts/packaged_desktop_first_launch_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
+          python scripts/packaged_desktop_first_launch_smoke.py --exe $cleanInstalledExe
 
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (Test-Path $uninstaller) {
@@ -362,6 +402,22 @@ jobs:
           $installedVersion = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion
           if ($installedVersion -ne $expectedVersion) {
             throw "Existing-install upgrade left version $installedVersion; expected $expectedVersion"
+          }
+
+          Write-Host "Verify upgraded CATalyst signature and hash"
+          python scripts/verify_windows_authenticode.py `
+            --file "$installedExe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Upgraded CATalyst signature verification failed"
+          }
+          $upgradedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
+          if ($upgradedHash -ne $signedBundleHash) {
+            throw "installed Catalyst.exe hash does not match signed bundle during upgrade"
+          }
+          & $defender -Scan -ScanType 3 -File $installedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installed application with code $LASTEXITCODE"
           }
 
           $shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\CATalyst.lnk"
