@@ -225,7 +225,9 @@ def validate_evidence(
             raise ReleaseVerificationError(f"evidence {field} does not match")
     if not re.fullmatch(r"[A-F0-9]{40}", str(signature.get("signer_thumbprint") or "")):
         raise ReleaseVerificationError("evidence signer thumbprint is invalid")
-    if not re.fullmatch(r"[A-F0-9]{40}", str(signature.get("timestamp_thumbprint") or "")):
+    if not re.fullmatch(
+        r"[A-F0-9]{40}", str(signature.get("timestamp_thumbprint") or "")
+    ):
         raise ReleaseVerificationError("evidence timestamp thumbprint is invalid")
     if not re.fullmatch(r"[a-f0-9]{40}", str(source.get("commit") or "")):
         raise ReleaseVerificationError("evidence source commit is invalid")
@@ -233,9 +235,7 @@ def validate_evidence(
     if (
         workflow_url.scheme != "https"
         or workflow_url.netloc != "github.com"
-        or not workflow_url.path.startswith(
-            "/catalystxch/catalyst-bot/actions/runs/"
-        )
+        or not workflow_url.path.startswith("/catalystxch/catalyst-bot/actions/runs/")
     ):
         raise ReleaseVerificationError("evidence workflow URL is invalid")
     for key in ("application_signing_request_id", "installer_signing_request_id"):
@@ -251,9 +251,13 @@ def validate_evidence(
 def parse_osslsigncode_output(output: str) -> str:
     subject_match = re.search(r"(?m)^Subject:\s*(.+SignPath Foundation.+)$", output)
     if "Succeeded" not in output or "The signature is timestamped" not in output:
-        raise ReleaseVerificationError("osslsigncode did not prove a timestamped signature")
+        raise ReleaseVerificationError(
+            "osslsigncode did not prove a timestamped signature"
+        )
     if not subject_match:
-        raise ReleaseVerificationError("osslsigncode publisher is not SignPath Foundation")
+        raise ReleaseVerificationError(
+            "osslsigncode publisher is not SignPath Foundation"
+        )
     return subject_match.group(1).strip()
 ```
 

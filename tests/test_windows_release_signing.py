@@ -9,9 +9,7 @@ SIGNPATH_ACTION = (
     "signpath/github-action-submit-signing-request@"
     "c92b958760219087e01f8d67a1669ed57afe2627"
 )
-UPLOAD_ACTION = (
-    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-)
+UPLOAD_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 
 
 def load_workflow() -> dict:
@@ -75,9 +73,7 @@ def test_application_signing_uses_pinned_actions_and_exact_policy():
         "wait-for-completion-timeout-in-seconds": 7200,
         "output-artifact-directory": "signed/application",
         "skip-decompress": True,
-        "parameters": (
-            'version: "${{ steps.release-version.outputs.version }}"\n'
-        ),
+        "parameters": ('version: "${{ steps.release-version.outputs.version }}"\n'),
     }
 
 

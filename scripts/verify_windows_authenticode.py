@@ -347,9 +347,7 @@ def main(argv: list[str] | None = None) -> int:
                 "source_tag": args.source_tag,
                 "source_commit": args.source_commit,
                 "workflow_run_url": args.workflow_run_url,
-                "application_signing_request_id": (
-                    args.application_signing_request_id
-                ),
+                "application_signing_request_id": (args.application_signing_request_id),
                 "installer_signing_request_id": args.installer_signing_request_id,
             }
             missing = [key for key, value in evidence_fields.items() if not value]

@@ -28,9 +28,10 @@ def valid_metadata() -> dict[str, str]:
 
 
 def test_validate_signature_metadata_accepts_expected_release():
-    assert validate_signature_metadata(
-        valid_metadata(), expected_version="1.3.17"
-    ) == valid_metadata()
+    assert (
+        validate_signature_metadata(valid_metadata(), expected_version="1.3.17")
+        == valid_metadata()
+    )
 
 
 @pytest.mark.parametrize(
@@ -204,7 +205,9 @@ def test_collect_powershell_metadata_rejects_process_failure(
         raise subprocess.CalledProcessError(1, command, stderr="PowerShell failed")
 
     monkeypatch.setattr(subprocess, "run", fail)
-    with pytest.raises(VerificationError, match="PowerShell signature inspection failed"):
+    with pytest.raises(
+        VerificationError, match="PowerShell signature inspection failed"
+    ):
         module.collect_powershell_metadata(artifact)
 
 
@@ -231,7 +234,7 @@ def test_run_signtool_rejects_failed_authenticode_verification(
 
 
 def test_atomic_json_write_preserves_existing_evidence_on_serialization_failure(
-    tmp_path: Path
+    tmp_path: Path,
 ):
     destination = tmp_path / "windows-signature-v1.3.17.json"
     destination.write_text('{"trusted": true}\n', encoding="utf-8")

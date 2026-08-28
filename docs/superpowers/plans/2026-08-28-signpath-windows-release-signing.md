@@ -163,12 +163,23 @@ def validate_signature_metadata(
     expected_publisher: str = "SignPath Foundation",
     expected_product: str = "CATalyst",
 ) -> dict[str, str]:
-    values = {key: str(metadata.get(key) or "").strip() for key in (
-        "status", "signer_subject", "signer_thumbprint", "timestamp_subject",
-        "timestamp_thumbprint", "product_name", "product_version", "file_version",
-    )}
+    values = {
+        key: str(metadata.get(key) or "").strip()
+        for key in (
+            "status",
+            "signer_subject",
+            "signer_thumbprint",
+            "timestamp_subject",
+            "timestamp_thumbprint",
+            "product_name",
+            "product_version",
+            "file_version",
+        )
+    }
     if values["status"] != "Valid":
-        raise VerificationError(f"Authenticode status is {values['status'] or 'missing'}")
+        raise VerificationError(
+            f"Authenticode status is {values['status'] or 'missing'}"
+        )
     if expected_publisher.casefold() not in values["signer_subject"].casefold():
         raise VerificationError("publisher is not SignPath Foundation")
     if not values["timestamp_subject"] or not values["timestamp_thumbprint"]:
@@ -554,7 +565,10 @@ def test_signpath_policy_and_privacy_are_publicly_linked():
     policy = (ROOT / "docs" / "CODE_SIGNING_POLICY.md").read_text(encoding="utf-8")
     privacy = (ROOT / "docs" / "PRIVACY.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Free code signing provided by SignPath.io, certificate by SignPath Foundation" in policy
+    assert (
+        "Free code signing provided by SignPath.io, certificate by SignPath Foundation"
+        in policy
+    )
     assert "Authors and committers" in policy
     assert "Reviewers" in policy
     assert "Approvers" in policy
@@ -566,7 +580,9 @@ def test_signpath_policy_and_privacy_are_publicly_linked():
 
 def test_installer_does_not_claim_cat_certificate_for_upstream_splash():
     installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
-    assert "same code-signing cert used for Catalyst.exe and splash.exe" not in installer
+    assert (
+        "same code-signing cert used for Catalyst.exe and splash.exe" not in installer
+    )
     assert "Do not sign upstream splash.exe with the CATalyst certificate" in installer
 ```
 
