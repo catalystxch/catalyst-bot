@@ -185,8 +185,6 @@ jobs:
         if: matrix.os == 'windows-latest'
         env:
           RELEASE_REF: ${{ github.ref_name }}
-          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
-          CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Install Inno Setup
@@ -206,12 +204,79 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           # Rename output to match release naming
           Move-Item "Output\Catalyst-Setup-$version.exe" "Catalyst-Setup-$($env:RELEASE_REF).exe"
-          # Publish a checksum sidecar for manual verification and manifest signing.
+        shell: pwsh
+
+      - name: Upload unsigned Windows installer for SignPath
+        id: upload-unsigned-installer
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: catalyst-windows-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Catalyst-Setup-${{ github.ref_name }}.exe
+          archive: false
+
+      - name: Sign Windows installer with SignPath
+        id: sign-installer
+        if: matrix.os == 'windows-latest'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: catalyst
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: catalyst-windows-installer-v1
+          github-artifact-id: ${{ steps.upload-unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/installer
+          skip-decompress: true
+          parameters: |
+            version: "${{ steps.release-version.outputs.version }}"
+
+      - name: Replace and verify signed Windows installer
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GITHUB_SERVER: ${{ github.server_url }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          APPLICATION_SIGNING_REQUEST_ID: ${{ steps.sign-application.outputs.signing-request-id }}
+          INSTALLER_SIGNING_REQUEST_ID: ${{ steps.sign-installer.outputs.signing-request-id }}
+        run: |
+          $installer = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signedInstaller = "signed/installer/$installer"
+          if (-not (Test-Path -LiteralPath $signedInstaller)) {
+            throw "SignPath did not return $installer"
+          }
+          Copy-Item -LiteralPath $signedInstaller -Destination $installer -Force
+          python scripts/verify_windows_authenticode.py `
+            --file "$installer" `
+            --expected-version "$($env:RELEASE_VERSION)" `
+            --evidence-output "windows-signature-$($env:RELEASE_REF).json" `
+            --source-repository "$($env:SOURCE_REPOSITORY)" `
+            --source-tag "$($env:RELEASE_REF)" `
+            --source-commit "$($env:SOURCE_COMMIT)" `
+            --workflow-run-url "$($env:GITHUB_SERVER)/$($env:SOURCE_REPOSITORY)/actions/runs/$($env:WORKFLOW_RUN_ID)" `
+            --application-signing-request-id "$($env:APPLICATION_SIGNING_REQUEST_ID)" `
+            --installer-signing-request-id "$($env:INSTALLER_SIGNING_REQUEST_ID)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed Windows installer verification failed"
+          }
+
+      - name: Generate signed-installer checksum and update manifest
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
+        run: |
           $installer = "Catalyst-Setup-$($env:RELEASE_REF).exe"
           $digest = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
           "$digest  $installer" | Set-Content "${installer}.sha256" -NoNewline
-          # Sign a public update manifest. The private key is only read from
-          # the Actions secret; CATalyst ships the matching public key.
           if (-not $env:CATALYST_UPDATE_SIGNING_KEY_B64) {
             throw "CATALYST_UPDATE_SIGNING_KEY_B64 secret is required for signed updates"
           }
@@ -226,9 +291,8 @@ jobs:
             --out-signature latest.json.sig
           Copy-Item latest.json "update-manifest-$($env:RELEASE_REF).json"
           Copy-Item latest.json.sig "update-manifest-$($env:RELEASE_REF).json.sig"
-        shell: pwsh
 
-      - name: Smoke test Windows installer payload
+      - name: Smoke test signed Windows installer payload
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -418,7 +482,7 @@ jobs:
           echo "Failed to upload Linux packages to $RELEASE_REF"
           exit 1
 
-      - name: Upload Windows Installer to Release
+      - name: Upload signed Windows installer to Release
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -439,6 +503,7 @@ jobs:
           $assets = @(
             "Catalyst-Setup-$($env:RELEASE_REF).exe",
             "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256",
+            "windows-signature-$($env:RELEASE_REF).json",
             "latest.json",
             "latest.json.sig",
             "update-manifest-$($env:RELEASE_REF).json",
@@ -454,7 +519,7 @@ jobs:
           }
           throw "Failed to upload Windows installer assets to $($env:RELEASE_REF)"
 
-      - name: Publish public update channel
+      - name: Publish verified public update channel
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -463,12 +528,12 @@ jobs:
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
           if (-not $env:GH_TOKEN) {
-            Write-Warning "CATALYST_RELEASE_CHANNEL_TOKEN is not configured; skipping public update channel publish."
-            exit 0
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
           }
           $assets = @(
             "Catalyst-Setup-$($env:RELEASE_REF).exe",
             "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256",
+            "windows-signature-$($env:RELEASE_REF).json",
             "latest.json",
             "latest.json.sig",
             "update-manifest-$($env:RELEASE_REF).json",
