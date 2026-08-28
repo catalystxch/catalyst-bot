@@ -7,6 +7,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: write
 
 
@@ -24,7 +25,7 @@ jobs:
             ext: .tar.gz
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout code
@@ -62,12 +63,47 @@ jobs:
             python -m pip install -r requirements-linux.txt
           fi
 
-      - name: Sync release metadata to tag
+      - name: Resolve release version
+        id: release-version
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          python scripts/sync_release_metadata.py "${version}"
-          echo "Synced release metadata to ${version}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Sync release metadata to tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          python scripts/sync_release_metadata.py "${RELEASE_VERSION}"
+          echo "Synced release metadata to ${RELEASE_VERSION}"
+
+      - name: Require Windows release signing configuration
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          CATALYST_RELEASE_CHANNEL_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
+            throw "SIGNPATH_API_TOKEN is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_ORGANIZATION_ID)) {
+            throw "SIGNPATH_ORGANIZATION_ID is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_UPDATE_SIGNING_KEY_B64)) {
+            throw "CATALYST_UPDATE_SIGNING_KEY_B64 is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_RELEASE_CHANNEL_TOKEN)) {
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
 
       - name: Build with PyInstaller
         run: python build.py
@@ -89,7 +125,52 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: python scripts/packaged_upgrade_publication_recovery_smoke.py --exe dist/Catalyst/Catalyst.exe
 
-      - name: Package (Windows zip)
+      - name: Upload unsigned CATalyst application for SignPath
+        id: upload-unsigned-application
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: catalyst-windows-application-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/Catalyst/Catalyst.exe
+          archive: false
+
+      - name: Sign CATalyst application with SignPath
+        id: sign-application
+        if: matrix.os == 'windows-latest'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: catalyst
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: catalyst-windows-application-v1
+          github-artifact-id: ${{ steps.upload-unsigned-application.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/application
+          skip-decompress: true
+          parameters: |
+            version: "${{ steps.release-version.outputs.version }}"
+
+      - name: Replace and verify signed CATalyst application
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          $signedApplication = "signed/application/Catalyst.exe"
+          if (-not (Test-Path -LiteralPath $signedApplication)) {
+            throw "SignPath did not return Catalyst.exe"
+          }
+          Copy-Item -LiteralPath $signedApplication -Destination "dist/Catalyst/Catalyst.exe" -Force
+          python scripts/verify_windows_authenticode.py `
+            --file "dist/Catalyst/Catalyst.exe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed CATalyst application verification failed"
+          }
+
+      - name: Package signed Windows zip
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -100,7 +181,7 @@ jobs:
           $package = "${env:ARTIFACT_NAME}-${env:RELEASE_REF}${env:PACKAGE_EXT}"
           Compress-Archive -Path dist/Catalyst/* -DestinationPath $package
 
-      - name: Build Windows Installer
+      - name: Build Windows installer from signed application
         if: matrix.os == 'windows-latest'
         env:
           RELEASE_REF: ${{ github.ref_name }}
