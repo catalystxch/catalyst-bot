@@ -560,11 +560,13 @@ git commit -m "fix: gate Windows download on verified publisher"
 Extend `check_sync_workflow.py` to require:
 
 ```python
-required.update({
-    "sudo apt-get install -y osslsigncode": "the independent Authenticode verifier",
-    "python scripts/check_windows_release_verification.py": "pure Windows release verifier regression checks",
-    "windows-signature-": "the signed evidence companion asset",
-})
+required.update(
+    {
+        "sudo apt-get install -y osslsigncode": "the independent Authenticode verifier",
+        "python scripts/check_windows_release_verification.py": "pure Windows release verifier regression checks",
+        "windows-signature-": "the signed evidence companion asset",
+    }
+)
 ```
 
 Also assert the sync step appears after the package installation and the metadata check appears after sync. Keep existing immutable-action and protected-main assertions.
