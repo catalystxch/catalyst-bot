@@ -218,3 +218,10 @@ def test_installer_smoke_uses_release_version_output_for_signature_checks():
         "${{ steps.release-version.outputs.version }}"
     )
     assert smoke["run"].count('--expected-version "$($env:RELEASE_VERSION)"') == 2
+
+
+def test_installer_pe_metadata_matches_signature_verifier_contract():
+    installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
+    assert "VersionInfoProductName={#MyAppName}" in installer
+    assert "VersionInfoProductVersion={#MyAppVersion}" in installer
+    assert "VersionInfoVersion={#MyAppVersion}" in installer

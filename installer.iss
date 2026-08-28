@@ -41,6 +41,8 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
 VersionInfoVersion={#MyAppVersion}
 
 ; Install to Program Files by default.  All per-user data
