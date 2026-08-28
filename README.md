@@ -498,6 +498,16 @@ Standalone live-wallet scripts are excluded by `tests/conftest.py` and the expli
 
 ---
 
+## Code signing policy and privacy
+
+Windows releases use a fail-closed SignPath release pipeline: the CATalyst-owned executable and final installer are independently verified before publication, and no unsigned Windows fallback is published.
+
+- [Code signing policy](docs/CODE_SIGNING_POLICY.md)
+- [Privacy policy](docs/PRIVACY.md)
+- Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+---
+
 ## Disclaimer
 
 This is beta software that controls a live trading wallet. **There is no

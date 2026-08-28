@@ -7,6 +7,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: write
 
 
@@ -24,7 +25,7 @@ jobs:
             ext: .tar.gz
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout code
@@ -62,12 +63,47 @@ jobs:
             python -m pip install -r requirements-linux.txt
           fi
 
-      - name: Sync release metadata to tag
+      - name: Resolve release version
+        id: release-version
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          python scripts/sync_release_metadata.py "${version}"
-          echo "Synced release metadata to ${version}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Sync release metadata to tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          python scripts/sync_release_metadata.py "${RELEASE_VERSION}"
+          echo "Synced release metadata to ${RELEASE_VERSION}"
+
+      - name: Require Windows release signing configuration
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          CATALYST_RELEASE_CHANNEL_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
+            throw "SIGNPATH_API_TOKEN is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_ORGANIZATION_ID)) {
+            throw "SIGNPATH_ORGANIZATION_ID is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_UPDATE_SIGNING_KEY_B64)) {
+            throw "CATALYST_UPDATE_SIGNING_KEY_B64 is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_RELEASE_CHANNEL_TOKEN)) {
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
 
       - name: Build with PyInstaller
         run: python build.py
@@ -89,7 +125,52 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: python scripts/packaged_upgrade_publication_recovery_smoke.py --exe dist/Catalyst/Catalyst.exe
 
-      - name: Package (Windows zip)
+      - name: Upload unsigned CATalyst application for SignPath
+        id: upload-unsigned-application
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: catalyst-windows-application-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/Catalyst/Catalyst.exe
+          archive: false
+
+      - name: Sign CATalyst application with SignPath
+        id: sign-application
+        if: matrix.os == 'windows-latest'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: catalyst
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: catalyst-windows-application-v1
+          github-artifact-id: ${{ steps.upload-unsigned-application.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/application
+          skip-decompress: true
+          parameters: |
+            version: "${{ steps.release-version.outputs.version }}"
+
+      - name: Replace and verify signed CATalyst application
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          $signedApplication = "signed/application/Catalyst.exe"
+          if (-not (Test-Path -LiteralPath $signedApplication)) {
+            throw "SignPath did not return Catalyst.exe"
+          }
+          Copy-Item -LiteralPath $signedApplication -Destination "dist/Catalyst/Catalyst.exe" -Force
+          python scripts/verify_windows_authenticode.py `
+            --file "dist/Catalyst/Catalyst.exe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed CATalyst application verification failed"
+          }
+
+      - name: Package signed Windows zip
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -100,12 +181,10 @@ jobs:
           $package = "${env:ARTIFACT_NAME}-${env:RELEASE_REF}${env:PACKAGE_EXT}"
           Compress-Archive -Path dist/Catalyst/* -DestinationPath $package
 
-      - name: Build Windows Installer
+      - name: Build Windows installer from signed application
         if: matrix.os == 'windows-latest'
         env:
           RELEASE_REF: ${{ github.ref_name }}
-          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
-          CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Install Inno Setup
@@ -125,12 +204,79 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           # Rename output to match release naming
           Move-Item "Output\Catalyst-Setup-$version.exe" "Catalyst-Setup-$($env:RELEASE_REF).exe"
-          # Publish a checksum sidecar for manual verification and manifest signing.
+        shell: pwsh
+
+      - name: Upload unsigned Windows installer for SignPath
+        id: upload-unsigned-installer
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: catalyst-windows-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: Catalyst-Setup-${{ github.ref_name }}.exe
+          archive: false
+
+      - name: Sign Windows installer with SignPath
+        id: sign-installer
+        if: matrix.os == 'windows-latest'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: catalyst
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: catalyst-windows-installer-v1
+          github-artifact-id: ${{ steps.upload-unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/installer
+          skip-decompress: true
+          parameters: |
+            version: "${{ steps.release-version.outputs.version }}"
+
+      - name: Replace and verify signed Windows installer
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GITHUB_SERVER: ${{ github.server_url }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          APPLICATION_SIGNING_REQUEST_ID: ${{ steps.sign-application.outputs.signing-request-id }}
+          INSTALLER_SIGNING_REQUEST_ID: ${{ steps.sign-installer.outputs.signing-request-id }}
+        run: |
+          $installer = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signedInstaller = "signed/installer/$installer"
+          if (-not (Test-Path -LiteralPath $signedInstaller)) {
+            throw "SignPath did not return $installer"
+          }
+          Copy-Item -LiteralPath $signedInstaller -Destination $installer -Force
+          python scripts/verify_windows_authenticode.py `
+            --file "$installer" `
+            --expected-version "$($env:RELEASE_VERSION)" `
+            --evidence-output "windows-signature-$($env:RELEASE_REF).json" `
+            --source-repository "$($env:SOURCE_REPOSITORY)" `
+            --source-tag "$($env:RELEASE_REF)" `
+            --source-commit "$($env:SOURCE_COMMIT)" `
+            --workflow-run-url "$($env:GITHUB_SERVER)/$($env:SOURCE_REPOSITORY)/actions/runs/$($env:WORKFLOW_RUN_ID)" `
+            --application-signing-request-id "$($env:APPLICATION_SIGNING_REQUEST_ID)" `
+            --installer-signing-request-id "$($env:INSTALLER_SIGNING_REQUEST_ID)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signed Windows installer verification failed"
+          }
+
+      - name: Generate signed-installer checksum and update manifest
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
+        run: |
           $installer = "Catalyst-Setup-$($env:RELEASE_REF).exe"
           $digest = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
           "$digest  $installer" | Set-Content "${installer}.sha256" -NoNewline
-          # Sign a public update manifest. The private key is only read from
-          # the Actions secret; CATalyst ships the matching public key.
           if (-not $env:CATALYST_UPDATE_SIGNING_KEY_B64) {
             throw "CATALYST_UPDATE_SIGNING_KEY_B64 secret is required for signed updates"
           }
@@ -145,15 +291,16 @@ jobs:
             --out-signature latest.json.sig
           Copy-Item latest.json "update-manifest-$($env:RELEASE_REF).json"
           Copy-Item latest.json.sig "update-manifest-$($env:RELEASE_REF).json.sig"
-        shell: pwsh
 
-      - name: Smoke test Windows installer payload
+      - name: Smoke test signed Windows installer payload
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
           RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           $installer = Resolve-Path "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signedBundleExe = Resolve-Path "dist/Catalyst/Catalyst.exe"
           $installDir = Join-Path $env:RUNNER_TEMP "CatalystInstall"
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
@@ -169,10 +316,48 @@ jobs:
             throw "Installer exited with code $($install.ExitCode)"
           }
 
-          python scripts/packaged_api_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
+          $cleanInstalledExe = Join-Path $installDir "Catalyst.exe"
+          Write-Host "Verify clean installed CATalyst signature and hash"
+          python scripts/verify_windows_authenticode.py `
+            --file "$cleanInstalledExe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Clean installed CATalyst signature verification failed"
+          }
+          $signedBundleHash = (Get-FileHash -LiteralPath $signedBundleExe -Algorithm SHA256).Hash
+          $cleanInstalledHash = (Get-FileHash -LiteralPath $cleanInstalledExe -Algorithm SHA256).Hash
+          if ($cleanInstalledHash -ne $signedBundleHash) {
+            throw "installed Catalyst.exe hash does not match signed bundle during clean install"
+          }
+
+          $defenderCandidates = @(
+            (Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe")
+          )
+          $platformRoot = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform"
+          if (Test-Path -LiteralPath $platformRoot) {
+            $defenderCandidates += Get-ChildItem -LiteralPath $platformRoot -Directory |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          }
+          $defender = $defenderCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $defender) {
+            throw "Defender scan failed: MpCmdRun.exe is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installer with code $LASTEXITCODE"
+          }
+          & $defender -Scan -ScanType 3 -File $cleanInstalledExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installed application with code $LASTEXITCODE"
+          }
+
+          python scripts/packaged_api_smoke.py --exe $cleanInstalledExe
 
           Write-Host "Smoke test Windows clean desktop first launch"
-          python scripts/packaged_desktop_first_launch_smoke.py --exe (Join-Path $installDir "Catalyst.exe")
+          python scripts/packaged_desktop_first_launch_smoke.py --exe $cleanInstalledExe
 
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (Test-Path $uninstaller) {
@@ -217,6 +402,22 @@ jobs:
           $installedVersion = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion
           if ($installedVersion -ne $expectedVersion) {
             throw "Existing-install upgrade left version $installedVersion; expected $expectedVersion"
+          }
+
+          Write-Host "Verify upgraded CATalyst signature and hash"
+          python scripts/verify_windows_authenticode.py `
+            --file "$installedExe" `
+            --expected-version "$($env:RELEASE_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Upgraded CATalyst signature verification failed"
+          }
+          $upgradedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
+          if ($upgradedHash -ne $signedBundleHash) {
+            throw "installed Catalyst.exe hash does not match signed bundle during upgrade"
+          }
+          & $defender -Scan -ScanType 3 -File $installedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Defender scan failed for installed application with code $LASTEXITCODE"
           }
 
           $shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\CATalyst.lnk"
@@ -337,7 +538,7 @@ jobs:
           echo "Failed to upload Linux packages to $RELEASE_REF"
           exit 1
 
-      - name: Upload Windows Installer to Release
+      - name: Upload signed Windows installer to Release
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -358,6 +559,7 @@ jobs:
           $assets = @(
             "Catalyst-Setup-$($env:RELEASE_REF).exe",
             "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256",
+            "windows-signature-$($env:RELEASE_REF).json",
             "latest.json",
             "latest.json.sig",
             "update-manifest-$($env:RELEASE_REF).json",
@@ -373,7 +575,7 @@ jobs:
           }
           throw "Failed to upload Windows installer assets to $($env:RELEASE_REF)"
 
-      - name: Publish public update channel
+      - name: Publish verified public update channel
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -382,12 +584,12 @@ jobs:
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
           if (-not $env:GH_TOKEN) {
-            Write-Warning "CATALYST_RELEASE_CHANNEL_TOKEN is not configured; skipping public update channel publish."
-            exit 0
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
           }
           $assets = @(
             "Catalyst-Setup-$($env:RELEASE_REF).exe",
             "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256",
+            "windows-signature-$($env:RELEASE_REF).json",
             "latest.json",
             "latest.json.sig",
             "update-manifest-$($env:RELEASE_REF).json",
