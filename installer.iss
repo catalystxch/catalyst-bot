@@ -7,10 +7,10 @@
 ;
 ; Inno Setup download: https://jrsoftware.org/isinfo.php
 ;
-; After Inno produces Output\Catalyst-Setup-X.Y.Z.exe,
-; SIGN that installer with the same code-signing cert used for
-; Catalyst.exe and splash.exe (see docs\PUBLIC_RELEASE_CHECKLIST.md). Users run
-; the installer first, so SmartScreen checks its signature.
+; The release workflow signs CATalyst-owned Catalyst.exe first, builds this
+; installer from that signed bundle, then signs the final installer. Do not
+; sign upstream splash.exe with the CATalyst certificate. Users run the
+; installer first, so Windows checks its signature before the payload.
 ; ============================================================
 
 #ifndef MyAppName
