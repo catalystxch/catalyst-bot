@@ -500,11 +500,11 @@ Standalone live-wallet scripts are excluded by `tests/conftest.py` and the expli
 
 ## Code signing policy and privacy
 
-Windows releases use a fail-closed SignPath release pipeline: the CATalyst-owned executable and final installer are independently verified before publication, and no unsigned Windows fallback is published.
+CATalyst's preferred Windows release path uses a fail-closed SignPath pipeline. While public code signing is unavailable, the website may offer a clearly labelled unsigned beta from the official GitHub release repository with its exact SHA-256 checksum and SmartScreen guidance; invalid signing evidence still fails closed.
 
 - [Code signing policy](docs/CODE_SIGNING_POLICY.md)
 - [Privacy policy](docs/PRIVACY.md)
-- Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+- Preferred future signing option: [SignPath.io](https://about.signpath.io/) with a certificate from [SignPath Foundation](https://signpath.org/). The current public Windows beta is unsigned.
 
 ---
 
