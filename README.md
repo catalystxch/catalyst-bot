@@ -504,7 +504,7 @@ CATalyst's preferred Windows release path uses a fail-closed SignPath pipeline. 
 
 - [Code signing policy](docs/CODE_SIGNING_POLICY.md)
 - [Privacy policy](docs/PRIVACY.md)
-- Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+- Preferred future signing option: [SignPath.io](https://about.signpath.io/) with a certificate from [SignPath Foundation](https://signpath.org/). The current public Windows beta is unsigned.
 
 ---
 
