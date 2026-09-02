@@ -13,7 +13,7 @@ The release workflow may sign only artifacts built from CATalyst source and buil
 
 The installer can contain unsigned upstream open-source components. CATalyst's certificate must not be applied to those components. In particular, the optional upstream `splash.exe` binary from the Dexie Splash project is not a CATalyst-built binary and is never signed with CATalyst's SignPath entitlement.
 
-The GitHub Actions release workflow uploads each CATalyst-owned artifact to SignPath directly from a GitHub-hosted runner. SignPath verifies its build origin. The workflow verifies the returned Authenticode publisher, timestamp, product, version, and Windows policy before packaging or publication. Checksums and updater manifests are generated only from the final signed installer bytes.
+The GitHub Actions signed-release workflow uploads each CATalyst-owned artifact to SignPath directly from a GitHub-hosted runner. SignPath verifies its build origin. The workflow verifies the returned Authenticode publisher, timestamp, product, version, and Windows policy before packaging or publication. In that signed-release workflow, checksums and updater manifests are generated only from the final signed installer bytes.
 
 ## Unsigned beta artifacts
 
