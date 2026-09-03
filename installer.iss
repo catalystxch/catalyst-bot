@@ -63,11 +63,11 @@ PrivilegesRequiredOverridesAllowed=commandline
 
 OutputBaseFilename=Catalyst-Setup-{#MyAppVersion}
 OutputDir=Output
-Compression=lzma2/ultra
-; Defender engine 1.1.26080.3 with definitions 1.459.28.0 classified the
-; v1.3.17 installer built with SolidCompression=yes as
-; Trojan:Win32/Wacatac.B!ml. The exact payload passed with
-; SolidCompression=no, so keep this directive explicit.
+Compression=zip
+; Defender engine 1.1.26080.3 with definitions 1.459.28.0 quarantined the
+; non-solid LZMA2 v1.3.18 installer only on a real browser download. The same
+; payload rebuilt with non-solid ZIP compression downloaded with a ZoneId=3
+; Internet-origin marker and scanned clean, so keep both directives explicit.
 SolidCompression=no
 WizardStyle=modern
 SetupLogging=yes
