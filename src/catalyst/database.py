@@ -28601,9 +28601,10 @@ def suppress_orphaned_dispatched_publications_at_startup(
                     ):
                         continue
                     error_evidence = json.loads(canonical_error)
-                    if (
-                        error_evidence.get("provider") != publisher
-                        or error_evidence.get("request_sha256") != request_sha256
+                    if not _publication_error_matches_dispatch(
+                        error_evidence,
+                        publisher=publisher,
+                        request_sha256=request_sha256,
                     ):
                         continue
             except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
@@ -28701,6 +28702,21 @@ def _unresolve_publication_candidate(
         raise RuntimeError("publication candidate changed during validation")
 
 
+def _publication_error_matches_dispatch(
+    error_evidence: Dict[str, Any], *, publisher: str, request_sha256: str
+) -> bool:
+    """Accept current linked evidence or the one exact legacy dispatch shape."""
+
+    if error_evidence.get("request_sha256") != request_sha256:
+        return False
+    if error_evidence.get("provider") == publisher:
+        return True
+    return (
+        set(error_evidence) == {"code", "request_sha256"}
+        and error_evidence.get("code") == "POSSIBLE_PRIOR_DISPATCH_WITHOUT_OBSERVATION"
+    )
+
+
 def claim_publication_outbox(
     *,
     publisher: str,
@@ -28762,7 +28778,10 @@ def claim_publication_outbox(
                 current,
                 code="POSSIBLE_PRIOR_DISPATCH_WITHOUT_OBSERVATION",
                 observed_at=at,
-                evidence={"request_sha256": current.get("request_sha256")},
+                evidence={
+                    "provider": safe_publisher,
+                    "request_sha256": current.get("request_sha256"),
+                },
             )
             conn.commit()
             return None
@@ -29367,8 +29386,11 @@ def recover_publication_outbox_from_provider_readback(
                     or canonical_error != error_text
                     or hashlib.sha256(error_text.encode("utf-8")).hexdigest()
                     != error_sha256
-                    or error_evidence.get("provider") != safe_provider
-                    or error_evidence.get("request_sha256") != request_sha256
+                    or not _publication_error_matches_dispatch(
+                        error_evidence,
+                        publisher=safe_provider,
+                        request_sha256=request_sha256,
+                    )
                 ):
                     raise ValueError("publication error evidence is not linked")
             payload_text = _canonical_json_text(

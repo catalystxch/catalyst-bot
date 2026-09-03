@@ -133,19 +133,11 @@ def _seed_upgrade_interrupted_claims(data_dir: Path) -> tuple[object, str, str]:
         owner_host=socket.gethostname(),
         wallet_fingerprint_hash=hashlib.sha256(b"fingerprint:123456789").hexdigest(),
         network="mainnet",
-        lease_expires_at=_timestamp(now + timedelta(minutes=5)),
+        lease_expires_at=_timestamp(now + timedelta(seconds=6)),
         now=_timestamp(now),
     )
     if stale_lease.get("acquired") is not True:
         raise SmokeFailure("packaged upgrade stale runtime lease was not seeded")
-    expired_at = _timestamp(now - timedelta(seconds=1))
-    conn = database.get_connection()
-    conn.execute(
-        "UPDATE runtime_mutation_lease SET expires_at=?, heartbeat_at=?, updated_at=? "
-        "WHERE singleton_id=1",
-        (expired_at, expired_at, expired_at),
-    )
-    conn.commit()
     database.close_connection()
     return (
         database,

@@ -6434,8 +6434,6 @@ def test_desktop_retries_startup_after_exact_coin_prep_recovery(
 
 
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
-    import mutation_gate
-
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     lease = {
         "active": 1,
@@ -6472,6 +6470,63 @@ def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
             },
         ),
     ]
+
+
+def test_desktop_waits_for_brief_dead_owner_lease_then_retires_it(monkeypatch):
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    lease = {
+        "active": 1,
+        "lease_version": 19,
+        "owner_run_id": "killed-updater-owner",
+        "owner_pid": 2147483647,
+        "owner_host": socket.gethostname(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(milliseconds=50))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+    }
+    calls = []
+    retire_results = iter(
+        [
+            {"retired": False, "reason": "lease_not_expired", "lease": dict(lease)},
+            {"retired": True, "reason": "expired_dead_owner", "lease": dict(lease)},
+        ]
+    )
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: dict(lease))
+    monkeypatch.setattr(
+        mutation_gate,
+        "pid_liveness",
+        lambda pid, host: calls.append(("liveness", pid, host)) or False,
+    )
+    monkeypatch.setattr(
+        database,
+        "retire_expired_dead_runtime_lease_at_startup",
+        lambda **kwargs: calls.append(("retire", kwargs)) or next(retire_results),
+    )
+    monkeypatch.setattr(
+        desktop_app.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+
+    result = desktop_app._retire_expired_dead_startup_lease()
+
+    assert result["retired"] is True
+    assert [event[0] for event in calls] == [
+        "liveness",
+        "retire",
+        "sleep",
+        "liveness",
+        "retire",
+    ]
+    assert 0 < calls[2][1] <= desktop_app._STARTUP_DEAD_LEASE_MAX_WAIT_SECONDS
+    assert (
+        calls[1][1]
+        == calls[4][1]
+        == {
+            "expected_lease_version": 19,
+            "prior_owner_liveness_proven_dead": True,
+        }
+    )
 
 
 def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
@@ -7174,6 +7229,65 @@ def test_diagnostics_preflight_fails_closed_if_checkpoint_races_snapshot_copy(
 
     assert read_only_diagnostics.preflight_requires_diagnostics(path) is True
     assert checkpointed == [True]
+
+
+def test_diagnostics_preflight_allows_brief_dead_owner_lease_to_reach_recovery(
+    isolated_gate_database, monkeypatch
+):
+    path, clock = isolated_gate_database
+    import read_only_diagnostics
+
+    expires_at = (
+        (datetime.now(timezone.utc) + timedelta(seconds=5))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="upgrade-hard-killed-owner",
+        owner_pid=2147483647,
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_expires_at=expires_at,
+        now=clock(),
+        expected_lease_version=0,
+    )
+    assert acquired["acquired"] is True
+    database.close_connection()
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "_pid_liveness",
+        lambda pid, host: False,
+    )
+
+    assert read_only_diagnostics.preflight_requires_diagnostics(path) is False
+
+
+def test_diagnostics_preflight_keeps_long_dead_owner_lease_fail_closed(
+    isolated_gate_database, monkeypatch
+):
+    path, clock = isolated_gate_database
+    import read_only_diagnostics
+
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="unexpected-long-lease-owner",
+        owner_pid=2147483647,
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+        now=clock(),
+        expected_lease_version=0,
+    )
+    assert acquired["acquired"] is True
+    database.close_connection()
+    monkeypatch.setattr(
+        read_only_diagnostics,
+        "_pid_liveness",
+        lambda pid, host: False,
+    )
+
+    assert read_only_diagnostics.preflight_requires_diagnostics(path) is True
 
 
 def test_diagnostics_preflight_allows_valid_legacy_database_migration(tmp_path: Path):

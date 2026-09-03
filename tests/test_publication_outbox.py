@@ -1308,7 +1308,7 @@ def test_upgrade_restart_suppresses_orphaned_dispatched_publication_without_redi
         dispatched_at=WITHIN_LEASE,
     )
     if orphaned_state == "unresolved":
-        orphaned = isolated_database.unresolve_publication_outbox(
+        isolated_database.unresolve_publication_outbox(
             publication_id=dispatched["publication_id"],
             owner_run_id=dispatched["claim_owner_run_id"],
             claim_token=dispatched["claim_token"],
@@ -1322,7 +1322,7 @@ def test_upgrade_restart_suppresses_orphaned_dispatched_publication_without_redi
             unresolved_at=WITHIN_LEASE,
         )
     else:
-        orphaned = dispatched
+        assert dispatched["state"] == "claimed"
 
     assert isolated_database.get_stability_startup_recovery_snapshot()[
         "publication_issues"
@@ -1371,6 +1371,113 @@ def test_upgrade_restart_suppresses_orphaned_dispatched_publication_without_redi
             network="mainnet",
             queued_at=AFTER_LEASE,
         )
+
+
+def test_expired_dispatched_claim_records_provider_and_can_be_suppressed(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("expired-dispatch-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+
+    assert (
+        isolated_database.claim_publication_outbox(
+            publisher="dexie",
+            owner_run_id="replacement-worker",
+            claim_token="replacement-claim",
+            claimed_at=AFTER_LEASE,
+            claim_expires_at="2026-08-15T12:01:00.000000Z",
+        )
+        is None
+    )
+    unresolved = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert unresolved["state"] == "unresolved"
+    assert json.loads(unresolved["last_error_json"]) == {
+        "code": "POSSIBLE_PRIOR_DISPATCH_WITHOUT_OBSERVATION",
+        "provider": "dexie",
+        "request_sha256": dispatched["request_sha256"],
+    }
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at="2026-08-15T12:00:32.000000Z"
+    )
+
+    assert result == {"examined": 1, "suppressed": 1, "remaining": 0}
+
+
+@pytest.mark.parametrize("recovery", ["readback", "suppression"])
+def test_exact_legacy_expired_dispatch_evidence_remains_recoverable(
+    isolated_database, recovery
+):
+    intent, trade_id, _fingerprint = _prepare_claimable(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("legacy-expired-dispatch-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    assert (
+        isolated_database.claim_publication_outbox(
+            publisher="dexie",
+            owner_run_id="replacement-worker",
+            claim_token="replacement-claim",
+            claimed_at=AFTER_LEASE,
+            claim_expires_at="2026-08-15T12:01:00.000000Z",
+        )
+        is None
+    )
+    legacy_error = json.dumps(
+        {
+            "code": "POSSIBLE_PRIOR_DISPATCH_WITHOUT_OBSERVATION",
+            "request_sha256": dispatched["request_sha256"],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET last_error_json=?, last_error_sha256=? "
+        "WHERE publication_id=?",
+        (
+            legacy_error,
+            hashlib.sha256(legacy_error.encode("utf-8")).hexdigest(),
+            claim["publication_id"],
+        ),
+    )
+    conn.commit()
+    unresolved = isolated_database.get_publication_outbox(claim["publication_id"])
+
+    if recovery == "readback":
+        recovered = isolated_database.recover_publication_outbox_from_provider_readback(
+            publication_id=unresolved["publication_id"],
+            expected_row_version=unresolved["row_version"],
+            provider="dexie",
+            provider_response_id="dexie-legacy-recovery",
+            observed_trade_id=trade_id,
+            observed_offer_bech32=offer_text,
+            provider_status=0,
+            observed_at="2026-08-15T12:00:32.000000Z",
+        )
+        assert recovered["state"] == "succeeded"
+    else:
+        result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+            recovered_at="2026-08-15T12:00:32.000000Z"
+        )
+        assert result == {"examined": 1, "suppressed": 1, "remaining": 0}
 
 
 def test_upgrade_restart_keeps_ambiguous_publication_when_owner_is_active(
