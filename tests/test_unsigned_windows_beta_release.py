@@ -77,6 +77,10 @@ def test_unsigned_beta_keeps_signed_updater_metadata_without_fake_signature_evid
     )
     assert "scripts/sign_update_manifest.py" in metadata["run"]
     assert "latest.json.sig" in metadata["run"]
+    assert "release_notes_unsigned_beta.md" in metadata["run"]
+    assert "unsigned Windows beta" in metadata["run"]
+    assert "SmartScreen" in metadata["run"]
+    assert "--release-notes-file release_notes_unsigned_beta.md" in metadata["run"]
 
     publication = named_step("Publish unsigned beta update channel")
     assert publication["env"]["GH_TOKEN"] == (
@@ -89,6 +93,21 @@ def test_unsigned_beta_keeps_signed_updater_metadata_without_fake_signature_evid
     assert "update-manifest-$($env:RELEASE_REF).json" in script
     assert "windows-signature" not in script
     assert "unsigned Windows beta" in script
+
+
+def test_publication_is_immutable_and_staged_before_becoming_latest():
+    script = named_step("Publish unsigned beta update channel")["run"]
+    assert "Release channel tag already exists" in script
+    assert "--clobber" not in script
+    assert "--draft" in script
+    assert "gh release upload" in script
+    assert "--draft=false" in script
+
+    existing_check = script.index("gh release view")
+    draft_create = script.index("gh release create")
+    upload = script.index("gh release upload")
+    publish = script.index("--draft=false")
+    assert existing_check < draft_create < upload < publish
 
 
 def test_release_tag_is_validated_as_an_immutable_main_ancestor():

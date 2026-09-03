@@ -187,6 +187,16 @@ jobs:
             release_notes.md `
             release_notes_sanitized.md `
             --private-repo $env:SOURCE_REPOSITORY
+          $sourceNotes = Get-Content -Raw -LiteralPath release_notes_sanitized.md
+          $warning = @"
+          ## Windows unsigned beta
+
+          This update installs an intentionally unsigned Windows beta. Microsoft SmartScreen may show the normal blue warning. Verify the SHA-256 sidecar before choosing More info and Run anyway.
+
+          The installer has no Authenticode publisher signature; only this update manifest is cryptographically signed.
+          "@
+          "$warning`r`n`r`n$sourceNotes" |
+            Set-Content -Encoding utf8 release_notes_unsigned_beta.md
           $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
           $sidecar = "$installer.sha256"
           python scripts/sign_update_manifest.py `
@@ -195,7 +205,7 @@ jobs:
             --sha256-file $sidecar `
             --download-base-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/download/$($env:RELEASE_REF)" `
             --release-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tag/$($env:RELEASE_REF)" `
-            --release-notes-file release_notes_sanitized.md `
+            --release-notes-file release_notes_unsigned_beta.md `
             --out-manifest latest.json `
             --out-signature latest.json.sig
           if ($LASTEXITCODE -ne 0) {
@@ -223,32 +233,27 @@ jobs:
             "update-manifest-$($env:RELEASE_REF).json",
             "update-manifest-$($env:RELEASE_REF).json.sig"
           )
-          $notes = @"
-          ## Windows unsigned beta
-
-          This is the official CATalyst $($env:RELEASE_REF) unsigned Windows beta. Microsoft SmartScreen may show the normal blue warning. Verify the SHA-256 sidecar before choosing More info and Run anyway.
-
-          The executable is intentionally unsigned; the in-app update manifest remains cryptographically signed.
-          "@
-          $notes | Set-Content -Encoding utf8 release_channel_notes.md
           gh release view $env:RELEASE_REF --repo $env:RELEASE_CHANNEL_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_REF @assets `
-              --repo $env:RELEASE_CHANNEL_REPOSITORY `
-              --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Release asset upload failed" }
-            gh release edit $env:RELEASE_REF `
-              --repo $env:RELEASE_CHANNEL_REPOSITORY `
-              --notes-file release_channel_notes.md `
-              --draft=false `
-              --latest
-          } else {
-            gh release create $env:RELEASE_REF @assets `
-              --repo $env:RELEASE_CHANNEL_REPOSITORY `
-              --title "CATalyst $($env:RELEASE_REF)" `
-              --notes-file release_channel_notes.md `
-              --latest
+            throw "Release channel tag already exists; unsigned beta releases are immutable"
           }
+          gh release create $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --title "CATalyst $($env:RELEASE_REF)" `
+            --notes-file release_notes_unsigned_beta.md `
+            --draft
           if ($LASTEXITCODE -ne 0) {
-            throw "Unsigned Windows beta publication failed"
+            throw "Unable to create staged unsigned Windows beta release"
+          }
+          gh release upload $env:RELEASE_REF @assets `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unsigned Windows beta asset upload failed; the release remains a draft"
+          }
+          gh release edit $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --draft=false `
+            --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unsigned Windows beta publication failed; the release remains a draft"
           }
