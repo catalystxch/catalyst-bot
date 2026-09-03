@@ -59,10 +59,11 @@ def test_windows_installer_update_contract_is_fail_closed():
     assert "RaiseException" in installer
 
 
-def test_windows_installer_avoids_defender_solid_archive_false_positive():
+def test_windows_installer_uses_public_download_defender_safe_archive_layout():
     installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
 
-    assert re.search(r"(?m)^\s*Compression\s*=\s*lzma2/ultra\s*$", installer)
+    assert re.search(r"(?m)^\s*Compression\s*=\s*zip\s*$", installer)
+    assert not re.search(r"(?m)^\s*Compression\s*=\s*lzma2(?:/\w+)?\s*$", installer)
     assert re.search(r"(?m)^\s*SolidCompression\s*=\s*no\s*$", installer)
     assert not re.search(r"(?m)^\s*SolidCompression\s*=\s*yes\s*$", installer)
 
