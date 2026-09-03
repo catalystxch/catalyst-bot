@@ -1,0 +1,254 @@
+name: Publish unsigned Windows beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Public catalystxch/catalyst-bot release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-unsigned-windows-beta
+  cancel-in-progress: false
+
+jobs:
+  publish-unsigned-windows-beta:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout trusted main release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Install release verification dependencies
+        shell: pwsh
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate release tag
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+        run: |
+          if ($env:RELEASE_REF -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tag must be vMAJOR.MINOR.PATCH"
+          }
+          git fetch --force origin main "refs/tags/$($env:RELEASE_REF):refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch refs/tags/$($env:RELEASE_REF)"
+          }
+          $tagCommit = (git rev-list -n 1 "refs/tags/$($env:RELEASE_REF)").Trim()
+          $mainCommit = (git rev-parse origin/main).Trim()
+          git merge-base --is-ancestor $tagCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw "$($env:RELEASE_REF) is not an ancestor of protected main"
+          }
+          $release = gh release view $env:RELEASE_REF `
+            --repo $env:SOURCE_REPOSITORY `
+            --json isDraft,tagName | ConvertFrom-Json
+          if ($release.isDraft -or $release.tagName -ne $env:RELEASE_REF) {
+            throw "$($env:RELEASE_REF) is not a matching public release"
+          }
+          "version=$($env:RELEASE_REF.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+
+      - name: Download official Windows release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          gh release download $env:RELEASE_REF `
+            --repo $env:SOURCE_REPOSITORY `
+            --pattern "Catalyst-Setup-$($env:RELEASE_REF).exe" `
+            --pattern "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256" `
+            --dir release
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download official Windows release assets"
+          }
+
+      - name: Prove installer identity and unsigned status
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $name = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $installer = Resolve-Path -LiteralPath "release/$name"
+          $sidecarPath = "release/$name.sha256"
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          $sidecar = (Get-Content -Raw -LiteralPath $sidecarPath).TrimEnd("`r", "`n")
+          if ($sidecar -cne "$digest  $name") {
+            throw "Installer SHA-256 sidecar does not match the downloaded bytes"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "NotSigned") {
+            throw "Unsigned beta path requires NotSigned status; found $($signature.Status)"
+          }
+          $version = (Get-Item -LiteralPath $installer).VersionInfo.ProductVersion.Trim()
+          if ($version -ne $env:RELEASE_VERSION) {
+            throw "Installer product version $version does not match $($env:RELEASE_VERSION)"
+          }
+          $defender = @(
+            (Join-Path $env:ProgramFiles "Windows Defender/MpCmdRun.exe")
+            Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $defender) {
+            throw "Microsoft Defender command-line scanner is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected the installer with exit code $LASTEXITCODE"
+          }
+
+      - name: Install and smoke test the downloaded release
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $installer = Resolve-Path -LiteralPath "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "CatalystUnsignedBeta"
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/NOICONS",
+            "/CURRENTUSER",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Installer exited with code $($install.ExitCode)"
+          }
+          $installedExe = Join-Path $installDir "Catalyst.exe"
+          $version = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion.Trim()
+          if ($version -ne $env:RELEASE_VERSION) {
+            throw "Installed product version $version does not match $($env:RELEASE_VERSION)"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installedExe
+          if ($signature.Status -ne "NotSigned") {
+            throw "Unsigned beta payload requires NotSigned status; found $($signature.Status)"
+          }
+          $defender = @(
+            (Join-Path $env:ProgramFiles "Windows Defender/MpCmdRun.exe")
+            Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName "MpCmdRun.exe" }
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $defender) {
+            throw "Microsoft Defender command-line scanner is unavailable"
+          }
+          & $defender -Scan -ScanType 3 -File $installedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected the installed app with exit code $LASTEXITCODE"
+          }
+          python scripts/packaged_sage_rpc_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged Sage RPC smoke failed" }
+          python scripts/packaged_api_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged API smoke failed" }
+          python scripts/packaged_desktop_first_launch_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged desktop smoke failed" }
+          python scripts/packaged_upgrade_publication_recovery_smoke.py --exe $installedExe
+          if ($LASTEXITCODE -ne 0) { throw "Packaged upgrade recovery smoke failed" }
+
+      - name: Generate signed update metadata
+        shell: pwsh
+        env:
+          CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CATALYST_UPDATE_SIGNING_KEY_B64)) {
+            throw "CATALYST_UPDATE_SIGNING_KEY_B64 is required"
+          }
+          gh release view $env:RELEASE_REF `
+            --repo $env:SOURCE_REPOSITORY `
+            --json body --jq .body | Set-Content -Encoding utf8 release_notes.md
+          python scripts/sanitize_release_notes.py `
+            release_notes.md `
+            release_notes_sanitized.md `
+            --private-repo $env:SOURCE_REPOSITORY
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $sidecar = "$installer.sha256"
+          python scripts/sign_update_manifest.py `
+            --version $env:RELEASE_REF `
+            --installer $installer `
+            --sha256-file $sidecar `
+            --download-base-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/download/$($env:RELEASE_REF)" `
+            --release-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tag/$($env:RELEASE_REF)" `
+            --release-notes-file release_notes_sanitized.md `
+            --out-manifest latest.json `
+            --out-signature latest.json.sig
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to sign the update manifest"
+          }
+          Copy-Item latest.json "update-manifest-$($env:RELEASE_REF).json"
+          Copy-Item latest.json.sig "update-manifest-$($env:RELEASE_REF).json.sig"
+
+      - name: Publish unsigned beta update channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $assets = @(
+            $installer,
+            "$installer.sha256",
+            "latest.json",
+            "latest.json.sig",
+            "update-manifest-$($env:RELEASE_REF).json",
+            "update-manifest-$($env:RELEASE_REF).json.sig"
+          )
+          $notes = @"
+          ## Windows unsigned beta
+
+          This is the official CATalyst $($env:RELEASE_REF) unsigned Windows beta. Microsoft SmartScreen may show the normal blue warning. Verify the SHA-256 sidecar before choosing More info and Run anyway.
+
+          The executable is intentionally unsigned; the in-app update manifest remains cryptographically signed.
+          "@
+          $notes | Set-Content -Encoding utf8 release_channel_notes.md
+          gh release view $env:RELEASE_REF --repo $env:RELEASE_CHANNEL_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_REF @assets `
+              --repo $env:RELEASE_CHANNEL_REPOSITORY `
+              --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Release asset upload failed" }
+            gh release edit $env:RELEASE_REF `
+              --repo $env:RELEASE_CHANNEL_REPOSITORY `
+              --notes-file release_channel_notes.md `
+              --draft=false `
+              --latest
+          } else {
+            gh release create $env:RELEASE_REF @assets `
+              --repo $env:RELEASE_CHANNEL_REPOSITORY `
+              --title "CATalyst $($env:RELEASE_REF)" `
+              --notes-file release_channel_notes.md `
+              --latest
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unsigned Windows beta publication failed"
+          }
