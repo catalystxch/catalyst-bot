@@ -1164,6 +1164,53 @@ def test_startup_recovers_unresolved_dexie_dispatch_from_exact_active_offer(
     )
 
 
+def test_startup_readback_checks_unexpired_claim_after_owner_is_absent(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_claimable(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    claim = _claim(isolated_database)
+    isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("request-contract"),
+        dispatched_at=WITHIN_LEASE,
+    )
+
+    def exact_orderbook(_url, **_kwargs):
+        return _TransportResponse(
+            200,
+            {
+                "count": 1,
+                "page": 1,
+                "page_size": 100,
+                "offers": [
+                    {
+                        "id": "dexie-readback-unexpired",
+                        "status": 0,
+                        "trade_id": f"0x{trade_id}",
+                        "offer": offer_text,
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(dexie_manager.requests, "get", exact_orderbook)
+    result = dexie_manager.recover_expired_dexie_publications_at_startup(
+        now_provider=lambda: WITHIN_LEASE
+    )
+
+    assert result == {"checked": 1, "recovered": 1, "remaining": 0}
+    recovered = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert recovered["state"] == "succeeded"
+    assert isolated_database.get_offer(trade_id)["dexie_id"] == (
+        "dexie-readback-unexpired"
+    )
+
+
 @pytest.mark.parametrize("publisher", ["dexie", "splash"])
 def test_upgrade_restart_recovers_undispatched_publication_claim_without_active_owner(
     isolated_database, publisher
@@ -1361,6 +1408,91 @@ def test_upgrade_restart_keeps_ambiguous_publication_when_owner_is_active(
     )
 
 
+def test_upgrade_restart_suppresses_orphaned_dispatch_after_dead_lease_proof(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    lease_result = isolated_database.acquire_runtime_mutation_lease(
+        owner_run_id="upgrade-killed-owner",
+        owner_pid=2147483647,
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        lease_expires_at="2099-01-01T00:05:00.000000Z",
+        now=AT,
+    )
+    assert lease_result["acquired"] is True
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE runtime_mutation_lease SET expires_at=?, heartbeat_at=?, updated_at=? "
+        "WHERE singleton_id=1",
+        (LEASE_END, LEASE_END, LEASE_END),
+    )
+    conn.commit()
+    lease = isolated_database.get_runtime_mutation_lease()
+
+    retired = isolated_database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=AFTER_LEASE,
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=True,
+    )
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert retired["retired"] is True
+    assert result == {"examined": 1, "suppressed": 1, "remaining": 0}
+    recovered = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert recovered["state"] == "suppressed"
+    retained_lease = isolated_database.get_runtime_mutation_lease()
+    assert retained_lease["active"] == 0
+    assert retained_lease["owner_run_id"] == "upgrade-killed-owner"
+    assert retained_lease["lease_version"] == lease["lease_version"] + 1
+
+
+def test_upgrade_restart_does_not_retire_stale_lease_without_dead_owner_proof(
+    isolated_database,
+):
+    lease_result = isolated_database.acquire_runtime_mutation_lease(
+        owner_run_id="possibly-live-owner",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        lease_expires_at="2099-01-01T00:05:00.000000Z",
+        now=AT,
+    )
+    assert lease_result["acquired"] is True
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE runtime_mutation_lease SET expires_at=?, heartbeat_at=?, updated_at=? "
+        "WHERE singleton_id=1",
+        (LEASE_END, LEASE_END, LEASE_END),
+    )
+    conn.commit()
+    lease = isolated_database.get_runtime_mutation_lease()
+
+    retained = isolated_database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=AFTER_LEASE,
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+    )
+
+    assert retained["retired"] is False
+    assert retained["reason"] == "prior_owner_liveness_unproven"
+    assert isolated_database.get_runtime_mutation_lease()["active"] == 1
+
+
 def test_upgrade_restart_keeps_unresolved_row_without_dispatch_evidence_fail_closed(
     isolated_database,
 ):
@@ -1392,6 +1524,8 @@ def test_upgrade_restart_keeps_unresolved_row_without_dispatch_evidence_fail_clo
         ("request_sha256", "A" * 64),
         ("payload_sha256", "0" * 64),
         ("recovery_generation", 99),
+        ("updated_at", "2026-08-15T13:00:20.000000+01:00"),
+        ("claim_expires_at", "2026-08-15T13:00:30.000000+01:00"),
     ],
 )
 def test_upgrade_restart_keeps_malformed_dispatched_publication_fail_closed(
@@ -1424,6 +1558,138 @@ def test_upgrade_restart_keeps_malformed_dispatched_publication_fail_closed(
     assert (
         isolated_database.get_publication_outbox(claim["publication_id"]) == malformed
     )
+
+
+@pytest.mark.parametrize(
+    "malformed_error",
+    [
+        {
+            "code": "AMBIGUOUS_TRANSPORT_FAILURE",
+            "provider": "splash",
+            "request_sha256": _sha("upgrade-restart-request"),
+        },
+        {
+            "code": "AMBIGUOUS_TRANSPORT_FAILURE",
+            "provider": "dexie",
+            "request_sha256": _sha("different-request"),
+        },
+    ],
+)
+def test_upgrade_restart_keeps_unlinked_unresolved_error_evidence_fail_closed(
+    isolated_database, malformed_error
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    unresolved = isolated_database.unresolve_publication_outbox(
+        publication_id=dispatched["publication_id"],
+        owner_run_id=dispatched["claim_owner_run_id"],
+        claim_token=dispatched["claim_token"],
+        claim_generation=dispatched["claim_generation"],
+        expected_row_version=dispatched["row_version"],
+        error_json={
+            "code": "AMBIGUOUS_TRANSPORT_FAILURE",
+            "provider": "dexie",
+            "request_sha256": dispatched["request_sha256"],
+        },
+        unresolved_at=WITHIN_LEASE,
+    )
+    error_text = json.dumps(
+        malformed_error, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET last_error_json=?, last_error_sha256=? "
+        "WHERE publication_id=?",
+        (
+            error_text,
+            hashlib.sha256(error_text.encode("utf-8")).hexdigest(),
+            claim["publication_id"],
+        ),
+    )
+    conn.commit()
+    malformed = isolated_database.get_publication_outbox(claim["publication_id"])
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert result == {"examined": 1, "suppressed": 0, "remaining": 1}
+    assert malformed["state"] == unresolved["state"] == "unresolved"
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"]) == malformed
+    )
+
+
+def test_startup_repost_skips_suppressed_offer_and_continues_batch(
+    monkeypatch,
+):
+    suppressed_error = getattr(database, "PublicationSuppressedError", ValueError)
+
+    class RepostDexie:
+        def __init__(self):
+            self.calls = []
+            self.flushes = 0
+
+        def queue_post(self, _offer, trade_id, force=False):
+            self.calls.append((trade_id, force))
+            if trade_id == "suppressed-trade":
+                raise suppressed_error("suppressed publication history blocks new work")
+
+        def flush_queue(self, flush_all=False):
+            self.flushes += int(flush_all)
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop.dexie_manager = RepostDexie()
+    loop.splash_manager = object()
+    events = []
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "suppressed-trade",
+                "offer_bech32": "offer1suppressed",
+                "dexie_id": None,
+                "side": "buy",
+            },
+            {
+                "trade_id": "ordinary-trade",
+                "offer_bech32": "offer1ordinary",
+                "dexie_id": None,
+                "side": "sell",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event, message, data=None: events.append(
+            (level, event, message, data)
+        ),
+    )
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+
+    assert loop.dexie_manager.calls == [
+        ("suppressed-trade", True),
+        ("ordinary-trade", True),
+    ]
+    assert loop.dexie_manager.flushes == 1
+    assert any(event == "dexie_repost_quarantined" for _, event, _, _ in events)
+    assert not any(event == "dexie_repost_failed" for _, event, _, _ in events)
 
 
 @pytest.mark.parametrize(

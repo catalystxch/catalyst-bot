@@ -81,16 +81,16 @@ def recover_expired_dexie_publications_at_startup(
         ):
             continue
         if row.get("state") == "claimed":
-            try:
-                expiry = datetime.fromisoformat(
-                    str(row["claim_expires_at"]).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError):
-                continue
             if (
-                expiry.tzinfo is None
-                or expiry.utcoffset() is None
-                or expiry >= observed_dt
+                any(
+                    not row.get(field)
+                    for field in (
+                        "claim_owner_run_id",
+                        "claim_token",
+                        "claim_expires_at",
+                    )
+                )
+                or row.get("next_attempt_at") is not None
             ):
                 continue
         elif any(

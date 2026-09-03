@@ -1659,12 +1659,44 @@ def _run_coin_prep_worker_mode(worker_args):
         sys.argv = old_argv
 
 
+def _retire_expired_dead_startup_lease() -> dict:
+    """Retire a hard-killed predecessor only after decisive OS proof."""
+
+    from database import (
+        get_runtime_mutation_lease,
+        retire_expired_dead_runtime_lease_at_startup,
+    )
+    from mutation_gate import pid_liveness
+
+    lease = get_runtime_mutation_lease()
+    if not bool(lease.get("active")):
+        return {"retired": False, "reason": "lease_not_active", "lease": lease}
+    try:
+        prior_alive = pid_liveness(
+            int(lease.get("owner_pid") or 0),
+            str(lease.get("owner_host") or ""),
+        )
+    except Exception:
+        prior_alive = None
+    return retire_expired_dead_runtime_lease_at_startup(
+        expected_lease_version=int(lease.get("lease_version") or -1),
+        prior_owner_liveness_proven_dead=prior_alive is False,
+    )
+
+
 def _initialize_startup_ownership() -> dict:
     """Initialize storage, reconcile exact prep evidence, and acquire ownership."""
 
     from database import init_database
 
     init_database()
+    try:
+        _retire_expired_dead_startup_lease()
+    except Exception:
+        # A stale lease is retired only with exact expiry, version, owner, and
+        # dead-process proof. Any uncertainty remains visible to the normal
+        # fail-closed startup checks below.
+        pass
     import api_server
 
     authorization = api_server.initialize_mutation_runtime()

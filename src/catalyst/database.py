@@ -27531,6 +27531,125 @@ def release_runtime_mutation_lease(
         conn.close()
 
 
+def retire_expired_dead_runtime_lease_at_startup(
+    *,
+    expected_lease_version: int,
+    prior_owner_liveness_proven_dead: bool,
+    retired_at: Any = None,
+) -> Dict[str, Any]:
+    """Retire one expired predecessor lease after exact dead-process proof.
+
+    Hard termination can leave the durable lease marked active even though its
+    owner no longer exists. Startup recovery cannot safely mutate publication
+    or wallet journals while that stale bit remains set. This transition is
+    deliberately narrow: the safety latch must be resolved, the lease must be
+    expired, the caller must have decisive OS liveness evidence, and every
+    predecessor field is compare-and-set under the same write transaction.
+    """
+
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior_owner_liveness_proven_dead must be an exact bool")
+    at = _stability_timestamp_or_now(retired_at, "retired_at")
+    at_dt = _parse_iso_timestamp(at, "retired_at", require_timezone=True)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch = conn.execute(
+            "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if latch is None or lease_row is None:
+            raise RuntimeError("startup lease retirement authority is missing")
+        current = dict(lease_row)
+
+        def unchanged(reason: str) -> Dict[str, Any]:
+            conn.commit()
+            return {"retired": False, "reason": reason, "lease": current}
+
+        if prior_owner_liveness_proven_dead is not True:
+            return unchanged("prior_owner_liveness_unproven")
+        if latch["state"] != "resolved":
+            return unchanged("safety_latch_not_resolved")
+        if not bool(current.get("active")):
+            return unchanged("lease_not_active")
+        if int(current.get("lease_version") or -1) != version:
+            return unchanged("compare_and_set_failed")
+        try:
+            owner_run_id = _required_stability_text(
+                current.get("owner_run_id"), "lease owner_run_id"
+            )
+            owner_pid = _exact_integer(
+                current.get("owner_pid"), "lease owner_pid", minimum=1
+            )
+            owner_host = _required_stability_text(
+                current.get("owner_host"), "lease owner_host"
+            )
+            expiry = _stability_timestamp(current.get("expires_at"), "lease expires_at")
+            if expiry != current.get("expires_at"):
+                return unchanged("lease_expiry_not_canonical")
+            expiry_dt = _parse_iso_timestamp(
+                expiry, "lease expires_at", require_timezone=True
+            )
+        except (TypeError, ValueError):
+            return unchanged("lease_authority_malformed")
+        if expiry_dt > at_dt:
+            return unchanged("lease_not_expired")
+
+        cursor = conn.execute(
+            """
+            UPDATE runtime_mutation_lease
+            SET lease_version=lease_version+1, active=0, released_at=?,
+                expires_at=NULL, updated_at=?
+            WHERE singleton_id=1 AND active=1 AND lease_version=?
+              AND owner_run_id=? AND owner_pid=? AND owner_host=?
+              AND expires_at=?
+              AND (SELECT state FROM runtime_safety_latch
+                   WHERE singleton_id=1)='resolved'
+            """,
+            (
+                at,
+                at,
+                version,
+                owner_run_id,
+                owner_pid,
+                owner_host,
+                expiry,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return {
+                "retired": False,
+                "reason": "compare_and_set_failed",
+                "lease": get_runtime_mutation_lease(),
+            }
+        conn.execute(
+            """
+            UPDATE runtime_worker_delegations
+            SET state='revoked', revoked_at=?, updated_at=?
+            WHERE parent_run_id=? AND state='active'
+            """,
+            (at, at, owner_run_id),
+        )
+        retired = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        conn.commit()
+        return {"retired": True, "reason": "expired_dead_owner", "lease": retired}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def issue_worker_delegation(
     *,
     delegation_id: str,
@@ -27731,6 +27850,10 @@ def revoke_worker_delegation(
         raise
     finally:
         conn.close()
+
+
+class PublicationSuppressedError(ValueError):
+    """The exact offer is quarantined from any publication replay."""
 
 
 def enqueue_publication_outbox(
@@ -27960,7 +28083,9 @@ def enqueue_publication_for_trade(
         ):
             raise ValueError("possible dispatched publication history blocks new work")
         if any(row["state"] == "suppressed" for row in existing_rows):
-            raise ValueError("suppressed publication history blocks new work")
+            raise PublicationSuppressedError(
+                "suppressed publication history blocks new work"
+            )
         if not force:
             succeeded = next(
                 (row for row in existing_rows if row["state"] == "succeeded"),
@@ -28350,6 +28475,12 @@ def suppress_orphaned_dispatched_publications_at_startup(
                     row.get("dispatch_started_at"), "dispatch_started_at"
                 )
                 updated_at = _stability_timestamp(row.get("updated_at"), "updated_at")
+                if (
+                    queued_at != row.get("queued_at")
+                    or dispatched_at != row.get("dispatch_started_at")
+                    or updated_at != row.get("updated_at")
+                ):
+                    continue
                 queued_dt = _parse_iso_timestamp(
                     queued_at, "queued_at", require_timezone=True
                 )
@@ -28431,6 +28562,8 @@ def suppress_orphaned_dispatched_publications_at_startup(
                     claim_expiry = _stability_timestamp(
                         row.get("claim_expires_at"), "claim_expires_at"
                     )
+                    if claim_expiry != row.get("claim_expires_at"):
+                        continue
                     claim_expiry_dt = _parse_iso_timestamp(
                         claim_expiry, "claim_expires_at", require_timezone=True
                     )
@@ -28465,6 +28598,12 @@ def suppress_orphaned_dispatched_publications_at_startup(
                         or canonical_error != error_text
                         or hashlib.sha256(error_text.encode("utf-8")).hexdigest()
                         != error_sha256
+                    ):
+                        continue
+                    error_evidence = json.loads(canonical_error)
+                    if (
+                        error_evidence.get("provider") != publisher
+                        or error_evidence.get("request_sha256") != request_sha256
                     ):
                         continue
             except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
@@ -29051,10 +29190,14 @@ def recover_publication_outbox_from_provider_readback(
 
     This recovery is intentionally narrower than a normal acknowledgement:
     it only accepts an active Dexie row whose trade id and complete offer bytes
-    match the immutable local projection.  It also requires either an expired
-    claim or an already-unresolved record and an inactive mutation lease, so a
-    recovery process cannot race a live publisher.
+    match the immutable local projection. It requires an inactive mutation
+    lease, so a recovery process cannot race a live publisher. The short claim
+    TTL is not used as owner proof: once the singleton lease is safely absent,
+    even an unexpired process-local claim is orphaned and should be checked
+    before it can be terminally suppressed.
     """
+
+    from publication_outbox import canonical_publication_identity
 
     publication = _required_stability_text(publication_id, "publication_id")
     version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
@@ -29091,10 +29234,12 @@ def recover_publication_outbox_from_provider_readback(
             return None
         current = dict(row)
         state = current.get("state")
-        expired_claim = (
+        claimed_dispatch = (
             state == "claimed"
+            and bool(current.get("claim_owner_run_id"))
+            and bool(current.get("claim_token"))
             and bool(current.get("claim_expires_at"))
-            and current["claim_expires_at"] < observed
+            and current.get("next_attempt_at") is None
         )
         unresolved_dispatch = (
             state == "unresolved"
@@ -29104,7 +29249,7 @@ def recover_publication_outbox_from_provider_readback(
             and current.get("next_attempt_at") is None
         )
         if (
-            not (expired_claim or unresolved_dispatch)
+            not (claimed_dispatch or unresolved_dispatch)
             or current.get("publisher") != safe_provider
             or int(current.get("row_version") or -1) != version
             or not current.get("dispatch_started_at")
@@ -29114,7 +29259,7 @@ def recover_publication_outbox_from_provider_readback(
             conn.commit()
             return None
         latch = conn.execute(
-            "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
         ).fetchone()
         lease = conn.execute(
             "SELECT active FROM runtime_mutation_lease WHERE singleton_id=1"
@@ -29128,6 +29273,104 @@ def recover_publication_outbox_from_provider_readback(
             conn.commit()
             return None
         try:
+            queued_at = _stability_timestamp(current.get("queued_at"), "queued_at")
+            dispatched_at = _stability_timestamp(
+                current.get("dispatch_started_at"), "dispatch_started_at"
+            )
+            updated_at = _stability_timestamp(current.get("updated_at"), "updated_at")
+            if (
+                queued_at != current.get("queued_at")
+                or dispatched_at != current.get("dispatch_started_at")
+                or updated_at != current.get("updated_at")
+                or not (
+                    _parse_iso_timestamp(queued_at, "queued_at", require_timezone=True)
+                    <= _parse_iso_timestamp(
+                        dispatched_at, "dispatch_started_at", require_timezone=True
+                    )
+                    <= _parse_iso_timestamp(
+                        updated_at, "updated_at", require_timezone=True
+                    )
+                    <= _parse_iso_timestamp(
+                        observed, "observed_at", require_timezone=True
+                    )
+                )
+            ):
+                raise ValueError("publication timestamps are not canonical")
+            request_sha256 = _required_stability_text(
+                current.get("request_sha256"), "request_sha256"
+            )
+            if re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+                raise ValueError("request_sha256 is not canonical")
+            identity = canonical_publication_identity(
+                current.get("network"),
+                current.get("offer_fingerprint"),
+                current.get("publication_epoch"),
+            )
+            if current.get("idempotency_key") != identity.idempotency_key:
+                raise ValueError("publication identity is not canonical")
+            claim_generation = _exact_integer(
+                current.get("claim_generation"), "claim_generation", minimum=1
+            )
+            attempt_count = _exact_integer(
+                current.get("attempt_count"), "attempt_count", minimum=1
+            )
+            recovery_generation = _exact_integer(
+                current.get("recovery_generation"),
+                "recovery_generation",
+                minimum=0,
+            )
+            if (
+                claim_generation != attempt_count
+                or int(current.get("row_version") or -1) < claim_generation
+                or recovery_generation != int(latch["generation"])
+            ):
+                raise ValueError("publication generation is inconsistent")
+            if state == "claimed":
+                owner = _required_stability_text(
+                    current.get("claim_owner_run_id"), "claim_owner_run_id"
+                )
+                token = _required_stability_text(
+                    current.get("claim_token"), "claim_token"
+                )
+                claim_expiry = _stability_timestamp(
+                    current.get("claim_expires_at"), "claim_expires_at"
+                )
+                if (
+                    owner != current.get("claim_owner_run_id")
+                    or token != current.get("claim_token")
+                    or claim_expiry != current.get("claim_expires_at")
+                ):
+                    raise ValueError("publication claim authority is not canonical")
+                claim_lifetime = (
+                    _parse_iso_timestamp(
+                        claim_expiry, "claim_expires_at", require_timezone=True
+                    )
+                    - _parse_iso_timestamp(
+                        updated_at, "updated_at", require_timezone=True
+                    )
+                ).total_seconds()
+                if claim_lifetime < 0 or claim_lifetime > 300:
+                    raise ValueError("publication claim lifetime is invalid")
+            else:
+                error_text = current.get("last_error_json")
+                error_sha256 = current.get("last_error_sha256")
+                canonical_error = _canonical_json_text(
+                    error_text,
+                    "publication error evidence",
+                    expected_type=dict,
+                    max_bytes=16384,
+                )
+                error_evidence = json.loads(canonical_error)
+                if (
+                    type(error_text) is not str
+                    or type(error_sha256) is not str
+                    or canonical_error != error_text
+                    or hashlib.sha256(error_text.encode("utf-8")).hexdigest()
+                    != error_sha256
+                    or error_evidence.get("provider") != safe_provider
+                    or error_evidence.get("request_sha256") != request_sha256
+                ):
+                    raise ValueError("publication error evidence is not linked")
             payload_text = _canonical_json_text(
                 current["payload_json"],
                 "publication payload",
@@ -29135,11 +29378,13 @@ def recover_publication_outbox_from_provider_readback(
                 max_bytes=4096,
             )
             payload = json.loads(payload_text)
-        except (TypeError, ValueError):
+        except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
             conn.commit()
             return None
         if (
             payload_text != current["payload_json"]
+            or hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+            != current.get("payload_sha256")
             or set(payload) != {"offer_ref"}
             or payload.get("offer_ref") != trade
         ):
@@ -29186,8 +29431,9 @@ def recover_publication_outbox_from_provider_readback(
             WHERE publication_id=? AND publisher='dexie' AND row_version=?
               AND dispatch_started_at IS NOT NULL AND request_sha256 IS NOT NULL
               AND (
-                (state='claimed' AND claim_expires_at IS NOT NULL
-                 AND claim_expires_at<?) OR
+                (state='claimed' AND claim_owner_run_id IS NOT NULL
+                 AND claim_token IS NOT NULL AND claim_expires_at IS NOT NULL
+                 AND next_attempt_at IS NULL) OR
                 (state='unresolved' AND claim_owner_run_id IS NULL
                  AND claim_token IS NULL AND claim_expires_at IS NULL
                  AND next_attempt_at IS NULL)
@@ -29201,7 +29447,6 @@ def recover_publication_outbox_from_provider_readback(
                 observed,
                 publication,
                 version,
-                observed,
             ),
         )
         if cursor.rowcount != 1:

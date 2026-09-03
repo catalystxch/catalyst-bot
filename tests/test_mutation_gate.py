@@ -6357,6 +6357,14 @@ def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
     events = []
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
     monkeypatch.setattr(
+        desktop_app,
+        "_retire_expired_dead_startup_lease",
+        lambda: (
+            events.append("retire_stale_lease")
+            or {"retired": False, "reason": "lease_not_active"}
+        ),
+    )
+    monkeypatch.setattr(
         api_server,
         "initialize_mutation_runtime",
         lambda: events.append("lease") or {"allowed": True},
@@ -6368,7 +6376,7 @@ def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
     )
 
     assert desktop_app._initialize_startup_ownership() == {"allowed": True}
-    assert events == ["database", "lease"]
+    assert events == ["database", "retire_stale_lease", "lease"]
 
 
 @pytest.mark.parametrize(
@@ -6422,6 +6430,47 @@ def test_desktop_retries_startup_after_exact_coin_prep_recovery(
         "authorize",
         "coin_prep_recovery",
         "authorize",
+    ]
+
+
+def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
+    import mutation_gate
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    lease = {
+        "active": 1,
+        "lease_version": 17,
+        "owner_pid": 2147483647,
+        "owner_host": socket.gethostname(),
+    }
+    calls = []
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: dict(lease))
+    monkeypatch.setattr(
+        mutation_gate,
+        "pid_liveness",
+        lambda pid, host: calls.append(("liveness", pid, host)) or False,
+    )
+    monkeypatch.setattr(
+        database,
+        "retire_expired_dead_runtime_lease_at_startup",
+        lambda **kwargs: (
+            calls.append(("retire", kwargs))
+            or {"retired": True, "reason": "expired_dead_owner"}
+        ),
+    )
+
+    result = desktop_app._retire_expired_dead_startup_lease()
+
+    assert result["retired"] is True
+    assert calls == [
+        ("liveness", 2147483647, socket.gethostname()),
+        (
+            "retire",
+            {
+                "expected_lease_version": 17,
+                "prior_owner_liveness_proven_dead": True,
+            },
+        ),
     ]
 
 

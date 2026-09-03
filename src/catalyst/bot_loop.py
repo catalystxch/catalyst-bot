@@ -14197,7 +14197,7 @@ class BotLoop:
             return
 
         try:
-            from database import get_offers_for_repost
+            from database import PublicationSuppressedError, get_offers_for_repost
 
             # Get open offers with their stored bech32 strings from DB
             cat_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
@@ -14264,11 +14264,30 @@ class BotLoop:
 
             # Fast path: queue all offers that have bech32 stored
             count = 0
+            splash_count = 0
+
+            def queue_visibility(manager, offer_text, trade_id, publisher):
+                try:
+                    manager.queue_post(offer_text, trade_id, force=True)
+                    return True
+                except PublicationSuppressedError:
+                    log_event(
+                        "warning",
+                        f"{publisher}_repost_quarantined",
+                        "Skipped an offer whose uncertain prior publication was "
+                        "safely suppressed during upgrade recovery",
+                        data={"trade_id": trade_id, "publisher": publisher},
+                    )
+                    return False
+
             for trade_id, bech32 in fast_queue:
-                self.dexie_manager.queue_post(bech32, trade_id, force=True)
+                if queue_visibility(self.dexie_manager, bech32, trade_id, "dexie"):
+                    count += 1
                 if getattr(cfg, "SPLASH_ENABLED", False):
-                    self.splash_manager.queue_post(bech32, trade_id, force=True)
-                count += 1
+                    if queue_visibility(
+                        self.splash_manager, bech32, trade_id, "splash"
+                    ):
+                        splash_count += 1
 
             # Slow path: fetch bech32 from wallet RPC for offers without it
             if slow_queue:
@@ -14278,12 +14297,15 @@ class BotLoop:
                     try:
                         bech32 = get_offer_bech32(trade_id)
                         if bech32:
-                            self.dexie_manager.queue_post(bech32, trade_id, force=True)
+                            if queue_visibility(
+                                self.dexie_manager, bech32, trade_id, "dexie"
+                            ):
+                                count += 1
                             if getattr(cfg, "SPLASH_ENABLED", False):
-                                self.splash_manager.queue_post(
-                                    bech32, trade_id, force=True
-                                )
-                            count += 1
+                                if queue_visibility(
+                                    self.splash_manager, bech32, trade_id, "splash"
+                                ):
+                                    splash_count += 1
                             # Save to DB for next time
                             try:
                                 from database import update_offer_bech32
@@ -14310,14 +14332,22 @@ class BotLoop:
                     f"{skip_count} already live)",
                 )
                 # Also broadcast to Splash if enabled (V3)
-                if getattr(cfg, "SPLASH_ENABLED", False):
+                if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
                     self.splash_manager.flush_queue(flush_all=True)
                     log_event(
                         "info",
                         "splash_repost_done",
-                        f"Confirmed {count} offers over Splash"
+                        f"Confirmed {splash_count} offers over Splash"
                         + (" in the background" if background else ""),
                     )
+            elif getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+                self.splash_manager.flush_queue(flush_all=True)
+                log_event(
+                    "info",
+                    "splash_repost_done",
+                    f"Confirmed {splash_count} offers over Splash"
+                    + (" in the background" if background else ""),
+                )
             else:
                 log_event(
                     "info",

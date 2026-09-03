@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,25 @@ def _seed_upgrade_interrupted_claims(data_dir: Path) -> tuple[object, str, str]:
     )
     if not isinstance(unresolved, dict) or unresolved.get("state") != "unresolved":
         raise SmokeFailure("packaged upgrade ambiguity was not seeded")
+    stale_lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="upgrade-hard-killed-owner",
+        owner_pid=2147483647,
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=hashlib.sha256(b"fingerprint:123456789").hexdigest(),
+        network="mainnet",
+        lease_expires_at=_timestamp(now + timedelta(minutes=5)),
+        now=_timestamp(now),
+    )
+    if stale_lease.get("acquired") is not True:
+        raise SmokeFailure("packaged upgrade stale runtime lease was not seeded")
+    expired_at = _timestamp(now - timedelta(seconds=1))
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE runtime_mutation_lease SET expires_at=?, heartbeat_at=?, updated_at=? "
+        "WHERE singleton_id=1",
+        (expired_at, expired_at, expired_at),
+    )
+    conn.commit()
     database.close_connection()
     return (
         database,
@@ -217,6 +237,14 @@ def run_smoke(executable: Path, timeout_seconds: int) -> int:
                     )
                 if snapshot["blocker_counts"]["publication_claims"] != 0:
                     raise SmokeFailure("packaged upgrade recovery retained a blocker")
+                if (
+                    snapshot["lease"]["active"] != 1
+                    or snapshot["lease"]["owner_pid"] != process.pid
+                    or snapshot["lease"]["owner_run_id"] == "upgrade-hard-killed-owner"
+                ):
+                    raise SmokeFailure(
+                        "packaged upgrade did not replace the stale killed-owner lease"
+                    )
             except Exception as exc:
                 output.flush()
                 details = stdout_path.read_text(encoding="utf-8", errors="replace")
