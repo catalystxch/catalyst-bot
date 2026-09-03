@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 
 _SOCKET_TYPE = socket.socket
+_DEAD_OWNER_STARTUP_WAIT_SECONDS = 31.0
 
 
 def _authority_sql_sha256(value: Any) -> str | None:
@@ -492,9 +493,13 @@ def preflight_requires_diagnostics(path: Path | None = None) -> bool:
         expiry = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
         if expiry.tzinfo is None or expiry.utcoffset() is None:
             return True
-        if expiry.astimezone(timezone.utc) > datetime.now(timezone.utc):
-            return True
-        return _pid_liveness(row["owner_pid"], row["owner_host"]) is not False
+        remaining = (
+            expiry.astimezone(timezone.utc) - datetime.now(timezone.utc)
+        ).total_seconds()
+        owner_dead = _pid_liveness(row["owner_pid"], row["owner_host"]) is False
+        if remaining > 0:
+            return not (owner_dead and remaining <= _DEAD_OWNER_STARTUP_WAIT_SECONDS)
+        return not owner_dead
     except Exception:
         return True
     finally:

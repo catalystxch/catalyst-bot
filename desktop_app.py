@@ -26,6 +26,7 @@ import time
 import argparse
 import subprocess
 import importlib.util
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -130,6 +131,8 @@ WINDOW_MIN_HEIGHT = 700
 _startup_diagnostics_status = None
 _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS = 3
 _LEGACY_STARTUP_RECOVERY_RETRY_DELAY_SECONDS = 1.0
+_STARTUP_DEAD_LEASE_MAX_WAIT_SECONDS = 31.0
+_STARTUP_DEAD_LEASE_EXPIRY_GRACE_SECONDS = 0.05
 
 
 def _configure_linux_webengine_env() -> None:
@@ -1659,12 +1662,101 @@ def _run_coin_prep_worker_mode(worker_args):
         sys.argv = old_argv
 
 
+def _retire_expired_dead_startup_lease() -> dict:
+    """Retire a hard-killed predecessor after its bounded lease expires."""
+
+    from database import (
+        get_runtime_mutation_lease,
+        retire_expired_dead_runtime_lease_at_startup,
+    )
+    from mutation_gate import pid_liveness
+
+    lease = get_runtime_mutation_lease()
+    if not bool(lease.get("active")):
+        return {"retired": False, "reason": "lease_not_active", "lease": lease}
+    try:
+        prior_alive = pid_liveness(
+            int(lease.get("owner_pid") or 0),
+            str(lease.get("owner_host") or ""),
+        )
+    except Exception:
+        prior_alive = None
+    result = retire_expired_dead_runtime_lease_at_startup(
+        expected_lease_version=int(lease.get("lease_version") or -1),
+        prior_owner_liveness_proven_dead=prior_alive is False,
+    )
+    if result.get("reason") != "lease_not_expired" or prior_alive is not False:
+        return result
+
+    retained = result.get("lease")
+    if not isinstance(retained, dict):
+        return result
+    expires_at = retained.get("expires_at")
+    try:
+        if type(expires_at) is not str or not expires_at.endswith("Z"):
+            return result
+        expiry = datetime.fromisoformat(f"{expires_at[:-1]}+00:00")
+        canonical_expiry = (
+            expiry.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+    except (TypeError, ValueError):
+        return result
+    if canonical_expiry != expires_at:
+        return result
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    bounded_wait = max(0.0, remaining) + _STARTUP_DEAD_LEASE_EXPIRY_GRACE_SECONDS
+    if bounded_wait > _STARTUP_DEAD_LEASE_MAX_WAIT_SECONDS:
+        return {
+            "retired": False,
+            "reason": "lease_expiry_outside_startup_wait",
+            "lease": retained,
+        }
+
+    time.sleep(bounded_wait)
+    refreshed = get_runtime_mutation_lease()
+    authority_fields = (
+        "lease_version",
+        "owner_run_id",
+        "owner_pid",
+        "owner_host",
+        "expires_at",
+    )
+    if not bool(refreshed.get("active")):
+        return {"retired": False, "reason": "lease_not_active", "lease": refreshed}
+    if any(refreshed.get(field) != retained.get(field) for field in authority_fields):
+        return {
+            "retired": False,
+            "reason": "lease_authority_changed_during_wait",
+            "lease": refreshed,
+        }
+    try:
+        still_alive = pid_liveness(
+            int(refreshed.get("owner_pid") or 0),
+            str(refreshed.get("owner_host") or ""),
+        )
+    except Exception:
+        still_alive = None
+    return retire_expired_dead_runtime_lease_at_startup(
+        expected_lease_version=int(refreshed.get("lease_version") or -1),
+        prior_owner_liveness_proven_dead=still_alive is False,
+    )
+
+
 def _initialize_startup_ownership() -> dict:
     """Initialize storage, reconcile exact prep evidence, and acquire ownership."""
 
     from database import init_database
 
     init_database()
+    try:
+        _retire_expired_dead_startup_lease()
+    except Exception:
+        # A stale lease is retired only with exact expiry, version, owner, and
+        # dead-process proof. Any uncertainty remains visible to the normal
+        # fail-closed startup checks below.
+        pass
     import api_server
 
     authorization = api_server.initialize_mutation_runtime()
@@ -1719,6 +1811,27 @@ def _initialize_startup_ownership() -> dict:
         except Exception:
             # Provider readback recovery is exact and fail-closed. Keep the
             # diagnostics blocker when the public offer cannot be proven.
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from database import (
+                suppress_orphaned_dispatched_publications_at_startup,
+            )
+
+            suppression = suppress_orphaned_dispatched_publications_at_startup()
+            if (
+                suppression.get("suppressed", 0) > 0
+                and suppression.get("remaining") == 0
+            ):
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Abandoned requests are terminalized only when their durable
+            # identity is intact and no mutation owner exists. Any malformed
+            # or unlinked evidence remains blocked for explicit recovery.
             pass
     legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
