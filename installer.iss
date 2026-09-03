@@ -64,7 +64,11 @@ PrivilegesRequiredOverridesAllowed=commandline
 OutputBaseFilename=Catalyst-Setup-{#MyAppVersion}
 OutputDir=Output
 Compression=lzma2/ultra
-SolidCompression=yes
+; Defender engine 1.1.26080.3 with definitions 1.459.28.0 classified the
+; v1.3.17 installer built with SolidCompression=yes as
+; Trojan:Win32/Wacatac.B!ml. The exact payload passed with
+; SolidCompression=no, so keep this directive explicit.
+SolidCompression=no
 WizardStyle=modern
 SetupLogging=yes
 
