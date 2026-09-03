@@ -1101,6 +1101,69 @@ def test_startup_recovers_expired_dexie_claim_from_exact_active_offer(
     assert isolated_database.get_offer(trade_id)["dexie_id"] == "dexie-readback-1"
 
 
+def test_startup_recovers_unresolved_dexie_dispatch_from_exact_active_offer(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_claimable(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("request-contract"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    unresolved = isolated_database.unresolve_publication_outbox(
+        publication_id=dispatched["publication_id"],
+        owner_run_id=dispatched["claim_owner_run_id"],
+        claim_token=dispatched["claim_token"],
+        claim_generation=dispatched["claim_generation"],
+        expected_row_version=dispatched["row_version"],
+        error_json={
+            "code": "AMBIGUOUS_TRANSPORT_FAILURE",
+            "provider": "dexie",
+            "request_sha256": dispatched["request_sha256"],
+        },
+        unresolved_at=WITHIN_LEASE,
+    )
+
+    def exact_orderbook(_url, **_kwargs):
+        return _TransportResponse(
+            200,
+            {
+                "count": 1,
+                "page": 1,
+                "page_size": 100,
+                "offers": [
+                    {
+                        "id": "dexie-readback-unresolved",
+                        "status": 0,
+                        "trade_id": f"0x{trade_id}",
+                        "offer": offer_text,
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(dexie_manager.requests, "get", exact_orderbook)
+    result = dexie_manager.recover_expired_dexie_publications_at_startup(
+        now_provider=lambda: AFTER_LEASE
+    )
+
+    assert result == {"checked": 1, "recovered": 1, "remaining": 0}
+    recovered = isolated_database.get_publication_outbox(unresolved["publication_id"])
+    assert recovered["state"] == "succeeded"
+    assert recovered["claim_owner_run_id"] is None
+    assert recovered["claim_token"] is None
+    assert recovered["claim_expires_at"] is None
+    assert isolated_database.get_offer(trade_id)["dexie_id"] == (
+        "dexie-readback-unresolved"
+    )
+
+
 @pytest.mark.parametrize("publisher", ["dexie", "splash"])
 def test_upgrade_restart_recovers_undispatched_publication_claim_without_active_owner(
     isolated_database, publisher
@@ -1180,6 +1243,187 @@ def test_upgrade_restart_keeps_dispatched_publication_claim_fail_closed(
     assert result == {"examined": 1, "recovered": 0, "remaining": 1}
     assert retained == dispatched
     assert retained["state"] == "claimed"
+
+
+@pytest.mark.parametrize("orphaned_state", ["claimed", "unresolved"])
+def test_upgrade_restart_suppresses_orphaned_dispatched_publication_without_redispatch(
+    isolated_database, orphaned_state
+):
+    intent, trade_id, fingerprint = _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    if orphaned_state == "unresolved":
+        orphaned = isolated_database.unresolve_publication_outbox(
+            publication_id=dispatched["publication_id"],
+            owner_run_id=dispatched["claim_owner_run_id"],
+            claim_token=dispatched["claim_token"],
+            claim_generation=dispatched["claim_generation"],
+            expected_row_version=dispatched["row_version"],
+            error_json={
+                "code": "AMBIGUOUS_TRANSPORT_FAILURE",
+                "provider": "dexie",
+                "request_sha256": dispatched["request_sha256"],
+            },
+            unresolved_at=WITHIN_LEASE,
+        )
+    else:
+        orphaned = dispatched
+
+    assert isolated_database.get_stability_startup_recovery_snapshot()[
+        "publication_issues"
+    ] == [claim["publication_id"]]
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert result == {"examined": 1, "suppressed": 1, "remaining": 0}
+    recovered = isolated_database.get_publication_outbox(claim["publication_id"])
+    assert recovered["state"] == "suppressed"
+    assert recovered["claim_owner_run_id"] is None
+    assert recovered["claim_token"] is None
+    assert recovered["claim_expires_at"] is None
+    assert recovered["next_attempt_at"] is None
+    assert recovered["terminal_at"] == AFTER_LEASE
+    assert json.loads(recovered["suppression_json"]) == {
+        "code": "UPGRADE_RESTART_ORPHANED_DISPATCH_SUPPRESSED",
+        "prior_state": orphaned_state,
+        "publisher": "dexie",
+        "request_sha256": dispatched["request_sha256"],
+    }
+    assert (
+        isolated_database.get_stability_startup_recovery_snapshot()[
+            "publication_issues"
+        ]
+        == []
+    )
+    assert (
+        isolated_database.claim_publication_outbox(
+            publisher="dexie",
+            owner_run_id="worker-b",
+            claim_token="claim-b",
+            claimed_at=AFTER_LEASE,
+            claim_expires_at="2026-08-15T12:01:00.000000Z",
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="suppressed publication history"):
+        isolated_database.enqueue_publication_for_trade(
+            trade_id=trade_id,
+            offer_fingerprint=fingerprint,
+            publisher="dexie",
+            force=True,
+            network="mainnet",
+            queued_at=AFTER_LEASE,
+        )
+
+
+def test_upgrade_restart_keeps_ambiguous_publication_when_owner_is_active(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    dispatched = isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    lease = isolated_database.acquire_runtime_mutation_lease(
+        owner_run_id="live-owner",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=_sha("wallet"),
+        network="mainnet",
+        lease_expires_at="2099-01-01T00:05:00.000000Z",
+        now=AT,
+    )
+    assert lease["acquired"] is True
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert result == {"examined": 0, "suppressed": 0, "remaining": 1}
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"]) == dispatched
+    )
+
+
+def test_upgrade_restart_keeps_unresolved_row_without_dispatch_evidence_fail_closed(
+    isolated_database,
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    unresolved = isolated_database.unresolve_publication_outbox(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        error_json={"code": "PUBLICATION_OFFER_REFERENCE_MISSING"},
+        unresolved_at=WITHIN_LEASE,
+    )
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert result == {"examined": 1, "suppressed": 0, "remaining": 1}
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"]) == unresolved
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "malformed_value"),
+    [
+        ("request_sha256", "A" * 64),
+        ("payload_sha256", "0" * 64),
+        ("recovery_generation", 99),
+    ],
+)
+def test_upgrade_restart_keeps_malformed_dispatched_publication_fail_closed(
+    isolated_database, column, malformed_value
+):
+    _prepare_claimable(isolated_database)
+    claim = _claim(isolated_database)
+    isolated_database.mark_publication_dispatch_started(
+        publication_id=claim["publication_id"],
+        owner_run_id=claim["claim_owner_run_id"],
+        claim_token=claim["claim_token"],
+        claim_generation=claim["claim_generation"],
+        expected_row_version=claim["row_version"],
+        request_sha256=_sha("upgrade-restart-request"),
+        dispatched_at=WITHIN_LEASE,
+    )
+    conn = isolated_database.get_connection()
+    conn.execute(
+        f"UPDATE publication_outbox SET {column}=? WHERE publication_id=?",
+        (malformed_value, claim["publication_id"]),
+    )
+    conn.commit()
+    malformed = isolated_database.get_publication_outbox(claim["publication_id"])
+
+    result = isolated_database.suppress_orphaned_dispatched_publications_at_startup(
+        recovered_at=AFTER_LEASE
+    )
+
+    assert result == {"examined": 1, "suppressed": 0, "remaining": 1}
+    assert (
+        isolated_database.get_publication_outbox(claim["publication_id"]) == malformed
+    )
 
 
 @pytest.mark.parametrize(

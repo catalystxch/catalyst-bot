@@ -1720,6 +1720,27 @@ def _initialize_startup_ownership() -> dict:
             # Provider readback recovery is exact and fail-closed. Keep the
             # diagnostics blocker when the public offer cannot be proven.
             pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from database import (
+                suppress_orphaned_dispatched_publications_at_startup,
+            )
+
+            suppression = suppress_orphaned_dispatched_publications_at_startup()
+            if (
+                suppression.get("suppressed", 0) > 0
+                and suppression.get("remaining") == 0
+            ):
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            # Abandoned requests are terminalized only when their durable
+            # identity is intact and no mutation owner exists. Any malformed
+            # or unlinked evidence remains blocked for explicit recovery.
+            pass
     legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",

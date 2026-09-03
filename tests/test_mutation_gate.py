@@ -6470,6 +6470,69 @@ def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
     ]
 
 
+def test_desktop_retries_startup_after_orphaned_publication_is_suppressed(
+    monkeypatch,
+):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
+                "failed_check": "publication_claims",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        database,
+        "recover_undispatched_publication_claims_at_startup",
+        lambda: (
+            events.append("undispatched_publication_recovery")
+            or {"examined": 1, "recovered": 0, "remaining": 1}
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "suppress_orphaned_dispatched_publications_at_startup",
+        lambda: (
+            events.append("orphaned_publication_suppression")
+            or {"examined": 1, "suppressed": 1, "remaining": 0}
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "dexie_manager",
+        SimpleNamespace(
+            recover_expired_dexie_publications_at_startup=lambda: (
+                events.append("dexie_publication_recovery")
+                or {"checked": 1, "recovered": 0, "remaining": 1}
+            )
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "undispatched_publication_recovery",
+        "dexie_publication_recovery",
+        "orphaned_publication_suppression",
+        "authorize",
+    ]
+
+
 def test_desktop_upgrade_restart_recovers_undispatched_publication_before_readback(
     monkeypatch,
 ):

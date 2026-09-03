@@ -28259,6 +28259,273 @@ def recover_undispatched_publication_claims_at_startup(
         conn.close()
 
 
+def suppress_orphaned_dispatched_publications_at_startup(
+    *, recovered_at: Any = None
+) -> Dict[str, int]:
+    """Terminalize valid abandoned dispatches without sending them again.
+
+    A process can disappear after recording the outbound request boundary but
+    before it commits a provider acknowledgement.  Once no mutation owner is
+    active, the only universally safe local outcome is to suppress that exact
+    publication identity: an offer that reached the provider remains tracked
+    by its immutable Sage trade, while an offer that did not reach the provider
+    is never retransmitted.  Corrupt, unlinked, or undispatched rows remain
+    fail-closed for explicit reconciliation.
+    """
+
+    from publication_outbox import canonical_publication_identity
+
+    recovered = _stability_timestamp_or_now(recovered_at, "recovered_at")
+    recovered_dt = _parse_iso_timestamp(
+        recovered, "recovered_at", require_timezone=True
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch = conn.execute(
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if (
+            latch is None
+            or latch["state"] != "resolved"
+            or lease is None
+            or bool(lease["active"])
+        ):
+            remaining = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM publication_outbox "
+                    "WHERE state IN ('claimed','unresolved')"
+                ).fetchone()[0]
+            )
+            conn.commit()
+            return {"examined": 0, "suppressed": 0, "remaining": remaining}
+
+        rows = conn.execute(
+            "SELECT * FROM publication_outbox "
+            "WHERE state IN ('claimed','unresolved') "
+            "ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup publication suppression limit exceeded")
+
+        latch_generation = _exact_integer(
+            latch["generation"], "runtime safety generation", minimum=0
+        )
+        suppressed_count = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            if (
+                row.get("dispatch_started_at") is None
+                or row.get("request_sha256") is None
+            ):
+                continue
+            try:
+                publication_id = _required_stability_text(
+                    row.get("publication_id"), "publication_id"
+                )
+                if publication_id != row.get("publication_id"):
+                    continue
+                publisher = _required_stability_text(row.get("publisher"), "publisher")
+                if publisher not in {"dexie", "splash"}:
+                    continue
+                identity = canonical_publication_identity(
+                    row.get("network"),
+                    row.get("offer_fingerprint"),
+                    row.get("publication_epoch"),
+                )
+                if row.get("idempotency_key") != identity.idempotency_key:
+                    continue
+                request_sha256 = row.get("request_sha256")
+                if (
+                    type(request_sha256) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+                ):
+                    continue
+                queued_at = _stability_timestamp(row.get("queued_at"), "queued_at")
+                dispatched_at = _stability_timestamp(
+                    row.get("dispatch_started_at"), "dispatch_started_at"
+                )
+                updated_at = _stability_timestamp(row.get("updated_at"), "updated_at")
+                queued_dt = _parse_iso_timestamp(
+                    queued_at, "queued_at", require_timezone=True
+                )
+                dispatched_dt = _parse_iso_timestamp(
+                    dispatched_at, "dispatch_started_at", require_timezone=True
+                )
+                updated_dt = _parse_iso_timestamp(
+                    updated_at, "updated_at", require_timezone=True
+                )
+                if not queued_dt <= dispatched_dt <= updated_dt <= recovered_dt:
+                    continue
+                payload_text = _canonical_json_text(
+                    row.get("payload_json"),
+                    "publication payload",
+                    expected_type=dict,
+                    max_bytes=4096,
+                )
+                payload = json.loads(payload_text)
+                if (
+                    payload_text != row.get("payload_json")
+                    or hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                    != row.get("payload_sha256")
+                    or set(payload) != {"offer_ref"}
+                    or type(payload.get("offer_ref")) is not str
+                    or not payload["offer_ref"]
+                ):
+                    continue
+                offer = conn.execute(
+                    "SELECT offer_bech32 FROM offers WHERE trade_id=?",
+                    (payload["offer_ref"],),
+                ).fetchone()
+                if (
+                    offer is None
+                    or type(offer["offer_bech32"]) is not str
+                    or not offer["offer_bech32"]
+                    or hashlib.sha256(offer["offer_bech32"].encode("utf-8")).hexdigest()
+                    != identity.offer_fingerprint
+                ):
+                    continue
+                claim_generation = _exact_integer(
+                    row.get("claim_generation"), "claim_generation", minimum=1
+                )
+                attempt_count = _exact_integer(
+                    row.get("attempt_count"), "attempt_count", minimum=1
+                )
+                row_version = _exact_integer(
+                    row.get("row_version"), "row_version", minimum=1
+                )
+                recovery_generation = _exact_integer(
+                    row.get("recovery_generation"),
+                    "recovery_generation",
+                    minimum=0,
+                )
+                if (
+                    claim_generation != attempt_count
+                    or row_version < claim_generation
+                    or recovery_generation != latch_generation
+                    or row.get("next_attempt_at") is not None
+                    or any(
+                        row.get(field) is not None
+                        for field in (
+                            "succeeded_at",
+                            "terminal_at",
+                            "acknowledgement_json",
+                            "acknowledgement_sha256",
+                            "suppression_json",
+                            "suppression_sha256",
+                        )
+                    )
+                ):
+                    continue
+                if row["state"] == "claimed":
+                    owner = _required_stability_text(
+                        row.get("claim_owner_run_id"), "claim_owner_run_id"
+                    )
+                    token = _required_stability_text(
+                        row.get("claim_token"), "claim_token"
+                    )
+                    claim_expiry = _stability_timestamp(
+                        row.get("claim_expires_at"), "claim_expires_at"
+                    )
+                    claim_expiry_dt = _parse_iso_timestamp(
+                        claim_expiry, "claim_expires_at", require_timezone=True
+                    )
+                    if (
+                        owner != row.get("claim_owner_run_id")
+                        or token != row.get("claim_token")
+                        or not dispatched_dt <= claim_expiry_dt
+                        or (claim_expiry_dt - dispatched_dt).total_seconds() > 300
+                    ):
+                        continue
+                else:
+                    if any(
+                        row.get(field) is not None
+                        for field in (
+                            "claim_owner_run_id",
+                            "claim_token",
+                            "claim_expires_at",
+                        )
+                    ):
+                        continue
+                    error_text = row.get("last_error_json")
+                    error_sha256 = row.get("last_error_sha256")
+                    canonical_error = _canonical_json_text(
+                        error_text,
+                        "publication error evidence",
+                        expected_type=dict,
+                        max_bytes=16384,
+                    )
+                    if (
+                        type(error_text) is not str
+                        or type(error_sha256) is not str
+                        or canonical_error != error_text
+                        or hashlib.sha256(error_text.encode("utf-8")).hexdigest()
+                        != error_sha256
+                    ):
+                        continue
+            except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+            evidence, evidence_sha256 = _bounded_publication_evidence(
+                {
+                    "code": "UPGRADE_RESTART_ORPHANED_DISPATCH_SUPPRESSED",
+                    "prior_state": row["state"],
+                    "publisher": publisher,
+                    "request_sha256": request_sha256,
+                },
+                "orphaned publication suppression evidence",
+            )
+            cursor = conn.execute(
+                """
+                UPDATE publication_outbox
+                SET state='suppressed', claim_owner_run_id=NULL, claim_token=NULL,
+                    claim_expires_at=NULL, next_attempt_at=NULL,
+                    suppression_json=?, suppression_sha256=?, terminal_at=?,
+                    row_version=row_version+1, updated_at=?
+                WHERE publication_id=? AND row_version=? AND state=?
+                  AND dispatch_started_at=? AND request_sha256=?
+                  AND (SELECT active FROM runtime_mutation_lease
+                       WHERE singleton_id=1)=0
+                  AND (SELECT state FROM runtime_safety_latch
+                       WHERE singleton_id=1)='resolved'
+                """,
+                (
+                    evidence,
+                    evidence_sha256,
+                    recovered,
+                    recovered,
+                    publication_id,
+                    row_version,
+                    row["state"],
+                    dispatched_at,
+                    request_sha256,
+                ),
+            )
+            suppressed_count += int(cursor.rowcount)
+
+        remaining = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM publication_outbox "
+                "WHERE state IN ('claimed','unresolved')"
+            ).fetchone()[0]
+        )
+        conn.commit()
+        return {
+            "examined": len(rows),
+            "suppressed": suppressed_count,
+            "remaining": remaining,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _unresolve_publication_candidate(
     conn: sqlite3.Connection,
     row: Dict[str, Any],
@@ -28780,13 +29047,13 @@ def recover_publication_outbox_from_provider_readback(
     provider_status: int,
     observed_at: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Resolve an expired dispatched claim from one exact public readback.
+    """Resolve an orphaned dispatched claim from one exact public readback.
 
     This recovery is intentionally narrower than a normal acknowledgement:
     it only accepts an active Dexie row whose trade id and complete offer bytes
-    match the immutable local projection.  It also requires the prior claim to
-    have expired and the mutation lease to be inactive, so a recovery process
-    cannot race a live publisher.
+    match the immutable local projection.  It also requires either an expired
+    claim or an already-unresolved record and an inactive mutation lease, so a
+    recovery process cannot race a live publisher.
     """
 
     publication = _required_stability_text(publication_id, "publication_id")
@@ -28823,12 +29090,23 @@ def recover_publication_outbox_from_provider_readback(
             conn.commit()
             return None
         current = dict(row)
+        state = current.get("state")
+        expired_claim = (
+            state == "claimed"
+            and bool(current.get("claim_expires_at"))
+            and current["claim_expires_at"] < observed
+        )
+        unresolved_dispatch = (
+            state == "unresolved"
+            and current.get("claim_owner_run_id") is None
+            and current.get("claim_token") is None
+            and current.get("claim_expires_at") is None
+            and current.get("next_attempt_at") is None
+        )
         if (
-            current.get("state") != "claimed"
+            not (expired_claim or unresolved_dispatch)
             or current.get("publisher") != safe_provider
             or int(current.get("row_version") or -1) != version
-            or not current.get("claim_expires_at")
-            or current["claim_expires_at"] >= observed
             or not current.get("dispatch_started_at")
             or not current.get("request_sha256")
             or current["dispatch_started_at"] > observed
@@ -28902,11 +29180,18 @@ def recover_publication_outbox_from_provider_readback(
             UPDATE publication_outbox
             SET state='succeeded', acknowledgement_json=?,
                 acknowledgement_sha256=?, claim_owner_run_id=NULL,
-                claim_token=NULL, claim_expires_at=NULL, succeeded_at=?,
+                claim_token=NULL, claim_expires_at=NULL, next_attempt_at=NULL,
+                last_error_json=NULL, last_error_sha256=NULL, succeeded_at=?,
                 terminal_at=?, row_version=row_version+1, updated_at=?
-            WHERE publication_id=? AND state='claimed' AND publisher='dexie'
-              AND row_version=? AND claim_expires_at<?
+            WHERE publication_id=? AND publisher='dexie' AND row_version=?
               AND dispatch_started_at IS NOT NULL AND request_sha256 IS NOT NULL
+              AND (
+                (state='claimed' AND claim_expires_at IS NOT NULL
+                 AND claim_expires_at<?) OR
+                (state='unresolved' AND claim_owner_run_id IS NULL
+                 AND claim_token IS NULL AND claim_expires_at IS NULL
+                 AND next_attempt_at IS NULL)
+              )
             """,
             (
                 acknowledgement,

@@ -54,7 +54,7 @@ _offer_detail_cache_at: Dict[str, float] = {}
 def recover_expired_dexie_publications_at_startup(
     *, now_provider=None
 ) -> Dict[str, int]:
-    """Recover crashed Dexie dispatches from exact active-orderbook bytes."""
+    """Recover orphaned Dexie dispatches from exact active-orderbook bytes."""
 
     observed_at = (
         now_provider()
@@ -75,19 +75,33 @@ def recover_expired_dexie_publications_at_startup(
     candidates = []
     for row in list_publication_outbox(publisher="dexie"):
         if (
-            row.get("state") != "claimed"
+            row.get("state") not in {"claimed", "unresolved"}
             or not row.get("dispatch_started_at")
             or not row.get("request_sha256")
-            or not row.get("claim_expires_at")
         ):
             continue
-        try:
-            expiry = datetime.fromisoformat(
-                str(row["claim_expires_at"]).replace("Z", "+00:00")
+        if row.get("state") == "claimed":
+            try:
+                expiry = datetime.fromisoformat(
+                    str(row["claim_expires_at"]).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                continue
+            if (
+                expiry.tzinfo is None
+                or expiry.utcoffset() is None
+                or expiry >= observed_dt
+            ):
+                continue
+        elif any(
+            row.get(field) is not None
+            for field in (
+                "claim_owner_run_id",
+                "claim_token",
+                "claim_expires_at",
+                "next_attempt_at",
             )
-        except (TypeError, ValueError):
-            continue
-        if expiry.tzinfo is None or expiry.utcoffset() is None or expiry >= observed_dt:
+        ):
             continue
         candidates.append(row)
 
