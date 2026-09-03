@@ -37,6 +37,11 @@ def test_linux_release_is_manual_and_validates_a_public_main_tag():
     assert validation_step["env"]["SOURCE_REPOSITORY"] == "catalystxch/catalyst-bot"
 
 
+def test_yaml_parser_is_a_direct_developer_dependency():
+    requirements = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8").lower()
+    assert "pyyaml>=" in requirements
+
+
 def test_linux_build_uses_the_validated_tag_and_existing_release_scripts():
     ordered = [
         "Validate release tag",
