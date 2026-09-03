@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -56,6 +57,14 @@ def test_windows_installer_update_contract_is_fail_closed():
     assert "procedure VerifyInstalledVersion" in installer
     assert "GetVersionNumbersString" in installer
     assert "RaiseException" in installer
+
+
+def test_windows_installer_avoids_defender_solid_archive_false_positive():
+    installer = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+    assert re.search(r"(?m)^\s*Compression\s*=\s*lzma2/ultra\s*$", installer)
+    assert re.search(r"(?m)^\s*SolidCompression\s*=\s*no\s*$", installer)
+    assert not re.search(r"(?m)^\s*SolidCompression\s*=\s*yes\s*$", installer)
 
 
 def test_windows_installer_supports_isolated_runtime_smoke_identity():
