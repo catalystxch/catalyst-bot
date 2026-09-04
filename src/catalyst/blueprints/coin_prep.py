@@ -33,7 +33,6 @@ import api_server
 from config import cfg
 from database import (
     backup_database,
-    get_connection,
     get_offer_cancel_effect_claim,
     get_offer_intent_by_trade_id,
     get_offer_operation_events,
