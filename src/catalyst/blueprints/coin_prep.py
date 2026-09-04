@@ -25,19 +25,24 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
 from flask import Blueprint, Response, g, jsonify, request, send_file
 
 import api_server
-import database
 from config import cfg
+from database import (
+    backup_database,
+    get_connection,
+    get_offer_cancel_effect_claim,
+    get_offer_intent_by_trade_id,
+    get_offer_operation_events,
+    get_open_offers,
+    get_stats,
+    guarded_reset_authoritative_state,
+    log_event,
+)
 from pc_diagnostics import collect_pc_diagnostics as _collect_pc_diagnostics
-
-
-log_event = database.log_event
-get_stats = database.get_stats
-backup_database = database.backup_database
-get_connection = database.get_connection
 
 
 # Package directory — the parent of blueprints/ (i.e. src/catalyst/).
@@ -62,11 +67,11 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
     """
 
     import offer_reconciliation
-    import wallet
+    from wallet import get_all_offers, get_authoritative_offer_history
 
-    reader = getattr(wallet, "get_authoritative_offer_history", None)
+    reader = get_authoritative_offer_history
     if not callable(reader):
-        reader = getattr(wallet, "get_all_offers", None)
+        reader = get_all_offers
     if not callable(reader):
         return {
             "complete": False,
@@ -112,7 +117,7 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
                 if int(xch_amount or 0) > 0:
                     return "buy"
             except (TypeError, ValueError):
-                pass
+                return ""
             if any(key != "xch" and value for key, value in offered.items()):
                 return "sell"
         return ""
@@ -183,7 +188,7 @@ def _reconcile_authoritative_open_offers_before_prep() -> dict:
 
     import offer_reconciliation
 
-    rows = database.get_open_offers(include_elapsed=True)
+    rows = get_open_offers(include_elapsed=True)
     summary = {
         "examined": len(rows),
         "terminal_applied": 0,
@@ -195,10 +200,14 @@ def _reconcile_authoritative_open_offers_before_prep() -> dict:
         offer_reconciliation.CANCELLED_PROVEN,
         offer_reconciliation.EXPIRED_PROVEN,
     }
+    cancel_evidence_database = SimpleNamespace(
+        get_offer_operation_events=get_offer_operation_events,
+        get_offer_cancel_effect_claim=get_offer_cancel_effect_claim,
+    )
     for row in rows:
         trade_id = row.get("trade_id") if type(row) is dict else None
         intent = (
-            database.get_offer_intent_by_trade_id(trade_id)
+            get_offer_intent_by_trade_id(trade_id)
             if type(trade_id) is str and trade_id
             else None
         )
@@ -211,7 +220,7 @@ def _reconcile_authoritative_open_offers_before_prep() -> dict:
             cancel_context = offer_reconciliation._derive_single_cancel_context(
                 intent,
                 evidence,
-                database_module=database,
+                database_module=cancel_evidence_database,
                 observed_at=observed_at,
             )
             classification = offer_reconciliation.classify_terminal_evidence(
@@ -271,7 +280,7 @@ def _coin_prep_open_offer_conflict(
     if "open_offers" not in conflicts:
         return None
 
-    rows = database.get_open_offers(include_elapsed=True)
+    rows = get_open_offers(include_elapsed=True)
     buy_count = sum(1 for row in rows if type(row) is dict and row.get("side") == "buy")
     sell_count = sum(
         1 for row in rows if type(row) is dict and row.get("side") == "sell"
@@ -288,8 +297,7 @@ def _coin_prep_open_offer_conflict(
     legacy_count = sum(
         1
         for row in rows
-        if type(row) is dict
-        and not database.get_offer_intent_by_trade_id(row.get("trade_id"))
+        if type(row) is dict and not get_offer_intent_by_trade_id(row.get("trade_id"))
     )
     noun = "offer" if open_count == 1 else "offers"
     additional_conflicts = sorted(
@@ -954,7 +962,7 @@ def api_log_event():
             return jsonify({"success": False, "error": "No message"}), 400
 
         # Write to DB + push to SSE (log_event does both now)
-        database.log_event(severity, event_type, message)
+        api_server.database.log_event(severity, event_type, message)
 
         # Emit a coin_change SSE event when coin prep hits key milestones
         # so the Chia dashboard can auto-refresh Coins/Balances/Wallet Status
@@ -1886,7 +1894,7 @@ def _api_coin_prep_trigger_locked():
         wallet_has_open_offers = (
             int(wallet_offer_snapshot.get("open_offer_count", 0) or 0) > 0
         )
-        local_open_offers = database.get_open_offers(include_elapsed=True)
+        local_open_offers = get_open_offers(include_elapsed=True)
         if wallet_has_open_offers and not local_open_offers:
             wallet_conflict = _coin_prep_open_offer_conflict(
                 {
@@ -1957,7 +1965,7 @@ def _api_coin_prep_trigger_locked():
         # otherwise bloat the history view.
         if _prep_reset_offers:
             try:
-                history_reset = database.guarded_reset_authoritative_state(
+                history_reset = guarded_reset_authoritative_state(
                     clear_terminal_offers=True
                 )
                 if not history_reset["success"]:

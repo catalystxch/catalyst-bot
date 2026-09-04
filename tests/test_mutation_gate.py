@@ -4208,7 +4208,7 @@ def test_exclusive_mutation_fences_new_work_until_owner_exits(
                 timeout_seconds=1,
             )
             acquired.set()
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     worker = threading.Thread(target=acquire_exclusive)

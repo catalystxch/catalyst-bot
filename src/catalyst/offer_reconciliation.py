@@ -1749,6 +1749,16 @@ def load_sage_offer_history(
         pages.append(rows)
         collected_count += len(rows)
         page_authoritative_end = _authoritative_page_end(result, len(rows))
+        explicit_authoritative_end = bool(
+            type(result) is dict
+            and (
+                result.get("end_of_history") is True or result.get("has_more") is False
+            )
+        )
+        if explicit_authoritative_end and len(rows) <= page_size:
+            authoritative_end = True
+            complete = True
+            break
         try:
             repeated_first_page = page_index > 0 and rows == pages[0]
         except BaseException:

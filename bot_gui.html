@@ -34443,10 +34443,17 @@ function closeCtgErrorModal() {
                         return true;
                     }
 
-                    if (data.error === 'coin_prep_requires_offer_cancellation') {
+                    const retryAction = String(data.action || '');
+                    const awaitingTerminalProof =
+                        data.error === 'coin_prep_requires_offer_cancellation'
+                        || data.error === 'coin_prep_offer_reconciliation_pending'
+                        || data.error === 'coin_prep_legacy_offer_recovery_required'
+                        || retryAction === 'retry_authoritative_reconciliation'
+                        || retryAction === 'retry_authoritative_legacy_recovery';
+                    if (awaitingTerminalProof) {
                         const remaining = Math.max(0, Math.trunc(Number(data.open_offer_count) || 0));
                         const waitingMessage = remaining > 0
-                            ? `Waiting for Sage confirmation: ${remaining} open offer${remaining === 1 ? '' : 's'} remain.`
+                            ? `Waiting for Sage confirmation: ${remaining} offer${remaining === 1 ? '' : 's'} still await authoritative terminal proof.`
                             : 'Waiting for Sage to publish authoritative cancellation evidence.';
                         if (statusEl) statusEl.textContent = waitingMessage;
                     } else if (data.error !== 'rate_limited') {

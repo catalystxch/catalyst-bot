@@ -677,6 +677,59 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     expect(page.locator("#coinPrepProgressView")).to_be_visible()
 
 
+def test_coin_prep_keeps_waiting_while_terminal_proof_propagates(page):
+    """A temporarily empty Sage book must not abort automatic reconciliation."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let triggerCalls = 0;
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            apiFetch = async (path) => {
+                if (!String(path).includes('/coin-prep/trigger')) {
+                    return new Response(JSON.stringify({ success: true }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                triggerCalls += 1;
+                const body = triggerCalls === 1
+                    ? {
+                        success: false,
+                        error: 'coin_prep_offer_reconciliation_pending',
+                        action: 'retry_authoritative_reconciliation',
+                        message: 'Sage currently shows no live offers while proof propagates.',
+                        open_offer_count: 2,
+                      }
+                    : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                      };
+                return new Response(JSON.stringify(body), {
+                    status: triggerCalls === 1 ? 409 : 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            const started = await resumeCoinPrepAfterCancelledOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+            }, { retryDelayMs: 0, timeoutMs: 1000 });
+            return { started, triggerCalls };
+        }"""
+    )
+
+    assert result["started"] is True
+    assert result["triggerCalls"] == 2
+    expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
 def test_coin_prep_recovery_rejects_unverified_success_response(page):
     """The browser must not equate a generic 200 with wallet-wide terminal proof."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
