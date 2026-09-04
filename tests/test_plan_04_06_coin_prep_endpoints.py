@@ -374,6 +374,27 @@ class TestCoinPrepTrigger(_FlaskBase):
         self._open_offers = patch("database.get_open_offers", return_value=[])
         self._open_offers.start()
         self.addCleanup(self._open_offers.stop)
+        self._wallet_offer_snapshot = patch.object(
+            coin_prep_blueprint,
+            "_wallet_open_offer_snapshot_before_prep",
+            return_value={
+                "complete": True,
+                "read_error": None,
+                "open_offer_count": 0,
+                "open_buy_count": 0,
+                "open_sell_count": 0,
+                "open_trade_ids": [],
+            },
+        )
+        self._wallet_offer_snapshot.start()
+        self.addCleanup(self._wallet_offer_snapshot.stop)
+        self._legacy_recovery = patch.object(
+            coin_prep_blueprint,
+            "_recover_legacy_open_offers_before_prep",
+            return_value={"examined": 0, "recovered": 0, "remaining": 0},
+        )
+        self._legacy_recovery.start()
+        self.addCleanup(self._legacy_recovery.stop)
 
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
