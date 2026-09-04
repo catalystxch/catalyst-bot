@@ -40,3 +40,11 @@ Regression coverage lives in `tests/test_offer_reconciliation.py`, under
 terminal commits, spent/released dispositions, original-offer corruption,
 provider contradictions, stale observations, chain identity mismatches, and
 the transaction-block expiry boundary. Tests make no live wallet mutations.
+
+The built-app restart check also exposed a separate completion-display defect:
+saved asymmetric plans were checked using the shared maximum tier counts for
+both assets. Restart verification now checks each saved side's own count map
+against fresh spendable wallet coins, falling back to shared counts only for
+older plans without side maps. Disjoint matching still rejects missing coins,
+wrong sizes, unavailable wallet evidence, and overlapping fee/sniper shortages.
+Coverage is in `tests/test_coin_prep_restart_verification.py`.

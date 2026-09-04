@@ -376,7 +376,9 @@ class TestCoinPrepTrigger(_FlaskBase):
         super().setUp()
         # Trigger contract tests use an empty authoritative offer view without
         # requiring the full durable offers schema.
-        self._open_offers = patch("database.get_open_offers", return_value=[])
+        self._open_offers = patch.object(
+            coin_prep_blueprint, "get_open_offers", return_value=[]
+        )
         self._open_offers.start()
         self.addCleanup(self._open_offers.stop)
         self._wallet_offer_snapshot = patch.object(

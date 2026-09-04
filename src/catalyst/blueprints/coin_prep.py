@@ -1205,33 +1205,35 @@ def api_coin_prep_status():
                                     _tsxch = _last.get("tier_sizes_xch", {})
                                     _tscat = _last.get("tier_sizes_cat", {})
                                     _tc = _last.get("tier_counts", {})
+                                    # Current plans can prepare different counts
+                                    # on each side. The shared legacy map stores
+                                    # their maxima, not either side's contract.
+                                    _tcxch = _last.get("tier_counts_xch", _tc)
+                                    _tccat = _last.get("tier_counts_cat", _tc)
                                     _xreqs = []
                                     _creqs = []
-                                    for _t, _cnt in _tc.items():
-                                        _cnt = int(_cnt or 0)
-                                        _xsz = float(_tsxch.get(_t, 0))
-                                        _csz = float(_tscat.get(_t, 0))
-                                        _target_xch += _cnt
-                                        if _csz > 0:
-                                            _target_cat += _cnt
-                                        if _xsz > 0 and _cnt > 0:
-                                            _xreqs.append((_t, int(_xsz * 1e12), _cnt))
-                                        if _csz > 0 and _cnt > 0:
-                                            _creqs.append(
-                                                (_t, int(_csz * (10**_cat_dec)), _cnt)
-                                            )
+                                    for _sizes, _counts, _scale, _reqs in (
+                                        (_tsxch, _tcxch, 10**12, _xreqs),
+                                        (_tscat, _tccat, 10**_cat_dec, _creqs),
+                                    ):
+                                        for _t, _raw_cnt in _counts.items():
+                                            _cnt = int(_raw_cnt or 0)
+                                            _size = Decimal(str(_sizes.get(_t, 0)))
+                                            if _size > 0 and _cnt > 0:
+                                                _reqs.append(
+                                                    (_t, int(_size * _scale), _cnt)
+                                                )
+                                    _target_xch = sum(n for _, _, n in _xreqs)
+                                    _target_cat = sum(n for _, _, n in _creqs)
                                     _xa = _alloc_match(_xch_coins, _xreqs, _tol)
                                     _ca = _alloc_match(_cat_coins, _creqs, _tol)
-                                    for _t, _cnt in _tc.items():
-                                        _cnt = int(_cnt or 0)
-                                        if _cnt <= 0:
-                                            continue
-                                        _xsz = float(_tsxch.get(_t, 0))
-                                        _csz = float(_tscat.get(_t, 0))
-                                        if _xsz > 0 and _xa.get(_t, 0) < _cnt:
-                                            _all_ok = False
-                                        if _csz > 0 and _ca.get(_t, 0) < _cnt:
-                                            _all_ok = False
+                                    _all_ok = all(
+                                        _xa.get(_t, 0) >= _cnt
+                                        for _t, _, _cnt in _xreqs
+                                    ) and all(
+                                        _ca.get(_t, 0) >= _cnt
+                                        for _t, _, _cnt in _creqs
+                                    )
                                     _matched_xch = sum(_xa.values())
                                     _matched_cat = sum(_ca.values())
                                 else:
