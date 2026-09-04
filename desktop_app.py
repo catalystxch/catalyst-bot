@@ -1183,6 +1183,23 @@ def run_desktop_mode(dev_mode: bool = False):
     _state["confirmed_close"] = False
 
     def on_closing():
+        # The bot loop stops before cancel-on-exit finishes. Keep the native
+        # window alive while its worker is still settling wallet effects.
+        try:
+            import api_server as _api
+
+            cancel_thread = getattr(_api, "_cancel_all_thread", None)
+            with _api._cancel_all_state_lock:
+                cancel_active = bool(_api._cancel_all_state.get("running"))
+            if cancel_active or (
+                cancel_thread is not None and cancel_thread.is_alive()
+            ):
+                window.show()
+                window.restore()
+                return False
+        except Exception:
+            # An unreadable worker state cannot establish safe completion.
+            return False
         # If the user already confirmed via the modal, let it through.
         if _state.get("confirmed_close"):
             try:

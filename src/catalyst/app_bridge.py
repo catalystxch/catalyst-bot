@@ -549,7 +549,10 @@ class AppBridge:
             "/api/offers/cancel_all",
             method="POST",
             content_type="application/json",
-            data="{}",
+            json={
+                "wait_for_confirmation": type(_body) is dict
+                and _body.get("wait_for_confirmation") is True
+            },
         ):
             resp = api_server.api_cancel_all()
         return _unwrap_flask_response(resp)

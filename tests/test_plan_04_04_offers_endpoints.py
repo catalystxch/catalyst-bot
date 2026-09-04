@@ -388,6 +388,129 @@ class TestCancelOffer(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllPost(_FlaskBase):
+    def test_shutdown_pending_cancel_is_not_empty_or_complete(self):
+        for value in (2, "2", "PENDING_CANCEL"):
+            with self.subTest(status=value):
+                stopped = _make_bot()
+                stopped.is_running.return_value = False
+                stopped.offer_manager.cancel_offers_and_settle.return_value = {
+                    "complete": False,
+                    "authoritative_complete": False,
+                    "total": 1,
+                    "cancelled": 0,
+                    "resolved": 0,
+                    "closed": 0,
+                    "pending": 1,
+                    "failed": 0,
+                    "remaining": 1,
+                    "error": "Pending proof",
+                }
+                history = {
+                    "success": True,
+                    "end_of_history": True,
+                    "total": 1,
+                    "offers": [{"trade_id": "a" * 64, "status": value}],
+                }
+                with (
+                    patch.object(api_server, "bot", stopped),
+                    patch(
+                        "wallet.get_authoritative_offer_history", return_value=history
+                    ),
+                    patch(
+                        "database.get_retryable_failed_offer_cancels", return_value=[]
+                    ),
+                    patch.object(
+                        api_server,
+                        "start_mutation_thread",
+                        side_effect=lambda **kw: kw["target"](),
+                    ),
+                ):
+                    resp = self._post(
+                        "/api/offers/cancel_all", {"wait_for_confirmation": True}
+                    )
+                self.assertEqual(resp.status_code, 200)
+                stopped.offer_manager.cancel_offers_and_settle.assert_called_once()
+                status = self.client.get(
+                    "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+                ).get_json()
+                self.assertFalse(status["complete"])
+                stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
+
+    def test_shutdown_incomplete_or_paginated_history_cannot_prove_empty(self):
+        for history in (
+            [],
+            {"offers": [], "success": True, "end_of_history": False, "total": 0},
+            {"offers": [], "success": True, "end_of_history": True, "total": 4},
+        ):
+            with self.subTest(history=history):
+                stopped = _make_bot()
+                stopped.is_running.return_value = False
+                with (
+                    patch.object(api_server, "bot", stopped),
+                    patch(
+                        "wallet.get_authoritative_offer_history", return_value=history
+                    ),
+                ):
+                    resp = self._post(
+                        "/api/offers/cancel_all", {"wait_for_confirmation": True}
+                    )
+                self.assertFalse(resp.get_json()["success"])
+                stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
+
+    def test_shutdown_mode_waits_for_authoritative_manager_completion(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        tid = "a" * 64
+        stopped.offer_manager.cancel_offers_and_settle.return_value = {
+            "total": 1,
+            "cancelled": 0,
+            "pending": 1,
+            "failed": 0,
+            "remaining": 1,
+            "complete": False,
+            "authoritative_complete": False,
+            "error": "Confirmation still pending",
+        }
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "end_of_history": True,
+                    "total": 1,
+                    "offers": [{"trade_id": tid, "status": "active"}],
+                },
+            ),
+            patch("database.get_retryable_failed_offer_cancels", return_value=[]),
+            patch.object(
+                api_server,
+                "start_mutation_thread",
+                side_effect=lambda **kw: kw["target"](),
+            ),
+        ):
+            resp = self._post("/api/offers/cancel_all", {"wait_for_confirmation": True})
+        self.assertEqual(resp.status_code, 200)
+        stopped.offer_manager.cancel_offers_and_settle.assert_called_once()
+        stopped.offer_manager.cancel_offers.assert_not_called()
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(status["pending"], 1)
+
+    def test_shutdown_mode_wallet_unavailable_does_not_report_empty(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", return_value=None),
+        ):
+            resp = self._post("/api/offers/cancel_all", {"wait_for_confirmation": True})
+        self.assertFalse(resp.get_json()["success"])
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
+
     def test_requires_token(self):
         resp = self._post("/api/offers/cancel_all", auth=False)
         self.assertEqual(resp.status_code, 401)
@@ -561,10 +684,11 @@ class TestCancelAllPost(_FlaskBase):
         assert "cancelResult.async === true" in shutdown_source
         assert "cancelResult.total" in shutdown_source
         assert "await waitForShutdownCancelAllCompletion" in shutdown_source
-        assert "pending + failed !== count" in shutdown_source
+        assert "finalStatus.authoritative_complete !== true" in shutdown_source
+        assert "cancelled + closed !== count" in shutdown_source
         assert "throw e;" in shutdown_source
         assert "/offers/open_count" not in shutdown_source
-        assert "pending authoritative reconciliation" in shutdown_source
+        assert "waiting for authoritative confirmation" in shutdown_source
         assert "confirmed cancelled" not in shutdown_source
 
     def test_stopped_cancel_all_submits_500_offers_in_one_authority_envelope(self):

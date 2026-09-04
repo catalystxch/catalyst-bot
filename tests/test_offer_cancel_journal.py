@@ -3752,9 +3752,11 @@ def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
+@pytest.mark.parametrize("shutdown_mode", [False, True])
 def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
     isolated_database,
     monkeypatch,
+    shutdown_mode,
 ):
     intent_id = _seed_task7_created_offer(
         trade_id=TRADE_ID,
@@ -3832,7 +3834,13 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
         ),
     )
 
-    assert manager.retry_failed_cancels() == 0
+    if shutdown_mode:
+        result = manager.cancel_offers_and_settle(
+            [TRADE_ID], retry_failed_attempts={TRADE_ID: 1}
+        )
+        assert result["complete"] is True and result["cancelled"] == 1
+    else:
+        assert manager.retry_failed_cancels() == 0
 
     assert effects == [TRADE_ID, TRADE_ID]
     assert active_operations == [None, OPERATION_ID]
@@ -3842,9 +3850,11 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
     assert release_calls == [(1, [OPERATION_ID])]
 
 
+@pytest.mark.parametrize("shutdown_mode", [False, True])
 def test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven(
     isolated_database,
     monkeypatch,
+    shutdown_mode,
 ):
     _seed_task7_created_offer(
         trade_id=TRADE_ID,
@@ -3917,7 +3927,13 @@ def test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven(
         ),
     )
 
-    assert manager.retry_failed_cancels() == -1
+    if shutdown_mode:
+        result = manager.cancel_offers_and_settle(
+            [TRADE_ID], retry_failed_attempts={TRADE_ID: 1}
+        )
+        assert result["complete"] is False and result["pending"] == 1
+    else:
+        assert manager.retry_failed_cancels() == -1
 
     assert effects == [TRADE_ID, TRADE_ID]
     assert reconcile_calls == []

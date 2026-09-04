@@ -305,6 +305,10 @@ def api_cancel_all():
     slog("GUI_ACTION", ">>> BUTTON: Cancel All Offers")
     cancelled = 0
     failed = 0
+    body = request.get_json(silent=True) or {}
+    wait_for_confirmation = (
+        type(body) is dict and body.get("wait_for_confirmation") is True
+    )
 
     if bot and bot.is_running():
         msg = (
@@ -331,6 +335,7 @@ def api_cancel_all():
 
     _reset_cancel_all_state(
         running=True,
+        confirmation_mode=wait_for_confirmation,
         complete=False,
         error=None,
         phase="starting",
@@ -389,9 +394,34 @@ def api_cancel_all():
         # and the GUI can poll /api/offers/cancel_all/status for live progress
         # instead of hanging for 2-3 minutes with no feedback.
         try:
-            from wallet import get_all_offers
+            from wallet import get_all_offers, get_authoritative_offer_history
 
-            all_offers = get_all_offers(include_completed=False, end=500)
+            if wait_for_confirmation:
+                history = get_authoritative_offer_history(
+                    include_completed=False, end=500
+                )
+                all_offers = history.get("offers") if type(history) is dict else None
+                if (
+                    type(history) is not dict
+                    or history.get("success") is not True
+                    or history.get("end_of_history") is not True
+                    or type(all_offers) is not list
+                    or type(history.get("total")) is not int
+                    or history.get("total") != len(all_offers)
+                ):
+                    all_offers = None
+            else:
+                all_offers = get_all_offers(include_completed=False, end=500)
+            if wait_for_confirmation and type(all_offers) is not list:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    phase="error",
+                    error="Wallet offer inventory is unavailable",
+                )
+                return jsonify(
+                    {"success": False, "error": "Wallet offer inventory is unavailable"}
+                ), 503
             if not all_offers:
                 if bot and getattr(bot, "offer_manager", None):
                     bot.offer_manager.expect_empty_wallet_offer_book(
@@ -406,7 +436,12 @@ def api_cancel_all():
                     finished_at=datetime.now(timezone.utc).isoformat(),
                 )
                 return jsonify(
-                    {"success": True, "cancelled": 0, "message": "No offers found"}
+                    {
+                        "success": True,
+                        "cancelled": 0,
+                        "message": "No offers found",
+                        "authoritative_complete": wait_for_confirmation,
+                    }
                 )
 
             # Filter to open offers only.
@@ -427,6 +462,8 @@ def api_cancel_all():
             open_ids = []
             for o in all_offers if isinstance(all_offers, list) else []:
                 if not isinstance(o, dict):
+                    if wait_for_confirmation:
+                        raise ValueError("Wallet returned an invalid offer record")
                     continue
                 raw_status = o.get("status", "")
                 status = str(raw_status).upper() if raw_status is not None else ""
@@ -434,10 +471,31 @@ def api_cancel_all():
                 is_open = status in OPEN_STATUSES or (
                     isinstance(raw_status, int) and raw_status <= 1
                 )
+                if wait_for_confirmation:
+                    is_open = status in (OPEN_STATUSES - {"4"}) | {
+                        "PENDING_CANCEL",
+                        "2",
+                    }
                 if is_open:
                     tid = o.get("trade_id", "") or o.get("offer_id", "")
                     if tid:
                         open_ids.append(tid)
+                    elif wait_for_confirmation:
+                        raise ValueError(
+                            "Wallet returned an active offer without an ID"
+                        )
+                elif wait_for_confirmation and status not in {
+                    "CANCELLED",
+                    "CANCELED",
+                    "EXPIRED",
+                    "CONFIRMED",
+                    "FILLED",
+                    "3",
+                    "4",
+                    "5",
+                    "6",
+                }:
+                    raise ValueError("Wallet returned an unknown offer status")
 
             if not open_ids:
                 if bot and getattr(bot, "offer_manager", None):
@@ -457,6 +515,7 @@ def api_cancel_all():
                         "success": True,
                         "cancelled": 0,
                         "message": "No active offers found",
+                        "authoritative_complete": wait_for_confirmation,
                     }
                 )
 
@@ -516,6 +575,41 @@ def api_cancel_all():
                 _w_pending = 0
                 _w_failed = 0
                 try:
+                    if wait_for_confirmation:
+
+                        def on_confirm_progress(**payload):
+                            _set_cancel_all_state(
+                                **payload,
+                                phase="confirming",
+                                message=f"{payload['resolved']}/{payload['total']} offers resolved: {payload['cancelled']} cancelled, {payload['closed']} otherwise ended; waiting for confirmation.",
+                            )
+
+                        result = durable_manager.cancel_offers_and_settle(
+                            _cancel_open_ids,
+                            retry_failed_attempts=_retry_failed_attempts,
+                            progress_callback=on_confirm_progress,
+                        )
+                        complete = result.get("authoritative_complete") is True
+                        _set_cancel_all_state(
+                            **result,
+                            running=False,
+                            phase="complete" if complete else "error",
+                            message=(
+                                f"All {len(_cancel_open_ids)} offers resolved with authoritative proof."
+                                if complete
+                                else result.get("error", "Cancellation is incomplete.")
+                            ),
+                            finished_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        log_event(
+                            "info" if complete else "warning",
+                            "shutdown_cancellation_complete"
+                            if complete
+                            else "shutdown_cancellation_incomplete",
+                            f"Cancel-on-exit: {result.get('cancelled', 0)} confirmed, "
+                            f"{result.get('remaining', len(_cancel_open_ids))} remaining",
+                        )
+                        return
                     _cancel_kwargs = {
                         "reason": "manual_cancel_all",
                         "force_storm": True,

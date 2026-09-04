@@ -32732,6 +32732,15 @@
                 const total = Number(state.total || 0);
                 const pending = Number(state.pending || 0);
                 const failed = Number(state.failed || 0);
+                if (state.confirmation_mode === true) {
+                    const confirmedTotal = Number(state.cancelled || 0);
+                    const complete = state.authoritative_complete === true;
+                    const failedState = state.phase === 'error';
+                    const copy = state.message || `${confirmedTotal}/${total} cancellations confirmed; ${pending} awaiting confirmation.`;
+                    setShutdownStep('Offers', failedState ? 'error' : complete ? 'done' : 'active', copy);
+                    updateShutdownProgress(complete ? 'Cancellations confirmed' : 'Waiting for cancellation confirmations...', copy);
+                    return;
+                }
                 const processed = Math.max(0, pending + failed);
                 const remaining = Math.max(0, total - processed);
                 const batchNum = Number(state.current_batch || 0);
@@ -32776,12 +32785,17 @@
         }
 
         async function waitForShutdownCancelAllCompletion(timeoutMs = 180000) {
-            const startedAt = Date.now();
-            while (Date.now() - startedAt < timeoutMs) {
+            let lastProgressAt = Date.now();
+            let confirmedCount = -1;
+            while (Date.now() - lastProgressAt < timeoutMs) {
                 const statusResp = await apiFetch(`${API_URL}/offers/cancel_all/status`);
                 const statusData = await statusResp.json();
                 if (!statusData || statusData.success !== true) {
                     throw new Error('Cancellation status returned an invalid response.');
+                }
+                if (Number.isInteger(statusData.resolved) && statusData.resolved > confirmedCount) {
+                    confirmedCount = statusData.resolved;
+                    lastProgressAt = Date.now();
                 }
                 const phase = String(statusData.phase || '').toLowerCase();
                 if (phase === 'error' || statusData.error) {
@@ -32795,7 +32809,7 @@
                 }
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            throw new Error('Cancellation worker did not finish before the shutdown timeout.');
+            throw new Error('No cancellation confirmation progress for three minutes. The app will stay open.');
         }
 
         function finishShutdownProgress(success, detailText) {
@@ -32874,10 +32888,11 @@
                     updateShutdownProgress('Cancelling offers...', 'Sending cancel request to Sage...');
                     addLogEntry('info', '   Step 2: Cancelling all offers...');
                     try {
-                        startShutdownCancelAllPoll();
-                        const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
+                        const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ wait_for_confirmation: true })
+                        });
                         const cancelResult = await cancelResp.json();
-                        stopShutdownCancelAllPoll();
 
                         if (!cancelResult.success) {
                             throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');
@@ -32892,23 +32907,33 @@
                         }
 
                         if (isAsyncCancel) {
-                            addLogEntry('info', `   Journaling cancellation requests for ${count} offers...`);
+                            startShutdownCancelAllPoll();
+                            addLogEntry('info', `   Cancelling ${count} offers and waiting for authoritative confirmation...`);
                             const finalStatus = await waitForShutdownCancelAllCompletion(180000);
                             stopShutdownCancelAllPoll();
                             const pending = Number(finalStatus.pending);
                             const failed = Number(finalStatus.failed);
+                            const cancelled = Number(finalStatus.cancelled);
+                            const closed = Number(finalStatus.closed);
                             if (!Number.isInteger(pending) || pending < 0 ||
                                 !Number.isInteger(failed) || failed < 0 ||
-                                pending + failed !== count) {
-                                throw new Error('Cancellation worker returned inconsistent completion totals.');
+                                finalStatus.authoritative_complete !== true ||
+                                !Number.isInteger(cancelled) || cancelled < 0 ||
+                                !Number.isInteger(closed) || closed < 0 ||
+                                pending !== 0 || failed !== 0 || cancelled + closed !== count ||
+                                finalStatus.resolved !== count ||
+                                finalStatus.remaining !== 0) {
+                                throw new Error('Not all cancellations are confirmed. The app will stay open.');
                             }
-                            const journalSummary = `${pending} pending authoritative reconciliation, ${failed} rejected without effect.`;
-                            setShutdownStep('Offers', 'done', `Cancellation requests journaled: ${journalSummary}`);
-                            addLogEntry('success', `   Cancellation requests journaled: ${journalSummary}`);
+                            const finalCopy = `${cancelled} cancellations confirmed; ${closed} offers otherwise ended with authoritative proof.`;
+                            setShutdownStep('Offers', 'done', finalCopy);
+                            addLogEntry('success', `   ${finalCopy}`);
                         } else if (count > 0) {
-                            setShutdownStep('Offers', 'done', `Cancellation handler completed for ${count} offers.`);
-                            addLogEntry('success', `   Cancellation handler completed for ${count} offers`);
+                            throw new Error('Cancellation confirmation was not returned. The app will stay open.');
                         } else {
+                            if (cancelResult.authoritative_complete !== true) {
+                                throw new Error('Wallet offer inventory could not be verified. The app will stay open.');
+                            }
                             setShutdownStep('Offers', 'done', 'No open offers needed cancelling.');
                             addLogEntry('success', '   No offers to cancel');
                         }

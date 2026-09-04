@@ -27,13 +27,15 @@ def shutdown_page(page):
         content="""
         const API_URL = '/api'; let TAURI_ALLOW_CLOSE = false;
         window.calls = []; window.logs = []; window.finished = false;
+        window.cancelStatus = {success: true, complete: true, running: false,
+            phase: 'complete', pending: 0, failed: 0, cancelled: 72,
+            remaining: 0, authoritative_complete: true, resolved: 72, closed: 0};
         async function apiFetch(path) {
             calls.push(path);
             return {json: async () => path.endsWith('/cancel_all')
                 ? {success: true, async: true, total: 72}
                 : path.endsWith('/status')
-                    ? {success: true, complete: true, running: false,
-                       phase: 'complete', pending: 72, failed: 0}
+                    ? window.cancelStatus
                     : {success: true}};
         }
         function addLogEntry(level, message) {logs.push({level, message});}
@@ -108,3 +110,57 @@ def test_explicit_leave_open_choice_still_shuts_down(shutdown_page):
     page.locator("#confirmShutdownBtn").click()
     page.wait_for_function("finished")
     assert page.evaluate("calls") == ["/api/bot/stop", "/api/shutdown"]
+
+
+def test_proven_expired_members_are_not_reported_as_cancelled(shutdown_page):
+    page = shutdown_page
+    page.evaluate("cancelStatus.cancelled=70; cancelStatus.closed=2;")
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.evaluate("confirmShutdown()")
+    assert page.evaluate("finished") is True
+    assert page.evaluate(
+        "logs.some(e => e.message.includes('70 cancellations confirmed; 2 offers otherwise ended'))"
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {
+            "complete": True,
+            "running": False,
+            "phase": "complete",
+            "pending": 1,
+            "failed": 71,
+            "cancelled": 0,
+        },
+        {
+            "complete": True,
+            "running": False,
+            "phase": "complete",
+            "pending": 72,
+            "failed": 0,
+            "cancelled": 0,
+        },
+        {
+            "complete": True,
+            "running": False,
+            "phase": "complete",
+            "pending": 0,
+            "failed": 0,
+            "cancelled": 72,
+        },
+    ],
+)
+def test_journal_completion_without_authoritative_completion_keeps_app_open(
+    shutdown_page, status
+):
+    page = shutdown_page
+    page.evaluate("(s) => {window.cancelStatus={success:true,...s};}", status)
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.evaluate("confirmShutdown()")
+    assert "/api/shutdown" not in page.evaluate("calls")
+    assert page.evaluate("finished") is False
+    assert page.evaluate("logs.some(e => e.level === 'error')")

@@ -53,6 +53,7 @@ import offer_registry
 from refresh_safety import RefreshPlan, plan_refresh
 from sage_offer_wire import canonical_sage_offer_text
 import wallet
+from super_log import slog
 from cancel_outcomes import (
     CANCEL_CONFIRMED,
     CANCEL_FAILED,
@@ -4291,7 +4292,9 @@ class OfferManager:
                 if (
                     type(reason) is str
                     and 0 < len(reason) <= 80
-                    and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789" for c in reason)
+                    and all(
+                        c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789" for c in reason
+                    )
                 ):
                     fail_msg += f" [{reason}]"
                 # Coin exhaustion is an expected operational state (not a code
@@ -7349,6 +7352,128 @@ class OfferManager:
     # Retry failed cancels (V1 parity: retry_failed_cancels)
     # -------------------------------------------------------------------
 
+    def cancel_offers_and_settle(
+        self, trade_ids, *, retry_failed_attempts=None, progress_callback=None
+    ) -> dict:
+        """Cancel an explicit snapshot, settling each effect before the next.
+
+        Used by cancel-on-exit. Ordinary bulk callers retain their existing
+        journal-only contract. No submission or wallet status alone completes
+        this workflow; the existing exact-proof settlement owns gate release.
+        """
+        intents = [
+            self._canonical_cancel_intent(tid) for tid in dict.fromkeys(trade_ids)
+        ]
+        total = len(intents)
+        state = dict(
+            total=total,
+            cancelled=0,
+            resolved=0,
+            closed=0,
+            pending=0,
+            failed=0,
+            remaining=total,
+            complete=False,
+            authoritative_complete=False,
+        )
+        retries = dict(retry_failed_attempts or {})
+
+        def publish():
+            if progress_callback:
+                progress_callback(**state)
+
+        for intent in intents:
+            if not self._begin_cancel_settlement(intent.operation_id):
+                state["error"] = "Another cancellation is awaiting confirmation."
+                return state
+            try:
+                proof = database.get_authoritative_terminal_record(intent.trade_id)
+
+                def proven_outcome(record):
+                    if (
+                        type(record) is dict
+                        and record.get("intent_id") == intent.intent_id
+                        and record.get("sage_trade_id") == intent.trade_id
+                        and record.get("operation_id")
+                        == f"reconcile:{intent.intent_id}"
+                        and record.get("outcome")
+                        in {"CANCELLED_PROVEN", "FILLED_PROVEN", "EXPIRED_PROVEN"}
+                    ):
+                        return record["outcome"]
+                    return None
+
+                terminal = proven_outcome(proof)
+                if terminal is None:
+                    elapsed = self._reconcile_elapsed_cancel_retry(
+                        intent,
+                        database.get_offer(intent.trade_id),
+                        now_timestamp=time.time(),
+                    )
+                    if elapsed is not None:
+                        terminal = (
+                            proven_outcome(
+                                database.get_authoritative_terminal_record(
+                                    intent.trade_id
+                                )
+                            )
+                            if elapsed
+                            else None
+                        )
+                        if terminal is None:
+                            state["error"] = (
+                                "An ended offer still needs authoritative reconciliation. The app will stay open."
+                            )
+                            return state
+                if terminal is None:
+                    kwargs = dict(reason="shutdown_cancel_all", force_storm=True)
+                    if intent.trade_id in retries:
+                        kwargs["_retry_failed_attempts"] = {
+                            intent.trade_id: retries[intent.trade_id]
+                        }
+                    results = self.cancel_offers([intent.trade_id], **kwargs)
+                    result = (
+                        results.get(intent.trade_id) if type(results) is dict else None
+                    )
+                    outcome = result.get("outcome") if type(result) is dict else None
+                    if outcome != CANCEL_SUBMITTED_UNCONFIRMED:
+                        state["failed"] = int(outcome == CANCEL_FAILED)
+                        state["pending"] = int(outcome != CANCEL_FAILED)
+                        state["error"] = (
+                            "Cancellation was rejected or its outcome is unproven. The app will stay open."
+                        )
+                        publish()
+                        return state
+                    state["pending"] = 1
+                    publish()
+                    if not self._settle_submitted_cancel(intent):
+                        state["error"] = (
+                            "Cancellation confirmation is still pending. The app will stay open."
+                        )
+                        publish()
+                        return state
+                    terminal = "CANCELLED_PROVEN"
+                state["pending"] = 0
+                state["cancelled"] += int(terminal == "CANCELLED_PROVEN")
+                state["closed"] += int(terminal != "CANCELLED_PROVEN")
+                state["resolved"] += 1
+                state["remaining"] = total - state["resolved"]
+                publish()
+            except Exception as exc:
+                slog(
+                    "CANCEL",
+                    "Cancel-on-exit stopped before completion",
+                    data={"error_type": type(exc).__name__},
+                    level="error",
+                )
+                state["error"] = (
+                    "Cancellation could not finish safely. Check the logs; the app will stay open."
+                )
+                return state
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
+        state.update(complete=True, authoritative_complete=True)
+        return state
+
     def get_active_cancel_settlement_operation(self) -> Optional[str]:
         """Return the exact retry operation currently awaiting Task 9 proof."""
 
@@ -7503,7 +7628,7 @@ class OfferManager:
         if type(offer) is not dict:
             return None
         status = str(offer.get("status") or "").strip().lower()
-        should_reconcile = status in {"cancelled", "expired"}
+        should_reconcile = status in {"cancelled", "expired", "filled"}
         expires_at = offer.get("expires_at")
         if not should_reconcile and expires_at:
             try:
