@@ -31955,7 +31955,7 @@
                 showToast(message, 'warning', 10000);
                 _cancelAllInProgress = false;
                 window._catalystCancelAllFlowActive = false;
-            }, 300000);
+            }, 900000); // Longer than the confirmed worker's 10-minute proof wait.
         }
 
         async function cancelAllRequestJson(path, options, timeoutMs = 120000) {
@@ -32027,7 +32027,7 @@
 
             try {
                 openCancelProgressModal(totalActive);
-                const stopDeadline = Date.now() + 300000;
+                const stopDeadline = Date.now() + 600000;
                 while (true) {
                     const stopped = await cancelAllRequestJson(`${API_URL}/bot/stop`, {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -32860,7 +32860,7 @@
             _shutdownCancelAllPollTimer = setInterval(pollShutdownCancelAllStatusOnce, 1000);
         }
 
-        async function waitForShutdownCancelAllCompletion(timeoutMs = 180000) {
+        async function waitForShutdownCancelAllCompletion(timeoutMs = 900000) {
             let lastProgressAt = Date.now();
             let confirmedCount = -1;
             while (Date.now() - lastProgressAt < timeoutMs) {
@@ -32884,7 +32884,7 @@
                 }
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            throw new Error('No cancellation confirmation progress for three minutes. The app will stay open.');
+            throw new Error('Cancellation confirmation is taking too long. The app will stay open; check Sage before retrying.');
         }
 
         function finishShutdownProgress(success, detailText) {
@@ -32949,7 +32949,7 @@
                 updateShutdownProgress('Stopping the bot...', 'Pausing pricing, watchers, and trading loops.');
                 addLogEntry('info', '   Step 1: Stopping bot loop...');
                 try {
-                    const stopDeadline = Date.now() + 300000;
+                    const stopDeadline = Date.now() + 600000;
                     while (true) {
                         const stopResult = await cancelAllRequestJson(`${API_URL}/bot/stop`, {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -32999,7 +32999,7 @@
                         if (isAsyncCancel) {
                             startShutdownCancelAllPoll();
                             addLogEntry('info', `   Cancelling ${count} offers and waiting for authoritative confirmation...`);
-                            const finalStatus = await waitForShutdownCancelAllCompletion(180000);
+                            const finalStatus = await waitForShutdownCancelAllCompletion();
                             stopShutdownCancelAllPoll();
                             const pending = Number(finalStatus.pending);
                             const failed = Number(finalStatus.failed);

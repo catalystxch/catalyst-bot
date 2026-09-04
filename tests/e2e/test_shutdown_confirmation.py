@@ -62,6 +62,26 @@ def shutdown_page(page):
     return page
 
 
+def test_shutdown_keeps_waiting_past_three_minutes_for_proof(shutdown_page):
+    page = shutdown_page
+    page.clock.install()
+    page.evaluate(
+        "cancelStatus={...cancelStatus,phase:'confirming',running:true,complete:false,authoritative_complete:false,resolved:0,cancelled:0,pending:1,remaining:72}"
+    )
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.locator("#confirmShutdownBtn").click()
+    page.clock.fast_forward(480000)
+    assert page.evaluate("window._catalystShutdownFlowActive") is True
+    assert page.evaluate("finished") is False
+    assert not page.evaluate("logs.some(e=>e.level==='error')")
+    page.evaluate(
+        "cancelStatus={...cancelStatus,phase:'complete',running:false,complete:true,authoritative_complete:true,resolved:72,cancelled:72,pending:0,remaining:0}"
+    )
+    page.clock.run_for(3100)
+    assert page.evaluate("finished") is True
+
+
 @pytest.mark.parametrize("repeat_open", [False, True])
 def test_confirmed_cancellation_survives_repeated_close_request(
     shutdown_page, repeat_open

@@ -3932,6 +3932,7 @@ def test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven(
     reconcile_calls = []
     release_calls = []
     monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(offer_manager, "CONFIRMED_CANCEL_WAIT_SECONDS", 0)
     monkeypatch.setattr(
         offer_reconciliation,
         "load_authoritative_evidence",

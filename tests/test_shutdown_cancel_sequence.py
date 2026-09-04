@@ -7,6 +7,8 @@ from unittest.mock import Mock
 import pytest
 
 import database
+import offer_manager
+import offer_reconciliation
 from offer_manager import OfferManager
 
 
@@ -34,7 +36,7 @@ def test_waits_for_each_confirmation_before_next_effect(manager, monkeypatch):
         calls.append(("submit", ids[0], kwargs.get("_retry_failed_attempts")))
         return {ids[0]: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}}
 
-    def settle(intent):
+    def settle(intent, **kwargs):
         calls.append(("settle", intent.trade_id))
         return True
 
@@ -89,6 +91,90 @@ def test_exception_releases_settlement_lock_and_stops(manager, monkeypatch):
     assert result["complete"] is False
     assert "private detail" not in str(result)
     assert manager.get_active_cancel_settlement_operation() is None
+
+
+@pytest.mark.parametrize("proof_after", [150, None])
+def test_confirmed_batch_waits_for_late_proof_without_resubmitting(
+    manager, monkeypatch, proof_after
+):
+    """Exercise the real settlement loop across the old 90-second cutoff."""
+    clock = [0.0]
+    current = [None]
+    submitted = []
+    applied = []
+    monkeypatch.setattr(
+        offer_manager,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            time=lambda: clock[0],
+            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        ),
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 90)
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_POLL_INTERVAL_SECS", 5)
+    monkeypatch.setattr(
+        manager, "_reconcile_elapsed_cancel_retry", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {"state": "tripped", "generation": 1},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": "cancel:" + current[0]}],
+    )
+    monkeypatch.setattr(
+        database, "get_offer_intent", lambda iid: {"sage_trade_id": iid.split(":")[1]}
+    )
+
+    def cancel(ids, **kwargs):
+        current[0] = ids[0]
+        submitted.append((ids[0], clock[0]))
+        return {ids[0]: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}}
+
+    monkeypatch.setattr(manager, "cancel_offers", cancel)
+    monkeypatch.setattr(
+        offer_reconciliation, "load_authoritative_evidence", lambda intent: {}
+    )
+    monkeypatch.setattr(
+        offer_reconciliation, "_derive_single_cancel_context", lambda *a, **kw: {}
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *a, **kw: {
+            "classification": "CANCELLED_PROVEN"
+            if proof_after is not None and clock[0] - submitted[-1][1] >= proof_after
+            else "UNKNOWN"
+        },
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda iid, **kw: (
+            applied.append(iid)
+            or {"classification": "CANCELLED_PROVEN", "applied": True}
+        ),
+    )
+    monkeypatch.setattr(
+        offer_manager.mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(release_resolved=lambda *a: {"released": True}),
+    )
+
+    result = manager.cancel_offers_and_settle(["a", "b"])
+    if proof_after is not None:
+        assert result["complete"] is True
+        assert submitted == [("a", 0), ("b", 150)]
+        assert applied == ["intent:a", "intent:b"]
+        assert result["resolved"] == 2
+    else:
+        assert result["complete"] is False and result["pending"] == 1
+        assert submitted == [("a", 0)] and applied == []
+        assert clock[0] == 600
 
 
 def test_desktop_bridge_preserves_confirmation_mode(monkeypatch):

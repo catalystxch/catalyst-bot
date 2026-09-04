@@ -64,6 +64,11 @@ from cancel_outcomes import (
     validate_cancel_result,
 )
 
+# Explicit manual/shutdown cancellation can wait through slow confirmations.
+# Ordinary trading retries retain cfg.CANCEL_MAX_WAIT_SECS. The GUI's idle
+# deadline is longer (15 minutes) so it cannot abandon this 10-minute wait.
+CONFIRMED_CANCEL_WAIT_SECONDS = 600.0
+
 
 @dataclass(frozen=True, slots=True)
 class _CanonicalOfferCreationIntent:
@@ -7445,7 +7450,9 @@ class OfferManager:
                         return state
                     state["pending"] = 1
                     publish()
-                    if not self._settle_submitted_cancel(intent):
+                    if not self._settle_submitted_cancel(
+                        intent, max_wait_seconds=CONFIRMED_CANCEL_WAIT_SECONDS
+                    ):
                         state["error"] = (
                             "Cancellation confirmation is still pending. The app will stay open."
                         )

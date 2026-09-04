@@ -182,13 +182,34 @@ def test_manual_timeout_extends_only_for_increasing_proven_count(cancel_page):
     )
     page.evaluate("confirmCancelAll()")
     page.evaluate("stopCancelAllProgressPolling()")
-    page.clock.fast_forward(290000)
+    page.clock.fast_forward(890000)
     page.evaluate(
         "async()=>{cancelStatus.resolved=1; cancelStatus.cancelled=1; cancelStatus.remaining=1; await pollCancelAllProgressOnce(2);}"
     )
     page.clock.fast_forward(20000)
     assert page.evaluate("_cancelAllInProgress") is True
     page.evaluate("pollCancelAllProgressOnce(2)")
-    page.clock.fast_forward(280001)
+    page.clock.fast_forward(880001)
     page.wait_for_function("!_cancelAllInProgress")
     assert "timed out" in page.locator("#cancelProgressMessage").inner_text()
+
+
+def test_manual_keeps_waiting_past_five_minutes_for_confirmed_worker(cancel_page):
+    page = cancel_page
+    page.clock.install()
+    page.evaluate(
+        "cancelStatus={...cancelStatus,phase:'confirming',running:true,complete:false,authoritative_complete:false,resolved:0,cancelled:0,remaining:2}"
+    )
+    page.evaluate("confirmCancelAll()")
+    page.clock.fast_forward(480000)
+    assert page.evaluate("_cancelAllInProgress") is True
+    assert page.evaluate("window._catalystCancelAllFlowActive") is True
+    page.evaluate(
+        "cancelStatus={...cancelStatus,phase:'complete',running:false,complete:true,authoritative_complete:true,resolved:2,cancelled:2,remaining:0}; pollCancelAllProgressOnce(2)"
+    )
+    page.clock.run_for(2100)
+    assert page.evaluate("_cancelAllInProgress") is False
+    assert (
+        "2 cancellations confirmed"
+        in page.locator("#cancelProgressMessage").inner_text()
+    )
