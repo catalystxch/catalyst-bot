@@ -32630,16 +32630,24 @@
         const updateStartChiaButton = updateStartSageButton;
 
         function showShutdownModal() {
-            // Reset state each time modal opens
+            const modal = document.getElementById('shutdownModal');
+            // Native close requests can arrive again while this dialog is open.
+            // Preserve the user's cancellation choice for the current dialog.
+            if (modal.classList.contains('active')) return;
             const cb = document.getElementById('shutdownCancelOffers');
             if (cb) cb.checked = false;
+            resetShutdownCancelConfirmation();
+            modal.classList.add('active');
+        }
+
+        function resetShutdownCancelConfirmation() {
+            const cb = document.getElementById('shutdownCancelOffers');
             const warn = document.getElementById('shutdownCancelWarning');
-            if (warn) warn.style.display = 'none';
+            if (warn) warn.style.display = cb && cb.checked ? 'block' : 'none';
             const confirmed = document.getElementById('shutdownCancelConfirmed');
             if (confirmed) confirmed.value = 'no';
             // Reset warning innerHTML in case it was replaced by confirmation text
             if (warn) warn.innerHTML = '⚠️ This will cancel <strong>all active offers</strong> on Dexie before shutting down. Are you sure?<div style="margin-top: 6px; display: flex; gap: 8px;"><button onclick="document.getElementById(\'shutdownCancelConfirmed\').value=\'yes\'; this.parentElement.parentElement.innerHTML=\'✅ Offers will be cancelled before shutdown\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(239,68,68,0.5); background: rgba(220,38,38,0.3); color: var(--danger-200); cursor: pointer; font-size: 12px;">Yes, cancel them</button><button onclick="document.getElementById(\'shutdownCancelOffers\').checked=false; document.getElementById(\'shutdownCancelWarning\').style.display=\'none\'; document.getElementById(\'shutdownCancelConfirmed\').value=\'no\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(100,116,139,0.4); background: rgba(100,116,139,0.2); color: var(--slate-400); cursor: pointer; font-size: 12px;">No, leave them open</button></div>';
-            document.getElementById('shutdownModal').classList.add('active');
         }
 
         function closeShutdownModal() {
@@ -32822,26 +32830,24 @@
         // Show/hide cancel warning when checkbox changes
         document.addEventListener('change', function(e) {
             if (e.target && e.target.id === 'shutdownCancelOffers') {
-                const warn = document.getElementById('shutdownCancelWarning');
-                const confirmed = document.getElementById('shutdownCancelConfirmed');
-                if (e.target.checked) {
-                    if (warn) warn.style.display = 'block';
-                    if (confirmed) confirmed.value = 'no';
-                } else {
-                    if (warn) warn.style.display = 'none';
-                    if (confirmed) confirmed.value = 'no';
-                }
+                resetShutdownCancelConfirmation();
             }
         });
 
         async function confirmShutdown() {
             const btn = document.getElementById('confirmShutdownBtn');
-            if (btn) { btn.disabled = true; btn.textContent = 'Shutting down...'; }
 
             // Only cancel offers if checkbox ticked AND user confirmed the "are you sure"
             const cbChecked = document.getElementById('shutdownCancelOffers').checked;
             const confirmed = document.getElementById('shutdownCancelConfirmed');
             const cancelOffers = cbChecked && confirmed && confirmed.value === 'yes';
+            // A selected but unconfirmed cancellation must never mean leave-open.
+            if (cbChecked && !cancelOffers) {
+                resetShutdownCancelConfirmation();
+                addLogEntry('warning', 'Please confirm "Yes, cancel them" before shutting down.');
+                return;
+            }
+            if (btn) { btn.disabled = true; btn.textContent = 'Shutting down...'; }
             closeShutdownModal();
             showShutdownProgressModal(cancelOffers);
 
