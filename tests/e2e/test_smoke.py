@@ -345,6 +345,58 @@ def test_dashboard_diagnostics_do_not_render_false_tibet_values_during_outage(pa
     )
 
 
+def test_dashboard_diagnostics_do_not_render_false_tibet_values_without_pool(page):
+    """A reachable TibetSwap API with no pool cannot supply depth or arb data."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    rendered = page.evaluate(
+        """() => {
+            window.renderMarketSummaryVenueState({
+                has_data: true,
+                dexie_depth_xch: 128.35,
+                pool_xch: 0,
+                tibet_price: 0,
+                arb_gap_bps: 0,
+                tibet_available: true,
+                tibet_reason: 'no_pool',
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market healthy — bot operating normally',
+                metrics: { arb_gap_bps: '0', pool_depth_ratio: '0' },
+            });
+            window.updateIntelDiagnostics({
+                pricing: { bid: 0.00007343, ask: 0.00007860 },
+                arb_gap_bps: 0,
+                chia_health: { status: 'healthy' },
+                diagnostics: { spacescan_enabled: true },
+            });
+            return {
+                depth: document.getElementById('mktTibetDepth').textContent,
+                gap: document.getElementById('mktArbGap').textContent,
+                sub: document.getElementById('mktArbSub').textContent,
+                healthGap: document.getElementById('ccArbGap').textContent,
+                healthPool: document.getElementById('ccPoolDepth').textContent,
+                intelCoverage: document.getElementById('coverageTibet').textContent,
+                intelGap: document.getElementById('intelArbGapTrend').textContent,
+                intelGapSub: document.getElementById('intelArbGapTrendSub').textContent,
+            };
+        }"""
+    )
+
+    assert rendered == {
+        "depth": "Tibet: no pool",
+        "gap": "Unavailable",
+        "sub": "No TibetSwap pool — Dexie-only",
+        "healthGap": "Unavailable",
+        "healthPool": "Unavailable",
+        "intelCoverage": "none",
+        "intelGap": "Unavailable",
+        "intelGapSub": "No TibetSwap pool — Dexie-only",
+    }
+
+
 def test_dashboard_market_health_marks_tibet_metrics_unavailable_during_outage(page):
     """The TibetSwap outage must not render AMM-only health metrics as zero."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

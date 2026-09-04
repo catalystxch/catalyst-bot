@@ -149,7 +149,10 @@ class PublicReadinessSmokeTests(unittest.TestCase):
             REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "feedback.yml"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("May 2026 public beta", html)
+        self.assertIn("What's current - public beta", html)
+        self.assertNotIn("What's current - May 2026 public beta", html)
+        self.assertIn('<div class="card-title">Recent Activity</div>', html)
+        self.assertNotIn("Recent Activity (Last 20)", html)
         self.assertIn("Dashboard layout (May 2026 beta refresh)", html)
         self.assertIn("plants tighter real inner-tier offers", html)
         self.assertNotIn("April 2026", html)

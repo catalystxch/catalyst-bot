@@ -9889,7 +9889,7 @@
 
             <!-- History Tab -->
             <div id="historyTab" class="tab-content">
-                <div class="card-title">Recent Activity (Last 20)</div>
+                <div class="card-title">Recent Activity</div>
                 <div class="offers-list" id="historyOffers" style="max-height: 500px; overflow-y: auto;">
                     <div class="empty-state">No fills in this session yet. As Dexie matches your offers, each fill will appear here with its side, price, and size.</div>
                 </div>
@@ -12294,7 +12294,7 @@
                         </div>
                     </div>
                     <div class="v4-modal-panel">
-                        <div class="v4-modal-panel-title">What's current - May 2026 public beta</div>
+                        <div class="v4-modal-panel-title">What's current - public beta</div>
                         <div class="v4-modal-panel-copy">
                             <strong>Public beta release flow</strong> - The website, installer metadata, and in-app update badge now track the current release so testers can download the latest build from one place.<br>
                             <strong>Sage wallet selection</strong> - Startup asks testers to choose the Sage signing wallet/fingerprint on every launch, then runs RPC, version, Spacescan, Splash, Smart Settings, coin prep, and start-guard checks against that wallet.<br>
@@ -14827,6 +14827,7 @@
             const summary = (typeof _lastMarketSummary !== 'undefined' && _lastMarketSummary) || {};
             const tibetOutage = summary.tibet_available === false
                 && summary.tibet_reason === 'provider_outage';
+            const tibetNoPool = summary.tibet_reason === 'no_pool';
             const summaryTibetXch = Number(summary.pool_xch || 0);
             const hasTibet = Number(pricing.tibet_price || 0) > 0
                 || String(pricing.source || '').toLowerCase() === 'tibetswap'
@@ -14839,13 +14840,22 @@
             const sageOk = healthText.indexOf('error') === -1 && healthText.indexOf('offline') === -1;
             const spacescan = data.diagnostics && data.diagnostics.spacescan_enabled !== false;
             _diagPill('coverageDexie', hasDexie, hasDexie ? 'ready' : 'thin');
-            _diagPill('coverageTibet', hasTibet && !tibetOutage, tibetOutage ? 'outage' : (hasTibet ? 'ready' : 'none'));
+            _diagPill(
+                'coverageTibet',
+                hasTibet && !tibetOutage && !tibetNoPool,
+                tibetOutage ? 'outage' : (tibetNoPool ? 'none' : (hasTibet ? 'ready' : 'none'))
+            );
             _diagPill('coverageSpacescan', spacescan, spacescan ? 'enabled' : 'limited');
             _diagPill('coverageSage', sageOk, sageOk ? 'ready' : 'check');
 
             if (tibetOutage) {
                 _diagText('intelArbGapTrend', 'Unavailable');
                 _diagText('intelArbGapTrendSub', 'TibetSwap outage — Dexie-only');
+                return;
+            }
+            if (tibetNoPool) {
+                _diagText('intelArbGapTrend', 'Unavailable');
+                _diagText('intelArbGapTrendSub', 'No TibetSwap pool — Dexie-only');
                 return;
             }
             const gap = Number(data.arb_gap_bps || 0);
@@ -23661,20 +23671,30 @@
 
         function renderMarketSummaryVenueState(data = {}) {
             _lastMarketSummary = data;
+            const tibetReason = String(data.tibet_reason || '').toLowerCase();
             const tibetOutage = data.tibet_available === false
-                && data.tibet_reason === 'provider_outage';
-            if (!tibetOutage) return false;
+                && tibetReason === 'provider_outage';
+            const tibetNoPool = tibetReason === 'no_pool';
+            if (!tibetOutage && !tibetNoPool) return false;
 
             const tibetDepthEl = document.getElementById('mktTibetDepth');
             const gapEl = document.getElementById('mktArbGap');
             const gapSub = document.getElementById('mktArbSub');
             const lcGapVal = document.getElementById('lcGapValue');
-            if (tibetDepthEl) tibetDepthEl.textContent = 'Tibet: unavailable';
+            if (tibetDepthEl) {
+                tibetDepthEl.textContent = tibetOutage
+                    ? 'Tibet: unavailable'
+                    : 'Tibet: no pool';
+            }
             if (gapEl) {
                 gapEl.textContent = 'Unavailable';
                 gapEl.style.color = 'var(--status-warning)';
             }
-            if (gapSub) gapSub.textContent = 'TibetSwap outage — Dexie-only';
+            if (gapSub) {
+                gapSub.textContent = tibetOutage
+                    ? 'TibetSwap outage — Dexie-only'
+                    : 'No TibetSwap pool — Dexie-only';
+            }
             if (lcGapVal) lcGapVal.textContent = '—';
             _latestFastArbGapBps = null;
             return true;
@@ -27138,15 +27158,25 @@
                 m.tibetswap_available === false
                 && String(m.pricing_mode || '').toLowerCase() === 'dexie_only'
             );
+            const tibetNoPool = String(
+                (_lastMarketSummary && _lastMarketSummary.tibet_reason)
+                || m.tibet_reason
+                || ''
+            ).toLowerCase() === 'no_pool';
+            const tibetReferenceUnavailable = tibetSwapOutage || tibetNoPool;
             const arbEl = el('ccArbGap');
             const poolDepthEl = el('ccPoolDepth');
-            if (tibetSwapOutage) {
+            if (tibetReferenceUnavailable) {
                 arbEl.textContent = 'Unavailable';
-                arbEl.title = 'TibetSwap outage — Dexie-only pricing';
+                arbEl.title = tibetSwapOutage
+                    ? 'TibetSwap outage — Dexie-only pricing'
+                    : 'No TibetSwap pool — Dexie-only pricing';
                 arbEl.style.color = 'var(--status-warning)';
                 arbEl.style.opacity = '1';
                 poolDepthEl.textContent = 'Unavailable';
-                poolDepthEl.title = 'TibetSwap outage — pool depth unavailable';
+                poolDepthEl.title = tibetSwapOutage
+                    ? 'TibetSwap outage — pool depth unavailable'
+                    : 'No TibetSwap pool — pool depth unavailable';
                 poolDepthEl.style.color = 'var(--status-warning)';
                 poolDepthEl.style.opacity = '1';
             } else if (m.arb_gap_bps !== undefined) {
@@ -27156,7 +27186,7 @@
                 arbEl.style.color = arbVal > 200 ? 'var(--status-warning)' : 'var(--slate-200)';
                 arbEl.style.opacity = '1';
             }
-            if (!tibetSwapOutage && m.pool_depth_ratio !== undefined) {
+            if (!tibetReferenceUnavailable && m.pool_depth_ratio !== undefined) {
                 poolDepthEl.textContent = (parseFloat(m.pool_depth_ratio) * 100).toFixed(2) + '%';
                 poolDepthEl.title = '';
                 poolDepthEl.style.color = '';
