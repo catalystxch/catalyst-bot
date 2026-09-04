@@ -136,6 +136,20 @@ class _TempDB(unittest.TestCase):
             cat_asset_id=_FAKE_ASSET,
         )
 
+    def _seed_unresolved_open_offer(self, trade_id, side):
+        """Create an open row that authoritative preflight cannot retire."""
+        self.assertTrue(
+            _db.add_offer(
+                trade_id,
+                side,
+                Decimal("0.001"),
+                Decimal("1"),
+                Decimal("1000"),
+                _FAKE_ASSET,
+                tier="inner",
+            )
+        )
+
     def _seed_terminal_offer_proof(self):
         """Mirror a completed TEST 7 offer with append-only proof history."""
         coin_id = "b" * 64
@@ -232,7 +246,7 @@ class _TempDB(unittest.TestCase):
         bot.coin_manager.get_coin_health.return_value = (5, 5)
         return bot
 
-    def _trigger(self, bot_mock=None, full_reset=False):
+    def _trigger(self, bot_mock=None, full_reset=False, *, reset_offer_history=False):
         """POST /api/coin-prep/trigger with threading mocked out."""
         mock_thread = MagicMock()
         with (
@@ -245,7 +259,10 @@ class _TempDB(unittest.TestCase):
             mock_thread_cls.return_value = mock_thread
             return self.client.post(
                 "/api/coin-prep/trigger",
-                json={"full_reset": full_reset},
+                json={
+                    "full_reset": full_reset,
+                    "reset_offer_history": reset_offer_history,
+                },
                 headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
             )
@@ -441,6 +458,97 @@ class TestCoinPrepFullCycle(_TempDB):
                 "now": "2026-08-24T09:55:00Z",
             },
         )
+
+    def test_keep_history_reprep_names_open_offer_cancellation_recovery(self):
+        """A live book must produce an actionable, fail-closed prep response."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+        self._seed_unresolved_open_offer("open-sell", "sell")
+
+        resp = self._trigger(full_reset=False)
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "error": "coin_prep_requires_offer_cancellation",
+                "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+                "message": (
+                    "2 open offers must be cancelled and authoritatively confirmed "
+                    "before coin prep can safely replace their locked coins."
+                ),
+                "action": "cancel_all_then_retry",
+                "open_offer_count": 2,
+                "open_buy_count": 1,
+                "open_sell_count": 1,
+                "reconciliation": {
+                    "examined": 2,
+                    "terminal_applied": 0,
+                    "pending": 2,
+                    "errors": 0,
+                },
+                "conflicts": ["open_offers"],
+                "fills_cleared": 0,
+                "round_trips_cleared": 0,
+                "coins_cleared": 0,
+                "open_offers_cancelled": 0,
+                "offers_deleted": 0,
+                "price_history_cleared": False,
+                "inventory_cleared": False,
+                "preserve_history": True,
+                "reset_at": unittest.mock.ANY,
+            },
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_full_reset_names_open_offers_without_hiding_other_conflicts(self):
+        """Full reset must expose cancel recovery without promising it clears proof state."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+        self._seed_unresolved_open_offer("open-sell", "sell")
+
+        resp = self._trigger(full_reset=True)
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(data["reason"], "OPEN_OFFERS_REQUIRE_CANCELLATION")
+        self.assertEqual(
+            data["action"], "cancel_all_then_retry_without_protected_resets"
+        )
+        self.assertEqual(data["open_offer_count"], 2)
+        self.assertEqual(data["open_buy_count"], 1)
+        self.assertEqual(data["open_sell_count"], 1)
+        self.assertEqual(
+            data["conflicts"],
+            ["authoritative_session_state", "coin_reservations", "open_offers"],
+        )
+        self.assertEqual(
+            data["additional_conflicts"],
+            ["authoritative_session_state", "coin_reservations"],
+        )
+        self.assertIn(
+            "retry coin prep without clearing protected history", data["message"]
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_offer_history_reset_does_not_auto_resume_after_cancellation(self):
+        """Cancelling creates proof history, so that requested reset must stay manual."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+
+        resp = self._trigger(full_reset=False, reset_offer_history=True)
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(
+            data["action"], "cancel_all_then_retry_without_protected_resets"
+        )
+        self.assertEqual(data["conflicts"], ["open_offers"])
+        self.assertEqual(data["additional_conflicts"], ["offer_proof_history"])
+        self.assertIn(
+            "retry coin prep without clearing protected history", data["message"]
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
 
 
 # ---------------------------------------------------------------------------

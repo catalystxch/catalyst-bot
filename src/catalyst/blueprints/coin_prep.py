@@ -126,6 +126,96 @@ def _reconcile_authoritative_open_offers_before_prep() -> dict:
     return summary
 
 
+def _coin_prep_open_offer_conflict(
+    reset_summary: dict,
+    reconciliation: dict | None,
+    *,
+    protected_offer_history_reset: bool = False,
+) -> dict | None:
+    """Translate the reset guard's live-book denial into a recovery contract.
+
+    The authority guard is intentionally generic because it protects several
+    reset routes.  Coin prep has a specific safe recovery: the operator must
+    explicitly cancel the live book, wait for Sage to prove the terminal
+    states, and then retry.  Keep every guard field while adding the counts
+    and action the GUI needs to offer that path without pretending any offer
+    was cancelled locally.
+    """
+
+    conflicts = list(reset_summary.get("conflicts") or [])
+    if "open_offers" not in conflicts:
+        return None
+
+    import database
+
+    rows = database.get_open_offers(include_elapsed=True)
+    buy_count = sum(1 for row in rows if type(row) is dict and row.get("side") == "buy")
+    sell_count = sum(
+        1 for row in rows if type(row) is dict and row.get("side") == "sell"
+    )
+    open_count = len(rows)
+    noun = "offer" if open_count == 1 else "offers"
+    additional_conflicts = sorted(
+        conflict for conflict in conflicts if conflict != "open_offers"
+    )
+    # Cancelling an offer necessarily creates/extends durable offer proof.
+    # Therefore a request to delete offer history cannot be auto-replayed
+    # after cancellation even when the first broad guard only reports the
+    # currently open rows.
+    if (
+        protected_offer_history_reset
+        and "offer_proof_history" not in additional_conflicts
+    ):
+        additional_conflicts.append("offer_proof_history")
+        additional_conflicts.sort()
+    if additional_conflicts:
+        action = "cancel_all_then_retry_without_protected_resets"
+        message = (
+            f"{open_count} open {noun} must be cancelled and "
+            "authoritatively confirmed before coin prep can safely replace "
+            "their locked coins. The requested history reset is also blocked "
+            "by protected authoritative state; after cancellation, retry coin "
+            "prep without clearing protected history."
+        )
+    else:
+        action = "cancel_all_then_retry"
+        message = (
+            f"{open_count} open {noun} must be cancelled and "
+            "authoritatively confirmed before coin prep can safely "
+            "replace their locked coins."
+        )
+    result = dict(reset_summary)
+    result.update(
+        {
+            "success": False,
+            "error": "coin_prep_requires_offer_cancellation",
+            "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+            "message": message,
+            "action": action,
+            "open_offer_count": open_count,
+            "open_buy_count": buy_count,
+            "open_sell_count": sell_count,
+            "reconciliation": dict(reconciliation or {}),
+        }
+    )
+    if additional_conflicts:
+        result["additional_conflicts"] = additional_conflicts
+    log_event(
+        "warning",
+        "coin_prep_requires_offer_cancellation",
+        result["message"],
+        data={
+            "open_offer_count": open_count,
+            "open_buy_count": buy_count,
+            "open_sell_count": sell_count,
+            "additional_conflicts": additional_conflicts,
+            "action": action,
+            "reconciliation": result["reconciliation"],
+        },
+    )
+    return result
+
+
 def _inventory_summary_from_coin_summary(
     coin_summary: dict, manager_summary: dict = None
 ) -> dict:
@@ -1555,8 +1645,9 @@ def _api_coin_prep_trigger_locked():
         # Under full_reset=True the caller requests the broad legacy reset.
         # It remains opt-in, but authoritative or protected state produces a
         # stable conflict instead of deleting fills, proofs, offers, or locks.
+        _prep_reconciliation = None
         if not _prep_reset_pnl:
-            _reconcile_authoritative_open_offers_before_prep()
+            _prep_reconciliation = _reconcile_authoritative_open_offers_before_prep()
         try:
             reset_summary = api_server._reset_fresh_run_session(
                 clear_coins=_prep_reset_pnl,
@@ -1571,6 +1662,13 @@ def _api_coin_prep_trigger_locked():
                 ),
             )
             if not reset_summary["success"]:
+                open_offer_conflict = _coin_prep_open_offer_conflict(
+                    reset_summary,
+                    _prep_reconciliation,
+                    protected_offer_history_reset=_prep_reset_offers,
+                )
+                if open_offer_conflict is not None:
+                    return jsonify(open_offer_conflict), 409
                 return jsonify(reset_summary), 409
         except Exception as _clean_err:
             log_event(

@@ -121,6 +121,31 @@ def _local_api_log_url() -> str:
     return f"http://127.0.0.1:{port}/api/log"
 
 
+def _select_smallest_sufficient_coin_id(
+    coins,
+    *,
+    minimum_amount: int,
+    excluded_coin_ids=None,
+) -> str | None:
+    """Select one exact input without consuming a protected pool coin."""
+
+    excluded = {
+        str(coin_id or "").replace("0x", "").lower()
+        for coin_id in (excluded_coin_ids or set())
+    }
+    sufficient = []
+    for coin in coins or []:
+        if not isinstance(coin, Mapping):
+            continue
+        coin_id = str(coin.get("coin_id") or "").replace("0x", "").lower()
+        amount = int(coin.get("amount", 0) or 0)
+        if len(coin_id) == 64 and coin_id not in excluded and amount >= minimum_amount:
+            sufficient.append((amount, coin_id))
+    if not sufficient:
+        return None
+    return min(sufficient, key=lambda item: item[0])[1]
+
+
 def _validate_coin_prep_worker_delegation(args, environment=None) -> dict:
     """Validate the exact parent/run scope before constructing the worker."""
 
@@ -988,9 +1013,13 @@ class CoinPrepWorker:
             "coin_prep.combine_batch": "coin_ids",
             "coin_prep.combine": "coin_ids",
             "coin_prep.combine_cat_with_fee": "coin_ids",
+            "coin_prep.create_cat_tier_pools_exact_with_fee": "coin_ids",
             "coin_prep.create_tier_pools_exact": "selected_coin_ids",
         }
-        exact_pool_operations = {"coin_prep.create_tier_pools_exact"}
+        exact_pool_operations = {
+            "coin_prep.create_cat_tier_pools_exact_with_fee",
+            "coin_prep.create_tier_pools_exact",
+        }
         single_source_operations = {
             "coin_prep.split_tier_pool": "target_coin_id",
             "coin_prep.split_xch_pool": "target_coin_id",
@@ -1081,6 +1110,7 @@ class CoinPrepWorker:
         fee_coin_ids: list[str] = []
         sage_topup_operations = {
             "coin_prep.combine_cat_with_fee",
+            "coin_prep.create_cat_tier_pools_exact_with_fee",
             "coin_prep.split_cat_pool",
             "coin_prep.retry_cat_split",
         }
@@ -5193,6 +5223,43 @@ class CoinPrepWorker:
                             }
                             for payment in payments
                         ]
+                        fee_mojos = self._tx_fee_mojos()
+                        fee_coin_id = None
+                        if fee_mojos > 0:
+                            fee_candidates = (
+                                self._get_coins_via_rpc(
+                                    self.xch_wallet_id,
+                                    "cat-tier-pool-fee-exact-source",
+                                    selectable_only=True,
+                                )
+                                or []
+                            )
+                            safe_fee_candidates = fee_candidates
+                            if getattr(self, "tier_enabled", False):
+                                _assigned, unmatched = (
+                                    self._partition_coins_for_designation(
+                                        fee_candidates,
+                                        "xch",
+                                    )
+                                )
+                                safe_fee_candidates = unmatched
+                            protected_xch_pool_ids = {
+                                str(coin.get("coin_id") or "")
+                                for coin in xch_pool_coin_map.values()
+                                if isinstance(coin, Mapping)
+                            }
+                            fee_coin_id = _select_smallest_sufficient_coin_id(
+                                safe_fee_candidates,
+                                minimum_amount=fee_mojos,
+                                excluded_coin_ids=protected_xch_pool_ids,
+                            )
+                            if fee_coin_id is None:
+                                self.log(
+                                    "      Exact-source CAT pool creation needs one "
+                                    f"safe unmatched XCH fee input of at least {fee_mojos:,} mojos"
+                                )
+                                return None
+                            actions.append({"type": "fee", "amount": str(fee_mojos)})
                         change_mojos = selected_total - total_mojos
                         output_contract = [
                             (
@@ -5215,30 +5282,55 @@ class CoinPrepWorker:
                             )
                             return None
 
-                        def _create_exact_cat_pools(
-                            selected_coin_ids,
-                            actions,
-                            auto_submit=True,
-                            fee_mojos=0,
-                        ):
-                            return create_transaction_rpc(
+                        if fee_mojos > 0:
+
+                            def _create_exact_cat_pools_with_fee(
+                                coin_ids,
+                                actions,
+                                fee_coin_id,
+                                auto_submit=True,
+                                fee_mojos=0,
+                            ):
+                                return create_transaction_rpc(
+                                    selected_coin_ids=[*coin_ids, fee_coin_id],
+                                    actions=actions,
+                                    auto_submit=auto_submit,
+                                )
+
+                            result = self._call_wallet_mutation(
+                                "coin_prep.create_cat_tier_pools_exact_with_fee",
+                                _create_exact_cat_pools_with_fee,
+                                coin_ids=selected_coin_ids,
+                                actions=actions,
+                                fee_coin_id=fee_coin_id,
+                                auto_submit=True,
+                                fee_mojos=fee_mojos,
+                                _authority_fee_coin_ids=[fee_coin_id],
+                                _prep_contract=prep_contract,
+                            )
+                        else:
+
+                            def _create_exact_cat_pools(
+                                selected_coin_ids,
+                                actions,
+                                auto_submit=True,
+                                fee_mojos=0,
+                            ):
+                                return create_transaction_rpc(
+                                    selected_coin_ids=selected_coin_ids,
+                                    actions=actions,
+                                    auto_submit=auto_submit,
+                                )
+
+                            result = self._call_wallet_mutation(
+                                "coin_prep.create_tier_pools_exact",
+                                _create_exact_cat_pools,
                                 selected_coin_ids=selected_coin_ids,
                                 actions=actions,
-                                auto_submit=auto_submit,
+                                auto_submit=True,
+                                fee_mojos=0,
+                                _prep_contract=prep_contract,
                             )
-
-                        result = self._call_wallet_mutation(
-                            "coin_prep.create_tier_pools_exact",
-                            _create_exact_cat_pools,
-                            selected_coin_ids=selected_coin_ids,
-                            actions=actions,
-                            auto_submit=True,
-                            # A CAT source cannot pay an XCH fee. Keeping this
-                            # exact-source creation fee-free prevents Sage from
-                            # silently selecting an unrelated XCH coin.
-                            fee_mojos=0,
-                            _prep_contract=prep_contract,
-                        )
                     else:
                         fee_mojos = self._tx_fee_mojos()
                         required_mojos = total_mojos + fee_mojos
