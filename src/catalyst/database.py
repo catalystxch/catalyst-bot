@@ -10774,6 +10774,21 @@ def _coin_terminal_mutation_is_protected(
     return bool(offer is not None and offer["status"] == "open")
 
 
+def _coin_has_authoritative_permanent_spend(
+    conn: sqlite3.Connection, coin_id: str
+) -> bool:
+    """Return whether immutable Task 9 proof says this coin was spent.
+
+    ``released`` is also a terminal offer outcome, but it deliberately returns
+    the same unspent coin to the wallet.  Treating every terminal outcome as a
+    permanent mutation fence strands expired/cancelled offer coins as ``gone``
+    even after Sage exposes them as selectable again.
+    """
+
+    outcome = _authoritative_coin_outcome(conn, coin_id)
+    return outcome is not None and outcome["disposition"] == "spent"
+
+
 def is_coin_reconciliation_protected(coin_id: str) -> bool:
     """Return whether legacy wallet reconciliation must preserve this coin."""
 
@@ -10851,7 +10866,7 @@ def reconcile_wallet_locked_coin_links(
             if (
                 row["trade_id"]
                 or coin_id in registry_protected
-                or _authoritative_coin_outcome(conn, coin_id) is not None
+                or _coin_has_authoritative_permanent_spend(conn, coin_id)
             ):
                 stats["protected"] += 1
                 continue
@@ -10969,7 +10984,7 @@ def reconcile_coins_with_wallet(
             if (
                 db_coins[nid]["trade_id"]
                 or norm_coin_id(raw_id) in registry_protected
-                or _authoritative_coin_outcome(conn, raw_id) is not None
+                or _coin_has_authoritative_permanent_spend(conn, raw_id)
             ):
                 stats["protected"] += 1
                 continue
@@ -11003,7 +11018,7 @@ def reconcile_coins_with_wallet(
             if nid not in db_ids:
                 if (
                     nid in registry_protected
-                    or _authoritative_coin_outcome(conn, store_id) is not None
+                    or _coin_has_authoritative_permanent_spend(conn, store_id)
                 ):
                     stats["protected"] += 1
                     continue
@@ -11071,7 +11086,7 @@ def reconcile_coins_with_wallet(
                     if (
                         db_coins[nid]["trade_id"]
                         or norm_coin_id(raw_id) in registry_protected
-                        or _authoritative_coin_outcome(conn, raw_id) is not None
+                        or _coin_has_authoritative_permanent_spend(conn, raw_id)
                     ):
                         stats["protected"] += 1
                         continue
@@ -11103,7 +11118,7 @@ def reconcile_coins_with_wallet(
                     if (
                         db_coins[nid]["trade_id"]
                         or norm_coin_id(raw_id) in registry_protected
-                        or _authoritative_coin_outcome(conn, raw_id) is not None
+                        or _coin_has_authoritative_permanent_spend(conn, raw_id)
                     ):
                         stats["protected"] += 1
                         continue
@@ -11124,7 +11139,7 @@ def reconcile_coins_with_wallet(
                     if (
                         db_coins[nid]["trade_id"]
                         or norm_coin_id(raw_id) in registry_protected
-                        or _authoritative_coin_outcome(conn, raw_id) is not None
+                        or _coin_has_authoritative_permanent_spend(conn, raw_id)
                     ):
                         stats["already_ok"] += 1
                     else:
@@ -11245,7 +11260,7 @@ def link_offers_to_locked_coins(active_offers: list, cat_asset_id: str) -> dict:
             normalized = norm_coin_id(r["coin_id"])
             if (
                 normalized in registry_protected
-                or _authoritative_coin_outcome(conn, normalized) is not None
+                or _coin_has_authoritative_permanent_spend(conn, normalized)
             ):
                 stats["protected"] += 1
                 continue
@@ -11599,7 +11614,7 @@ def cleanup_orphaned_locked_coins(
             if (
                 tid
                 or nid in registry_protected
-                or _authoritative_coin_outcome(conn, nid) is not None
+                or _coin_has_authoritative_permanent_spend(conn, nid)
             ):
                 stats["protected_registry_or_trade"] += 1
                 continue

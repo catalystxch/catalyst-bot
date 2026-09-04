@@ -9033,6 +9033,49 @@ def test_exact_expiry_proof_persists_terminal_and_releases_selected_coin(
     )
 
 
+def test_released_expiry_coin_reappears_from_authoritative_wallet_snapshot(
+    isolated_database,
+):
+    """Released terminal proof must not strand a selectable coin as gone.
+
+    Regression for the 2026-09-04 TEST 7 live ladder: 36 prepared XCH
+    coins were selectable in Sage after their earlier offers expired, but
+    CATalyst kept them ``gone`` because any terminal coin outcome was treated
+    like a permanent spend.  Only ``spent`` outcomes are permanently fenced.
+    """
+    _persist_created_offer()
+    evidence = _evidence(
+        offers=[_offer(status=5, transaction_id="")],
+        transactions=[],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                offer_id=TRADE,
+            )
+        },
+    )
+    result = reconcile_offer("intent-task9", evidence=evidence, now=AFTER)
+    assert result["classification"] == EXPIRED_PROVEN
+
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE coins SET status='gone', trade_id=NULL WHERE coin_id=?",
+        (database.norm_coin_id(COIN),),
+    )
+    conn.commit()
+
+    selectable = {database.norm_coin_id(COIN): 1000}
+    stats = database.reconcile_coins_with_wallet(selectable, selectable, "xch")
+
+    assert stats["reappeared"] == 1
+    assert stats["protected"] == 0
+    coin = database.get_coin_state(COIN)
+    assert coin["status"] == "free"
+    assert coin["trade_id"] is None
+
+
 def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(
     isolated_database,
 ):
