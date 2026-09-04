@@ -387,6 +387,15 @@ class _OfferCreationContinuation:
         raise TypeError("offer creation continuations cannot be serialized")
 
 
+class _OfferContinuationExpired(mutation_gate.MutationBlocked):
+    """The local continuation deadline elapsed before a wallet effect."""
+
+    def __init__(self):
+        # Adapters rethrow MutationBlocked past their generic RPC-error handlers.
+        # The facade catches this subtype and supplies the continuation outcome.
+        super().__init__("MUTATION_GATE_SAFETY_STOP", "wallet:continuation:expired")
+
+
 class _OfferCreationContinuationState:
     __slots__ = (
         "adapter",
@@ -501,14 +510,10 @@ def _begin_offer_operation_continuation(
             permit,
             f"{wallet_operation}:continuation:journal",
         )
-        snapshot = _identity_from_adapter(adapter)
-        mutation_gate.require_wallet_mutation_permit_authority(
-            permit,
-            f"{wallet_operation}:continuation:identity",
-        )
-        decision = mutation_gate.require_fresh_wallet_identity(
+        snapshot, decision = _fresh_identity_for_permit(
+            adapter,
             binding,
-            snapshot,
+            permit,
             f"{wallet_operation}:continuation",
         )
         mutation_gate.require_wallet_mutation_permit_authority(
@@ -660,15 +665,15 @@ def refresh_offer_cancel_continuation(
             return False
 
     try:
-        snapshot = _identity_from_adapter(state.adapter)
-        binding, adapter, _decision = (
-            mutation_gate.require_fresh_wallet_operation_continuation(
+        _snapshot, (binding, adapter, _decision) = _read_and_validate_identity(
+            state.adapter,
+            lambda snapshot: mutation_gate.require_fresh_wallet_operation_continuation(
                 state.permit,
                 snapshot,
                 state.wallet_operation,
                 operation,
                 intent,
-            )
+            ),
         )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
@@ -728,6 +733,11 @@ def _run_offer_operation_continuation(
     if state is None:
         return blocked_result()
     effect_attempted = False
+
+    def require_unexpired():
+        if time.monotonic() > state.deadline:
+            raise _OfferContinuationExpired()
+
     try:
         try:
             operation = _exact_continuation_text(operation_id, "operation_id")
@@ -743,15 +753,15 @@ def _run_offer_operation_continuation(
             or target_trade_id != state.target_trade_id
         ):
             return blocked_result()
-        snapshot = _identity_from_adapter(state.adapter)
-        binding, adapter, _decision = (
-            mutation_gate.require_fresh_wallet_operation_continuation(
+        _snapshot, (binding, adapter, _decision) = _read_and_validate_identity(
+            state.adapter,
+            lambda snapshot: mutation_gate.require_fresh_wallet_operation_continuation(
                 state.permit,
                 snapshot,
                 wallet_operation,
                 operation,
                 intent,
-            )
+            ),
         )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
@@ -771,14 +781,18 @@ def _run_offer_operation_continuation(
             safe_step = (
                 step if type(step) is str and step and len(step) <= 64 else "effect"
             )
-            fresh_snapshot = _identity_from_adapter(adapter)
-            checked_binding, checked_adapter, _step_decision = (
-                mutation_gate.require_fresh_wallet_operation_continuation(
-                    state.permit,
-                    fresh_snapshot,
-                    f"{wallet_operation}:{safe_step}:identity",
-                    operation,
-                    intent,
+            _snapshot, (checked_binding, checked_adapter, _step_decision) = (
+                _read_and_validate_identity(
+                    adapter,
+                    lambda fresh_snapshot: (
+                        mutation_gate.require_fresh_wallet_operation_continuation(
+                            state.permit,
+                            fresh_snapshot,
+                            f"{wallet_operation}:{safe_step}:identity",
+                            operation,
+                            intent,
+                        )
+                    ),
                 )
             )
             if (
@@ -790,10 +804,12 @@ def _run_offer_operation_continuation(
                     "WALLET_IDENTITY_BINDING_INVALID",
                     f"{wallet_operation}:{safe_step}",
                 )
+            require_unexpired()
             effect_attempted = True
 
         callback_kwargs["_identity_recheck"] = identity_recheck
         callback = getattr(adapter, adapter_method)
+        require_unexpired()
         result = callback(*callback_args, **callback_kwargs)
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
@@ -814,6 +830,8 @@ def _run_offer_operation_continuation(
         result = dict(result)
         result["_catalyst_effect_attempted"] = effect_attempted
         return result
+    except _OfferContinuationExpired:
+        return blocked_result(effect_attempted=effect_attempted)
     except mutation_gate.MutationBlocked as exc:
         return blocked_result(
             exc.reason_code,
@@ -992,6 +1010,38 @@ def _identity_from_adapter(adapter) -> dict:
     return adapter.get_wallet_identity()
 
 
+_wallet_identity_observation_lock = threading.RLock()
+
+
+def _read_and_validate_identity(adapter, validate):
+    """Order observations with validation; retry only fresh reads, never effects.
+
+    Parallel RPC completion can reverse observation order, and Windows clock
+    ticks can produce equal timestamps. Keep the gate's strict replay policy:
+    reread after a short delay instead of accepting or modifying a stale value.
+    No adapter mutation runs while this observation lock is held.
+    """
+    with _wallet_identity_observation_lock:
+        for attempt in range(3):
+            snapshot = _identity_from_adapter(adapter)
+            try:
+                return snapshot, validate(snapshot)
+            except mutation_gate.MutationBlocked as exc:
+                if exc.reason_code != "WALLET_IDENTITY_STALE" or attempt == 2:
+                    raise
+                time.sleep(0.02)
+
+
+def _fresh_identity_for_permit(adapter, binding, permit, operation):
+    def validate(snapshot):
+        mutation_gate.require_wallet_mutation_permit_authority(
+            permit, f"{operation}:identity"
+        )
+        return mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+
+    return _read_and_validate_identity(adapter, validate)
+
+
 def _revalidate_adapter_authority(adapter, operation: str) -> None:
     runtime = mutation_gate.current_runtime()
     if runtime is not None:
@@ -1109,11 +1159,7 @@ def _run_wallet_mutation_with_authority(
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
         is_identity_transition = export_name == "sage_login"
         if not is_identity_transition:
-            snapshot = _identity_from_adapter(adapter)
-            mutation_gate.require_wallet_mutation_permit_authority(
-                permit, f"{operation}:identity"
-            )
-            mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+            _fresh_identity_for_permit(adapter, binding, permit, operation)
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:dispatch"
         )
@@ -1127,11 +1173,8 @@ def _run_wallet_mutation_with_authority(
                     permit, f"{operation}:{safe_step}:identity"
                 )
                 if not is_identity_transition:
-                    fresh_snapshot = _identity_from_adapter(adapter)
-                    mutation_gate.require_fresh_wallet_identity(
-                        binding,
-                        fresh_snapshot,
-                        f"{operation}:{safe_step}",
+                    _fresh_identity_for_permit(
+                        adapter, binding, permit, f"{operation}:{safe_step}"
                     )
                 mutation_gate.require_wallet_mutation_permit_authority(
                     permit, f"{operation}:{safe_step}:dispatch"
@@ -1148,11 +1191,8 @@ def _run_wallet_mutation_with_authority(
             permit, f"{operation}:outcome"
         )
         if is_identity_transition and wallet_mutation_succeeded(result):
-            target_snapshot = _identity_from_adapter(adapter)
-            mutation_gate.require_fresh_wallet_identity(
-                binding,
-                target_snapshot,
-                f"{operation}:postcondition",
+            _fresh_identity_for_permit(
+                adapter, binding, permit, f"{operation}:postcondition"
             )
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)

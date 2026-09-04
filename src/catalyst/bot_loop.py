@@ -10657,12 +10657,14 @@ class BotLoop:
         self._flush_public_offer_queues()
 
         # ---- Step 12: Coin management ----
+        self._set_cycle_step("step12_coin_health")
         print("   [12] Coin health...", end="", flush=True)
         self._handle_coins(len(current_buy_ids), len(current_sell_ids))
         print(" done", flush=True)
         # step12 log removed
 
         # ---- Step 12a: Trim excess offers (Fix 3) ----
+        self._set_cycle_step("step12a_trim_offers")
         # Belt-and-braces: if anything in steps 9-11 left the live book
         # over the per-side cap (e.g. a slow-confirming cancel meant a
         # create-first requote left both old and new offers alive), trim
@@ -10728,6 +10730,7 @@ class BotLoop:
             )
 
         # ---- Step 12b: Recovery mode evaluation ----
+        self._set_cycle_step("step12b_recovery")
         # Subtract any confirmed probe slots so the probe offer doesn't inflate
         # the apparent buy count and mask a genuine under-target condition.
         _probe_offsets = self._confirmed_probe_slot_offsets(
@@ -10740,6 +10743,7 @@ class BotLoop:
         )
 
         # ---- Step 13: Housekeeping ----
+        self._set_cycle_step("step13_housekeeping")
         print("   [13-15] Housekeeping + inventory + GUI push...", end="", flush=True)
         self._handle_housekeeping()
 
@@ -12361,6 +12365,7 @@ class BotLoop:
 
         # ---- Step 11b: Submit to local Splash node after Dexie is live ----
         if getattr(cfg, "SPLASH_ENABLED", False):
+            self._set_cycle_step("step11b_splash_post")
             try:
                 splash_q = len(getattr(self.splash_manager, "_queue", []) or [])
                 if splash_q > 0:

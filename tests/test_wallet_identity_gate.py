@@ -5,6 +5,8 @@ import ast
 import inspect
 from pathlib import Path
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -153,6 +155,256 @@ def test_runtime_rejects_replayed_or_rollback_identity_observation(monkeypatch):
     with pytest.raises(mutation_gate.MutationBlocked) as replay:
         gate.require_fresh_wallet_identity(_identity(), "offer:create")
     assert replay.value.reason_code == "WALLET_IDENTITY_STALE"
+
+
+@pytest.fixture
+def clock_tick_wallet(monkeypatch):
+    """Use real replay policy, with wallet effects replaced by a recorder."""
+    gate = mutation_gate.MutationGate(
+        run_id="run-clock-tick",
+        owner_pid=123,
+        owner_host="host",
+        wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(123456789),
+        network="mainnet",
+        wallet_identity_binding=_binding(),
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(gate, "require_allowed", lambda operation: None)
+    gate.require_fresh_wallet_identity(
+        _identity(observed_at_utc="2026-08-16T11:59:58Z"), "prime"
+    )
+    snapshots, reads, effects = [], [], []
+
+    def read():
+        snapshot = snapshots.pop(0)
+        reads.append(snapshot)
+        return snapshot
+
+    def create(*args, **kwargs):
+        kwargs["_identity_recheck"]("make_offer")
+        effects.append("make_offer")
+        return {"success": True, "trade_id": "3" * 64, "offer": "offer1test"}
+
+    adapter = SimpleNamespace(get_wallet_identity=read, create_offer=create)
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(mutation_gate, "enter_wallet_mutation", lambda op: object())
+    monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, op: (_binding(), adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_identity",
+        lambda binding, snapshot, op: gate.require_fresh_wallet_identity(snapshot, op),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_operation_continuation",
+        lambda permit, snapshot, op, operation_id, intent_id: (
+            _binding(),
+            adapter,
+            gate.require_fresh_wallet_identity(snapshot, op),
+        ),
+    )
+    return SimpleNamespace(
+        gate=gate,
+        adapter=adapter,
+        snapshots=snapshots,
+        reads=reads,
+        effects=effects,
+    )
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_wallet_rereads_clock_tick_collisions_without_repeating_effect(
+    clock_tick_wallet,
+    continuation,
+):
+    state = clock_tick_wallet
+    seconds = [58, 59, 59, 59.1]
+    if continuation:
+        seconds += [59.1, 59.2]
+    state.snapshots.extend(
+        _identity(observed_at_utc=f"2026-08-16T11:59:{second}Z") for second in seconds
+    )
+    kwargs = {}
+    if continuation:
+        handle = wallet.begin_offer_creation_continuation(
+            operation_id="create:tick",
+            intent_id="tick",
+        )
+        journal = wallet.offer_creation_continuation_journal(handle)
+        assert journal["snapshot"]["observation"]["observed_at_utc"] == (
+            "2026-08-16T11:59:59.000000Z"
+        )
+        kwargs = dict(
+            _creation_continuation=handle,
+            _creation_operation_id="create:tick",
+            _creation_intent_id="tick",
+        )
+    result = wallet.create_offer({1: -1000, 2: 2000}, **kwargs)
+    assert result["success"] is True, result
+    assert state.effects == ["make_offer"]
+    assert len(state.reads) == len(seconds)
+    assert state.snapshots == []
+
+
+@pytest.mark.parametrize(
+    "snapshot,reason,expected_reads",
+    [
+        (_identity(observed_at_utc="2026-08-16T11:59:58Z"), "WALLET_IDENTITY_STALE", 3),
+        (_identity(fingerprint=987654321), "WALLET_IDENTITY_MISMATCH", 1),
+        (_identity(success=False), "WALLET_IDENTITY_UNAVAILABLE", 1),
+        (_identity(observed_at_utc="invalid"), "WALLET_IDENTITY_MALFORMED", 1),
+    ],
+)
+def test_identity_reread_is_bounded_and_other_failures_are_immediate(
+    clock_tick_wallet,
+    snapshot,
+    reason,
+    expected_reads,
+):
+    state = clock_tick_wallet
+    state.snapshots.extend([snapshot] * 4)
+    result = wallet.create_offer({1: -1000, 2: 2000})
+    assert result["reason"] == reason
+    assert result["_catalyst_effect_attempted"] is False
+    assert len(state.reads) == expected_reads
+    assert state.effects == []
+
+
+def test_identity_retry_rechecks_lease_before_dispatch(clock_tick_wallet, monkeypatch):
+    state = clock_tick_wallet
+    state.snapshots.extend(
+        [
+            _identity(observed_at_utc="2026-08-16T11:59:58Z"),
+            _identity(),
+        ]
+    )
+
+    def authority(permit, operation):
+        if len(state.reads) >= 2:
+            raise mutation_gate.MutationBlocked("LEASE_LOST", operation)
+        return _binding(), state.adapter
+
+    monkeypatch.setattr(
+        mutation_gate, "require_wallet_mutation_permit_authority", authority
+    )
+    result = wallet.create_offer({1: -1000, 2: 2000})
+    assert result["reason"] == "LEASE_LOST"
+    assert result["_catalyst_effect_attempted"] is False
+    assert len(state.reads) == 2
+    assert state.effects == []
+
+
+def test_identity_failure_after_adapter_effect_never_repeats_effect(
+    clock_tick_wallet,
+    monkeypatch,
+):
+    state = clock_tick_wallet
+    state.snapshots.append(_identity())
+
+    def effect(*args, **kwargs):
+        state.effects.append("submitted")
+        raise mutation_gate.MutationBlocked("WALLET_IDENTITY_STALE", "after-effect")
+
+    monkeypatch.setattr(state.adapter, "create_offer", effect)
+    result = wallet.create_offer({1: -1000, 2: 2000})
+    assert result["reason"] == "WALLET_IDENTITY_STALE"
+    assert result["_catalyst_effect_attempted"] is True
+    assert state.effects == ["submitted"]
+    assert len(state.reads) == 1
+
+
+@pytest.mark.parametrize("expire_on_read", [2, 3])
+def test_continuation_expiring_during_identity_read_blocks_effect(
+    clock_tick_wallet,
+    monkeypatch,
+    expire_on_read,
+):
+    state = clock_tick_wallet
+    clock = [10.0]
+    monkeypatch.setattr(
+        wallet,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            sleep=lambda seconds: None,
+        ),
+    )
+    state.snapshots.extend(
+        [
+            _identity(),
+            _identity(observed_at_utc="2026-08-16T11:59:59.1Z"),
+            _identity(observed_at_utc="2026-08-16T11:59:59.2Z"),
+        ]
+    )
+    original_read = state.adapter.get_wallet_identity
+
+    def read():
+        snapshot = original_read()
+        if len(state.reads) == expire_on_read:
+            clock[0] = 41.0
+        return snapshot
+
+    monkeypatch.setattr(state.adapter, "get_wallet_identity", read)
+    handle = wallet.begin_offer_creation_continuation(
+        operation_id="create:expiry",
+        intent_id="expiry",
+        ttl_seconds=30,
+    )
+    result = wallet.create_offer(
+        {1: -1000, 2: 2000},
+        _creation_continuation=handle,
+        _creation_operation_id="create:expiry",
+        _creation_intent_id="expiry",
+    )
+    assert result["reason"] == "OFFER_CREATION_CONTINUATION_INVALID"
+    assert result["_catalyst_effect_attempted"] is False
+    assert state.effects == []
+
+
+def test_parallel_identity_reads_are_ordered_but_wallet_effects_can_overlap(
+    clock_tick_wallet,
+    monkeypatch,
+):
+    state = clock_tick_wallet
+    counter_lock = threading.Lock()
+    second_read = threading.Event()
+    effects_ready = threading.Barrier(2)
+
+    def read():
+        with counter_lock:
+            index = len(state.reads) + 1
+            snapshot = _identity(observed_at_utc=f"2026-08-16T11:59:59.{index:06d}Z")
+            state.reads.append(snapshot)
+        if index == 1:
+            # Without serialization a later observation overtakes this RPC.
+            second_read.wait(timeout=0.05)
+        else:
+            second_read.set()
+        return snapshot
+
+    def create(*args, **kwargs):
+        kwargs["_identity_recheck"]("make_offer")
+        # Holding the identity lock through the effect would deadlock here.
+        effects_ready.wait(timeout=5)
+        state.effects.append("make_offer")
+        return {"success": True}
+
+    monkeypatch.setattr(state.adapter, "get_wallet_identity", read)
+    monkeypatch.setattr(state.adapter, "create_offer", create)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(wallet.create_offer, {1: -1000, 2: 2000}) for _ in range(2)
+        ]
+        results = [future.result(timeout=10) for future in futures]
+    assert all(result["success"] is True for result in results), results
+    assert len(state.effects) == 2
+    assert len(state.reads) == 4
 
 
 def test_exported_mutation_reads_identity_again_after_preflight(monkeypatch):

@@ -4287,6 +4287,13 @@ class OfferManager:
             if not res or not res.get("success"):
                 error_msg = str(res.get("error", "")) if res else ""
                 fail_msg = f"Offer #{i + 1}/{num} {side} FAILED: {error_msg[:100]}"
+                reason = res.get("reason") if res else None
+                if (
+                    type(reason) is str
+                    and 0 < len(reason) <= 80
+                    and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789" for c in reason)
+                ):
+                    fail_msg += f" [{reason}]"
                 # Coin exhaustion is an expected operational state (not a code
                 # defect) — already tracked by record_slot_coin_failure /
                 # slot_suspended, so downgrade to debug to avoid log spam.
