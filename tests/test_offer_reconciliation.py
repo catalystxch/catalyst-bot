@@ -10163,7 +10163,7 @@ def test_deleted_history_loader_reinspects_hash_bound_offer_before_recovery(
     corrupt_blob,
     chain_fault,
 ):
-    from coinset_client import CoinsetClient
+    import coinset_client
 
     coin_id = "a11518c6cebbe3f4a28304e4a0f17a9d1530e5c7f8617d3f080a61dbd6bed8a3"
     blob = "offer1regressionfixture"
@@ -10216,18 +10216,16 @@ def test_deleted_history_loader_reinspects_hash_bound_offer_before_recovery(
         ),
     )
     monkeypatch.setattr(
-        CoinsetClient,
+        coinset_client.CoinsetClient,
         "get_block_record_by_height",
         lambda self, height: _deleted_history_expiry_evidence(spent=True)[
             "offer_reinspection"
         ]["spend_blocks"].get(str(height)),
     )
-    import coinset_client
-
     chain_progress = {"past_expiry": False}
 
     monkeypatch.setattr(
-        CoinsetClient,
+        coinset_client.CoinsetClient,
         "get_coin_by_name",
         lambda self, name: (
             {
