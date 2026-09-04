@@ -11917,8 +11917,8 @@
                     <div>
                         <div class="v4-modal-kicker">Offer Control</div>
                         <h3 class="v4-modal-title" id="cancelProgressTitle">Cancelling offers<span id="cancelProgressDots"></span></h3>
-                        <p class="v4-modal-copy" id="cancelProgressMessage">Submitting all cancels in a single bulk transaction, then waiting for on-chain confirmation.</p>
-                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Usually confirms within a block or two (well under a minute).</p>
+                        <p class="v4-modal-copy" id="cancelProgressMessage">Cancelling offers in sequence and checking each confirmation before continuing.</p>
+                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Confirmation times depend on the network. Keep the app open while cancellation is running.</p>
                     </div>
                 </div>
                 <div class="v4-modal-panel" style="margin-bottom: 12px;">
@@ -19598,9 +19598,7 @@
             const cancelBtn = document.getElementById('cancelAllBtn');
             if (!cancelBtn) return;
 
-            // Count open offers (both sides) so we can disable the button
-            // when there's nothing to cancel, instead of opening a modal
-            // that says "no offers to cancel".
+            // Local counts are a preview; the wallet may have additional offers.
             const buyCount = (bot_state && bot_state.offers && bot_state.offers.buy) ? bot_state.offers.buy.length : 0;
             const sellCount = (bot_state && bot_state.offers && bot_state.offers.sell) ? bot_state.offers.sell.length : 0;
             const total = buyCount + sellCount;
@@ -19608,13 +19606,13 @@
             const locked = !!isRunning;
             const empty = total === 0;
 
-            cancelBtn.disabled = locked || empty;
+            cancelBtn.disabled = locked;
             if (locked) {
                 cancelBtn.textContent = 'Stop Bot To Cancel';
                 cancelBtn.title = 'Stop the bot first. Cancelling while it is running can race with automatic requotes and recreate offers.';
             } else if (empty) {
-                cancelBtn.textContent = 'No Offers To Cancel';
-                cancelBtn.title = 'No active offers on the book.';
+                cancelBtn.textContent = 'Check Wallet & Cancel';
+                cancelBtn.title = 'Check the connected wallet for live offers, including offers not listed here.';
             } else {
                 cancelBtn.textContent = `Cancel All (${total})`;
                 cancelBtn.title = 'Cancel every live buy and sell offer for a clean restart or wallet switch.';
@@ -31930,6 +31928,7 @@
         let _cancelAllCompletionPoll = null;
         let _cancelAllSafetyTimer = null;
         let _cancelAllOperationGeneration = 0;
+        let _cancelAllLastResolved = -1;
 
         function clearCancelAllCompletionTimers() {
             if (_cancelAllCompletionPoll) {
@@ -31939,6 +31938,44 @@
             if (_cancelAllSafetyTimer) {
                 clearTimeout(_cancelAllSafetyTimer);
                 _cancelAllSafetyTimer = null;
+            }
+        }
+
+        function resetCancelAllSafetyTimer(total, operationGeneration) {
+            if (_cancelAllSafetyTimer) clearTimeout(_cancelAllSafetyTimer);
+            _cancelAllSafetyTimer = setTimeout(() => {
+                if (operationGeneration !== _cancelAllOperationGeneration) return;
+                clearCancelAllCompletionTimers();
+                stopCancelAllProgressPolling();
+                const message = 'Cancellation status timed out without new confirmation. Check Sage, then retry Cancel All.';
+                _cancelAllLastState = {...(_cancelAllLastState || {}), success: false,
+                    phase: 'error', total, message};
+                renderCancelAllProgress(_cancelAllLastState, total);
+                addLogEntry('warning', message);
+                showToast(message, 'warning', 10000);
+                _cancelAllInProgress = false;
+                window._catalystCancelAllFlowActive = false;
+            }, 300000);
+        }
+
+        async function cancelAllRequestJson(path, options, timeoutMs = 120000) {
+            const controller = new AbortController();
+            let timer;
+            try {
+                return await Promise.race([
+                    (async () => {
+                        const response = await apiFetch(path, {...options, signal: controller.signal});
+                        return await response.json();
+                    })(),
+                    new Promise((_, reject) => {
+                        timer = setTimeout(() => {
+                            reject(new Error('Cancellation request timed out. Check Sage and the current cancellation status before retrying.'));
+                            controller.abort();
+                        }, timeoutMs);
+                    })
+                ]);
+            } finally {
+                clearTimeout(timer);
             }
         }
 
@@ -31957,9 +31994,11 @@
                 return;
             }
             _cancelAllInProgress = true;
+            window._catalystCancelAllFlowActive = true;
             const operationGeneration = ++_cancelAllOperationGeneration;
             let releaseImmediately = true;
             _cancelAllLastState = null;
+            _cancelAllLastResolved = -1;
             const cancelContext = _cancelAllContext;
 
             const contextBuyCount = Number(cancelContext?.openBuyCount);
@@ -31987,19 +32026,40 @@
             if (sellCount > 0) addLogEntry('info', `   ${sellCount} sell offer${sellCount !== 1 ? 's' : ''}...`);
 
             try {
-                const response = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
-                const result = await response.json();
+                openCancelProgressModal(totalActive);
+                const stopDeadline = Date.now() + 300000;
+                while (true) {
+                    const stopped = await cancelAllRequestJson(`${API_URL}/bot/stop`, {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({wait_for_workers: true, settle_cancellations: true})
+                    });
+                    if (stopped.success !== true || typeof stopped.stopped !== 'boolean') {
+                        throw new Error(stopped.error || 'Could not verify that the bot stopped safely.');
+                    }
+                    if (stopped.stopped === true) break;
+                    renderCancelAllProgress({phase: 'stopping', total: totalActive,
+                        message: stopped.message || 'Waiting for workers and cancellation confirmation.'}, totalActive);
+                    if (Date.now() >= stopDeadline) {
+                        throw new Error('Workers or cancellation confirmation are still pending. Check Sage, then retry Cancel All.');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                const result = await cancelAllRequestJson(`${API_URL}/offers/cancel_all`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({wait_for_confirmation: true})
+                });
 
-                if (!result.success) {
-                    addLogEntry('error', '   ❌ Cancel failed: ' + (result.error || 'Unknown error'));
-                    _cancelAllInProgress = false;
-                    return;
+                if (result.success !== true) {
+                    throw new Error(result.error || 'Cancel All returned an invalid response.');
                 }
 
                 // Backend runs asynchronously — open progress modal and poll
-                if (result.async) {
+                if (result.async === true) {
+                    const total = result.total;
+                    if (!Number.isInteger(total) || total < 1) {
+                        throw new Error('Cancel All returned an invalid offer count.');
+                    }
                     releaseImmediately = false;
-                    const total = result.total || totalActive;
                     addLogEntry('info', `   Wallet cancel started for ${total} offers — tracking progress...`);
                     openCancelProgressModal(total);
                     startCancelAllProgressPolling(total, operationGeneration);
@@ -32017,9 +32077,17 @@
                                 try { updateResumeOverview(); } catch (_re) { /* non-fatal */ }
                                 if (st.phase === 'complete') {
                                     const view = cancelAllProgressView(st, total);
-                                    addLogEntry(view.severity, `   ${view.message}`);
-                                    showToast(view.message, view.severity);
-                                    if (cancelContext?.source === 'coin_prep') {
+                                    if (!view.authoritativeComplete) {
+                                        const message = 'Not all cancellations are confirmed. Check Sage, then retry Cancel All.';
+                                        _cancelAllLastState = {...st, phase: 'error', message};
+                                        renderCancelAllProgress(_cancelAllLastState, total);
+                                        addLogEntry('error', message);
+                                        showToast(message, 'error');
+                                    } else {
+                                        addLogEntry(view.severity, `   ${view.message}`);
+                                        showToast(view.message, view.severity);
+                                    }
+                                    if (view.authoritativeComplete && cancelContext?.source === 'coin_prep') {
                                         if (Number(st.failed || 0) > 0) {
                                             showToast('Coin prep is still blocked because one or more offer cancellations were rejected.', 'error', 8000);
                                         } else if (cancelContext.resumeAfterCancel !== false) {
@@ -32034,6 +32102,7 @@
                                 }
                                 if (operationGeneration === _cancelAllOperationGeneration) {
                                     _cancelAllInProgress = false;
+                                    window._catalystCancelAllFlowActive = false;
                                 }
                             }
                         } catch (_e) { /* polling check failed, keep trying */ }
@@ -32041,44 +32110,22 @@
 
                     // Safety timeout: show an explicit fail-closed state and
                     // release the UI latch so the operator can retry safely.
-                    _cancelAllSafetyTimer = setTimeout(() => {
-                        if (operationGeneration !== _cancelAllOperationGeneration) return;
-                        clearCancelAllCompletionTimers();
-                        stopCancelAllProgressPolling();
-                        const timeoutMessage = 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
-                        _cancelAllLastState = {
-                            success: false,
-                            phase: 'error',
-                            total,
-                            pending: 0,
-                            failed: 0,
-                            message: timeoutMessage,
-                        };
-                        renderCancelAllProgress(_cancelAllLastState, total);
-                        addLogEntry('warning', `   ${timeoutMessage}`);
-                        showToast(timeoutMessage, 'warning', 10000);
-                        _cancelAllInProgress = false;
-                    }, 300000);
+                    resetCancelAllSafetyTimer(total, operationGeneration);
                     return;
                 }
 
-                // Synchronous response (bot-running path or legacy)
-                const pending = Number(result.pending || result.cancelled || 0);
-                const failed = result.failed || 0;
-
-                if (pending === 0 && failed === 0) {
-                    addLogEntry('warning', '   No offers found to cancel');
-                } else {
-                    addLogEntry('warning', `   ${pending} cancellation request${pending !== 1 ? 's' : ''} pending authoritative reconciliation`);
-                    if (failed > 0) {
-                        addLogEntry('warning', `   ${failed} offer${failed !== 1 ? 's' : ''} rejected without effect`);
-                    }
+                if (result.authoritative_complete !== true || result.cancelled !== 0 ||
+                    (result.pending !== undefined && result.pending !== 0) ||
+                    (result.failed !== undefined && result.failed !== 0)) {
+                    throw new Error('Cancellation confirmation was not returned. Check Sage before retrying.');
                 }
-
-                addLogEntry('info', '   Refreshing offer list...');
+                renderCancelAllProgress({success: true, confirmation_mode: true,
+                    phase: 'complete', complete: true, running: false, total: 0,
+                    cancelled: 0, closed: 0, resolved: 0, remaining: 0, pending: 0,
+                    failed: 0, authoritative_complete: true}, 0);
                 await fetchStatus();
-                addLogEntry('success', '⚠️ CANCEL ALL — done');
-                if (cancelContext?.source === 'coin_prep' && failed === 0) {
+                addLogEntry('success', 'No active offers remain in the authoritative wallet inventory.');
+                if (cancelContext?.source === 'coin_prep') {
                     if (cancelContext.resumeAfterCancel !== false) {
                         await resumeCoinPrepAfterCancelledOffers(cancelContext);
                     } else {
@@ -32088,10 +32135,13 @@
 
             } catch (error) {
                 addLogEntry('error', '   ❌ Error: ' + error.message);
+                showToast(error.message, 'error');
+                renderCancelAllProgress({phase: 'error', total: totalActive, message: error.message}, totalActive);
             } finally {
                 if (releaseImmediately && operationGeneration === _cancelAllOperationGeneration) {
                     clearCancelAllCompletionTimers();
                     _cancelAllInProgress = false;
+                    window._catalystCancelAllFlowActive = false;
                 }
             }
         }
@@ -32135,10 +32185,17 @@
             const total = Math.max(Number(status.total) || 0, Number(totalHint) || 0);
             const pending = Number(status.pending) || 0;
             const failed = Number(status.failed) || 0;
-            const processed = Math.min(total || (pending + failed), pending + failed);
+            let processed = Math.min(total || (pending + failed), pending + failed);
             const phase = String(status.phase || 'starting').toLowerCase();
             const isDone = phase === 'complete' || phase === 'error';
-            const remaining = Math.max(0, total - processed);
+            let remaining = Math.max(0, total - processed);
+            const proofCounts = [status.total, status.resolved, status.cancelled, status.closed,
+                status.pending, status.failed, status.remaining];
+            const authoritativeComplete = status.success === true && status.complete === true &&
+                status.running === false && phase === 'complete' && status.authoritative_complete === true &&
+                proofCounts.every(n => Number.isInteger(n) && n >= 0) && status.total === total &&
+                status.pending === 0 && status.failed === 0 && status.remaining === 0 &&
+                status.resolved === total && status.cancelled + status.closed === total;
             let title = 'Journaling cancellation requests';
             let message = status.message || 'Preparing cancellation journals...';
             let severity = 'info';
@@ -32153,7 +32210,21 @@
             } else if (total > 0) {
                 message = `${processed} journaled, ${remaining} remaining.`;
             }
-            return { total, pending, failed, processed, phase, isDone, title, message, severity };
+            if (status.confirmation_mode === true || status.authoritative_complete === true) {
+                processed = Number.isInteger(status.resolved) ? Math.max(0, Math.min(total, status.resolved)) : 0;
+                remaining = Math.max(0, total - processed);
+                title = authoritativeComplete ? 'Cancellation confirmed' : phase === 'error'
+                    ? 'Cancellation incomplete' : 'Waiting for cancellation confirmation';
+                message = authoritativeComplete
+                    ? `${status.cancelled} cancellations confirmed; ${status.closed} offers otherwise ended with authoritative proof.`
+                    : phase === 'error' ? (status.message || 'Cancellation is incomplete.')
+                    : `${processed} of ${total} offers confirmed, ${remaining} remaining.`;
+                severity = authoritativeComplete ? 'success' : isDone ? 'error' : 'info';
+            } else if (phase === 'stopping') {
+                title = 'Waiting for the bot to stop safely';
+                message = status.message || 'Waiting for workers and cancellation confirmation.';
+            }
+            return { total, pending, failed, processed, phase, isDone, title, message, severity, authoritativeComplete };
         }
 
         function renderCancelAllProgress(status = {}, totalHint = 0) {
@@ -32187,7 +32258,7 @@
             }
             if (dotsEl) dotsEl.style.display = isDone ? 'none' : '';
             if (timeNoteEl) timeNoteEl.style.display = isDone ? 'none' : '';
-            if (iconEl) iconEl.textContent = phase === 'complete' ? '✅' : phase === 'error' ? '❌' : '⏳';
+            if (iconEl) iconEl.textContent = view.authoritativeComplete ? '✅' : isDone ? '⚠️' : '⏳';
             if (messageEl) messageEl.textContent = view.message;
             if (summaryEl) {
                 summaryEl.textContent = total > 0
@@ -32224,6 +32295,11 @@
                 }
                 // Cache for _get_cancel_all_state_local()
                 _cancelAllLastState = status;
+                if (_cancelAllInProgress && Number.isInteger(status.resolved) &&
+                    status.resolved > _cancelAllLastResolved && status.resolved <= Number(status.total)) {
+                    _cancelAllLastResolved = status.resolved;
+                    resetCancelAllSafetyTimer(totalHint, operationGeneration);
+                }
 
                 renderCancelAllProgress(status, totalHint);
 
@@ -32788,8 +32864,7 @@
             let lastProgressAt = Date.now();
             let confirmedCount = -1;
             while (Date.now() - lastProgressAt < timeoutMs) {
-                const statusResp = await apiFetch(`${API_URL}/offers/cancel_all/status`);
-                const statusData = await statusResp.json();
+                const statusData = await cancelAllRequestJson(`${API_URL}/offers/cancel_all/status`, {});
                 if (!statusData || statusData.success !== true) {
                     throw new Error('Cancellation status returned an invalid response.');
                 }
@@ -32876,11 +32951,10 @@
                 try {
                     const stopDeadline = Date.now() + 300000;
                     while (true) {
-                        const stopResp = await apiFetch(`${API_URL}/bot/stop`, {
+                        const stopResult = await cancelAllRequestJson(`${API_URL}/bot/stop`, {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({wait_for_workers: true, settle_cancellations: cancelOffers})
                         });
-                        const stopResult = await stopResp.json();
                         if (stopResult.success !== true || typeof stopResult.stopped !== 'boolean') {
                             throw new Error(stopResult.error || 'Could not verify that the bot stopped safely.');
                         }
@@ -32905,11 +32979,10 @@
                     updateShutdownProgress('Cancelling offers...', 'Sending cancel request to Sage...');
                     addLogEntry('info', '   Step 2: Cancelling all offers...');
                     try {
-                        const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                        const cancelResult = await cancelAllRequestJson(`${API_URL}/offers/cancel_all`, {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ wait_for_confirmation: true })
                         });
-                        const cancelResult = await cancelResp.json();
 
                         if (!cancelResult.success) {
                             throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');

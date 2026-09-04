@@ -770,6 +770,8 @@ def test_coin_prep_recovery_rejects_unverified_success_response(page):
 def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
     """Confirm must journal cancels, await proof, and retry prep with saved settings."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
@@ -787,13 +789,18 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
             addLogEntry = (_level, message) => window.__cancelRecovery.logs.push(message);
             apiFetch = async (path, options = {}) => {
                 const url = String(path);
+                if (url.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({success:true,stopped:true}));
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__cancelRecovery.statusCalls += 1;
                     return new Response(JSON.stringify({
                         success: true,
                         phase: 'complete',
                         total: 2,
-                        pending: 2,
+                        confirmation_mode: true, complete: true, running: false,
+                        pending: 0, cancelled: 2, closed: 0, resolved: 2,
+                        remaining: 0, authoritative_complete: true,
                         failed: 0,
                         message: 'Cancellation requests journaled',
                     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -861,6 +868,8 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
 def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
     """Hiding or re-clicking must not start a second cancel while one is active."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     still_latched = page.evaluate(
@@ -873,6 +882,7 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).endsWith('/bot/stop')) return new Response(JSON.stringify({success:true,stopped:true}));
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,
@@ -901,6 +911,8 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
 def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
     """A previous completion must not prematurely finish a new wallet request."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     cached_state = page.evaluate(
@@ -911,6 +923,7 @@ def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).endsWith('/bot/stop')) return new Response(JSON.stringify({success:true,stopped:true}));
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Promise(() => {});
                 }
@@ -931,6 +944,8 @@ def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
 def test_cancel_all_discards_status_from_older_operation_generation(page):
     """A late poll from an old operation must not overwrite the current state."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     result = page.evaluate(
@@ -961,6 +976,8 @@ def test_cancel_all_discards_status_from_older_operation_generation(page):
 def test_cancel_all_timeout_is_visible_and_releases_latch(page):
     """A stalled journal poll must end in an explicit, safe timeout state."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
@@ -974,6 +991,7 @@ def test_cancel_all_timeout_is_visible_and_releases_latch(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).endsWith('/bot/stop')) return new Response(JSON.stringify({success:true,stopped:true}));
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,

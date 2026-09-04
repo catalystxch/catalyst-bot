@@ -21,6 +21,13 @@ def shutdown_page(page):
             "        // Wallet Picker Modal", 1
         )[0]
     )
+    script = (
+        "async function cancelAllRequestJson"
+        + source.split("async function cancelAllRequestJson", 1)[1].split(
+            "async function confirmCancelAll", 1
+        )[0]
+        + script
+    )
     page.route("**/*", lambda route: route.abort())
     page.set_content(markup)
     page.add_script_tag(
@@ -200,3 +207,24 @@ def test_journal_completion_without_authoritative_completion_keeps_app_open(
     assert "/api/shutdown" not in page.evaluate("calls")
     assert page.evaluate("finished") is False
     assert page.evaluate("logs.some(e => e.level === 'error')")
+
+
+@pytest.mark.parametrize("hung_path", ["/bot/stop", "/offers/cancel_all"])
+def test_shutdown_unanswered_request_keeps_app_open_with_visible_error(
+    shutdown_page, hung_path
+):
+    page = shutdown_page
+    page.clock.install()
+    page.evaluate(
+        "suffix=>{const previous=apiFetch; apiFetch=(path,options)=>path.endsWith(suffix)?new Promise(()=>{}):previous(path,options)}",
+        hung_path,
+    )
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.locator("#confirmShutdownBtn").click()
+    page.clock.fast_forward(120001)
+    assert page.evaluate(
+        "logs.some(e=>e.level==='error' && e.message.includes('timed out'))"
+    )
+    assert page.evaluate("finished") is False
+    assert "/api/shutdown" not in page.evaluate("calls")

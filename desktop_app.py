@@ -1218,7 +1218,9 @@ def run_desktop_mode(dev_mode: bool = False):
         # A repeated native close must not cut that confirmed flow short.
         try:
             if (
-                window.evaluate_js("Boolean(window._catalystShutdownFlowActive)")
+                window.evaluate_js(
+                    "Boolean(window._catalystShutdownFlowActive || window._catalystCancelAllFlowActive)"
+                )
                 is True
             ):
                 window.show()
