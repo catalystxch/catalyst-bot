@@ -126,11 +126,16 @@ class TestLogsClear(_FlaskBase):
         self.assertTrue(resp.get_json().get("success"))
 
     def test_sets_logs_cleared_at(self):
-        original = api_server._logs_cleared_at
-        with patch("database.set_setting"):
+        # Back-to-back clears can share one Windows wall-clock tick. Start
+        # with a known earlier marker so this tests the update, not timer resolution.
+        original = "2000-01-01T00:00:00+00:00"
+        with (
+            patch.object(api_server, "_logs_cleared_at", original),
+            patch("database.set_setting"),
+        ):
             self._post("/api/logs/clear")
-        self.assertIsNotNone(api_server._logs_cleared_at)
-        self.assertNotEqual(api_server._logs_cleared_at, original)
+            self.assertIsNotNone(api_server._logs_cleared_at)
+            self.assertNotEqual(api_server._logs_cleared_at, original)
 
 
 # ---------------------------------------------------------------------------

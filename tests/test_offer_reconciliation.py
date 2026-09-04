@@ -3342,6 +3342,7 @@ def _persist_created_offer(
     offered: str = "1000",
     coin_amount: int | None = None,
     tier: str = "inner",
+    offer_hash: str = OFFER_HASH,
 ) -> dict:
     selected_amount = int(offered) if coin_amount is None else coin_amount
     assert database.upsert_coin(
@@ -3381,7 +3382,7 @@ def _persist_created_offer(
         lifecycle_state="created",
         outcome="CONFIRMED",
         sage_trade_id=TRADE,
-        offer_text_sha256=OFFER_HASH,
+        offer_text_sha256=offer_hash,
         wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
         evidence_json={"offer": "confirmed"},
         finalized_at=AT,
@@ -10015,3 +10016,316 @@ def test_authoritative_terminal_record_exposes_exact_journal_identity(
         "terminal_state": "filled",
     }
     assert terminal["event_id"] == "reconcile:intent-task9:attempt:1:finalized"
+
+
+def _deleted_history_expiry_evidence(*, spent=False):
+    evidence = _evidence(
+        offers=[],
+        transactions=[],
+        observed_at=RECONCILED,
+        coins={
+            COIN: _coin(
+                COIN, asset_id="xch", amount=1000, spent_height=99 if spent else None
+            )
+        },
+    )
+    evidence["offer_reinspection"] = {
+        "observed_at": RECONCILED,
+        "complete": True,
+        "provenance": "wallet.view_offer",
+        "offer_text_sha256": OFFER_HASH,
+        "status": "cancelled" if spent else "expired",
+        "summary": {"offered": {"xch": 1000}, "requested": {ASSET: 2000}},
+        "expiration_timestamp": 1787227201,
+        "expiration_height": None,
+        "spend_blocks": {
+            "99": {
+                "height": 99,
+                "timestamp": 1787227205,
+                "header_hash": "e" * 64,
+                "prev_transaction_block_height": 98,
+                "prev_transaction_block_hash": "f" * 64,
+            },
+            "98": {"height": 98, "timestamp": 1787227203, "header_hash": "f" * 64},
+        }
+        if spent
+        else {},
+        "chain_provenance": "coinset.get_block_record_by_height",
+        "chain_coins": {
+            COIN: {"coin_id": COIN, "amount": 1000, "spent_height": 99 if spent else 0}
+        },
+        "chain_tip": {"height": 98, "timestamp": 1787227203, "header_hash": "f" * 64},
+        "dexie": None,
+    }
+    return evidence
+
+
+@pytest.mark.parametrize("spent,want_coin_status", [(False, "free"), (True, "spent")])
+def test_deleted_sage_history_reinspection_preserves_terminal_and_coin_disposition(
+    isolated_database,
+    spent,
+    want_coin_status,
+):
+    _persist_created_offer()
+    result = reconcile_offer(
+        "intent-task9",
+        evidence=_deleted_history_expiry_evidence(spent=spent),
+        now=RECONCILED,
+    )
+    assert result["classification"] == EXPIRED_PROVEN
+    assert result["applied"] is True
+    assert database.get_offer(TRADE)["status"] == "expired"
+    assert database.get_coin_state(COIN)["status"] == want_coin_status
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
+    assert (
+        database.get_authoritative_terminal_record(TRADE)["outcome"] == EXPIRED_PROVEN
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "hash",
+        "amount",
+        "asset",
+        "active",
+        "filled",
+        "no_expiry",
+        "future_expiry",
+        "stale",
+        "incomplete",
+        "spent_before_expiry",
+        "missing_block",
+        "wrong_height",
+        "wrong_network",
+        "wrong_wallet",
+        "coin_locked",
+        "coin_not_owned",
+        "dexie_filled",
+    ],
+)
+def test_deleted_history_reinspection_never_releases_unproven_inputs(fault):
+    evidence = _deleted_history_expiry_evidence(spent=True)
+    proof = evidence["offer_reinspection"]
+    if fault == "hash":
+        proof["offer_text_sha256"] = "0" * 64
+    elif fault == "amount":
+        proof["summary"]["offered"]["xch"] = 999
+    elif fault == "asset":
+        proof["summary"]["requested"] = {"0" * 64: 2000}
+    elif fault in {"active", "filled"}:
+        proof["status"] = fault
+    elif fault == "no_expiry":
+        proof["expiration_timestamp"] = None
+    elif fault == "future_expiry":
+        proof["expiration_timestamp"] = 1787227300
+    elif fault == "stale":
+        proof["observed_at"] = "2026-08-19T12:00:00.000000Z"
+    elif fault == "incomplete":
+        proof["complete"] = False
+    elif fault == "spent_before_expiry":
+        proof["spend_blocks"]["99"]["timestamp"] = 1787227200
+    elif fault == "missing_block":
+        proof["spend_blocks"] = {}
+    elif fault == "wrong_height":
+        proof["spend_blocks"]["99"]["height"] = 100
+    elif fault == "wrong_network":
+        evidence["network"] = "testnet11"
+    elif fault == "wrong_wallet":
+        evidence["wallet_fingerprint_hash"] = "0" * 64
+    elif fault == "coin_locked":
+        evidence["coin_records"]["records"][COIN]["offer_id"] = OTHER_TRADE
+    elif fault == "coin_not_owned":
+        evidence["coin_records"]["records"][COIN]["owned"] = False
+    elif fault == "dexie_filled":
+        proof["dexie"] = {"trade_id": TRADE, "status": 4}
+    result = classify_terminal_evidence(_intent(), evidence, now=RECONCILED)
+    assert result["classification"] in {UNKNOWN, CONFLICT}
+
+
+@pytest.mark.parametrize(
+    "spent,corrupt_blob,chain_fault",
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, None),
+        (False, False, "coin_id"),
+        (True, False, "spent_height"),
+        (False, False, "unsynced"),
+        (False, False, "non_transaction_peak"),
+        (False, False, "fill_at_expiry"),
+    ],
+)
+def test_deleted_history_loader_reinspects_hash_bound_offer_before_recovery(
+    isolated_database,
+    monkeypatch,
+    spent,
+    corrupt_blob,
+    chain_fault,
+):
+    from coinset_client import CoinsetClient
+
+    coin_id = "a11518c6cebbe3f4a28304e4a0f17a9d1530e5c7f8617d3f080a61dbd6bed8a3"
+    blob = "offer1regressionfixture"
+    intent = _persist_created_offer(
+        coin_id=coin_id, offer_hash=hashlib.sha256(blob.encode()).hexdigest()
+    )
+    database.update_offer_bech32(TRADE, blob + "corrupt" if corrupt_blob else blob)
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": RECONCILED,
+        },
+        get_authoritative_offer_history=lambda **kwargs: {
+            "offers": [],
+            "total": 0,
+            "end_of_history": True,
+        },
+        get_transactions_list=lambda **kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda ids: (
+            {
+                coin_id: {
+                    "coin_id": coin_id,
+                    "amount": 1000,
+                    "spent_height": 99 if spent else None,
+                    "offer_id": None,
+                },
+            }
+            if ids == [coin_id]
+            else None
+        ),
+        view_offer=lambda text: (
+            {
+                "status": "cancelled" if spent else "expired",
+                "offer": {
+                    "maker": [{"asset": {"asset_id": None}, "amount": 1000}],
+                    "taker": [{"asset": {"asset_id": ASSET}, "amount": 2000}],
+                    "expiration_timestamp": 1787227201,
+                    "expiration_height": None,
+                },
+            }
+            if text == blob
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        CoinsetClient,
+        "get_block_record_by_height",
+        lambda self, height: _deleted_history_expiry_evidence(spent=True)[
+            "offer_reinspection"
+        ]["spend_blocks"].get(str(height)),
+    )
+    import coinset_client
+
+    chain_progress = {"past_expiry": False}
+
+    monkeypatch.setattr(
+        CoinsetClient,
+        "get_coin_by_name",
+        lambda self, name: (
+            {
+                "coin": {
+                    "parent_coin_info": "0x"
+                    + ("ef" if chain_fault == "coin_id" else "ab") * 32,
+                    "puzzle_hash": "0x" + "cd" * 32,
+                    "amount": 1000,
+                },
+                "spent": spent
+                or (chain_fault == "fill_at_expiry" and chain_progress["past_expiry"]),
+                "spent_block_index": 42
+                if chain_fault == "spent_height"
+                else 99
+                if spent
+                else 99
+                if chain_fault == "fill_at_expiry" and chain_progress["past_expiry"]
+                else 0,
+            }
+            if name.removeprefix("0x") == coin_id
+            else None
+        ),
+    )
+
+    monkeypatch.setattr(
+        coinset_client.requests,
+        "post",
+        lambda url, **kwargs: (
+            chain_progress.update(past_expiry=True)
+            or SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "success": True,
+                    "blockchain_state": {
+                        "peak": {
+                            "height": 100
+                            if chain_fault == "non_transaction_peak"
+                            else 98,
+                            "timestamp": None
+                            if chain_fault == "non_transaction_peak"
+                            else 1787227203,
+                            "header_hash": "f" * 64,
+                            "prev_transaction_block_height": 98,
+                            "prev_transaction_block_hash": None,
+                        },
+                        "sync": {"synced": chain_fault != "unsynced"},
+                    },
+                },
+            )
+            if url.endswith("/get_blockchain_state")
+            else None
+        ),
+    )
+    evidence = load_authoritative_evidence(
+        intent, wallet_facade=facade, clock=_clock_at(RECONCILED)
+    )
+    result = reconcile_offer("intent-task9", evidence=evidence, now=RECONCILED)
+    blocked = corrupt_blob or chain_fault not in {None, "non_transaction_peak"}
+    assert result["classification"] == (UNKNOWN if blocked else EXPIRED_PROVEN)
+    assert database.get_coin_state(coin_id)["status"] == (
+        "locked" if blocked else "spent" if spent else "free"
+    )
+    # The immutable audit bundle contains observations, never the signed blob.
+    assert blob not in canonical_evidence_and_digest(evidence)[0]
+
+
+@pytest.mark.parametrize("spent", [False, True])
+def test_deleted_history_requires_chain_time_to_cross_signed_expiry(spent):
+    evidence = _deleted_history_expiry_evidence(spent=spent)
+    # The PC clock and spending-block clock are already past expiry, but the
+    # preceding transaction block is not. Chia can still accept the old offer.
+    proof = evidence["offer_reinspection"]
+    proof["chain_tip"] = {
+        "height": 98,
+        "timestamp": 1787227200,
+        "header_hash": "f" * 64,
+    }
+    if spent:
+        proof["spend_blocks"]["99"].update(
+            {
+                "prev_transaction_block_height": 98,
+                "prev_transaction_block_hash": "f" * 64,
+            }
+        )
+        proof["spend_blocks"]["98"] = proof["chain_tip"]
+    result = classify_terminal_evidence(_intent(), evidence, now=RECONCILED)
+    assert result["classification"] == UNKNOWN
+
+
+@pytest.mark.parametrize("spent", [False, True])
+def test_deleted_history_wallet_coin_state_must_agree_with_chain(spent):
+    evidence = _deleted_history_expiry_evidence(spent=spent)
+    evidence["offer_reinspection"]["chain_coins"] = {
+        COIN: {
+            "coin_id": COIN,
+            "amount": 1000,
+            "spent_height": 42 if not spent else 100,
+        },
+    }
+    result = classify_terminal_evidence(_intent(), evidence, now=RECONCILED)
+    assert result["classification"] in {UNKNOWN, CONFLICT}

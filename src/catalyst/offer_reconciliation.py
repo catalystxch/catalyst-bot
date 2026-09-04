@@ -1366,6 +1366,155 @@ def _expired_inputs_were_subsequently_spent(
     return max(spent_heights)
 
 
+def _reinspected_expiry_proof(
+    intent: dict[str, Any],
+    evidence: dict[str, Any],
+    coins: dict[str, dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    """Recover deleted history from the original offer and fresh external reads.
+
+    The stored blob identifies what to inspect; its local status proves nothing.
+    Sage must decode the hash-bound offer again. Spent inputs additionally need
+    a chain timestamp proving they could not have filled before signed expiry.
+    """
+    proof = evidence.get("offer_reinspection")
+    if type(proof) is not dict:
+        return _unknown("OFFER_ABSENCE_NOT_PROOF")
+    observed = _parse_utc(proof.get("observed_at"))
+    started = _parse_utc(evidence.get("collection_started_at"))
+    if (
+        proof.get("complete") is not True
+        or proof.get("provenance") != "wallet.view_offer"
+        or not _is_canonical_utc_text(proof.get("observed_at"))
+        or observed is None
+        or started is None
+        or not 0 <= (observed - started).total_seconds() <= _MAX_SOURCE_SKEW_SECONDS
+        or not -30 <= (now - observed).total_seconds() <= _MAX_EVIDENCE_AGE_SECONDS
+        or _hex_id(proof.get("offer_text_sha256")) != intent["offer_text_sha256"]
+        or not _offer_summary_matches(
+            intent,
+            {
+                "trade_id": intent["sage_trade_id"],
+                "summary": proof.get("summary"),
+            },
+        )
+    ):
+        return _unknown("OFFER_REINSPECTION_INVALID")
+    expiry = proof.get("expiration_timestamp")
+    if (
+        type(expiry) is not int
+        or expiry <= 0
+        or expiry < intent["offer_created_at"].timestamp()
+        or expiry > observed.timestamp()
+        or proof.get("status") not in {"expired", "cancelled"}
+    ):
+        return _unknown("SIGNED_EXPIRY_UNPROVEN")
+    dexie = proof.get("dexie")
+    if dexie is not None and (
+        type(dexie) is not dict
+        or _hex_id(dexie.get("trade_id")) != intent["sage_trade_id"]
+        or type(dexie.get("status")) is not int
+        or dexie["status"] != 6
+    ):
+        return _conflict("EXTERNAL_OFFER_STATUS_CONFLICT")
+    chain_coins = proof.get("chain_coins")
+    if type(chain_coins) is not dict or set(chain_coins) != set(
+        intent["selected_coin_ids"]
+    ):
+        return _unknown("CHAIN_COIN_STATE_UNPROVEN")
+    for cid in intent["selected_coin_ids"]:
+        chain_coin = chain_coins[cid]
+        wallet_coin = coins.get(cid)
+        if (
+            type(chain_coin) is not dict
+            or type(wallet_coin) is not dict
+            or chain_coin.get("coin_id") != cid
+            or type(chain_coin.get("amount")) is not int
+            or chain_coin["amount"] != wallet_coin.get("amount")
+            or type(chain_coin.get("spent_height")) is not int
+            or chain_coin["spent_height"] < 0
+            or chain_coin["spent_height"] != (wallet_coin.get("spent_height") or 0)
+        ):
+            return _unknown("CHAIN_COIN_STATE_UNPROVEN")
+    # A released coin has no live offer link. Never free a coin now reserved
+    # by another offer, including an explicit wallet link to this old offer.
+    if any(
+        _norm_id(coins.get(cid, {}).get("offer_id"))
+        for cid in intent["selected_coin_ids"]
+    ):
+        return _unknown("EXPIRY_SAFE_RELEASE_UNPROVEN")
+    if proof["status"] == "expired" and _selected_inputs_are_exactly_owned_and_linked(
+        intent,
+        coins,
+        allow_released_link=True,
+        allow_missing_asset=True,
+    ):
+        tip = proof.get("chain_tip")
+        if (
+            evidence.get("network") != "mainnet"
+            or proof.get("chain_provenance") != "coinset.get_block_record_by_height"
+            or type(tip) is not dict
+            or type(tip.get("height")) is not int
+            or tip["height"] <= 0
+            or not _hex_id(tip.get("header_hash"))
+            or type(tip.get("timestamp")) is not int
+            or not expiry < tip["timestamp"] <= observed.timestamp()
+        ):
+            return _unknown("CHAIN_EXPIRY_UNPROVEN")
+        return {
+            "classification": EXPIRED_PROVEN,
+            "reason_code": "AUTHORITATIVE_REINSPECTED_EXPIRY_PROOF",
+            "input_coins_owned_unlocked": True,
+        }
+    height = _expired_inputs_were_subsequently_spent(intent, coins)
+    blocks = proof.get("spend_blocks")
+    if (
+        height is None
+        or type(blocks) is not dict
+        or len(blocks) > 2 * _MAX_SELECTED_COINS
+        or evidence.get("network") != "mainnet"
+        or proof.get("chain_provenance") != "coinset.get_block_record_by_height"
+    ):
+        return _unknown("EXPIRY_SUBSEQUENT_SPEND_UNPROVEN")
+    for cid in intent["selected_coin_ids"]:
+        spent_height = coins[cid]["spent_height"]
+        block = blocks.get(str(spent_height))
+        if (
+            type(block) is not dict
+            or type(block.get("height")) is not int
+            or block["height"] != spent_height
+            or not _hex_id(block.get("header_hash"))
+            or type(block.get("timestamp")) is not int
+            or not expiry < block["timestamp"] <= observed.timestamp()
+        ):
+            return _unknown("EXPIRY_SUBSEQUENT_SPEND_UNPROVEN")
+        previous_height = block.get("prev_transaction_block_height")
+        previous = blocks.get(str(previous_height))
+        # Chia evaluates ASSERT_BEFORE_SECONDS_ABSOLUTE against the previous
+        # transaction block, not the timestamp on the spending block itself.
+        if (
+            type(previous_height) is not int
+            or not 0 < previous_height < spent_height
+            or type(previous) is not dict
+            or previous.get("height") != previous_height
+            or type(previous.get("height")) is not int
+            or not _hex_id(block.get("prev_transaction_block_hash"))
+            or _hex_id(previous.get("header_hash"))
+            != _hex_id(block["prev_transaction_block_hash"])
+            or type(previous.get("timestamp")) is not int
+            or not expiry < previous["timestamp"] <= block["timestamp"]
+        ):
+            return _unknown("EXPIRY_SUBSEQUENT_SPEND_UNPROVEN")
+    return {
+        "classification": EXPIRED_PROVEN,
+        "reason_code": "AUTHORITATIVE_EXPIRY_WITH_SUBSEQUENT_SPEND_PROOF",
+        "input_coins_owned_unlocked": False,
+        "subsequent_spent_height": height,
+        "block_height": height,
+    }
+
+
 def _classify_terminal_evidence(
     intent: Any,
     evidence: Any,
@@ -1446,13 +1595,18 @@ def _classify_terminal_evidence(
         return _conflict("DUPLICATE_FILL_TRANSACTION_PROOF")
     candidate_fill = candidate_fills[0] if candidate_fills else None
     if not matches:
+        reinspected = _reinspected_expiry_proof(
+            exact_intent, evidence, coins, observed_now
+        )
         if candidate_fill is not None:
+            if reinspected["classification"] in {EXPIRED_PROVEN, CONFLICT}:
+                return _conflict()
             return {
                 "classification": FILLED_PROVEN,
                 "reason_code": "EXACT_FILL_PROOF_WITHOUT_OFFER_ROW",
                 **candidate_fill,
             }
-        return _unknown("OFFER_ABSENCE_NOT_PROOF")
+        return reinspected
     if len(matches) != 1:
         return _conflict("DUPLICATE_OFFER_IDENTITY")
     offer = matches[0]
@@ -2144,6 +2298,167 @@ def _load_transactions(
     }
 
 
+def _load_offer_reinspection(intent, wallet_facade, coins, clock):
+    """Read external proof for deleted Sage history; never restore wallet rows."""
+    import database
+
+    proof = {
+        "complete": False,
+        "provenance": "wallet.view_offer",
+        "spend_blocks": {},
+        "chain_provenance": "coinset.get_block_record_by_height",
+        "dexie": None,
+    }
+    try:
+        row = database.get_offer(intent["sage_trade_id"])
+        blob = row.get("offer_bech32") if type(row) is dict else None
+        if (
+            type(blob) is not str
+            or not blob.startswith("offer1")
+            or len(blob) > 1_000_000
+            or hashlib.sha256(blob.encode("utf-8")).hexdigest()
+            != intent["offer_text_sha256"]
+        ):
+            return None
+        response = wallet_facade.view_offer(blob)
+        _require_provider_bounds(response)
+        if type(response) is not dict or type(response.get("offer")) is not dict:
+            return None
+        summary = response["offer"]
+        amounts = {}
+        for source, target in (("maker", "offered"), ("taker", "requested")):
+            items = summary.get(source)
+            if type(items) is not list or len(items) != 1 or type(items[0]) is not dict:
+                return None
+            item = items[0]
+            asset = item.get("asset")
+            if type(asset) is not dict or "asset_id" not in asset:
+                return None
+            asset_id = (
+                "xch" if asset["asset_id"] is None else _hex_id(asset["asset_id"])
+            )
+            amount = _positive_int(item.get("amount"))
+            if not asset_id or amount is None:
+                return None
+            amounts[target] = {asset_id: amount}
+        proof.update(
+            {
+                "offer_text_sha256": intent["offer_text_sha256"],
+                "summary": amounts,
+                "status": response.get("status"),
+                "expiration_timestamp": summary.get("expiration_timestamp"),
+                "expiration_height": summary.get("expiration_height"),
+            }
+        )
+        heights = {
+            coins.get(cid, {}).get("spent_height")
+            for cid in intent["selected_coin_ids"]
+        }
+        if intent["network"] == "mainnet":
+            from coinset_client import CoinsetClient
+            from chia_rs import Coin
+
+            client = CoinsetClient()
+
+            def read_block(height):
+                block = client.get_block_record_by_height(height)
+                _require_provider_bounds(block)
+                if type(block) is dict:
+                    return {
+                        key: block.get(key)
+                        for key in (
+                            "height",
+                            "timestamp",
+                            "header_hash",
+                            "prev_transaction_block_height",
+                            "prev_transaction_block_hash",
+                        )
+                    }
+                return None
+
+            spent_heights = sorted(h for h in heights if type(h) is int and h > 0)
+            for height in spent_heights:
+                block = read_block(height)
+                if block is not None:
+                    proof["spend_blocks"][str(height)] = block
+                    previous_height = block.get("prev_transaction_block_height")
+                    if type(previous_height) is int and 0 < previous_height < height:
+                        proof["spend_blocks"][str(previous_height)] = read_block(
+                            previous_height
+                        )
+            if not spent_heights:
+                peak = client.get_peak_block_record()
+                _require_provider_bounds(peak)
+                if type(peak) is dict:
+                    if peak.get("timestamp") is None:
+                        height = peak.get("prev_transaction_block_height")
+                        previous = (
+                            read_block(height)
+                            if type(height) is int and height > 0
+                            else None
+                        )
+                        if (
+                            type(previous) is dict
+                            and previous.get("height") == height
+                            and type(peak.get("height")) is int
+                            and height < peak["height"]
+                            and _hex_id(previous.get("header_hash"))
+                            and (
+                                peak.get("prev_transaction_block_hash") is None
+                                or _hex_id(previous["header_hash"])
+                                == _hex_id(peak.get("prev_transaction_block_hash"))
+                            )
+                        ):
+                            peak = previous
+                    proof["chain_tip"] = {
+                        key: peak.get(key)
+                        for key in ("height", "timestamp", "header_hash")
+                    }
+            # Read coin state AFTER the expiry tip. Otherwise a fill in the
+            # first block crossing expiry could race an earlier unspent read.
+            proof["chain_coins"] = {}
+            for cid in intent["selected_coin_ids"]:
+                record = client.get_coin_by_name(cid)
+                _require_provider_bounds(record)
+                if type(record) is not dict or type(record.get("coin")) is not dict:
+                    continue
+                raw_coin = record["coin"]
+                spent_height = record.get("spent_block_index")
+                if (
+                    type(raw_coin.get("amount")) is not int
+                    or type(spent_height) is not int
+                    or spent_height < 0
+                    or type(record.get("spent")) is not bool
+                    or record["spent"] != (spent_height > 0)
+                ):
+                    continue
+                coin = Coin.from_json_dict(raw_coin)
+                if coin.name().hex() != cid:
+                    continue
+                proof["chain_coins"][cid] = {
+                    "coin_id": cid,
+                    "amount": raw_coin["amount"],
+                    "spent_height": spent_height,
+                }
+        dexie_id = _hex_id(row.get("dexie_id"))
+        if dexie_id:
+            from dexie_manager import get_offer_detail
+
+            # Dexie corroborates identity/status where a listing exists. Its
+            # absence or outage cannot establish an outcome in either direction.
+            detail = get_offer_detail(dexie_id)
+            _require_provider_bounds(detail)
+            if type(detail) is dict:
+                proof["dexie"] = {
+                    key: detail.get(key) for key in ("trade_id", "status")
+                }
+        proof["complete"] = True
+    except Exception:
+        proof["read_error"] = "reader_exception"
+    proof["observed_at"] = _clock_utc(clock)
+    return proof
+
+
 def load_authoritative_evidence(
     intent: Any,
     *,
@@ -2382,6 +2697,25 @@ def load_authoritative_evidence(
         and set(normalized_coins) == required_ids
         and coin_error is None
     )
+    reinspection = None
+    if (
+        wallet_backend == "sage"
+        and identity_valid
+        and wallet_hash == exact_intent["wallet_fingerprint_hash"]
+        and network == exact_intent["network"]
+        and offers.get("complete") is True
+        and coin_complete
+        and callable(getattr(wallet_facade, "view_offer", None))
+        and not any(
+            _hex_id(_first_present(row, "trade_id", "offer_id"))
+            == exact_intent["sage_trade_id"]
+            for row in offers["records"]
+            if type(row) is dict
+        )
+    ):
+        reinspection = _load_offer_reinspection(
+            exact_intent, wallet_facade, normalized_coins, clock
+        )
     collected_at = _clock_utc(clock)
     return {
         "schema_version": 1,
@@ -2427,6 +2761,7 @@ def load_authoritative_evidence(
             },
         },
         "local_expired": False,
+        **({"offer_reinspection": reinspection} if reinspection is not None else {}),
     }
 
 

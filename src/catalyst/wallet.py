@@ -239,6 +239,22 @@ def get_wallet_type() -> str:
     return WALLET_TYPE
 
 
+def view_offer(offer_bech32: str) -> dict | None:
+    """Inspect a signed offer through Sage without importing or submitting it."""
+    if (
+        _WALLET_BACKEND_AUTHORITY != "sage"
+        or type(offer_bech32) is not str
+        or not offer_bech32.startswith("offer1")
+        or len(offer_bech32) > 1_000_000
+    ):
+        return None
+    try:
+        result = _wallet_adapter.view_offer(offer_bech32)
+    except Exception:
+        return None
+    return result if type(result) is dict else None
+
+
 def get_coins_by_ids(coin_ids: list) -> dict | None:
     """Read exact owned/spent coin records through the selected adapter.
 

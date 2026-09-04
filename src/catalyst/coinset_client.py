@@ -475,6 +475,35 @@ class CoinsetClient:
     # converts height → header_hash so the enrichment can chain calls.
     # -------------------------------------------------------------------
 
+    def get_peak_block_record(self) -> Optional[Dict]:
+        """Read the synced mainnet peak for proof-based expiry recovery."""
+        if (
+            not getattr(cfg, "COINSET_ENABLED", True)
+            or time.time() < self._rate_limited_until
+        ):
+            return None
+        self._record_api_call("get_blockchain_state")
+        try:
+            response = requests.post(
+                f"{cfg.COINSET_API_URL.rstrip('/')}/get_blockchain_state",
+                json={},
+                headers=COINSET_HEADERS,
+                timeout=getattr(cfg, "COINSET_TIMEOUT", 5),
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            state = data.get("blockchain_state", {})
+            if (
+                data.get("success") is not True
+                or state.get("sync", {}).get("synced") is not True
+            ):
+                return None
+            peak = state.get("peak")
+            return peak if type(peak) is dict else None
+        except Exception:
+            return None
+
     def get_block_record_by_height(self, height: int) -> Optional[Dict]:
         """Return the Chia block record at a given height.
 
