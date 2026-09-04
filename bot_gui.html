@@ -11890,20 +11890,20 @@
                     <div class="v4-modal-icon">⚠️</div>
                     <div>
                         <div class="v4-modal-kicker">Offer Control</div>
-                        <h3 class="v4-modal-title">Cancel all live offers?</h3>
-                        <p class="v4-modal-copy">This sends cancel requests for every active buy and sell offer your bot is managing. Use it for a clean restart or wallet switch after the bot has been stopped.</p>
+                        <h3 class="v4-modal-title" id="cancelConfirmTitle">Cancel all live offers?</h3>
+                        <p class="v4-modal-copy" id="cancelConfirmCopy">This sends cancel requests for every active buy and sell offer your bot is managing. Use it for a clean restart or wallet switch after the bot has been stopped.</p>
                     </div>
                 </div>
                 <div id="cancelOfferCount" class="v4-modal-panel v4-modal-panel--warning" style="margin-bottom: 0;">
                     Checking active offers...
                 </div>
-                <div class="v4-modal-note">
+                <div class="v4-modal-note" id="cancelConfirmNote">
                     <span class="v4-modal-note-icon">ⓘ</span>
                     <span>Stop the bot first, then use this for a clean restart or wallet switch. It is not needed for routine monitoring.</span>
                 </div>
                 <div class="v4-modal-actions v4-modal-actions--center">
                     <button class="btn btn-config btn-secondary" onclick="closeCancelConfirm()" style="flex: 1; max-width: 170px;">Keep Offers</button>
-                    <button class="btn btn-cancel btn-danger" onclick="confirmCancelAll()" style="flex: 1; max-width: 170px;" id="confirmCancelBtn">Cancel All</button>
+                    <button class="btn btn-cancel btn-danger" onclick="confirmCancelAll()" style="flex: 1; max-width: 170px;" id="cancelAllConfirmBtn">Cancel All</button>
                 </div>
             </div>
         </div>
@@ -31858,23 +31858,62 @@
             }
         }
 
-        async function cancelAllOffers() {
+        let _cancelAllContext = null;
+
+        async function cancelAllOffers(context = null) {
             if (bot_state?.running) {
                 showToast('Stop the bot before cancelling all offers', 'warning');
                 return;
             }
 
+            _cancelAllContext = context && context.source === 'coin_prep'
+                ? context
+                : null;
+
             // Count active offers
-            const buyCount = bot_state?.offers?.buy?.length || 0;
-            const sellCount = bot_state?.offers?.sell?.length || 0;
-            const totalActive = buyCount + sellCount;
+            const contextBuyCount = Number(_cancelAllContext?.openBuyCount);
+            const contextSellCount = Number(_cancelAllContext?.openSellCount);
+            const contextTotal = Number(_cancelAllContext?.openOfferCount);
+            const buyCount = Number.isFinite(contextBuyCount)
+                ? Math.max(0, Math.trunc(contextBuyCount))
+                : (bot_state?.offers?.buy?.length || 0);
+            const sellCount = Number.isFinite(contextSellCount)
+                ? Math.max(0, Math.trunc(contextSellCount))
+                : (bot_state?.offers?.sell?.length || 0);
+            const totalActive = Number.isFinite(contextTotal)
+                ? Math.max(0, Math.trunc(contextTotal))
+                : buyCount + sellCount;
+
+            const titleEl = document.getElementById('cancelConfirmTitle');
+            const copyEl = document.getElementById('cancelConfirmCopy');
+            const noteEl = document.getElementById('cancelConfirmNote');
+            const confirmBtn = document.getElementById('cancelAllConfirmBtn');
+            if (_cancelAllContext) {
+                if (titleEl) titleEl.textContent = 'Cancel offers before coin prep?';
+                const willResume = _cancelAllContext.resumeAfterCancel !== false;
+                if (copyEl) copyEl.textContent = willResume
+                    ? 'Coin prep cannot safely replace coins while live offers still lock them. Confirming sends cancellation requests for every live offer in the connected wallet, including offers not tracked by CATalyst, waits for authoritative terminal proof, then continues coin prep.'
+                    : 'Coin prep cannot safely replace coins while live offers still lock them. Confirming sends cancellation requests for every live offer in the connected wallet, including offers not tracked by CATalyst, but protected authoritative history cannot be cleared. After terminal proof arrives, retry Prepare Coins without resetting protected history.';
+                if (noteEl) noteEl.textContent = 'No offer is removed from CATalyst until Sage provides authoritative cancellation or fill evidence.';
+                if (confirmBtn) confirmBtn.textContent = willResume ? 'Cancel Offers & Continue' : 'Cancel Offers';
+            } else {
+                if (titleEl) titleEl.textContent = 'Cancel all live offers?';
+                if (copyEl) copyEl.textContent = 'This sends cancellation requests for every live offer in the connected wallet, including offers not tracked by CATalyst. Use it for a clean restart or wallet switch after the bot has been stopped.';
+                if (noteEl) noteEl.innerHTML = '<span class="v4-modal-note-icon">ⓘ</span><span>Stop the bot first, then use this for a clean restart or wallet switch. It is not needed for routine monitoring.</span>';
+                if (confirmBtn) confirmBtn.textContent = 'Cancel All';
+            }
             
             const countEl = document.getElementById('cancelOfferCount');
             if (countEl) {
                 if (totalActive === 0) {
-                    countEl.innerHTML = '<span style="color: var(--warning-300);">No active offers to cancel.</span>';
+                    countEl.innerHTML = _cancelAllContext
+                        ? '<span style="color: var(--warning-300);">No CATalyst-tracked active offers were counted. The connected wallet will still be checked for live offers.</span>'
+                        : '<span style="color: var(--warning-300);">CATalyst currently shows no active offers. The connected wallet will still be checked for live offers.</span>';
                 } else {
-                    countEl.innerHTML = `<strong style="color: var(--warning-300); font-size: 1.1em;">${totalActive}</strong> active offer${totalActive !== 1 ? 's' : ''} will be cancelled` +
+                    const scopeLabel = _cancelAllContext
+                        ? `${totalActive} CATalyst-tracked active offer${totalActive !== 1 ? 's' : ''} block coin prep`
+                        : `CATalyst currently shows ${totalActive} active offer${totalActive !== 1 ? 's' : ''}`;
+                    countEl.innerHTML = `<strong style="color: var(--warning-300); font-size: 1.1em;">${scopeLabel}</strong><br><span style="color: var(--text-muted);">The connected wallet may contain additional live offers; confirming cancels all of them.</span>` +
                         (buyCount > 0 && sellCount > 0 ? `<br><span style="color: var(--status-success);">${buyCount} buy</span> · <span style="color: var(--sell-color);">${sellCount} sell</span>` : '');
                 }
             }
@@ -31882,11 +31921,26 @@
             document.getElementById('cancelConfirmModal').classList.add('active');
         }
         
-        function closeCancelConfirm() {
+        function closeCancelConfirm({ clearContext = true } = {}) {
             document.getElementById('cancelConfirmModal').classList.remove('active');
+            if (clearContext) _cancelAllContext = null;
         }
         
         let _cancelAllInProgress = false;
+        let _cancelAllCompletionPoll = null;
+        let _cancelAllSafetyTimer = null;
+        let _cancelAllOperationGeneration = 0;
+
+        function clearCancelAllCompletionTimers() {
+            if (_cancelAllCompletionPoll) {
+                clearInterval(_cancelAllCompletionPoll);
+                _cancelAllCompletionPoll = null;
+            }
+            if (_cancelAllSafetyTimer) {
+                clearTimeout(_cancelAllSafetyTimer);
+                _cancelAllSafetyTimer = null;
+            }
+        }
 
         async function confirmCancelAll() {
             if (bot_state?.running) {
@@ -31903,15 +31957,32 @@
                 return;
             }
             _cancelAllInProgress = true;
+            const operationGeneration = ++_cancelAllOperationGeneration;
+            let releaseImmediately = true;
+            _cancelAllLastState = null;
+            const cancelContext = _cancelAllContext;
 
-            const buyCount = bot_state?.offers?.buy?.length || 0;
-            const sellCount = bot_state?.offers?.sell?.length || 0;
-            const totalActive = buyCount + sellCount;
+            const contextBuyCount = Number(cancelContext?.openBuyCount);
+            const contextSellCount = Number(cancelContext?.openSellCount);
+            const contextTotal = Number(cancelContext?.openOfferCount);
+            const buyCount = Number.isFinite(contextBuyCount)
+                ? Math.max(0, Math.trunc(contextBuyCount))
+                : (bot_state?.offers?.buy?.length || 0);
+            const sellCount = Number.isFinite(contextSellCount)
+                ? Math.max(0, Math.trunc(contextSellCount))
+                : (bot_state?.offers?.sell?.length || 0);
+            const totalActive = Number.isFinite(contextTotal)
+                ? Math.max(0, Math.trunc(contextTotal))
+                : buyCount + sellCount;
 
             // Close confirm modal immediately
-            closeCancelConfirm();
+            closeCancelConfirm({ clearContext: false });
+            _cancelAllContext = null;
 
-            addLogEntry('warning', `⚠️ CANCEL ALL — cancelling ${totalActive} offer${totalActive !== 1 ? 's' : ''}...`);
+            const scopeMessage = cancelContext?.source === 'coin_prep'
+                ? `${totalActive} CATalyst-tracked offer${totalActive !== 1 ? 's' : ''}; checking connected wallet...`
+                : `${totalActive} CATalyst-visible offer${totalActive !== 1 ? 's' : ''}; checking connected wallet...`;
+            addLogEntry('warning', `⚠️ CANCEL ALL — ${scopeMessage}`);
             if (buyCount > 0) addLogEntry('info', `   ${buyCount} buy offer${buyCount !== 1 ? 's' : ''}...`);
             if (sellCount > 0) addLogEntry('info', `   ${sellCount} sell offer${sellCount !== 1 ? 's' : ''}...`);
 
@@ -31927,38 +31998,65 @@
 
                 // Backend runs asynchronously — open progress modal and poll
                 if (result.async) {
+                    releaseImmediately = false;
                     const total = result.total || totalActive;
                     addLogEntry('info', `   Wallet cancel started for ${total} offers — tracking progress...`);
                     openCancelProgressModal(total);
-                    startCancelAllProgressPolling(total);
+                    startCancelAllProgressPolling(total, operationGeneration);
 
                     // Auto-stop polling when complete (check every second via the
                     // existing polling, but also set a safety fallback)
-                    const _pollCheck = setInterval(async () => {
+                    clearCancelAllCompletionTimers();
+                    _cancelAllCompletionPoll = setInterval(async () => {
                         try {
                             const st = _get_cancel_all_state_local();
                             if (st && (st.phase === 'complete' || st.phase === 'error')) {
-                                clearInterval(_pollCheck);
+                                clearCancelAllCompletionTimers();
                                 stopCancelAllProgressPolling();
-                                _cancelAllInProgress = false;
                                 await fetchStatus();
                                 try { updateResumeOverview(); } catch (_re) { /* non-fatal */ }
                                 if (st.phase === 'complete') {
                                     const view = cancelAllProgressView(st, total);
                                     addLogEntry(view.severity, `   ${view.message}`);
                                     showToast(view.message, view.severity);
+                                    if (cancelContext?.source === 'coin_prep') {
+                                        if (Number(st.failed || 0) > 0) {
+                                            showToast('Coin prep is still blocked because one or more offer cancellations were rejected.', 'error', 8000);
+                                        } else if (cancelContext.resumeAfterCancel !== false) {
+                                            await resumeCoinPrepAfterCancelledOffers(cancelContext);
+                                        } else {
+                                            showToast('Cancellation requests were recorded. After Sage confirms the offers terminal, retry Prepare Coins without resetting protected history.', 'warning', 10000);
+                                        }
+                                    }
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
+                                }
+                                if (operationGeneration === _cancelAllOperationGeneration) {
+                                    _cancelAllInProgress = false;
                                 }
                             }
                         } catch (_e) { /* polling check failed, keep trying */ }
                     }, 2000);
 
-                    // Safety timeout: stop polling after 5 minutes regardless
-                    setTimeout(() => {
-                        clearInterval(_pollCheck);
+                    // Safety timeout: show an explicit fail-closed state and
+                    // release the UI latch so the operator can retry safely.
+                    _cancelAllSafetyTimer = setTimeout(() => {
+                        if (operationGeneration !== _cancelAllOperationGeneration) return;
+                        clearCancelAllCompletionTimers();
                         stopCancelAllProgressPolling();
+                        const timeoutMessage = 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
+                        _cancelAllLastState = {
+                            success: false,
+                            phase: 'error',
+                            total,
+                            pending: 0,
+                            failed: 0,
+                            message: timeoutMessage,
+                        };
+                        renderCancelAllProgress(_cancelAllLastState, total);
+                        addLogEntry('warning', `   ${timeoutMessage}`);
+                        showToast(timeoutMessage, 'warning', 10000);
                         _cancelAllInProgress = false;
                     }, 300000);
                     return;
@@ -31980,11 +32078,21 @@
                 addLogEntry('info', '   Refreshing offer list...');
                 await fetchStatus();
                 addLogEntry('success', '⚠️ CANCEL ALL — done');
+                if (cancelContext?.source === 'coin_prep' && failed === 0) {
+                    if (cancelContext.resumeAfterCancel !== false) {
+                        await resumeCoinPrepAfterCancelledOffers(cancelContext);
+                    } else {
+                        showToast('Cancellation requests were recorded. After Sage confirms the offers terminal, retry Prepare Coins without resetting protected history.', 'warning', 10000);
+                    }
+                }
 
             } catch (error) {
                 addLogEntry('error', '   ❌ Error: ' + error.message);
             } finally {
-                _cancelAllInProgress = false;
+                if (releaseImmediately && operationGeneration === _cancelAllOperationGeneration) {
+                    clearCancelAllCompletionTimers();
+                    _cancelAllInProgress = false;
+                }
             }
         }
 
@@ -32104,11 +32212,16 @@
             if (isDone) _stopCancelDots();
         }
 
-        async function pollCancelAllProgressOnce(totalHint = 0) {
+        async function pollCancelAllProgressOnce(totalHint = 0, operationGeneration = _cancelAllOperationGeneration) {
             try {
                 const response = await apiFetch(`${API_URL}/offers/cancel_all/status`);
                 const status = await response.json();
                 if (!status || status.success === false) return;
+                if (operationGeneration !== _cancelAllOperationGeneration) return;
+                const statusPhase = String(status.phase || '').toLowerCase();
+                if (!_cancelAllInProgress && statusPhase !== 'complete' && statusPhase !== 'error') {
+                    return;
+                }
                 // Cache for _get_cancel_all_state_local()
                 _cancelAllLastState = status;
 
@@ -32141,11 +32254,11 @@
             }
         }
 
-        function startCancelAllProgressPolling(totalHint = 0) {
+        function startCancelAllProgressPolling(totalHint = 0, operationGeneration = _cancelAllOperationGeneration) {
             stopCancelAllProgressPolling();
-            pollCancelAllProgressOnce(totalHint);
+            pollCancelAllProgressOnce(totalHint, operationGeneration);
             _cancelAllProgressPoll = setInterval(() => {
-                pollCancelAllProgressOnce(totalHint);
+                pollCancelAllProgressOnce(totalHint, operationGeneration);
             }, 1000);
         }
 
@@ -34282,6 +34395,91 @@ function closeCtgErrorModal() {
             }
         }
 
+        async function resumeCoinPrepAfterCancelledOffers(context, options = {}) {
+            const prepPayload = context?.prepPayload;
+            if (!prepPayload || typeof prepPayload !== 'object') {
+                showToast('Coin prep could not resume because its saved settings were unavailable.', 'error');
+                return false;
+            }
+
+            const requestedDelay = Number(options.retryDelayMs);
+            const requestedTimeout = Number(options.timeoutMs);
+            const retryDelayMs = Number.isFinite(requestedDelay) && requestedDelay >= 0
+                ? requestedDelay
+                : 5000;
+            const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+                ? requestedTimeout
+                : 10 * 60 * 1000;
+            const deadline = Date.now() + timeoutMs;
+            const wait = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+            const titleEl = document.getElementById('cancelProgressTitle');
+            const messageEl = document.getElementById('cancelProgressMessage');
+            const statusEl = document.getElementById('cancelProgressStatus');
+            if (titleEl) titleEl.textContent = 'Waiting for Sage confirmation';
+            if (messageEl) messageEl.textContent = 'Cancellation requests were sent. CATalyst is waiting for Sage to prove every offer terminal before replacing locked coins.';
+
+            while (Date.now() <= deadline) {
+                try {
+                    const response = await apiFetch(`${API_URL}/coin-prep/trigger`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(prepPayload),
+                    });
+                    const data = await response.json();
+                    if (data.success) {
+                        if (data.wallet_offer_book_verified_empty !== true) {
+                            throw new Error('Coin prep start was not accompanied by a complete empty Sage offer-book proof.');
+                        }
+                        _coinPrepMsgHistory = [];
+                        _coinPrepLastMsg = '';
+                        closeCancelProgressModal();
+                        showCoinPrepView('progress');
+                        if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+                        coinPrepPollInterval = setInterval(pollCoinPrepProgress, 1500);
+                        pollCoinPrepProgress();
+                        addLogEntry('success', 'Offer states confirmed terminal — coin prep started automatically.');
+                        showToast('Offer states are confirmed terminal. Coin prep has started.', 'success', 6000);
+                        return true;
+                    }
+
+                    const retryAction = String(data.action || '');
+                    const awaitingTerminalProof =
+                        data.error === 'coin_prep_requires_offer_cancellation'
+                        || data.error === 'coin_prep_offer_reconciliation_pending'
+                        || data.error === 'coin_prep_legacy_offer_recovery_required'
+                        || retryAction === 'retry_authoritative_reconciliation'
+                        || retryAction === 'retry_authoritative_legacy_recovery';
+                    if (awaitingTerminalProof) {
+                        const remaining = Math.max(0, Math.trunc(Number(data.open_offer_count) || 0));
+                        const waitingMessage = remaining > 0
+                            ? `Waiting for Sage confirmation: ${remaining} offer${remaining === 1 ? '' : 's'} still await authoritative terminal proof.`
+                            : 'Waiting for Sage to publish authoritative cancellation evidence.';
+                        if (statusEl) statusEl.textContent = waitingMessage;
+                    } else if (data.error !== 'rate_limited') {
+                        throw new Error(data.message || data.error || 'Coin prep could not resume');
+                    }
+                } catch (error) {
+                    const message = 'Coin prep could not resume after offer cancellation: ' + formatError(error);
+                    if (statusEl) statusEl.textContent = message;
+                    showToast(message, 'error', 8000);
+                    const btn = document.getElementById('cpConfirmBtn');
+                    if (btn) { btn.disabled = false; btn.textContent = 'Yes, Prepare Coins'; }
+                    return false;
+                }
+
+                if (Date.now() + retryDelayMs > deadline) break;
+                await wait(retryDelayMs);
+            }
+
+            const timeoutMessage = 'Offer cancellations are still awaiting Sage confirmation. Coin prep remains safely blocked; try Prepare Coins again after the wallet confirms them.';
+            if (statusEl) statusEl.textContent = timeoutMessage;
+            showToast(timeoutMessage, 'warning', 10000);
+            const btn = document.getElementById('cpConfirmBtn');
+            if (btn) { btn.disabled = false; btn.textContent = 'Yes, Prepare Coins'; }
+            return false;
+        }
+
         // Track whether we're currently in the lightweight "loading" state
         // so dismissCoinPrepConfirmLoading can avoid touching a real modal
         // the user has already moved past.
@@ -34828,15 +35026,16 @@ function closeCtgErrorModal() {
             try {
                 // Send the spare coin multiplier from the GUI to the API
                 const coinMultiplier = parseFloat(document.getElementById('configCoinPrepMultiplier')?.value) || 2;
+                const prepPayload = {
+                    coin_multiplier: coinMultiplier,
+                    reset_pnl: !!resets.pnl,
+                    reset_offer_history: !!resets.offers,
+                    reset_counters: !!resets.counters,
+                };
                 const response = await apiFetch(`${API_URL}/coin-prep/trigger`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        coin_multiplier: coinMultiplier,
-                        reset_pnl: !!resets.pnl,
-                        reset_offer_history: !!resets.offers,
-                        reset_counters: !!resets.counters,
-                    })
+                    body: JSON.stringify(prepPayload)
                 });
                 const data = await response.json();
 
@@ -34851,6 +35050,21 @@ function closeCtgErrorModal() {
                     // Start polling for progress
                     coinPrepPollInterval = setInterval(pollCoinPrepProgress, 1500);
                     pollCoinPrepProgress(); // Immediate first poll
+                } else if (data.error === 'coin_prep_requires_offer_cancellation') {
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = 'Yes, Prepare Coins';
+                    }
+                    showToast(data.message || 'Open offers must be cancelled before coin prep.', 'warning', 7000);
+                    await cancelAllOffers({
+                        source: 'coin_prep',
+                        prepPayload,
+                        openOfferCount: data.open_offer_count,
+                        openBuyCount: data.open_buy_count,
+                        openSellCount: data.open_sell_count,
+                        resumeAfterCancel: data.action === 'cancel_all_then_retry',
+                        additionalConflicts: data.additional_conflicts || [],
+                    });
                 } else if (data.error && data.error.includes('already running')) {
                     // Stale flag - try resetting and retrying once
                     debugLog('[COIN PREP] Stale running flag detected, resetting...');

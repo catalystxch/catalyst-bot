@@ -1481,6 +1481,107 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             {"fee_mojos": 100_000_000, "coin_ids": [fee_coin_id]},
         )
 
+    def test_exact_source_cat_tier_pool_binds_a_separate_xch_fee_cohort(self):
+        sources = [hashlib.sha256(b"cat-tier-pool").hexdigest()]
+        fee_coin_id = hashlib.sha256(b"xch-tier-pool-fee").hexdigest()
+        identity = {
+            "backend": "sage",
+            "name": "Task 16 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": "2026-08-22T00:00:00.000000Z",
+            "maximum_age_seconds": 300,
+        }
+        claims = []
+        prepared_calls = []
+        adapter_calls = []
+        claim = {"claim_token": "b" * 64, "generation": 1}
+        self.coin_prep_worker.DB_AVAILABLE = True
+        self.coin_prep_worker.claim_wallet_effect = lambda **kwargs: (
+            claims.append(kwargs) or claim
+        )
+        self.coin_prep_worker.wallet_effect_claim_is_current = (
+            lambda *_args, **_kwargs: True
+        )
+        self.coin_prep_worker.begin_wallet_effect_dispatch = lambda *_args, **_kwargs: (
+            object()
+        )
+        self.coin_prep_worker.wallet_effect_adapter_dispatch_authority = (
+            lambda _dispatch: nullcontext()
+        )
+        self.coin_prep_worker.complete_wallet_effect_dispatch = (
+            lambda *_args, **_kwargs: "SUBMITTED"
+        )
+
+        def prepare_coin_prep_operation(**kwargs):
+            prepared_calls.append(kwargs)
+            return {
+                "operation": {
+                    "operation_id": "coin-prep:" + "f" * 64,
+                    "outcome": "PREPARED",
+                    "source_coin_ids_json": json.dumps(sources),
+                    "wallet_identity_json": json.dumps(identity),
+                    "effect_claim_token": claim["claim_token"],
+                    "effect_claim_generation": claim["generation"],
+                }
+            }
+
+        self.coin_prep_worker.prepare_coin_prep_operation = prepare_coin_prep_operation
+        self.coin_prep_worker.record_coin_prep_operation_outcome = (
+            lambda operation_id, **kwargs: {
+                "operation": {"operation_id": operation_id, **kwargs}
+            }
+        )
+        self.worker._current_coin_prep_wallet_identity = lambda: identity
+        self.worker._observe_coin_prep_post_effect = lambda _operation: None
+
+        result = self.worker._call_wallet_mutation(
+            "coin_prep.create_cat_tier_pools_exact_with_fee",
+            lambda **kwargs: (
+                adapter_calls.append(kwargs) or {"success": True, "submitted": True}
+            ),
+            coin_ids=sources,
+            actions=[
+                {
+                    "type": "send",
+                    "id": {"type": "existing", "asset_id": "bb" * 32},
+                    "address": "xch1exactfee",
+                    "amount": "200",
+                    "memos": [],
+                },
+                {"type": "fee", "amount": "100000000"},
+            ],
+            fee_coin_id=fee_coin_id,
+            fee_mojos=100_000_000,
+            _authority_fee_coin_ids=[fee_coin_id],
+            _prep_contract={
+                "operation_kind": "split",
+                "purpose": "replacement",
+                "target_contract": {
+                    "wallet_type": "cat",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "amount_mojos": 200,
+                            "purpose": "replacement",
+                        }
+                    ],
+                },
+                "pre_view_coin_ids": sources,
+            },
+        )
+
+        self.assertEqual(type(result), self.coin_prep_worker.CoinPrepSubmittedUnknown)
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertEqual(claims[0]["source_coin_ids"], sources)
+        self.assertEqual(claims[0]["fee_coin_ids"], [fee_coin_id])
+        self.assertEqual(
+            prepared_calls[0]["target_contract"]["external_fee"],
+            {"fee_mojos": 100_000_000, "coin_ids": [fee_coin_id]},
+        )
+
     def test_zero_fee_cat_split_keeps_fee_free_prep_contract(self):
         source = hashlib.sha256(b"zero-fee-cat-source").hexdigest()
         identity = {

@@ -13,11 +13,89 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import time
 from typing import Any
 
 
 _HEX = frozenset("0123456789abcdef")
 _XCH_SCALE = Decimal("1000000000000")
+
+
+class _CachedReadOnlyWallet:
+    """Share immutable Sage history reads across a bounded legacy ladder."""
+
+    _SHARED_METHODS = frozenset(
+        {
+            "get_wallet_backend_authority",
+            "get_wallet_identity",
+            "get_authoritative_offer_history",
+            "get_all_offers",
+            "get_transactions_list",
+        }
+    )
+
+    def __init__(self, wallet_facade: Any, *, seed_coin_ids: set[str] | None = None):
+        self._wallet = wallet_facade
+        self._cache: dict[tuple[str, str], Any] = {}
+        self._seed_coin_ids = {
+            normalized
+            for value in (seed_coin_ids or set())
+            if (normalized := _hex_id(value))
+        }
+        self._coin_records: Any = None
+
+    @staticmethod
+    def _key(
+        name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[str, str]:
+        encoded = json.dumps(
+            {"args": args, "kwargs": kwargs},
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return name, encoded
+
+    def __getattr__(self, name: str):
+        target = getattr(self._wallet, name)
+        if name == "get_coins_by_ids" and callable(target):
+
+            def cached_coins(coin_ids):
+                requested = {
+                    normalized for value in coin_ids if (normalized := _hex_id(value))
+                }
+                if self._coin_records is None:
+                    self._coin_records = target(sorted(requested | self._seed_coin_ids))
+                result = self._coin_records
+                if type(result) is not dict or result.get("success") is not True:
+                    return result
+                records = result.get("records")
+                if type(records) is not dict:
+                    return result
+                filtered = {
+                    key: value
+                    for key, value in records.items()
+                    if _hex_id(key) in requested
+                    or (
+                        type(value) is dict
+                        and _hex_id(value.get("coin_id")) in requested
+                    )
+                }
+                return {**result, "records": filtered}
+
+            return cached_coins
+        if name not in self._SHARED_METHODS or not callable(target):
+            return target
+
+        def cached(*args, **kwargs):
+            key = self._key(name, args, kwargs)
+            if key not in self._cache:
+                self._cache[key] = target(*args, **kwargs)
+            return self._cache[key]
+
+        return cached
 
 
 def _hex_id(value: Any) -> str:
@@ -114,6 +192,7 @@ def recover_legacy_sage_reservations(
     database_module: Any = None,
     reconciliation_module: Any = None,
     config: Any = None,
+    deadline_seconds: float = 60.0,
 ) -> dict[str, int]:
     """Adopt and expire exact legacy locks using fresh Sage evidence only."""
 
@@ -136,15 +215,36 @@ def recover_legacy_sage_reservations(
     candidates = database_module.get_legacy_startup_reservation_candidates(limit=128)
     if type(candidates) is not list or len(candidates) > 128:
         raise RuntimeError("legacy reservation inventory is malformed")
+    if type(deadline_seconds) not in {int, float} or not 0 < deadline_seconds <= 300:
+        raise ValueError("legacy recovery deadline must be between 0 and 300 seconds")
+    deadline = time.monotonic() + float(deadline_seconds)
+    parsed_candidates: list[tuple[Any, dict | None]] = []
+    seed_coin_ids: set[str] = set()
+    for candidate in candidates:
+        try:
+            synthetic = _legacy_intent(candidate, wallet_hash, safe_network, decimals)
+        except Exception:
+            synthetic = None
+        parsed_candidates.append((candidate, synthetic))
+        if synthetic is not None:
+            seed_coin_ids.update(synthetic["selected_coin_ids"])
+    wallet_facade = _CachedReadOnlyWallet(
+        wallet_facade,
+        seed_coin_ids=seed_coin_ids,
+    )
     result = {"examined": len(candidates), "recovered": 0, "remaining": 0}
     wallet_identity = {
         "wallet_fingerprint_hash": wallet_hash,
         "network": safe_network,
     }
 
-    for candidate in candidates:
+    for index, (candidate, synthetic) in enumerate(parsed_candidates):
+        if time.monotonic() >= deadline:
+            result["remaining"] += len(parsed_candidates) - index
+            break
         try:
-            synthetic = _legacy_intent(candidate, wallet_hash, safe_network, decimals)
+            if synthetic is None:
+                raise ValueError("legacy reservation candidate is malformed")
             intent_id = synthetic["intent_id"]
             existing = database_module.get_offer_intent(intent_id)
             evidence_target = (
@@ -170,6 +270,13 @@ def recover_legacy_sage_reservations(
             ):
                 result["remaining"] += 1
                 continue
+
+            durable_json, evidence_sha256 = (
+                reconciliation_module.canonical_evidence_and_digest(
+                    {"classification": classification, "evidence": evidence},
+                    max_bytes=65536,
+                )
+            )
 
             if existing is None:
                 database_module.prepare_offer_intent(
@@ -201,33 +308,27 @@ def recover_legacy_sage_reservations(
                 )
                 existing = database_module.get_offer_intent(intent_id)
 
-            if type(existing) is dict and existing.get("lifecycle_state") == "prepared":
-                database_module.finalize_offer_intent(
-                    intent_id=intent_id,
-                    operation_id=f"create:{intent_id}",
-                    event_id=f"create:{intent_id}:finalized",
-                    lifecycle_state="created",
-                    outcome="CONFIRMED",
-                    sage_trade_id=synthetic["sage_trade_id"],
-                    offer_text_sha256=synthetic["offer_text_sha256"],
-                    wallet_identity_json=wallet_identity,
-                    evidence_json={
-                        "migration": "legacy_startup_expiry",
-                        "trade_id": synthetic["sage_trade_id"],
-                    },
-                    reason_code="LEGACY_OFFER_ADOPTED",
-                    finalized_at=synthetic["confirmed_at"],
-                    finalize_selected_coin_reservations=False,
-                )
-
-            reconciled = reconciliation_module.reconcile_offer(
-                intent_id, evidence=evidence, now=observed_at
+            reconciled = database_module.commit_legacy_expired_offer_intent(
+                intent_id=intent_id,
+                sage_trade_id=synthetic["sage_trade_id"],
+                offer_text_sha256=synthetic["offer_text_sha256"],
+                wallet_fingerprint_hash=wallet_hash,
+                network=safe_network,
+                classification=reconciliation_module.EXPIRED_PROVEN,
+                reason_code=classification.get(
+                    "reason_code", "AUTHORITATIVE_EXPIRY_PROOF"
+                ),
+                wallet_identity_json=wallet_identity,
+                evidence_json=durable_json,
+                evidence_sha256=evidence_sha256,
+                confirmed_at=synthetic["confirmed_at"],
+                reconciled_at=observed_at,
             )
             if (
                 type(reconciled) is dict
-                and reconciled.get("classification")
+                and type(reconciled.get("event")) is dict
+                and reconciled["event"].get("outcome")
                 == reconciliation_module.EXPIRED_PROVEN
-                and reconciled.get("applied") is True
             ):
                 result["recovered"] += 1
             else:

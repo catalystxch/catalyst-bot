@@ -47,6 +47,11 @@ class _FlaskBase(unittest.TestCase):
                 "enter_mutation",
                 return_value="coin-prep-unit-permit",
             ),
+            patch.object(
+                api_server.mutation_gate,
+                "acquire_exclusive_mutation",
+                return_value=True,
+            ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
             patch("wallet.get_spendable_coin_count", return_value=0),
         ]
@@ -374,6 +379,27 @@ class TestCoinPrepTrigger(_FlaskBase):
         self._open_offers = patch("database.get_open_offers", return_value=[])
         self._open_offers.start()
         self.addCleanup(self._open_offers.stop)
+        self._wallet_offer_snapshot = patch.object(
+            coin_prep_blueprint,
+            "_wallet_open_offer_snapshot_before_prep",
+            return_value={
+                "complete": True,
+                "read_error": None,
+                "open_offer_count": 0,
+                "open_buy_count": 0,
+                "open_sell_count": 0,
+                "open_trade_ids": [],
+            },
+        )
+        self._wallet_offer_snapshot.start()
+        self.addCleanup(self._wallet_offer_snapshot.stop)
+        self._legacy_recovery = patch.object(
+            coin_prep_blueprint,
+            "_recover_legacy_open_offers_before_prep",
+            return_value={"examined": 0, "recovered": 0, "remaining": 0},
+        )
+        self._legacy_recovery.start()
+        self.addCleanup(self._legacy_recovery.stop)
 
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
@@ -421,7 +447,7 @@ class TestCoinPrepTrigger(_FlaskBase):
 
     def test_stops_bot_if_running(self):
         bot = MagicMock()
-        bot.is_running.return_value = True
+        bot.is_running.side_effect = [True, False]
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -431,7 +457,7 @@ class TestCoinPrepTrigger(_FlaskBase):
         ):
             mock_thread.return_value.start = MagicMock()
             self._post("/api/coin-prep/trigger")
-        bot.stop.assert_called_once()
+        bot.stop.assert_called_once_with(wait=True)
 
     def test_duplicate_trigger_does_not_start_second_worker(self):
         with (

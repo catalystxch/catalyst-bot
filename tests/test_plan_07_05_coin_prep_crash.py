@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import api_server
     import coin_manager as cm_module
+    from blueprints import coin_prep as coin_prep_blueprint
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
@@ -274,7 +275,35 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
                 "enter_mutation",
                 return_value="coin-prep-crash-unit-permit",
             ),
+            patch.object(
+                api_server.mutation_gate,
+                "acquire_exclusive_mutation",
+                return_value=True,
+            ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+            patch("database.get_open_offers", return_value=[]),
+            patch.object(
+                coin_prep_blueprint,
+                "_wallet_open_offer_snapshot_before_prep",
+                return_value={
+                    "complete": True,
+                    "read_error": None,
+                    "open_offer_count": 0,
+                    "open_buy_count": 0,
+                    "open_sell_count": 0,
+                    "open_trade_ids": [],
+                },
+            ),
+            patch.object(
+                coin_prep_blueprint,
+                "_recover_legacy_open_offers_before_prep",
+                return_value={"examined": 0, "recovered": 0, "remaining": 0},
+            ),
+            patch.object(
+                coin_prep_blueprint,
+                "_reconcile_authoritative_open_offers_before_prep",
+                return_value=None,
+            ),
         ]
         for patcher in self._gate_patchers:
             patcher.start()

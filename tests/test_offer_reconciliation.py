@@ -1539,6 +1539,37 @@ def test_sage_loader_rejects_repeated_exact_page_with_page_local_total():
     assert len(calls) == 2
 
 
+def test_sage_loader_accepts_exact_page_with_explicit_authoritative_end():
+    """An explicit Sage end marker must finish an exact-size first page."""
+
+    rows = [_offer(status=1, trade_id=f"{index:064x}") for index in range(2)]
+    calls = []
+
+    def authoritative_exact_page(**kwargs):
+        calls.append(kwargs)
+        return {
+            "success": True,
+            "offers": [dict(row) for row in rows],
+            "total": len(rows),
+            "end_of_history": True,
+        }
+
+    source = load_sage_offer_history(
+        get_all_offers=authoritative_exact_page,
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=2,
+        max_pages=4,
+        max_records=10,
+    )
+
+    assert source["complete"] is True
+    assert source["read_error"] is None
+    assert len(source["records"]) == 2
+    assert source["pagination"]["authoritative_end"] is True
+    assert len(calls) == 1
+
+
 def test_sage_loader_accepts_oversized_snapshot_only_with_authoritative_total():
     rows = [_offer(status=1, trade_id=f"{index:064x}") for index in range(5)]
 

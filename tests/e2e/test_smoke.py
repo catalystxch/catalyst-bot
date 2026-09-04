@@ -463,6 +463,542 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
+def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
+    """A live ladder must lead to a usable cancel-first recovery, not raw JSON."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async () => {
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            askPrepHistoryChoice = async () => ({
+                action: 'proceed',
+                resets: { pnl: false, offers: false, counters: false },
+            });
+            apiFetch = async (path) => {
+                if (!String(path).includes('/coin-prep/trigger')) {
+                    throw new Error(`Unexpected test request: ${path}`);
+                }
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'coin_prep_requires_offer_cancellation',
+                    reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
+                    message: '72 open offers must be cancelled and authoritatively confirmed before coin prep can safely replace their locked coins.',
+                    action: 'cancel_all_then_retry',
+                    open_offer_count: 72,
+                    open_buy_count: 36,
+                    open_sell_count: 36,
+                }), {
+                    status: 409,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await startCoinPrepFromModal();
+        }"""
+    )
+
+    expect(page.locator("#cancelConfirmModal")).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator("#cancelConfirmTitle")).to_have_text(
+        "Cancel offers before coin prep?"
+    )
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "every live offer in the connected wallet"
+    )
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "including offers not tracked by CATalyst"
+    )
+    expect(page.locator("#cancelOfferCount")).to_contain_text(
+        "72 CATalyst-tracked active offers"
+    )
+    expect(page.locator("#cancelOfferCount")).to_contain_text("36 buy")
+    expect(page.locator("#cancelOfferCount")).to_contain_text("36 sell")
+    expect(page.locator("#cancelAllConfirmBtn")).to_have_text(
+        "Cancel Offers & Continue"
+    )
+
+
+def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
+    """Cancelling live offers must not promise to clear protected history."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async () => {
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            askPrepHistoryChoice = async () => ({
+                action: 'proceed',
+                resets: { pnl: true, offers: false, counters: false },
+            });
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false,
+                error: 'coin_prep_requires_offer_cancellation',
+                reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
+                message: '2 open offers must be cancelled. The requested history reset is also blocked by protected authoritative state; after cancellation, retry coin prep without clearing protected history.',
+                action: 'cancel_all_then_retry_without_protected_resets',
+                open_offer_count: 2,
+                open_buy_count: 1,
+                open_sell_count: 1,
+                additional_conflicts: ['authoritative_session_state', 'coin_reservations'],
+            }), {
+                status: 409,
+                headers: { 'Content-Type': 'application/json' },
+            });
+            await startCoinPrepFromModal();
+        }"""
+    )
+
+    expect(page.locator("#cancelConfirmModal")).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "retry Prepare Coins without resetting protected history"
+    )
+    expect(page.locator("#cancelAllConfirmBtn")).to_have_text("Cancel Offers")
+    assert page.evaluate("_cancelAllContext.resumeAfterCancel") is False
+
+
+def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
+    """Offer-history reset must not auto-resume after cancellation creates proof."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    submitted = page.evaluate(
+        """async () => {
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            askPrepHistoryChoice = async () => ({
+                action: 'proceed',
+                resets: { pnl: false, offers: true, counters: false },
+            });
+            window.__submittedPrepPayload = null;
+            apiFetch = async (_path, options) => {
+                window.__submittedPrepPayload = JSON.parse(options.body);
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'coin_prep_requires_offer_cancellation',
+                    reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
+                    message: '1 open offer must be cancelled. After cancellation, retry coin prep without clearing protected history.',
+                    action: 'cancel_all_then_retry_without_protected_resets',
+                    open_offer_count: 1,
+                    open_buy_count: 1,
+                    open_sell_count: 0,
+                    additional_conflicts: ['offer_proof_history'],
+                }), {
+                    status: 409,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await startCoinPrepFromModal();
+            return window.__submittedPrepPayload;
+        }"""
+    )
+
+    assert submitted["reset_pnl"] is False
+    assert submitted["reset_offer_history"] is True
+    expect(page.locator("#cancelAllConfirmBtn")).to_have_text("Cancel Offers")
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "retry Prepare Coins without resetting protected history"
+    )
+    assert page.evaluate("_cancelAllContext.resumeAfterCancel") is False
+
+
+def test_generic_cancel_all_explicitly_covers_every_live_sage_offer(page):
+    """Consent text must match wallet-wide cancellation, including orphan offers."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async () => {
+            bot_state = {
+                running: false,
+                offers: { buy: [{ trade_id: 'tracked' }], sell: [] },
+            };
+            await cancelAllOffers();
+        }"""
+    )
+
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "every live offer in the connected wallet"
+    )
+    expect(page.locator("#cancelConfirmCopy")).to_contain_text(
+        "including offers not tracked by CATalyst"
+    )
+    expect(page.locator("#cancelOfferCount")).to_contain_text(
+        "CATalyst currently shows 1 active offer"
+    )
+
+
+def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
+    """Submitted cancels must be proven terminal before prep starts automatically."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let triggerCalls = 0;
+            window.__coinPrepRecoveryLogs = [];
+            addLogEntry = (_level, message) => window.__coinPrepRecoveryLogs.push(message);
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            apiFetch = async (path) => {
+                if (!String(path).includes('/coin-prep/trigger')) {
+                    throw new Error(`Unexpected test request: ${path}`);
+                }
+                triggerCalls += 1;
+                const body = triggerCalls === 1
+                    ? {
+                        success: false,
+                        error: 'coin_prep_requires_offer_cancellation',
+                        message: '2 open offers are still awaiting Sage confirmation.',
+                        open_offer_count: 2,
+                      }
+                    : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                      };
+                return new Response(JSON.stringify(body), {
+                    status: triggerCalls === 1 ? 409 : 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            const started = await resumeCoinPrepAfterCancelledOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+            }, { retryDelayMs: 0, timeoutMs: 1000 });
+            return { started, triggerCalls, logs: window.__coinPrepRecoveryLogs };
+        }"""
+    )
+
+    assert result["started"] is True
+    assert result["triggerCalls"] == 2
+    assert any("Offer states confirmed terminal" in line for line in result["logs"])
+    expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_coin_prep_keeps_waiting_while_terminal_proof_propagates(page):
+    """A temporarily empty Sage book must not abort automatic reconciliation."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let triggerCalls = 0;
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            apiFetch = async (path) => {
+                if (!String(path).includes('/coin-prep/trigger')) {
+                    return new Response(JSON.stringify({ success: true }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                triggerCalls += 1;
+                const body = triggerCalls === 1
+                    ? {
+                        success: false,
+                        error: 'coin_prep_offer_reconciliation_pending',
+                        action: 'retry_authoritative_reconciliation',
+                        message: 'Sage currently shows no live offers while proof propagates.',
+                        open_offer_count: 2,
+                      }
+                    : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                      };
+                return new Response(JSON.stringify(body), {
+                    status: triggerCalls === 1 ? 409 : 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            const started = await resumeCoinPrepAfterCancelledOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+            }, { retryDelayMs: 0, timeoutMs: 1000 });
+            return { started, triggerCalls };
+        }"""
+    )
+
+    assert result["started"] is True
+    assert result["triggerCalls"] == 2
+    expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_coin_prep_recovery_rejects_unverified_success_response(page):
+    """The browser must not equate a generic 200 with wallet-wide terminal proof."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true,
+                message: 'Coin preparation started',
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+            const started = await resumeCoinPrepAfterCancelledOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+            }, { retryDelayMs: 0, timeoutMs: 10 });
+            return {
+                started,
+                progressVisible: getComputedStyle(
+                    document.getElementById('coinPrepProgressView')
+                ).display !== 'none',
+            };
+        }"""
+    )
+
+    assert result["started"] is False
+    assert result["progressVisible"] is False
+
+
+def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
+    """Confirm must journal cancels, await proof, and retry prep with saved settings."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async () => {
+            const nativeSetInterval = window.setInterval.bind(window);
+            const nativeSetTimeout = window.setTimeout.bind(window);
+            window.setInterval = (fn, delay, ...args) => nativeSetInterval(fn, Math.min(Number(delay) || 0, 20), ...args);
+            window.setTimeout = (fn, delay, ...args) => nativeSetTimeout(fn, Math.min(Number(delay) || 0, 20), ...args);
+            window.__cancelRecovery = { cancelCalls: 0, statusCalls: 0, triggerCalls: 0, logs: [] };
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            pollCoinPrepProgress = async () => {};
+            addLogEntry = (_level, message) => window.__cancelRecovery.logs.push(message);
+            apiFetch = async (path, options = {}) => {
+                const url = String(path);
+                if (url.includes('/offers/cancel_all/status')) {
+                    window.__cancelRecovery.statusCalls += 1;
+                    return new Response(JSON.stringify({
+                        success: true,
+                        phase: 'complete',
+                        total: 2,
+                        pending: 2,
+                        failed: 0,
+                        message: 'Cancellation requests journaled',
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                if (url.includes('/offers/cancel_all')) {
+                    window.__cancelRecovery.cancelCalls += 1;
+                    return new Response(JSON.stringify({ success: true, async: true, total: 2 }), {
+                        status: 202,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                if (url.includes('/coin-prep/trigger')) {
+                    window.__cancelRecovery.triggerCalls += 1;
+                    const waiting = window.__cancelRecovery.triggerCalls === 1;
+                    return new Response(JSON.stringify(waiting ? {
+                        success: false,
+                        error: 'coin_prep_requires_offer_cancellation',
+                        message: '2 offers remain pending authoritative proof',
+                        open_offer_count: 2,
+                    } : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                    }), {
+                        status: waiting ? 409 : 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                throw new Error(`Unexpected test request: ${url} ${options.method || 'GET'}`);
+            };
+
+            await cancelAllOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+                openOfferCount: 2,
+                openBuyCount: 1,
+                openSellCount: 1,
+                resumeAfterCancel: true,
+            });
+            await confirmCancelAll();
+        }"""
+    )
+
+    page.wait_for_function(
+        "window.__cancelRecovery && window.__cancelRecovery.triggerCalls >= 2",
+        timeout=5_000,
+    )
+    result = page.evaluate("window.__cancelRecovery")
+    assert result["cancelCalls"] == 1
+    assert result["statusCalls"] >= 1
+    assert result["triggerCalls"] == 2
+    assert any(
+        "2 CATalyst-tracked offers; checking connected wallet" in line
+        for line in result["logs"]
+    )
+    assert any("Offer states confirmed terminal" in line for line in result["logs"])
+    expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
+    """Hiding or re-clicking must not start a second cancel while one is active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    still_latched = page.evaluate(
+        """async () => {
+            const nativeSetInterval = window.setInterval.bind(window);
+            window.setInterval = (fn, delay, ...args) => nativeSetInterval(fn, Math.min(Number(delay) || 0, 20), ...args);
+            window.__cancelLatchPhase = 'running';
+            bot_state = { running: false, offers: { buy: [{ trade_id: 'one' }], sell: [] } };
+            fetchStatus = async () => {};
+            addLogEntry = () => {};
+            showToast = () => {};
+            apiFetch = async (path) => {
+                if (String(path).includes('/offers/cancel_all/status')) {
+                    return new Response(JSON.stringify({
+                        success: true,
+                        phase: window.__cancelLatchPhase,
+                        total: 1,
+                        pending: window.__cancelLatchPhase === 'complete' ? 1 : 0,
+                        failed: 0,
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                return new Response(JSON.stringify({ success: true, async: true, total: 1 }), {
+                    status: 202,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await cancelAllOffers();
+            await confirmCancelAll();
+            return _cancelAllInProgress;
+        }"""
+    )
+
+    assert still_latched is True
+    page.evaluate("window.__cancelLatchPhase = 'complete'")
+    page.wait_for_function("_cancelAllInProgress === false", timeout=2_000)
+
+
+def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
+    """A previous completion must not prematurely finish a new wallet request."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    cached_state = page.evaluate(
+        """async () => {
+            _cancelAllLastState = { success: true, phase: 'complete', total: 99 };
+            bot_state = { running: false, offers: { buy: [{ trade_id: 'one' }], sell: [] } };
+            fetchStatus = async () => {};
+            addLogEntry = () => {};
+            showToast = () => {};
+            apiFetch = async (path) => {
+                if (String(path).includes('/offers/cancel_all/status')) {
+                    return new Promise(() => {});
+                }
+                return new Response(JSON.stringify({ success: true, async: true, total: 1 }), {
+                    status: 202,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await cancelAllOffers();
+            await confirmCancelAll();
+            return _cancelAllLastState;
+        }"""
+    )
+
+    assert cached_state is None
+
+
+def test_cancel_all_discards_status_from_older_operation_generation(page):
+    """A late poll from an old operation must not overwrite the current state."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let resolveStatus;
+            _cancelAllInProgress = true;
+            _cancelAllOperationGeneration = 10;
+            apiFetch = () => new Promise(resolve => { resolveStatus = resolve; });
+            const oldPoll = pollCancelAllProgressOnce(1, 10);
+            await Promise.resolve();
+            _cancelAllOperationGeneration = 11;
+            _cancelAllLastState = { phase: 'current' };
+            resolveStatus(new Response(JSON.stringify({
+                success: true,
+                phase: 'complete',
+                total: 1,
+                pending: 1,
+                failed: 0,
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            await oldPoll;
+            return _cancelAllLastState;
+        }"""
+    )
+
+    assert result["phase"] == "current"
+
+
+def test_cancel_all_timeout_is_visible_and_releases_latch(page):
+    """A stalled journal poll must end in an explicit, safe timeout state."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async () => {
+            const nativeSetInterval = window.setInterval.bind(window);
+            const nativeSetTimeout = window.setTimeout.bind(window);
+            window.setInterval = (fn, delay, ...args) => nativeSetInterval(fn, Math.min(Number(delay) || 0, 20), ...args);
+            window.setTimeout = (fn, delay, ...args) => nativeSetTimeout(fn, Math.min(Number(delay) || 0, 60), ...args);
+            bot_state = { running: false, offers: { buy: [{ trade_id: 'one' }], sell: [] } };
+            fetchStatus = async () => {};
+            addLogEntry = () => {};
+            showToast = () => {};
+            apiFetch = async (path) => {
+                if (String(path).includes('/offers/cancel_all/status')) {
+                    return new Response(JSON.stringify({
+                        success: true,
+                        phase: 'running',
+                        total: 1,
+                        pending: 0,
+                        failed: 0,
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                return new Response(JSON.stringify({ success: true, async: true, total: 1 }), {
+                    status: 202,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await cancelAllOffers();
+            await confirmCancelAll();
+        }"""
+    )
+
+    expect(page.locator("#cancelProgressStatus")).to_contain_text(
+        "timed out", timeout=2_000
+    )
+    assert page.evaluate("_cancelAllInProgress") is False
+
+
 def test_no_console_errors_on_initial_load(app_page):
     """Catch JS console errors that fire just from loading the dashboard."""
     errors: list[str] = []

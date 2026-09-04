@@ -355,6 +355,53 @@ def test_sage_login_legacy_true_is_normalized_after_guarded_dispatch(monkeypatch
     assert callable(adapter_calls[0][2])
 
 
+def test_sage_login_switches_other_active_key_to_exact_frozen_target(monkeypatch):
+    """A bound login may replace another active key, then must verify the target."""
+
+    current_fingerprint = {"value": 654321}
+    events = []
+
+    def sage_login(fingerprint, force_resync, *, _identity_recheck=None):
+        events.append("adapter")
+        _identity_recheck("sage_login:login")
+        current_fingerprint["value"] = fingerprint
+        events.append("effect")
+        return True
+
+    _authorize_wallet(monkeypatch, SimpleNamespace(sage_login=sage_login))
+
+    def identity_from_adapter(_adapter):
+        fingerprint = current_fingerprint["value"]
+        return {
+            "success": True,
+            "backend": "sage",
+            "name": "Expected Wallet" if fingerprint == 123456 else "Other Wallet",
+            "fingerprint": fingerprint,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "observed_at_utc": _utc(),
+        }
+
+    def require_fresh_identity(binding, snapshot, operation):
+        events.append(f"verified:{snapshot['fingerprint']}")
+        if snapshot["fingerprint"] != binding.fingerprint:
+            raise mutation_gate.MutationBlocked("WALLET_IDENTITY_MISMATCH", operation)
+        return {"allowed": True}
+
+    monkeypatch.setattr(wallet, "_identity_from_adapter", identity_from_adapter)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_identity",
+        require_fresh_identity,
+    )
+
+    result = wallet.sage_login(123456)
+
+    assert result == {"success": True, "_catalyst_effect_attempted": True}
+    assert events == ["adapter", "effect", "verified:123456"]
+
+
 @pytest.mark.parametrize(
     ("adapter_name", "facade_name", "facade_args"),
     [

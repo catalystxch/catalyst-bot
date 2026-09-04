@@ -82,6 +82,11 @@ class _TempDB(unittest.TestCase):
                 api_server.mutation_gate, "enter_mutation", return_value="permit"
             ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+            patch.object(
+                api_server.mutation_gate,
+                "acquire_exclusive_mutation",
+                return_value=True,
+            ),
         )
         for mutation_patch in self._mutation_patches:
             mutation_patch.start()
@@ -93,6 +98,7 @@ class _TempDB(unittest.TestCase):
         # Snapshot coin prep state so tearDown can restore it
         self._orig_coin_prep_state = dict(api_server._coin_prep_state)
         self._orig_coin_prep_proc = api_server._coin_prep_proc
+        self._orig_coin_prep_thread = api_server._coin_prep_thread
         api_server._coin_prep_state.update(
             {
                 "running": False,
@@ -104,6 +110,7 @@ class _TempDB(unittest.TestCase):
             }
         )
         api_server._coin_prep_proc = None
+        api_server._coin_prep_thread = None
 
     def tearDown(self):
         if hasattr(_db._local, "conn") and _db._local.conn:
@@ -125,6 +132,7 @@ class _TempDB(unittest.TestCase):
         api_server._coin_prep_state.clear()
         api_server._coin_prep_state.update(self._orig_coin_prep_state)
         api_server._coin_prep_proc = self._orig_coin_prep_proc
+        api_server._coin_prep_thread = self._orig_coin_prep_thread
 
     def _seed_fill(self, trade_id=_TRADE_ID_A):
         _db.record_fill(
@@ -134,6 +142,20 @@ class _TempDB(unittest.TestCase):
             size_xch=Decimal("0.001"),
             size_cat=Decimal("0.5"),
             cat_asset_id=_FAKE_ASSET,
+        )
+
+    def _seed_unresolved_open_offer(self, trade_id, side):
+        """Create an open row that authoritative preflight cannot retire."""
+        self.assertTrue(
+            _db.add_offer(
+                trade_id,
+                side,
+                Decimal("0.001"),
+                Decimal("1"),
+                Decimal("1000"),
+                _FAKE_ASSET,
+                tier="inner",
+            )
         )
 
     def _seed_terminal_offer_proof(self):
@@ -232,23 +254,64 @@ class _TempDB(unittest.TestCase):
         bot.coin_manager.get_coin_health.return_value = (5, 5)
         return bot
 
-    def _trigger(self, bot_mock=None, full_reset=False):
+    def _trigger(
+        self,
+        bot_mock=None,
+        full_reset=False,
+        *,
+        reset_offer_history=False,
+        wallet_offer_snapshot=None,
+        legacy_recovery=None,
+    ):
         """POST /api/coin-prep/trigger with threading mocked out."""
         mock_thread = MagicMock()
+        if wallet_offer_snapshot is None:
+            wallet_offer_snapshot = {
+                "complete": True,
+                "open_offer_count": 0,
+                "open_trade_ids": [],
+            }
+        if legacy_recovery is None:
+            legacy_recovery = {"examined": 0, "recovered": 0, "remaining": 0}
+        legacy_recovery_patch = (
+            {"side_effect": legacy_recovery}
+            if callable(legacy_recovery)
+            else {"return_value": legacy_recovery}
+        )
+        snapshot_patch = (
+            {"side_effect": wallet_offer_snapshot}
+            if callable(wallet_offer_snapshot)
+            else {"return_value": wallet_offer_snapshot}
+        )
         with (
             patch.object(api_server, "bot", bot_mock or self._make_bot()),
             patch("blueprints.coin_prep.threading.Thread") as mock_thread_cls,
             patch("blueprints.coin_prep.log_event"),
+            patch(
+                "blueprints.coin_prep._wallet_open_offer_snapshot_before_prep",
+                create=True,
+                **snapshot_patch,
+            ),
+            patch(
+                "blueprints.coin_prep._recover_legacy_open_offers_before_prep",
+                create=True,
+                **legacy_recovery_patch,
+            ) as recover_legacy,
             patch("os.path.exists", return_value=True),
             patch("builtins.open", unittest.mock.mock_open()),
         ):
             mock_thread_cls.return_value = mock_thread
-            return self.client.post(
+            response = self.client.post(
                 "/api/coin-prep/trigger",
-                json={"full_reset": full_reset},
+                json={
+                    "full_reset": full_reset,
+                    "reset_offer_history": reset_offer_history,
+                },
                 headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
             )
+            response.legacy_recovery_mock = recover_legacy
+            return response
 
     def _reset(self, bot_mock=None):
         with patch.object(api_server, "bot", bot_mock), patch("api_server.log_event"):
@@ -282,6 +345,55 @@ class TestCoinPrepFullCycle(_TempDB):
         resp = self._trigger()
         self.assertTrue(resp.get_json().get("success"))
 
+    def test_trigger_proves_wallet_offer_book_empty_before_starting(self):
+        resp = self._trigger()
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["wallet_offer_book_verified_empty"])
+
+    def test_untracked_wallet_offer_blocks_prep_before_worker_start(self):
+        """An orphan Sage offer must block prep even when CATalyst has no row."""
+        resp = self._trigger(
+            wallet_offer_snapshot={
+                "complete": True,
+                "open_offer_count": 1,
+                "open_trade_ids": ["f" * 64],
+            }
+        )
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(data["action"], "cancel_all_then_retry")
+        self.assertEqual(data["wallet_open_offer_count"], 1)
+        self.assertFalse(data["wallet_offer_book_verified_empty"])
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_trigger_rechecks_wallet_book_after_stopping_live_bot(self):
+        bot = self._make_bot()
+        bot.is_running.side_effect = [True, False]
+        appeared = {
+            "complete": True,
+            "open_offer_count": 1,
+            "open_trade_ids": ["f" * 64],
+        }
+
+        def snapshot_after_stop():
+            self.assertTrue(bot.stop.called)
+            return appeared
+
+        resp = self._trigger(
+            bot_mock=bot,
+            wallet_offer_snapshot=snapshot_after_stop,
+        )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json()["error"], "coin_prep_requires_offer_cancellation"
+        )
+        bot.stop.assert_called_once_with(wait=True)
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
     def test_trigger_sets_running_true(self):
         """After trigger, _coin_prep_state['running'] is True."""
         self._trigger()
@@ -308,7 +420,7 @@ class TestCoinPrepFullCycle(_TempDB):
     def test_trigger_stops_running_bot(self):
         """Trigger must call bot.stop() to prevent concurrent trading."""
         bot = self._make_bot()
-        bot.is_running.return_value = True
+        bot.is_running.side_effect = [True, False]
         self._trigger(bot_mock=bot)
         bot.stop.assert_called()
 
@@ -441,6 +553,196 @@ class TestCoinPrepFullCycle(_TempDB):
                 "now": "2026-08-24T09:55:00Z",
             },
         )
+
+    def test_keep_history_reprep_names_open_offer_cancellation_recovery(self):
+        """A live book must produce an actionable, fail-closed prep response."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+        self._seed_unresolved_open_offer("open-sell", "sell")
+
+        resp = self._trigger(
+            full_reset=False,
+            wallet_offer_snapshot={
+                "complete": True,
+                "open_offer_count": 2,
+                "open_buy_count": 1,
+                "open_sell_count": 1,
+                "open_trade_ids": ["open-buy", "open-sell"],
+            },
+        )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": False,
+                "error": "coin_prep_requires_offer_cancellation",
+                "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+                "message": (
+                    "2 open offers must be cancelled and authoritatively confirmed "
+                    "before coin prep can safely replace their locked coins."
+                ),
+                "action": "cancel_all_then_retry",
+                "open_offer_count": 2,
+                "open_buy_count": 1,
+                "open_sell_count": 1,
+                "wallet_open_offer_count": 2,
+                "wallet_offer_book_verified_empty": False,
+                "legacy_offer_count": 2,
+                "legacy_recovery": {
+                    "examined": 0,
+                    "recovered": 0,
+                    "remaining": 2,
+                },
+                "reconciliation": {},
+                "conflicts": ["open_offers"],
+                "fills_cleared": 0,
+                "round_trips_cleared": 0,
+                "coins_cleared": 0,
+                "open_offers_cancelled": 0,
+                "offers_deleted": 0,
+                "price_history_cleared": False,
+                "inventory_cleared": False,
+                "preserve_history": True,
+                "reset_at": unittest.mock.ANY,
+            },
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_legacy_open_offer_is_recovered_before_reset_guard(self):
+        """A proof-backed legacy row must not remain an endless cancel retry."""
+        trade_id = "9" * 64
+        coin_id = "8" * 64
+        self.assertTrue(
+            _db.upsert_coin(
+                coin_id,
+                "xch",
+                1_000,
+                designation="tier_spare",
+                tier="inner",
+                purpose="lifecycle",
+            )
+        )
+        self.assertTrue(
+            _db.add_offer(
+                trade_id,
+                "buy",
+                Decimal("0.001"),
+                Decimal("1"),
+                Decimal("1000"),
+                _FAKE_ASSET,
+                tier="inner",
+                coin_id=coin_id,
+            )
+        )
+        conn = _db.get_connection()
+        conn.execute(
+            "UPDATE coins SET status='locked', trade_id=? WHERE coin_id=?",
+            (trade_id, _db.norm_coin_id(coin_id)),
+        )
+        conn.commit()
+
+        def recover_legacy_row():
+            recovery_conn = _db.get_connection()
+            recovery_conn.execute(
+                "UPDATE offers SET status='expired', lifecycle_state='expired' "
+                "WHERE trade_id=?",
+                (trade_id,),
+            )
+            recovery_conn.execute(
+                "UPDATE coins SET status='free', trade_id=NULL WHERE coin_id=?",
+                (_db.norm_coin_id(coin_id),),
+            )
+            recovery_conn.commit()
+            return {"examined": 1, "recovered": 1, "remaining": 0}
+
+        resp = self._trigger(legacy_recovery=recover_legacy_row)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["success"])
+        resp.legacy_recovery_mock.assert_called_once_with()
+
+    def test_wallet_empty_legacy_conflict_does_not_offer_useless_cancel_retry(self):
+        """A legacy row still lacking proof needs repair, not another Cancel All."""
+        self._seed_unresolved_open_offer("legacy-open-row", "buy")
+
+        resp = self._trigger(
+            legacy_recovery={"examined": 1, "recovered": 0, "remaining": 1}
+        )
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_legacy_offer_recovery_required")
+        self.assertEqual(data["action"], "retry_authoritative_legacy_recovery")
+        self.assertEqual(data["legacy_offer_count"], 1)
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_full_reset_names_open_offers_without_hiding_other_conflicts(self):
+        """Full reset must expose cancel recovery without promising it clears proof state."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+        self._seed_unresolved_open_offer("open-sell", "sell")
+
+        resp = self._trigger(
+            full_reset=True,
+            wallet_offer_snapshot={
+                "complete": True,
+                "open_offer_count": 2,
+                "open_buy_count": 1,
+                "open_sell_count": 1,
+                "open_trade_ids": ["open-buy", "open-sell"],
+            },
+        )
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(data["reason"], "OPEN_OFFERS_REQUIRE_CANCELLATION")
+        self.assertEqual(
+            data["action"], "cancel_all_then_retry_without_protected_resets"
+        )
+        self.assertEqual(data["open_offer_count"], 2)
+        self.assertEqual(data["open_buy_count"], 1)
+        self.assertEqual(data["open_sell_count"], 1)
+        self.assertEqual(
+            data["conflicts"],
+            ["authoritative_session_state", "coin_reservations", "open_offers"],
+        )
+        self.assertEqual(
+            data["additional_conflicts"],
+            ["authoritative_session_state", "coin_reservations"],
+        )
+        self.assertIn(
+            "retry coin prep without clearing protected history", data["message"]
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_offer_history_reset_does_not_auto_resume_after_cancellation(self):
+        """Cancelling creates proof history, so that requested reset must stay manual."""
+        self._seed_unresolved_open_offer("open-buy", "buy")
+
+        resp = self._trigger(
+            full_reset=False,
+            reset_offer_history=True,
+            wallet_offer_snapshot={
+                "complete": True,
+                "open_offer_count": 1,
+                "open_buy_count": 1,
+                "open_sell_count": 0,
+                "open_trade_ids": ["open-buy"],
+            },
+        )
+        data = resp.get_json()
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(
+            data["action"], "cancel_all_then_retry_without_protected_resets"
+        )
+        self.assertEqual(data["conflicts"], ["open_offers"])
+        self.assertEqual(data["additional_conflicts"], ["offer_proof_history"])
+        self.assertIn(
+            "retry coin prep without clearing protected history", data["message"]
+        )
+        self.assertFalse(api_server._coin_prep_state.get("running"))
 
 
 # ---------------------------------------------------------------------------

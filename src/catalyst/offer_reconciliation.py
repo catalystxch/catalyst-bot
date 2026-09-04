@@ -283,6 +283,12 @@ def _status(value: Any) -> int | str | None:
     return None
 
 
+def is_terminal_offer_status(value: Any) -> bool:
+    """Return true only for an explicitly understood terminal wallet status."""
+
+    return _status(value) in _TERMINAL_STATUSES
+
+
 def _redact_json(
     value: Any,
     *,
@@ -1743,6 +1749,16 @@ def load_sage_offer_history(
         pages.append(rows)
         collected_count += len(rows)
         page_authoritative_end = _authoritative_page_end(result, len(rows))
+        explicit_authoritative_end = bool(
+            type(result) is dict
+            and (
+                result.get("end_of_history") is True or result.get("has_more") is False
+            )
+        )
+        if explicit_authoritative_end and len(rows) <= page_size:
+            authoritative_end = True
+            complete = True
+            break
         try:
             repeated_first_page = page_index > 0 and rows == pages[0]
         except BaseException:
@@ -1787,9 +1803,7 @@ def load_sage_offer_history(
         read_error = "normalization_exception"
     if not include_completed:
         records = [
-            row
-            for row in records
-            if _status(row.get("status")) not in _TERMINAL_STATUSES
+            row for row in records if not is_terminal_offer_status(row.get("status"))
         ]
     return {
         "observed_at": read_times[-1] if read_times else _clock_utc(clock),
@@ -3506,5 +3520,6 @@ __all__ = [
     "drain_offer_fill_hook_outbox",
     "load_authoritative_evidence",
     "load_sage_offer_history",
+    "is_terminal_offer_status",
     "reconcile_offer",
 ]

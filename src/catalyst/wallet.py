@@ -1091,11 +1091,13 @@ def _run_wallet_mutation_with_authority(
         )
         wallet_authority["network"] = binding.network_id
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
-        snapshot = _identity_from_adapter(adapter)
-        mutation_gate.require_wallet_mutation_permit_authority(
-            permit, f"{operation}:identity"
-        )
-        mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+        is_identity_transition = export_name == "sage_login"
+        if not is_identity_transition:
+            snapshot = _identity_from_adapter(adapter)
+            mutation_gate.require_wallet_mutation_permit_authority(
+                permit, f"{operation}:identity"
+            )
+            mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:dispatch"
         )
@@ -1105,15 +1107,16 @@ def _run_wallet_mutation_with_authority(
                 safe_step = (
                     step if type(step) is str and step and len(step) <= 64 else "effect"
                 )
-                fresh_snapshot = _identity_from_adapter(adapter)
                 mutation_gate.require_wallet_mutation_permit_authority(
                     permit, f"{operation}:{safe_step}:identity"
                 )
-                mutation_gate.require_fresh_wallet_identity(
-                    binding,
-                    fresh_snapshot,
-                    f"{operation}:{safe_step}",
-                )
+                if not is_identity_transition:
+                    fresh_snapshot = _identity_from_adapter(adapter)
+                    mutation_gate.require_fresh_wallet_identity(
+                        binding,
+                        fresh_snapshot,
+                        f"{operation}:{safe_step}",
+                    )
                 mutation_gate.require_wallet_mutation_permit_authority(
                     permit, f"{operation}:{safe_step}:dispatch"
                 )
@@ -1128,6 +1131,13 @@ def _run_wallet_mutation_with_authority(
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:outcome"
         )
+        if is_identity_transition and wallet_mutation_succeeded(result):
+            target_snapshot = _identity_from_adapter(adapter)
+            mutation_gate.require_fresh_wallet_identity(
+                binding,
+                target_snapshot,
+                f"{operation}:postcondition",
+            )
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if callable(close):

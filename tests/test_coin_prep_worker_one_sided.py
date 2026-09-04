@@ -6,6 +6,22 @@ from unittest.mock import MagicMock, patch
 import coin_prep_worker
 
 
+def test_cat_pool_fee_selection_excludes_prepared_xch_tier_pools():
+    protected_pool_id = "11" * 32
+    reserve_id = "22" * 32
+
+    selected = coin_prep_worker._select_smallest_sufficient_coin_id(
+        [
+            {"coin_id": protected_pool_id, "amount": 1_000_000_000},
+            {"coin_id": reserve_id, "amount": 5_000_000_000},
+        ],
+        minimum_amount=13_079_100,
+        excluded_coin_ids={protected_pool_id},
+    )
+
+    assert selected == reserve_id
+
+
 def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
     asset_id = "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105"
     source_id = "aa" * 32
@@ -95,6 +111,9 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
 
     def call_wallet_mutation(operation, callback, *args, **kwargs):
         mutation_calls.append((operation, callback, kwargs))
+        if operation == "coin_prep.create_cat_tier_pools_exact_with_fee":
+            submitted["value"] = True
+            return {"success": True, "transaction_id": "11" * 32}
         if operation == "coin_prep.create_tier_pools_exact":
             send_ids = [
                 action.get("id", {}).get("type")
@@ -122,16 +141,18 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
             is False
         )
 
-    exact_calls = [
+    cat_pool_calls = [
         call
         for call in mutation_calls
-        if call[0] == "coin_prep.create_tier_pools_exact"
+        if call[0] == "coin_prep.create_cat_tier_pools_exact_with_fee"
     ]
-    assert len(exact_calls) == 2
-    _operation, callback, kwargs = exact_calls[0]
+    assert len(cat_pool_calls) == 1
+    _operation, callback, kwargs = cat_pool_calls[0]
     assert callback is not fake_wallet.send_cat_multi
-    assert kwargs["selected_coin_ids"] == [source_id]
-    assert kwargs["fee_mojos"] == 0
+    assert kwargs["coin_ids"] == [source_id]
+    assert kwargs["fee_coin_id"] == xch_source_id
+    assert kwargs["fee_mojos"] == 13_079_100
+    assert kwargs["_authority_fee_coin_ids"] == [xch_source_id]
     send_actions = [action for action in kwargs["actions"] if action["type"] == "send"]
     assert send_actions == [
         {
@@ -142,7 +163,15 @@ def test_sage_cat_pool_and_fee_input_creation_bind_exact_sources():
             "memos": [],
         }
     ]
-    _operation, _callback, fee_kwargs = exact_calls[1]
+    assert kwargs["actions"][-1] == {"type": "fee", "amount": "13079100"}
+
+    exact_calls = [
+        call
+        for call in mutation_calls
+        if call[0] == "coin_prep.create_tier_pools_exact"
+    ]
+    assert len(exact_calls) == 1
+    _operation, _callback, fee_kwargs = exact_calls[0]
     assert fee_kwargs["selected_coin_ids"] == [xch_source_id]
     assert fee_kwargs["fee_mojos"] == 13_079_100
     assert fee_kwargs["_authority_fee_coin_ids"] == [xch_source_id]
