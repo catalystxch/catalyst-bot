@@ -1182,100 +1182,7 @@ def run_desktop_mode(dev_mode: bool = False):
     # we let the window actually close.
     _state["confirmed_close"] = False
 
-    def on_closing():
-        # The bot loop stops before cancel-on-exit finishes. Keep the native
-        # window alive while its worker is still settling wallet effects.
-        try:
-            import api_server as _api
-
-            cancel_thread = getattr(_api, "_cancel_all_thread", None)
-            with _api._cancel_all_state_lock:
-                cancel_active = bool(_api._cancel_all_state.get("running"))
-            if cancel_active or (
-                cancel_thread is not None and cancel_thread.is_alive()
-            ):
-                window.show()
-                window.restore()
-                return False
-        except Exception:
-            # An unreadable worker state cannot establish safe completion.
-            return False
-        # If the user already confirmed via the modal, let it through.
-        if _state.get("confirmed_close"):
-            try:
-                _save_window_state(window)
-            except Exception:
-                pass
-            _cleanup()
-            if tray:
-                try:
-                    tray.stop()
-                except Exception:
-                    pass
-            return True
-
-        # The GUI can be waiting for worker drain before cancel-all starts.
-        # A repeated native close must not cut that confirmed flow short.
-        try:
-            if (
-                window.evaluate_js(
-                    "Boolean(window._catalystShutdownFlowActive || window._catalystCancelAllFlowActive)"
-                )
-                is True
-            ):
-                window.show()
-                window.restore()
-                return False
-        except Exception:
-            return False
-
-        # Check whether the bot is actually running. If not, we can
-        # close immediately — there's nothing to gracefully shut down.
-        bot_running = False
-        try:
-            import api_server as _api
-
-            if _api.bot and getattr(_api.bot, "_running", False):
-                bot_running = True
-        except Exception:
-            pass
-
-        if not bot_running:
-            # Safe path — save state and close.
-            try:
-                _save_window_state(window)
-            except Exception:
-                pass
-            _cleanup()
-            if tray:
-                try:
-                    tray.stop()
-                except Exception:
-                    pass
-            return True
-
-        # Bot is running — route through the in-GUI shutdown modal.
-        try:
-            window.show()
-            window.restore()
-            window.evaluate_js(
-                "window.showShutdownModal && window.showShutdownModal();"
-            )
-            print("\n  Alt+F4 intercepted — showing shutdown confirmation.", flush=True)
-        except Exception as e:
-            print(f"  [CLOSE] Could not show shutdown modal: {e}", flush=True)
-            # Fall back to hard close so the user isn't trapped
-            try:
-                _save_window_state(window)
-            except Exception:
-                pass
-            _cleanup()
-            return True
-        # Cancel this close event — the modal will set confirmed_close
-        # and re-invoke the close when it finishes the graceful sequence.
-        return False
-
-    window.events.closing += on_closing
+    window.events.closing += _create_close_handler(window, tray)
     # Expose the confirm flag to the JS side via the bridge.
     # The shutdown modal's "Shutdown App" button sets this before
     # re-triggering close, so a second on_closing() call is honoured.
@@ -1513,6 +1420,86 @@ def _tray_graceful_quit(webview_module, tray):
         _quit_app(webview_module, tray)
 
 
+def _create_close_handler(window, tray):
+    """Defer native close work so the WebView UI thread remains available.
+
+    WinForms FormClosing runs its handlers synchronously. evaluate_js waits
+    for a continuation on that same UI thread, so it must run in a worker.
+    Only a checked, cleaned-up close may pass through the native callback.
+    """
+    probe_lock = threading.Lock()
+    close_ready = False
+
+    def check_close():
+        nonlocal close_ready
+        try:
+            import api_server as _api
+
+            cancel_thread = getattr(_api, "_cancel_all_thread", None)
+            with _api._cancel_all_state_lock:
+                cancel_active = bool(_api._cancel_all_state.get("running"))
+            if cancel_active or (
+                cancel_thread is not None and cancel_thread.is_alive()
+            ):
+                return
+
+            if not _state.get("confirmed_close"):
+                flow_active = window.evaluate_js(
+                    "Boolean(window._catalystShutdownFlowActive || window._catalystCancelAllFlowActive)"
+                )
+                # Missing/unreadable JS state cannot establish safe closure.
+                if flow_active is not False:
+                    return
+                if _api.bot and getattr(_api.bot, "_running", False):
+                    window.show()
+                    window.restore()
+                    window.evaluate_js(
+                        "window.showShutdownModal && window.showShutdownModal();"
+                    )
+                    return
+
+            _save_window_state(window)
+            cleanup = _cleanup()
+            if not isinstance(cleanup, dict) or not (
+                cleanup.get("released") is True
+                or cleanup.get("reason") == "not_initialized"
+            ):
+                return
+            if tray:
+                try:
+                    tray.stop()
+                except Exception:
+                    pass
+            close_ready = True
+            window.destroy()
+        except Exception as exc:
+            close_ready = False
+            from super_log import slog
+
+            slog(
+                "DESKTOP",
+                "Native close deferred after an error",
+                {"error": str(exc)},
+                level="warning",
+            )
+        finally:
+            probe_lock.release()
+
+    def on_closing():
+        if close_ready:
+            return True
+        if probe_lock.acquire(blocking=False):
+            try:
+                threading.Thread(
+                    target=check_close, name="NativeCloseCoordinator", daemon=True
+                ).start()
+            except Exception:
+                probe_lock.release()
+        return False
+
+    return on_closing
+
+
 def _cleanup():
     """Clean shutdown of bot and modules."""
     try:
@@ -1525,9 +1512,9 @@ def _cleanup():
     try:
         import api_server
 
-        api_server.quiesce_and_release_mutation_runtime()
+        return api_server.quiesce_and_release_mutation_runtime()
     except Exception:
-        pass
+        return {"released": False, "reason": "cleanup_failed"}
 
 
 def _poll_tray_status(tray, interval: float = 3.0):
