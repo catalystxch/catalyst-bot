@@ -47,6 +47,11 @@ class _FlaskBase(unittest.TestCase):
                 "enter_mutation",
                 return_value="coin-prep-unit-permit",
             ),
+            patch.object(
+                api_server.mutation_gate,
+                "acquire_exclusive_mutation",
+                return_value=True,
+            ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
             patch("wallet.get_spendable_coin_count", return_value=0),
         ]
@@ -442,7 +447,7 @@ class TestCoinPrepTrigger(_FlaskBase):
 
     def test_stops_bot_if_running(self):
         bot = MagicMock()
-        bot.is_running.return_value = True
+        bot.is_running.side_effect = [True, False]
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -452,7 +457,7 @@ class TestCoinPrepTrigger(_FlaskBase):
         ):
             mock_thread.return_value.start = MagicMock()
             self._post("/api/coin-prep/trigger")
-        bot.stop.assert_called_once()
+        bot.stop.assert_called_once_with(wait=True)
 
     def test_duplicate_trigger_does_not_start_second_worker(self):
         with (

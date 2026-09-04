@@ -4405,7 +4405,10 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
         get_all_offers._last_error = "get_offers returned None/empty"
         print("  [Sage] get_offers returned None/empty!", flush=True)
         return None
-    if isinstance(res, dict) and res.get("success") is False and res.get("error"):
+    if not isinstance(res, dict):
+        get_all_offers._last_error = "get_offers response is not an object"
+        return None
+    if res.get("success") is False and res.get("error"):
         get_all_offers._last_error = str(res.get("error") or "wallet get_offers failed")
         print(
             f"  ⚠️  [Sage] get_offers failed: {get_all_offers._last_error}", flush=True
@@ -4414,13 +4417,17 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
 
     # Handle Sage's response format
     # Sage may return {"offers": [...]} or {"trades": [...]}
-    offers_list = res.get("offers")
-    if offers_list is None:
-        offers_list = res.get("trades")
-    if offers_list is None:
-        offers_list = res.get("trade_records")
-    if offers_list is None:
-        offers_list = []
+    offer_keys = ("offers", "trades", "trade_records")
+    present_keys = [key for key in offer_keys if key in res]
+    if len(present_keys) != 1:
+        get_all_offers._last_error = "get_offers collection is missing or ambiguous"
+        return None
+    offers_list = res[present_keys[0]]
+    if not isinstance(offers_list, list) or any(
+        not isinstance(offer, dict) for offer in offers_list
+    ):
+        get_all_offers._last_error = "get_offers collection is malformed"
+        return None
 
     # Log format details on first call AND on first call that has offers
     # (first call may return 0 offers before any are created)
@@ -4467,9 +4474,6 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
                 )
             else:
                 print(f"  [Sage] First offer summary: {raw_summary}", flush=True)
-
-    if not isinstance(offers_list, list):
-        return []
 
     # Normalize each offer to ensure Chia-compatible fields exist
     normalized = []
@@ -4534,14 +4538,17 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     # letting adverse fills stack into a fast move.
     if not include_completed:
         before_count = len(normalized)
-        FILLABLE_STATUS_STRINGS = {
-            "PENDING_ACCEPT",
-            "PENDING_CONFIRM",
-            "PENDING",
-            "PENDING_CANCEL",
-            "IN_PROGRESS",
-            "OPEN",
-            "ACTIVE",
+        TERMINAL_STATUS_INTS = {3, 4, 5}
+        TERMINAL_STATUS_STRINGS = {
+            "CANCELLED",
+            "CANCELED",
+            "CONFIRMED",
+            "COMPLETED",
+            "SUCCESS",
+            "TAKEN",
+            "FILLED",
+            "FAILED",
+            "EXPIRED",
         }
         filtered = []
         for offer in normalized:
@@ -4549,12 +4556,14 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
             if status_val is None:
                 filtered.append(offer)  # keep unknowns for classification to handle
                 continue
-            if isinstance(status_val, int):
-                if status_val <= 2:  # PENDING_ACCEPT, PENDING_CONFIRM, PENDING_CANCEL
-                    filtered.append(offer)
-            else:
-                if str(status_val).upper() in FILLABLE_STATUS_STRINGS:
-                    filtered.append(offer)
+            if type(status_val) is int and status_val in TERMINAL_STATUS_INTS:
+                continue
+            if (
+                type(status_val) is str
+                and status_val.strip().upper() in TERMINAL_STATUS_STRINGS
+            ):
+                continue
+            filtered.append(offer)
 
         if before_count != len(filtered):
             if not hasattr(get_all_offers, "_filter_logged"):

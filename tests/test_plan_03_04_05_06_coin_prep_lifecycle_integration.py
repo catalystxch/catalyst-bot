@@ -82,6 +82,11 @@ class _TempDB(unittest.TestCase):
                 api_server.mutation_gate, "enter_mutation", return_value="permit"
             ),
             patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+            patch.object(
+                api_server.mutation_gate,
+                "acquire_exclusive_mutation",
+                return_value=True,
+            ),
         )
         for mutation_patch in self._mutation_patches:
             mutation_patch.start()
@@ -93,6 +98,7 @@ class _TempDB(unittest.TestCase):
         # Snapshot coin prep state so tearDown can restore it
         self._orig_coin_prep_state = dict(api_server._coin_prep_state)
         self._orig_coin_prep_proc = api_server._coin_prep_proc
+        self._orig_coin_prep_thread = api_server._coin_prep_thread
         api_server._coin_prep_state.update(
             {
                 "running": False,
@@ -104,6 +110,7 @@ class _TempDB(unittest.TestCase):
             }
         )
         api_server._coin_prep_proc = None
+        api_server._coin_prep_thread = None
 
     def tearDown(self):
         if hasattr(_db._local, "conn") and _db._local.conn:
@@ -125,6 +132,7 @@ class _TempDB(unittest.TestCase):
         api_server._coin_prep_state.clear()
         api_server._coin_prep_state.update(self._orig_coin_prep_state)
         api_server._coin_prep_proc = self._orig_coin_prep_proc
+        api_server._coin_prep_thread = self._orig_coin_prep_thread
 
     def _seed_fill(self, trade_id=_TRADE_ID_A):
         _db.record_fill(
@@ -270,14 +278,19 @@ class _TempDB(unittest.TestCase):
             if callable(legacy_recovery)
             else {"return_value": legacy_recovery}
         )
+        snapshot_patch = (
+            {"side_effect": wallet_offer_snapshot}
+            if callable(wallet_offer_snapshot)
+            else {"return_value": wallet_offer_snapshot}
+        )
         with (
             patch.object(api_server, "bot", bot_mock or self._make_bot()),
             patch("blueprints.coin_prep.threading.Thread") as mock_thread_cls,
             patch("blueprints.coin_prep.log_event"),
             patch(
                 "blueprints.coin_prep._wallet_open_offer_snapshot_before_prep",
-                return_value=wallet_offer_snapshot,
                 create=True,
+                **snapshot_patch,
             ),
             patch(
                 "blueprints.coin_prep._recover_legacy_open_offers_before_prep",
@@ -356,6 +369,31 @@ class TestCoinPrepFullCycle(_TempDB):
         self.assertFalse(data["wallet_offer_book_verified_empty"])
         self.assertFalse(api_server._coin_prep_state.get("running"))
 
+    def test_trigger_rechecks_wallet_book_after_stopping_live_bot(self):
+        bot = self._make_bot()
+        bot.is_running.side_effect = [True, False]
+        appeared = {
+            "complete": True,
+            "open_offer_count": 1,
+            "open_trade_ids": ["f" * 64],
+        }
+
+        def snapshot_after_stop():
+            self.assertTrue(bot.stop.called)
+            return appeared
+
+        resp = self._trigger(
+            bot_mock=bot,
+            wallet_offer_snapshot=snapshot_after_stop,
+        )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json()["error"], "coin_prep_requires_offer_cancellation"
+        )
+        bot.stop.assert_called_once_with(wait=True)
+        self.assertFalse(api_server._coin_prep_state.get("running"))
+
     def test_trigger_sets_running_true(self):
         """After trigger, _coin_prep_state['running'] is True."""
         self._trigger()
@@ -382,7 +420,7 @@ class TestCoinPrepFullCycle(_TempDB):
     def test_trigger_stops_running_bot(self):
         """Trigger must call bot.stop() to prevent concurrent trading."""
         bot = self._make_bot()
-        bot.is_running.return_value = True
+        bot.is_running.side_effect = [True, False]
         self._trigger(bot_mock=bot)
         bot.stop.assert_called()
 

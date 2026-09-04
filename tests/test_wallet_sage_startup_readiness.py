@@ -44,6 +44,31 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             end=100,
         )
 
+    def test_get_all_offers_rejects_missing_or_malformed_offer_collection(self):
+        for response in ({"success": True}, {"success": True, "offers": {}}, [1, 2]):
+            with (
+                self.subTest(response=response),
+                patch.object(wallet_sage, "rpc", return_value=response),
+            ):
+                self.assertIsNone(wallet_sage.get_all_offers(include_completed=True))
+
+    def test_get_all_offers_keeps_unknown_statuses_when_filtering_open_book(self):
+        rows = [
+            {"trade_id": "a" * 64, "status": 99},
+            {"trade_id": "b" * 64, "status": "SAGE_FUTURE_ACTIVE"},
+            {"trade_id": "c" * 64, "status": 4},
+            {"trade_id": "d" * 64, "status": "CANCELLED"},
+        ]
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": rows}
+        ):
+            result = wallet_sage.get_all_offers(include_completed=False)
+
+        self.assertEqual(
+            [row["trade_id"] for row in result],
+            ["a" * 64, "b" * 64],
+        )
+
     def test_reload_connection_settings_uses_canonical_cfg_values(self):
         old_cert = wallet_sage.CERT_PATH
         old_key = wallet_sage.KEY_PATH

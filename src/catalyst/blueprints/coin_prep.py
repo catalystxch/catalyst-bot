@@ -26,7 +26,7 @@ import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from flask import Blueprint, Response, jsonify, request, send_file
+from flask import Blueprint, Response, g, jsonify, request, send_file
 
 import api_server
 import database
@@ -78,7 +78,7 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
         }
     snapshot = offer_reconciliation.load_sage_offer_history(
         get_all_offers=reader,
-        include_completed=False,
+        include_completed=True,
         page_size=500,
         max_pages=9,
         max_records=4096,
@@ -117,17 +117,22 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
                 return "sell"
         return ""
 
+    open_records = [
+        row
+        for row in records
+        if not offer_reconciliation.is_terminal_offer_status(row.get("status"))
+    ]
     trade_ids = []
-    for row in records:
+    for row in open_records:
         trade_id = row.get("trade_id") or row.get("offer_id")
         if type(trade_id) is str and trade_id:
             trade_ids.append(trade_id)
     return {
         "complete": True,
         "read_error": None,
-        "open_offer_count": len(records),
-        "open_buy_count": sum(1 for row in records if offer_side(row) == "buy"),
-        "open_sell_count": sum(1 for row in records if offer_side(row) == "sell"),
+        "open_offer_count": len(open_records),
+        "open_buy_count": sum(1 for row in open_records if offer_side(row) == "buy"),
+        "open_sell_count": sum(1 for row in open_records if offer_side(row) == "sell"),
         "open_trade_ids": sorted(set(trade_ids)),
     }
 
@@ -273,16 +278,10 @@ def _coin_prep_open_offer_conflict(
     )
     local_open_count = len(rows)
     wallet_snapshot = dict(wallet_offer_snapshot or {})
-    wallet_open_count = max(
-        0, int(wallet_snapshot.get("open_offer_count", 0) or 0)
-    )
+    wallet_open_count = max(0, int(wallet_snapshot.get("open_offer_count", 0) or 0))
     open_count = max(local_open_count, wallet_open_count)
-    buy_count = max(
-        buy_count, int(wallet_snapshot.get("open_buy_count", 0) or 0)
-    )
-    sell_count = max(
-        sell_count, int(wallet_snapshot.get("open_sell_count", 0) or 0)
-    )
+    buy_count = max(buy_count, int(wallet_snapshot.get("open_buy_count", 0) or 0))
+    sell_count = max(sell_count, int(wallet_snapshot.get("open_sell_count", 0) or 0))
     wallet_verified_empty = bool(
         wallet_snapshot.get("complete") is True and wallet_open_count == 0
     )
@@ -1745,6 +1744,54 @@ def _api_coin_prep_trigger_locked():
             f"reset_counters={_prep_reset_counters})",
         )
 
+        # Coin prep changes the wallet's coin shape.  Fence every other API
+        # mutation, drain in-flight mutations, and stop the bot before taking
+        # the one authoritative wallet-offer snapshot used by this run.
+        permit = getattr(g, "_mutation_permit", None)
+        try:
+            api_server.mutation_gate.acquire_exclusive_mutation(
+                permit,
+                "api:coin_prep.api_coin_prep_trigger",
+                timeout_seconds=10.0,
+            )
+        except api_server.mutation_gate.MutationBlocked as exc:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "coin_prep_mutation_exclusion_unavailable",
+                        "reason": exc.reason_code,
+                    }
+                ),
+                423,
+            )
+
+        if bot and bot.is_running():
+            bot.stop(wait=True)
+            if bot.is_running():
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": "coin_prep_bot_stop_incomplete",
+                            "reason": "MUTATION_PRODUCER_NOT_QUIESCENT",
+                            "message": (
+                                "CATalyst could not prove that the bot stopped. "
+                                "Coin prep remains safely blocked."
+                            ),
+                        }
+                    ),
+                    503,
+                )
+            log_event(
+                "info",
+                "coin_prep_bot_stopped",
+                "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
+            )
+            api_server.events.emit(
+                "bot_control", {"action": "stopped", "reason": "coin_prep"}
+            )
+
         # If a previous worker is still running, kill it first.
         # Two workers operating on the same wallet simultaneously causes
         # coin conflicts, failed splits, and wallet sync chaos.
@@ -1857,9 +1904,7 @@ def _api_coin_prep_trigger_locked():
                 },
                 None,
                 wallet_offer_snapshot=wallet_offer_snapshot,
-                protected_offer_history_reset=(
-                    _prep_reset_offers or _prep_reset_pnl
-                ),
+                protected_offer_history_reset=(_prep_reset_offers or _prep_reset_pnl),
             )
             return jsonify(wallet_conflict), 409
 
@@ -2004,23 +2049,6 @@ def _api_coin_prep_trigger_locked():
         api_server._coin_prep_state["started_at"] = datetime.now(
             timezone.utc
         ).isoformat()
-
-        # CRITICAL: Stop the bot loop entirely during coin prep.
-        # Just setting _prep_running is NOT enough — the bot loop's
-        # requote step also creates offers, and any running cycle
-        # may already be mid-execution. The only safe approach is
-        # to fully stop the bot. User must press "Start Bot" after
-        # coin prep completes.
-        if bot and bot.is_running():
-            bot.stop()
-            log_event(
-                "info",
-                "coin_prep_bot_stopped",
-                "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
-            )
-            api_server.events.emit(
-                "bot_control", {"action": "stopped", "reason": "coin_prep"}
-            )
 
         # Also set the flag as a safety belt
         if bot and hasattr(bot, "coin_manager"):

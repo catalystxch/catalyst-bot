@@ -72,6 +72,7 @@ _ALLOWED_REASON_CODES = frozenset(
         "LEASE_OWNED_BY_OTHER",
         "LEASE_UNAVAILABLE",
         "MUTATION_GATE_SAFETY_STOP",
+        "MUTATION_EXCLUSION_TIMEOUT",
         "MUTATION_RUNTIME_NOT_INITIALIZED",
         "MUTATION_SHUTTING_DOWN",
         "OPERATION_UNKNOWN",
@@ -102,6 +103,7 @@ _REASON_DESCRIPTIONS = {
     "LEASE_OWNED_BY_OTHER": "Another CATalyst run owns mutation",
     "LEASE_UNAVAILABLE": "No active mutation lease is owned by this run",
     "MUTATION_GATE_SAFETY_STOP": "Mutation stopped by the safety gate",
+    "MUTATION_EXCLUSION_TIMEOUT": "Concurrent mutations did not drain in time",
     "MUTATION_RUNTIME_NOT_INITIALIZED": "Mutation runtime is not initialized",
     "MUTATION_SHUTTING_DOWN": "Mutation runtime is shutting down",
     "OPERATION_UNKNOWN": "Operation outcome requires reconciliation",
@@ -1147,6 +1149,7 @@ class MutationGate:
         self._mutation_condition = threading.Condition(self._lock)
         self._active_mutations: dict[str, str] = {}
         self._active_wallet_mutations: set[str] = set()
+        self._exclusive_mutation_permit: Optional[str] = None
         self._wallet_lifecycle_transitioning = False
         self._quiescing = False
         self._lease_version: Optional[int] = None
@@ -1647,7 +1650,11 @@ class MutationGate:
         intent = _exact_text(blocking_intent_id, "blocking_intent_id")
         with self._lock:
             self.require_active_wallet_mutation_permit(permit, safe_operation)
-            if self._quiescing or self._wallet_lifecycle_transitioning:
+            if (
+                self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit not in {None, permit}
+            ):
                 raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
             if self._local_reason_code:
                 raise MutationBlocked(self._local_reason_code, safe_operation)
@@ -1765,7 +1772,11 @@ class MutationGate:
 
         safe_operation = _safe_operation(operation)
         with self._lock:
-            if self._quiescing or self._wallet_lifecycle_transitioning:
+            if (
+                self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit is not None
+            ):
                 raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
             self.require_allowed(safe_operation)
             permit = str(uuid.uuid4())
@@ -1782,9 +1793,43 @@ class MutationGate:
                 or permit not in self._active_mutations
                 or self._quiescing
                 or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit not in {None, permit}
             ):
                 raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
             self._active_wallet_mutations.add(permit)
+
+    def acquire_exclusive_mutation(
+        self,
+        permit: str,
+        operation: str,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Fence new mutations and wait for every other permit to drain."""
+
+        safe_operation = _safe_operation(operation)
+        if type(permit) is not str or not permit:
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", safe_operation)
+        timeout = max(0.0, float(timeout_seconds))
+        deadline = time.monotonic() + timeout
+        with self._mutation_condition:
+            if (
+                permit not in self._active_mutations
+                or self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit not in {None, permit}
+            ):
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", safe_operation)
+            self._exclusive_mutation_permit = permit
+            self._mutation_condition.notify_all()
+            while any(active != permit for active in self._active_mutations):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._exclusive_mutation_permit = None
+                    self._mutation_condition.notify_all()
+                    raise MutationBlocked("MUTATION_EXCLUSION_TIMEOUT", safe_operation)
+                self._mutation_condition.wait(timeout=remaining)
+            return True
 
     def exit_mutation(self, permit: str) -> bool:
         """Finish one exact guarded mutation permit."""
@@ -1795,6 +1840,8 @@ class MutationGate:
             self._active_wallet_mutations.discard(permit)
             removed = self._active_mutations.pop(permit, None) is not None
             if removed:
+                if self._exclusive_mutation_permit == permit:
+                    self._exclusive_mutation_permit = None
                 self._mutation_condition.notify_all()
             return removed
 
@@ -3184,6 +3231,19 @@ def exit_mutation(permit: str) -> bool:
     return runtime.exit_mutation(permit) if runtime is not None else False
 
 
+def acquire_exclusive_mutation(
+    permit: str, operation: str, *, timeout_seconds: float
+) -> bool:
+    runtime = current_runtime()
+    if runtime is None:
+        raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+    return runtime.acquire_exclusive_mutation(
+        permit,
+        operation,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def trip(reason_code: str, blocking_operation_ids: list[str]) -> GateStatus:
     runtime = current_runtime()
     if runtime is None:
@@ -3250,6 +3310,7 @@ __all__ = [
     "WalletIdentityBinding",
     "WalletMutationPermit",
     "clear_worker_authority_environment",
+    "acquire_exclusive_mutation",
     "enter_mutation",
     "enter_wallet_mutation",
     "exit_mutation",

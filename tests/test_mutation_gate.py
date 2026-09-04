@@ -4187,6 +4187,71 @@ def test_inflight_mutation_quiescence_blocks_new_work_and_lease_release(
     assert gate.exit_mutation(permit) is True
 
 
+def test_exclusive_mutation_fences_new_work_until_owner_exits(
+    isolated_gate_database,
+):
+    """Coin-shape work can drain peers without globally quiescing shutdown."""
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="exclusive-coin-prep-owner")
+    assert gate.acquire()["acquired"] is True
+    owner = gate.enter_mutation("api:coin-prep")
+    peer = gate.enter_mutation("api:offer-create")
+    acquired = threading.Event()
+    errors = []
+
+    def acquire_exclusive():
+        try:
+            gate.acquire_exclusive_mutation(
+                owner,
+                "api:coin-prep",
+                timeout_seconds=1,
+            )
+            acquired.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=acquire_exclusive)
+    worker.start()
+    deadline = time.monotonic() + 1
+    while gate._exclusive_mutation_permit != owner and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate._exclusive_mutation_permit == owner
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        gate.enter_mutation("api:offer-cancel")
+    assert exc_info.value.reason_code == "MUTATION_SHUTTING_DOWN"
+    assert gate.exit_mutation(peer) is True
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert acquired.is_set()
+    assert gate.exit_mutation(owner) is True
+    after = gate.enter_mutation("api:after-coin-prep")
+    assert gate.exit_mutation(after) is True
+
+
+def test_exclusive_mutation_timeout_reopens_gate(isolated_gate_database):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock, run_id="exclusive-timeout-owner")
+    assert gate.acquire()["acquired"] is True
+    owner = gate.enter_mutation("api:coin-prep")
+    peer = gate.enter_mutation("api:offer-create")
+
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        gate.acquire_exclusive_mutation(
+            owner,
+            "api:coin-prep",
+            timeout_seconds=0,
+        )
+
+    assert exc_info.value.reason_code == "MUTATION_EXCLUSION_TIMEOUT"
+    after = gate.enter_mutation("api:after-timeout")
+    assert gate.exit_mutation(after) is True
+    assert gate.exit_mutation(peer) is True
+    assert gate.exit_mutation(owner) is True
+
+
 def test_shutdown_stop_exception_or_live_thread_keeps_lease_until_expiry(
     isolated_gate_database, monkeypatch
 ):

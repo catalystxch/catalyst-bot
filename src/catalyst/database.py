@@ -23205,6 +23205,304 @@ def _validate_reconciliation_cancel_context(
     }
 
 
+def commit_legacy_expired_offer_intent(
+    *,
+    intent_id: str,
+    sage_trade_id: str,
+    offer_text_sha256: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    classification: str,
+    reason_code: str,
+    wallet_identity_json: Any,
+    evidence_json: Any,
+    evidence_sha256: str,
+    confirmed_at: Any,
+    reconciled_at: Any,
+) -> Dict[str, Any]:
+    """Atomically adopt one pre-intent Sage offer directly as expired.
+
+    The preceding PREPARED record is non-publishable.  This boundary commits
+    the historical creation identity, queues and suppresses publication, and
+    applies the authoritative expiry proof in one transaction.  No other
+    process can observe a publishable legacy offer between those states.
+    """
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    trade_id = _reconciliation_coin_identity(sage_trade_id, "sage_trade_id")[0]
+    offer_hash = _reconciliation_coin_identity(offer_text_sha256, "offer_text_sha256")[
+        0
+    ]
+    wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network").lower()
+    if classification != "EXPIRED_PROVEN":
+        raise ValueError("legacy adoption requires authoritative expiry proof")
+    safe_reason = _required_stability_text(reason_code, "reason_code").upper()
+    creation_time = _stability_timestamp(confirmed_at, "confirmed_at")
+    when = _stability_timestamp(reconciled_at, "reconciled_at")
+    wallet_json = _canonical_json_text(
+        wallet_identity_json,
+        "wallet_identity_json",
+        expected_type=dict,
+    )
+    wallet_identity = json.loads(wallet_json)
+    if (
+        wallet_identity.get("wallet_fingerprint_hash") != wallet_hash
+        or str(wallet_identity.get("network") or "").lower() != safe_network
+    ):
+        raise ValueError("legacy adoption wallet binding mismatch")
+    canonical_evidence = _canonical_json_text(
+        evidence_json,
+        "evidence_json",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    expected_digest = _evidence_digest_from_canonical_json(canonical_evidence)
+    if type(evidence_sha256) is not str or evidence_sha256 != expected_digest:
+        raise ValueError("evidence_sha256 does not match canonical evidence JSON")
+    proof = json.loads(canonical_evidence)
+    proof_classification = proof.get("classification")
+    if (
+        type(proof_classification) is not dict
+        or proof_classification.get("classification") != "EXPIRED_PROVEN"
+    ):
+        raise ValueError("legacy adoption proof does not establish expiry")
+
+    create_operation = f"create:{safe_intent_id}"
+    create_evidence = _canonical_json_text(
+        {"migration": "legacy_startup_expiry", "trade_id": trade_id},
+        "legacy creation evidence",
+        expected_type=dict,
+    )
+    create_journal = _journal_values(
+        event_id=f"{create_operation}:finalized",
+        operation_id=create_operation,
+        intent_id=safe_intent_id,
+        operation_type="CREATE",
+        attempt=1,
+        phase="FINALIZED",
+        outcome="CONFIRMED",
+        request_timestamp=creation_time,
+        wallet_identity_json=wallet_json,
+        transaction_id=None,
+        spend_identity=None,
+        evidence_json=create_evidence,
+        evidence_sha256=hashlib.sha256(create_evidence.encode("utf-8")).hexdigest(),
+        reason_code="LEGACY_OFFER_ADOPTED",
+        blocks_mutation=False,
+        created_at=creation_time,
+    )
+    reconcile_operation = f"reconcile:{safe_intent_id}"
+    reconcile_journal = _journal_values(
+        event_id=f"{reconcile_operation}:attempt:1:finalized",
+        operation_id=reconcile_operation,
+        intent_id=safe_intent_id,
+        operation_type="RECONCILE",
+        attempt=1,
+        phase="FINALIZED",
+        outcome="EXPIRED_PROVEN",
+        request_timestamp=when,
+        wallet_identity_json=wallet_json,
+        transaction_id=None,
+        spend_identity=None,
+        evidence_json=canonical_evidence,
+        evidence_sha256=expected_digest,
+        reason_code=safe_reason,
+        blocks_mutation=False,
+        created_at=when,
+    )
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("intent_id does not exist")
+        intent = dict(row)
+        if (
+            intent["wallet_fingerprint_hash"] != wallet_hash
+            or intent["network"] != safe_network
+        ):
+            raise ValueError("legacy adoption wallet binding mismatch")
+
+        existing_terminal = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?",
+            (reconcile_journal["event_id"],),
+        ).fetchone()
+        if existing_terminal is not None:
+            existing = validate_offer_operation_event(dict(existing_terminal))
+            if any(
+                existing[column] != reconcile_journal[column]
+                for column in _JOURNAL_COMPARE_COLUMNS
+            ):
+                raise ValueError("legacy expiry replay has different proof")
+            if intent["lifecycle_state"] != "terminal":
+                raise ValueError("legacy expiry journal lacks terminal intent state")
+            _suppress_publication_outbox_rows(
+                conn,
+                intent_id=safe_intent_id,
+                proof_json={
+                    "terminal_event_id": existing["event_id"],
+                    "outcome": "EXPIRED_PROVEN",
+                    "evidence_sha256": expected_digest,
+                },
+                suppressed_at=when,
+            )
+            conn.commit()
+            return {"event": existing, "idempotent": True, "fill_id": None}
+
+        if intent["lifecycle_state"] not in {"prepared", "created"}:
+            raise ValueError("legacy offer is not eligible for expiry adoption")
+        if intent["lifecycle_state"] == "created" and (
+            intent["sage_trade_id"] != trade_id
+            or intent["offer_text_sha256"] != offer_hash
+        ):
+            raise ValueError("legacy created offer identity differs")
+        try:
+            selected_bare = json.loads(intent["selected_coin_ids_json"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "offer intent selected coin identity is corrupt"
+            ) from exc
+        if type(selected_bare) is not list or not selected_bare:
+            raise RuntimeError("offer intent selected coin identity is corrupt")
+        selected = [
+            _reconciliation_coin_identity(value, "selected coin id")
+            for value in selected_bare
+        ]
+        selected_registry = [registry for _bare, registry in selected]
+        if _active_wallet_effect_coin_ids(conn).intersection(selected_registry):
+            raise ValueError("selected coin has an unresolved wallet effect claim")
+        placeholders = ",".join("?" for _value in selected_registry)
+        coin_rows = conn.execute(
+            f"SELECT * FROM coins WHERE coin_id IN ({placeholders})",
+            selected_registry,
+        ).fetchall()
+        coins = {str(coin["coin_id"]): dict(coin) for coin in coin_rows}
+        if set(coins) != set(selected_registry):
+            raise RuntimeError("offer intent selected coin reservation is missing")
+        if any(
+            coins[coin_id]["status"] != "locked"
+            or coins[coin_id]["trade_id"] != trade_id
+            for coin_id in selected_registry
+        ):
+            raise RuntimeError("legacy offer selected coin lock is not held")
+
+        from publication_outbox import canonical_publication_identity
+
+        publication = canonical_publication_identity(
+            safe_network, offer_hash, str(intent["generation"])
+        ).idempotency_key
+        if intent["lifecycle_state"] == "prepared":
+            cursor = conn.execute(
+                """
+                UPDATE offer_intents
+                SET sage_trade_id=?, offer_text_sha256=?, publication_identity=?,
+                    lifecycle_state='created', confirmed_at=?, updated_at=?,
+                    row_version=row_version+1
+                WHERE intent_id=? AND lifecycle_state='prepared'
+                """,
+                (
+                    trade_id,
+                    offer_hash,
+                    publication,
+                    creation_time,
+                    creation_time,
+                    safe_intent_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("legacy intent changed during adoption")
+        elif intent.get("publication_identity") != publication:
+            raise ValueError("legacy publication identity differs")
+
+        _insert_confirmed_publication_rows(
+            conn,
+            intent=intent,
+            trade_id=trade_id,
+            offer_fingerprint=offer_hash,
+            queued_at=creation_time,
+        )
+        _insert_offer_operation_event(conn, create_journal)
+        event = _insert_offer_operation_event(conn, reconcile_journal)
+        cursor = conn.execute(
+            """
+            UPDATE offer_intents
+            SET lifecycle_state='terminal', terminal_at=?, updated_at=?,
+                row_version=row_version+1
+            WHERE intent_id=? AND lifecycle_state='created'
+            """,
+            (when, when, safe_intent_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("legacy intent changed during terminal adoption")
+        _suppress_publication_outbox_rows(
+            conn,
+            intent_id=safe_intent_id,
+            proof_json={
+                "terminal_event_id": event["event_id"],
+                "outcome": "EXPIRED_PROVEN",
+                "evidence_sha256": expected_digest,
+            },
+            suppressed_at=when,
+        )
+        _insert_authoritative_coin_outcomes(
+            conn,
+            intent_id=safe_intent_id,
+            trade_id=trade_id,
+            selected_coin_ids=selected_registry,
+            event=event,
+            recorded_at=when,
+        )
+        legacy = conn.execute(
+            "SELECT status FROM offers WHERE trade_id=?", (trade_id,)
+        ).fetchone()
+        if legacy is None or legacy["status"] != "open":
+            raise ValueError("legacy offer projection is not open")
+        conn.execute(
+            """
+            UPDATE offers
+            SET status='expired', lifecycle_state='expired',
+                filled_at=NULL, cancelled_at=NULL
+            WHERE trade_id=? AND status='open'
+            """,
+            (trade_id,),
+        )
+        conn.execute(
+            f"""
+            UPDATE coins SET status='free', trade_id=NULL, last_seen=?
+            WHERE coin_id IN ({placeholders}) AND status='locked'
+              AND trade_id=?
+            """,
+            (when, *selected_registry, trade_id),
+        )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=reconcile_operation,
+            wallet_fingerprint_hash=wallet_hash,
+            network=safe_network,
+            reason_code=safe_reason,
+            reason="authoritative legacy expiry proof committed",
+            reconciled_at=when,
+            blocking=False,
+        )
+        conn.commit()
+        return {"event": event, "idempotent": False, "fill_id": None}
+    except _PublicationConfirmationConflict as exc:
+        conn.rollback()
+        _persist_confirmation_publication_conflict(exc.publication_id, when)
+        raise ValueError("confirmed publication identity conflicts") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def commit_offer_reconciliation(
     *,
     intent_id: str,
