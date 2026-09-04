@@ -7494,9 +7494,77 @@ class OfferManager:
             if self._cancel_settlement_operation_id == operation_id:
                 self._cancel_settlement_operation_id = None
 
+    def reconcile_pending_cancellation_once(self) -> bool:
+        """Prove one late cancellation without ever submitting another effect."""
+        runtime = mutation_gate.current_runtime()
+
+        def owned():
+            return bool(
+                runtime is not None
+                and mutation_gate.current_runtime() is runtime
+                and runtime.has_live_reconciliation_lease() is True
+            )
+
+        try:
+            if not owned():
+                return False
+            blockers = database.get_unresolved_offer_operation_blockers()
+            if not blockers:
+                return runtime.status().allowed is True
+            if type(blockers) is not list or len(blockers) != 1:
+                return False
+            blocker = blockers[0]
+            if (
+                type(blocker) is not dict
+                or blocker.get("phase") != "FINALIZED"
+                or blocker.get("outcome") != CANCEL_SUBMITTED_UNCONFIRMED
+                or not self._is_canonical_cancel_digest_id(
+                    blocker.get("operation_id"), "cancel:"
+                )
+            ):
+                return False
+            intent = self._canonical_cancel_intent(blocker["operation_id"][7:])
+            projection = self._read_existing_cancel_result(intent)
+            authority = projection.result
+            if (
+                type(authority) is not dict
+                or authority.get("outcome") != CANCEL_SUBMITTED_UNCONFIRMED
+                or projection.latch_binding
+                != (runtime.wallet_fingerprint_hash, runtime.network)
+                or authority.get("_catalyst_operation_id") != intent.operation_id
+                or authority.get("_catalyst_intent_id") != intent.intent_id
+                or blocker.get("intent_id") != intent.intent_id
+                or type(authority.get("_catalyst_attempt")) is not int
+                or authority.get("_catalyst_attempt") != blocker.get("attempt")
+            ):
+                return False
+            row = database.get_offer_intent(intent.intent_id)
+            if (
+                type(row) is not dict
+                or row.get("wallet_fingerprint_hash") != runtime.wallet_fingerprint_hash
+                or row.get("network") != runtime.network
+            ):
+                return False
+            if not self._begin_cancel_settlement(intent.operation_id):
+                return False
+            try:
+                return (
+                    self._settle_submitted_cancel(
+                        intent, max_wait_seconds=0, before_reconcile=owned
+                    )
+                    is True
+                )
+            finally:
+                self._end_cancel_settlement(intent.operation_id)
+        except Exception:
+            return False
+
     @staticmethod
     def _settle_submitted_cancel(
         intent: _CanonicalOfferCancelIntent,
+        *,
+        max_wait_seconds=None,
+        before_reconcile=None,
     ) -> bool:
         """Release one cancel latch only after exact authoritative proof.
 
@@ -7524,7 +7592,14 @@ class OfferManager:
         except Exception:
             return False
 
-        max_wait = max(0.0, float(cfg.CANCEL_MAX_WAIT_SECS))
+        max_wait = max(
+            0.0,
+            float(
+                cfg.CANCEL_MAX_WAIT_SECS
+                if max_wait_seconds is None
+                else max_wait_seconds
+            ),
+        )
         poll_interval = max(0.05, float(cfg.CANCEL_POLL_INTERVAL_SECS))
         deadline = time.monotonic() + max_wait
         while True:
@@ -7554,6 +7629,8 @@ class OfferManager:
                     and classification.get("classification")
                     == offer_reconciliation.CANCELLED_PROVEN
                 ):
+                    if before_reconcile is not None and before_reconcile() is not True:
+                        return False
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent.intent_id,
                         evidence=evidence,
@@ -7744,6 +7821,8 @@ class OfferManager:
         durable_ids = set()
         now = time.time()
         for candidate in candidates:
+            if getattr(self, "_stop_requested", False) is True:
+                return 0
             try:
                 trade_id = candidate["trade_id"]
                 attempt = candidate["attempt"]
@@ -7805,6 +7884,8 @@ class OfferManager:
             if not self._begin_cancel_settlement(intent.operation_id):
                 return -1
             try:
+                if getattr(self, "_stop_requested", False) is True:
+                    return 0
                 results = self.cancel_offers(
                     [trade_id],
                     reason="retry_failed_cancel",

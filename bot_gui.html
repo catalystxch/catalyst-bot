@@ -32862,6 +32862,7 @@
                 return;
             }
             if (btn) { btn.disabled = true; btn.textContent = 'Shutting down...'; }
+            window._catalystShutdownFlowActive = true;
             closeShutdownModal();
             showShutdownProgressModal(cancelOffers);
 
@@ -32873,13 +32874,29 @@
                 updateShutdownProgress('Stopping the bot...', 'Pausing pricing, watchers, and trading loops.');
                 addLogEntry('info', '   Step 1: Stopping bot loop...');
                 try {
-                    const stopResp = await apiFetch(`${API_URL}/bot/stop`, { method: 'POST' });
-                    await stopResp.json();
+                    const stopDeadline = Date.now() + 300000;
+                    while (true) {
+                        const stopResp = await apiFetch(`${API_URL}/bot/stop`, {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({wait_for_workers: true, settle_cancellations: cancelOffers})
+                        });
+                        const stopResult = await stopResp.json();
+                        if (stopResult.success !== true || typeof stopResult.stopped !== 'boolean') {
+                            throw new Error(stopResult.error || 'Could not verify that the bot stopped safely.');
+                        }
+                        if (stopResult.stopped === true) break;
+                        updateShutdownProgress('Waiting for the bot to stop safely...',
+                            stopResult.message || 'Waiting for workers and cancellation confirmation.');
+                        if (Date.now() >= stopDeadline) {
+                            throw new Error('Workers or cancellation confirmation are still pending. The app will stay open; retry shutdown once confirmation is available.');
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
                     setShutdownStep('Stop', 'done', 'Bot loop and background watchers stopped.');
                     addLogEntry('success', '   Bot loop stopped');
                 } catch(e) {
-                    setShutdownStep('Stop', 'done', 'Bot was already stopped before shutdown.');
-                    addLogEntry('warning', '   Bot loop was not running');
+                    setShutdownStep('Stop', 'error', e.message || 'Could not confirm the bot stopped safely.');
+                    throw e;
                 }
 
                 // Step 2: Cancel offers (if requested)
@@ -33000,6 +33017,7 @@
                 finishShutdownProgress(false, error.message || 'Unexpected shutdown error.');
                 addLogEntry('error', '   Shutdown error: ' + error.message);
             } finally {
+                window._catalystShutdownFlowActive = false;
                 if (btn) { btn.disabled = false; btn.textContent = 'Shutdown App'; }
             }
         }

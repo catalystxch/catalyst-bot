@@ -411,6 +411,38 @@ def api_bot_stop():
         return jsonify({"error": "Bot not initialised"}), 500
 
     bot.stop(wait=False)
+    body = request.get_json(silent=True)
+    if type(body) is dict and (
+        body.get("wait_for_workers") is True or body.get("settle_cancellations") is True
+    ):
+        try:
+            monitor = getattr(bot, "runtime_monitor", None)
+            if monitor is not None:
+                monitor.stop()
+            if any(thread.is_alive() for thread in server._shutdown_thread_refs(bot)):
+                return jsonify(
+                    success=True,
+                    stopped=False,
+                    status="stopping",
+                    message="Waiting for trading workers to finish safely.",
+                )
+            if (
+                body.get("settle_cancellations") is True
+                and bot.offer_manager.reconcile_pending_cancellation_once() is not True
+            ):
+                return jsonify(
+                    success=True,
+                    stopped=False,
+                    status="confirming",
+                    message="Waiting for exact cancellation confirmation.",
+                )
+        except Exception:
+            return jsonify(
+                success=False,
+                stopped=False,
+                error="Could not verify that trading workers and cancellation have settled.",
+            )
+        return jsonify(success=True, stopped=True, status="stopped")
     server.events.emit("bot_control", {"action": "stopped"})
     return jsonify({"status": "stopped"})
 

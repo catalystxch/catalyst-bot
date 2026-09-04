@@ -1214,6 +1214,19 @@ def run_desktop_mode(dev_mode: bool = False):
                     pass
             return True
 
+        # The GUI can be waiting for worker drain before cancel-all starts.
+        # A repeated native close must not cut that confirmed flow short.
+        try:
+            if (
+                window.evaluate_js("Boolean(window._catalystShutdownFlowActive)")
+                is True
+            ):
+                window.show()
+                window.restore()
+                return False
+        except Exception:
+            return False
+
         # Check whether the bot is actually running. If not, we can
         # close immediately — there's nothing to gracefully shut down.
         bot_running = False

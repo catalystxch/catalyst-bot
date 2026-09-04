@@ -12,7 +12,10 @@ import pytest
 
 @pytest.mark.parametrize("confirmed_close", [False, True])
 @pytest.mark.parametrize("active", [False, True])
-def test_native_close_waits_for_cancel_worker(monkeypatch, confirmed_close, active):
+@pytest.mark.parametrize("flow_active", [False, True])
+def test_native_close_waits_for_cancel_worker(
+    monkeypatch, confirmed_close, active, flow_active
+):
     source = Path(__file__).resolve().parents[1] / "desktop_app.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     node = next(
@@ -34,10 +37,12 @@ def test_native_close_waits_for_cancel_worker(monkeypatch, confirmed_close, acti
         _cancel_all_state={"running": active},
         _cancel_all_state_lock=threading.Lock(),
     )
+    namespace["window"].evaluate_js.return_value = flow_active
     monkeypatch.setitem(sys.modules, "api_server", fake)
     exec(
         compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"),
         namespace,
     )
-    assert namespace["on_closing"]() is (not active)
-    assert cleanup.call_count == int(not active)
+    allowed = not active and (confirmed_close or not flow_active)
+    assert namespace["on_closing"]() is allowed
+    assert cleanup.call_count == int(allowed)

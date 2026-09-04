@@ -207,7 +207,8 @@ class RuntimeMonitor:
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=2)
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
 
     def _set_state_quiet(self, status: str, note: str = ""):
         with self._lock:

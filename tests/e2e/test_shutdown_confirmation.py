@@ -27,11 +27,18 @@ def shutdown_page(page):
         content="""
         const API_URL = '/api'; let TAURI_ALLOW_CLOSE = false;
         window.calls = []; window.logs = []; window.finished = false;
+        window.stopResponses = [{success: true, stopped: true}];
+        window.stopBodies = [];
         window.cancelStatus = {success: true, complete: true, running: false,
             phase: 'complete', pending: 0, failed: 0, cancelled: 72,
             remaining: 0, authoritative_complete: true, resolved: 72, closed: 0};
-        async function apiFetch(path) {
+        async function apiFetch(path, options) {
             calls.push(path);
+            if (path.endsWith('/bot/stop')) {
+                stopBodies.push(options && options.body ? JSON.parse(options.body) : null);
+                const result = stopResponses.length > 1 ? stopResponses.shift() : stopResponses[0];
+                return {json: async () => result};
+            }
             return {json: async () => path.endsWith('/cancel_all')
                 ? {success: true, async: true, total: 72}
                 : path.endsWith('/status')
@@ -110,6 +117,35 @@ def test_explicit_leave_open_choice_still_shuts_down(shutdown_page):
     page.locator("#confirmShutdownBtn").click()
     page.wait_for_function("finished")
     assert page.evaluate("calls") == ["/api/bot/stop", "/api/shutdown"]
+
+
+@pytest.mark.parametrize(
+    "response", [{"success": False, "error": "stop failed"}, {"stopped": True}]
+)
+def test_shutdown_rejects_unverified_stop_response(shutdown_page, response):
+    page = shutdown_page
+    page.evaluate("value => {stopResponses = [value]}", response)
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.evaluate("confirmShutdown()")
+    assert page.evaluate("finished") is False
+    assert "/api/offers/cancel_all" not in page.evaluate("calls")
+    assert "/api/shutdown" not in page.evaluate("calls")
+
+
+def test_shutdown_waits_for_drain_and_late_confirmation(shutdown_page):
+    page = shutdown_page
+    page.evaluate(
+        "stopResponses = [{success:true,stopped:false,status:'stopping'}, {success:true,stopped:false,status:'confirming'}, {success:true,stopped:true}]"
+    )
+    page.locator("#shutdownCancelOffers").check()
+    page.get_by_role("button", name="Yes, cancel them", exact=True).click()
+    page.evaluate("confirmShutdown()")
+    calls = page.evaluate("calls")
+    assert calls[:3] == ["/api/bot/stop"] * 3
+    assert calls[3] == "/api/offers/cancel_all"
+    assert page.evaluate("stopBodies.every(b => b.settle_cancellations === true)")
+    assert page.evaluate("finished") is True
 
 
 def test_proven_expired_members_are_not_reported_as_cancelled(shutdown_page):

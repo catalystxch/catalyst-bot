@@ -1630,6 +1630,52 @@ class MutationGate:
                     source="durable_read",
                 )
 
+    def has_live_reconciliation_lease(self) -> bool:
+        """Verify owner authority for proof-only recovery behind a cancel latch.
+
+        This grants no wallet mutation permit and never clears a safety fence.
+        Unlike status(), it validates the lease even when the latch is tripped.
+        """
+        with self._lock:
+            try:
+                if (
+                    self._quiescing
+                    or self._wallet_lifecycle_transitioning
+                    or self._local_reason_code not in {"", "UNRESOLVED_OPERATIONS"}
+                ):
+                    return False
+                lease = self._authorization_snapshot()["lease"]
+                expected = (
+                    True,
+                    self.run_id,
+                    self.owner_pid,
+                    self.owner_host,
+                    self.wallet_fingerprint_hash,
+                    self.network,
+                    self._lease_version,
+                    self._lease_acquired_at,
+                )
+                actual = (
+                    bool(lease.get("active")),
+                    lease.get("owner_run_id"),
+                    lease.get("owner_pid"),
+                    lease.get("owner_host"),
+                    lease.get("wallet_fingerprint_hash"),
+                    lease.get("network"),
+                    lease.get("lease_version"),
+                    lease.get("acquired_at"),
+                )
+                return bool(
+                    type(self._lease_version) is int
+                    and self._lease_version > 0
+                    and type(self._lease_acquired_at) is str
+                    and self._lease_acquired_at
+                    and actual == expected
+                    and _as_utc(lease.get("expires_at")) > self._now()
+                )
+            except Exception:
+                return False
+
     def require_allowed(self, operation: str) -> GateStatus:
         current = self.status()
         if not current.allowed:

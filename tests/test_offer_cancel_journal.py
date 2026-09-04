@@ -268,6 +268,7 @@ def _seed_task7_created_offer(
     coin_id: str,
     intent_seed: str,
     expires_at: str | None = None,
+    wallet_hash: str = "f" * 64,
 ) -> str:
     """Persist one Task 7 creation journal and its confirmed trade binding."""
 
@@ -286,7 +287,7 @@ def _seed_task7_created_offer(
         operation_id=operation_id,
         event_id=f"{operation_id}:prepared",
         run_id=f"run-task7-{intent_seed}",
-        wallet_fingerprint_hash="f" * 64,
+        wallet_fingerprint_hash=wallet_hash,
         network="mainnet",
         asset_id=ASSET_ID,
         side="buy",
@@ -3752,7 +3753,7 @@ def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
-@pytest.mark.parametrize("shutdown_mode", [False, True])
+@pytest.mark.parametrize("shutdown_mode", [False, True, "late", "late_expired"])
 def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
     isolated_database,
     monkeypatch,
@@ -3762,6 +3763,7 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
         trade_id=TRADE_ID,
         coin_id=COIN_ID,
         intent_seed="retry-submitted-settlement",
+        wallet_hash=mutation_gate.wallet_fingerprint_hash(_binding().fingerprint),
     )
     effects = []
     active_operations = []
@@ -3827,14 +3829,44 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
         mutation_gate,
         "current_runtime",
         lambda: SimpleNamespace(
+            has_live_reconciliation_lease=lambda: True,
+            wallet_fingerprint_hash=database.get_offer_intent(intent_id)[
+                "wallet_fingerprint_hash"
+            ],
+            network=database.get_offer_intent(intent_id)["network"],
             release_resolved=lambda generation, operation_ids: (
                 release_calls.append((generation, operation_ids))
                 or {"released": True, "reason": "released"}
-            )
+            ),
         ),
     )
 
-    if shutdown_mode:
+    # Keep one stable runtime identity for proof-only recovery's revalidation.
+    stable_runtime = mutation_gate.current_runtime()
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: stable_runtime)
+    if shutdown_mode == "late_expired":
+        lease_checks = iter([True, False])
+        stable_runtime.has_live_reconciliation_lease = lambda: next(lease_checks)
+    if shutdown_mode in {"late", "late_expired"}:
+        submitted = manager.cancel_offers(
+            [TRADE_ID], force_storm=True, _retry_failed_attempts={TRADE_ID: 1}
+        )
+        assert submitted[TRADE_ID]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        projection = manager._read_existing_cancel_result(
+            manager._canonical_cancel_intent(TRADE_ID)
+        )
+        assert projection.result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        assert projection.latch_binding == (
+            stable_runtime.wallet_fingerprint_hash,
+            stable_runtime.network,
+        )
+        blockers = database.get_unresolved_offer_operation_blockers()
+        assert len(blockers) == 1 and blockers[0]["phase"] == "FINALIZED", blockers
+        assert blockers[0]["intent_id"] == intent_id
+        assert manager.reconcile_pending_cancellation_once() is (
+            shutdown_mode == "late"
+        )
+    elif shutdown_mode:
         result = manager.cancel_offers_and_settle(
             [TRADE_ID], retry_failed_attempts={TRADE_ID: 1}
         )
@@ -3843,8 +3875,15 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
         assert manager.retry_failed_cancels() == 0
 
     assert effects == [TRADE_ID, TRADE_ID]
-    assert active_operations == [None, OPERATION_ID]
+    assert active_operations == [
+        None,
+        None if shutdown_mode in {"late", "late_expired"} else OPERATION_ID,
+    ]
     assert manager.get_active_cancel_settlement_operation() is None
+    if shutdown_mode == "late_expired":
+        assert reconcile_calls == [] and release_calls == []
+        assert len(database.get_unresolved_offer_operation_blockers()) == 1
+        return
     assert len(reconcile_calls) == 1
     assert reconcile_calls[0][0] == intent_id
     assert release_calls == [(1, [OPERATION_ID])]

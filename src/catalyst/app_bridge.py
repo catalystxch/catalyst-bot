@@ -295,6 +295,22 @@ class AppBridge:
     @_safe
     def stop_bot(self, _body=None):
         """Stop the bot loop. Maps to POST /api/bot/stop."""
+        if type(_body) is dict and (
+            _body.get("wait_for_workers") is True
+            or _body.get("settle_cancellations") is True
+        ):
+            import api_server
+
+            with api_server.app.test_request_context(
+                "/api/bot/stop",
+                method="POST",
+                json={
+                    key: True
+                    for key in ("settle_cancellations", "wait_for_workers")
+                    if _body.get(key) is True
+                },
+            ):
+                return _unwrap_flask_response(api_server.api_bot_stop())
         api = self.api
         bot = api.bot
         if bot is None:
