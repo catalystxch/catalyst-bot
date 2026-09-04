@@ -29,9 +29,15 @@ from decimal import Decimal, InvalidOperation
 from flask import Blueprint, Response, jsonify, request, send_file
 
 import api_server
+import database
 from config import cfg
-from database import log_event, get_stats, backup_database, get_connection
 from pc_diagnostics import collect_pc_diagnostics as _collect_pc_diagnostics
+
+
+log_event = database.log_event
+get_stats = database.get_stats
+backup_database = database.backup_database
+get_connection = database.get_connection
 
 
 # Package directory — the parent of blueprints/ (i.e. src/catalyst/).
@@ -46,6 +52,119 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _wallet_open_offer_snapshot_before_prep() -> dict:
+    """Return one complete, read-only view of every live wallet offer.
+
+    The local ``offers`` table cannot prove an empty wallet book because Sage
+    can contain orphan or pre-CATalyst offers.  Coin prep therefore checks the
+    authoritative wallet-wide offer surface before any reset or subprocess is
+    allowed to run.  Unknown statuses remain conservatively nonterminal.
+    """
+
+    import offer_reconciliation
+    import wallet
+
+    reader = getattr(wallet, "get_authoritative_offer_history", None)
+    if not callable(reader):
+        reader = getattr(wallet, "get_all_offers", None)
+    if not callable(reader):
+        return {
+            "complete": False,
+            "read_error": "reader_unavailable",
+            "open_offer_count": 0,
+            "open_buy_count": 0,
+            "open_sell_count": 0,
+            "open_trade_ids": [],
+        }
+    snapshot = offer_reconciliation.load_sage_offer_history(
+        get_all_offers=reader,
+        include_completed=False,
+        page_size=500,
+        max_pages=9,
+        max_records=4096,
+    )
+    records = snapshot.get("records")
+    complete = bool(
+        snapshot.get("complete") is True
+        and snapshot.get("read_error") is None
+        and type(records) is list
+        and all(type(row) is dict for row in records)
+    )
+    if not complete:
+        return {
+            "complete": False,
+            "read_error": snapshot.get("read_error") or "incomplete_snapshot",
+            "open_offer_count": 0,
+            "open_buy_count": 0,
+            "open_sell_count": 0,
+            "open_trade_ids": [],
+        }
+
+    def offer_side(row: dict) -> str:
+        side = row.get("side")
+        if side in {"buy", "sell"}:
+            return side
+        summary = row.get("summary")
+        offered = summary.get("offered") if type(summary) is dict else None
+        if type(offered) is dict:
+            xch_amount = offered.get("xch")
+            try:
+                if int(xch_amount or 0) > 0:
+                    return "buy"
+            except (TypeError, ValueError):
+                pass
+            if any(key != "xch" and value for key, value in offered.items()):
+                return "sell"
+        return ""
+
+    trade_ids = []
+    for row in records:
+        trade_id = row.get("trade_id") or row.get("offer_id")
+        if type(trade_id) is str and trade_id:
+            trade_ids.append(trade_id)
+    return {
+        "complete": True,
+        "read_error": None,
+        "open_offer_count": len(records),
+        "open_buy_count": sum(1 for row in records if offer_side(row) == "buy"),
+        "open_sell_count": sum(1 for row in records if offer_side(row) == "sell"),
+        "open_trade_ids": sorted(set(trade_ids)),
+    }
+
+
+def _recover_legacy_open_offers_before_prep() -> dict:
+    """Try the existing proof-bound migration for a pre-intent ladder."""
+
+    try:
+        result = api_server.recover_legacy_startup_reservations()
+    except Exception as exc:
+        result = {
+            "examined": 0,
+            "recovered": 0,
+            "remaining": 0,
+            "errors": 1,
+            "error_type": type(exc).__name__,
+        }
+        log_event(
+            "warning",
+            "coin_prep_legacy_offer_recovery_failed",
+            "Coin prep could not complete proof-bound legacy offer recovery",
+            data=result,
+        )
+        return result
+    if result.get("examined", 0):
+        log_event(
+            "info" if not result.get("remaining", 0) else "warning",
+            "coin_prep_legacy_offer_recovery",
+            "Coin prep legacy offer recovery: "
+            f"examined {result.get('examined', 0)}, "
+            f"recovered {result.get('recovered', 0)}, "
+            f"remaining {result.get('remaining', 0)}",
+            data=result,
+        )
+    return result
+
+
 def _reconcile_authoritative_open_offers_before_prep() -> dict:
     """Resolve proof-backed terminal offers before the re-prep safety guard.
 
@@ -57,7 +176,6 @@ def _reconcile_authoritative_open_offers_before_prep() -> dict:
     rows remain untouched and the reset guard continues to fail closed.
     """
 
-    import database
     import offer_reconciliation
 
     rows = database.get_open_offers(include_elapsed=True)
@@ -130,6 +248,8 @@ def _coin_prep_open_offer_conflict(
     reset_summary: dict,
     reconciliation: dict | None,
     *,
+    wallet_offer_snapshot: dict | None = None,
+    legacy_recovery: dict | None = None,
     protected_offer_history_reset: bool = False,
 ) -> dict | None:
     """Translate the reset guard's live-book denial into a recovery contract.
@@ -146,14 +266,32 @@ def _coin_prep_open_offer_conflict(
     if "open_offers" not in conflicts:
         return None
 
-    import database
-
     rows = database.get_open_offers(include_elapsed=True)
     buy_count = sum(1 for row in rows if type(row) is dict and row.get("side") == "buy")
     sell_count = sum(
         1 for row in rows if type(row) is dict and row.get("side") == "sell"
     )
-    open_count = len(rows)
+    local_open_count = len(rows)
+    wallet_snapshot = dict(wallet_offer_snapshot or {})
+    wallet_open_count = max(
+        0, int(wallet_snapshot.get("open_offer_count", 0) or 0)
+    )
+    open_count = max(local_open_count, wallet_open_count)
+    buy_count = max(
+        buy_count, int(wallet_snapshot.get("open_buy_count", 0) or 0)
+    )
+    sell_count = max(
+        sell_count, int(wallet_snapshot.get("open_sell_count", 0) or 0)
+    )
+    wallet_verified_empty = bool(
+        wallet_snapshot.get("complete") is True and wallet_open_count == 0
+    )
+    legacy_count = sum(
+        1
+        for row in rows
+        if type(row) is dict
+        and not database.get_offer_intent_by_trade_id(row.get("trade_id"))
+    )
     noun = "offer" if open_count == 1 else "offers"
     additional_conflicts = sorted(
         conflict for conflict in conflicts if conflict != "open_offers"
@@ -168,7 +306,28 @@ def _coin_prep_open_offer_conflict(
     ):
         additional_conflicts.append("offer_proof_history")
         additional_conflicts.sort()
-    if additional_conflicts:
+    if wallet_verified_empty and legacy_count:
+        action = "retry_authoritative_legacy_recovery"
+        message = (
+            f"{legacy_count} legacy CATalyst offer "
+            f"row{' remains' if legacy_count == 1 else ' rows remain'} open even "
+            "though Sage proves the live wallet book is empty. CATalyst will "
+            "not start coin prep until those pre-intent rows have proof-bound "
+            "terminal recovery. Retry Prepare Coins; if this remains, download "
+            "a debug bundle for support."
+        )
+        error = "coin_prep_legacy_offer_recovery_required"
+        reason = "LEGACY_OPEN_OFFERS_REQUIRE_AUTHORITATIVE_REPAIR"
+    elif wallet_verified_empty:
+        action = "retry_authoritative_reconciliation"
+        message = (
+            f"{open_count} CATalyst {noun} still await authoritative terminal "
+            "proof even though Sage currently shows no live offers. Coin prep "
+            "remains blocked; retry after wallet reconciliation completes."
+        )
+        error = "coin_prep_offer_reconciliation_pending"
+        reason = "OFFER_TERMINAL_PROOF_PENDING"
+    elif additional_conflicts:
         action = "cancel_all_then_retry_without_protected_resets"
         message = (
             f"{open_count} open {noun} must be cancelled and "
@@ -177,6 +336,8 @@ def _coin_prep_open_offer_conflict(
             "by protected authoritative state; after cancellation, retry coin "
             "prep without clearing protected history."
         )
+        error = "coin_prep_requires_offer_cancellation"
+        reason = "OPEN_OFFERS_REQUIRE_CANCELLATION"
     else:
         action = "cancel_all_then_retry"
         message = (
@@ -184,17 +345,23 @@ def _coin_prep_open_offer_conflict(
             "authoritatively confirmed before coin prep can safely "
             "replace their locked coins."
         )
+        error = "coin_prep_requires_offer_cancellation"
+        reason = "OPEN_OFFERS_REQUIRE_CANCELLATION"
     result = dict(reset_summary)
     result.update(
         {
             "success": False,
-            "error": "coin_prep_requires_offer_cancellation",
-            "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+            "error": error,
+            "reason": reason,
             "message": message,
             "action": action,
             "open_offer_count": open_count,
             "open_buy_count": buy_count,
             "open_sell_count": sell_count,
+            "wallet_open_offer_count": wallet_open_count,
+            "wallet_offer_book_verified_empty": wallet_verified_empty,
+            "legacy_offer_count": legacy_count,
+            "legacy_recovery": dict(legacy_recovery or {}),
             "reconciliation": dict(reconciliation or {}),
         }
     )
@@ -208,6 +375,9 @@ def _coin_prep_open_offer_conflict(
             "open_offer_count": open_count,
             "open_buy_count": buy_count,
             "open_sell_count": sell_count,
+            "wallet_open_offer_count": wallet_open_count,
+            "wallet_offer_book_verified_empty": wallet_verified_empty,
+            "legacy_offer_count": legacy_count,
             "additional_conflicts": additional_conflicts,
             "action": action,
             "reconciliation": result["reconciliation"],
@@ -785,9 +955,7 @@ def api_log_event():
             return jsonify({"success": False, "error": "No message"}), 400
 
         # Write to DB + push to SSE (log_event does both now)
-        from database import log_event
-
-        log_event(severity, event_type, message)
+        database.log_event(severity, event_type, message)
 
         # Emit a coin_change SSE event when coin prep hits key milestones
         # so the Chia dashboard can auto-refresh Coins/Balances/Wallet Status
@@ -1645,8 +1813,65 @@ def _api_coin_prep_trigger_locked():
         # Under full_reset=True the caller requests the broad legacy reset.
         # It remains opt-in, but authoritative or protected state produces a
         # stable conflict instead of deleting fills, proofs, offers, or locks.
+        wallet_offer_snapshot = _wallet_open_offer_snapshot_before_prep()
+        if wallet_offer_snapshot.get("complete") is not True:
+            unavailable = {
+                "success": False,
+                "error": "coin_prep_wallet_offer_check_unavailable",
+                "reason": "WALLET_OFFER_BOOK_UNAVAILABLE",
+                "message": (
+                    "CATalyst could not prove the complete Sage offer book. "
+                    "Coin prep remains safely blocked; confirm Sage is connected "
+                    "and synced, then retry."
+                ),
+                "action": "retry_wallet_offer_check",
+                "wallet_offer_book_verified_empty": False,
+                "wallet_offer_snapshot": wallet_offer_snapshot,
+            }
+            log_event(
+                "warning",
+                "coin_prep_wallet_offer_check_unavailable",
+                unavailable["message"],
+                data=wallet_offer_snapshot,
+            )
+            return jsonify(unavailable), 503
+
+        wallet_has_open_offers = (
+            int(wallet_offer_snapshot.get("open_offer_count", 0) or 0) > 0
+        )
+        local_open_offers = database.get_open_offers(include_elapsed=True)
+        if wallet_has_open_offers and not local_open_offers:
+            wallet_conflict = _coin_prep_open_offer_conflict(
+                {
+                    "success": False,
+                    "conflicts": ["open_offers"],
+                    "fills_cleared": 0,
+                    "round_trips_cleared": 0,
+                    "coins_cleared": 0,
+                    "open_offers_cancelled": 0,
+                    "offers_deleted": 0,
+                    "price_history_cleared": False,
+                    "inventory_cleared": False,
+                    "preserve_history": not _prep_reset_pnl,
+                    "reset_at": datetime.now(timezone.utc).isoformat(),
+                },
+                None,
+                wallet_offer_snapshot=wallet_offer_snapshot,
+                protected_offer_history_reset=(
+                    _prep_reset_offers or _prep_reset_pnl
+                ),
+            )
+            return jsonify(wallet_conflict), 409
+
+        legacy_recovery = {
+            "examined": 0,
+            "recovered": 0,
+            "remaining": len(local_open_offers),
+        }
+        if not wallet_has_open_offers:
+            legacy_recovery = _recover_legacy_open_offers_before_prep()
         _prep_reconciliation = None
-        if not _prep_reset_pnl:
+        if not _prep_reset_pnl and not wallet_has_open_offers:
             _prep_reconciliation = _reconcile_authoritative_open_offers_before_prep()
         try:
             reset_summary = api_server._reset_fresh_run_session(
@@ -1665,6 +1890,8 @@ def _api_coin_prep_trigger_locked():
                 open_offer_conflict = _coin_prep_open_offer_conflict(
                     reset_summary,
                     _prep_reconciliation,
+                    wallet_offer_snapshot=wallet_offer_snapshot,
+                    legacy_recovery=legacy_recovery,
                     protected_offer_history_reset=_prep_reset_offers,
                 )
                 if open_offer_conflict is not None:
@@ -1685,9 +1912,7 @@ def _api_coin_prep_trigger_locked():
         # otherwise bloat the history view.
         if _prep_reset_offers:
             try:
-                from database import guarded_reset_authoritative_state
-
-                history_reset = guarded_reset_authoritative_state(
+                history_reset = database.guarded_reset_authoritative_state(
                     clear_terminal_offers=True
                 )
                 if not history_reset["success"]:
@@ -2364,7 +2589,14 @@ def _api_coin_prep_trigger_locked():
             name="coin-prep-api-worker",
         )
         api_server._coin_prep_thread.start()
-        return jsonify({"success": True, "message": "Coin prep started"})
+        return jsonify(
+            {
+                "success": True,
+                "message": "Coin prep started",
+                "wallet_offer_book_verified_empty": True,
+                "legacy_recovery": legacy_recovery,
+            }
+        )
     except Exception as e:
         api_server._coin_prep_state["running"] = False
         # Also ungate on early failure

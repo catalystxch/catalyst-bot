@@ -20,6 +20,49 @@ _HEX = frozenset("0123456789abcdef")
 _XCH_SCALE = Decimal("1000000000000")
 
 
+class _CachedReadOnlyWallet:
+    """Share immutable Sage history reads across a bounded legacy ladder."""
+
+    _SHARED_METHODS = frozenset(
+        {
+            "get_wallet_backend_authority",
+            "get_wallet_identity",
+            "get_authoritative_offer_history",
+            "get_all_offers",
+            "get_transactions_list",
+        }
+    )
+
+    def __init__(self, wallet_facade: Any):
+        self._wallet = wallet_facade
+        self._cache: dict[tuple[str, str], Any] = {}
+
+    @staticmethod
+    def _key(name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
+        encoded = json.dumps(
+            {"args": args, "kwargs": kwargs},
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return name, encoded
+
+    def __getattr__(self, name: str):
+        target = getattr(self._wallet, name)
+        if name not in self._SHARED_METHODS or not callable(target):
+            return target
+
+        def cached(*args, **kwargs):
+            key = self._key(name, args, kwargs)
+            if key not in self._cache:
+                self._cache[key] = target(*args, **kwargs)
+            return self._cache[key]
+
+        return cached
+
+
 def _hex_id(value: Any) -> str:
     if type(value) is not str:
         return ""
@@ -127,6 +170,7 @@ def recover_legacy_sage_reservations(
         import offer_reconciliation as reconciliation_module
     if wallet_facade is None:
         import wallet as wallet_facade
+    wallet_facade = _CachedReadOnlyWallet(wallet_facade)
     if config is None:
         from config import cfg as config
     decimals = getattr(config, "CAT_DECIMALS", None)

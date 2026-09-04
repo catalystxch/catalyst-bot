@@ -133,3 +133,60 @@ def test_nonexpired_legacy_reservation_remains_blocked_without_writes():
 
     assert result == {"examined": 1, "recovered": 0, "remaining": 1}
     assert [call[0] for call in calls] == ["evidence"]
+
+
+def test_many_legacy_candidates_share_bounded_wallet_history_reads():
+    """Repairing a large old ladder must not reload all Sage history per row."""
+    import legacy_startup_recovery
+
+    first = _candidate()
+    second = {
+        **_candidate(),
+        "trade_id": "4" * 64,
+        "coin_id": "0x" + "5" * 64,
+    }
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [first, second],
+        get_offer_intent=lambda _intent_id: None,
+    )
+    wallet_calls = {"identity": 0, "offers": 0}
+
+    class Wallet:
+        @staticmethod
+        def get_wallet_identity():
+            wallet_calls["identity"] += 1
+            return {"success": True}
+
+        @staticmethod
+        def get_authoritative_offer_history(**_kwargs):
+            wallet_calls["offers"] += 1
+            return {"success": True, "offers": []}
+
+    def load_evidence(_intent, wallet_facade=None):
+        wallet_facade.get_wallet_identity()
+        wallet_facade.get_authoritative_offer_history(
+            include_completed=True,
+            start=0,
+            end=50,
+        )
+        return {"observed_at": AT}
+
+    reconciliation = SimpleNamespace(
+        EXPIRED_PROVEN="EXPIRED_PROVEN",
+        load_authoritative_evidence=load_evidence,
+        classify_terminal_evidence=lambda *_args, **_kwargs: {
+            "classification": "ACTIVE_PROVEN"
+        },
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=Wallet(),
+        database_module=database,
+        reconciliation_module=reconciliation,
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 2, "recovered": 0, "remaining": 2}
+    assert wallet_calls == {"identity": 1, "offers": 1}

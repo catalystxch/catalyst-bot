@@ -34428,6 +34428,9 @@ function closeCtgErrorModal() {
                     });
                     const data = await response.json();
                     if (data.success) {
+                        if (data.wallet_offer_book_verified_empty !== true) {
+                            throw new Error('Coin prep start was not accompanied by a complete empty Sage offer-book proof.');
+                        }
                         _coinPrepMsgHistory = [];
                         _coinPrepLastMsg = '';
                         closeCancelProgressModal();

@@ -648,7 +648,11 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
                         message: '2 open offers are still awaiting Sage confirmation.',
                         open_offer_count: 2,
                       }
-                    : { success: true, message: 'Coin preparation started' };
+                    : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                      };
                 return new Response(JSON.stringify(body), {
                     status: triggerCalls === 1 ? 409 : 200,
                     headers: { 'Content-Type': 'application/json' },
@@ -671,6 +675,43 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     assert result["triggerCalls"] == 2
     assert any("Offer states confirmed terminal" in line for line in result["logs"])
     expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_coin_prep_recovery_rejects_unverified_success_response(page):
+    """The browser must not equate a generic 200 with wallet-wide terminal proof."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true,
+                message: 'Coin preparation started',
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+            const started = await resumeCoinPrepAfterCancelledOffers({
+                source: 'coin_prep',
+                prepPayload: {
+                    coin_multiplier: 1,
+                    reset_pnl: false,
+                    reset_offer_history: false,
+                    reset_counters: false,
+                },
+            }, { retryDelayMs: 0, timeoutMs: 10 });
+            return {
+                started,
+                progressVisible: getComputedStyle(
+                    document.getElementById('coinPrepProgressView')
+                ).display !== 'none',
+            };
+        }"""
+    )
+
+    assert result["started"] is False
+    assert result["progressVisible"] is False
 
 
 def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
@@ -719,7 +760,11 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
                         error: 'coin_prep_requires_offer_cancellation',
                         message: '2 offers remain pending authoritative proof',
                         open_offer_count: 2,
-                    } : { success: true, message: 'Coin preparation started' }), {
+                    } : {
+                        success: true,
+                        message: 'Coin preparation started',
+                        wallet_offer_book_verified_empty: true,
+                    }), {
                         status: waiting ? 409 : 200,
                         headers: { 'Content-Type': 'application/json' },
                     });
