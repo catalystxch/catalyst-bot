@@ -3327,6 +3327,7 @@ def _start_background_cat_resolver():
 # available via the debug log download (preserves full history).
 # Loaded from database on startup so it survives restarts.
 _logs_cleared_at = None
+_logs_clear_lock = threading.Lock()
 _session_start_time = None  # Set at app startup — logs older than this are hidden
 _run_history_cutoff = None  # Set when the user explicitly starts a fresh run
 if not hasattr(cfg, "RUN_HISTORY_CUTOFF"):

@@ -18912,7 +18912,12 @@ def record_splash_incoming(
     successful webhook delivery because the peer may need to retry it.
     """
     conn = get_connection()
-    for attempt in range(2):
+    # Offer ladder writes can hold SQLite's single writer lock beyond one
+    # five-second busy timeout on slower Windows machines.  Splash treats a
+    # failed webhook as retryable, but waiting through a few bounded local
+    # attempts avoids needless 503s and warning storms during ladder builds.
+    max_attempts = 4
+    for attempt in range(max_attempts):
         try:
             # Skip if we already have this fingerprint (dedup).  The webhook
             # path is serialized in api_server, so repeating this whole unit
@@ -18939,7 +18944,7 @@ def record_splash_incoming(
             except Exception:
                 # Preserve the original Splash insert error if rollback also fails.
                 pass
-            if attempt == 0 and _sqlite_locked(e):
+            if attempt < max_attempts - 1 and _sqlite_locked(e):
                 continue
             log_event(
                 "warning", "splash_db_error", f"Failed to record incoming offer: {e}"
@@ -18995,7 +19000,8 @@ def update_splash_incoming_status(
         status: New status ('processed', 'ignored', 'expired')
     """
     conn = get_connection()
-    for attempt in range(2):
+    max_attempts = 4
+    for attempt in range(max_attempts):
         try:
             if pair_hint is None:
                 conn.execute(
@@ -19015,7 +19021,7 @@ def update_splash_incoming_status(
             except Exception:
                 # Preserve the original Splash update error if rollback also fails.
                 pass
-            if attempt == 0 and _sqlite_locked(e):
+            if attempt < max_attempts - 1 and _sqlite_locked(e):
                 continue
             log_event(
                 "warning",

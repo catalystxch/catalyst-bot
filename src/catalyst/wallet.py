@@ -429,6 +429,7 @@ class _OfferCreationContinuationState:
 
 
 _offer_creation_continuation_lock = threading.RLock()
+_wallet_identity_observation_lock = threading.RLock()
 _offer_creation_continuations: dict[
     _OfferCreationContinuation, _OfferCreationContinuationState
 ] = {}
@@ -502,16 +503,17 @@ def _begin_offer_operation_continuation(
             permit,
             f"{wallet_operation}:continuation:journal",
         )
-        snapshot = _identity_from_adapter(adapter)
-        mutation_gate.require_wallet_mutation_permit_authority(
-            permit,
-            f"{wallet_operation}:continuation:identity",
-        )
-        decision = mutation_gate.require_fresh_wallet_identity(
-            binding,
-            snapshot,
-            f"{wallet_operation}:continuation",
-        )
+        with _wallet_identity_observation_lock:
+            snapshot = _identity_from_adapter(adapter)
+            mutation_gate.require_wallet_mutation_permit_authority(
+                permit,
+                f"{wallet_operation}:continuation:identity",
+            )
+            decision = mutation_gate.require_fresh_wallet_identity(
+                binding,
+                snapshot,
+                f"{wallet_operation}:continuation",
+            )
         mutation_gate.require_wallet_mutation_permit_authority(
             permit,
             f"{wallet_operation}:continuation:dispatch",
@@ -661,16 +663,17 @@ def refresh_offer_cancel_continuation(
             return False
 
     try:
-        snapshot = _identity_from_adapter(state.adapter)
-        binding, adapter, _decision = (
-            mutation_gate.require_fresh_wallet_operation_continuation(
-                state.permit,
-                snapshot,
-                state.wallet_operation,
-                operation,
-                intent,
+        with _wallet_identity_observation_lock:
+            snapshot = _identity_from_adapter(state.adapter)
+            binding, adapter, _decision = (
+                mutation_gate.require_fresh_wallet_operation_continuation(
+                    state.permit,
+                    snapshot,
+                    state.wallet_operation,
+                    operation,
+                    intent,
+                )
             )
-        )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
             or mutation_gate.wallet_identity_binding_digest(binding)
@@ -744,16 +747,17 @@ def _run_offer_operation_continuation(
             or target_trade_id != state.target_trade_id
         ):
             return blocked_result()
-        snapshot = _identity_from_adapter(state.adapter)
-        binding, adapter, _decision = (
-            mutation_gate.require_fresh_wallet_operation_continuation(
-                state.permit,
-                snapshot,
-                wallet_operation,
-                operation,
-                intent,
+        with _wallet_identity_observation_lock:
+            snapshot = _identity_from_adapter(state.adapter)
+            binding, adapter, _decision = (
+                mutation_gate.require_fresh_wallet_operation_continuation(
+                    state.permit,
+                    snapshot,
+                    wallet_operation,
+                    operation,
+                    intent,
+                )
             )
-        )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
             or mutation_gate.wallet_identity_binding_digest(binding)
@@ -772,16 +776,17 @@ def _run_offer_operation_continuation(
             safe_step = (
                 step if type(step) is str and step and len(step) <= 64 else "effect"
             )
-            fresh_snapshot = _identity_from_adapter(adapter)
-            checked_binding, checked_adapter, _step_decision = (
-                mutation_gate.require_fresh_wallet_operation_continuation(
-                    state.permit,
-                    fresh_snapshot,
-                    f"{wallet_operation}:{safe_step}:identity",
-                    operation,
-                    intent,
+            with _wallet_identity_observation_lock:
+                fresh_snapshot = _identity_from_adapter(adapter)
+                checked_binding, checked_adapter, _step_decision = (
+                    mutation_gate.require_fresh_wallet_operation_continuation(
+                        state.permit,
+                        fresh_snapshot,
+                        f"{wallet_operation}:{safe_step}:identity",
+                        operation,
+                        intent,
+                    )
                 )
-            )
             if (
                 mutation_gate.wallet_identity_binding_digest(checked_binding)
                 != mutation_gate.wallet_identity_binding_digest(binding)
@@ -1110,11 +1115,14 @@ def _run_wallet_mutation_with_authority(
         args = _bind_identity_selecting_arguments(export_name, args, binding, operation)
         is_identity_transition = export_name == "sage_login"
         if not is_identity_transition:
-            snapshot = _identity_from_adapter(adapter)
-            mutation_gate.require_wallet_mutation_permit_authority(
-                permit, f"{operation}:identity"
-            )
-            mutation_gate.require_fresh_wallet_identity(binding, snapshot, operation)
+            with _wallet_identity_observation_lock:
+                snapshot = _identity_from_adapter(adapter)
+                mutation_gate.require_wallet_mutation_permit_authority(
+                    permit, f"{operation}:identity"
+                )
+                mutation_gate.require_fresh_wallet_identity(
+                    binding, snapshot, operation
+                )
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:dispatch"
         )
@@ -1124,16 +1132,17 @@ def _run_wallet_mutation_with_authority(
                 safe_step = (
                     step if type(step) is str and step and len(step) <= 64 else "effect"
                 )
-                mutation_gate.require_wallet_mutation_permit_authority(
-                    permit, f"{operation}:{safe_step}:identity"
-                )
-                if not is_identity_transition:
-                    fresh_snapshot = _identity_from_adapter(adapter)
-                    mutation_gate.require_fresh_wallet_identity(
-                        binding,
-                        fresh_snapshot,
-                        f"{operation}:{safe_step}",
+                with _wallet_identity_observation_lock:
+                    mutation_gate.require_wallet_mutation_permit_authority(
+                        permit, f"{operation}:{safe_step}:identity"
                     )
+                    if not is_identity_transition:
+                        fresh_snapshot = _identity_from_adapter(adapter)
+                        mutation_gate.require_fresh_wallet_identity(
+                            binding,
+                            fresh_snapshot,
+                            f"{operation}:{safe_step}",
+                        )
                 mutation_gate.require_wallet_mutation_permit_authority(
                     permit, f"{operation}:{safe_step}:dispatch"
                 )
@@ -1159,12 +1168,13 @@ def _run_wallet_mutation_with_authority(
             permit, f"{operation}:outcome"
         )
         if is_identity_transition and wallet_mutation_succeeded(result):
-            target_snapshot = _identity_from_adapter(adapter)
-            mutation_gate.require_fresh_wallet_identity(
-                binding,
-                target_snapshot,
-                f"{operation}:postcondition",
-            )
+            with _wallet_identity_observation_lock:
+                target_snapshot = _identity_from_adapter(adapter)
+                mutation_gate.require_fresh_wallet_identity(
+                    binding,
+                    target_snapshot,
+                    f"{operation}:postcondition",
+                )
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if callable(close):
@@ -1546,12 +1556,13 @@ def build_transaction_rpc(selected_coin_ids: list, actions: list):
         binding, adapter = _expected_identity_authority()
 
         def identity_recheck(step: str) -> None:
-            _revalidate_adapter_authority(adapter, f"wallet:unsigned_build:{step}")
-            mutation_gate.require_fresh_wallet_identity(
-                binding,
-                _identity_from_adapter(adapter),
-                f"wallet:unsigned_build:{step}",
-            )
+            with _wallet_identity_observation_lock:
+                _revalidate_adapter_authority(adapter, f"wallet:unsigned_build:{step}")
+                mutation_gate.require_fresh_wallet_identity(
+                    binding,
+                    _identity_from_adapter(adapter),
+                    f"wallet:unsigned_build:{step}",
+                )
 
         identity_recheck("identity")
         result = adapter.build_transaction_rpc(

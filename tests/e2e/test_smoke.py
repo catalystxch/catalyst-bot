@@ -1242,6 +1242,53 @@ def test_cancel_all_discards_status_from_older_operation_generation(page):
     assert result["phase"] == "current"
 
 
+def test_status_refresh_discards_older_response_that_finishes_last(page):
+    """A slow pre-cancel status response must not restore cancelled offers."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const pending = [];
+            const appliedOfferCounts = [];
+            apiFetch = () => new Promise(resolve => pending.push(resolve));
+            updateUI = data => appliedOfferCounts.push(
+                (data.offers?.buy?.length || 0) + (data.offers?.sell?.length || 0)
+            );
+            syncCommandCentreFromStatus = () => {};
+            updateWalletPickerAvailability = () => {};
+
+            const staleRequest = fetchStatus();
+            await Promise.resolve();
+            const currentRequest = fetchStatus();
+            await Promise.resolve();
+
+            pending[1](new Response(JSON.stringify({
+                running: false,
+                offers: { buy: [], sell: [] },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            await currentRequest;
+
+            pending[0](new Response(JSON.stringify({
+                running: false,
+                offers: {
+                    buy: Array.from({ length: 36 }, (_, i) => ({ trade_id: `buy-${i}` })),
+                    sell: Array.from({ length: 36 }, (_, i) => ({ trade_id: `sell-${i}` })),
+                },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            await staleRequest;
+
+            return {
+                finalOfferCount: (bot_state.offers?.buy?.length || 0)
+                    + (bot_state.offers?.sell?.length || 0),
+                appliedOfferCounts,
+            };
+        }"""
+    )
+
+    assert result == {"finalOfferCount": 0, "appliedOfferCounts": [0]}
+
+
 def test_cancel_all_timeout_is_visible_and_releases_latch(page):
     """A stalled journal poll must end in an explicit, safe timeout state."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

@@ -24180,14 +24180,24 @@
             }
         }
 
+        let _statusRequestGeneration = 0;
+
         async function fetchStatus() {
             if (isWalletSwitchBusy()) return null;
+            const requestGeneration = ++_statusRequestGeneration;
             try {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 25000);
                 const response = await apiFetch(`${API_URL}/status`, { signal: controller.signal });
                 clearTimeout(timeoutId);
                 const data = await response.json();
+                // Status refreshes may overlap during long-running operations such
+                // as Cancel All.  Never let a slower, older response restore the
+                // offer counts and locked balances that a newer response cleared.
+                if (requestGeneration !== _statusRequestGeneration) {
+                    debugLog('[STATUS] Ignoring out-of-order status response');
+                    return null;
+                }
                 if (_catSwitchTargetAssetId) {
                     const returnedAssetId = data?.current_cat?.asset_id || '';
                     if (!returnedAssetId || returnedAssetId !== _catSwitchTargetAssetId) {

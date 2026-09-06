@@ -747,6 +747,42 @@ class TestCancelAllPost(_FlaskBase):
             },
         )
 
+    def test_stopped_cancel_all_refreshes_wallet_snapshot_after_completion(self):
+        """A proven Cancel All must replace the stopped UI's stale offer cache."""
+
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    trade_id: {
+                        "sage_trade_id": trade_id,
+                        "outcome": "CANCELLED_PROVEN",
+                    }
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_called_once_with(
+            "manual_cancel_all_confirmed"
+        )
+        stopped.offer_manager.sync_from_wallet.assert_called_once_with()
+
     def test_cancel_all_completed_at_deadline_is_not_reported_as_zero_pending_error(
         self,
     ):

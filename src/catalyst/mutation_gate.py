@@ -135,6 +135,12 @@ _TERMINAL_PROCESS_FENCES = frozenset(
     }
 )
 
+# SQLite's configured busy timeout can consume roughly five seconds per lease
+# write.  Four bounded attempts fit inside the remaining lease window when the
+# normal heartbeat starts one third into a 30-second lease, while letting a
+# short burst of bot shutdown writes drain without permanently fencing the run.
+_HEARTBEAT_MAX_ATTEMPTS = 4
+
 
 class MutationBlocked(RuntimeError):
     """Raised immediately before a mutation that is not durably authorized."""
@@ -2126,7 +2132,7 @@ class MutationGate:
                 self._set_local_block("HEARTBEAT_FAILED")
                 return {"heartbeat": False, "reason": "not_owned"}
             result = {"heartbeat": False, "reason": "durable_state_unavailable"}
-            for attempt in range(2):
+            for attempt in range(_HEARTBEAT_MAX_ATTEMPTS):
                 now = self._now()
                 try:
                     result = database.heartbeat_runtime_mutation_lease(
@@ -2137,7 +2143,7 @@ class MutationGate:
                     )
                     result = _lease_public_result(result)
                 except Exception:
-                    if attempt == 0:
+                    if attempt + 1 < _HEARTBEAT_MAX_ATTEMPTS:
                         continue
                     result = {
                         "heartbeat": False,
