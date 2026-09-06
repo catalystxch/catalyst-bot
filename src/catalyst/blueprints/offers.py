@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
@@ -80,6 +81,38 @@ def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
         ):
             retries[trade_id] = attempt
     return retries
+
+
+def _authoritatively_terminal_offer_ids(trade_ids) -> set[str]:
+    """Return targets whose exact Task 9 terminal record is durable."""
+
+    exact_trade_ids = [
+        trade_id for trade_id in trade_ids if type(trade_id) is str and trade_id
+    ]
+    try:
+        records = database.get_authoritative_terminal_records(exact_trade_ids)
+    except Exception:
+        # Compatibility/recovery fallback for a database that has not yet
+        # loaded the batch helper. Normal packaged runtimes use one query.
+        records = {}
+        for trade_id in exact_trade_ids:
+            try:
+                record = database.get_authoritative_terminal_record(trade_id)
+            except Exception:
+                continue
+            if record is not None:
+                records[trade_id] = record
+    terminal = set()
+    for trade_id in exact_trade_ids:
+        record = records.get(trade_id)
+        if (
+            type(record) is dict
+            and record.get("sage_trade_id") == trade_id
+            and record.get("outcome")
+            in {"CANCELLED_PROVEN", "FILLED_PROVEN", "EXPIRED_PROVEN"}
+        ):
+            terminal.add(trade_id)
+    return terminal
 
 
 def _norm_offer_state(value) -> str:
@@ -490,6 +523,7 @@ def api_cancel_all():
                 complete=False,
                 error=None,
                 phase="running",
+                _target_trade_ids=tuple(open_ids),
                 total=len(open_ids),
                 batch_size=len(open_ids),
                 total_batches=1,
@@ -513,9 +547,18 @@ def api_cancel_all():
             )
 
             def _cancel_all_worker():
-                _w_pending = 0
-                _w_failed = 0
                 try:
+                    # A stopped bot has no cycle to refresh its in-memory fee
+                    # pool.  Refresh from Sage immediately before planning so
+                    # Cancel All can use one native bulk transaction with one
+                    # explicitly reserved fee coin instead of silently falling
+                    # back to serial cancellation.
+                    coin_manager = getattr(bot, "coin_manager", None)
+                    refresh_fee_pool = getattr(
+                        coin_manager, "refresh_fee_pool_from_wallet", None
+                    )
+                    if callable(refresh_fee_pool):
+                        refresh_fee_pool()
                     _cancel_kwargs = {
                         "reason": "manual_cancel_all",
                         "force_storm": True,
@@ -524,20 +567,46 @@ def api_cancel_all():
                         _cancel_kwargs["_retry_failed_attempts"] = (
                             _retry_failed_attempts
                         )
-                    _results = durable_manager.cancel_offers(
-                        _cancel_open_ids, **_cancel_kwargs
+                    durable_manager.cancel_offers(_cancel_open_ids, **_cancel_kwargs)
+                    _deadline_seconds = _cancel_all_deadline_seconds(
+                        len(_cancel_open_ids),
+                        cfg.CANCEL_MAX_WAIT_SECS,
                     )
-                    for _tid in _cancel_open_ids:
-                        _res = _results.get(_tid) if type(_results) is dict else None
-                        if (
-                            type(_res) is dict
-                            and _res.get("outcome") == "CANCEL_FAILED"
-                        ):
-                            _w_failed += 1
-                        else:
-                            # Submitted, unknown, malformed, and any claimed
-                            # confirmation all remain nonterminal here.
-                            _w_pending += 1
+                    _deadline = time.monotonic() + _deadline_seconds
+                    _terminal_ids = _authoritatively_terminal_offer_ids(
+                        _cancel_open_ids
+                    )
+                    while len(_terminal_ids) < len(_cancel_open_ids):
+                        durable_manager.retry_failed_cancels()
+                        _terminal_ids = _authoritatively_terminal_offer_ids(
+                            _cancel_open_ids
+                        )
+                        _remaining_count = len(_cancel_open_ids) - len(_terminal_ids)
+                        _set_cancel_all_state(
+                            running=True,
+                            complete=False,
+                            error=None,
+                            phase="reconciling",
+                            total=len(_cancel_open_ids),
+                            cancelled=len(_terminal_ids),
+                            confirmed=len(_terminal_ids),
+                            pending=_remaining_count,
+                            failed=0,
+                            message=(
+                                "Waiting for authoritative cancellation proof: "
+                                f"{len(_terminal_ids)}/{len(_cancel_open_ids)} "
+                                "offers terminal."
+                            ),
+                        )
+                        _remaining_seconds = _deadline - time.monotonic()
+                        if not _remaining_count:
+                            break
+                        if _remaining_seconds <= 0:
+                            raise TimeoutError(
+                                "Cancel all is still awaiting authoritative Sage "
+                                f"proof for {_remaining_count} offer(s)."
+                            )
+                        time.sleep(min(1.0, _remaining_seconds))
                     _set_cancel_all_state(
                         running=False,
                         complete=True,
@@ -547,32 +616,30 @@ def api_cancel_all():
                         batch_size=len(_cancel_open_ids),
                         total_batches=1,
                         current_batch=1,
-                        batch_cancelled=0,
-                        batch_failed=_w_failed,
-                        cancelled=0,
-                        pending=_w_pending,
-                        failed=_w_failed,
+                        batch_cancelled=len(_terminal_ids),
+                        batch_failed=0,
+                        cancelled=len(_terminal_ids),
+                        confirmed=len(_terminal_ids),
+                        pending=0,
+                        failed=0,
                         finished_at=datetime.now(timezone.utc).isoformat(),
                         message=(
-                            "Cancellation requests journaled: "
-                            f"{_w_pending} pending reconciliation, "
-                            f"{_w_failed} rejected without effect."
+                            "Cancel all complete: "
+                            f"{len(_terminal_ids)} offer(s) authoritatively terminal."
                         ),
                     )
                     api_server.events.emit(
-                        "offer_cancels_journaled",
+                        "offers_cancelled",
                         {
-                            "count": len(_cancel_open_ids),
-                            "pending": _w_pending,
-                            "failed": _w_failed,
+                            "count": len(_terminal_ids),
                             "reason": "manual_cancel_all",
                         },
                     )
                     log_event(
                         "info",
-                        "cancel_all_journaled",
-                        f"Cancel all journaled: {_w_pending} pending, "
-                        f"{_w_failed} failed",
+                        "cancel_all_confirmed",
+                        f"Cancel all confirmed {len(_terminal_ids)} "
+                        "authoritatively terminal offer(s)",
                     )
                 except Exception as _e:
                     _set_cancel_all_state(
@@ -622,6 +689,10 @@ def api_cancel_all():
                     "success": True,
                     "async": True,
                     "total": len(open_ids),
+                    "timeout_seconds": _cancel_all_deadline_seconds(
+                        len(open_ids),
+                        cfg.CANCEL_MAX_WAIT_SECS,
+                    ),
                     "message": f"Cancelling {len(open_ids)} offers in background...",
                 }
             )
@@ -1215,6 +1286,65 @@ def api_market_fill_intel():
         return api_server._api_exception(request.path)
 
 
+def _offer_diagnostic_assessment(
+    *,
+    wallet_error,
+    duplicate_coin_ids,
+    reserve_backed,
+    stale_in_db,
+    wallet_only,
+    wallet_cancel_pending,
+    wallet_cancelled_still_visible,
+):
+    """Classify local offer health without claiming unobserved Dexie state."""
+    local_book_consistent = (
+        wallet_error is None
+        and len(duplicate_coin_ids) == 0
+        and len(reserve_backed) == 0
+        and len(stale_in_db) == 0
+        and len(wallet_only) == 0
+        and len(wallet_cancel_pending) == 0
+        and len(wallet_cancelled_still_visible) == 0
+    )
+    cancel_settle_in_progress = (
+        wallet_error is None
+        and len(duplicate_coin_ids) == 0
+        and len(reserve_backed) == 0
+        and len(stale_in_db) == 0
+        and len(wallet_only) == 0
+        and (
+            len(wallet_cancel_pending) > 0
+            or len(wallet_cancelled_still_visible) > 0
+        )
+    )
+
+    if local_book_consistent:
+        diagnosis = (
+            "Wallet and DB agree on the open book, and each live offer has a "
+            "unique non-reserve coin. This endpoint did not evaluate any Dexie "
+            "row, so it cannot determine whether a greyed Dexie row is stale."
+        )
+    elif cancel_settle_in_progress:
+        diagnosis = (
+            "Wallet and DB are in a cancel-settle window. Sage still shows "
+            "offers that CATalyst has already cancelled or is cancelling; new "
+            "offer creation should remain blocked until those rows disappear."
+        )
+    else:
+        diagnosis = (
+            "Wallet/DB mismatch or coin-safety issue detected. Inspect the "
+            "differences below before assessing external Dexie rows."
+        )
+
+    return {
+        "local_book_consistent": local_book_consistent,
+        "cancel_settle_in_progress": cancel_settle_in_progress,
+        "dexie_rows_evaluated": False,
+        "likely_stale_dexie_rows": None,
+        "diagnosis": diagnosis,
+    }
+
+
 @bp.route("/api/offers/diagnostic")
 def api_offers_diagnostic():
     """Compare the live wallet book to the DB book and summarize coin safety."""
@@ -1336,51 +1466,31 @@ def api_offers_diagnostic():
             row for row in known_db_rows if row.get("trade_id") in pending_cancel_ids
         ]
 
-        likely_stale_dexie_rows = (
-            wallet_error is None
-            and len(duplicate_coin_ids) == 0
-            and len(reserve_backed) == 0
-            and len(stale_in_db) == 0
-            and len(wallet_only) == 0
-            and len(wallet_cancel_pending) == 0
-            and len(wallet_cancelled_still_visible) == 0
+        assessment = _offer_diagnostic_assessment(
+            wallet_error=wallet_error,
+            duplicate_coin_ids=duplicate_coin_ids,
+            reserve_backed=reserve_backed,
+            stale_in_db=stale_in_db,
+            wallet_only=wallet_only,
+            wallet_cancel_pending=wallet_cancel_pending,
+            wallet_cancelled_still_visible=wallet_cancelled_still_visible,
         )
-        cancel_settle_in_progress = (
-            wallet_error is None
-            and len(duplicate_coin_ids) == 0
-            and len(reserve_backed) == 0
-            and len(stale_in_db) == 0
-            and len(wallet_only) == 0
-            and (
-                len(wallet_cancel_pending) > 0
-                or len(wallet_cancelled_still_visible) > 0
-            )
-        )
-
-        if likely_stale_dexie_rows:
-            diagnosis = (
-                "Wallet and DB agree on the open book, and each live offer has a "
-                "unique non-reserve coin. Greyed Dexie rows are likely stale invalid "
-                "offers from earlier runs or Dexie cache lag."
-            )
-        elif cancel_settle_in_progress:
-            diagnosis = (
-                "Wallet and DB are in a cancel-settle window. Sage still shows "
-                "offers that CATalyst has already cancelled or is cancelling; new "
-                "offer creation should remain blocked until those rows disappear."
-            )
-        else:
-            diagnosis = (
-                "Wallet/DB mismatch or coin-safety issue detected. Inspect the "
-                "differences below before assuming Dexie is just stale."
-            )
 
         return jsonify(
             api_server._serialize_dict(
                 {
                     "success": True,
-                    "diagnosis": diagnosis,
-                    "likely_stale_dexie_rows": likely_stale_dexie_rows,
+                    "diagnosis": assessment["diagnosis"],
+                    "local_book_consistent": assessment[
+                        "local_book_consistent"
+                    ],
+                    "cancel_settle_in_progress": assessment[
+                        "cancel_settle_in_progress"
+                    ],
+                    "dexie_rows_evaluated": assessment["dexie_rows_evaluated"],
+                    "likely_stale_dexie_rows": assessment[
+                        "likely_stale_dexie_rows"
+                    ],
                     "wallet_error": wallet_error,
                     "wallet_open_buys": len(wallet_open_buys),
                     "wallet_open_sells": len(wallet_open_sells),
@@ -1929,6 +2039,21 @@ def api_pnl():
         return server._api_exception(request.path)
 
 
+def _cancel_all_deadline_seconds(offer_count, per_offer_wait_seconds):
+    """Bound one native bulk cancel plus authoritative reconciliation."""
+    # Sage's native ``cancel_offers`` call puts every member in one transaction,
+    # but CATalyst still commits one durable terminal proof per member. Allow a
+    # small bounded record budget without reverting to the old assumption that
+    # every offer needs its own on-chain confirmation window.
+    count = max(0, int(offer_count))
+    confirmation_wait = max(1.0, float(per_offer_wait_seconds))
+    record_budget = max(0, count - 1) * 10.0
+    return max(
+        180.0,
+        min(3_600.0, confirmation_wait * 2.0 + record_budget),
+    )
+
+
 def _new_cancel_all_state():
     return {
         "running": False,
@@ -1973,4 +2098,25 @@ def _reset_cancel_all_state(**updates):
 
 def _get_cancel_all_state():
     with api_server._cancel_all_state_lock:
-        return dict(api_server._cancel_all_state)
+        state = dict(api_server._cancel_all_state)
+    targets = state.pop("_target_trade_ids", ())
+    if state.get("running") and targets:
+        # Serial wallet retries can take many minutes before returning to the
+        # worker's progress update. Poll only exact durable terminal proof so
+        # the GUI advances during that call; never submit/reconcile here or
+        # declare completion before the worker has actually finished.
+        confirmed = len(_authoritatively_terminal_offer_ids(targets))
+        state.update(
+            phase="reconciling",
+            total=len(targets),
+            cancelled=confirmed,
+            confirmed=confirmed,
+            pending=len(targets) - confirmed,
+            batch_cancelled=confirmed,
+            progress_observed_at=datetime.now(timezone.utc).isoformat(),
+            message=(
+                "Waiting for authoritative cancellation proof: "
+                f"{confirmed}/{len(targets)} offers terminal."
+            ),
+        )
+    return state

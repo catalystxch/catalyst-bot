@@ -174,6 +174,31 @@ def api_fingerprint():
         import chia_node
 
         if not chia_node.is_startup_authorised():
+            # A recovered/resumed API process can lose the UI-local startup
+            # flag while the bot still owns a fully verified wallet identity.
+            # Report that frozen authority without touching Sage RPC.  This
+            # keeps a fresh desktop window in sync with its running bot while
+            # retaining the pre-disclaimer RPC boundary for an idle process.
+            bot = api_server.bot
+            if bot and bot.is_running():
+                try:
+                    import mutation_gate
+
+                    runtime = mutation_gate.current_runtime()
+                    binding = runtime.require_wallet_identity_authority(
+                        "fingerprint:read"
+                    )
+                    fp = _safe_digit_text(binding.fingerprint)
+                    if fp:
+                        return jsonify(
+                            {
+                                "success": True,
+                                "fingerprint": fp,
+                                "source": "runtime_identity",
+                            }
+                        )
+                except Exception:
+                    pass
             return jsonify({"fingerprint": "", "source": "not_started"})
 
         fp = None

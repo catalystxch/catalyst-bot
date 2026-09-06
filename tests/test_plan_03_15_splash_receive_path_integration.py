@@ -15,6 +15,7 @@ The Flask test client drives /api/splash/incoming; database is real SQLite.
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -150,6 +151,104 @@ class TestSplashReceiveDB(_TempDB):
         self._post_offer()
         rows = _db.get_splash_incoming_offers()
         self.assertEqual(rows[0].get("source_ip"), "127.0.0.1")
+
+    def test_pending_batch_can_select_oldest_offers_first(self):
+        """A sustained inbound stream must not starve the oldest new offers."""
+
+        for suffix in ("a", "b", "c"):
+            self._post_offer(offer="offer1" + suffix * 100)
+        conn = _db.get_connection()
+        rows = conn.execute(
+            "SELECT id FROM splash_incoming_offers ORDER BY id"
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+
+        pending = _db.get_splash_incoming_offers(
+            status="new",
+            limit=2,
+            oldest_first=True,
+        )
+
+        self.assertEqual([row["id"] for row in pending], ids[:2])
+
+    def test_database_lock_is_not_reported_as_a_duplicate(self):
+        """Persistence failure must be distinguishable from duplicate input."""
+
+        connection = MagicMock()
+        connection.execute.side_effect = sqlite3.OperationalError(
+            "database is locked"
+        )
+        with patch("database.get_connection", return_value=connection):
+            result = _db.record_splash_incoming(
+                _VALID_OFFER,
+                "locked-fingerprint",
+                source_ip="127.0.0.1",
+            )
+
+        self.assertIsNone(result)
+
+    def test_transient_database_lock_is_retried_before_webhook_failure(self):
+        """A brief competing write must not drop an inbound Splash offer."""
+
+        connection = MagicMock()
+        attempts = {"select": 0}
+
+        def execute(sql, _params=()):
+            if "SELECT id FROM splash_incoming_offers" in sql:
+                attempts["select"] += 1
+                if attempts["select"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return MagicMock(fetchone=MagicMock(return_value=None))
+            return MagicMock()
+
+        connection.execute.side_effect = execute
+        with patch("database.get_connection", return_value=connection):
+            result = _db.record_splash_incoming(
+                _VALID_OFFER,
+                "transient-lock-fingerprint",
+                source_ip="127.0.0.1",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(attempts["select"], 2)
+        connection.rollback.assert_called_once()
+        connection.commit.assert_called_once()
+
+    def test_transient_database_lock_is_retried_before_status_update_is_lost(self):
+        """A brief competing write must not leave a classified offer as new."""
+
+        connection = MagicMock()
+        attempts = {"update": 0}
+
+        def execute(sql, _params=()):
+            if "UPDATE splash_incoming_offers" in sql:
+                attempts["update"] += 1
+                if attempts["update"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return MagicMock()
+
+        connection.execute.side_effect = execute
+        with patch("database.get_connection", return_value=connection):
+            result = _db.update_splash_incoming_status(
+                454158,
+                "processed",
+                pair_hint="MZ_XCH",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(attempts["update"], 2)
+        connection.rollback.assert_called_once()
+        connection.commit.assert_called_once()
+
+    def test_database_lock_returns_retryable_webhook_failure(self):
+        """Splash must receive non-2xx when its offer was not persisted."""
+
+        with patch("database.record_splash_incoming", return_value=None):
+            resp = self._post_offer()
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertFalse(resp.get_json().get("ok"))
+        self.assertEqual(resp.get_json().get("error"), "persistence_unavailable")
 
 
 # ---------------------------------------------------------------------------

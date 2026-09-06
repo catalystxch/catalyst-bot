@@ -493,6 +493,45 @@ class ProbeAnchorTests(unittest.TestCase):
                 loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
             )
 
+        bulk_operation_ids = [
+            "cancel:" + ("a" * 64),
+            "cancel:" + ("b" * 64),
+        ]
+        loop.offer_manager.get_active_cancel_settlement_operation = (
+            lambda: bulk_operation_ids[0]
+        )
+        loop.offer_manager._sage_bulk_cancel_manifest_for_blockers = (
+            lambda blockers: (
+                {"cohort_id": "cancel-cohort:test"}
+                if [row["operation_id"] for row in blockers] == bulk_operation_ids
+                else None
+            )
+        )
+        with (
+            patch.object(
+                runtime_database,
+                "get_runtime_safety_latch",
+                return_value={
+                    "state": "tripped",
+                    "generation": 7,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                },
+                create=True,
+            ),
+            patch.object(
+                runtime_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[
+                    {"operation_id": operation_id}
+                    for operation_id in bulk_operation_ids
+                ],
+                create=True,
+            ),
+        ):
+            self.assertTrue(
+                loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
+            )
+
     def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
         self,
     ):
@@ -1252,6 +1291,34 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(
             loop._last_quoted_price["sell"],
             Decimal("1.18") / Decimal("1.03"),
+        )
+
+    def test_create_offers_if_needed_returns_created_ids_for_same_cycle_counts(self):
+        loop = bot_loop.BotLoop()
+
+        def _fake_create_ladder(mid_price, side, **kwargs):
+            del mid_price, kwargs
+            return [
+                {
+                    "offer_bech32": f"offer1-{side}",
+                    "trade_id": f"trade-{side}-1",
+                },
+                {
+                    "offer_bech32": f"offer2-{side}",
+                    "trade_id": f"trade-{side}-2",
+                },
+            ]
+
+        loop.offer_manager.create_ladder = _fake_create_ladder
+
+        created_ids = loop._create_offers_if_needed(Decimal("1.10"), 0, 0)
+
+        self.assertEqual(
+            created_ids,
+            {
+                "buy": {"trade-buy-1", "trade-buy-2"},
+                "sell": {"trade-sell-1", "trade-sell-2"},
+            },
         )
 
     def test_create_offers_if_needed_counts_live_confirmed_probes_in_hard_cap(self):

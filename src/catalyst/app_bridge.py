@@ -23,6 +23,7 @@ a synthetic loopback remote address.
 import inspect
 import json
 import traceback
+from contextvars import ContextVar
 from decimal import Decimal
 from functools import wraps
 from types import FunctionType, MappingProxyType
@@ -31,6 +32,7 @@ from types import FunctionType, MappingProxyType
 _LOOPBACK_ENVIRON = {"REMOTE_ADDR": "127.0.0.1"}
 _mutation_guarded_functions: set[object] = set()
 _MISSING_STATIC_ATTRIBUTE = object()
+_bridge_mutation_permit = ContextVar("bridge_mutation_permit", default=None)
 
 
 def _bridge_runtime_api(instance):
@@ -146,9 +148,11 @@ def _mutation_guard(operation: str):
                     "reason": exc.reason_code,
                     "operation": operation,
                 }
+            context_token = _bridge_mutation_permit.set(permit)
             try:
                 return func(self, *args, **kwargs)
             finally:
+                _bridge_mutation_permit.reset(context_token)
                 api.mutation_gate.exit_mutation(permit)
 
         wrapper._mutation_operation = operation
@@ -790,15 +794,24 @@ class AppBridge:
     @_mutation_guard("app_bridge:trigger_coin_prep")
     def trigger_coin_prep(self, _body=None):
         """Trigger coin prep. Maps to POST /api/coin-prep/trigger."""
+        from flask import g
         import api_server
 
         with api_server.app.test_request_context(
             "/api/coin-prep/trigger",
             method="POST",
             content_type="application/json",
-            data="{}",
+            data=json.dumps(_body or {}),
         ):
-            resp = api_server.api_coin_prep_trigger()
+            # Native calls skip before_request. Reuse this call's guarded
+            # permit for the same exclusive-prep check as the HTTP route;
+            # never acquire a second permit that would wait on our own first.
+            g._mutation_permit = _bridge_mutation_permit.get()
+            try:
+                resp = api_server.api_coin_prep_trigger()
+            finally:
+                # The bridge guard owns release, not Flask teardown_request.
+                g.pop("_mutation_permit", None)
         return _unwrap_flask_response(resp)
 
     @_safe

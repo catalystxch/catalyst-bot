@@ -1,4 +1,3 @@
-import itertools
 import sys
 import types
 import unittest
@@ -60,84 +59,80 @@ from cancel_outcomes import (
 
 class WalletSageCancelBatchTests(unittest.TestCase):
     def test_cancel_batch_never_confirms_by_unlock_or_absence(self):
-        ticks = itertools.count(start=0, step=1)
-
         with (
-            patch.object(wallet_sage, "cancel_offer", return_value={"success": True}),
-            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
-            patch.object(wallet_sage, "get_pending_transactions", return_value=[]),
-            patch.object(wallet_sage, "get_all_offers", return_value=[]),
-            patch.object(wallet_sage, "get_owned_coins_detailed", return_value={}),
-            patch("builtins.print"),
-            patch.object(wallet_sage.time, "sleep", return_value=None),
-            patch.object(wallet_sage.time, "time", side_effect=lambda: next(ticks)),
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage, "_sage_post", return_value={"success": True}
+            ),
+            patch.object(wallet_sage, "get_pending_transactions") as pending,
+            patch.object(wallet_sage, "get_all_offers") as offers,
+            patch.object(wallet_sage, "get_owned_coins_detailed") as owned,
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
         self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
         self.assertFalse(results["0xabc123"]["success"])
+        pending.assert_not_called()
+        offers.assert_not_called()
+        owned.assert_not_called()
         validate_cancel_result(results["0xabc123"])
 
     def test_cancel_batch_does_not_confirm_when_offer_disappears_but_tx_pending(self):
-        ticks = itertools.count(start=0, step=31)
-
         with (
-            patch.object(wallet_sage, "cancel_offer", return_value={"success": True}),
-            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage, "_sage_post", return_value={"success": True}
+            ),
             patch.object(
                 wallet_sage,
                 "get_pending_transactions",
                 return_value=[{"transaction_id": "pending"}],
-            ),
-            patch.object(wallet_sage, "get_all_offers", return_value=[]),
-            patch.object(wallet_sage, "get_owned_coins_detailed", return_value={}),
-            patch("builtins.print"),
-            patch.object(wallet_sage.time, "sleep", return_value=None),
-            patch.object(wallet_sage.time, "time", side_effect=lambda: next(ticks)),
+            ) as pending,
+            patch.object(wallet_sage, "get_all_offers", return_value=[]) as offers,
+            patch.object(
+                wallet_sage, "get_owned_coins_detailed", return_value={}
+            ) as owned,
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
         self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
+        pending.assert_not_called()
+        offers.assert_not_called()
+        owned.assert_not_called()
         validate_cancel_result(results["0xabc123"])
 
     def test_cancel_batch_does_not_confirm_when_offer_lock_still_visible(self):
-        ticks = itertools.count(start=0, step=31)
-
         with (
-            patch.object(wallet_sage, "cancel_offer", return_value={"success": True}),
-            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
-            patch.object(wallet_sage, "get_pending_transactions", return_value=[]),
-            patch.object(wallet_sage, "get_all_offers", return_value=[]),
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage, "_sage_post", return_value={"success": True}
+            ),
+            patch.object(wallet_sage, "get_pending_transactions") as pending,
+            patch.object(wallet_sage, "get_all_offers", return_value=[]) as offers,
             patch.object(
                 wallet_sage,
                 "get_owned_coins_detailed",
                 return_value={"0xcoin": {"offer_id": "0xabc123"}},
-            ),
-            patch("builtins.print"),
-            patch.object(wallet_sage.time, "sleep", return_value=None),
-            patch.object(wallet_sage.time, "time", side_effect=lambda: next(ticks)),
+            ) as owned,
         ):
             results = wallet_sage.cancel_offers_batch(["0xabc123"], secure=False)
 
         self.assertEqual(results["0xabc123"]["outcome"], CANCEL_UNKNOWN)
+        pending.assert_not_called()
+        offers.assert_not_called()
+        owned.assert_not_called()
         validate_cancel_result(results["0xabc123"])
 
-    def test_sequential_cancel_retries_without_fee_when_fee_coin_unavailable(self):
-        no_fee_coin = {
-            "success": False,
-            "error": "Sage HTTP 500: Wallet error: Coin selection error: no spendable coins",
-        }
-        accepted_without_fee = {"success": True}
-
+    def test_bulk_cancel_preserves_no_spendable_failure_without_fee_fallback(self):
         with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
             patch.object(
                 wallet_sage,
-                "cancel_offer",
-                side_effect=[no_fee_coin, accepted_without_fee],
-            ) as cancel,
-            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
-            patch("builtins.print"),
-            patch.object(wallet_sage.time, "sleep", return_value=None),
+                "_sage_post",
+                side_effect=wallet_sage.SageOperationalError(
+                    error_code="NO_SPENDABLE_COINS"
+                ),
+            ) as sage_post,
         ):
             results = wallet_sage.cancel_offers_batch(
                 ["0xabc123"],
@@ -147,8 +142,16 @@ class WalletSageCancelBatchTests(unittest.TestCase):
             )
 
         self.assertEqual(results["0xabc123"]["outcome"], CANCEL_FAILED)
-        self.assertEqual(cancel.call_args_list[0].kwargs["fee_mojos"], 100)
-        self.assertEqual(cancel.call_count, 1)
+        sage_post.assert_called_once_with(
+            "cancel_offers",
+            {
+                "offer_ids": ["0xabc123"],
+                "fee": "100",
+                "auto_submit": False,
+            },
+            timeout=60,
+            retry_transport_error=False,
+        )
 
     def test_cancel_offer_treats_mempool_conflict_as_pending_cancel(self):
         with (
@@ -200,34 +203,31 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         self.assertFalse(result["success"])
         validate_cancel_result(result)
 
-    def test_sequential_cancel_retries_stable_no_spendable_code_without_fee(self):
-        stable_no_fee_coin = {
-            "success": False,
-            "error": "NO_SPENDABLE_COINS",
-            "error_code": "NO_SPENDABLE_COINS",
-            "message": "Sage reports that no spendable coins are available.",
-        }
-
+    def test_bulk_cancel_replicates_stable_no_spendable_code_to_every_member(self):
+        trade_ids = ["0xabc123", "0xdef456"]
         with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
             patch.object(
                 wallet_sage,
-                "cancel_offer",
-                side_effect=[stable_no_fee_coin, {"success": True}],
-            ) as cancel,
-            patch.object(wallet_sage, "get_spendable_coin_count", return_value=100),
-            patch("builtins.print"),
-            patch.object(wallet_sage.time, "sleep", return_value=None),
+                "_sage_post",
+                side_effect=wallet_sage.SageOperationalError(
+                    error_code="NO_SPENDABLE_COINS"
+                ),
+            ) as sage_post,
         ):
             results = wallet_sage.cancel_offers_batch(
-                ["0xabc123"],
+                trade_ids,
                 secure=True,
                 fee_mojos=100,
                 skip_confirmation=True,
             )
 
-        self.assertEqual(results["0xabc123"]["outcome"], CANCEL_FAILED)
-        self.assertEqual(cancel.call_count, 1)
-        self.assertEqual(cancel.call_args_list[0].kwargs["fee_mojos"], 100)
+        sage_post.assert_called_once()
+        self.assertEqual(set(results), set(trade_ids))
+        for result in results.values():
+            self.assertEqual(result["outcome"], CANCEL_FAILED)
+            self.assertEqual(result["error"], "REJECTED")
+            validate_cancel_result(result)
 
     def test_cancel_offer_success_without_identity_is_unknown(self):
         with (

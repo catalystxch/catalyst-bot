@@ -11917,8 +11917,8 @@
                     <div>
                         <div class="v4-modal-kicker">Offer Control</div>
                         <h3 class="v4-modal-title" id="cancelProgressTitle">Cancelling offers<span id="cancelProgressDots"></span></h3>
-                        <p class="v4-modal-copy" id="cancelProgressMessage">Submitting all cancels in a single bulk transaction, then waiting for on-chain confirmation.</p>
-                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Usually confirms within a block or two (well under a minute).</p>
+                        <p class="v4-modal-copy" id="cancelProgressMessage">CATalyst asks Sage to cancel the full offer set in a single bulk transaction and waits for authoritative on-chain confirmation before treating any offer as terminal.</p>
+                        <p class="v4-modal-copy" id="cancelProgressTimeNote" style="margin-top: 4px; font-size: 11px; color: var(--text-muted); opacity: 0.8;">Large offer books can take several blocks. You can hide this window while cancellation continues safely in the background.</p>
                     </div>
                 </div>
                 <div class="v4-modal-panel" style="margin-bottom: 12px;">
@@ -13452,7 +13452,7 @@
                         }
                         if (!blankFreshTemplates) {
                             const rb = parseFloat(g('REQUOTE_BPS') || 0); if (rb > 0) document.getElementById('configRequoteBps').value = (rb / 100).toFixed(1);
-                            const rc = g('REQUOTE_COOLDOWN'); if (rc) document.getElementById('configRequoteCooldown').value = rc;
+                            const rc = g('REQUOTE_COOLDOWN_SECS'); if (rc) document.getElementById('configRequoteCooldown').value = rc;
                             const rbs = parseInt(g('REQUOTE_BATCH_SIZE') || 0); if (rbs > 0) document.getElementById('configRequoteBatchSize').value = rbs;
 
                             // MAX_MID_MOVE_BPS removed 2026-04-08 — was never consumed by trading code.
@@ -15319,6 +15319,19 @@
             STARTUP_AUTHORITY_CHANGED: 'Startup authority changed',
             UNRESOLVED_OPERATIONS: 'Unresolved operations require review',
             RECONCILIATION_REQUIRED: 'Authoritative reconciliation is required',
+            CANCEL_UNKNOWN: 'Cancellation outcome requires reconciliation',
+            CREATE_UNKNOWN: 'Creation outcome requires reconciliation',
+            HEARTBEAT_FAILED: 'Lease heartbeat failed; review diagnostics before restarting CATalyst',
+            RUNTIME_DISCONTINUITY: 'Runtime clock changed; review diagnostics before restarting CATalyst',
+            MUTATION_EXCLUSION_TIMEOUT: 'Concurrent wallet operations did not finish in time',
+            MUTATION_RUNTIME_NOT_INITIALIZED: 'Mutation runtime is not initialized',
+            MUTATION_SHUTTING_DOWN: 'CATalyst is shutting down',
+            OPERATION_UNKNOWN: 'Wallet operation outcome requires reconciliation',
+            WORKER_DELEGATION_INVALID: 'Worker mutation authority is invalid',
+            WALLET_MUTATION_FAILED: 'Wallet operation failed after authorization; review diagnostics',
+            COIN_PREP_EFFECT_UNKNOWN: 'Coin Prep transaction outcome needs verification',
+            COIN_PREP_RECOVERY_REQUIRED: 'Coin Prep recovery is required',
+            MUTATION_GATE_SAFETY_STOP: 'This process is safety-stopped; review diagnostics before restarting CATalyst',
             CONTRADICTORY_HISTORY: 'Authoritative history is contradictory',
             RESERVATION_RECONCILIATION_REQUIRED: 'Coin reservations require reconciliation',
             PUBLICATION_CLAIM_RECOVERY_REQUIRED: 'Publication claims require recovery',
@@ -18670,6 +18683,46 @@
             updateStartupChecklist(bot_state);
         }
 
+        async function restoreCoinPrepReadiness() {
+            // A browser/window reload resets this client-only flag to "none".
+            // Rehydrate it from the wallet-verified backend result so a
+            // successful Coin Prep does not strand Start Bot after restart.
+            if (coinPrepStatus !== 'none' || !settingsReviewed) return false;
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/status`, {
+                    cache: 'no-store'
+                });
+                if (!response.ok) return false;
+                const status = await response.json();
+                if (status.complete !== true
+                    || status.needs_coin_prep === true
+                    || status.needs_prep === true
+                    || status.phase === 'error') {
+                    return false;
+                }
+
+                const lastAssetId = String(
+                    status.last_prep_settings?.cat_asset_id || ''
+                ).trim().toLowerCase();
+                const activeAssetId = String(
+                    currentCAT?.asset_id
+                    || bot_state?.current_cat?.asset_id
+                    || getStoredSettingsReviewedAssetId()
+                    || ''
+                ).trim().toLowerCase();
+                if (lastAssetId && (!activeAssetId || lastAssetId !== activeAssetId)) {
+                    return false;
+                }
+
+                setCoinPrepStatus('done');
+                debugLog('[CoinPrep] Restored wallet-verified prep readiness after reload');
+                return true;
+            } catch (error) {
+                debugWarn('[CoinPrep] Could not restore prep readiness:', error);
+                return false;
+            }
+        }
+
         function hasSelectedTradingPair(state = bot_state) {
             return !!(
                 (currentCAT && currentCAT.asset_id) ||
@@ -18842,11 +18895,43 @@
             }
         }
 
+        let _startSafetyExpiryTimer = null;
+
+        function startSafetyMessage(reason) {
+            const known = typeof reason === 'string' && reason !== ''
+                && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_REASONS, reason);
+            return known
+                ? `Start blocked by safety: ${SAFETY_DIAGNOSTICS_REASONS[reason]} (${reason}).`
+                : 'Start blocked: waiting for a fresh runtime safety check. Review Safety Diagnostics if this persists.';
+        }
+
+        function getStartSafetyState(data = bot_state) {
+            const safety = data?.runtime_safety;
+            const freshness = safety?.recovery?.freshness;
+            const observedAt = Date.parse(freshness?.observed_at_utc);
+            const elapsed = Date.now() - observedAt;
+            const allowed = safety?.allowed === true && safety.reason_code === ''
+                && safety.lease?.active === true && safety.lease?.owned_by_this_run === true
+                && freshness?.valid === true && freshness.age_seconds === 0
+                && freshness.max_age_seconds === SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS
+                && freshness.provenance === 'live_gate_and_durable_snapshot'
+                && Number.isFinite(elapsed) && elapsed >= 0
+                && elapsed <= SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS * 1000;
+            return { allowed, message: allowed ? '' : startSafetyMessage(safety?.reason_code) };
+        }
+
+        function rememberStartSafetyDenial(result) {
+            if (result?.error !== 'mutation_gate_blocked') return;
+            bot_state = { ...bot_state, runtime_safety: {
+                allowed: false, reason_code: result.reason || result.reason_code,
+            } };
+        }
+
         function canAttemptBotStart() {
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const hasPair = !!pair.selected;
             const restoredBookIsPrepared = hasResumedLiveBook();
-            return isSettingsReviewedForCurrentPair()
+            return getStartSafetyState().allowed && isSettingsReviewedForCurrentPair()
                 && hasPair
                 && coinPrepStatus !== 'checking'
                 && (coinPrepStatus !== 'none' || restoredBookIsPrepared);
@@ -19124,9 +19209,22 @@
             }
             setStartupStepState('startupStepCoinPrep', coinPrepState, coinPrepDetail);
 
+            const startSafety = getStartSafetyState(data);
+            clearTimeout(_startSafetyExpiryTimer);
+            _startSafetyExpiryTimer = null;
+            if (startSafety.allowed && !data?.running) {
+                const expiresAt = Date.parse(data.runtime_safety.recovery.freshness.observed_at_utc)
+                    + SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS * 1000;
+                // Bridge requests can stall: expire visible readiness independently
+                // of the next poll and without changing backend safety authority.
+                _startSafetyExpiryTimer = setTimeout(() => {
+                    updateStartupChecklist(bot_state);
+                    updateResumeOverview();
+                }, Math.max(1, expiresAt - Date.now() + 1));
+            }
             const startReady = !!(data && data.running)
                 || (
-                    walletReachable
+                    startSafety.allowed && walletReachable
                     && pair.selected
                     && settingsReviewed
                     && coinPrepStatus !== 'checking'
@@ -19137,6 +19235,9 @@
             if (data && data.running) {
                 startState = 'ready';
                 startDetail = `Bot is live on ${pair.name || 'the selected pair'}.`;
+            } else if (!startSafety.allowed) {
+                startState = 'warning';
+                startDetail = startSafety.message;
             } else if (coinPrepStatus === 'skipped-unsafe') {
                 startState = 'warning';
                 startDetail = 'Start Bot will warn again because coin prep still needs attention.';
@@ -19159,6 +19260,10 @@
                     : 'All pre-flight checks look good. You can start the bot.';
             }
             setStartupStepState('startupStepStart', startState, startDetail);
+            const startButton = document.getElementById('startBtn');
+            if (startButton && !data?.running) {
+                startButton.disabled = _botStarting || !canAttemptBotStart();
+            }
             updateStartReadyCta({
                 visible: !data?.running && !_botStarting && startReady,
                 detail: startReady
@@ -19330,6 +19435,9 @@
                 }
                 // API response shape: { error: "code"|"message", code?: "..." }
                 if (typeof err === 'object') {
+                    if (err.error === 'mutation_gate_blocked') {
+                        return startSafetyMessage(err.reason || err.reason_code);
+                    }
                     const code = err.code || err.error_code;
                     if (code && _ERROR_CODE_MAP[code]) return _ERROR_CODE_MAP[code];
                     // If `error` is a known code → map it
@@ -22639,7 +22747,7 @@
 
             if (midPrice <= 0 && maxSell > 0) {
                 showInputWarning(coinPrepWarn, 'critical',
-                    `? <strong>Waiting for TibetSwap pricing...</strong> Cannot calculate token amounts for sell offers until pricing loads. Make sure your trading pair is selected and TibetSwap is reachable.`);
+                    `⏳ <strong>Waiting for current market pricing...</strong> Cannot calculate token amounts for sell offers until a current price is available. Check your selected pair and market connection. During a TibetSwap outage, CATalyst can use valid Dexie pricing.`);
                 tradingSettingsImpossible = true;
                 return;
             }
@@ -24249,6 +24357,8 @@
                 return data;
             } catch (error) {
                 // Suppress AbortError (expected when Sage wallet RPC is slow)
+                bot_state = { ...bot_state, runtime_safety: null };
+                updateStartupChecklist(bot_state);
                 if (error.name !== 'AbortError') {
                     debugError('Failed to fetch status:', error);
                 }
@@ -25415,10 +25525,13 @@
             }
 
             if (receive) {
+                const enabled = !!receive.enabled;
+                const active = !!receive.active;
                 if (el('splashListenStatus')) {
-                    const enabled = !!receive.enabled;
-                    el('splashListenStatus').textContent = enabled ? 'ON' : 'OFF';
-                    el('splashListenStatus').style.color = enabled ? 'var(--status-success)' : 'rgba(255,255,255,0.5)';
+                    el('splashListenStatus').textContent = active ? 'ON' : (enabled ? 'READY' : 'OFF');
+                    el('splashListenStatus').style.color = active
+                        ? 'var(--status-success)'
+                        : (enabled ? 'var(--status-warning)' : 'rgba(255,255,255,0.5)');
                 }
                 if (el('splashIncomingNew')) {
                     // Use total (cumulative this session) not new (resets to 0 once processed)
@@ -25434,11 +25547,14 @@
                     const pairLabel = receive.pair_label || 'CAT/XCH';
                     const receivedCount = Number(receive.total || 0);
                     const relevantCount = Number(receive.relevant || 0);
-                    if (receive.enabled && receivedCount > 0 && relevantCount === 0) {
+                    if (enabled && !active) {
+                        el('splashIncomingHint').textContent =
+                            'Listening enabled; start the bot to receive peer offers.';
+                    } else if (active && receivedCount > 0 && relevantCount === 0) {
                         el('splashIncomingHint').textContent =
                             'Connected; gossip sparse, no relevant offers seen for '
                             + pairLabel + ' yet.';
-                    } else if (receive.enabled && receivedCount === 0) {
+                    } else if (active && receivedCount === 0) {
                         el('splashIncomingHint').textContent =
                             'Connected; waiting for peer offers. Splash gossip can be sparse. Relevant = inbound offers matching '
                             + pairLabel + '.';
@@ -25503,10 +25619,9 @@
                 }
                 if (el('splashListenToggle')) {
                     const btn = el('splashListenToggle');
-                    const enabled = !!receive.enabled;
                     btn.dataset.enabled = enabled ? '1' : '0';
                     if (!btn.dataset.busy || btn.dataset.busy !== '1') {
-                        btn.textContent = enabled ? 'Listening On' : 'Start Listening';
+                        btn.textContent = enabled ? (active ? 'Listening On' : 'Listening Enabled') : 'Start Listening';
                     }
                     btn.style.background = enabled ? 'rgba(16,185,129,0.18)' : 'rgba(6,182,212,0.18)';
                     btn.style.color = enabled ? 'var(--success-200)' : 'var(--accent-cyan)';
@@ -27788,20 +27903,28 @@
                     renderMarketIntel(data);
                 }
 
-                const compBuys = parseInt(data.num_competitor_buys || 0) || 0;
-                const compSells = parseInt(data.num_competitor_sells || 0) || 0;
                 const partial = {
                     best_bid: data.best_bid,
                     best_ask: data.best_ask,
                     overall_best_bid: data.overall_best_bid,
                     overall_best_ask: data.overall_best_ask,
-                    competitor_count: compBuys + compSells,
-                    competitor_sides: compBuys > 0 && compSells > 0
-                        ? 'both'
-                        : (compBuys > 0 ? 'buy only' : (compSells > 0 ? 'sell only' : 'none')),
                     market_spread_bps: data.competitor_spread_bps,
                     overall_spread_bps: data.overall_spread_bps,
                 };
+                // Older/sparse market-intel pushes only carry total orderbook
+                // counts.  Do not overwrite the dashboard's known competitor
+                // count with a fabricated zero when competitor-only fields are
+                // absent.  Current bot-loop pushes include both fields below.
+                const hasCompBuys = data.num_competitor_buys !== undefined;
+                const hasCompSells = data.num_competitor_sells !== undefined;
+                if (hasCompBuys || hasCompSells) {
+                    const compBuys = parseInt(data.num_competitor_buys ?? 0, 10) || 0;
+                    const compSells = parseInt(data.num_competitor_sells ?? 0, 10) || 0;
+                    partial.competitor_count = compBuys + compSells;
+                    partial.competitor_sides = compBuys > 0 && compSells > 0
+                        ? 'both'
+                        : (compBuys > 0 ? 'buy only' : (compSells > 0 ? 'sell only' : 'none'));
+                }
                 if (data.buy_depth_xch !== undefined || data.sell_depth_xch !== undefined) {
                     const buyDepth = parseFloat(data.buy_depth_xch || 0) || 0;
                     const sellDepth = parseFloat(data.sell_depth_xch || 0) || 0;
@@ -31561,6 +31684,12 @@
         }
 
         async function startBot() {
+            const safety = getStartSafetyState();
+            if (!safety.allowed) {
+                updateStartupChecklist(bot_state);
+                showToast(safety.message, 'warning');
+                return;
+            }
             if ((!currentCAT || !currentCAT.asset_id) && _resumeSessionSummary?.active_cat?.asset_id) {
                 syncResumePairIntoSelectors(_resumeSessionSummary.active_cat);
             }
@@ -31677,6 +31806,7 @@
                     updateDashboardStartupLayout(bot_state);
                 } else {
                     // Show detailed error — check for preflight errors array
+                    rememberStartSafetyDenial(result);
                     let errorMsg = formatError(result);
                     if (result.errors && Array.isArray(result.errors) && result.errors.length > 0) {
                         errorMsg = result.errors.join('; ');
@@ -31758,12 +31888,20 @@
         
         async function forceStartBot() {
             document.getElementById('startNoPrepModal').classList.remove('active');
+            const safety = getStartSafetyState();
+            if (!safety.allowed) {
+                updateStartupChecklist(bot_state);
+                showToast(safety.message, 'warning');
+                return;
+            }
             try {
                 const response = await apiFetch(`${API_URL}/bot/start`, { method: 'POST' });
                 const result = await response.json();
                 if (result.success) {
                     showToast('Bot started (limited - coins not prepped)', 'warning');
                 } else {
+                    rememberStartSafetyDenial(result);
+                    updateStartupChecklist(bot_state);
                     showToast('Failed to start bot: ' + formatError(result), 'error');
                 }
             } catch (error) {
@@ -31972,6 +32110,17 @@
             }
         }
 
+        function cancelAllClientTimeoutMs(serverTimeoutSeconds) {
+            const seconds = Number(serverTimeoutSeconds);
+            const serverWindowMs = Number.isFinite(seconds) && seconds > 0
+                ? Math.ceil(seconds * 1000)
+                : 0;
+            // The backend deadline reflects one native Sage bulk transaction
+            // plus authoritative confirmation. Give its final status poll a small grace window,
+            // while preserving the existing five-minute minimum.
+            return Math.max(300000, serverWindowMs + 30000);
+        }
+
         async function confirmCancelAll() {
             if (bot_state?.running) {
                 addLogEntry('warning', 'Cancel All blocked - stop the bot first');
@@ -32088,7 +32237,7 @@
                         addLogEntry('warning', `   ${timeoutMessage}`);
                         showToast(timeoutMessage, 'warning', 10000);
                         _cancelAllInProgress = false;
-                    }, 300000);
+                    }, cancelAllClientTimeoutMs(result.timeout_seconds));
                     return;
                 }
 
@@ -32163,27 +32312,34 @@
 
         function cancelAllProgressView(status = {}, totalHint = 0) {
             const total = Math.max(Number(status.total) || 0, Number(totalHint) || 0);
+            const cancelled = Math.max(0, Number(status.cancelled) || 0);
             const pending = Number(status.pending) || 0;
             const failed = Number(status.failed) || 0;
-            const processed = Math.min(total || (pending + failed), pending + failed);
+            const processed = Math.min(total || cancelled, cancelled);
             const phase = String(status.phase || 'starting').toLowerCase();
             const isDone = phase === 'complete' || phase === 'error';
             const remaining = Math.max(0, total - processed);
-            let title = 'Journaling cancellation requests';
-            let message = status.message || 'Preparing cancellation journals...';
+            const terminalComplete = phase === 'complete'
+                && cancelled === total && pending === 0 && failed === 0;
+            let title = 'Cancelling offers';
+            let message = status.message || 'Preparing durable cancellation requests...';
             let severity = 'info';
-            if (phase === 'complete') {
-                title = 'Cancellation requests journaled';
-                message = `${pending} pending authoritative reconciliation, ${failed} rejected without effect.`;
-                severity = 'warning';
+            if (terminalComplete) {
+                title = 'Cancel all complete';
+                message = `${cancelled} offer${cancelled !== 1 ? 's are' : ' is'} authoritatively terminal.`;
+                severity = 'success';
+            } else if (phase === 'complete') {
+                title = 'Cancellation incomplete';
+                message = `${pending} still awaiting authoritative proof, ${failed} failed.`;
+                severity = 'error';
             } else if (phase === 'error') {
-                title = 'Cancellation journal stopped';
-                message = status.message || 'The cancellation journal stopped before all requests were recorded.';
+                title = 'Cancellation stopped';
+                message = status.message || 'Cancellation stopped before every offer was authoritatively terminal.';
                 severity = 'error';
             } else if (total > 0) {
-                message = `${processed} journaled, ${remaining} remaining.`;
+                message = status.message || `${processed} authoritatively terminal, ${remaining} remaining.`;
             }
-            return { total, pending, failed, processed, phase, isDone, title, message, severity };
+            return { total, cancelled, pending, failed, processed, remaining, phase, isDone, title, message, severity };
         }
 
         function renderCancelAllProgress(status = {}, totalHint = 0) {
@@ -32217,7 +32373,7 @@
             }
             if (dotsEl) dotsEl.style.display = isDone ? 'none' : '';
             if (timeNoteEl) timeNoteEl.style.display = isDone ? 'none' : '';
-            if (iconEl) iconEl.textContent = phase === 'complete' ? '✅' : phase === 'error' ? '❌' : '⏳';
+            if (iconEl) iconEl.textContent = view.severity === 'success' ? '✅' : view.severity === 'error' ? '❌' : '⏳';
             if (messageEl) messageEl.textContent = view.message;
             if (summaryEl) {
                 summaryEl.textContent = total > 0
@@ -32230,7 +32386,7 @@
             if (failedEl) failedEl.textContent = String(failed);
 
             let percent = 8;
-            if (phase === 'complete') {
+            if (phase === 'complete' && view.severity === 'success') {
                 percent = 100;
             } else if (phase === 'error') {
                 percent = total > 0 ? Math.round((processed / total) * 100) : 100;
@@ -32257,18 +32413,18 @@
 
                 renderCancelAllProgress(status, totalHint);
 
-                const progressKey = `${status.phase || ''}|${status.current_batch || 0}|${status.pending || 0}|${status.failed || 0}|${status.message || ''}`;
+                const progressKey = `${status.phase || ''}|${status.current_batch || 0}|${status.cancelled || 0}|${status.pending || 0}|${status.failed || 0}|${status.message || ''}`;
                 if (status.message && progressKey !== _cancelAllLastProgressKey) {
                     const severity = status.phase === 'error'
                         ? 'error'
                         : status.phase === 'complete'
-                            ? 'warning'
+                            ? 'success'
                             : 'info';
                     addLogEntry(severity, `   ${status.message}`);
                     _cancelAllLastProgressKey = progressKey;
                 }
 
-                const offerRefreshKey = `${status.pending || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
+                const offerRefreshKey = `${status.cancelled || 0}|${status.pending || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
                 const shouldRefreshOffers = (
                     offerRefreshKey !== _cancelAllLastOfferRefreshKey
                     && (status.pending || status.failed || status.phase === 'complete' || status.phase === 'error')
@@ -32296,6 +32452,50 @@
             if (_cancelAllProgressPoll) {
                 clearInterval(_cancelAllProgressPoll);
                 _cancelAllProgressPoll = null;
+            }
+        }
+
+        async function restoreActiveCancelAllProgress() {
+            try {
+                const response = await apiFetch(`${API_URL}/offers/cancel_all/status`);
+                const status = await response.json();
+                const phase = String(status?.phase || '').toLowerCase();
+                if (!status || status.success === false || status.running !== true
+                    || status.complete === true || phase === 'complete' || phase === 'error') {
+                    return false;
+                }
+
+                const operationGeneration = ++_cancelAllOperationGeneration;
+                const total = Math.max(0, Number(status.total) || 0);
+                _cancelAllInProgress = true;
+                _cancelAllLastState = status;
+
+                const resumeModal = document.getElementById('resumeSessionModal');
+                if (resumeModal) resumeModal.classList.remove('active');
+                openCancelProgressModal(total);
+                _cancelAllLastState = status;
+                renderCancelAllProgress(status, total);
+                startCancelAllProgressPolling(total, operationGeneration);
+
+                clearCancelAllCompletionTimers();
+                _cancelAllCompletionPoll = setInterval(async () => {
+                    if (operationGeneration !== _cancelAllOperationGeneration) return;
+                    const latest = _get_cancel_all_state_local();
+                    const latestPhase = String(latest?.phase || '').toLowerCase();
+                    if (!latest || (latestPhase !== 'complete' && latestPhase !== 'error')) return;
+                    clearCancelAllCompletionTimers();
+                    stopCancelAllProgressPolling();
+                    _cancelAllInProgress = false;
+                    try { await fetchStatus(); } catch (_statusError) { /* non-fatal */ }
+                    try { updateResumeOverview(); } catch (_resumeError) { /* non-fatal */ }
+                }, 1000);
+
+                const startBtn = document.getElementById('startBtn');
+                if (startBtn) startBtn.disabled = true;
+                return true;
+            } catch (error) {
+                debugWarn('[CANCEL ALL] Could not restore active cancellation progress:', error);
+                return false;
             }
         }
 
@@ -32752,9 +32952,10 @@
                 if (!state || !state.success) return;
 
                 const total = Number(state.total || 0);
+                const cancelled = Number(state.cancelled || 0);
                 const pending = Number(state.pending || 0);
                 const failed = Number(state.failed || 0);
-                const processed = Math.max(0, pending + failed);
+                const processed = Math.max(0, cancelled);
                 const remaining = Math.max(0, total - processed);
                 const batchNum = Number(state.current_batch || 0);
                 const batchTotal = Number(state.total_batches || 0);
@@ -32762,17 +32963,17 @@
                 const phase = String(state.phase || '').toLowerCase();
                 const summary = total > 0
                     ? (phase === 'complete'
-                        ? `${pending} pending authoritative reconciliation, ${failed} rejected without effect`
-                        : `${processed} journaled, ${remaining} remaining`)
-                    : 'Checking cancellation journals...';
+                        ? `${cancelled} authoritatively terminal`
+                        : `${cancelled} authoritatively terminal, ${remaining} remaining`)
+                    : 'Checking authoritative cancellation state...';
                 const suffix = state.message ? ` ${state.message}` : '';
 
                 if (phase === 'complete') {
                     setShutdownStep('Offers', 'done', total > 0
-                        ? `Cancellation journal complete. ${summary}.`
+                        ? `Cancellation complete. ${summary}.`
                         : 'No open offers needed cancelling.');
                     updateShutdownProgress('Cancelling offers...', total > 0
-                        ? `Cancellation journal complete. ${summary}.`
+                        ? `Cancellation complete. ${summary}.`
                         : 'No open offers needed cancelling.');
                 } else if (phase === 'error') {
                     setShutdownStep('Offers', 'error', state.message || 'Offer cancel hit a problem.');
@@ -32864,6 +33065,29 @@
             }
         });
 
+        function shutdownOfferDisposition(state = bot_state, cancelState = null) {
+            if (cancelState === null && typeof _cancelAllLastState !== 'undefined') {
+                cancelState = _cancelAllLastState;
+            }
+            const offers = state && state.offers ? state.offers : {};
+            const buyCount = Array.isArray(offers.buy)
+                ? offers.buy.length
+                : Math.max(0, Number(offers.buy_count) || 0);
+            const sellCount = Array.isArray(offers.sell)
+                ? offers.sell.length
+                : Math.max(0, Number(offers.sell_count) || 0);
+            const terminalTotal = Math.max(0, Number(cancelState?.total) || 0);
+            const hasTerminalProof = terminalTotal > 0
+                && Number(cancelState?.cancelled) === terminalTotal
+                && Number(cancelState?.confirmed) === terminalTotal
+                && Number(cancelState?.pending) === 0
+                && Number(cancelState?.failed) === 0;
+            const count = hasTerminalProof ? 0 : buyCount + sellCount;
+            return count === 0
+                ? { count, copy: 'No open offers were left behind.' }
+                : { count, copy: `${count} open offer${count === 1 ? '' : 's'} left active.` };
+        }
+
         async function confirmShutdown() {
             const btn = document.getElementById('confirmShutdownBtn');
             if (btn) { btn.disabled = true; btn.textContent = 'Shutting down...'; }
@@ -32901,7 +33125,6 @@
                         startShutdownCancelAllPoll();
                         const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
                         const cancelResult = await cancelResp.json();
-                        stopShutdownCancelAllPoll();
 
                         if (!cancelResult.success) {
                             throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');
@@ -32917,18 +33140,27 @@
 
                         if (isAsyncCancel) {
                             addLogEntry('info', `   Journaling cancellation requests for ${count} offers...`);
-                            const finalStatus = await waitForShutdownCancelAllCompletion(180000);
+                            const serverTimeoutSeconds = Number(cancelResult.timeout_seconds);
+                            const cancelTimeoutMs = Number.isFinite(serverTimeoutSeconds) && serverTimeoutSeconds > 0
+                                ? Math.max(180000, (serverTimeoutSeconds * 1000) + 60000)
+                                : Math.max(180000, Math.min(21660000, count * 180000 + 60000));
+                            const finalStatus = await waitForShutdownCancelAllCompletion(cancelTimeoutMs);
                             stopShutdownCancelAllPoll();
+                            const cancelled = Number(finalStatus.cancelled);
                             const pending = Number(finalStatus.pending);
                             const failed = Number(finalStatus.failed);
-                            if (!Number.isInteger(pending) || pending < 0 ||
+                            if (!Number.isInteger(cancelled) || cancelled < 0 ||
+                                !Number.isInteger(pending) || pending < 0 ||
                                 !Number.isInteger(failed) || failed < 0 ||
-                                pending + failed !== count) {
+                                cancelled + pending + failed !== count) {
                                 throw new Error('Cancellation worker returned inconsistent completion totals.');
                             }
-                            const journalSummary = `${pending} pending authoritative reconciliation, ${failed} rejected without effect.`;
-                            setShutdownStep('Offers', 'done', `Cancellation requests journaled: ${journalSummary}`);
-                            addLogEntry('success', `   Cancellation requests journaled: ${journalSummary}`);
+                            if (cancelled !== count || pending !== 0 || failed !== 0) {
+                                throw new Error(`Cancellation incomplete: ${cancelled}/${count} offers are authoritatively terminal.`);
+                            }
+                            const terminalSummary = `${cancelled} offer${cancelled !== 1 ? 's are' : ' is'} authoritatively terminal.`;
+                            setShutdownStep('Offers', 'done', terminalSummary);
+                            addLogEntry('success', `   ${terminalSummary}`);
                         } else if (count > 0) {
                             setShutdownStep('Offers', 'done', `Cancellation handler completed for ${count} offers.`);
                             addLogEntry('success', `   Cancellation handler completed for ${count} offers`);
@@ -32943,8 +33175,9 @@
                         throw e;
                     }
                 } else {
-                    setShutdownStep('Offers', 'done', 'Offers left open.');
-                    addLogEntry('info', '   Step 2: Offers left open');
+                    const disposition = shutdownOfferDisposition();
+                    setShutdownStep('Offers', 'done', disposition.copy);
+                    addLogEntry('info', `   Step 2: ${disposition.copy}`);
                 }
 
                 // Step 3: Shut down the server and close the window.
@@ -35116,7 +35349,12 @@ function closeCtgErrorModal() {
                         if (btn) { btn.disabled = false; btn.textContent = 'Yes, Prepare Coins'; }
                     }
                 } else {
-                    showToast('Coin prep failed: ' + (data.error || 'Unknown error'), 'error');
+                    const detail = data.error === 'authoritative_state_conflict'
+                        ? 'History reset refused: protected offer and accounting evidence must be preserved. Retry Coin Prep without resetting history; runtime counters can be reset separately.'
+                        : (data.message || data.error || 'Unknown error');
+                    const reason = data.reason ? ` (${data.reason})` : '';
+                    setCoinPrepStatus('error');
+                    showCoinPrepError(detail + reason);
                     if (btn) {
                         btn.disabled = false;
                         btn.textContent = 'Yes, Prepare Coins';
@@ -36688,6 +36926,11 @@ function finalDismiss() {
 
             debugLog('[STARTUP] Gates complete — checking for resume...');
             try {
+                const cancelRestored = await restoreActiveCancelAllProgress();
+                if (cancelRestored) {
+                    debugLog('[STARTUP] Active Cancel All restored — deferring resume prompt');
+                    return;
+                }
                 const hasOffers = await checkForResume();
                 if (hasOffers) {
                     debugLog('[STARTUP] Resume modal shown after gates');
@@ -36699,9 +36942,11 @@ function finalDismiss() {
                 debugError('[STARTUP] Resume check failed:', e);
             }
         }
-        // No resume needed (or already handled) — only unlock if settings confirmed
+        await restoreCoinPrepReadiness();
+        // No resume needed (or already handled) — unlock only when every
+        // start prerequisite, including fresh safety and verified prep, holds.
         if (startBtn) {
-            startBtn.disabled = !settingsReviewed;
+            startBtn.disabled = !canAttemptBotStart();
             startBtn.innerHTML = '▶ Start Bot';
         }
     }, 300);

@@ -272,7 +272,25 @@ def api_splash_incoming():
         was_new = server._record_splash_incoming_locked(
             offer_bech32, fp, source_ip=source_ip
         )
+        if was_new is None:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "persistence_unavailable",
+                        "message": "Incoming offer was not persisted; retry delivery.",
+                    }
+                ),
+                503,
+            )
         server._splash_incoming_note_recorded(was_new)
+
+        bot = server.bot
+        if bot:
+            try:
+                bot.splash_node.note_webhook_delivery()
+            except Exception:
+                pass
 
         if was_new:
             log_event(
@@ -280,7 +298,6 @@ def api_splash_incoming():
                 "splash_received",
                 f"Received new offer from Splash (fp: {fp[:16]}...)",
             )
-            bot = server.bot
             if bot:
                 try:
                     server.events.emit(

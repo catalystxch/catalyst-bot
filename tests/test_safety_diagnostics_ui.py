@@ -677,7 +677,8 @@ renderSafetyDiagnosticsStatus({
   recommended_action: 'REVIEW_SAFETY_DIAGNOSTICS'
 });
 assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
-assert.strictEqual(elements.safetyDiagnosticsReason.textContent, 'RUNTIME_DISCONTINUITY');
+assert.ok(elements.safetyDiagnosticsReason.textContent.startsWith('RUNTIME_DISCONTINUITY'));
+assert.ok(elements.safetyDiagnosticsReason.textContent.includes('Runtime clock changed'));
 assert.strictEqual(elements.safetyDiagnosticsError.textContent, '');
 """
     )

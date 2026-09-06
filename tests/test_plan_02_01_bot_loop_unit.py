@@ -478,13 +478,37 @@ class TestBotLoopWiring(_PatchedCfg):
         self.assertEqual(loop._bot_state["our_best_bid"], "1.00")
         self.assertEqual(loop._bot_state["our_best_ask"], "1.05")
 
+    def test_splash_receive_requests_oldest_pending_batch(self):
+        loop = _make_loop()
+        requested = []
+
+        fake_db = types.ModuleType("database")
+
+        def get_offers(status=None, limit=50, oldest_first=False):
+            requested.append((status, limit, oldest_first))
+            return []
+
+        fake_db.get_splash_incoming_offers = get_offers
+        fake_db.update_splash_incoming_status = lambda *args, **kwargs: True
+
+        with (
+            patch.dict(sys.modules, {"database": fake_db}),
+            patch.object(bot_loop.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+        ):
+            loop._process_splash_incoming_batch()
+
+        self.assertEqual(
+            requested,
+            [("new", loop._splash_receive_batch_size, True)],
+        )
+
     def test_splash_receive_retries_unviewable_offer_before_ignoring(self):
         loop = _make_loop()
         loop._splash_receive_view_retries = 3
         updates = []
 
         fake_db = types.ModuleType("database")
-        fake_db.get_splash_incoming_offers = lambda status=None, limit=50: [
+        fake_db.get_splash_incoming_offers = lambda status=None, limit=50, oldest_first=False: [
             {"id": 7, "offer_bech32": "offer1bad"}
         ]
         fake_db.update_splash_incoming_status = (
@@ -517,7 +541,7 @@ class TestBotLoopWiring(_PatchedCfg):
         updates = []
 
         fake_db = types.ModuleType("database")
-        fake_db.get_splash_incoming_offers = lambda status=None, limit=50: [
+        fake_db.get_splash_incoming_offers = lambda status=None, limit=50, oldest_first=False: [
             {"id": 7, "offer_bech32": "offer1bad", "pair_hint": "view_retry:2"}
         ]
         fake_db.update_splash_incoming_status = (

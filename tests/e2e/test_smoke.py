@@ -515,6 +515,51 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
+def test_sparse_market_intel_sse_preserves_dashboard_competitor_count(page):
+    """A sparse live orderbook push must not replace known competitors with zero."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const health = {
+                status: 'green',
+                message: 'Market healthy',
+                conditions: [],
+                metrics: {
+                    market_intel_state: 'ready',
+                    competitor_count: 7,
+                    competitor_sides: 'both',
+                    market_spread_bps: '320',
+                },
+            };
+            _dashboardData = { settings: {}, performance: {}, market_health: health };
+            _lcDashboardData = { settings: {}, performance: {}, market_health: health };
+            updateMarketHealth(health);
+
+            // This is the sparse shape emitted by the bot loop today.  It has
+            // total orderbook counts but no competitor-only counts.
+            handleSSEEvent({
+                type: 'market_intel',
+                data: {
+                    best_bid: '0.00008000',
+                    best_ask: '0.00008600',
+                    num_buy_offers: 18,
+                    num_sell_offers: 24,
+                },
+            });
+
+            return {
+                count: _lcDashboardData.market_health.metrics.competitor_count,
+                sides: _lcDashboardData.market_health.metrics.competitor_sides,
+                text: document.getElementById('ccCompetitors').textContent,
+            };
+        }"""
+    )
+
+    assert result == {"count": 7, "sides": "both", "text": "7 (both)"}
+
+
 def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
     """A live ladder must lead to a usable cancel-first recovery, not raw JSON."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -649,6 +694,120 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
         "retry Prepare Coins without resetting protected history"
     )
     assert page.evaluate("_cancelAllContext.resumeAfterCancel") is False
+
+
+@pytest.mark.parametrize("failure, detail", [
+    ({"success": False, "error": "coin_prep_mutation_exclusion_unavailable",
+      "reason": "WALLET_IDENTITY_BINDING_INVALID"}, "WALLET_IDENTITY_BINDING_INVALID"),
+    ({"success": False, "error": "authoritative_state_conflict",
+      "conflicts": ["offer_proof_history"]}, "without resetting history"),
+])
+def test_coin_prep_rejected_start_shows_persistent_error_not_checking(page, failure, detail):
+    """A rejected trigger must not leave the checklist checking or lose its reason."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """async (failure) => {
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            coinPrepStatus = 'checking';
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            showCoinPrepView('confirm');
+            askPrepHistoryChoice = async () => ({
+                action: 'proceed', resets: { pnl: false, offers: true, counters: true },
+            });
+            apiFetch = async () => new Response(JSON.stringify(failure), {
+                status: 423, headers: { 'Content-Type': 'application/json' },
+            });
+            await startCoinPrepFromModal();
+        }""", failure,
+    )
+
+    expect(page.locator("#coinPrepErrorView")).to_be_visible()
+    expect(page.locator("#cpErrorDetail")).to_contain_text(detail)
+    assert page.evaluate("coinPrepStatus") == "error"
+    assert page.evaluate("coinPrepPollInterval") is None
+
+
+def test_reload_restores_completed_coin_prep_for_same_asset_only(page):
+    """A fresh window must not forget valid prep or apply it to another CAT."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            settingsReviewed = true;
+            currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            coinPrepStatus = 'none';
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true,
+                complete: true,
+                previously_complete: true,
+                needs_coin_prep: false,
+                last_prep_settings: { cat_asset_id: 'asset-a' },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            const sameAsset = await restoreCoinPrepReadiness();
+            const restoredStatus = coinPrepStatus;
+
+            coinPrepStatus = 'none';
+            currentCAT = { asset_id: 'asset-b', wallet_id: 3 };
+            const otherAsset = await restoreCoinPrepReadiness();
+            return { sameAsset, restoredStatus, otherAsset, finalStatus: coinPrepStatus };
+        }"""
+    )
+
+    assert result == {
+        "sameAsset": True,
+        "restoredStatus": "done",
+        "otherAsset": False,
+        "finalStatus": "none",
+    }
+
+
+def test_final_startup_dismiss_keeps_start_disabled_without_verified_prep(page):
+    """Completing the startup overlay must not bypass Coin Prep readiness."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.clock.install()
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """() => {
+            const assetId = 'ab'.repeat(32);
+            settingsReviewed = true;
+            localStorage.setItem('settingsReviewed', 'true');
+            localStorage.setItem('settingsReviewedAssetId', assetId);
+            currentCAT = { asset_id: assetId, wallet_id: 2 };
+            _pairSelectedByUser = true;
+            coinPrepStatus = 'none';
+            _resumeHandled = true;
+            hasCheckedResumeOnLoad = true;
+            bot_state = {
+                running: false,
+                runtime_safety: {
+                    allowed: true,
+                    reason_code: '',
+                    lease: { active: true, owned_by_this_run: true },
+                    recovery: { freshness: {
+                        valid: true,
+                        age_seconds: 0,
+                        max_age_seconds: 30,
+                        provenance: 'live_gate_and_durable_snapshot',
+                        observed_at_utc: new Date().toISOString(),
+                    } },
+                },
+            };
+            updateFingerprint = async () => {};
+            fetchFingerprint = async () => {};
+            fetchDashboard = async () => {};
+            fetchStatus = async () => {};
+            loadCATs = async () => {};
+            showStartupLaunchBar = () => {};
+            restoreCoinPrepReadiness = async () => false;
+            finalDismiss();
+        }"""
+    )
+    page.clock.fast_forward(400)
+    expect(page.locator("#startBtn")).to_be_disabled()
 
 
 def test_generic_cancel_all_explicitly_covers_every_live_sage_offer(page):
@@ -948,6 +1107,61 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
     assert still_latched is True
     page.evaluate("window.__cancelLatchPhase = 'complete'")
     page.wait_for_function("_cancelAllInProgress === false", timeout=2_000)
+
+
+def test_reload_restores_active_cancel_all_progress_before_resume_prompt(page):
+    """A fresh window must surface the durable cancel instead of offering Resume."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('resumeSessionModal').classList.add('active');
+            document.getElementById('cancelProgressModal').classList.remove('active');
+            _cancelAllInProgress = false;
+            _cancelAllLastState = null;
+            apiFetch = async (path) => {
+                if (!String(path).includes('/offers/cancel_all/status')) {
+                    throw new Error(`Unexpected test request: ${path}`);
+                }
+                return new Response(JSON.stringify({
+                    success: true,
+                    running: true,
+                    complete: false,
+                    phase: 'reconciling',
+                    total: 72,
+                    cancelled: 11,
+                    confirmed: 11,
+                    pending: 61,
+                    failed: 0,
+                    message: 'Waiting for authoritative cancellation proof: 11/72 offers terminal.',
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            };
+
+            if (typeof restoreActiveCancelAllProgress !== 'function') {
+                return { restored: false };
+            }
+            const restored = await restoreActiveCancelAllProgress();
+            const snapshot = {
+                restored,
+                inProgress: _cancelAllInProgress,
+                progressVisible: document.getElementById('cancelProgressModal').classList.contains('active'),
+                resumeVisible: document.getElementById('resumeSessionModal').classList.contains('active'),
+                summary: document.getElementById('cancelProgressSummary').textContent,
+            };
+            stopCancelAllProgressPolling();
+            clearCancelAllCompletionTimers();
+            return snapshot;
+        }"""
+    )
+
+    assert result == {
+        "restored": True,
+        "inProgress": True,
+        "progressVisible": True,
+        "resumeVisible": False,
+        "summary": "11 of 72 offers processed",
+    }
 
 
 def test_cancel_all_clears_cached_completion_before_new_async_operation(page):

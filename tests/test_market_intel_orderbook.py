@@ -78,6 +78,36 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertTrue(parsed["is_ours"])
 
+    def test_parse_current_dexie_v1_single_asset_objects(self):
+        """Dexie v1 currently returns offered/requested as objects, not arrays."""
+        self.intel._known_dexie_ids = {"dexie-current-shape"}
+
+        parsed = self.intel._parse_dexie_offer(
+            {
+                "id": "dexie-current-shape",
+                "offered": {
+                    "id": "test-cat",
+                    "code": "TEST",
+                    "name": "Test Token",
+                    "amount": 9151.136,
+                },
+                "requested": {
+                    "id": "xch",
+                    "code": "XCH",
+                    "name": "Chia",
+                    "amount": 0.7901,
+                },
+                "date_found": "2026-09-05T16:23:34Z",
+            },
+            "sell",
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["price"], Decimal("0.7901") / Decimal("9151.136"))
+        self.assertEqual(parsed["cat_amount"], Decimal("9151.136"))
+        self.assertEqual(parsed["xch_amount"], Decimal("0.7901"))
+        self.assertTrue(parsed["is_ours"])
+
     def test_orderbook_snapshot_identifies_aggregated_v3_source(self):
         """Catches v3 price levels being mistaken for attributable offers."""
 
@@ -86,6 +116,37 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         snapshot = self.intel.get_orderbook_snapshot()
 
         self.assertEqual(snapshot["source"], "dexie_v3_orderbook")
+
+    def test_anonymous_v3_book_does_not_replace_attributed_own_only_v1_book(self):
+        """An own-only v1 book is valid evidence that there are no competitors."""
+        own_buy = {
+            "price": Decimal("0.00008066"),
+            "xch_amount": Decimal("0.9581"),
+            "cat_amount": Decimal("11878.107"),
+            "side": "buy",
+            "is_ours": True,
+        }
+        own_sell = {
+            "price": Decimal("0.00008634"),
+            "xch_amount": Decimal("0.7901"),
+            "cat_amount": Decimal("9151.136"),
+            "side": "sell",
+            "is_ours": True,
+        }
+        self.intel._orderbook["buy_offers"] = [own_buy]
+        self.intel._orderbook["sell_offers"] = [own_sell]
+        self.intel._analyse_orderbook(
+            [own_buy], [own_sell], source="dexie_v1_offers"
+        )
+
+        anonymous_v3_buy = [{**own_buy, "is_ours": False}]
+        anonymous_v3_sell = [{**own_sell, "is_ours": False}]
+
+        self.assertFalse(
+            self.intel._should_use_v3_orderbook(
+                anonymous_v3_buy, anonymous_v3_sell
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -62,6 +62,18 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "wallet_sage"
         ].get_spendable_coin_count(wallet_id)
         fake_wallet.get_pending_transactions = lambda: []
+        fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {
+            "success": True
+        }
+        fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
+            "success": True
+        }
+        fake_wallet.validate_unsigned_transaction_effect = (
+            lambda *args, **kwargs: {
+                "_catalyst_validated_unsigned": True,
+                "constructed_outputs": [],
+            }
+        )
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_spendable_coins_rpc = lambda wallet_id: {
@@ -1856,6 +1868,116 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         observation = self.worker._observe_recoverable_coin_prep_operation(operation)
 
         self.assertIsNone(observation)
+
+    def test_v2_batch_recovery_uses_persisted_constructed_coin_ids(self):
+        """Direct batches recover by exact Sage output IDs, never amount ordering."""
+
+        source = hashlib.sha256(b"v2-cat-source").hexdigest()
+        fee_source = hashlib.sha256(b"v2-fee-source").hexdigest()
+        cat_output = hashlib.sha256(b"v2-cat-output").hexdigest()
+        xch_output = hashlib.sha256(b"v2-xch-output").hexdigest()
+        now = datetime.now(timezone.utc)
+        bound_at = (now - timedelta(seconds=1)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        observed_at = now.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": bound_at,
+            "maximum_age_seconds": 300,
+        }
+        constructed = [
+            {
+                "asset": "cat",
+                "address": "xch1owner",
+                "amount_mojos": 50,
+                "purpose": "replacement",
+                "ordinal": 0,
+                "coin_id": cat_output,
+            },
+            {
+                "asset": "xch",
+                "address": "xch1owner",
+                "amount_mojos": 50,
+                "purpose": "fee_reserve",
+                "ordinal": -1,
+                "coin_id": xch_output,
+            },
+        ]
+        operation = {
+            "operation_id": "coin-prep:" + "f" * 64,
+            "outcome": "SUBMITTED_CONFIRMED",
+            "source_coin_ids_json": json.dumps([source]),
+            "effect_fee_coin_ids_json": json.dumps([fee_source]),
+            "target_contract_json": json.dumps(
+                {
+                    "contract_version": 2,
+                    "wallet_type": "cat",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "asset": "cat",
+                            "amount_mojos": 50,
+                            "purpose": "replacement",
+                        },
+                        {
+                            "output_index": 1,
+                            "asset": "xch",
+                            "amount_mojos": 50,
+                            "purpose": "fee_reserve",
+                        },
+                    ],
+                }
+            ),
+            "constructed_outputs_json": json.dumps(constructed),
+            "prepared_evidence_json": json.dumps(
+                {"pre_view_coin_ids": [source, fee_source]}
+            ),
+            "wallet_identity_json": json.dumps(identity),
+        }
+        self.worker.xch_wallet_id = 1
+        self.worker.cat_wallet_id = 2
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            "success": True,
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "observed_at_utc": observed_at,
+        }
+
+        def confirmed(wallet_id, _context):
+            if wallet_id == 1:
+                return [{"coin_id": xch_output, "amount_mojos": 50}]
+            return [{"coin_id": cat_output, "amount_mojos": 50}]
+
+        self.worker._get_confirmed_owned_coins_via_rpc = confirmed
+        self.worker._get_sage_selectable_coin_ids_for_recovery = lambda _wid: set()
+
+        observation = self.worker._observe_recoverable_coin_prep_operation(operation)
+
+        self.assertIsInstance(observation, dict)
+        self.assertEqual(observation["expected_outputs"], [
+            {
+                "coin_id": cat_output,
+                "amount_mojos": 50,
+                "purpose": "replacement",
+            },
+            {
+                "coin_id": xch_output,
+                "amount_mojos": 50,
+                "purpose": "fee_reserve",
+            },
+        ])
 
     def test_sage_native_split_contract_matches_ceil_then_final_output(self):
         """Sage /split divides the exact total across output_count outputs."""

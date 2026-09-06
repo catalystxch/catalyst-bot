@@ -142,6 +142,13 @@ class _TempDB(unittest.TestCase):
         api_server._run_history_cutoff = self._orig_run_history_cutoff
         api_server._active_cat.clear()
         api_server._active_cat.update(self._orig_active_cat)
+        # CAT selection starts a tracked resolver.  Tests replace Thread with a
+        # MagicMock so its target never runs and therefore cannot remove itself
+        # from the production registry.  Do not leak those inert test doubles
+        # into later shutdown-safety tests in the same pytest process.
+        with api_server._background_mutation_threads_lock:
+            api_server._background_mutation_threads.clear()
+        api_server._startup_cat_resolver_thread = None
 
     def _seed_fill(self):
         _db.record_fill(

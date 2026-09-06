@@ -139,6 +139,84 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json(), dict)
 
+    def test_stopped_market_intel_uses_live_orderbook_mid_for_spacescan_gap(self):
+        """A stopped bot must not suppress a current explorer-price conflict."""
+        bot = _make_bot()
+        bot.is_running.return_value = False
+        bot.price_engine.get_last_price.return_value = Decimal("0")
+        bot.market_intel.get_market_summary.return_value = {
+            "best_bid": "0.00007",
+            "best_ask": "0.00009",
+        }
+        fake_local = {
+            "our_best_bid": Decimal("0"),
+            "our_best_ask": Decimal("0"),
+            "our_open_buys": 0,
+            "our_open_sells": 0,
+            "source": "wallet_snapshot",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.dict(
+                api_server._active_cat,
+                {"asset_id": "ab" * 32, "ticker_id": "MZ_XCH", "decimals": 3},
+                clear=True,
+            ),
+            patch("api_server._get_live_local_offer_edges", return_value=fake_local),
+            patch(
+                "api_server._get_spacescan_market_context",
+                return_value={"enabled": True, "has_data": True},
+            ) as spacescan_context,
+            patch("api_server._fetch_dbx_pair_status", return_value={}),
+        ):
+            resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            spacescan_context.call_args.kwargs["executable_mid_price"],
+            0.00008,
+        )
+
+    def test_live_local_edges_recompute_our_spread_bps(self):
+        """Wallet-authoritative edges must not retain a stale zero spread."""
+        bot = _make_bot()
+        bot.market_intel.get_market_summary.return_value = {
+            "best_bid": "0.000073",
+            "best_ask": "0.000079",
+            "overall_best_bid": "0.000073",
+            "overall_best_ask": "0.000079",
+            "our_spread_bps": "0",
+        }
+        fake_local = {
+            "our_best_bid": Decimal("0.000073"),
+            "our_best_ask": Decimal("0.000079"),
+            "our_open_buys": 36,
+            "our_open_sells": 36,
+            "source": "wallet_sync",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("api_server._get_live_local_offer_edges", return_value=fake_local),
+            patch(
+                "api_server._get_spacescan_market_context",
+                return_value={"enabled": False, "has_data": False},
+            ),
+            patch("api_server._fetch_dbx_pair_status", return_value={}),
+        ):
+            response = self.client.get(
+                "/api/market/intel", environ_base=self._LOOPBACK
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        expected = (
+            (Decimal("0.000079") - Decimal("0.000073"))
+            / ((Decimal("0.000079") + Decimal("0.000073")) / Decimal("2"))
+            * Decimal("10000")
+        )
+        self.assertEqual(Decimal(payload["our_spread_bps"]), expected)
+        self.assertEqual(payload["live_book_source"], "wallet_sync")
+
     def test_slippage_endpoint_defaults_to_one_xch(self):
         bot = _make_bot()
         bot.price_engine.get_tibet_quote.return_value = {"slippage_bps": "10"}

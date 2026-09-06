@@ -249,6 +249,26 @@ def test_database_persists_exact_purpose_through_designation_and_reservation(
     assert reservations[0]["purpose"] == "replacement"
 
 
+def test_legacy_unpurposed_tier_rows_do_not_advertise_spare_capacity(
+    isolated_database,
+):
+    """Readiness and dashboard counts must match offer-selection authority."""
+
+    database.init_database()
+    for label, purpose in (("legacy-tier", None), ("policy-tier", "replacement")):
+        assert database.upsert_coin(
+            hashlib.sha256(label.encode("utf-8")).hexdigest(),
+            "cat",
+            100,
+            designation="tier_spare",
+            assigned_tier="inner",
+            purpose=purpose,
+        )
+
+    assert database.get_tier_spare_counts("cat")["inner"] == 1
+    assert database.get_live_tier_group_counts()["cat"]["inner"] == 1
+
+
 def test_repository_capacity_is_exact_and_excludes_intent_reservations(
     isolated_database,
 ):
@@ -421,6 +441,272 @@ def test_coin_prep_operation_identity_binds_external_fee_contract():
     assert new_fee["target_contract"]["external_fee"] == {
         "fee_mojos": 9_420_000_000,
         "coin_ids": [fee_coin],
+    }
+
+
+def _batch_target(source_asset="cat"):
+    cat_asset_id = hashlib.sha256(b"batch-cat-asset").hexdigest()
+    target = {
+        "contract_version": 2,
+        "wallet_type": source_asset,
+        "cat_asset_id": cat_asset_id if source_asset == "cat" else None,
+        "fee_mojos": 10,
+        "outputs": [
+            {
+                "output_index": 0,
+                "asset": source_asset,
+                "address": "xch1batchowner",
+                "amount_mojos": 90,
+                "purpose": "replacement",
+                "ordinal": 0,
+            },
+            {
+                "output_index": 1,
+                "asset": "xch",
+                "address": "xch1batchowner",
+                "amount_mojos": 20,
+                "purpose": "fee_reserve",
+                "ordinal": -1,
+            },
+        ],
+    }
+    if source_asset == "cat":
+        target["external_fee"] = {
+            "fee_mojos": 10,
+            "coin_ids": [hashlib.sha256(b"batch-fee-source").hexdigest()],
+        }
+    return target
+
+
+def test_batch_contract_round_trip_binds_plan_hash_and_exact_outputs():
+    source = hashlib.sha256(b"batch-source").hexdigest()
+    first = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_batch_target(),
+    )
+    replay = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=first["target_contract"],
+    )
+    assert first == replay
+    assert first["contract_version"] == "coin_prep_operation_v2"
+    assert len(first["target_contract"]["plan_hash"]) == 64
+
+    tampered = dict(first["target_contract"])
+    tampered["fee_mojos"] = 11
+    with pytest.raises(ValueError, match="fee|hash"):
+        replacement_capacity.canonical_coin_prep_contract(
+            operation_kind="split",
+            purpose="replacement",
+            source_coin_ids=[source],
+            target_contract=tampered,
+        )
+
+
+def test_batch_constructed_outputs_bind_once_before_dispatch(
+    isolated_database, monkeypatch
+):
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="batch-bind")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"batch-source").hexdigest()
+    fee_source = hashlib.sha256(b"batch-fee-source").hexdigest()
+    target = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_batch_target(),
+    )["target_contract"]
+    assert database.upsert_coin(source, "cat", 90, purpose="replacement")
+    assert database.upsert_coin(fee_source, "xch", 30, purpose="fee_reserve")
+    operation_id = replacement_capacity.coin_prep_operation_identity(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=operation_id,
+        source_coin_ids=[source],
+        fee_coin_ids=[fee_source],
+    )
+    prepared = database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source, fee_source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    output_cat = hashlib.sha256(b"batch-output-cat").hexdigest()
+    output_change = hashlib.sha256(b"batch-output-change").hexdigest()
+    constructed = [
+        {
+            "asset": "cat",
+            "address": "xch1batchowner",
+            "amount_mojos": 90,
+            "purpose": "replacement",
+            "ordinal": 0,
+            "coin_id": output_cat,
+        },
+        {
+            "asset": "xch",
+            "address": "xch1batchowner",
+            "amount_mojos": 20,
+            "purpose": "fee_reserve",
+            "ordinal": -1,
+            "coin_id": output_change,
+        },
+    ]
+    bound = database.bind_coin_prep_constructed_outputs(
+        prepared["operation"]["operation_id"],
+        plan_hash=target["plan_hash"],
+        constructed_outputs=constructed,
+    )
+    replay = database.bind_coin_prep_constructed_outputs(
+        prepared["operation"]["operation_id"],
+        plan_hash=target["plan_hash"],
+        constructed_outputs=list(reversed(constructed)),
+    )
+    assert bound["idempotent"] is False
+    assert replay["idempotent"] is True
+    assert (
+        json.loads(bound["operation"]["constructed_outputs_json"])[0]["coin_id"]
+        == "0x" + output_cat
+    )
+
+    changed = [dict(output) for output in constructed]
+    changed[0]["coin_id"] = hashlib.sha256(b"other-output").hexdigest()
+    with pytest.raises(ValueError, match="cannot be rebound"):
+        database.bind_coin_prep_constructed_outputs(
+            prepared["operation"]["operation_id"],
+            plan_hash=target["plan_hash"],
+            constructed_outputs=changed,
+        )
+
+
+def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
+    isolated_database, monkeypatch
+):
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="batch-confirm")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"batch-source").hexdigest()
+    fee_source = hashlib.sha256(b"batch-fee-source").hexdigest()
+    target = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=_batch_target(),
+    )["target_contract"]
+    database.upsert_coin(source, "cat", 90, purpose="replacement")
+    database.upsert_coin(fee_source, "xch", 30, purpose="fee_reserve")
+    operation_id = replacement_capacity.coin_prep_operation_identity(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=operation_id,
+        source_coin_ids=[source],
+        fee_coin_ids=[fee_source],
+    )
+    prepared = database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source, fee_source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )["operation"]
+    output_cat = hashlib.sha256(b"batch-output-cat").hexdigest()
+    output_change = hashlib.sha256(b"batch-output-change").hexdigest()
+    constructed = [
+        {
+            "asset": "cat",
+            "address": "xch1batchowner",
+            "amount_mojos": 90,
+            "purpose": "replacement",
+            "ordinal": 0,
+            "coin_id": output_cat,
+        },
+        {
+            "asset": "xch",
+            "address": "xch1batchowner",
+            "amount_mojos": 20,
+            "purpose": "fee_reserve",
+            "ordinal": -1,
+            "coin_id": output_change,
+        },
+    ]
+    database.bind_coin_prep_constructed_outputs(
+        operation_id,
+        plan_hash=target["plan_hash"],
+        constructed_outputs=constructed,
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=operation_id,
+        source_coin_ids=[source],
+        fee_coin_ids=[fee_source],
+    )
+    database.complete_wallet_effect_dispatch(dispatch, result={"success": True})
+    database.record_coin_prep_operation_outcome(
+        operation_id,
+        outcome="SUBMITTED_UNKNOWN",
+        evidence_json={
+            "reason_code": "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "dispatch_outcome": "UNKNOWN",
+        },
+    )
+    expected_outputs = [
+        {
+            "coin_id": item["coin_id"],
+            "amount_mojos": item["amount_mojos"],
+            "purpose": item["purpose"],
+        }
+        for item in constructed
+    ]
+    observed_at = "2026-08-21T12:00:01.000000Z"
+    authoritative_view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": observed_at,
+        "expires_at": "2026-08-21T12:00:16.000000Z",
+        "coins": expected_outputs,
+    }
+    confirmed = database.record_coin_prep_operation_outcome(
+        operation_id,
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": [source],
+            "expected_outputs": expected_outputs,
+            "authoritative_view": authoritative_view,
+            "expected_wallet_identity": identity,
+        },
+    )
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    assert {coin["coin_id"] for coin in database.get_free_coins("cat")} == {
+        "0x" + output_cat
+    }
+    assert {coin["coin_id"] for coin in database.get_free_coins("xch")} == {
+        "0x" + output_change
     }
 
 

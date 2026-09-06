@@ -33,6 +33,10 @@ import shutil
 import subprocess
 import argparse
 import fnmatch
+import re
+from pathlib import Path
+
+from scripts.sync_release_metadata import sync_release_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +70,10 @@ _RUNTIME_ARTIFACT_GLOBS = (
     "bot.db.recovered",
 )
 
+_VERSION_ASSIGNMENT_RE = re.compile(
+    r'^__version__\s*=\s*["\'](\d+\.\d+\.\d+)["\']', re.MULTILINE
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,6 +101,24 @@ def _ensure_pyinstaller():
             "  Install build dependencies with: python -m pip install -r requirements-dev.txt"
         )
         raise SystemExit(1)
+
+
+def _sync_build_metadata() -> str:
+    """Make PE metadata agree with the runtime version before PyInstaller runs."""
+    version_file = Path(HERE) / "src" / "catalyst" / "_version.py"
+    try:
+        source = version_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Unable to read runtime version from {version_file}: {exc}")
+
+    match = _VERSION_ASSIGNMENT_RE.search(source)
+    if not match:
+        raise SystemExit(f"No numeric __version__ assignment found in {version_file}")
+
+    version = match.group(1)
+    sync_release_metadata(Path(HERE), version)
+    print(f"  Release metadata synchronized to {version}.")
+    return version
 
 
 def _clean():
@@ -236,6 +262,7 @@ def main():
         sys.exit(1)
 
     _ensure_pyinstaller()
+    _sync_build_metadata()
 
     if not args.no_clean:
         print("\n  Cleaning previous build...")

@@ -691,18 +691,21 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "designation": "reserve",
                 "assigned_tier": "none",
                 "amount_mojos": 6000,
+                "purpose": "lifecycle",
             },
             {
                 "coin_id": "0xouter",
                 "designation": "tier_spare",
                 "assigned_tier": "outer",
                 "amount_mojos": 2200,
+                "purpose": "replacement",
             },
             {
                 "coin_id": "0xinner",
                 "designation": "tier_spare",
                 "assigned_tier": "inner",
                 "amount_mojos": 2100,
+                "purpose": "replacement",
             },
         ]
 
@@ -723,6 +726,49 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         self.assertEqual(coin_id, "0xinner")
 
+    def test_select_coin_for_offer_skips_purpose_less_legacy_tier_coin(self):
+        """Only policy-bound coins may reach the durable creation journal."""
+
+        manager = offer_manager.OfferManager()
+        records = [
+            {"coin_id": "0xlegacy", "coin": {"amount": 2000}},
+            {"coin_id": "0xreplacement", "coin": {"amount": 2100}},
+        ]
+        db_free = [
+            {
+                "coin_id": "0xlegacy",
+                "designation": "tier_spare",
+                "assigned_tier": "inner",
+                "amount_mojos": 2000,
+                "purpose": None,
+            },
+            {
+                "coin_id": "0xreplacement",
+                "designation": "tier_spare",
+                "assigned_tier": "inner",
+                "amount_mojos": 2100,
+                "purpose": "replacement",
+            },
+        ]
+
+        with (
+            patch.object(
+                offer_manager,
+                "get_exact_spendable_coins_rpc",
+                return_value={"success": True, "confirmed_records": records},
+            ),
+            patch("database.get_free_coins", return_value=db_free),
+            patch("database.get_reserve_coins", return_value=[]),
+        ):
+            coin_id = manager._select_coin_for_offer(
+                wallet_id=1,
+                amount_mojos=1900,
+                preferred_tier="inner",
+                strict_preferred_tier=True,
+            )
+
+        self.assertEqual(coin_id, "0xreplacement")
+
     def test_select_coin_for_offer_strict_tier_does_not_fallback(self):
         manager = offer_manager.OfferManager()
         records = [
@@ -735,12 +781,14 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "designation": "tier_spare",
                 "assigned_tier": "mid",
                 "amount_mojos": 2100,
+                "purpose": "replacement",
             },
             {
                 "coin_id": "0xouter",
                 "designation": "tier_spare",
                 "assigned_tier": "outer",
                 "amount_mojos": 2200,
+                "purpose": "replacement",
             },
         ]
 
@@ -773,6 +821,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "designation": "tier_spare",
                 "assigned_tier": "extreme",
                 "amount_mojos": 1550,
+                "purpose": "replacement",
             },
         ]
 
@@ -813,6 +862,7 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "designation": "tier_spare",
                 "assigned_tier": "extreme",
                 "amount_mojos": 5000,
+                "purpose": "replacement",
             },
         ]
 
@@ -1447,18 +1497,21 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 "designation": "tier_spare",
                 "assigned_tier": "mid",
                 "amount_mojos": 20000000000,
+                "purpose": "replacement",
             },
             {
                 "coin_id": "0xcoin2",
                 "designation": "tier_spare",
                 "assigned_tier": "mid",
                 "amount_mojos": 21000000000,
+                "purpose": "replacement",
             },
             {
                 "coin_id": "0xcoin3",
                 "designation": "tier_spare",
                 "assigned_tier": "mid",
                 "amount_mojos": 22000000000,
+                "purpose": "replacement",
             },
         ]
         counter = itertools.count(1)

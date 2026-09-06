@@ -17,6 +17,7 @@ posting) and splash_receive (inbound classification).
 """
 
 import os
+import re
 import sys
 import time
 import signal
@@ -58,6 +59,8 @@ class SplashNode:
         # Output capture
         self._last_output_lines: list = []
         self._max_output_lines: int = 50
+        self._last_hook_failure_fragment_time: float = 0.0
+        self._last_webhook_delivery_time: float = 0.0
 
         # Metrics: cached from Splash's Prometheus-ish JSON endpoint
         # populated by --listen-metrics. See _poll_metrics for the poller.
@@ -77,6 +80,10 @@ class SplashNode:
     # -------------------------------------------------------------------
     # Binary discovery
     # -------------------------------------------------------------------
+
+    def note_webhook_delivery(self) -> None:
+        """Record that Splash successfully reached CATalyst's offer webhook."""
+        self._last_webhook_delivery_time = time.time()
 
     def find_binary(self) -> Optional[str]:
         """Find the Splash binary. Search order:
@@ -563,6 +570,18 @@ class SplashNode:
             for line in self._process.stdout:
                 line = line.rstrip()
                 if line:
+                    # Splash can write peer and hook messages concurrently on
+                    # Windows, producing one interleaved line such as
+                    # ``tcp connect errorReceived Offer: offer1...``.  Never
+                    # retain or surface the complete offer payload in status or
+                    # activity logs, even when the daemon loses the usual hook
+                    # prefix during that interleaving.
+                    line = re.sub(
+                        r"offer1[0-9a-z]+",
+                        "offer1[redacted]",
+                        line,
+                        flags=re.IGNORECASE,
+                    )
                     self._last_output_lines.append(line)
                     # Trim to max
                     if len(self._last_output_lines) > self._max_output_lines:
@@ -585,24 +604,57 @@ class SplashNode:
                         _since_start < 30
                         and "insufficientpeers" in lower.replace(" ", "")
                     )
-                    _is_hook_refused = "/api/splash/incoming" in lower and (
+                    _has_hook_marker = (
+                        "offer hook" in lower or "/api/splash/incoming" in lower
+                    )
+                    _has_received_offer = "received offer:" in lower
+                    _is_connection_refused = (
                         "connection refused" in lower
                         or "actively refused" in lower
                         or "os error 10061" in lower
                     )
-                    _is_hook_failure = (
-                        "offer hook" in lower or "/api/splash/incoming" in lower
-                    ) and (
-                        _is_hook_refused
-                        or "429" in lower
-                        or "too many requests" in lower
-                        or "failed" in lower
-                        or "error" in lower
+                    _is_interleaved_offer_failure = _has_received_offer and (
+                        _is_connection_refused
+                        or "tcp connect error" in lower
+                        or "error trying to connect" in lower
+                        # Windows can split ``(os error 10061)`` across
+                        # concurrent Rust writes, leaving only ``(os error``
+                        # immediately before the received-offer marker.
+                        or "os error" in lower
+                    )
+                    _is_hook_refused = _is_connection_refused and (
+                        _has_hook_marker or _has_received_offer
+                    )
+                    _is_hook_failure = _is_interleaved_offer_failure or (
+                        _has_hook_marker
+                        and (
+                            _is_hook_refused
+                            or "429" in lower
+                            or "too many requests" in lower
+                            or "rate_limited" in lower
+                            or "backlog_full" in lower
+                            or "failed" in lower
+                            or "error" in lower
+                        )
+                    )
+                    now = time.time()
+                    _is_hook_failure_fragment = (
+                        now - self._last_hook_failure_fragment_time <= 2.0
+                        and (
+                            _is_connection_refused
+                            or "tcp connect error" in lower
+                            or "error trying to connect" in lower
+                            or "error sending request" in lower
+                        )
                     )
                     if "duplicate" in lower:
                         log_event("debug", "splash_node_output", f"Splash: {line}")
                     elif _is_hook_failure:
-                        now = time.time()
+                        # Splash writes concurrent Rust errors to Windows stdout
+                        # in fragments.  Keep a very short context window so the
+                        # continuation lines cannot bypass the 60-second hook
+                        # warning throttle below.
+                        self._last_hook_failure_fragment_time = now
                         last_logged = float(
                             getattr(self, "_last_hook_failure_log_time", 0.0) or 0.0
                         )
@@ -611,15 +663,32 @@ class SplashNode:
                             severity = "debug" if _since_start < 30 else "warning"
                             if _is_hook_refused and _since_start < 30:
                                 prefix = "Splash webhook waiting for Flask"
-                            elif "429" in lower or "too many requests" in lower:
+                            elif (
+                                "429" in lower
+                                or "too many requests" in lower
+                                or "rate_limited" in lower
+                                or "backlog_full" in lower
+                                or now
+                                - float(self._last_webhook_delivery_time or 0.0)
+                                <= 30.0
+                            ):
                                 prefix = "Splash webhook backpressure active"
                             else:
                                 prefix = "Splash webhook delivery failing"
                             log_event(
                                 severity,
                                 "splash_node_output",
-                                f"{prefix}; suppressing repeated hook errors for 60s",
+                                (
+                                    f"{prefix}; inbound delivery remains live; "
+                                    "suppressing repeated hook errors for 60s"
+                                    if now
+                                    - float(self._last_webhook_delivery_time or 0.0)
+                                    <= 30.0
+                                    else f"{prefix}; suppressing repeated hook errors for 60s"
+                                ),
                             )
+                    elif _is_hook_failure_fragment:
+                        self._last_hook_failure_fragment_time = now
                     elif _is_startup_burst:
                         log_event(
                             "debug", "splash_node_output", f"Splash (startup): {line}"
@@ -698,7 +767,14 @@ class SplashNode:
             self._last_output_lines[-10:] if self._last_output_lines else []
         )
         health["manager_running"] = self._running
-        health["metrics"] = self.get_metrics()
+        metrics = self.get_metrics()
+        # Counters are intentionally retained as last-known evidence after a
+        # stop, but they must not advertise a dead daemon as currently
+        # reachable.  The GUI uses this flag to distinguish live peer data
+        # from cached cumulative totals.
+        if not health["process_running"]:
+            metrics["reachable"] = False
+        health["metrics"] = metrics
         return health
 
     def get_metrics(self) -> Dict:

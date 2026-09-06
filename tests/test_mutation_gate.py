@@ -346,6 +346,26 @@ def test_release_requires_generation_and_every_journal_blocker_resolved(
     assert gate.status().allowed is True
 
 
+def test_release_supports_native_bulk_cancel_cohort_above_legacy_64_cap(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    operation_ids = [f"cancel:{index:064x}" for index in range(71)]
+    for operation_id in operation_ids:
+        _append_event(operation_id, blocks=True, suffix="unknown")
+    gate.trip("CANCEL_SUBMITTED_UNCONFIRMED", operation_ids)
+    for operation_id in operation_ids:
+        _append_event(operation_id, blocks=False, suffix="reconciled")
+
+    released = gate.release_resolved(1, operation_ids)
+
+    assert released["released"] is True
+    assert released["reason"] == "released"
+    assert gate.status().allowed is True
+
+
 def test_release_clears_matching_local_fence_after_external_durable_resolution(
     isolated_gate_database,
 ):
@@ -883,6 +903,36 @@ def test_database_write_lock_during_heartbeat_fails_closed(
     with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
         gate.require_allowed("coin.split")
     assert exc_info.value.reason_code == "HEARTBEAT_FAILED"
+
+
+def test_transient_durable_heartbeat_failure_retries_before_process_fence(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    real_heartbeat = database.heartbeat_runtime_mutation_lease
+    calls = 0
+
+    def transient_failure(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_heartbeat(**kwargs)
+
+    monkeypatch.setattr(
+        database,
+        "heartbeat_runtime_mutation_lease",
+        transient_failure,
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is True
+    assert calls == 2
+    assert gate.status().allowed is True
 
 
 def test_release_uses_exact_owner_and_version_and_cannot_be_reused(
@@ -2004,6 +2054,75 @@ def test_coin_prep_telemetry_does_not_enter_wallet_mutation_gate(monkeypatch):
     ]
 
 
+def test_splash_inbox_during_coin_prep_does_not_latch_parent_process(
+    isolated_gate_database, monkeypatch
+):
+    """Market-data ingestion must not permanently fence an in-flight prep owner."""
+    import api_server
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    operation_id = "create:pending-prep-effect"
+    _append_event(operation_id, blocks=True, suffix="submitted")
+    database.trip_runtime_safety_latch(
+        reason_code="CREATE_UNKNOWN",
+        blocking_operation_ids=[operation_id],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server.mutation_gate, "enter_mutation", gate.enter_mutation)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(SPLASH_RECEIVE_ENABLED=True))
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "_splash_incoming_rate_limited", lambda: False)
+    monkeypatch.setattr(api_server, "_splash_incoming_backlog_full", lambda: False)
+
+    response = api_server.app.test_client().post(
+        "/api/splash/incoming",
+        json={"offer": "offer1testincomingmarketdata"},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "new": True}
+    assert gate.read_only_status().allowed is False
+    assert database.get_splash_incoming_offers(limit=10)
+    _append_event(operation_id, blocks=False, suffix="confirmed")
+    assert database.resolve_runtime_safety_latch(
+        expected_generation=1,
+        resolved_operation_ids=[operation_id],
+        resolved_at=clock(),
+    )["resolved"] is True
+    assert gate.status().allowed is True
+
+
+@pytest.mark.parametrize(
+    "reason_code", ["COIN_PREP_EFFECT_UNKNOWN", "COIN_PREP_RECOVERY_REQUIRED"]
+)
+def test_coin_prep_latch_diagnostics_preserve_the_actionable_reason(
+    isolated_gate_database, reason_code
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code=reason_code,
+        blocking_operation_ids=["coin-prep:pending"],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    status = gate.read_only_status().to_dict()
+    assert status["allowed"] is False
+    assert status["reason_code"] == reason_code
+    assert status["blocking_operation_count"] == 1
+    with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
+        gate.require_allowed("offer.create")
+    assert exc_info.value.reason_code == reason_code
+
+
 def test_api_blocks_mutation_but_keeps_diagnostics_and_read_only_posts(
     monkeypatch,
 ):
@@ -2430,6 +2549,78 @@ def test_every_existing_public_appbridge_callable_has_auditable_access_classific
         in {"mutation", "read_only", "control"}
         for name in public
     )
+
+
+def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
+    isolated_gate_database, monkeypatch,
+):
+    """Desktop prep must reach wallet preflight, not lose its permit in Flask g."""
+    import api_server
+    import app_bridge
+    from blueprints import coin_prep
+
+    _, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server, "wallet_setup_bootstrap_allows", lambda _op: False)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
+    monkeypatch.setattr(api_server, "_coin_prep_thread", None)
+    monkeypatch.setattr(api_server, "_coin_prep_state", {"running": False})
+    # Stop at the external wallet boundary: no wallet calls, resets or worker.
+    monkeypatch.setattr(
+        coin_prep, "_wallet_open_offer_snapshot_before_prep",
+        lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
+    )
+
+    result = app_bridge.AppBridge().trigger_coin_prep()
+
+    assert result["error"] == "coin_prep_wallet_offer_check_unavailable"
+    assert result["reason"] == "WALLET_OFFER_BOOK_UNAVAILABLE"
+    assert api_server._coin_prep_state["running"] is False
+    # Early return must release both admission and exclusive fencing.
+    next_permit = gate.enter_mutation("test:after-desktop-preflight")
+    assert gate.acquire_exclusive_mutation(
+        next_permit, "test:after-desktop-preflight", timeout_seconds=0,
+    ) is True
+    assert gate.exit_mutation(next_permit) is True
+
+
+@pytest.mark.parametrize("payload, expected", [
+    (None, {}),
+    ({"coin_multiplier": 1.5, "reset_pnl": False,
+      "reset_offer_history": True, "reset_counters": True},
+     {"coin_multiplier": 1.5, "reset_pnl": False,
+      "reset_offer_history": True, "reset_counters": True}),
+    ({"full_reset": True, "reset_offer_history": False},
+     {"full_reset": True, "reset_offer_history": False}),
+])
+def test_desktop_coin_prep_forwards_selected_options(
+    isolated_gate_database, monkeypatch, payload, expected,
+):
+    """Native prep must deliver the same JSON contract as browser HTTP prep."""
+    from flask import jsonify, request
+    import api_server
+    import app_bridge
+
+    _, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server, "wallet_setup_bootstrap_allows", lambda _op: False)
+    # Observe the bridge's outbound JSON at the handler boundary, without
+    # actually deleting histories or launching a financial operation.
+    monkeypatch.setattr(
+        api_server, "api_coin_prep_trigger",
+        lambda: jsonify({"success": True, "received": request.get_json()}),
+    )
+
+    result = app_bridge.AppBridge().trigger_coin_prep(payload)
+
+    assert result == {"success": True, "received": expected}
 
 
 def test_future_unclassified_appbridge_callable_defaults_to_mutation_guard(

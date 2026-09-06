@@ -28,6 +28,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -1428,6 +1429,7 @@ CREATE TABLE IF NOT EXISTS coin_prep_operations (
                                'operator_recovery', 'top_up', 'fee_reserve')),
     source_coin_ids_json   TEXT NOT NULL,
     target_contract_json   TEXT NOT NULL,
+    constructed_outputs_json TEXT,
     wallet_identity_json   TEXT NOT NULL,
     prepared_evidence_json TEXT NOT NULL,
     effect_claim_token     TEXT,
@@ -6327,6 +6329,7 @@ def _init_database_impl():
     for column_name, column_sql in (
         ("effect_claim_token", "TEXT"),
         ("effect_claim_generation", "INTEGER"),
+        ("constructed_outputs_json", "TEXT"),
     ):
         try:
             conn.execute(f"SELECT {column_name} FROM coin_prep_operations LIMIT 1")
@@ -11016,9 +11019,8 @@ def reconcile_coins_with_wallet(
             store_id = nid if nid.startswith("0x") else "0x" + nid
 
             if nid not in db_ids:
-                if (
-                    nid in registry_protected
-                    or _coin_has_authoritative_permanent_spend(conn, store_id)
+                if nid in registry_protected or _coin_has_authoritative_permanent_spend(
+                    conn, store_id
                 ):
                     stats["protected"] += 1
                     continue
@@ -11861,15 +11863,19 @@ def get_tier_spare_counts(wallet_type: str) -> Dict[str, int]:
 
     Returns dict like: {'inner': 5, 'mid': 3, 'outer': 5, 'extreme': 2}
     """
+    from replacement_capacity import COIN_PURPOSES
+
     conn = get_connection()
+    purpose_placeholders = ",".join("?" for _ in COIN_PURPOSES)
     rows = conn.execute(
         f"""SELECT assigned_tier, COUNT(*) as cnt
            FROM coins
            WHERE wallet_type=? AND designation='tier_spare'
                  AND status='free'
+                 AND purpose IN ({purpose_placeholders})
                  AND {_authoritative_coin_available_predicate()}
            GROUP BY assigned_tier""",
-        (wallet_type,),
+        (wallet_type, *COIN_PURPOSES),
     ).fetchall()
 
     result = {"inner": 0, "mid": 0, "outer": 0, "extreme": 0, "sniper": 0, "fees": 0}
@@ -11894,6 +11900,8 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
     It intentionally ignores locked/tier_active coins because the dashboard
     copy describes the pool as coins still available before a top-up is needed.
     """
+    from replacement_capacity import COIN_PURPOSES
+
     conn = get_connection()
     result = {
         "enabled": True,
@@ -11920,13 +11928,17 @@ def get_live_tier_group_counts() -> Dict[str, Dict[str, int]]:
         "meta": {"xch_order": "size_tier", "cat_order": "sell_position"},
     }
 
+    purpose_placeholders = ",".join("?" for _ in COIN_PURPOSES)
     rows = conn.execute(
         f"""SELECT wallet_type, designation, assigned_tier, COUNT(*) as cnt
            FROM coins
            WHERE status='free'
              AND designation IN ('tier_spare', 'reserve', 'dust')
+             AND (designation != 'tier_spare'
+                  OR purpose IN ({purpose_placeholders}))
              AND {_authoritative_coin_available_predicate()}
-           GROUP BY wallet_type, designation, assigned_tier"""
+           GROUP BY wallet_type, designation, assigned_tier""",
+        COIN_PURPOSES,
     ).fetchall()
 
     for row in rows:
@@ -18885,7 +18897,7 @@ def set_setting(key: str, value: str) -> bool:
 
 def record_splash_incoming(
     offer_bech32: str, fingerprint: str, pair_hint: str = None, source_ip: str = None
-) -> bool:
+) -> Optional[bool]:
     """Record an offer received from the Splash P2P network.
 
     Args:
@@ -18894,55 +18906,74 @@ def record_splash_incoming(
         pair_hint: Optional hint about which pair this offer is for
         source_ip: Optional IP address of the sending peer
 
-    Returns True if recorded (new), False if duplicate fingerprint.
+    Returns True if recorded (new), False if duplicate fingerprint, and None
+    when persistence failed.  Callers must not acknowledge None as a
+    successful webhook delivery because the peer may need to retry it.
     """
     conn = get_connection()
-    try:
-        # Skip if we already have this fingerprint (dedup)
-        existing = conn.execute(
-            "SELECT id FROM splash_incoming_offers WHERE fingerprint = ?",
-            (fingerprint,),
-        ).fetchone()
-        if existing:
-            return False
-
-        conn.execute(
-            """INSERT INTO splash_incoming_offers
-               (offer_bech32, fingerprint, received_at, status, pair_hint, source_ip)
-               VALUES (?, ?, ?, 'new', ?, ?)""",
-            (offer_bech32, fingerprint, _now(), pair_hint, source_ip),
-        )
-        conn.commit()
-        return True
-    except Exception as e:
+    for attempt in range(2):
         try:
-            conn.rollback()
-        except Exception:
-            pass
-        log_event("warning", "splash_db_error", f"Failed to record incoming offer: {e}")
-        return False
+            # Skip if we already have this fingerprint (dedup).  The webhook
+            # path is serialized in api_server, so repeating this whole unit
+            # after a transient SQLite busy result is safe and preserves the
+            # same authoritative duplicate decision.
+            existing = conn.execute(
+                "SELECT id FROM splash_incoming_offers WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                return False
+
+            conn.execute(
+                """INSERT INTO splash_incoming_offers
+                   (offer_bech32, fingerprint, received_at, status, pair_hint, source_ip)
+                   VALUES (?, ?, ?, 'new', ?, ?)""",
+                (offer_bech32, fingerprint, _now(), pair_hint, source_ip),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt == 0 and _sqlite_locked(e):
+                continue
+            log_event(
+                "warning", "splash_db_error", f"Failed to record incoming offer: {e}"
+            )
+            return None
+
+    return None
 
 
-def get_splash_incoming_offers(status: str = None, limit: int = 50) -> List[Dict]:
+def get_splash_incoming_offers(
+    status: str = None,
+    limit: int = 50,
+    oldest_first: bool = False,
+) -> List[Dict]:
     """Get incoming offers from the Splash network.
 
     Args:
         status: Filter by status ('new', 'processed', 'ignored', 'expired')
         limit: Max number of results
+        oldest_first: Select oldest rows first for starvation-free processing
 
     Returns list of offer dicts.
     """
     conn = get_connection()
     try:
+        order = "ASC" if oldest_first else "DESC"
         if status:
             rows = conn.execute(
                 "SELECT * FROM splash_incoming_offers WHERE status = ? "
-                "ORDER BY received_at DESC LIMIT ?",
+                f"ORDER BY received_at {order}, id {order} LIMIT ?",
                 (status, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM splash_incoming_offers ORDER BY received_at DESC LIMIT ?",
+                f"SELECT * FROM splash_incoming_offers "
+                f"ORDER BY received_at {order}, id {order} LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -18962,28 +18993,35 @@ def update_splash_incoming_status(
         status: New status ('processed', 'ignored', 'expired')
     """
     conn = get_connection()
-    try:
-        if pair_hint is None:
-            conn.execute(
-                "UPDATE splash_incoming_offers SET status = ? WHERE id = ?",
-                (status, offer_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE splash_incoming_offers SET status = ?, pair_hint = ? WHERE id = ?",
-                (status, pair_hint, offer_id),
-            )
-        conn.commit()
-        return True
-    except Exception as e:
+    for attempt in range(2):
         try:
-            conn.rollback()
-        except Exception:
-            pass
-        log_event(
-            "warning", "splash_db_error", f"Failed to update offer {offer_id}: {e}"
-        )
-        return False
+            if pair_hint is None:
+                conn.execute(
+                    "UPDATE splash_incoming_offers SET status = ? WHERE id = ?",
+                    (status, offer_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE splash_incoming_offers SET status = ?, pair_hint = ? WHERE id = ?",
+                    (status, pair_hint, offer_id),
+                )
+            conn.commit()
+            return True
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt == 0 and _sqlite_locked(e):
+                continue
+            log_event(
+                "warning",
+                "splash_db_error",
+                f"Failed to update offer {offer_id}: {e}",
+            )
+            return False
+
+    return False
 
 
 def get_splash_incoming_stats(asset_id: str = None) -> Dict:
@@ -19661,18 +19699,9 @@ _JOURNAL_COMPARE_COLUMNS = (
 )
 
 
-def validate_offer_operation_event(event: Any) -> Dict[str, Any]:
-    """Return one exact canonical journal row or fail closed.
+def _validate_offer_operation_event_uncached(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalize one already shape-checked immutable journal row."""
 
-    This reuses the write-path validator so readers cannot trust parseable
-    evidence whose digest or other canonical event fields were altered.
-    """
-
-    if type(event) is not dict or set(event) != {
-        "sequence",
-        *_JOURNAL_COMPARE_COLUMNS,
-    }:
-        raise ValueError("offer operation event fields are invalid")
     sequence = _exact_integer(event["sequence"], "sequence", minimum=1)
     blocks_mutation = event["blocks_mutation"]
     if type(blocks_mutation) is not int or blocks_mutation not in {0, 1}:
@@ -19698,6 +19727,38 @@ def validate_offer_operation_event(event: Any) -> Dict[str, Any]:
     if any(event[column] != canonical[column] for column in _JOURNAL_COMPARE_COLUMNS):
         raise ValueError("offer operation event is not canonical")
     return {"sequence": sequence, **canonical}
+
+
+@lru_cache(maxsize=512)
+def _validate_offer_operation_event_cached(
+    cache_key: tuple[Any, ...],
+) -> tuple[tuple[str, Any], ...]:
+    """Cache exact immutable-row validation without sharing a mutable result."""
+
+    columns = ("sequence", *_JOURNAL_COMPARE_COLUMNS)
+    canonical = _validate_offer_operation_event_uncached(dict(zip(columns, cache_key)))
+    return tuple(canonical.items())
+
+
+def validate_offer_operation_event(event: Any) -> Dict[str, Any]:
+    """Return one exact canonical journal row or fail closed.
+
+    This reuses the write-path validator so readers cannot trust parseable
+    evidence whose digest or other canonical event fields were altered.  Exact
+    immutable SQLite rows are cached by every canonical field because native
+    Sage bulk settlement must re-check the cohort after each member commit.
+    Any changed field produces a distinct key and is fully revalidated.
+    """
+
+    columns = ("sequence", *_JOURNAL_COMPARE_COLUMNS)
+    if type(event) is not dict or set(event) != set(columns):
+        raise ValueError("offer operation event fields are invalid")
+    cache_key = tuple(event[column] for column in columns)
+    try:
+        hash(cache_key)
+    except TypeError:
+        return _validate_offer_operation_event_uncached(event)
+    return dict(_validate_offer_operation_event_cached(cache_key))
 
 
 def _insert_offer_operation_event(
@@ -20535,6 +20596,125 @@ def get_offer_cancel_effect_claim(
     return None if row is None else _validated_offer_cancel_effect_claim(dict(row))
 
 
+def claim_offer_cancel_cohort_effects(
+    *,
+    manifest_json: Any,
+    claimed_at: Any = None,
+) -> Dict[str, Any]:
+    """Atomically grant one complete cancellation cohort its wallet effect."""
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    claim_time = _stability_timestamp_or_now(claimed_at, "claimed_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        durable_manifest_row = conn.execute(
+            """
+            SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+                   manifest_json, created_at
+            FROM offer_cancel_cohort_manifests WHERE cohort_id=?
+            """,
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if durable_manifest_row is None:
+            raise ValueError("cancellation cohort effect claim requires a manifest")
+        durable_manifest = _validated_offer_cancel_cohort_manifest_row(
+            dict(durable_manifest_row)
+        )
+        if durable_manifest != manifest:
+            raise ValueError("cancellation cohort effect claim manifest is not exact")
+
+        recovery_latch = conn.execute(
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if recovery_latch is None or recovery_latch["state"] != "resolved":
+            raise ValueError("cancellation effect claim is blocked by runtime recovery")
+        recovery_generation = int(recovery_latch["generation"])
+
+        existing_claims = []
+        for member in manifest["members"]:
+            prepared_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            if prepared_row is None:
+                raise ValueError(
+                    "cancellation cohort effect claim requires every PREPARED member"
+                )
+            validate_offer_cancel_cohort_prepared_event(
+                dict(prepared_row),
+                manifest,
+            )
+            finalized = conn.execute(
+                """
+                SELECT 1 FROM offer_operation_journal
+                WHERE operation_id=? AND attempt=? AND phase='FINALIZED'
+                """,
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            if finalized is not None:
+                raise ValueError(
+                    "finalized cancellation cohort cannot claim a wallet effect"
+                )
+            existing = conn.execute(
+                """
+                SELECT operation_id, attempt, prepared_event_id, claimed_at,
+                       recovery_generation
+                FROM offer_cancel_effect_claims
+                WHERE operation_id=? AND attempt=?
+                """,
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            if existing is not None:
+                validated = _validated_offer_cancel_effect_claim(dict(existing))
+                if (
+                    validated["prepared_event_id"] != member["prepared_event_id"]
+                    or int(existing["recovery_generation"]) != recovery_generation
+                ):
+                    raise ValueError(
+                        "cancellation cohort effect claim replay is not exact"
+                    )
+            existing_claims.append(existing)
+
+        if any(claim is not None for claim in existing_claims):
+            if not all(claim is not None for claim in existing_claims):
+                raise ValueError("cancellation cohort effect claim is partial")
+            conn.commit()
+            return {
+                "cohort_id": manifest["cohort_id"],
+                "effect_claimed": False,
+                "member_count": manifest["member_count"],
+            }
+
+        for member in manifest["members"]:
+            conn.execute(
+                """
+                INSERT INTO offer_cancel_effect_claims (
+                    operation_id, attempt, prepared_event_id, claimed_at,
+                    recovery_generation
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    member["operation_id"],
+                    member["attempt"],
+                    member["prepared_event_id"],
+                    claim_time,
+                    recovery_generation,
+                ),
+            )
+        conn.commit()
+        return {
+            "cohort_id": manifest["cohort_id"],
+            "effect_claimed": True,
+            "member_count": manifest["member_count"],
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def claim_offer_cancel_effect(
     *,
     operation_id: str,
@@ -20631,7 +20811,7 @@ def claim_offer_cancel_effect(
         conn.close()
 
 
-def finalize_offer_cancel(
+def _offer_cancel_finalization_values(
     *,
     operation_id: str,
     event_id: str,
@@ -20644,12 +20824,6 @@ def finalize_offer_cancel(
     finalized_at: Any = None,
     require_unclaimed: bool = False,
 ) -> Dict[str, Any]:
-    """Append one typed nonterminal cancellation result atomically.
-
-    Task 8 deliberately has no terminal-proof authority.  A claimed confirmed
-    result is rejected until Task 9 supplies the separate proof boundary.
-    """
-
     from cancel_outcomes import (
         CANCEL_CONFIRMED,
         CANCEL_FAILED,
@@ -20727,103 +20901,238 @@ def finalize_offer_cancel(
         blocks_mutation=derived_blocker,
         created_at=final_time,
     )
+    return {
+        "journal": journal,
+        "safe_trade_id": safe_trade_id,
+        "result": result,
+        "outcome": outcome,
+        "safe_wallet_json": safe_wallet_json,
+        "evidence": evidence,
+        "require_unclaimed": require_unclaimed,
+    }
+
+
+def _finalize_offer_cancel_in_transaction(
+    conn: sqlite3.Connection,
+    values: Dict[str, Any],
+) -> Dict[str, Any]:
+    journal = values["journal"]
+    safe_trade_id = values["safe_trade_id"]
+    outcome = values["outcome"]
+    safe_wallet_json = values["safe_wallet_json"]
+    require_unclaimed = values["require_unclaimed"]
     safe_operation_id = journal["operation_id"]
     safe_intent_id = journal["intent_id"]
     safe_attempt = journal["attempt"]
-    conn = _stability_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        prepared_row = conn.execute(
+    prepared_row = conn.execute(
+        """
+        SELECT * FROM offer_operation_journal
+        WHERE operation_id=? AND attempt=? AND phase='PREPARED'
+        """,
+        (safe_operation_id, safe_attempt),
+    ).fetchone()
+    if prepared_row is None:
+        raise ValueError("cancellation result has no prepared request")
+    prepared_event = validate_offer_operation_event(dict(prepared_row))
+    if (
+        prepared_event["operation_type"] != "CANCEL"
+        or prepared_event["outcome"] != "PREPARED"
+        or prepared_event["blocks_mutation"] != 1
+        or prepared_event["intent_id"] != safe_intent_id
+        or prepared_event["wallet_identity_json"] != safe_wallet_json
+    ):
+        raise ValueError("cancellation prepared request does not match result")
+    prepared_evidence = json.loads(prepared_event["evidence_json"])
+    if prepared_evidence.get("trade_id") != safe_trade_id:
+        raise ValueError("cancellation prepared trade identity does not match")
+    if require_unclaimed:
+        if prepared_evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1":
+            raise ValueError("unclaimed cancellation finalization lacks cohort authority")
+        effect_claim = conn.execute(
             """
-            SELECT * FROM offer_operation_journal
-            WHERE operation_id=? AND attempt=? AND phase='PREPARED'
+            SELECT operation_id, attempt, prepared_event_id, claimed_at
+            FROM offer_cancel_effect_claims
+            WHERE operation_id=? AND attempt=?
             """,
             (safe_operation_id, safe_attempt),
         ).fetchone()
-        if prepared_row is None:
-            raise ValueError("cancellation result has no prepared request")
-        prepared_event = validate_offer_operation_event(dict(prepared_row))
-        if (
-            prepared_event["operation_type"] != "CANCEL"
-            or prepared_event["outcome"] != "PREPARED"
-            or prepared_event["blocks_mutation"] != 1
-            or prepared_event["intent_id"] != safe_intent_id
-            or prepared_event["wallet_identity_json"] != safe_wallet_json
-        ):
-            raise ValueError("cancellation prepared request does not match result")
-        prepared_evidence = json.loads(prepared_event["evidence_json"])
-        if prepared_evidence.get("trade_id") != safe_trade_id:
-            raise ValueError("cancellation prepared trade identity does not match")
-        if require_unclaimed:
-            if (
-                prepared_evidence.get("effect_claim_protocol")
-                != "durable_cohort_claim_v1"
-            ):
-                raise ValueError(
-                    "unclaimed cancellation finalization lacks cohort authority"
-                )
-            effect_claim = conn.execute(
-                """
-                SELECT operation_id, attempt, prepared_event_id, claimed_at
-                FROM offer_cancel_effect_claims
-                WHERE operation_id=? AND attempt=?
-                """,
-                (safe_operation_id, safe_attempt),
-            ).fetchone()
-            if effect_claim is not None:
-                _validated_offer_cancel_effect_claim(dict(effect_claim))
-                raise ValueError(
-                    "unclaimed cancellation finalization conflicts with effect claim"
-                )
-        else:
-            effect_claim = conn.execute(
-                "SELECT recovery_generation FROM offer_cancel_effect_claims "
-                "WHERE operation_id=? AND attempt=?",
-                (safe_operation_id, safe_attempt),
-            ).fetchone()
-            if effect_claim is not None:
-                latch = conn.execute(
-                    "SELECT generation,state FROM runtime_safety_latch "
-                    "WHERE singleton_id=1"
-                ).fetchone()
-                if (
-                    latch is None
-                    or latch["state"] != "resolved"
-                    or int(effect_claim["recovery_generation"])
-                    != int(latch["generation"])
-                ):
-                    raise ValueError(
-                        "cancellation completion is fenced by runtime recovery"
-                    )
-        prior_lifecycle_state = prepared_evidence.get("prior_lifecycle_state")
-        if prior_lifecycle_state is not None and (
-            type(prior_lifecycle_state) is not str
-            or not prior_lifecycle_state
-            or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
-        ):
-            raise ValueError("cancellation prior lifecycle is invalid")
-        legacy_offer = conn.execute(
-            "SELECT status FROM offers WHERE trade_id=?",
-            (safe_trade_id,),
+        if effect_claim is not None:
+            _validated_offer_cancel_effect_claim(dict(effect_claim))
+            raise ValueError(
+                "unclaimed cancellation finalization conflicts with effect claim"
+            )
+    else:
+        effect_claim = conn.execute(
+            "SELECT recovery_generation FROM offer_cancel_effect_claims "
+            "WHERE operation_id=? AND attempt=?",
+            (safe_operation_id, safe_attempt),
         ).fetchone()
-        if legacy_offer is not None and legacy_offer["status"] != "open":
-            raise ValueError("cancellation cannot rewrite a terminal legacy offer")
-        row = _insert_offer_operation_event(conn, journal)
-        if legacy_offer is not None:
-            next_lifecycle_state = (
-                prior_lifecycle_state
-                if outcome == CANCEL_FAILED and prior_lifecycle_state is not None
-                else "cancel_requested"
-            )
-            conn.execute(
-                """
-                UPDATE offers SET lifecycle_state=?
-                WHERE trade_id=? AND status='open'
-                """,
-                (next_lifecycle_state, safe_trade_id),
-            )
+        if effect_claim is not None:
+            latch = conn.execute(
+                "SELECT generation,state FROM runtime_safety_latch "
+                "WHERE singleton_id=1"
+            ).fetchone()
+            if (
+                latch is None
+                or latch["state"] != "resolved"
+                or int(effect_claim["recovery_generation"]) != int(latch["generation"])
+            ):
+                raise ValueError("cancellation completion is fenced by runtime recovery")
+    prior_lifecycle_state = prepared_evidence.get("prior_lifecycle_state")
+    if prior_lifecycle_state is not None and (
+        type(prior_lifecycle_state) is not str
+        or not prior_lifecycle_state
+        or prior_lifecycle_state in _NON_ACTIONABLE_OPEN_LIFECYCLE_STATES
+    ):
+        raise ValueError("cancellation prior lifecycle is invalid")
+    legacy_offer = conn.execute(
+        "SELECT status FROM offers WHERE trade_id=?",
+        (safe_trade_id,),
+    ).fetchone()
+    if legacy_offer is not None and legacy_offer["status"] != "open":
+        raise ValueError("cancellation cannot rewrite a terminal legacy offer")
+    row = _insert_offer_operation_event(conn, journal)
+    if legacy_offer is not None:
+        next_lifecycle_state = (
+            prior_lifecycle_state
+            if outcome == "CANCEL_FAILED" and prior_lifecycle_state is not None
+            else "cancel_requested"
+        )
+        conn.execute(
+            """
+            UPDATE offers SET lifecycle_state=?
+            WHERE trade_id=? AND status='open'
+            """,
+            (next_lifecycle_state, safe_trade_id),
+        )
+    return row
+
+
+def finalize_offer_cancel(
+    *,
+    operation_id: str,
+    event_id: str,
+    trade_id: str,
+    intent_id: Optional[str],
+    attempt: int,
+    cancel_result: Any,
+    wallet_identity_json: Any,
+    evidence_json: Any,
+    finalized_at: Any = None,
+    require_unclaimed: bool = False,
+) -> Dict[str, Any]:
+    """Append one typed nonterminal cancellation result atomically.
+
+    Task 8 deliberately has no terminal-proof authority.  A claimed confirmed
+    result is rejected until Task 9 supplies the separate proof boundary.
+    """
+
+    values = _offer_cancel_finalization_values(
+        operation_id=operation_id,
+        event_id=event_id,
+        trade_id=trade_id,
+        intent_id=intent_id,
+        attempt=attempt,
+        cancel_result=cancel_result,
+        wallet_identity_json=wallet_identity_json,
+        evidence_json=evidence_json,
+        finalized_at=finalized_at,
+        require_unclaimed=require_unclaimed,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _finalize_offer_cancel_in_transaction(conn, values)
         conn.commit()
         return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finalize_offer_cancel_cohort(
+    *,
+    manifest_json: Any,
+    member_requests_json: Any,
+    finalized_at: Any = None,
+) -> Dict[str, Any]:
+    """Atomically finalize every member of one shared cancellation effect."""
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    if (
+        type(member_requests_json) is not list
+        or len(member_requests_json) != manifest["member_count"]
+    ):
+        raise ValueError("cancellation cohort results do not match the manifest")
+    request_keys = {
+        "operation_id",
+        "event_id",
+        "trade_id",
+        "intent_id",
+        "attempt",
+        "cancel_result",
+        "wallet_identity_json",
+        "evidence_json",
+    }
+    values_by_member = []
+    shared_result = None
+    for member, request in zip(manifest["members"], member_requests_json):
+        if type(request) is not dict or set(request) != request_keys:
+            raise ValueError("cancellation cohort result fields are invalid")
+        identity = {
+            "operation_id": request["operation_id"],
+            "trade_id": request["trade_id"],
+            "intent_id": request["intent_id"],
+            "attempt": request["attempt"],
+        }
+        if any(identity[key] != member[key] for key in identity):
+            raise ValueError("cancellation cohort result is not manifest-bound")
+        values = _offer_cancel_finalization_values(
+            **request,
+            finalized_at=finalized_at,
+            require_unclaimed=False,
+        )
+        if values["evidence"].get("cohort_id") != manifest["cohort_id"]:
+            raise ValueError("cancellation cohort result evidence is not manifest-bound")
+        if shared_result is None:
+            shared_result = values["result"]
+        elif values["result"] != shared_result:
+            raise ValueError("cancellation cohort must share one wallet result")
+        values_by_member.append((member, values))
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        durable_manifest_row = conn.execute(
+            """
+            SELECT manifest_sequence, cohort_id, manifest_sha256, member_count,
+                   manifest_json, created_at
+            FROM offer_cancel_cohort_manifests WHERE cohort_id=?
+            """,
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if durable_manifest_row is None or (
+            _validated_offer_cancel_cohort_manifest_row(dict(durable_manifest_row))
+            != manifest
+        ):
+            raise ValueError("cancellation cohort result manifest is not exact")
+        events = []
+        for member, values in values_by_member:
+            prepared_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            if prepared_row is None:
+                raise ValueError("cancellation cohort result requires every member")
+            validate_offer_cancel_cohort_prepared_event(
+                dict(prepared_row),
+                manifest,
+            )
+            events.append(_finalize_offer_cancel_in_transaction(conn, values))
+        conn.commit()
+        return {"manifest": manifest, "events": events}
     except Exception:
         conn.rollback()
         raise
@@ -20966,11 +21275,11 @@ def prepare_coin_prep_operation(
             """
             INSERT INTO coin_prep_operations (
                 operation_id, operation_kind, purpose, source_coin_ids_json,
-                target_contract_json, wallet_identity_json,
+                target_contract_json, constructed_outputs_json, wallet_identity_json,
                 prepared_evidence_json, effect_claim_token,
                 effect_claim_generation, outcome, outcome_evidence_json,
                 prepared_at, finalized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'PREPARED', NULL, ?, NULL)
             """,
             (
                 immutable["operation_id"],
@@ -20993,6 +21302,121 @@ def prepare_coin_prep_operation(
         )
         conn.commit()
         return {"operation": row, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _canonical_coin_prep_constructed_outputs(target: Dict[str, Any], value: Any) -> str:
+    if target.get("contract_version") != 2:
+        raise ValueError("constructed outputs require a version-2 batch contract")
+    if type(value) is not list or len(value) != len(target.get("outputs") or []):
+        raise ValueError("constructed output count differs from batch target")
+    expected = {
+        (output["asset"], output["ordinal"]): output for output in target["outputs"]
+    }
+    canonical = []
+    coin_ids: set[str] = set()
+    seen: set[tuple[str, int]] = set()
+    for output in value:
+        if type(output) is not dict or set(output) != {
+            "asset",
+            "address",
+            "amount_mojos",
+            "purpose",
+            "ordinal",
+            "coin_id",
+        }:
+            raise ValueError("constructed output fields are invalid")
+        identity = (output.get("asset"), output.get("ordinal"))
+        planned = expected.get(identity)
+        coin_id = norm_coin_id(output.get("coin_id"))
+        if (
+            planned is None
+            or identity in seen
+            or coin_id in coin_ids
+            or output.get("address") != planned["address"]
+            or output.get("amount_mojos") != planned["amount_mojos"]
+            or output.get("purpose") != planned["purpose"]
+        ):
+            raise ValueError("constructed output differs from batch target")
+        seen.add(identity)
+        coin_ids.add(coin_id)
+        canonical.append(
+            {
+                "output_index": planned["output_index"],
+                "asset": planned["asset"],
+                "address": planned["address"],
+                "amount_mojos": planned["amount_mojos"],
+                "purpose": planned["purpose"],
+                "ordinal": planned["ordinal"],
+                "coin_id": coin_id,
+            }
+        )
+    if seen != set(expected):
+        raise ValueError("constructed output identities are incomplete")
+    canonical.sort(key=lambda output: output["output_index"])
+    return _canonical_json_text(
+        canonical,
+        "coin prep constructed outputs",
+        expected_type=list,
+        max_bytes=131072,
+    )
+
+
+def bind_coin_prep_constructed_outputs(
+    operation_id: str,
+    *,
+    plan_hash: str,
+    constructed_outputs: list[dict[str, Any]],
+) -> Dict[str, Any]:
+    """Bind Sage-created output identities after unsigned validation, before dispatch."""
+
+    safe_operation_id = _required_stability_text(operation_id, "operation_id")
+    if type(plan_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", plan_hash) is None:
+        raise ValueError("coin prep plan hash is invalid")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (safe_operation_id,),
+        ).fetchone()
+        if stored is None:
+            raise ValueError("coin prep operation does not exist")
+        row = dict(stored)
+        target = json.loads(row["target_contract_json"])
+        if target.get("contract_version") != 2 or target.get("plan_hash") != plan_hash:
+            raise ValueError("coin prep batch plan hash differs")
+        encoded = _canonical_coin_prep_constructed_outputs(target, constructed_outputs)
+        existing = row.get("constructed_outputs_json")
+        if existing is not None:
+            if existing != encoded:
+                raise ValueError("coin prep constructed outputs cannot be rebound")
+            conn.commit()
+            return {"operation": row, "idempotent": True}
+        dispatched = conn.execute(
+            "SELECT 1 FROM wallet_effect_dispatches "
+            "WHERE claim_token=? AND generation=?",
+            (row["effect_claim_token"], row["effect_claim_generation"]),
+        ).fetchone()
+        if row["outcome"] != "PREPARED" or dispatched is not None:
+            raise ValueError("coin prep outputs must be bound before dispatch")
+        conn.execute(
+            "UPDATE coin_prep_operations SET constructed_outputs_json=? "
+            "WHERE operation_id=?",
+            (encoded, safe_operation_id),
+        )
+        updated = dict(
+            conn.execute(
+                "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+                (safe_operation_id,),
+            ).fetchone()
+        )
+        conn.commit()
+        return {"operation": updated, "idempotent": False}
     except Exception:
         conn.rollback()
         raise
@@ -21514,24 +21938,49 @@ def record_coin_prep_operation_outcome(
                             "legacy top-up fee reconciliation is not authoritative"
                         )
             stored_target = json.loads(current["target_contract_json"])
-            target_outputs = sorted(
-                (output["amount_mojos"], output["purpose"])
-                for output in stored_target["outputs"]
-            )
-            confirmed_outputs = sorted(
-                (output["amount_mojos"], output["purpose"])
-                for output in evidence_payload["expected_outputs"]
-            )
-            if confirmed_outputs != target_outputs and not (
-                _legacy_sage_even_split_confirmation_matches(
-                    current,
-                    stored_target,
-                    evidence_payload["expected_outputs"],
+            if stored_target.get("contract_version") == 2:
+                if not current.get("constructed_outputs_json"):
+                    raise ValueError("coin prep batch outputs were not bound")
+                constructed = json.loads(current["constructed_outputs_json"])
+                bound_outputs = sorted(
+                    (
+                        norm_coin_id(output["coin_id"]),
+                        output["amount_mojos"],
+                        output["purpose"],
+                    )
+                    for output in constructed
                 )
-            ):
-                raise ValueError(
-                    "coin prep confirmed output differs from target contract"
+                confirmed_outputs = sorted(
+                    (
+                        norm_coin_id(output["coin_id"]),
+                        output["amount_mojos"],
+                        output["purpose"],
+                    )
+                    for output in evidence_payload["expected_outputs"]
                 )
+                if confirmed_outputs != bound_outputs:
+                    raise ValueError(
+                        "coin prep confirmed output differs from bound batch outputs"
+                    )
+            else:
+                target_outputs = sorted(
+                    (output["amount_mojos"], output["purpose"])
+                    for output in stored_target["outputs"]
+                )
+                confirmed_outputs = sorted(
+                    (output["amount_mojos"], output["purpose"])
+                    for output in evidence_payload["expected_outputs"]
+                )
+                if confirmed_outputs != target_outputs and not (
+                    _legacy_sage_even_split_confirmation_matches(
+                        current,
+                        stored_target,
+                        evidence_payload["expected_outputs"],
+                    )
+                ):
+                    raise ValueError(
+                        "coin prep confirmed output differs from target contract"
+                    )
         if current["outcome"] == outcome:
             if current["outcome_evidence_json"] != evidence:
                 raise ValueError("coin prep outcome replay evidence differs")
@@ -21559,8 +22008,32 @@ def record_coin_prep_operation_outcome(
                     "last_seen=? WHERE coin_id=?",
                     (when, norm_coin_id(source_coin_id)),
                 )
+            output_wallet_types = {}
+            if target.get("contract_version") == 2:
+                for bound in json.loads(current["constructed_outputs_json"]):
+                    output_wallet_types[norm_coin_id(bound["coin_id"])] = bound["asset"]
+                fee_row = conn.execute(
+                    "SELECT fee_coin_ids_json FROM wallet_effect_claims "
+                    "WHERE claim_token=? AND generation=?",
+                    (
+                        current["effect_claim_token"],
+                        current["effect_claim_generation"],
+                    ),
+                ).fetchone()
+                if fee_row is None:
+                    raise ValueError("coin prep batch fee claim is missing")
+                for fee_coin_id in json.loads(fee_row["fee_coin_ids_json"]):
+                    conn.execute(
+                        "UPDATE coins SET status='spent', trade_id=NULL, "
+                        "designation='unknown', assigned_tier='none', purpose=NULL, "
+                        "last_seen=? WHERE coin_id=?",
+                        (when, norm_coin_id(fee_coin_id)),
+                    )
             for output in evidence_payload["expected_outputs"]:
                 output_coin_id = norm_coin_id(output["coin_id"])
+                output_wallet_type = output_wallet_types.get(
+                    output_coin_id, wallet_type
+                )
                 amount_mojos = _exact_integer(
                     output["amount_mojos"],
                     "coin prep confirmed output amount",
@@ -21579,7 +22052,7 @@ def record_coin_prep_operation_outcome(
                     (output_coin_id,),
                 ).fetchone()
                 if existing_output is not None and (
-                    existing_output["wallet_type"] != wallet_type
+                    existing_output["wallet_type"] != output_wallet_type
                     or int(existing_output["amount_mojos"]) != amount_mojos
                     or existing_output["status"] not in {"free", "gone"}
                     or existing_output["trade_id"] is not None
@@ -21604,7 +22077,7 @@ def record_coin_prep_operation_outcome(
                     """,
                     (
                         output_coin_id,
-                        wallet_type,
+                        output_wallet_type,
                         amount_mojos,
                         when,
                         when,
@@ -22528,50 +23001,69 @@ _RECONCILE_BLOCKING_OUTCOMES = frozenset({"UNKNOWN", "CONFLICT"})
 _RECONCILE_OBSERVATION_OUTCOMES = frozenset({"ACTIVE_PROVEN"})
 
 
-def get_authoritative_terminal_record(trade_id: str) -> Optional[Dict[str, Any]]:
-    """Return the exact proof-bound terminal journal identity for a trade."""
+def get_authoritative_terminal_records(
+    trade_ids: Iterable[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return proof-bound terminal records for many trades in one DB query."""
 
-    safe_trade_id = _required_stability_text(trade_id, "trade_id")
-    row = (
-        get_connection()
-        .execute(
-            """
-        SELECT j.*
+    if type(trade_ids) not in {list, tuple, set, frozenset}:
+        raise ValueError("trade_ids must be an exact collection")
+    safe_trade_ids = list(
+        dict.fromkeys(
+            _required_stability_text(trade_id, "trade_id")
+            for trade_id in trade_ids
+        )
+    )
+    if not safe_trade_ids:
+        return {}
+    placeholders = ",".join("?" for _ in safe_trade_ids)
+    rows = get_connection().execute(
+        f"""
+        SELECT i.sage_trade_id AS _sage_trade_id, j.*
         FROM offer_operation_journal AS j
         JOIN offer_intents AS i ON i.intent_id=j.intent_id
-        WHERE i.sage_trade_id=?
+        WHERE i.sage_trade_id IN ({placeholders})
           AND i.lifecycle_state='terminal'
           AND j.operation_type='RECONCILE'
           AND j.phase='FINALIZED'
         ORDER BY j.sequence DESC
-        LIMIT 1
         """,
-            (safe_trade_id,),
-        )
-        .fetchone()
-    )
-    if row is None:
-        return None
-    event = validate_offer_operation_event(dict(row))
-    outcome = event["outcome"]
-    if outcome not in _RECONCILE_TERMINAL_OUTCOMES:
-        raise RuntimeError("terminal reconciliation journal outcome is invalid")
-    if event["operation_id"] != f"reconcile:{event['intent_id']}":
-        raise RuntimeError("terminal reconciliation journal identity is invalid")
-    return {
-        "attempt_no": event["attempt"],
-        "event_id": event["event_id"],
-        "evidence_sha256": event["evidence_sha256"],
-        "intent_id": event["intent_id"],
-        "operation_id": event["operation_id"],
-        "outcome": outcome,
-        "sage_trade_id": safe_trade_id,
-        "terminal_state": {
-            "FILLED_PROVEN": "filled",
-            "CANCELLED_PROVEN": "cancelled",
-            "EXPIRED_PROVEN": "expired",
-        }[outcome],
-    }
+        tuple(safe_trade_ids),
+    ).fetchall()
+    records = {}
+    for row in rows:
+        raw_event = dict(row)
+        safe_trade_id = raw_event.pop("_sage_trade_id")
+        event = validate_offer_operation_event(raw_event)
+        if safe_trade_id in records:
+            continue
+        outcome = event["outcome"]
+        if outcome not in _RECONCILE_TERMINAL_OUTCOMES:
+            raise RuntimeError("terminal reconciliation journal outcome is invalid")
+        if event["operation_id"] != f"reconcile:{event['intent_id']}":
+            raise RuntimeError("terminal reconciliation journal identity is invalid")
+        records[safe_trade_id] = {
+            "attempt_no": event["attempt"],
+            "event_id": event["event_id"],
+            "evidence_sha256": event["evidence_sha256"],
+            "intent_id": event["intent_id"],
+            "operation_id": event["operation_id"],
+            "outcome": outcome,
+            "sage_trade_id": safe_trade_id,
+            "terminal_state": {
+                "FILLED_PROVEN": "filled",
+                "CANCELLED_PROVEN": "cancelled",
+                "EXPIRED_PROVEN": "expired",
+            }[outcome],
+        }
+    return records
+
+
+def get_authoritative_terminal_record(trade_id: str) -> Optional[Dict[str, Any]]:
+    """Return the exact proof-bound terminal journal identity for a trade."""
+
+    safe_trade_id = _required_stability_text(trade_id, "trade_id")
+    return get_authoritative_terminal_records([safe_trade_id]).get(safe_trade_id)
 
 
 def _reconciliation_coin_identity(value: Any, label: str) -> tuple[str, str]:
@@ -22723,6 +23215,7 @@ def _validate_reconciliation_cancel_context(
     prepared_events: dict[str, Dict[str, Any]] = {}
     latest_events: dict[str, Dict[str, Any]] = {}
     exact_members: list[Dict[str, Any]] = []
+    native_batch_claims: list[Dict[str, Any]] = []
     auxiliary_bare = sorted(
         _reconciliation_coin_identity(value, "Task 8 auxiliary coin")[0]
         for value in context["auxiliary_coin_ids"]
@@ -22823,6 +23316,7 @@ def _validate_reconciliation_cancel_context(
             raise ValueError("Task 8 member intent facts are not exact")
         prepared_evidence = json.loads(prepared["evidence_json"])
         durable_auxiliary = None
+        native_batch_for_member = None
         if type(prepared_evidence) is dict:
             raw_auxiliary = prepared_evidence.get("auxiliary_coin_ids")
             wallet_effect = prepared_evidence.get("wallet_effect")
@@ -22837,6 +23331,65 @@ def _validate_reconciliation_cancel_context(
                     )[0]
                     for value in raw_auxiliary
                 )
+            if type(wallet_effect) is dict and "batch" in wallet_effect:
+                batch = wallet_effect.get("batch")
+                if (
+                    set(wallet_effect)
+                    != {"secure", "timeout", "fee_mojos", "batch"}
+                    or wallet_effect.get("secure") is not True
+                    or wallet_effect.get("timeout") != 60
+                    or type(wallet_effect.get("fee_mojos")) is not int
+                    or isinstance(wallet_effect.get("fee_mojos"), bool)
+                    or wallet_effect["fee_mojos"] <= 0
+                    or wallet_effect["fee_mojos"] != fee_mojos
+                    or type(batch) is not dict
+                    or set(batch)
+                    != {"protocol", "trade_ids", "source_coin_ids", "fee_coin_id"}
+                    or batch.get("protocol")
+                    != "sage_native_cancel_offers_zero_plus_fee_v1"
+                    or type(batch.get("trade_ids")) is not list
+                    or type(batch.get("source_coin_ids")) is not list
+                    or len(batch["trade_ids"]) != len(context["members"])
+                    or len(batch["source_coin_ids"]) != len(context["members"])
+                    or len(batch["trade_ids"]) < 2
+                ):
+                    raise ValueError("Task 8 native bulk cancel claim is invalid")
+                batch_trade_ids = [
+                    _reconciliation_coin_identity(
+                        value, "Task 8 native bulk trade_id"
+                    )[0]
+                    for value in batch["trade_ids"]
+                ]
+                batch_source_ids = [
+                    _reconciliation_coin_identity(
+                        value, "Task 8 native bulk source coin"
+                    )[0]
+                    for value in batch["source_coin_ids"]
+                ]
+                batch_fee_id = _reconciliation_coin_identity(
+                    batch["fee_coin_id"], "Task 8 native bulk fee coin"
+                )[0]
+                if (
+                    len(set(batch_trade_ids)) != len(batch_trade_ids)
+                    or len(set(batch_source_ids)) != len(batch_source_ids)
+                    or batch_fee_id in batch_source_ids
+                    or member_trade not in batch_trade_ids
+                    or len(selected_bare) != 1
+                    or batch_source_ids[batch_trade_ids.index(member_trade)]
+                    != selected_bare[0]
+                ):
+                    raise ValueError(
+                        "Task 8 native bulk cancel identities are not exact"
+                    )
+                native_batch_for_member = {
+                    "protocol": batch["protocol"],
+                    "trade_ids": batch_trade_ids,
+                    "source_coin_ids": batch_source_ids,
+                    "fee_coin_id": batch_fee_id,
+                    "fee_mojos": wallet_effect["fee_mojos"],
+                }
+                native_batch_claims.append(native_batch_for_member)
+                durable_auxiliary = [batch_fee_id]
         missing_prepared_auxiliary = bool(auxiliary_bare and durable_auxiliary is None)
         if durable_auxiliary is not None and durable_auxiliary != auxiliary_bare:
             raise ValueError("Task 8 auxiliary coin claim is not exact")
@@ -22976,7 +23529,7 @@ def _validate_reconciliation_cancel_context(
                 latest["outcome"] == "CANCEL_SUBMITTED_UNCONFIRMED"
                 and latest["transaction_id"] is not None
                 and latest["spend_identity"] is None
-                and member_transaction_id is None
+                and member_transaction_id in {None, latest["transaction_id"]}
                 and member_spend_identity is not None
                 and type(latest_evidence) is dict
                 and latest_evidence.get("effect_attempted") is True
@@ -23006,6 +23559,24 @@ def _validate_reconciliation_cancel_context(
                     )
             if latest_auxiliary is None:
                 if auxiliary_bare:
+                    if native_batch_for_member is not None:
+                        cancel_result = latest_evidence.get("cancel_result")
+                        if (
+                            auxiliary_bare
+                            != [native_batch_for_member["fee_coin_id"]]
+                            or type(cancel_result) is not dict
+                            or cancel_result.get("method")
+                            not in {
+                                "sage_native_cancel_offers",
+                                "bulk_rpc",
+                            }
+                            or cancel_result.get("outcome") != latest["outcome"]
+                        ):
+                            raise ValueError(
+                                "Task 8 native bulk result binding is invalid"
+                            )
+                        latest_auxiliary = auxiliary_bare
+                if auxiliary_bare and latest_auxiliary is None:
                     try:
                         prepared_wallet = json.loads(prepared["wallet_identity_json"])
                         snapshot = prepared_wallet.get("snapshot")
@@ -23112,6 +23683,30 @@ def _validate_reconciliation_cancel_context(
                 "prepared_event_id": prepared_event_id,
             }
         )
+    if native_batch_claims:
+        if len(native_batch_claims) != len(exact_members) or any(
+            claim != native_batch_claims[0] for claim in native_batch_claims[1:]
+        ):
+            raise ValueError("Task 8 native bulk cancel claim differs by member")
+        native_batch = native_batch_claims[0]
+        contextual_trade_ids = [member["trade_id"] for member in exact_members]
+        contextual_source_ids = []
+        for member in context["members"]:
+            selected = member["selected_coin_ids"]
+            if type(selected) is not list or len(selected) != 1:
+                raise ValueError("Task 8 native bulk source mapping is invalid")
+            contextual_source_ids.append(
+                _reconciliation_coin_identity(
+                    selected[0], "Task 8 native bulk contextual source coin"
+                )[0]
+            )
+        if (
+            native_batch["trade_ids"] != contextual_trade_ids
+            or native_batch["source_coin_ids"] != contextual_source_ids
+            or auxiliary_bare != [native_batch["fee_coin_id"]]
+            or native_batch["fee_mojos"] != fee_mojos
+        ):
+            raise ValueError("Task 8 native bulk cancellation context is not exact")
     targets = [
         member
         for member in exact_members
@@ -27336,7 +27931,7 @@ def resolve_runtime_safety_latch(
     )
     if type(resolved_operation_ids) not in (list, tuple):
         raise TypeError("resolved_operation_ids must be an exact bounded list or tuple")
-    if len(resolved_operation_ids) > 64:
+    if len(resolved_operation_ids) > 256:
         raise ValueError("resolved_operation_ids exceeds bound")
     resolved_ids = sorted(
         {

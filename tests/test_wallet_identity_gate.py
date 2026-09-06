@@ -260,6 +260,7 @@ def test_wallet_mutation_inventory_is_exact_and_facade_owned():
         "combine_coins",
         "create_offer",
         "create_transaction_rpc",
+        "submit_built_transaction_rpc",
         "full_node_rpc",
         "get_next_address",
         "rpc",
@@ -279,6 +280,84 @@ def test_wallet_mutation_inventory_is_exact_and_facade_owned():
 
     assert wallet.MUTATING_WALLET_EXPORTS == frozenset(expected)
     assert all(getattr(wallet, name).__module__ == "wallet" for name in expected)
+
+
+def test_sage_unsigned_build_uses_bound_identity_without_mutation_submission(monkeypatch):
+    adapter = SimpleNamespace(
+        build_transaction_rpc=lambda coin_ids, actions, _identity_recheck=None: (
+            _identity_recheck("create_transaction")
+            or {"summary": {"fee": "0", "inputs": []}, "coin_spends": []}
+        )
+    )
+    checks = []
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
+    monkeypatch.setattr(wallet, "_expected_identity_authority", lambda: ("binding", adapter))
+    monkeypatch.setattr(wallet, "_identity_from_adapter", lambda value: {"fresh": value is adapter})
+    monkeypatch.setattr(wallet, "_revalidate_adapter_authority", lambda value, operation: checks.append(operation))
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_identity",
+        lambda binding, snapshot, operation: checks.append((binding, snapshot, operation)),
+    )
+
+    result = wallet.build_transaction_rpc(["aa"], [{"type": "fee", "amount": "0"}])
+
+    assert result["summary"]["fee"] == "0"
+    assert checks == [
+        "wallet:unsigned_build:identity",
+        ("binding", {"fresh": True}, "wallet:unsigned_build:identity"),
+        "wallet:unsigned_build:create_transaction",
+        ("binding", {"fresh": True}, "wallet:unsigned_build:create_transaction"),
+    ]
+
+
+def test_rejected_unsigned_submission_preserves_adapter_no_effect(monkeypatch):
+    """A pre-signing rejection must not strand a durable coin-prep claim."""
+
+    exits = []
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=lambda: _identity(),
+        submit_built_transaction_rpc=lambda *args, **kwargs: {
+            "success": False,
+            "error": "Unsigned transaction effect was not validated",
+            "reason": "UNSIGNED_EFFECT_NOT_VALIDATED",
+            "_catalyst_effect_attempted": False,
+        },
+    )
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: (_binding(), fake_adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_revalidate_adapter_authority", lambda adapter, operation: None
+    )
+    monkeypatch.setattr(
+        mutation_gate, "enter_wallet_mutation", lambda operation: "permit"
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_identity",
+        lambda *args, **kwargs: {"allowed": True},
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "exit_wallet_mutation",
+        lambda permit: exits.append(permit) or True,
+    )
+
+    result = wallet.submit_built_transaction_rpc({"validated": False})
+
+    assert result["success"] is False
+    assert result["reason"] == "UNSIGNED_EFFECT_NOT_VALIDATED"
+    assert result["_catalyst_effect_attempted"] is False
+    assert exits == ["permit"]
 
 
 def test_new_address_export_is_guarded_but_existing_address_read_stays_available(
@@ -659,7 +738,11 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
     ("adapter_name", "caller_name", "callee_name"),
     [
         ("wallet_sage", "split_coins_bulk", "split_coins_rpc"),
-        ("wallet_sage", "cancel_offers_batch", "cancel_offer"),
+        (
+            "wallet_sage",
+            "cancel_offers_batch",
+            "_submit_coin_spends_if_needed",
+        ),
         ("wallet_sage", "delete_offers_batch", "delete_offer"),
         ("wallet_chia", "split_coins_bulk", "split_coins_rpc"),
         ("wallet_chia", "split_coins_bulk", "send_transaction"),
@@ -771,7 +854,7 @@ def test_sage_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):
 
     def recheck(step):
         events.append(f"check:{step}")
-        if step == "cancel_offer":
+        if step == "cancel_offers":
             raise mutation_gate.MutationBlocked("WALLET_IDENTITY_MISMATCH", step)
 
     with pytest.raises(mutation_gate.MutationBlocked):
@@ -782,7 +865,7 @@ def test_sage_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):
             _identity_recheck=recheck,
         )
 
-    assert events == ["check:cancel_offer"]
+    assert events == ["check:cancel_offers"]
 
 
 def test_chia_nested_cancel_recheck_block_propagates_before_effect(monkeypatch):

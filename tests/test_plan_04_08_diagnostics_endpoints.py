@@ -81,7 +81,38 @@ class _FlaskBase(unittest.TestCase):
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
-class TestHealthEndpoint(_FlaskBase):
+class TestHealthEndpointStartupAuthorisation(_FlaskBase):
+    def test_running_bot_health_is_reported_before_startup_authorisation_flag(self):
+        bot = _make_bot()
+        bot.is_running.return_value = True
+        bot.get_state.return_value = {
+            "running": True,
+            "chia_health": {
+                "status": "healthy",
+                "wallet_reachable": True,
+                "wallet_synced": True,
+                "wallet_syncing": False,
+                "wallet_sync_state": "synced",
+                "node_reachable": True,
+                "node_synced": False,
+                "peer_count": 8,
+                "consecutive_failures": 0,
+            },
+        }
+
+        with (
+            patch("chia_node.is_startup_authorised", return_value=False),
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self.client.get("/api/health", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["bot_running"])
+        self.assertEqual(body["chia_health"]["status"], "healthy")
+        self.assertTrue(body["chia_health"]["wallet_reachable"])
+        self.assertTrue(body["chia_health"]["wallet_synced"])
+
     def test_unreachable_live_wallet_check_counts_as_failure(self):
         raw_health = {
             "status": "unreachable",

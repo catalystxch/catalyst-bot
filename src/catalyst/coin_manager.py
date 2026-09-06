@@ -661,8 +661,9 @@ class FeeCoinPool:
 
     Sage CAT split/top-up calls can accept a dedicated XCH fee coin. Reserving
     that coin here prevents overlapping coin-management effects from selecting
-    the same input. Offer creation uses fee zero, while Sage cancellation does
-    not accept an explicit fee coin and is serialized separately.
+    the same input. Offer creation uses fee zero. Sage native bulk cancellation
+    also reserves one explicit fee coin here, then submits the offer roots and
+    that fee input as one transaction-bound cohort.
 
     Lifecycle:
       • ``refresh()`` is called once at the start of every bot cycle
@@ -4733,27 +4734,19 @@ class CoinManager:
         and the GUI can see how much capacity is currently reserved by
         in-flight offer creation attempts across threads.
 
-        Wallet-type guard: under Sage, ``self._xch_coins`` is already the
-        count of UNLOCKED coins — Sage's owned-coin snapshot puts coins
-        with an ``offer_id`` into a separate ``locked_ids`` set, and
-        ``selectable_records`` (the source of ``self._xch_coins``)
-        excludes them. Subtracting ``active_buy_count`` then double-counts
-        the lock and produces ``free_xch = 0`` whenever the bot has more
-        active offers than spare coins — exactly the steady state of a
-        live ladder. That triggers a false-positive "Coin headroom is low"
-        alert in runtime_monitor every cycle. Detect that condition
-        (active count > spendable count is only possible when spendable
-        already excluded the locks) and skip the subtraction. The legacy
-        chia-full-wallet path, where spendable did include offer-locked
-        coins, still uses the subtraction.
+        Wallet-type guard: under Sage, ``self._xch_coins`` and
+        ``self._cat_coins`` are already UNLOCKED/selectable counts — Sage's
+        owned-coin snapshot puts coins with an ``offer_id`` into a separate
+        ``locked_ids`` set. Subtracting active offers therefore double-counts
+        the lock even when selectable inventory is greater than the active
+        offer count (TEST 7 had 42 selectable CATs and 36 locked sells). The
+        legacy Chia adapter retains its historical subtraction contract.
         """
-        if active_buy_count > self._xch_coins:
+        if str(get_wallet_type() or "").strip().lower() == "sage":
             free_xch = self._xch_coins
-        else:
-            free_xch = max(0, self._xch_coins - active_buy_count)
-        if active_sell_count > self._cat_coins:
             free_cat = self._cat_coins
         else:
+            free_xch = max(0, self._xch_coins - active_buy_count)
             free_cat = max(0, self._cat_coins - active_sell_count)
 
         # Fetch active reservation totals (mojos held by in-flight creates).
@@ -5960,8 +5953,18 @@ class CoinManager:
         if self._health_check_counter % 5 != 0:
             return False
 
-        free_xch = max(0, self._xch_coins - active_buy_count)
-        free_cat = max(0, self._cat_coins - active_sell_count)
+        # Sage's owned/selectable snapshot already excludes offer-locked
+        # inputs, so ``_xch_coins`` and ``_cat_coins`` are genuinely free
+        # wallet counts.  Subtracting the active offers again caused the live
+        # TEST 7 health check to launch a no-op top-up at 42 selectable CAT
+        # coins / 36 locked sells.  Retain the legacy subtraction for the Chia
+        # adapter, whose historical count contract can include active inputs.
+        if str(get_wallet_type() or "").strip().lower() == "sage":
+            free_xch = max(0, self._xch_coins)
+            free_cat = max(0, self._cat_coins)
+        else:
+            free_xch = max(0, self._xch_coins - active_buy_count)
+            free_cat = max(0, self._cat_coins - active_sell_count)
         # Same spare-aware threshold as needs_topup()
         multiplier = float(getattr(cfg, "COIN_PREP_MULTIPLIER", Decimal("1.0")))
         xch_spare = int(cfg.MAX_ACTIVE_BUY_OFFERS * multiplier)
@@ -6243,18 +6246,52 @@ class CoinManager:
                 return
 
             # ---- Fresh coin inventory ----
-            xch_result = _get_free_coins_rpc(cfg.WALLET_ID_XCH)
-            cat_result = _get_free_coins_rpc(cfg.CAT_WALLET_ID)
+            # Sage's selectable view can transiently include coins that are
+            # already locked by offers.  The detailed owned view carries the
+            # authoritative ``offer_id`` marker, and update_coin_counts() uses
+            # it to derive the truly selectable subset.  Reuse that same view
+            # here so the trigger and worker cannot disagree (for example,
+            # 48 genuinely free fee coins being misread as 98 after counting
+            # 50 offer-locked coins).
+            xch_owned_snapshot = (
+                self._get_sage_owned_coin_snapshot(cfg.WALLET_ID_XCH)
+                if wallet_backend == "sage"
+                else None
+            )
+            cat_owned_snapshot = (
+                self._get_sage_owned_coin_snapshot(cfg.CAT_WALLET_ID)
+                if wallet_backend == "sage"
+                else None
+            )
+            xch_result = (
+                None
+                if xch_owned_snapshot is not None
+                else _get_free_coins_rpc(cfg.WALLET_ID_XCH)
+            )
+            cat_result = (
+                None
+                if cat_owned_snapshot is not None
+                else _get_free_coins_rpc(cfg.CAT_WALLET_ID)
+            )
 
             # Detect RPC errors: if the wallet returned an error (not just empty),
             # don't treat it as "no coins" and enter backoff — short cooldown instead.
-            xch_is_error = isinstance(xch_result, dict) and (
+            xch_is_error = xch_owned_snapshot is None and isinstance(
+                xch_result, dict
+            ) and (
                 xch_result.get("error") or xch_result.get("success") is False
             )
-            cat_is_error = isinstance(cat_result, dict) and (
+            cat_is_error = cat_owned_snapshot is None and isinstance(
+                cat_result, dict
+            ) and (
                 cat_result.get("error") or cat_result.get("success") is False
             )
-            if xch_is_error or cat_is_error or xch_result is None or cat_result is None:
+            if (
+                xch_is_error
+                or cat_is_error
+                or (xch_owned_snapshot is None and xch_result is None)
+                or (cat_owned_snapshot is None and cat_result is None)
+            ):
                 log_event(
                     "warning",
                     "topup_rpc_error",
@@ -6263,8 +6300,16 @@ class CoinManager:
                 self._last_topup_time = time.time()
                 return
 
-            xch_records = _extract_coin_records(xch_result)
-            cat_records = _extract_coin_records(cat_result)
+            xch_records = (
+                list(xch_owned_snapshot["selectable_records"])
+                if xch_owned_snapshot is not None
+                else _extract_coin_records(xch_result)
+            )
+            cat_records = (
+                list(cat_owned_snapshot["selectable_records"])
+                if cat_owned_snapshot is not None
+                else _extract_coin_records(cat_result)
+            )
 
             # ---- Sanity check: if we got 0 coins, wallet may still be catching up ----
             # The wallet can report synced=true but still not show coins for a few seconds
@@ -7033,7 +7078,17 @@ class CoinManager:
                         1, int(round(fee_target * _topup_tier_pct("fees", "xch")))
                     )
                     fee_xch_mojos = get_fee_coin_size_mojos()
-                    fee_xch_have = len(xch_inv.get("fees", []))
+                    # Use the purpose-separated DB count that fired
+                    # ``needs_topup``.  The size-classified wallet bucket can
+                    # also contain legacy/unpurposed coins with the same amount
+                    # as fee coins (the live Sage 0.13 reproduction showed 98
+                    # size matches but only 47 authoritative ``fee_reserve``
+                    # coins).  Counting that mixed bucket here makes the worker
+                    # disagree with its trigger and falsely log
+                    # ``drip_adequate``.
+                    fee_xch_have = int(
+                        self._tier_spares.get("xch", {}).get("fees", 0) or 0
+                    )
                     if fee_xch_have < fee_threshold and fee_xch_mojos > 0:
                         any_tier_needed = True
                         deficit = (fee_target - fee_xch_have) + 2

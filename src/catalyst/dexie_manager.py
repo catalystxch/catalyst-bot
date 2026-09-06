@@ -213,6 +213,13 @@ class DexieManager:
         self._durable_now_provider = None
         self._durable_lease_expires_provider = None
         self._durable_network: Optional[str] = None
+        # Keep synchronous publication work below the bot-cycle SLA.  A slow
+        # Dexie endpoint must not hold the whole trading loop for one timeout
+        # per queued offer; any untouched durable claims remain queued for the
+        # next cycle.
+        # Dexie and Splash drain sequentially in the same cycle, so each gets
+        # half of the 60-second step SLA with a small scheduling margin.
+        self._durable_flush_budget_seconds: float = 25.0
 
         # Rate limit cooldown (epoch time until which we skip Dexie calls)
         self._rate_limited_until: float = 0.0
@@ -274,7 +281,28 @@ class DexieManager:
     def _flush_durable_outbox(self, flush_all: bool) -> Dict:
         limit = 500 if flush_all else int(cfg.MAX_POSTS_PER_LOOP)
         posted = failed = skipped = requeued = 0
-        for _index in range(max(1, limit)):
+        budget_exhausted = False
+        flush_started = time.monotonic()
+        for index in range(max(1, limit)):
+            if not flush_all and index > 0:
+                elapsed = time.monotonic() - flush_started
+                budget = max(1.0, float(self._durable_flush_budget_seconds))
+                request_timeout = max(0.0, float(cfg.DEXIE_POST_TIMEOUT))
+                if budget - elapsed < request_timeout:
+                    budget_exhausted = True
+                    log_event(
+                        "info",
+                        "dexie_durable_flush_budget",
+                        "Dexie durable publication reached its cycle time budget; "
+                        "remaining claims stay queued for the next cycle",
+                        data={
+                            "elapsed_seconds": round(elapsed, 3),
+                            "budget_seconds": budget,
+                            "posted": posted,
+                            "failed": failed,
+                        },
+                    )
+                    break
             observed_at = self._durable_now_provider()
             claim = claim_publication_outbox(
                 publisher="dexie",
@@ -387,6 +415,7 @@ class DexieManager:
             "failed": failed,
             "skipped": skipped,
             "requeued": requeued,
+            "budget_exhausted": budget_exhausted,
         }
 
     def queue_post(self, offer_bech32: str, trade_id: str = None, force: bool = False):

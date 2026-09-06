@@ -194,7 +194,13 @@ def recover_legacy_sage_reservations(
     config: Any = None,
     deadline_seconds: float = 60.0,
 ) -> dict[str, int]:
-    """Adopt and expire exact legacy locks using fresh Sage evidence only."""
+    """Recover proof-bound startup offer blockers using fresh Sage evidence.
+
+    The public name is retained for compatibility with the desktop startup
+    coordinator.  In addition to old pre-registry reservations, this boundary
+    settles a modern submitted-cancel journal only when Sage provides the
+    exact Task 8/9 cancellation proof required by normal reconciliation.
+    """
 
     wallet_hash = _hex_id(wallet_fingerprint_hash)
     if not wallet_hash or type(network) is not str or not network.strip():
@@ -329,6 +335,95 @@ def recover_legacy_sage_reservations(
                 and type(reconciled.get("event")) is dict
                 and reconciled["event"].get("outcome")
                 == reconciliation_module.EXPIRED_PROVEN
+            ):
+                result["recovered"] += 1
+            else:
+                result["remaining"] += 1
+        except Exception:
+            result["remaining"] += 1
+
+    blocker_reader = getattr(
+        database_module, "get_unresolved_offer_operation_blockers", None
+    )
+    blockers = blocker_reader() if callable(blocker_reader) else []
+    if type(blockers) is not list or len(blockers) > 128:
+        raise RuntimeError("startup offer operation inventory is malformed")
+    submitted_cancels = [
+        blocker
+        for blocker in blockers
+        if type(blocker) is dict
+        and blocker.get("operation_type") == "CANCEL"
+        and blocker.get("phase") == "FINALIZED"
+        and blocker.get("outcome")
+        in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+        and blocker.get("blocks_mutation") == 1
+    ]
+    result["examined"] += len(submitted_cancels)
+    for index, blocker in enumerate(submitted_cancels):
+        if time.monotonic() >= deadline:
+            result["remaining"] += len(submitted_cancels) - index
+            break
+        try:
+            intent_id = blocker.get("intent_id")
+            if type(intent_id) is not str or not intent_id:
+                raise ValueError("submitted cancel intent identity is unavailable")
+            intent = database_module.get_offer_intent(intent_id)
+            trade_id = _hex_id(
+                intent.get("sage_trade_id") if type(intent) is dict else None
+            )
+            if (
+                type(intent) is not dict
+                or not trade_id
+                or blocker.get("operation_id") != f"cancel:{trade_id}"
+                or intent.get("wallet_fingerprint_hash") != wallet_hash
+                or str(intent.get("network") or "").strip().lower() != safe_network
+            ):
+                raise ValueError("submitted cancel authority binding is invalid")
+            evidence = reconciliation_module.load_authoritative_evidence(
+                intent, wallet_facade=wallet_facade
+            )
+            observed_at = (
+                evidence.get("observed_at") if type(evidence) is dict else None
+            )
+            cancel_context = reconciliation_module._derive_single_cancel_context(
+                intent,
+                evidence,
+                database_module=database_module,
+                observed_at=observed_at,
+            )
+            classification = reconciliation_module.classify_terminal_evidence(
+                intent,
+                evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            terminal_classification = classification.get("classification")
+            terminal_outcomes = {
+                reconciliation_module.CANCELLED_PROVEN,
+                reconciliation_module.FILLED_PROVEN,
+                reconciliation_module.EXPIRED_PROVEN,
+            }
+            if (
+                type(classification) is not dict
+                or terminal_classification not in terminal_outcomes
+                or (
+                    terminal_classification
+                    == reconciliation_module.CANCELLED_PROVEN
+                    and type(cancel_context) is not dict
+                )
+            ):
+                result["remaining"] += 1
+                continue
+            reconciled = reconciliation_module.reconcile_offer(
+                intent_id,
+                evidence=evidence,
+                cancel_context=cancel_context,
+                now=observed_at,
+            )
+            if (
+                type(reconciled) is dict
+                and reconciled.get("applied") is True
+                and reconciled.get("classification") == terminal_classification
             ):
                 result["recovered"] += 1
             else:

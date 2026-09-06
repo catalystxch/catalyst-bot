@@ -63,6 +63,8 @@ _DELEGATION_ENV_NAMES = (
 _ALLOWED_REASON_CODES = frozenset(
     {
         "CANCEL_UNKNOWN",
+        "COIN_PREP_EFFECT_UNKNOWN",
+        "COIN_PREP_RECOVERY_REQUIRED",
         "CREATE_UNKNOWN",
         "DURABLE_STATE_UNAVAILABLE",
         "HEARTBEAT_FAILED",
@@ -94,6 +96,8 @@ _ALLOWED_REASON_CODES = frozenset(
 
 _REASON_DESCRIPTIONS = {
     "CANCEL_UNKNOWN": "Cancellation outcome requires reconciliation",
+    "COIN_PREP_EFFECT_UNKNOWN": "Coin Prep is awaiting authoritative wallet confirmation",
+    "COIN_PREP_RECOVERY_REQUIRED": "Coin Prep requires authoritative recovery observation",
     "CREATE_UNKNOWN": "Creation outcome requires reconciliation",
     "DURABLE_STATE_UNAVAILABLE": "Durable mutation state is unavailable",
     "HEARTBEAT_FAILED": "Mutation lease heartbeat failed",
@@ -555,6 +559,69 @@ def _safe_operation(operation: Any) -> str:
     return "".join(ch if ch.isalnum() or ch in "._:-" else "_" for ch in value)
 
 
+def _is_exact_cancel_wallet_effect(
+    value: Any,
+    *,
+    trade_id: Optional[str] = None,
+    cohort_size: Optional[int] = None,
+) -> bool:
+    if value == {"secure": True, "timeout": 60, "fee_mojos": None}:
+        return True
+    if type(value) is not dict or set(value) != {
+        "secure",
+        "timeout",
+        "fee_mojos",
+        "batch",
+    }:
+        return False
+    fee_mojos = value["fee_mojos"]
+    batch = value["batch"]
+    if (
+        value["secure"] is not True
+        or value["timeout"] != 60
+        or type(fee_mojos) is not int
+        or isinstance(fee_mojos, bool)
+        or fee_mojos <= 0
+        or type(batch) is not dict
+        or set(batch) != {
+            "protocol",
+            "trade_ids",
+            "source_coin_ids",
+            "fee_coin_id",
+        }
+        or batch["protocol"] != "sage_native_cancel_offers_zero_plus_fee_v1"
+    ):
+        return False
+    trade_ids = batch["trade_ids"]
+    source_coin_ids = batch["source_coin_ids"]
+    fee_coin_id = batch["fee_coin_id"]
+    if (
+        type(trade_ids) is not list
+        or type(source_coin_ids) is not list
+        or len(trade_ids) < 2
+        or len(trade_ids) != len(source_coin_ids)
+        or len(set(trade_ids)) != len(trade_ids)
+        or len(set(source_coin_ids)) != len(source_coin_ids)
+        or type(fee_coin_id) is not str
+        or fee_coin_id in source_coin_ids
+        or (cohort_size is not None and len(trade_ids) != cohort_size)
+        or (trade_id is not None and trade_id not in trade_ids)
+    ):
+        return False
+    try:
+        for identifier in [*trade_ids, *source_coin_ids, fee_coin_id]:
+            if (
+                type(identifier) is not str
+                or len(identifier) != 64
+                or identifier != identifier.lower()
+            ):
+                return False
+            bytes.fromhex(identifier)
+    except ValueError:
+        return False
+    return True
+
+
 def _is_exact_prepared_operation_blocker(
     unresolved: Any,
     *,
@@ -685,8 +752,10 @@ def _is_exact_prepared_operation_blocker(
                     or wallet_identity.get("snapshot_sha256") != continuation_digest
                     or single_evidence["effect_claim_protocol"]
                     != "durable_cohort_claim_v1"
-                    or single_evidence["wallet_effect"]
-                    != {"secure": True, "timeout": 60, "fee_mojos": None}
+                    or not _is_exact_cancel_wallet_effect(
+                        single_evidence["wallet_effect"],
+                        trade_id=trade_id,
+                    )
                     or (
                         "prior_lifecycle_state" in single_evidence
                         and (
@@ -791,8 +860,11 @@ def _is_exact_prepared_operation_blocker(
                 or event["spend_identity"] is not None
                 or event["request_timestamp"] != event["created_at"]
                 or evidence["effect_claim_protocol"] != "durable_cohort_claim_v1"
-                or evidence["wallet_effect"]
-                != {"secure": True, "timeout": 60, "fee_mojos": None}
+                or not _is_exact_cancel_wallet_effect(
+                    evidence["wallet_effect"],
+                    trade_id=trade_id,
+                    cohort_size=cohort_size,
+                )
             ):
                 return None
             bytes.fromhex(trade_id)
@@ -819,6 +891,7 @@ def _is_exact_prepared_operation_blocker(
                 "cohort_id": cohort_id,
                 "cohort_size": cohort_size,
                 "operation_id": event["operation_id"],
+                "wallet_effect": evidence["wallet_effect"],
             }
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -833,6 +906,11 @@ def _is_exact_prepared_operation_blocker(
     cohort_size = own_context["cohort_size"]
     if any(
         context["cohort_id"] != cohort_id or context["cohort_size"] != cohort_size
+        for context in contexts
+    ):
+        return False
+    if any(
+        context["wallet_effect"] != own_context["wallet_effect"]
         for context in contexts
     ):
         return False
@@ -894,6 +972,21 @@ def _is_exact_prepared_operation_blocker(
             ).hexdigest()
         )
         if cohort_id != expected_cohort_id:
+            return False
+    batch = own_context["wallet_effect"].get("batch")
+    if batch is not None:
+        if manifest is None or batch["trade_ids"] != [
+            member["trade_id"] for member in manifest["members"]
+        ]:
+            return False
+        if any(
+            database.get_offer_cancel_effect_claim(
+                operation_id=member["operation_id"],
+                attempt=member["attempt"],
+            )
+            is None
+            for member in manifest["members"]
+        ):
             return False
     return (
         database.get_offer_cancel_effect_claim(
@@ -1940,7 +2033,7 @@ class MutationGate:
                         and bool(local_reason)
                         and not authorization["unresolved"]
                         and type(resolved_operation_ids) in (list, tuple)
-                        and 1 <= len(resolved_operation_ids) <= 64
+                        and 1 <= len(resolved_operation_ids) <= 256
                         and len(set(resolved_operation_ids))
                         == len(resolved_operation_ids)
                         and all(
@@ -2032,20 +2125,29 @@ class MutationGate:
             if version is None:
                 self._set_local_block("HEARTBEAT_FAILED")
                 return {"heartbeat": False, "reason": "not_owned"}
-            now = self._now()
-            try:
-                result = database.heartbeat_runtime_mutation_lease(
-                    owner_run_id=self.run_id,
-                    expected_lease_version=version,
-                    heartbeat_at=now,
-                    lease_expires_at=now + timedelta(seconds=self.lease_seconds),
-                )
-                result = _lease_public_result(result)
-            except Exception:
-                result = {"heartbeat": False, "reason": "durable_state_unavailable"}
-            if result.get("heartbeat"):
-                self._lease_version = int(result["lease"]["lease_version"])
-                return result
+            result = {"heartbeat": False, "reason": "durable_state_unavailable"}
+            for attempt in range(2):
+                now = self._now()
+                try:
+                    result = database.heartbeat_runtime_mutation_lease(
+                        owner_run_id=self.run_id,
+                        expected_lease_version=version,
+                        heartbeat_at=now,
+                        lease_expires_at=now
+                        + timedelta(seconds=self.lease_seconds),
+                    )
+                    result = _lease_public_result(result)
+                except Exception:
+                    if attempt == 0:
+                        continue
+                    result = {
+                        "heartbeat": False,
+                        "reason": "durable_state_unavailable",
+                    }
+                if result.get("heartbeat"):
+                    self._lease_version = int(result["lease"]["lease_version"])
+                    return result
+                break
             self._set_local_block("HEARTBEAT_FAILED")
             return result
 

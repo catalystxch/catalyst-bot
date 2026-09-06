@@ -259,7 +259,6 @@ _MUTATING_API_ENDPOINTS = {
     "session.api_session_fresh_start",
     "session.api_session_resume_chosen",
     "spacescan.api_spacescan_setup",
-    "splash.api_splash_incoming",
     "splash.api_splash_node_start",
     "splash.api_splash_receive",
     "splash.api_splash_setup_download",
@@ -276,6 +275,10 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
     # sample a transient safety latch into this process's local mutation fence.
     "coin_prep.api_log_event",
     "config_bp.api_settings_validate",
+    # Incoming offers are untrusted market-data inbox entries, not wallet
+    # acceptance. Sampling a pending Coin Prep latch here would permanently
+    # fence the parent merely because Splash delivered another message.
+    "splash.api_splash_incoming",
 }
 
 _CONTROL_WRITE_API_ENDPOINTS = {
@@ -540,7 +543,7 @@ def _splash_incoming_note_recorded(was_new: bool) -> None:
 
 def _record_splash_incoming_locked(
     offer_bech32: str, fingerprint: str, source_ip: str = None
-) -> bool:
+) -> Optional[bool]:
     from database import record_splash_incoming
 
     with _SPLASH_INCOMING_WRITE_LOCK:
@@ -1250,6 +1253,8 @@ def _history_age_label(timestamp_value: str) -> str:
     try:
         if timestamp_value:
             dt = datetime.fromisoformat(str(timestamp_value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             age_secs = max(0, (datetime.now(timezone.utc) - dt).total_seconds())
             if age_secs < 60:
                 age = f"{int(age_secs)}s ago"

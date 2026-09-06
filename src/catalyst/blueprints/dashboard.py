@@ -9,7 +9,7 @@ _get_live_local_offer_edges, _get_spacescan_market_context, etc.).
 from __future__ import annotations
 
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
@@ -172,7 +172,9 @@ def _positive_decimal_string(value) -> str:
     return str(dec)
 
 
-def _build_fiat_price_summary(spacescan_context: dict) -> dict:
+def _build_fiat_price_summary(
+    spacescan_context: dict, *, executable_mid_price=0
+) -> dict:
     """Build the dashboard's compact fiat price summary."""
     xch_price = {}
     try:
@@ -183,8 +185,25 @@ def _build_fiat_price_summary(spacescan_context: dict) -> dict:
         xch_price = {}
 
     xch_usd = _positive_decimal_string(xch_price.get("xch_usd"))
-    cat_usd = _positive_decimal_string((spacescan_context or {}).get("price_usd"))
-    cat_xch = _positive_decimal_string((spacescan_context or {}).get("price_xch"))
+    executable_mid = _positive_decimal_string(executable_mid_price)
+    if executable_mid:
+        cat_xch = executable_mid
+        try:
+            cat_usd = (
+                str(Decimal(executable_mid) * Decimal(xch_usd)) if xch_usd else ""
+            )
+        except (InvalidOperation, ValueError, TypeError):
+            cat_usd = ""
+        xch_source = str(xch_price.get("source") or "").strip()
+        cat_usd_source = f"market × {xch_source}" if cat_usd and xch_source else ""
+    else:
+        cat_usd = _positive_decimal_string(
+            (spacescan_context or {}).get("price_usd")
+        )
+        cat_xch = _positive_decimal_string(
+            (spacescan_context or {}).get("price_xch")
+        )
+        cat_usd_source = "spacescan" if cat_usd else ""
 
     return {
         "xch_usd_price": xch_usd,
@@ -194,7 +213,7 @@ def _build_fiat_price_summary(spacescan_context: dict) -> dict:
         else 0,
         "cat_usd_price": cat_usd,
         "cat_price_xch": cat_xch,
-        "cat_usd_source": "spacescan" if cat_usd else "",
+        "cat_usd_source": cat_usd_source,
     }
 
 
@@ -297,6 +316,7 @@ def api_dashboard():
         )
 
         # --- Market Health ---
+        market_summary = {}
         market_health = {
             "status": "green",
             "message": "Waiting for first cycle",
@@ -355,6 +375,7 @@ def api_dashboard():
 
                 if getattr(bot, "market_intel", None):
                     summary = bot.market_intel.get_market_summary() or {}
+                    market_summary = summary
                     refreshes = int(summary.get("orderbook_refreshes", 0) or 0)
                     metrics["market_intel_refreshes"] = refreshes
                     metrics["market_intel_state"] = (
@@ -450,6 +471,30 @@ def api_dashboard():
                 executable_mid = Decimal(str(_lp)) if _lp else Decimal("0")
         except Exception:
             executable_mid = Decimal("0")
+        if executable_mid <= 0:
+            try:
+                public_bid = Decimal(
+                    str(
+                        market_summary.get("overall_best_bid")
+                        or market_summary.get("best_bid")
+                        or 0
+                    )
+                )
+                public_ask = Decimal(
+                    str(
+                        market_summary.get("overall_best_ask")
+                        or market_summary.get("best_ask")
+                        or 0
+                    )
+                )
+                if (
+                    public_bid.is_finite()
+                    and public_ask.is_finite()
+                    and 0 < public_bid <= public_ask
+                ):
+                    executable_mid = (public_bid + public_ask) / Decimal("2")
+            except (InvalidOperation, ValueError, TypeError, AttributeError):
+                pass
 
         spacescan_context = api_server._get_spacescan_market_context(
             asset_id=active_asset_id,
@@ -457,7 +502,10 @@ def api_dashboard():
             decimals=active_decimals,
             executable_mid_price=executable_mid,
         )
-        fiat_prices = _build_fiat_price_summary(spacescan_context)
+        fiat_prices = _build_fiat_price_summary(
+            spacescan_context,
+            executable_mid_price=executable_mid,
+        )
         try:
             metrics = market_health.setdefault("metrics", {})
             metrics["spacescan_enabled"] = spacescan_context.get("enabled", False)

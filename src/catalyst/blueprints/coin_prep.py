@@ -1096,6 +1096,23 @@ def api_coin_prep_status():
                     result["cat_coins"] = worker_status.get("cat_coins_current", 0)
                     result["xch_target"] = worker_status.get("xch_coins_target", 0)
                     result["cat_target"] = worker_status.get("cat_coins_target", 0)
+                    # Surface the direct-final-batch execution details instead of
+                    # flattening them away at the API boundary.  These fields let
+                    # the GUI distinguish fast preparation from the compatibility
+                    # path and show authoritative confirmation/fee progress.
+                    for detail_key in (
+                        "execution_mode",
+                        "reused",
+                        "missing",
+                        "batch_current",
+                        "batch_confirmed",
+                        "planned_fee_mojos",
+                        "paid_fee_mojos",
+                        "confirmation_elapsed_seconds",
+                        "compatibility_reason",
+                    ):
+                        if detail_key in worker_status:
+                            result[detail_key] = worker_status[detail_key]
                     w_error = worker_status.get("error")
                     if w_error:
                         result["error"] = w_error
@@ -1153,7 +1170,7 @@ def api_coin_prep_status():
                                     api_server._active_cat.get("decimals")
                                     or getattr(_cfg, "CAT_DECIMALS", 3)
                                 )
-                                _tol = 0.05
+                                _tol = Decimal("0.05")
 
                                 # Fetch spendable coins from wallet
                                 _xr = get_spendable_coins_rpc(WALLET_ID_XCH)
@@ -1187,8 +1204,12 @@ def api_coin_prep_status():
                                         if target_m <= 0 or needed <= 0:
                                             allocated[tier] = 0
                                             continue
-                                        lo = int(target_m * (1 - tol))
-                                        hi = int(target_m * (1 + tol))
+                                        lo = int(
+                                            Decimal(target_m) * (Decimal(1) - tol)
+                                        )
+                                        hi = int(
+                                            Decimal(target_m) * (Decimal(1) + tol)
+                                        )
                                         hits = [
                                             i
                                             for i, a in enumerate(remaining)
@@ -1204,61 +1225,100 @@ def api_coin_prep_status():
                                 if _last.get("tier_enabled"):
                                     _tsxch = _last.get("tier_sizes_xch", {})
                                     _tscat = _last.get("tier_sizes_cat", {})
-                                    _tc = _last.get("tier_counts", {})
+                                    _legacy_counts = _last.get("tier_counts", {})
+                                    _tcxch = _last.get("tier_counts_xch")
+                                    _tccat = _last.get("tier_counts_cat")
+                                    if not isinstance(_tcxch, dict):
+                                        _tcxch = _legacy_counts
+                                    if not isinstance(_tccat, dict):
+                                        _tccat = _legacy_counts
                                     _xreqs = []
                                     _creqs = []
-                                    for _t, _cnt in _tc.items():
+                                    for _t, _cnt in _tcxch.items():
                                         _cnt = int(_cnt or 0)
-                                        _xsz = float(_tsxch.get(_t, 0))
-                                        _csz = float(_tscat.get(_t, 0))
-                                        _target_xch += _cnt
-                                        if _csz > 0:
-                                            _target_cat += _cnt
+                                        _xsz = Decimal(str(_tsxch.get(_t, 0)))
                                         if _xsz > 0 and _cnt > 0:
-                                            _xreqs.append((_t, int(_xsz * 1e12), _cnt))
+                                            _target_xch += _cnt
+                                            _xreqs.append(
+                                                (
+                                                    _t,
+                                                    int(
+                                                        _xsz
+                                                        * Decimal(10**12)
+                                                    ),
+                                                    _cnt,
+                                                )
+                                            )
+                                    for _t, _cnt in _tccat.items():
+                                        _cnt = int(_cnt or 0)
+                                        _csz = Decimal(str(_tscat.get(_t, 0)))
                                         if _csz > 0 and _cnt > 0:
+                                            _target_cat += _cnt
                                             _creqs.append(
-                                                (_t, int(_csz * (10**_cat_dec)), _cnt)
+                                                (
+                                                    _t,
+                                                    int(
+                                                        _csz
+                                                        * Decimal(10**_cat_dec)
+                                                    ),
+                                                    _cnt,
+                                                )
                                             )
                                     _xa = _alloc_match(_xch_coins, _xreqs, _tol)
                                     _ca = _alloc_match(_cat_coins, _creqs, _tol)
-                                    for _t, _cnt in _tc.items():
+                                    for _t, _cnt in _tcxch.items():
                                         _cnt = int(_cnt or 0)
                                         if _cnt <= 0:
                                             continue
-                                        _xsz = float(_tsxch.get(_t, 0))
-                                        _csz = float(_tscat.get(_t, 0))
+                                        _xsz = Decimal(str(_tsxch.get(_t, 0)))
                                         if _xsz > 0 and _xa.get(_t, 0) < _cnt:
                                             _all_ok = False
+                                    for _t, _cnt in _tccat.items():
+                                        _cnt = int(_cnt or 0)
+                                        if _cnt <= 0:
+                                            continue
+                                        _csz = Decimal(str(_tscat.get(_t, 0)))
                                         if _csz > 0 and _ca.get(_t, 0) < _cnt:
                                             _all_ok = False
                                     _matched_xch = sum(_xa.values())
                                     _matched_cat = sum(_ca.values())
                                 else:
                                     # Flat mode
-                                    _xsz = float(
-                                        _last.get("xch_coin_size")
-                                        or _last.get("prepared_trade_size_xch")
-                                        or 0
+                                    _xsz = Decimal(
+                                        str(
+                                            _last.get("xch_coin_size")
+                                            or _last.get("prepared_trade_size_xch")
+                                            or 0
+                                        )
                                     )
-                                    _csz = float(_last.get("cat_coin_size") or 0)
+                                    _csz = Decimal(
+                                        str(_last.get("cat_coin_size") or 0)
+                                    )
                                     _xt = int(_last.get("xch_target") or 0)
                                     _ct = int(_last.get("cat_target") or 0)
                                     _target_xch = _xt
                                     _target_cat = _ct
                                     if _xsz > 0 and _xt > 0:
-                                        _xm = int(_xsz * 1e12)
-                                        _lo = int(_xm * (1 - _tol))
-                                        _hi = int(_xm * (1 + _tol))
+                                        _xm = int(_xsz * Decimal(10**12))
+                                        _lo = int(
+                                            Decimal(_xm) * (Decimal(1) - _tol)
+                                        )
+                                        _hi = int(
+                                            Decimal(_xm) * (Decimal(1) + _tol)
+                                        )
                                         _matched_xch = sum(
                                             1 for c in _xch_coins if _lo <= c <= _hi
                                         )
                                         if _matched_xch < _xt:
                                             _all_ok = False
                                     if _csz > 0 and _ct > 0:
-                                        _cm = int(_csz * (10**_cat_dec))
-                                        _lo = int(_cm * (1 - _tol))
-                                        _hi = int(_cm * (1 + _tol))
+                                        _cm = int(_csz * Decimal(10**_cat_dec))
+                                        _lo = int(
+                                            Decimal(_cm) * (Decimal(1) - _tol)
+                                        )
+                                        _hi = int(
+                                            Decimal(_cm) * (Decimal(1) + _tol)
+                                        )
                                         _matched_cat = sum(
                                             1 for c in _cat_coins if _lo <= c <= _hi
                                         )

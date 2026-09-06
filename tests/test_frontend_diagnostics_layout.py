@@ -133,6 +133,14 @@ def test_smart_settings_snapshots_wallet_balances_from_response_sources():
     assert "_cp.cat_reserve" in snapshot_block
 
 
+def test_saved_config_loads_requote_cooldown_from_canonical_key():
+    """Opening Settings must preserve the Smart Settings cooldown value."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "g('REQUOTE_COOLDOWN_SECS')" in html
+    assert "g('REQUOTE_COOLDOWN')" not in html
+
+
 def test_settings_review_state_survives_reload_before_blank_template_gate():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
@@ -437,6 +445,15 @@ def test_splash_panel_distinguishes_local_submits_from_peer_relay():
     assert "local submits " in html
     assert "local submits only; peer relay depends on daemon peers" in html
     assert "Local submits</div><div>${fmtN(sp.total_posted)}</div>" in html
+
+
+def test_stopped_splash_listener_is_not_presented_as_actively_listening():
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    assert "const active = !!receive.active;" in html
+    assert "active ? 'ON' : (enabled ? 'READY' : 'OFF')" in html
+    assert "Listening enabled; start the bot to receive peer offers." in html
+    assert "active ? 'Listening On' : 'Listening Enabled'" in html
 
 
 def test_market_health_copy_distinguishes_recovery_from_market_health():

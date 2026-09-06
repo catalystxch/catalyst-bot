@@ -16,7 +16,7 @@ import json
 import os
 import threading
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
 
@@ -37,6 +37,107 @@ bp = Blueprint("market", __name__)
 _TIBET_PAIRS_CACHE_LOCK = threading.RLock()
 _TIBET_PAIRS_CACHE = {"base": "", "fetched_at": 0.0, "pairs": []}
 _TIBET_PAIRS_CACHE_TTL_SECS = 60.0
+
+_STARTUP_PRICE_LOCK = threading.Lock()
+_STARTUP_PRICE_CACHE = {"key": None, "expires_at": 0.0, "price": {}}
+
+
+def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
+    """Read-only setup pricing, including Dexie fallback during a TibetSwap outage.
+
+    Never call PriceEngine.get_price here: GUI polling must not write price
+    history or advance the trading engine's risk/reference state. Cache both
+    successes and failures so an outage cannot amplify five-second UI polling.
+    """
+    asset = str(asset_id or "").strip().lower().removeprefix("0x")
+    ticker = str(ticker_id or "").strip().upper()
+    if ticker and "_" not in ticker:
+        ticker += "_XCH"
+    if not asset:
+        return {}
+    tibet_base = getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
+    dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space").rstrip("/")
+    key = (asset, ticker, decimals, tibet_base, dexie_base)
+    with _STARTUP_PRICE_LOCK:
+        if (
+            _STARTUP_PRICE_CACHE["key"] == key
+            and time.monotonic() < _STARTUP_PRICE_CACHE["expires_at"]
+        ):
+            return dict(_STARTUP_PRICE_CACHE["price"])
+        price = {}
+        try:
+            for pair in _get_tibet_pairs_cached(tibet_base, timeout=3):
+                if (
+                    str(pair.get("asset_id", "")).strip().lower().removeprefix("0x")
+                    != asset
+                ):
+                    continue
+                xch = Decimal(str(pair.get("xch_reserve", 0))) / Decimal(10**12)
+                cat = Decimal(str(pair.get("token_reserve", 0))) / Decimal(
+                    10 ** int(decimals)
+                )
+                if xch.is_finite() and cat.is_finite() and xch > 0 and cat > 0:
+                    price = {
+                        "mid": str(xch / cat),
+                        "source": "tibetswap",
+                        "tibet_available": True,
+                    }
+                break
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            pass
+        if not price and ticker:
+            try:
+                import requests
+
+                _record_api_call("dexie", "/v2/prices/tickers")
+                response = requests.get(
+                    f"{dexie_base}/v2/prices/tickers",
+                    params={"ticker_id": ticker},
+                    timeout=5,
+                )
+                payload = response.json() if response.status_code == 200 else []
+                rows = (
+                    payload.get("tickers", [])
+                    if isinstance(payload, dict)
+                    else payload
+                )
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("ticker_id", "")).upper() != ticker:
+                        continue
+                    row_asset = (
+                        str(row.get("base_id") or "")
+                        .strip()
+                        .lower()
+                        .removeprefix("0x")
+                    )
+                    if row_asset and row_asset != asset:
+                        continue
+                    bid = Decimal(str(row.get("bid") or row.get("best_bid") or 0))
+                    ask = Decimal(str(row.get("ask") or row.get("best_ask") or 0))
+                    if bid.is_finite() and ask.is_finite() and 0 < bid <= ask:
+                        price = {
+                            "mid": str((bid + ask) / 2),
+                            "source": "dexie_bid_ask",
+                            "tibet_available": False,
+                        }
+                    # Historical last_price is not a current executable quote.
+                    break
+            except (
+                requests.RequestException,
+                InvalidOperation,
+                ValueError,
+                TypeError,
+                AttributeError,
+            ):
+                pass
+        _STARTUP_PRICE_CACHE.update(
+            key=key,
+            price=price,
+            expires_at=time.monotonic() + (60.0 if price else 15.0),
+        )
+        return dict(price)
 
 
 def _confirmed_tibetswap_outage(bot=None) -> dict:
@@ -201,6 +302,24 @@ def api_market_intel():
         live_dbx = {}
         mid_price = Decimal("0")
 
+    # A stopped bot commonly has no in-memory PriceEngine value even though the
+    # forced Dexie refresh above returned a current executable book.  Preserve
+    # that read-only midpoint for explorer-price sanity checks; otherwise the
+    # Spacescan panel reports a zero gap and can hide a materially stale or
+    # incompatible explorer quote.
+    if mid_price <= 0:
+        try:
+            public_bid = Decimal(str(summary.get("best_bid") or 0))
+            public_ask = Decimal(str(summary.get("best_ask") or 0))
+            if (
+                public_bid.is_finite()
+                and public_ask.is_finite()
+                and 0 < public_bid <= public_ask
+            ):
+                mid_price = (public_bid + public_ask) / Decimal("2")
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            pass
+
     try:
         local_book = api_server._get_live_local_offer_edges(asset_id)
         our_best_bid = local_book.get("our_best_bid", Decimal("0"))
@@ -210,6 +329,15 @@ def api_market_intel():
         summary["our_open_buys"] = int(local_book.get("our_open_buys", 0) or 0)
         summary["our_open_sells"] = int(local_book.get("our_open_sells", 0) or 0)
         summary["live_book_source"] = local_book.get("source", "")
+        if our_best_bid > 0 and our_best_ask > our_best_bid:
+            our_mid = (our_best_bid + our_best_ask) / Decimal("2")
+            summary["our_spread_bps"] = str(
+                (our_best_ask - our_best_bid)
+                / our_mid
+                * Decimal("10000")
+            )
+        else:
+            summary["our_spread_bps"] = "0"
 
         ext_best_bid = Decimal(
             str(summary.get("overall_best_bid") or summary.get("best_bid") or 0)

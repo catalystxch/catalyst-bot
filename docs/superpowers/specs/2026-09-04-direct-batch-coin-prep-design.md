@@ -2,7 +2,7 @@
 
 Date: 4 September 2026
 
-Status: approach approved; written specification awaiting user review
+Status: written specification approved; user requested startup/Cancel All testing first
 
 Scope: faster Sage Coin Prep, without weakening wallet-effect safety
 
@@ -112,4 +112,4 @@ The completed live wallet must remain untouched while implementing. After offlin
 
 ## Delivery boundary
 
-This change stays on a feature branch and is reviewed through a pull request before merging. The staged desktop/Splash fixes remain separately attributable. Do not modify the website or publish a release as part of design approval. This specification needs user review before the implementation plan and code changes begin.
+This change stays on a feature branch and is reviewed through a pull request before merging. The staged desktop/Splash fixes remain separately attributable. Do not modify the website or publish a release as part of design approval. The user approved this specification on 4 September, but requested Cancel All testing first and then reported the current bot-start failure. Resolve that testing prerequisite before starting the direct-batch implementation plan.

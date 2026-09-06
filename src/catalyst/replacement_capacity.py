@@ -177,6 +177,8 @@ def decide_capacity(
 def _canonical_target_contract(target_contract: Any) -> dict[str, Any]:
     if type(target_contract) is not dict:
         raise TypeError("target_contract must be an exact mapping")
+    if target_contract.get("contract_version") == 2:
+        return _canonical_batch_target_contract(target_contract)
     wallet_type = target_contract.get("wallet_type")
     if type(wallet_type) is not str or wallet_type not in {"xch", "cat"}:
         raise ValueError("target_contract wallet_type is invalid")
@@ -233,6 +235,130 @@ def _canonical_target_contract(target_contract: Any) -> dict[str, Any]:
     return canonical_target
 
 
+def _canonical_batch_target_contract(target_contract: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize the immutable plan for one Sage final-output batch."""
+
+    allowed = {
+        "contract_version",
+        "wallet_type",
+        "cat_asset_id",
+        "fee_mojos",
+        "outputs",
+        "external_fee",
+        "plan_hash",
+    }
+    if not set(target_contract).issubset(allowed):
+        raise ValueError("batch target contract fields are invalid")
+    wallet_type = target_contract.get("wallet_type")
+    if wallet_type not in {"xch", "cat"}:
+        raise ValueError("batch target wallet type is invalid")
+    fee_mojos = _exact_nonnegative_int(
+        target_contract.get("fee_mojos"), "batch fee mojos"
+    )
+    raw_cat_asset_id = target_contract.get("cat_asset_id")
+    if wallet_type == "cat":
+        cat_asset_id = _canonical_coin_id(raw_cat_asset_id, "CAT asset id")
+    elif raw_cat_asset_id not in {None, ""}:
+        raise ValueError("XCH batch cannot carry a CAT asset id")
+    else:
+        cat_asset_id = None
+
+    outputs = target_contract.get("outputs")
+    if type(outputs) is not list or not outputs or len(outputs) > 128:
+        raise ValueError("batch target outputs are invalid")
+    canonical_outputs = []
+    indexes: set[int] = set()
+    identities: set[tuple[str, int]] = set()
+    for output in outputs:
+        if type(output) is not dict or set(output) != {
+            "output_index",
+            "asset",
+            "address",
+            "amount_mojos",
+            "purpose",
+            "ordinal",
+        }:
+            raise ValueError("batch target output fields are invalid")
+        index = _exact_nonnegative_int(output.get("output_index"), "output_index")
+        asset = output.get("asset")
+        address = output.get("address")
+        amount = _exact_nonnegative_int(output.get("amount_mojos"), "amount_mojos")
+        ordinal = output.get("ordinal")
+        if (
+            index in indexes
+            or asset not in {"xch", "cat"}
+            or type(address) is not str
+            or not address
+            or len(address) > 256
+            or amount <= 0
+            or type(ordinal) is not int
+            or ordinal < -1
+            or (asset, ordinal) in identities
+        ):
+            raise ValueError("batch target output is invalid or repeated")
+        indexes.add(index)
+        identities.add((asset, ordinal))
+        canonical_outputs.append(
+            {
+                "output_index": index,
+                "asset": asset,
+                "address": address,
+                "amount_mojos": amount,
+                "purpose": validate_purpose(output.get("purpose")),
+                "ordinal": ordinal,
+            }
+        )
+    canonical_outputs.sort(key=lambda output: output["output_index"])
+    if [output["output_index"] for output in canonical_outputs] != list(
+        range(len(canonical_outputs))
+    ):
+        raise ValueError("batch target output indexes must be contiguous")
+
+    canonical = {
+        "contract_version": 2,
+        "wallet_type": wallet_type,
+        "cat_asset_id": cat_asset_id,
+        "fee_mojos": fee_mojos,
+        "outputs": canonical_outputs,
+    }
+    external_fee = target_contract.get("external_fee")
+    if external_fee is not None:
+        if wallet_type != "cat" or type(external_fee) is not dict:
+            raise ValueError("batch external fee is invalid")
+        if set(external_fee) != {"fee_mojos", "coin_ids"}:
+            raise ValueError("batch external fee fields are invalid")
+        external_fee_mojos = _exact_nonnegative_int(
+            external_fee.get("fee_mojos"), "batch external fee mojos"
+        )
+        raw_ids = external_fee.get("coin_ids")
+        if (
+            external_fee_mojos <= 0
+            or external_fee_mojos != fee_mojos
+            or type(raw_ids) is not list
+            or not raw_ids
+        ):
+            raise ValueError("batch external fee is invalid")
+        coin_ids = sorted(_canonical_coin_id(value) for value in raw_ids)
+        if len(coin_ids) != len(set(coin_ids)):
+            raise ValueError("batch external fee coin identities repeat")
+        canonical["external_fee"] = {
+            "fee_mojos": external_fee_mojos,
+            "coin_ids": coin_ids,
+        }
+    elif wallet_type == "cat" and fee_mojos:
+        raise ValueError("CAT batch fee requires an external fee contract")
+
+    encoded = json.dumps(
+        canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    plan_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    supplied_hash = target_contract.get("plan_hash")
+    if supplied_hash is not None and supplied_hash != plan_hash:
+        raise ValueError("batch target plan hash differs")
+    canonical["plan_hash"] = plan_hash
+    return canonical
+
+
 def canonical_coin_prep_contract(
     *,
     operation_kind: str,
@@ -254,7 +380,11 @@ def canonical_coin_prep_contract(
         raise ValueError("source coin identities must be unique")
     target = _canonical_target_contract(target_contract)
     material = {
-        "contract_version": "coin_prep_operation_v1",
+        "contract_version": (
+            "coin_prep_operation_v2"
+            if target.get("contract_version") == 2
+            else "coin_prep_operation_v1"
+        ),
         "operation_kind": operation_kind,
         "purpose": safe_purpose,
         "source_coin_ids": sources,

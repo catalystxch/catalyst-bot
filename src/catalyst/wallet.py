@@ -262,6 +262,21 @@ def get_coins_by_ids(coin_ids: list) -> dict | None:
     return result if type(result) is dict else None
 
 
+def get_transaction_by_height(height: int) -> dict | None:
+    """Read one exact height-addressed transaction when the backend supports it."""
+
+    if type(height) is not int or isinstance(height, bool) or height <= 0:
+        return None
+    reader = getattr(_wallet_adapter, "get_transaction_by_height", None)
+    if not callable(reader):
+        return None
+    try:
+        result = reader(height)
+    except Exception:
+        return None
+    return result if type(result) is dict else None
+
+
 MUTATING_WALLET_EXPORTS = frozenset(
     {
         "cancel_offer",
@@ -280,6 +295,7 @@ MUTATING_WALLET_EXPORTS = frozenset(
         "auto_combine_xch",
         "combine_coins",
         "create_transaction_rpc",
+        "submit_built_transaction_rpc",
         "sage_initialize",
         "sage_login",
         "sage_topup_split",
@@ -302,6 +318,7 @@ _COMPOUND_MUTATION_EXPORTS = frozenset(
         "combine_coins",
         "create_offer",
         "create_transaction_rpc",
+        "submit_built_transaction_rpc",
         "delete_offer",
         "delete_offers_batch",
         "get_next_address",
@@ -1128,6 +1145,16 @@ def _run_wallet_mutation_with_authority(
         )
         effect_attempted = True
         result = callback(*args, **kwargs)
+        if (
+            export_name == "submit_built_transaction_rpc"
+            and type(result) is dict
+            and result.get("_catalyst_effect_attempted") is False
+        ):
+            # The trusted Sage adapter rejected an unvalidated unsigned effect
+            # before signing. Preserve that exact no-effect assertion so the
+            # durable claim can be released instead of being misclassified as
+            # an ambiguous submission.
+            effect_attempted = False
         mutation_gate.require_wallet_mutation_permit_authority(
             permit, f"{operation}:outcome"
         )
@@ -1420,12 +1447,63 @@ def cancel_offers_batch(
     max_workers: int = 3,
     fee_mojos: int = None,
     skip_confirmation: bool = False,
+    *,
+    source_coin_ids: list = None,
+    fee_coin_id: str = None,
+    _cancel_continuation=None,
+    _cancel_operation_id: str = None,
+    _cancel_intent_id: str = None,
+    _cancel_trade_id: str = None,
 ):
-    del max_workers, skip_confirmation
+    def blocked_batch(
+        reason_code: str = "OFFER_CANCEL_CONTINUATION_INVALID",
+        *,
+        effect_attempted: bool = False,
+    ):
+        result = {
+            trade_id: _blocked_offer_cancel_continuation(
+                reason_code,
+                effect_attempted=effect_attempted,
+            )
+            for trade_id in trade_ids
+            if type(trade_id) is str
+        }
+        result["_catalyst_effect_attempted"] = effect_attempted
+        return result
+
     if type(trade_ids) is not list:
         return _blocked_offer_cancel_continuation(
             "OFFER_CANCEL_JOURNAL_REQUIRED",
             effect_attempted=False,
+        )
+    continuation_arguments = (
+        _cancel_continuation,
+        _cancel_operation_id,
+        _cancel_intent_id,
+        _cancel_trade_id,
+    )
+    if any(value is not None for value in continuation_arguments):
+        if not all(value is not None for value in continuation_arguments):
+            return blocked_batch()
+        return _run_offer_operation_continuation(
+            _cancel_continuation,
+            _cancel_operation_id,
+            _cancel_intent_id,
+            wallet_operation="wallet:cancel_offer",
+            adapter_method="cancel_offers_batch",
+            blocked_result=blocked_batch,
+            callback_args=(
+                trade_ids,
+                secure,
+                max_workers,
+                fee_mojos,
+                skip_confirmation,
+            ),
+            callback_kwargs={
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+            },
+            target_trade_id=_cancel_trade_id,
         )
     return {
         trade_id: _blocked_offer_cancel_continuation(
@@ -1453,6 +1531,52 @@ def create_transaction_rpc(
     return _run_sage_mutation(
         "create_transaction_rpc", selected_coin_ids, actions, auto_submit
     )
+
+
+def build_transaction_rpc(selected_coin_ids: list, actions: list):
+    """Build an unsigned Sage transaction under the bound wallet identity.
+
+    This cannot sign or submit. Its response must pass
+    ``validate_unsigned_transaction_effect`` before the separately guarded
+    submit entry point will accept it.
+    """
+    if WALLET_TYPE != "sage" or not hasattr(_wallet_adapter, "build_transaction_rpc"):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    try:
+        binding, adapter = _expected_identity_authority()
+
+        def identity_recheck(step: str) -> None:
+            _revalidate_adapter_authority(adapter, f"wallet:unsigned_build:{step}")
+            mutation_gate.require_fresh_wallet_identity(
+                binding,
+                _identity_from_adapter(adapter),
+                f"wallet:unsigned_build:{step}",
+            )
+
+        identity_recheck("identity")
+        result = adapter.build_transaction_rpc(
+            selected_coin_ids, actions, _identity_recheck=identity_recheck
+        )
+        return (
+            result
+            if type(result) is dict
+            else _blocked_mutation("WALLET_MUTATION_FAILED")
+        )
+    except mutation_gate.MutationBlocked as exc:
+        return _blocked_mutation(exc.reason_code)
+    except Exception:
+        return _blocked_mutation("WALLET_MUTATION_FAILED")
+
+
+def validate_unsigned_transaction_effect(result: dict, contract: dict):
+    callback = getattr(_wallet_adapter, "validate_unsigned_transaction_effect", None)
+    if WALLET_TYPE != "sage" or not callable(callback):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return callback(result, contract)
+
+
+def submit_built_transaction_rpc(validated_result: dict):
+    return _run_sage_mutation("submit_built_transaction_rpc", validated_result)
 
 
 def sage_topup_split(
