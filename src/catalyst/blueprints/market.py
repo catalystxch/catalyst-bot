@@ -97,9 +97,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                 )
                 payload = response.json() if response.status_code == 200 else []
                 rows = (
-                    payload.get("tickers", [])
-                    if isinstance(payload, dict)
-                    else payload
+                    payload.get("tickers", []) if isinstance(payload, dict) else payload
                 )
                 for row in rows if isinstance(rows, list) else []:
                     if not isinstance(row, dict):
@@ -107,10 +105,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                     if str(row.get("ticker_id", "")).upper() != ticker:
                         continue
                     row_asset = (
-                        str(row.get("base_id") or "")
-                        .strip()
-                        .lower()
-                        .removeprefix("0x")
+                        str(row.get("base_id") or "").strip().lower().removeprefix("0x")
                     )
                     if row_asset and row_asset != asset:
                         continue
@@ -332,9 +327,7 @@ def api_market_intel():
         if our_best_bid > 0 and our_best_ask > our_best_bid:
             our_mid = (our_best_bid + our_best_ask) / Decimal("2")
             summary["our_spread_bps"] = str(
-                (our_best_ask - our_best_bid)
-                / our_mid
-                * Decimal("10000")
+                (our_best_ask - our_best_bid) / our_mid * Decimal("10000")
             )
         else:
             summary["our_spread_bps"] = "0"

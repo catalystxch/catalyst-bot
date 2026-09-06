@@ -1625,9 +1625,7 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
             transaction_id="1" * 64,
             spend_identity="2" * 64,
         )
-        return {
-            trade_id: dict(shared) for trade_id in selected_trade_ids
-        }
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
 
     _stub_cancel_continuation_authority(
         monkeypatch,
@@ -1722,8 +1720,10 @@ def _confirmed_sage_bulk_cancel_evidence(
         for trade_id in trade_ids
     ]
     observed_at = (
-        max(request_times) + timedelta(seconds=2)
-    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        (max(request_times) + timedelta(seconds=2))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
     return_coin_ids = [f"{0x3000 + index:064x}" for index in range(len(trade_ids))]
     fee_return_coin_id = f"{0x4000:064x}"
     offers = []
@@ -1846,9 +1846,9 @@ def _confirmed_sage_bulk_cancel_evidence(
         "schema_version": 1,
         "collection_started_at": observed_at,
         "observed_at": observed_at,
-        "wallet_fingerprint_hash": database.get_offer_intent_by_trade_id(
-            trade_ids[0]
-        )["wallet_fingerprint_hash"],
+        "wallet_fingerprint_hash": database.get_offer_intent_by_trade_id(trade_ids[0])[
+            "wallet_fingerprint_hash"
+        ],
         "network": "mainnet",
         "wallet_identity": {
             "observed_at": observed_at,
@@ -2092,9 +2092,7 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
     missing_fee_evidence = json.loads(json.dumps(evidence))
     missing_fee_evidence["transaction_history"]["records"][0]["spent"] = [
         row
-        for row in missing_fee_evidence["transaction_history"]["records"][0][
-            "spent"
-        ]
+        for row in missing_fee_evidence["transaction_history"]["records"][0]["spent"]
         if row["coin_id"] != fee_coin_id
     ]
     assert (
@@ -3113,9 +3111,10 @@ def test_finalize_cancel_cohort_is_atomic_after_one_shared_wallet_effect(
             finalized_at="2026-08-16T12:00:02Z",
         )
     assert [
-        [event["phase"] for event in database.get_offer_operation_events(
-            member["operation_id"]
-        )]
+        [
+            event["phase"]
+            for event in database.get_offer_operation_events(member["operation_id"])
+        ]
         for member in manifest["members"]
     ] == [["PREPARED"], ["PREPARED"]]
 
@@ -4892,9 +4891,7 @@ def test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation(
         offer_reconciliation,
         "classify_terminal_evidence",
         lambda *_args, **_kwargs: {
-            "classification": getattr(
-                offer_reconciliation, terminal_classification
-            ),
+            "classification": getattr(offer_reconciliation, terminal_classification),
             "reason_code": "EXACT_TERMINAL_PROOF",
         },
     )
@@ -4902,9 +4899,7 @@ def test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation(
     def reconcile(intent_id, **kwargs):
         reconcile_calls.append((intent_id, kwargs))
         return {
-            "classification": getattr(
-                offer_reconciliation, terminal_classification
-            ),
+            "classification": getattr(offer_reconciliation, terminal_classification),
             "applied": True,
         }
 

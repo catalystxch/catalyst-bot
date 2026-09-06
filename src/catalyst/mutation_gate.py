@@ -583,7 +583,8 @@ def _is_exact_cancel_wallet_effect(
         or isinstance(fee_mojos, bool)
         or fee_mojos <= 0
         or type(batch) is not dict
-        or set(batch) != {
+        or set(batch)
+        != {
             "protocol",
             "trade_ids",
             "source_coin_ids",
@@ -910,8 +911,7 @@ def _is_exact_prepared_operation_blocker(
     ):
         return False
     if any(
-        context["wallet_effect"] != own_context["wallet_effect"]
-        for context in contexts
+        context["wallet_effect"] != own_context["wallet_effect"] for context in contexts
     ):
         return False
     try:
@@ -2133,8 +2133,7 @@ class MutationGate:
                         owner_run_id=self.run_id,
                         expected_lease_version=version,
                         heartbeat_at=now,
-                        lease_expires_at=now
-                        + timedelta(seconds=self.lease_seconds),
+                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
                     )
                     result = _lease_public_result(result)
                 except Exception:

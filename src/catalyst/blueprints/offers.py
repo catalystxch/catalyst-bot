@@ -1312,10 +1312,7 @@ def _offer_diagnostic_assessment(
         and len(reserve_backed) == 0
         and len(stale_in_db) == 0
         and len(wallet_only) == 0
-        and (
-            len(wallet_cancel_pending) > 0
-            or len(wallet_cancelled_still_visible) > 0
-        )
+        and (len(wallet_cancel_pending) > 0 or len(wallet_cancelled_still_visible) > 0)
     )
 
     if local_book_consistent:
@@ -1481,16 +1478,12 @@ def api_offers_diagnostic():
                 {
                     "success": True,
                     "diagnosis": assessment["diagnosis"],
-                    "local_book_consistent": assessment[
-                        "local_book_consistent"
-                    ],
+                    "local_book_consistent": assessment["local_book_consistent"],
                     "cancel_settle_in_progress": assessment[
                         "cancel_settle_in_progress"
                     ],
                     "dexie_rows_evaluated": assessment["dexie_rows_evaluated"],
-                    "likely_stale_dexie_rows": assessment[
-                        "likely_stale_dexie_rows"
-                    ],
+                    "likely_stale_dexie_rows": assessment["likely_stale_dexie_rows"],
                     "wallet_error": wallet_error,
                     "wallet_open_buys": len(wallet_open_buys),
                     "wallet_open_sells": len(wallet_open_sells),

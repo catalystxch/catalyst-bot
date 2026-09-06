@@ -8624,12 +8624,8 @@ class BotLoop:
                     ),
                     "num_buy_offers": intel_data.get("num_buy_offers", 0),
                     "num_sell_offers": intel_data.get("num_sell_offers", 0),
-                    "num_competitor_buys": intel_data.get(
-                        "num_competitor_buys", 0
-                    ),
-                    "num_competitor_sells": intel_data.get(
-                        "num_competitor_sells", 0
-                    ),
+                    "num_competitor_buys": intel_data.get("num_competitor_buys", 0),
+                    "num_competitor_sells": intel_data.get("num_competitor_sells", 0),
                     "thin_side": intel_data.get("thin_side", ""),
                 }
                 try:

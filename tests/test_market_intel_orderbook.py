@@ -135,17 +135,13 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         }
         self.intel._orderbook["buy_offers"] = [own_buy]
         self.intel._orderbook["sell_offers"] = [own_sell]
-        self.intel._analyse_orderbook(
-            [own_buy], [own_sell], source="dexie_v1_offers"
-        )
+        self.intel._analyse_orderbook([own_buy], [own_sell], source="dexie_v1_offers")
 
         anonymous_v3_buy = [{**own_buy, "is_ours": False}]
         anonymous_v3_sell = [{**own_sell, "is_ours": False}]
 
         self.assertFalse(
-            self.intel._should_use_v3_orderbook(
-                anonymous_v3_buy, anonymous_v3_sell
-            )
+            self.intel._should_use_v3_orderbook(anonymous_v3_buy, anonymous_v3_sell)
         )
 
 

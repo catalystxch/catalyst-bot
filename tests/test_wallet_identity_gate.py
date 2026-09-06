@@ -282,7 +282,9 @@ def test_wallet_mutation_inventory_is_exact_and_facade_owned():
     assert all(getattr(wallet, name).__module__ == "wallet" for name in expected)
 
 
-def test_sage_unsigned_build_uses_bound_identity_without_mutation_submission(monkeypatch):
+def test_sage_unsigned_build_uses_bound_identity_without_mutation_submission(
+    monkeypatch,
+):
     adapter = SimpleNamespace(
         build_transaction_rpc=lambda coin_ids, actions, _identity_recheck=None: (
             _identity_recheck("create_transaction")
@@ -292,13 +294,23 @@ def test_sage_unsigned_build_uses_bound_identity_without_mutation_submission(mon
     checks = []
     monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
-    monkeypatch.setattr(wallet, "_expected_identity_authority", lambda: ("binding", adapter))
-    monkeypatch.setattr(wallet, "_identity_from_adapter", lambda value: {"fresh": value is adapter})
-    monkeypatch.setattr(wallet, "_revalidate_adapter_authority", lambda value, operation: checks.append(operation))
+    monkeypatch.setattr(
+        wallet, "_expected_identity_authority", lambda: ("binding", adapter)
+    )
+    monkeypatch.setattr(
+        wallet, "_identity_from_adapter", lambda value: {"fresh": value is adapter}
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_revalidate_adapter_authority",
+        lambda value, operation: checks.append(operation),
+    )
     monkeypatch.setattr(
         mutation_gate,
         "require_fresh_wallet_identity",
-        lambda binding, snapshot, operation: checks.append((binding, snapshot, operation)),
+        lambda binding, snapshot, operation: checks.append(
+            (binding, snapshot, operation)
+        ),
     )
 
     result = wallet.build_transaction_rpc(["aa"], [{"type": "fee", "amount": "0"}])

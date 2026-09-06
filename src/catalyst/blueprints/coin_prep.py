@@ -1204,12 +1204,8 @@ def api_coin_prep_status():
                                         if target_m <= 0 or needed <= 0:
                                             allocated[tier] = 0
                                             continue
-                                        lo = int(
-                                            Decimal(target_m) * (Decimal(1) - tol)
-                                        )
-                                        hi = int(
-                                            Decimal(target_m) * (Decimal(1) + tol)
-                                        )
+                                        lo = int(Decimal(target_m) * (Decimal(1) - tol))
+                                        hi = int(Decimal(target_m) * (Decimal(1) + tol))
                                         hits = [
                                             i
                                             for i, a in enumerate(remaining)
@@ -1242,10 +1238,7 @@ def api_coin_prep_status():
                                             _xreqs.append(
                                                 (
                                                     _t,
-                                                    int(
-                                                        _xsz
-                                                        * Decimal(10**12)
-                                                    ),
+                                                    int(_xsz * Decimal(10**12)),
                                                     _cnt,
                                                 )
                                             )
@@ -1257,10 +1250,7 @@ def api_coin_prep_status():
                                             _creqs.append(
                                                 (
                                                     _t,
-                                                    int(
-                                                        _csz
-                                                        * Decimal(10**_cat_dec)
-                                                    ),
+                                                    int(_csz * Decimal(10**_cat_dec)),
                                                     _cnt,
                                                 )
                                             )
@@ -1291,21 +1281,15 @@ def api_coin_prep_status():
                                             or 0
                                         )
                                     )
-                                    _csz = Decimal(
-                                        str(_last.get("cat_coin_size") or 0)
-                                    )
+                                    _csz = Decimal(str(_last.get("cat_coin_size") or 0))
                                     _xt = int(_last.get("xch_target") or 0)
                                     _ct = int(_last.get("cat_target") or 0)
                                     _target_xch = _xt
                                     _target_cat = _ct
                                     if _xsz > 0 and _xt > 0:
                                         _xm = int(_xsz * Decimal(10**12))
-                                        _lo = int(
-                                            Decimal(_xm) * (Decimal(1) - _tol)
-                                        )
-                                        _hi = int(
-                                            Decimal(_xm) * (Decimal(1) + _tol)
-                                        )
+                                        _lo = int(Decimal(_xm) * (Decimal(1) - _tol))
+                                        _hi = int(Decimal(_xm) * (Decimal(1) + _tol))
                                         _matched_xch = sum(
                                             1 for c in _xch_coins if _lo <= c <= _hi
                                         )
@@ -1313,12 +1297,8 @@ def api_coin_prep_status():
                                             _all_ok = False
                                     if _csz > 0 and _ct > 0:
                                         _cm = int(_csz * Decimal(10**_cat_dec))
-                                        _lo = int(
-                                            Decimal(_cm) * (Decimal(1) - _tol)
-                                        )
-                                        _hi = int(
-                                            Decimal(_cm) * (Decimal(1) + _tol)
-                                        )
+                                        _lo = int(Decimal(_cm) * (Decimal(1) - _tol))
+                                        _hi = int(Decimal(_cm) * (Decimal(1) + _tol))
                                         _matched_cat = sum(
                                             1 for c in _cat_coins if _lo <= c <= _hi
                                         )

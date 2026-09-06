@@ -698,9 +698,7 @@ class TestReversed(NeedsTopupThresholdTests):
 
         free_xch = records(48)
         false_selectable_xch = records(98)
-        cat_records = [
-            {"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}
-        ]
+        cat_records = [{"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}]
 
         def owned_snapshot(wallet_id):
             selectable = free_xch if wallet_id == 1 else cat_records
@@ -708,9 +706,7 @@ class TestReversed(NeedsTopupThresholdTests):
 
         def classify(actual_records, wallet_type, _tier_sizes):
             inventory = {
-                "reserve": [
-                    {"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}
-                ],
+                "reserve": [{"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}],
                 "inner": [{}] * 100,
                 "mid": [{}] * 100,
                 "outer": [{}] * 100,
@@ -736,30 +732,40 @@ class TestReversed(NeedsTopupThresholdTests):
             patch.object(
                 mgr, "_get_sage_owned_coin_snapshot", side_effect=owned_snapshot
             ) as owned,
-            patch.object(
-                mgr, "_classify_coins_by_designation", side_effect=classify
-            ),
+            patch.object(mgr, "_classify_coins_by_designation", side_effect=classify),
             patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
             patch.object(mgr, "_fee_pool_enabled", return_value=True),
             patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup),
-            patch.object(mgr, "_topup_offer_deficits_by_tier", return_value={
-                "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
-                "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
-            }),
-            patch.object(mgr, "_get_tier_sizes_mojos", return_value={
-                "inner": 4_000_000,
-                "mid": 3_000_000,
-                "outer": 2_000_000,
-                "extreme": 1_500_000,
-                "sniper": 1_000_000,
-                "fees": 1_000_000,
-            }),
-            patch.object(mgr, "_configured_tier_sizes_xch", return_value={
-                "inner": Decimal("4"),
-                "mid": Decimal("3"),
-                "outer": Decimal("2"),
-                "extreme": Decimal("1.5"),
-            }),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                },
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 4_000_000,
+                    "mid": 3_000_000,
+                    "outer": 2_000_000,
+                    "extreme": 1_500_000,
+                    "sniper": 1_000_000,
+                    "fees": 1_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("4"),
+                    "mid": Decimal("3"),
+                    "outer": Decimal("2"),
+                    "extreme": Decimal("1.5"),
+                },
+            ),
             patch.object(mgr, "get_trading_pace", return_value="normal"),
             patch.object(mgr, "update_coin_counts"),
             patch.object(mgr, "log_inventory"),
@@ -811,9 +817,7 @@ class TestReversed(NeedsTopupThresholdTests):
             ]
 
         xch_records = records(98)
-        cat_records = [
-            {"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}
-        ]
+        cat_records = [{"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}]
 
         def owned_snapshot(wallet_id):
             selectable = xch_records if wallet_id == 1 else cat_records
@@ -821,9 +825,7 @@ class TestReversed(NeedsTopupThresholdTests):
 
         def classify(actual_records, wallet_type, _tier_sizes):
             inventory = {
-                "reserve": [
-                    {"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}
-                ],
+                "reserve": [{"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}],
                 "inner": [{}] * 100,
                 "mid": [{}] * 100,
                 "outer": [{}] * 100,
@@ -849,30 +851,40 @@ class TestReversed(NeedsTopupThresholdTests):
             patch.object(
                 mgr, "_get_sage_owned_coin_snapshot", side_effect=owned_snapshot
             ),
-            patch.object(
-                mgr, "_classify_coins_by_designation", side_effect=classify
-            ),
+            patch.object(mgr, "_classify_coins_by_designation", side_effect=classify),
             patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
             patch.object(mgr, "_fee_pool_enabled", return_value=True),
             patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup),
-            patch.object(mgr, "_topup_offer_deficits_by_tier", return_value={
-                "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
-                "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
-            }),
-            patch.object(mgr, "_get_tier_sizes_mojos", return_value={
-                "inner": 4_000_000,
-                "mid": 3_000_000,
-                "outer": 2_000_000,
-                "extreme": 1_500_000,
-                "sniper": 1_000_000,
-                "fees": 1_000_000,
-            }),
-            patch.object(mgr, "_configured_tier_sizes_xch", return_value={
-                "inner": Decimal("4"),
-                "mid": Decimal("3"),
-                "outer": Decimal("2"),
-                "extreme": Decimal("1.5"),
-            }),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                },
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 4_000_000,
+                    "mid": 3_000_000,
+                    "outer": 2_000_000,
+                    "extreme": 1_500_000,
+                    "sniper": 1_000_000,
+                    "fees": 1_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("4"),
+                    "mid": Decimal("3"),
+                    "outer": Decimal("2"),
+                    "extreme": Decimal("1.5"),
+                },
+            ),
             patch.object(mgr, "get_trading_pace", return_value="normal"),
             patch.object(mgr, "update_coin_counts"),
             patch.object(mgr, "log_inventory"),
@@ -1080,7 +1092,9 @@ class TestReversed(NeedsTopupThresholdTests):
             mgr.check_runtime_health(active_buy_count=36, active_sell_count=36)
         )
 
-    def test_sage_runtime_health_still_triggers_for_genuinely_low_selectable_counts(self):
+    def test_sage_runtime_health_still_triggers_for_genuinely_low_selectable_counts(
+        self,
+    ):
         """Removing the double subtraction must retain the real low-coin gate."""
         mgr = self._manager()
         self._ns.ENABLE_RUNTIME_COIN_HEALTH = True

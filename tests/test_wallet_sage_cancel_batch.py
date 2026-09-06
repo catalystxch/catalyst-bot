@@ -61,9 +61,7 @@ class WalletSageCancelBatchTests(unittest.TestCase):
     def test_cancel_batch_never_confirms_by_unlock_or_absence(self):
         with (
             patch.object(wallet_sage, "_require_signing_capability", return_value=True),
-            patch.object(
-                wallet_sage, "_sage_post", return_value={"success": True}
-            ),
+            patch.object(wallet_sage, "_sage_post", return_value={"success": True}),
             patch.object(wallet_sage, "get_pending_transactions") as pending,
             patch.object(wallet_sage, "get_all_offers") as offers,
             patch.object(wallet_sage, "get_owned_coins_detailed") as owned,
@@ -80,9 +78,7 @@ class WalletSageCancelBatchTests(unittest.TestCase):
     def test_cancel_batch_does_not_confirm_when_offer_disappears_but_tx_pending(self):
         with (
             patch.object(wallet_sage, "_require_signing_capability", return_value=True),
-            patch.object(
-                wallet_sage, "_sage_post", return_value={"success": True}
-            ),
+            patch.object(wallet_sage, "_sage_post", return_value={"success": True}),
             patch.object(
                 wallet_sage,
                 "get_pending_transactions",
@@ -104,9 +100,7 @@ class WalletSageCancelBatchTests(unittest.TestCase):
     def test_cancel_batch_does_not_confirm_when_offer_lock_still_visible(self):
         with (
             patch.object(wallet_sage, "_require_signing_capability", return_value=True),
-            patch.object(
-                wallet_sage, "_sage_post", return_value={"success": True}
-            ),
+            patch.object(wallet_sage, "_sage_post", return_value={"success": True}),
             patch.object(wallet_sage, "get_pending_transactions") as pending,
             patch.object(wallet_sage, "get_all_offers", return_value=[]) as offers,
             patch.object(

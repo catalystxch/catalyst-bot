@@ -277,10 +277,15 @@ class TestStatusEndpointSmoke(_FlaskBase):
             with (
                 self.subTest(bot_created=bot is not None),
                 patch.object(api_server, "bot", bot),
-                patch.object(api_server, "get_public_stability_status", return_value={
-                    "allowed": False, "reason_code": "COIN_PREP_EFFECT_UNKNOWN",
-                    "recovery": {"freshness": {"valid": True}},
-                }),
+                patch.object(
+                    api_server,
+                    "get_public_stability_status",
+                    return_value={
+                        "allowed": False,
+                        "reason_code": "COIN_PREP_EFFECT_UNKNOWN",
+                        "recovery": {"freshness": {"valid": True}},
+                    },
+                ),
             ):
                 response = self.client.get("/api/status", environ_base=self._LOOPBACK)
                 self.assertEqual(response.status_code, 200)
@@ -293,8 +298,11 @@ class TestStatusEndpointSmoke(_FlaskBase):
             with (
                 self.subTest(bot_created=bot is not None),
                 patch.object(api_server, "bot", bot),
-                patch.object(api_server, "get_public_stability_status",
-                             side_effect=RuntimeError("private diagnostics")),
+                patch.object(
+                    api_server,
+                    "get_public_stability_status",
+                    side_effect=RuntimeError("private diagnostics"),
+                ),
             ):
                 response = self.client.get("/api/status", environ_base=self._LOOPBACK)
                 self.assertEqual(response.status_code, 200)
@@ -771,7 +779,9 @@ class TestStatusEndpointSmoke(_FlaskBase):
         stopped_bot.price_engine.get_price.assert_not_called()
         record_price.assert_not_called()
 
-    def test_stopped_status_does_not_keep_old_trading_price_during_tibetswap_outage(self):
+    def test_stopped_status_does_not_keep_old_trading_price_during_tibetswap_outage(
+        self,
+    ):
         from unittest.mock import Mock
 
         api_server._active_cat.update({"asset_id": "stale-cat", "ticker_id": "MZ_XCH"})

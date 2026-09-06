@@ -458,9 +458,7 @@ def test_splash_output_reader_classifies_isolated_failure_as_backpressure_when_h
     import splash_node
 
     class FakeProcess:
-        stdout = iter(
-            ["error trying to connectReceived Offer: offer1abc123\n"]
-        )
+        stdout = iter(["error trying to connectReceived Offer: offer1abc123\n"])
 
     events = []
     monkeypatch.setattr(

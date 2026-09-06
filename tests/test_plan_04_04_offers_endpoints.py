@@ -236,7 +236,10 @@ def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
             "async function confirmShutdown", 1
         )[0]
     )
-    script = helper_source + "\nconsole.log(JSON.stringify([shutdownOfferDisposition({offers:{buy:[],sell:[]}}), shutdownOfferDisposition({offers:{buy:[{}],sell:[{},{}]}}), shutdownOfferDisposition({offers:{buy:[{}],sell:[{},{}]}}, {total:3,cancelled:3,confirmed:3,pending:0,failed:0})]));"
+    script = (
+        helper_source
+        + "\nconsole.log(JSON.stringify([shutdownOfferDisposition({offers:{buy:[],sell:[]}}), shutdownOfferDisposition({offers:{buy:[{}],sell:[{},{}]}}), shutdownOfferDisposition({offers:{buy:[{}],sell:[{},{}]}}, {total:3,cancelled:3,confirmed:3,pending:0,failed:0})]));"
+    )
     completed = subprocess.run(
         [node, "-e", script],
         check=True,
@@ -704,8 +707,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch(
@@ -745,7 +747,9 @@ class TestCancelAllPost(_FlaskBase):
             },
         )
 
-    def test_cancel_all_completed_at_deadline_is_not_reported_as_zero_pending_error(self):
+    def test_cancel_all_completed_at_deadline_is_not_reported_as_zero_pending_error(
+        self,
+    ):
         """Final terminal proof wins even when it arrives on the deadline boundary."""
         from blueprints import offers
 
@@ -790,9 +794,7 @@ class TestCancelAllPost(_FlaskBase):
                 "database.get_authoritative_terminal_records",
                 side_effect=terminal_records,
             ),
-            patch.object(
-                offers, "_cancel_all_deadline_seconds", return_value=0.0
-            ),
+            patch.object(offers, "_cancel_all_deadline_seconds", return_value=0.0),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
         ):
             response = self._post("/api/offers/cancel_all")
@@ -860,9 +862,11 @@ class TestCancelAllPost(_FlaskBase):
         snapshots = []
 
         def poll():
-            snapshots.append(self.client.get(
-                "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
-            ).get_json())
+            snapshots.append(
+                self.client.get(
+                    "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+                ).get_json()
+            )
 
         def terminal_records(candidates):
             return {
@@ -873,25 +877,31 @@ class TestCancelAllPost(_FlaskBase):
 
         def finish_retries():
             # One exact proof, one mismatched proof and one mere submission.
-            records.update({
-                trade_ids[0]: {
-                    "sage_trade_id": trade_ids[0], "outcome": "CANCELLED_PROVEN"
-                },
-                trade_ids[1]: {
-                    "sage_trade_id": "d" * 64, "outcome": "CANCELLED_PROVEN"
-                },
-                trade_ids[2]: {
-                    "sage_trade_id": trade_ids[2],
-                    "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
-                },
-            })
+            records.update(
+                {
+                    trade_ids[0]: {
+                        "sage_trade_id": trade_ids[0],
+                        "outcome": "CANCELLED_PROVEN",
+                    },
+                    trade_ids[1]: {
+                        "sage_trade_id": "d" * 64,
+                        "outcome": "CANCELLED_PROVEN",
+                    },
+                    trade_ids[2]: {
+                        "sage_trade_id": trade_ids[2],
+                        "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                    },
+                }
+            )
             poll()
             records[trade_ids[1]] = {
-                "sage_trade_id": trade_ids[1], "outcome": "EXPIRED_PROVEN"
+                "sage_trade_id": trade_ids[1],
+                "outcome": "EXPIRED_PROVEN",
             }
             poll()
             records[trade_ids[2]] = {
-                "sage_trade_id": trade_ids[2], "outcome": "CANCELLED_PROVEN"
+                "sage_trade_id": trade_ids[2],
+                "outcome": "CANCELLED_PROVEN",
             }
             poll()
             return 0
@@ -903,10 +913,12 @@ class TestCancelAllPost(_FlaskBase):
         stopped.offer_manager.retry_failed_cancels.side_effect = finish_retries
         with (
             patch.object(api_server, "bot", stopped),
-            patch("wallet.get_all_offers", return_value=[
-                {"trade_id": trade_id, "status": "ACTIVE"}
-                for trade_id in trade_ids
-            ]),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                ],
+            ),
             patch(
                 "database.get_authoritative_terminal_records",
                 side_effect=terminal_records,
@@ -926,7 +938,7 @@ class TestCancelAllPost(_FlaskBase):
             self.assertEqual(snapshot["total"], 3)
             self.assertEqual(snapshot["phase"], "reconciling")
             self.assertIn(
-                f'{snapshot["confirmed"]}/3 offers terminal', snapshot["message"]
+                f"{snapshot['confirmed']}/3 offers terminal", snapshot["message"]
             )
             self.assertNotIn("_target_trade_ids", snapshot)
         # Only the worker may declare completion, after the retry call returns.

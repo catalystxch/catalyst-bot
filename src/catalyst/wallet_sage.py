@@ -5236,10 +5236,7 @@ def cancel_offers_batch(
                 if type(item) is not dict or type(item.get("outputs")) is not list:
                     raise ValueError("malformed input")
                 coin_id = _canonical_hex(item.get("coin_id"))
-                if (
-                    not re.fullmatch(r"[0-9a-f]{64}", coin_id)
-                    or coin_id in input_ids
-                ):
+                if not re.fullmatch(r"[0-9a-f]{64}", coin_id) or coin_id in input_ids:
                     raise ValueError("duplicate or malformed input")
                 input_ids.add(coin_id)
                 input_total += _exact_summary_mojos(item.get("amount"))
@@ -5252,7 +5249,10 @@ def cancel_offers_batch(
                         or output_id in output_ids
                     ):
                         raise ValueError("duplicate or malformed output")
-                    if output.get("receiving") is not True or output.get("burning") is True:
+                    if (
+                        output.get("receiving") is not True
+                        or output.get("burning") is True
+                    ):
                         raise ValueError("non-receiving output")
                     output_ids.add(output_id)
                     output_total += _exact_summary_mojos(output.get("amount"))
@@ -5267,7 +5267,10 @@ def cancel_offers_batch(
 
             spend_ids = []
             for raw_spend in result["coin_spends"]:
-                if type(raw_spend) is not dict or type(raw_spend.get("coin")) is not dict:
+                if (
+                    type(raw_spend) is not dict
+                    or type(raw_spend.get("coin")) is not dict
+                ):
                     raise ValueError("malformed coin spend")
                 raw_coin = dict(raw_spend["coin"])
                 for field in ("parent_coin_info", "puzzle_hash"):
@@ -5404,9 +5407,7 @@ def cancel_offers_batch(
             _identity_recheck=_identity_recheck,
             _track_pending_identity=True,
         )
-        return _for_every_member(
-            normalize_cancel_response(result, method="bulk_rpc")
-        )
+        return _for_every_member(normalize_cancel_response(result, method="bulk_rpc"))
     except mutation_gate.MutationBlocked:
         raise
     except SageHTTPError as exc:

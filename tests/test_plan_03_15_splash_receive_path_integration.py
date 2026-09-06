@@ -175,9 +175,7 @@ class TestSplashReceiveDB(_TempDB):
         """Persistence failure must be distinguishable from duplicate input."""
 
         connection = MagicMock()
-        connection.execute.side_effect = sqlite3.OperationalError(
-            "database is locked"
-        )
+        connection.execute.side_effect = sqlite3.OperationalError("database is locked")
         with patch("database.get_connection", return_value=connection):
             result = _db.record_splash_incoming(
                 _VALID_OFFER,

@@ -1374,8 +1374,7 @@ class OfferManager:
             candidates = [
                 item
                 for item in fallback_candidates
-                if item[1] not in reserve_ids
-                and item[1] in policy_bound_coin_ids
+                if item[1] not in reserve_ids and item[1] in policy_bound_coin_ids
             ]
 
             if candidates:
@@ -5463,14 +5462,14 @@ class OfferManager:
             or isinstance(fee_mojos, bool)
             or fee_mojos <= 0
             or type(batch) is not dict
-            or set(batch) != {
+            or set(batch)
+            != {
                 "protocol",
                 "trade_ids",
                 "source_coin_ids",
                 "fee_coin_id",
             }
-            or batch["protocol"]
-            != "sage_native_cancel_offers_zero_plus_fee_v1"
+            or batch["protocol"] != "sage_native_cancel_offers_zero_plus_fee_v1"
         ):
             return False
         trade_ids = batch["trade_ids"]
@@ -5512,9 +5511,7 @@ class OfferManager:
         for intent, _attempt, _member_id in members:
             offer = database.get_offer(intent.trade_id)
             raw_coin_id = offer.get("coin_id") if type(offer) is dict else None
-            coin_id = (
-                str(raw_coin_id or "").strip().lower().removeprefix("0x")
-            )
+            coin_id = str(raw_coin_id or "").strip().lower().removeprefix("0x")
             if len(coin_id) != 64:
                 return None
             try:
@@ -5529,11 +5526,7 @@ class OfferManager:
             fee_mojos = get_effective_transaction_fee_mojos()
         except Exception:
             return None
-        if (
-            type(fee_mojos) is not int
-            or isinstance(fee_mojos, bool)
-            or fee_mojos <= 0
-        ):
+        if type(fee_mojos) is not int or isinstance(fee_mojos, bool) or fee_mojos <= 0:
             return None
         fee_coin_id = self._fee_pool.reserve()
         fee_coin_id = str(fee_coin_id or "").strip().lower().removeprefix("0x")
@@ -5554,7 +5547,9 @@ class OfferManager:
             "secure": True,
             "timeout": 60,
             "fee_mojos": fee_mojos,
-            "batch": {key: value for key, value in contract.items() if key != "fee_mojos"},
+            "batch": {
+                key: value for key, value in contract.items() if key != "fee_mojos"
+            },
         }
         return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
 
@@ -6911,10 +6906,7 @@ class OfferManager:
             and manifest is not None
             and len(members) == len(ordered_members)
             and {intent.trade_id for intent, _attempt, _member_id in members}
-            == {
-                intent.trade_id
-                for intent, _attempt, _member_id in ordered_members
-            }
+            == {intent.trade_id for intent, _attempt, _member_id in ordered_members}
         ):
             batch_contract = self._plan_sage_bulk_cancel(members)
 
@@ -7795,9 +7787,7 @@ class OfferManager:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         manifest_ids = {member["operation_id"] for member in manifest["members"]}
-        if manifest["member_count"] < 2 or not set(blocker_ids).issubset(
-            manifest_ids
-        ):
+        if manifest["member_count"] < 2 or not set(blocker_ids).issubset(manifest_ids):
             return None
         return manifest
 
@@ -7838,10 +7828,8 @@ class OfferManager:
                 current_ids = [row.get("operation_id") for row in current_blockers]
                 if not current_ids:
                     return False
-                current_manifest = (
-                    OfferManager._sage_bulk_cancel_manifest_for_blockers(
-                        current_blockers
-                    )
+                current_manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(
+                    current_blockers
                 )
                 if (
                     current_manifest is None
@@ -7882,14 +7870,10 @@ class OfferManager:
                         )
                     )
                     if cancel_context is None:
-                        raise ValueError(
-                            "native bulk cancellation proof is incomplete"
-                        )
+                        raise ValueError("native bulk cancellation proof is incomplete")
                     member = members_by_operation.get(current_ids[0])
                     if member is None:
-                        raise ValueError(
-                            "native bulk cancellation blocker set changed"
-                        )
+                        raise ValueError("native bulk cancellation blocker set changed")
                     intent_row = database.get_offer_intent(member["intent_id"])
                     if (
                         type(intent_row) is not dict
@@ -7908,9 +7892,7 @@ class OfferManager:
                         classification.get("classification")
                         != offer_reconciliation.CANCELLED_PROVEN
                     ):
-                        raise ValueError(
-                            "native bulk cancellation proof is incomplete"
-                        )
+                        raise ValueError("native bulk cancellation proof is incomplete")
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent_row["intent_id"],
                         evidence=evidence,
@@ -7922,12 +7904,8 @@ class OfferManager:
                         != offer_reconciliation.CANCELLED_PROVEN
                         or reconciled.get("applied") is not True
                     ):
-                        raise ValueError(
-                            "native bulk cancellation was not committed"
-                        )
-                    next_blockers = (
-                        database.get_unresolved_offer_operation_blockers()
-                    )
+                        raise ValueError("native bulk cancellation was not committed")
+                    next_blockers = database.get_unresolved_offer_operation_blockers()
                     next_ids = [row.get("operation_id") for row in next_blockers]
                     if len(next_ids) >= len(current_ids) or any(
                         operation_id not in members_by_operation
@@ -7939,9 +7917,7 @@ class OfferManager:
                     current_ids = next_ids
                 if not current_ids:
                     post_latch = database.get_runtime_safety_latch()
-                    post_blockers = (
-                        database.get_unresolved_offer_operation_blockers()
-                    )
+                    post_blockers = database.get_unresolved_offer_operation_blockers()
                     if post_latch.get("generation") != generation or post_blockers:
                         raise ValueError(
                             "native bulk cancellation blockers remain unresolved"
@@ -8038,13 +8014,9 @@ class OfferManager:
                     offer_reconciliation.FILLED_PROVEN,
                     offer_reconciliation.EXPIRED_PROVEN,
                 }
-                if (
-                    terminal_classification in terminal_outcomes
-                    and (
-                        terminal_classification
-                        != offer_reconciliation.CANCELLED_PROVEN
-                        or cancel_context is not None
-                    )
+                if terminal_classification in terminal_outcomes and (
+                    terminal_classification != offer_reconciliation.CANCELLED_PROVEN
+                    or cancel_context is not None
                 ):
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent.intent_id,

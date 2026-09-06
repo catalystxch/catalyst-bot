@@ -696,13 +696,30 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
     assert page.evaluate("_cancelAllContext.resumeAfterCancel") is False
 
 
-@pytest.mark.parametrize("failure, detail", [
-    ({"success": False, "error": "coin_prep_mutation_exclusion_unavailable",
-      "reason": "WALLET_IDENTITY_BINDING_INVALID"}, "WALLET_IDENTITY_BINDING_INVALID"),
-    ({"success": False, "error": "authoritative_state_conflict",
-      "conflicts": ["offer_proof_history"]}, "without resetting history"),
-])
-def test_coin_prep_rejected_start_shows_persistent_error_not_checking(page, failure, detail):
+@pytest.mark.parametrize(
+    "failure, detail",
+    [
+        (
+            {
+                "success": False,
+                "error": "coin_prep_mutation_exclusion_unavailable",
+                "reason": "WALLET_IDENTITY_BINDING_INVALID",
+            },
+            "WALLET_IDENTITY_BINDING_INVALID",
+        ),
+        (
+            {
+                "success": False,
+                "error": "authoritative_state_conflict",
+                "conflicts": ["offer_proof_history"],
+            },
+            "without resetting history",
+        ),
+    ],
+)
+def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
+    page, failure, detail
+):
     """A rejected trigger must not leave the checklist checking or lose its reason."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
@@ -719,7 +736,8 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(page, fail
                 status: 423, headers: { 'Content-Type': 'application/json' },
             });
             await startCoinPrepFromModal();
-        }""", failure,
+        }""",
+        failure,
     )
 
     expect(page.locator("#coinPrepErrorView")).to_be_visible()

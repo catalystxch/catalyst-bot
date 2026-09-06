@@ -41,8 +41,12 @@ def test_plan_is_deterministic_and_conserves_every_asset():
     first = plan_batch(**request)
     second = plan_batch(**request)
     assert first == second
-    assert sum(first.input_mojos("xch")) == sum(first.output_mojos("xch")) + first.fee_mojos
+    assert (
+        sum(first.input_mojos("xch"))
+        == sum(first.output_mojos("xch")) + first.fee_mojos
+    )
     assert sum(first.input_mojos("cat")) == sum(first.output_mojos("cat"))
+
 
 def test_ready_targets_reuse_distinct_coin_ids_without_a_transaction():
     result = plan_batch(**already_ready_request())

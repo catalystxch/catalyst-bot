@@ -6276,15 +6276,15 @@ class CoinManager:
 
             # Detect RPC errors: if the wallet returned an error (not just empty),
             # don't treat it as "no coins" and enter backoff — short cooldown instead.
-            xch_is_error = xch_owned_snapshot is None and isinstance(
-                xch_result, dict
-            ) and (
-                xch_result.get("error") or xch_result.get("success") is False
+            xch_is_error = (
+                xch_owned_snapshot is None
+                and isinstance(xch_result, dict)
+                and (xch_result.get("error") or xch_result.get("success") is False)
             )
-            cat_is_error = cat_owned_snapshot is None and isinstance(
-                cat_result, dict
-            ) and (
-                cat_result.get("error") or cat_result.get("success") is False
+            cat_is_error = (
+                cat_owned_snapshot is None
+                and isinstance(cat_result, dict)
+                and (cat_result.get("error") or cat_result.get("success") is False)
             )
             if (
                 xch_is_error

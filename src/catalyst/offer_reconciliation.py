@@ -1247,8 +1247,12 @@ def _cancel_proof(
             selected = [_hex_id(value) for value in member["selected_coin_ids"]]
             if len(selected) == 1:
                 member_by_input[selected[0]] = member
-        input_groups: dict[tuple[str, int], list[tuple[str, str, int, str, str, str]]] = {}
-        output_groups: dict[tuple[str, int], list[tuple[str, str, int, str, str, str]]] = {}
+        input_groups: dict[
+            tuple[str, int], list[tuple[str, str, int, str, str, str]]
+        ] = {}
+        output_groups: dict[
+            tuple[str, int], list[tuple[str, str, int, str, str, str]]
+        ] = {}
         for flow in spent_by_id.values():
             if flow[0] in expected_offer_inputs:
                 input_groups.setdefault(flow[1:3], []).append(flow)
@@ -1298,9 +1302,7 @@ def _cancel_proof(
                         or (input_flow[5] and available[coin_id][5] == input_flow[5])
                     ]
                     if len(lineage_matches) != 1:
-                        return {
-                            "_conflict_reason": "CANCEL_RETURN_LINEAGE_AMBIGUOUS"
-                        }
+                        return {"_conflict_reason": "CANCEL_RETURN_LINEAGE_AMBIGUOUS"}
                     return_id = lineage_matches[0]
             available.pop(return_id)
             rebindings.append(
@@ -2447,11 +2449,11 @@ def load_authoritative_evidence(
             except BaseException:
                 continue
             normalized_spent = normalized.get("spent")
-            normalized_spent_ids = {
-                flow.get("coin_id")
-                for flow in normalized_spent
-                if type(flow) is dict
-            } if type(normalized_spent) is list else set()
+            normalized_spent_ids = (
+                {flow.get("coin_id") for flow in normalized_spent if type(flow) is dict}
+                if type(normalized_spent) is list
+                else set()
+            )
             if (
                 normalized.get("confirmed") is True
                 and normalized.get("confirmed_height") == height
@@ -3413,9 +3415,7 @@ def _derive_sage_bulk_cancel_context(
     if len(blocker_ids) != len(blocking_operation_ids):
         return None
     try:
-        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(
-            manifest
-        )
+        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(manifest)
     except BaseException:
         return None
     if exact_manifest["member_count"] < 2:
@@ -3458,8 +3458,7 @@ def _derive_sage_bulk_cancel_context(
             or prepared["blocks_mutation"] != 1
             or type(prepared_evidence) is not dict
             or prepared_evidence.get("cohort_id") != exact_manifest["cohort_id"]
-            or prepared_evidence.get("cohort_size")
-            != exact_manifest["member_count"]
+            or prepared_evidence.get("cohort_size") != exact_manifest["member_count"]
             or prepared_evidence.get("member_id") != member["member_id"]
             or prepared_evidence.get("effect_claim_protocol")
             != "durable_cohort_claim_v1"
@@ -3493,9 +3492,10 @@ def _derive_sage_bulk_cancel_context(
             return None
         if latest["blocks_mutation"] == 1:
             currently_blocking.add(member["operation_id"])
-        if latest["attempt"] != member["attempt"] or latest["operation_id"] != member[
-            "operation_id"
-        ]:
+        if (
+            latest["attempt"] != member["attempt"]
+            or latest["operation_id"] != member["operation_id"]
+        ):
             return None
         if latest["phase"] == "PREPARED":
             if latest["event_id"] != prepared["event_id"]:
@@ -3516,9 +3516,10 @@ def _derive_sage_bulk_cancel_context(
             ):
                 return None
         elif latest["phase"] == "RECONCILED":
-            if latest["outcome"] != "CANCEL_CONFIRMED" or latest[
-                "blocks_mutation"
-            ] != 0:
+            if (
+                latest["outcome"] != "CANCEL_CONFIRMED"
+                or latest["blocks_mutation"] != 0
+            ):
                 return None
         else:
             return None

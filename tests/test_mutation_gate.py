@@ -2090,11 +2090,14 @@ def test_splash_inbox_during_coin_prep_does_not_latch_parent_process(
     assert gate.read_only_status().allowed is False
     assert database.get_splash_incoming_offers(limit=10)
     _append_event(operation_id, blocks=False, suffix="confirmed")
-    assert database.resolve_runtime_safety_latch(
-        expected_generation=1,
-        resolved_operation_ids=[operation_id],
-        resolved_at=clock(),
-    )["resolved"] is True
+    assert (
+        database.resolve_runtime_safety_latch(
+            expected_generation=1,
+            resolved_operation_ids=[operation_id],
+            resolved_at=clock(),
+        )["resolved"]
+        is True
+    )
     assert gate.status().allowed is True
 
 
@@ -2552,7 +2555,8 @@ def test_every_existing_public_appbridge_callable_has_auditable_access_classific
 
 
 def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
-    isolated_gate_database, monkeypatch,
+    isolated_gate_database,
+    monkeypatch,
 ):
     """Desktop prep must reach wallet preflight, not lose its permit in Flask g."""
     import api_server
@@ -2571,7 +2575,8 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     monkeypatch.setattr(api_server, "_coin_prep_state", {"running": False})
     # Stop at the external wallet boundary: no wallet calls, resets or worker.
     monkeypatch.setattr(
-        coin_prep, "_wallet_open_offer_snapshot_before_prep",
+        coin_prep,
+        "_wallet_open_offer_snapshot_before_prep",
         lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
     )
 
@@ -2582,23 +2587,46 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     assert api_server._coin_prep_state["running"] is False
     # Early return must release both admission and exclusive fencing.
     next_permit = gate.enter_mutation("test:after-desktop-preflight")
-    assert gate.acquire_exclusive_mutation(
-        next_permit, "test:after-desktop-preflight", timeout_seconds=0,
-    ) is True
+    assert (
+        gate.acquire_exclusive_mutation(
+            next_permit,
+            "test:after-desktop-preflight",
+            timeout_seconds=0,
+        )
+        is True
+    )
     assert gate.exit_mutation(next_permit) is True
 
 
-@pytest.mark.parametrize("payload, expected", [
-    (None, {}),
-    ({"coin_multiplier": 1.5, "reset_pnl": False,
-      "reset_offer_history": True, "reset_counters": True},
-     {"coin_multiplier": 1.5, "reset_pnl": False,
-      "reset_offer_history": True, "reset_counters": True}),
-    ({"full_reset": True, "reset_offer_history": False},
-     {"full_reset": True, "reset_offer_history": False}),
-])
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (None, {}),
+        (
+            {
+                "coin_multiplier": 1.5,
+                "reset_pnl": False,
+                "reset_offer_history": True,
+                "reset_counters": True,
+            },
+            {
+                "coin_multiplier": 1.5,
+                "reset_pnl": False,
+                "reset_offer_history": True,
+                "reset_counters": True,
+            },
+        ),
+        (
+            {"full_reset": True, "reset_offer_history": False},
+            {"full_reset": True, "reset_offer_history": False},
+        ),
+    ],
+)
 def test_desktop_coin_prep_forwards_selected_options(
-    isolated_gate_database, monkeypatch, payload, expected,
+    isolated_gate_database,
+    monkeypatch,
+    payload,
+    expected,
 ):
     """Native prep must deliver the same JSON contract as browser HTTP prep."""
     from flask import jsonify, request
@@ -2614,7 +2642,8 @@ def test_desktop_coin_prep_forwards_selected_options(
     # Observe the bridge's outbound JSON at the handler boundary, without
     # actually deleting histories or launching a financial operation.
     monkeypatch.setattr(
-        api_server, "api_coin_prep_trigger",
+        api_server,
+        "api_coin_prep_trigger",
         lambda: jsonify({"success": True, "received": request.get_json()}),
     )
 

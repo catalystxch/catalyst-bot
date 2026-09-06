@@ -178,9 +178,7 @@ class TestFingerprintEndpoint(_FlaskBase):
             resp = self.client.get("/api/fingerprint", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.get_json(), {"fingerprint": "", "source": "not_started"}
-        )
+        self.assertEqual(resp.get_json(), {"fingerprint": "", "source": "not_started"})
         current_key.assert_not_called()
 
     def test_running_bot_uses_frozen_runtime_identity_without_wallet_rpc(self):
@@ -222,6 +220,7 @@ class TestFingerprintEndpoint(_FlaskBase):
             "fingerprint:read"
         )
         current_key.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 3. GET /api/sage/startup-status

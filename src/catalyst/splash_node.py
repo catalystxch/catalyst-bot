@@ -668,8 +668,7 @@ class SplashNode:
                                 or "too many requests" in lower
                                 or "rate_limited" in lower
                                 or "backlog_full" in lower
-                                or now
-                                - float(self._last_webhook_delivery_time or 0.0)
+                                or now - float(self._last_webhook_delivery_time or 0.0)
                                 <= 30.0
                             ):
                                 prefix = "Splash webhook backpressure active"

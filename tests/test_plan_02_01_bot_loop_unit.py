@@ -508,9 +508,11 @@ class TestBotLoopWiring(_PatchedCfg):
         updates = []
 
         fake_db = types.ModuleType("database")
-        fake_db.get_splash_incoming_offers = lambda status=None, limit=50, oldest_first=False: [
-            {"id": 7, "offer_bech32": "offer1bad"}
-        ]
+        fake_db.get_splash_incoming_offers = (
+            lambda status=None, limit=50, oldest_first=False: [
+                {"id": 7, "offer_bech32": "offer1bad"}
+            ]
+        )
         fake_db.update_splash_incoming_status = (
             lambda offer_id, status, pair_hint=None: (
                 updates.append((offer_id, status, pair_hint)) or True
@@ -541,9 +543,11 @@ class TestBotLoopWiring(_PatchedCfg):
         updates = []
 
         fake_db = types.ModuleType("database")
-        fake_db.get_splash_incoming_offers = lambda status=None, limit=50, oldest_first=False: [
-            {"id": 7, "offer_bech32": "offer1bad", "pair_hint": "view_retry:2"}
-        ]
+        fake_db.get_splash_incoming_offers = (
+            lambda status=None, limit=50, oldest_first=False: [
+                {"id": 7, "offer_bech32": "offer1bad", "pair_hint": "view_retry:2"}
+            ]
+        )
         fake_db.update_splash_incoming_status = (
             lambda offer_id, status, pair_hint=None: (
                 updates.append((offer_id, status, pair_hint)) or True

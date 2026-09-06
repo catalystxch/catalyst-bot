@@ -354,8 +354,7 @@ def recover_legacy_sage_reservations(
         if type(blocker) is dict
         and blocker.get("operation_type") == "CANCEL"
         and blocker.get("phase") == "FINALIZED"
-        and blocker.get("outcome")
-        in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+        and blocker.get("outcome") in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
         and blocker.get("blocks_mutation") == 1
     ]
     result["examined"] += len(submitted_cancels)
@@ -407,8 +406,7 @@ def recover_legacy_sage_reservations(
                 type(classification) is not dict
                 or terminal_classification not in terminal_outcomes
                 or (
-                    terminal_classification
-                    == reconciliation_module.CANCELLED_PROVEN
+                    terminal_classification == reconciliation_module.CANCELLED_PROVEN
                     and type(cancel_context) is not dict
                 )
             ):

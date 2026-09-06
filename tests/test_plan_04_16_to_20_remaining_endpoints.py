@@ -203,9 +203,7 @@ class TestMarketIntel(_FlaskBase):
             ),
             patch("api_server._fetch_dbx_pair_status", return_value={}),
         ):
-            response = self.client.get(
-                "/api/market/intel", environ_base=self._LOOPBACK
-            )
+            response = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()

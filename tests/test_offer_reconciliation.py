@@ -1895,9 +1895,7 @@ def test_sage_loader_recovers_omitted_cancel_transaction_by_spent_height(
     must be used to fetch that one transaction before cancellation settlement.
     """
 
-    tx_timestamp = int(
-        datetime.fromisoformat(AFTER.replace("Z", "+00:00")).timestamp()
-    )
+    tx_timestamp = int(datetime.fromisoformat(AFTER.replace("Z", "+00:00")).timestamp())
     calls = []
     coins = {
         "0x" + COIN: {

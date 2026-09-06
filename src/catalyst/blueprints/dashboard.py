@@ -189,20 +189,14 @@ def _build_fiat_price_summary(
     if executable_mid:
         cat_xch = executable_mid
         try:
-            cat_usd = (
-                str(Decimal(executable_mid) * Decimal(xch_usd)) if xch_usd else ""
-            )
+            cat_usd = str(Decimal(executable_mid) * Decimal(xch_usd)) if xch_usd else ""
         except (InvalidOperation, ValueError, TypeError):
             cat_usd = ""
         xch_source = str(xch_price.get("source") or "").strip()
         cat_usd_source = f"market × {xch_source}" if cat_usd and xch_source else ""
     else:
-        cat_usd = _positive_decimal_string(
-            (spacescan_context or {}).get("price_usd")
-        )
-        cat_xch = _positive_decimal_string(
-            (spacescan_context or {}).get("price_xch")
-        )
+        cat_usd = _positive_decimal_string((spacescan_context or {}).get("price_usd"))
+        cat_xch = _positive_decimal_string((spacescan_context or {}).get("price_xch"))
         cat_usd_source = "spacescan" if cat_usd else ""
 
     return {

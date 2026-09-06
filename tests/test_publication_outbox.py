@@ -2546,9 +2546,7 @@ def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():
 
     def record_state(**updates):
         if "open_buys" in updates or "open_sells" in updates:
-            events.append(
-                ("offer_counts", updates["open_buys"], updates["open_sells"])
-            )
+            events.append(("offer_counts", updates["open_buys"], updates["open_sells"]))
 
     loop._set_state = record_state
 

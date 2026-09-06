@@ -62,18 +62,14 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "wallet_sage"
         ].get_spendable_coin_count(wallet_id)
         fake_wallet.get_pending_transactions = lambda: []
-        fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {
-            "success": True
-        }
+        fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
             "success": True
         }
-        fake_wallet.validate_unsigned_transaction_effect = (
-            lambda *args, **kwargs: {
-                "_catalyst_validated_unsigned": True,
-                "constructed_outputs": [],
-            }
-        )
+        fake_wallet.validate_unsigned_transaction_effect = lambda *args, **kwargs: {
+            "_catalyst_validated_unsigned": True,
+            "constructed_outputs": [],
+        }
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_spendable_coins_rpc = lambda wallet_id: {
@@ -1877,12 +1873,12 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         cat_output = hashlib.sha256(b"v2-cat-output").hexdigest()
         xch_output = hashlib.sha256(b"v2-xch-output").hexdigest()
         now = datetime.now(timezone.utc)
-        bound_at = (now - timedelta(seconds=1)).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
-        observed_at = now.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
+        bound_at = (
+            (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
         )
+        observed_at = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
         identity = {
             "backend": "sage",
             "name": "Task 12 Wallet",
@@ -1966,18 +1962,21 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         observation = self.worker._observe_recoverable_coin_prep_operation(operation)
 
         self.assertIsInstance(observation, dict)
-        self.assertEqual(observation["expected_outputs"], [
-            {
-                "coin_id": cat_output,
-                "amount_mojos": 50,
-                "purpose": "replacement",
-            },
-            {
-                "coin_id": xch_output,
-                "amount_mojos": 50,
-                "purpose": "fee_reserve",
-            },
-        ])
+        self.assertEqual(
+            observation["expected_outputs"],
+            [
+                {
+                    "coin_id": cat_output,
+                    "amount_mojos": 50,
+                    "purpose": "replacement",
+                },
+                {
+                    "coin_id": xch_output,
+                    "amount_mojos": 50,
+                    "purpose": "fee_reserve",
+                },
+            ],
+        )
 
     def test_sage_native_split_contract_matches_ceil_then_final_output(self):
         """Sage /split divides the exact total across output_count outputs."""

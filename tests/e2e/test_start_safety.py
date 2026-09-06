@@ -78,7 +78,9 @@ def test_start_safety_failure_explains_reason_and_does_not_dispatch(page):
     )
     assert result["dispatched"] == 0
     assert "COIN_PREP_EFFECT_UNKNOWN" in result["message"]
-    expect(page.locator("#startupStepStart")).to_contain_text("COIN_PREP_EFFECT_UNKNOWN")
+    expect(page.locator("#startupStepStart")).to_contain_text(
+        "COIN_PREP_EFFECT_UNKNOWN"
+    )
 
 
 def test_start_safety_error_uses_allowlisted_reason_not_untrusted_detail(page):
@@ -99,7 +101,9 @@ def test_start_safety_server_denial_remains_visible_until_fresh_status(page):
         await startBot();
     }""")
     assert page.evaluate("canAttemptBotStart()") is False
-    expect(page.locator("#startupStepStart")).to_contain_text("COIN_PREP_EFFECT_UNKNOWN")
+    expect(page.locator("#startupStepStart")).to_contain_text(
+        "COIN_PREP_EFFECT_UNKNOWN"
+    )
     expect(page.locator("#startBtn")).to_be_disabled()
     expect(page.locator("#startupReadyCtaBtn")).to_be_disabled()
 
@@ -116,12 +120,15 @@ def test_start_safety_failed_poll_invalidates_previously_allowed_state(page):
 
 def test_start_safety_force_start_cannot_bypass_runtime_block(page):
     _ready_setup(page)
-    assert page.evaluate("""async () => {
+    assert (
+        page.evaluate("""async () => {
         let calls = 0;
         apiFetch = async () => { calls++; return new Response('{}'); };
         await forceStartBot();
         return calls;
-    }""") == 0
+    }""")
+        == 0
+    )
 
 
 def test_start_safety_ready_display_expires_while_status_poll_is_stalled(page):
@@ -142,9 +149,11 @@ def test_start_safety_preserves_every_trusted_mutation_gate_reason(page):
     import mutation_gate
 
     _ready_setup(page)
-    messages = page.evaluate("""reasons => reasons.map(reason => ({reason,
+    messages = page.evaluate(
+        """reasons => reasons.map(reason => ({reason,
         message: formatError({error: 'mutation_gate_blocked', reason})}))""",
-        sorted(mutation_gate._ALLOWED_REASON_CODES))
+        sorted(mutation_gate._ALLOWED_REASON_CODES),
+    )
     for result in messages:
         assert result["reason"] in result["message"]
 
@@ -162,6 +171,10 @@ def test_tibetswap_outage_does_not_make_coin_prep_warning_require_tibet(page):
         document.getElementById('configTierEnabled').checked = false;
         updateCoinPrepPreview();
     }""")
-    expect(page.locator("#coinPrepWarning")).to_contain_text("Waiting for current market pricing")
-    expect(page.locator("#coinPrepWarning")).not_to_contain_text("TibetSwap is reachable")
+    expect(page.locator("#coinPrepWarning")).to_contain_text(
+        "Waiting for current market pricing"
+    )
+    expect(page.locator("#coinPrepWarning")).not_to_contain_text(
+        "TibetSwap is reachable"
+    )
     assert page.evaluate("tradingSettingsImpossible") is True

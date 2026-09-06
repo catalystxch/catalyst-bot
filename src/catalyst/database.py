@@ -20947,7 +20947,9 @@ def _finalize_offer_cancel_in_transaction(
         raise ValueError("cancellation prepared trade identity does not match")
     if require_unclaimed:
         if prepared_evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1":
-            raise ValueError("unclaimed cancellation finalization lacks cohort authority")
+            raise ValueError(
+                "unclaimed cancellation finalization lacks cohort authority"
+            )
         effect_claim = conn.execute(
             """
             SELECT operation_id, attempt, prepared_event_id, claimed_at
@@ -20969,15 +20971,16 @@ def _finalize_offer_cancel_in_transaction(
         ).fetchone()
         if effect_claim is not None:
             latch = conn.execute(
-                "SELECT generation,state FROM runtime_safety_latch "
-                "WHERE singleton_id=1"
+                "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
             ).fetchone()
             if (
                 latch is None
                 or latch["state"] != "resolved"
                 or int(effect_claim["recovery_generation"]) != int(latch["generation"])
             ):
-                raise ValueError("cancellation completion is fenced by runtime recovery")
+                raise ValueError(
+                    "cancellation completion is fenced by runtime recovery"
+                )
     prior_lifecycle_state = prepared_evidence.get("prior_lifecycle_state")
     if prior_lifecycle_state is not None and (
         type(prior_lifecycle_state) is not str
@@ -21095,7 +21098,9 @@ def finalize_offer_cancel_cohort(
             require_unclaimed=False,
         )
         if values["evidence"].get("cohort_id") != manifest["cohort_id"]:
-            raise ValueError("cancellation cohort result evidence is not manifest-bound")
+            raise ValueError(
+                "cancellation cohort result evidence is not manifest-bound"
+            )
         if shared_result is None:
             shared_result = values["result"]
         elif values["result"] != shared_result:
@@ -23010,15 +23015,16 @@ def get_authoritative_terminal_records(
         raise ValueError("trade_ids must be an exact collection")
     safe_trade_ids = list(
         dict.fromkeys(
-            _required_stability_text(trade_id, "trade_id")
-            for trade_id in trade_ids
+            _required_stability_text(trade_id, "trade_id") for trade_id in trade_ids
         )
     )
     if not safe_trade_ids:
         return {}
     placeholders = ",".join("?" for _ in safe_trade_ids)
-    rows = get_connection().execute(
-        f"""
+    rows = (
+        get_connection()
+        .execute(
+            f"""
         SELECT i.sage_trade_id AS _sage_trade_id, j.*
         FROM offer_operation_journal AS j
         JOIN offer_intents AS i ON i.intent_id=j.intent_id
@@ -23028,8 +23034,10 @@ def get_authoritative_terminal_records(
           AND j.phase='FINALIZED'
         ORDER BY j.sequence DESC
         """,
-        tuple(safe_trade_ids),
-    ).fetchall()
+            tuple(safe_trade_ids),
+        )
+        .fetchall()
+    )
     records = {}
     for row in rows:
         raw_event = dict(row)
@@ -23334,8 +23342,7 @@ def _validate_reconciliation_cancel_context(
             if type(wallet_effect) is dict and "batch" in wallet_effect:
                 batch = wallet_effect.get("batch")
                 if (
-                    set(wallet_effect)
-                    != {"secure", "timeout", "fee_mojos", "batch"}
+                    set(wallet_effect) != {"secure", "timeout", "fee_mojos", "batch"}
                     or wallet_effect.get("secure") is not True
                     or wallet_effect.get("timeout") != 60
                     or type(wallet_effect.get("fee_mojos")) is not int
@@ -23355,9 +23362,9 @@ def _validate_reconciliation_cancel_context(
                 ):
                     raise ValueError("Task 8 native bulk cancel claim is invalid")
                 batch_trade_ids = [
-                    _reconciliation_coin_identity(
-                        value, "Task 8 native bulk trade_id"
-                    )[0]
+                    _reconciliation_coin_identity(value, "Task 8 native bulk trade_id")[
+                        0
+                    ]
                     for value in batch["trade_ids"]
                 ]
                 batch_source_ids = [
@@ -23562,8 +23569,7 @@ def _validate_reconciliation_cancel_context(
                     if native_batch_for_member is not None:
                         cancel_result = latest_evidence.get("cancel_result")
                         if (
-                            auxiliary_bare
-                            != [native_batch_for_member["fee_coin_id"]]
+                            auxiliary_bare != [native_batch_for_member["fee_coin_id"]]
                             or type(cancel_result) is not dict
                             or cancel_result.get("method")
                             not in {

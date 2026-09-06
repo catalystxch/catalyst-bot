@@ -298,9 +298,7 @@ def test_direct_batch_prepare_persistence_failure_retains_claim_without_dispatch
     )
 
     assert worker._submit_direct_batch_plan(plan, "xch1owner") is False
-    assert retained == [
-        (token, 4, "DIRECT_BATCH_PREPARED_PERSIST_FAILED")
-    ]
+    assert retained == [(token, 4, "DIRECT_BATCH_PREPARED_PERSIST_FAILED")]
     assert built == []
 
 
@@ -386,9 +384,7 @@ def test_direct_batch_output_binding_failure_retains_claim_without_dispatch(
     ):
         worker._submit_direct_batch_plan(plan, "xch1owner")
 
-    assert retained == [
-        (token, 5, "DIRECT_BATCH_OUTPUT_BINDING_FAILED")
-    ]
+    assert retained == [(token, 5, "DIRECT_BATCH_OUTPUT_BINDING_FAILED")]
     assert dispatched == []
 
 
@@ -461,8 +457,8 @@ def test_uninspectable_unsigned_batch_records_proven_no_effect_for_fallback(
         "complete_wallet_effect_dispatch",
         lambda *_args, **_kwargs: "RELEASED_NO_EFFECT",
     )
-    worker._record_coin_prep_dispatch_outcome = (
-        lambda *_args, **kwargs: recorded.append(kwargs)
+    worker._record_coin_prep_dispatch_outcome = lambda *_args, **kwargs: (
+        recorded.append(kwargs)
     )
 
     assert worker._submit_direct_batch_plan(plan, "xch1owner") is False

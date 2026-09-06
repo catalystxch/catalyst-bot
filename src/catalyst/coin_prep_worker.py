@@ -2352,9 +2352,7 @@ class CoinPrepWorker:
                 ) from exc
         else:
             validation_reason = (
-                validated.get("reason")
-                if isinstance(validated, dict)
-                else "unknown"
+                validated.get("reason") if isinstance(validated, dict) else "unknown"
             )
             if validation_reason == "UNSIGNED_EFFECT_NOT_INSPECTABLE":
                 compatibility_reason = validation_reason

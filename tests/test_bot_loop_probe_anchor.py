@@ -497,15 +497,13 @@ class ProbeAnchorTests(unittest.TestCase):
             "cancel:" + ("a" * 64),
             "cancel:" + ("b" * 64),
         ]
-        loop.offer_manager.get_active_cancel_settlement_operation = (
-            lambda: bulk_operation_ids[0]
+        loop.offer_manager.get_active_cancel_settlement_operation = lambda: (
+            bulk_operation_ids[0]
         )
-        loop.offer_manager._sage_bulk_cancel_manifest_for_blockers = (
-            lambda blockers: (
-                {"cohort_id": "cancel-cohort:test"}
-                if [row["operation_id"] for row in blockers] == bulk_operation_ids
-                else None
-            )
+        loop.offer_manager._sage_bulk_cancel_manifest_for_blockers = lambda blockers: (
+            {"cohort_id": "cancel-cohort:test"}
+            if [row["operation_id"] for row in blockers] == bulk_operation_ids
+            else None
         )
         with (
             patch.object(

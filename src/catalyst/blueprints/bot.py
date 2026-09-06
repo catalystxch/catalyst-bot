@@ -1278,7 +1278,8 @@ def api_status():
 
             startup_pricing = _get_startup_price_cached(
                 active_asset_id,
-                api_server._active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", ""),
+                api_server._active_cat.get("ticker_id")
+                or getattr(cfg, "CAT_TICKER_ID", ""),
                 api_server._active_cat.get("decimals", getattr(cfg, "CAT_DECIMALS", 3)),
             )
             mid = api_server._safe_float(startup_pricing.get("mid", 0))
