@@ -189,6 +189,15 @@ def _post_build():
     else:
         print("  HTML assets verified in bundle.")
 
+    if not any(
+        os.path.isfile(os.path.join(root, "certifi", "cacert.pem"))
+        for root in data_roots
+    ):
+        print("\n  ERROR: certifi CA bundle not found in the packaged application.")
+        print("  HTTPS market-data requests would fail at runtime.")
+        raise SystemExit(1)
+    print("  certifi CA bundle verified in bundle.")
+
 
 def _purge_runtime_artifacts(root: str) -> int:
     """Remove user-writable runtime files that PyInstaller may collect.

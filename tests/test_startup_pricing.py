@@ -98,6 +98,14 @@ def test_tibetswap_outage_and_dexie_failure_are_negative_cached(prices, monkeypa
     assert market._get_tibet_pairs_cached.call_count == 2
 
 
+def test_missing_packaged_ca_bundle_is_negative_cached(prices):
+    _, fetch = prices
+    fetch.side_effect = OSError("Could not find a suitable TLS CA certificate bundle")
+
+    assert market._get_startup_price_cached("aa", "MZ_XCH") == {}
+    assert fetch.call_count == 1
+
+
 @pytest.mark.parametrize("key_change", ["asset", "ticker", "decimals"])
 def test_tibetswap_outage_quote_cache_is_scoped_to_pair(prices, key_change):
     response, fetch = prices

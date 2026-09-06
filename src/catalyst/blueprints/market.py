@@ -122,6 +122,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                     break
             except (
                 requests.RequestException,
+                OSError,
                 InvalidOperation,
                 ValueError,
                 TypeError,

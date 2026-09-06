@@ -28,6 +28,8 @@
 import os
 import sys
 
+from PyInstaller.utils.hooks import collect_data_files
+
 block_cipher = None
 
 # ---------------------------------------------------------------------------
@@ -104,6 +106,11 @@ _license_files = [
     (os.path.join(_license_dir, 'Chia-Network-chia-blockchain-Apache-2.0.txt'), 'licenses'),
 ]
 
+# requests resolves its default TLS trust store through certifi at runtime.
+# Collect it explicitly so a hook/version change cannot produce a bundle that
+# launches normally but fails every HTTPS market-data request.
+_certifi_files = collect_data_files('certifi')
+
 _datas = (
     _html_files
     + _image_files
@@ -111,6 +118,7 @@ _datas = (
     + _env_example_files
     + _worker_files
     + _license_files
+    + _certifi_files
 )
 
 # ---------------------------------------------------------------------------

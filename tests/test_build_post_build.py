@@ -50,6 +50,9 @@ class TestBuildPostBuild(unittest.TestCase):
                 ""
             )
             (internal / "bot_gui.html").write_text("<html></html>", encoding="utf-8")
+            certifi_dir = internal / "certifi"
+            certifi_dir.mkdir()
+            (certifi_dir / "cacert.pem").write_text("test CA bundle", encoding="utf-8")
             env_example = root / ".env.example"
             env_example.write_text(
                 "SAGE_RPC_URL=https://127.0.0.1:9257\n", encoding="utf-8"
@@ -70,6 +73,33 @@ class TestBuildPostBuild(unittest.TestCase):
                 (output / ".env.example").read_text(encoding="utf-8"),
                 "SAGE_RPC_URL=https://127.0.0.1:9257\n",
             )
+
+    def test_rejects_bundle_missing_certifi_ca_bundle(self):
+        build = _load_build_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "dist" / "Catalyst"
+            internal = output / "_internal"
+            internal.mkdir(parents=True)
+            (output / ("Catalyst.exe" if os.name == "nt" else "Catalyst")).write_text(
+                ""
+            )
+            (internal / "bot_gui.html").write_text("<html></html>", encoding="utf-8")
+            env_example = root / ".env.example"
+            env_example.write_text("", encoding="utf-8")
+
+            buf = io.StringIO()
+            with (
+                patch.object(build, "OUTPUT_DIR", str(output)),
+                patch.object(build, "ENV_EXAMPLE", str(env_example)),
+                contextlib.redirect_stdout(buf),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                build._post_build()
+
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("certifi CA bundle", buf.getvalue())
 
 
 if __name__ == "__main__":
