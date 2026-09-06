@@ -4,11 +4,13 @@ from unittest.mock import Mock
 
 import pytest
 
+import api_server
 from blueprints import market
 
 
 @pytest.fixture
 def prices(monkeypatch):
+    assert api_server.app is not None
     monkeypatch.setattr(
         market, "_STARTUP_PRICE_CACHE", {"key": None, "expires_at": 0, "price": {}}
     )
