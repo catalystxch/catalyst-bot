@@ -10,6 +10,7 @@ import os
 import sys
 import types
 import unittest
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -180,6 +181,107 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(fiat["cat_usd_price"], "0.0125")
         self.assertEqual(fiat["cat_price_xch"], "0.005")
         self.assertEqual(fiat["cat_usd_source"], "spacescan")
+
+    def test_fiat_summary_prefers_executable_market_over_spacescan_price(self):
+        with patch(
+            "market_data_collector.get_cached_xch_usd_price",
+            return_value={"has_data": True, "xch_usd": "2", "source": "coingecko"},
+        ):
+            fiat = dashboard_bp._build_fiat_price_summary(
+                {
+                    "price_xch": "0.000000001",
+                    "price_usd": "0.000000002",
+                    "price_gap_bps": "9999.875",
+                },
+                executable_mid_price="0.00008",
+            )
+
+        self.assertEqual(fiat["cat_price_xch"], "0.00008")
+        self.assertEqual(fiat["cat_usd_price"], "0.00016")
+        self.assertEqual(fiat["cat_usd_source"], "market × coingecko")
+
+    def test_stopped_dashboard_uses_current_orderbook_for_cat_fiat(self):
+        risk_manager = MagicMock()
+        risk_manager.get_inventory_state.return_value = {}
+        risk_manager.get_circuit_breaker_blocked_side.return_value = ""
+        risk_manager.get_market_health.return_value = {
+            "status": "green",
+            "message": "Market conditions healthy — bot stopped",
+            "conditions": [],
+            "metrics": {},
+        }
+        market_intel = MagicMock()
+        market_intel.get_market_summary.return_value = {
+            "best_bid": "0.00007",
+            "best_ask": "0.00009",
+            "orderbook_refreshes": 1,
+        }
+        price_engine = MagicMock()
+        price_engine.get_last_price.return_value = Decimal("0")
+        stopped_bot = types.SimpleNamespace(
+            risk_manager=risk_manager,
+            market_intel=market_intel,
+            price_engine=price_engine,
+            _loop_count=1,
+            _bot_state={},
+            _last_live_offer_edges={},
+            _probe_state={},
+            _start_time=0,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+            get_state=lambda: {"running": False},
+            is_running=lambda: False,
+        )
+        fake_stats = {
+            "realised_pnl_xch": "0",
+            "total_fills": 0,
+            "buy_fills": 0,
+            "sell_fills": 0,
+            "round_trips": 0,
+            "win_rate": 0,
+            "fill_rate_per_hour": 0,
+            "avg_spread_capture": "0",
+            "pending_verification_count": 0,
+            "volume_xch": "0",
+        }
+        fake_summary = {
+            "xch_free_count": 0,
+            "cat_free_count": 0,
+            "xch_total": 0,
+            "cat_total": 0,
+        }
+        with (
+            patch("database.get_stats", return_value=fake_stats),
+            patch("database.get_coin_summary", return_value=fake_summary),
+            patch("database.get_live_tier_group_counts", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch(
+                "market_data_collector.get_cached_xch_usd_price",
+                return_value={"xch_usd": "2", "source": "coingecko"},
+            ),
+            patch.object(
+                dashboard_bp, "_dashboard_wallet_reads_allowed", return_value=False
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value={
+                    **_priced_spacescan(),
+                    "price_xch": "0.000000001",
+                    "price_usd": "0.000000002",
+                },
+            ),
+            patch.object(api_server, "bot", stopped_bot),
+        ):
+            response = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        fiat = response.get_json()["fiat_prices"]
+        self.assertEqual(fiat["cat_price_xch"], "0.00008")
+        self.assertEqual(fiat["cat_usd_price"], "0.00016")
+        self.assertEqual(fiat["cat_usd_source"], "market × coingecko")
 
     def test_settings_has_trading_section(self):
         resp = self._get_dashboard()

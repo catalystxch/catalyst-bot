@@ -14,6 +14,7 @@ import threading
 from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any, Callable
 
 from offer_registry import (
@@ -62,7 +63,7 @@ _MAX_HISTORY_PAGES = 20
 _MAX_WALLET_IDS = 64
 _MAX_SELECTED_COINS = 256
 _MAX_TRANSACTION_FLOWS = 512
-_MAX_CANCEL_MEMBERS = 64
+_MAX_CANCEL_MEMBERS = 256
 _MAX_AUXILIARY_COINS = 256
 _MAX_COIN_RECORDS = 4096
 _MAX_PROVIDER_RECORD_FIELDS = 64
@@ -192,11 +193,24 @@ def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _hex_id(value: Any) -> str:
+def _hex_id_uncached(value: Any) -> str:
     text = _norm_id(value)
     if len(text) != 64 or any(character not in _HEX for character in text):
         return ""
     return text
+
+
+@lru_cache(maxsize=8192)
+def _hex_id_cached(value: str) -> str:
+    """Normalize one exact provider string without repeating 64-byte scans."""
+
+    return _hex_id_uncached(value)
+
+
+def _hex_id(value: Any) -> str:
+    # Provider payloads may contain hostile unhashable values.  Cache only the
+    # exact string case; malformed non-strings still fail closed uncached.
+    return _hex_id_cached(value) if type(value) is str else _hex_id_uncached(value)
 
 
 def _positive_int(value: Any) -> int | None:
@@ -1112,14 +1126,21 @@ def _cancel_proof(
         != intent["selected_coin_ids"]
     ):
         return None
+    transaction_id = _hex_id(tx.get("transaction_id")) or None
+    spend_identity = tx.get("spend_identity")
     for member in members:
-        if member.get("transaction_id") is not None and _hex_id(
-            member["transaction_id"]
-        ) != _hex_id(tx["transaction_id"]):
+        if (
+            transaction_id is not None
+            and member.get("transaction_id") is not None
+            and _hex_id(member["transaction_id"]) != transaction_id
+        ):
             return None
-        if member.get("spend_identity") is not None and member[
-            "spend_identity"
-        ] != tx.get("spend_identity"):
+        if transaction_id is None and member.get("spend_identity") is None:
+            return None
+        if (
+            member.get("spend_identity") is not None
+            and member["spend_identity"] != spend_identity
+        ):
             return None
         if member["transaction_timestamp"] != tx["timestamp"]:
             return None
@@ -1206,6 +1227,58 @@ def _cancel_proof(
     available = {flow[0]: flow for flow in created if flow}
     if len(available) != len(created):
         return None
+    # Sage's confirmed-by-height response currently omits parent and spend-
+    # condition lineage.  A native group cancellation can therefore return
+    # several coins with the same asset and amount without exposing which
+    # returned coin came from which offer input.  Pairing is still exact when
+    # every member owns one input, every affected offer is authoritatively
+    # cancelled, the input/output multisets match, and *none* of the flows
+    # carries partial lineage that a positional pairing could contradict.
+    # The older single-offer/multi-input case remains deliberately ambiguous.
+    indistinguishable_group_pairs: dict[str, str] = {}
+    if len(members) > 1:
+        member_by_input: dict[str, dict[str, Any]] = {}
+        cancelled_trade_ids = {
+            _hex_id(_first_present(row, "trade_id", "offer_id"))
+            for row in offers
+            if _status(row.get("status")) in _CANCELLED_STATUSES
+        }
+        for member in members:
+            selected = [_hex_id(value) for value in member["selected_coin_ids"]]
+            if len(selected) == 1:
+                member_by_input[selected[0]] = member
+        input_groups: dict[
+            tuple[str, int], list[tuple[str, str, int, str, str, str]]
+        ] = {}
+        output_groups: dict[
+            tuple[str, int], list[tuple[str, str, int, str, str, str]]
+        ] = {}
+        for flow in spent_by_id.values():
+            if flow[0] in expected_offer_inputs:
+                input_groups.setdefault(flow[1:3], []).append(flow)
+        for flow in available.values():
+            output_groups.setdefault(flow[1:3], []).append(flow)
+        for signature, input_group in input_groups.items():
+            output_group = output_groups.get(signature, [])
+            if (
+                len(input_group) < 2
+                or len(output_group) != len(input_group)
+                or any(flow[0] not in member_by_input for flow in input_group)
+                or any(
+                    _hex_id(member_by_input[flow[0]]["trade_id"])
+                    not in cancelled_trade_ids
+                    for flow in input_group
+                )
+                or any(flow[4] or flow[5] for flow in input_group)
+                or any(flow[3] != "own" or flow[4] or flow[5] for flow in output_group)
+            ):
+                continue
+            indistinguishable_group_pairs.update(
+                zip(
+                    sorted(flow[0] for flow in input_group),
+                    sorted(flow[0] for flow in output_group),
+                )
+            )
     rebindings: list[dict[str, Any]] = []
     unmatched_xch_inputs: list[tuple[str, tuple[str, str, int, str, str, str]]] = []
     for input_id in sorted(expected_offer_inputs):
@@ -1218,15 +1291,19 @@ def _cancel_proof(
         if candidates:
             return_id = candidates[0]
             if len(candidates) > 1:
-                lineage_matches = [
-                    coin_id
-                    for coin_id in candidates
-                    if available[coin_id][4] == input_id
-                    or (input_flow[5] and available[coin_id][5] == input_flow[5])
-                ]
-                if len(lineage_matches) != 1:
-                    return {"_conflict_reason": "CANCEL_RETURN_LINEAGE_AMBIGUOUS"}
-                return_id = lineage_matches[0]
+                cohort_return = indistinguishable_group_pairs.get(input_id)
+                if cohort_return in candidates:
+                    return_id = cohort_return
+                else:
+                    lineage_matches = [
+                        coin_id
+                        for coin_id in candidates
+                        if available[coin_id][4] == input_id
+                        or (input_flow[5] and available[coin_id][5] == input_flow[5])
+                    ]
+                    if len(lineage_matches) != 1:
+                        return {"_conflict_reason": "CANCEL_RETURN_LINEAGE_AMBIGUOUS"}
+                    return_id = lineage_matches[0]
             available.pop(return_id)
             rebindings.append(
                 {
@@ -1281,8 +1358,8 @@ def _cancel_proof(
             return None
     target_ids = set(intent["selected_coin_ids"])
     return {
-        "transaction_id": _hex_id(tx.get("transaction_id")) or None,
-        "spend_identity": tx.get("spend_identity"),
+        "transaction_id": transaction_id,
+        "spend_identity": spend_identity,
         "block_height": tx["confirmed_height"],
         "fee_mojos": fee,
         "grouped_cancel": len(members) > 1,
@@ -2309,6 +2386,126 @@ def load_authoritative_evidence(
         raw_coins = raw_coin_result["records"]
     else:
         raw_coins = raw_coin_result
+
+    # Sage's transaction list can omit a confirmed offer cancellation even
+    # though the exact selected coin already exposes its authoritative spent
+    # height.  Recover only those bounded, selected-input heights through the
+    # native height-addressed read.  This is evidence enrichment, never an
+    # inference: the returned transaction must be confirmed at the requested
+    # height and must contain one of the exact selected inputs.
+    if wallet_backend == "sage" and type(raw_coins) is dict:
+        try:
+            height_reader = getattr(wallet_facade, "get_transaction_by_height")
+        except BaseException:
+            height_reader = None
+        selected_ids = set(exact_intent["selected_coin_ids"])
+        spent_heights = set()
+        if callable(height_reader) and len(raw_coins) <= _MAX_COIN_RECORDS:
+            try:
+                for raw_id, raw_record in raw_coins.items():
+                    if type(raw_record) is not dict:
+                        continue
+                    explicit_id = raw_record.get("coin_id")
+                    candidate_id = raw_id if explicit_id is None else explicit_id
+                    if _hex_id(candidate_id) not in selected_ids:
+                        continue
+                    height_text = _atomic_text(raw_record.get("spent_height"))
+                    if height_text and int(height_text) > 0:
+                        spent_heights.add(int(height_text))
+            except BaseException:
+                spent_heights = set()
+
+        identified_heights = {
+            tx.get("confirmed_height")
+            for tx in transactions["records"]
+            if type(tx) is dict
+            and type(tx.get("confirmed_height")) is int
+            and tx.get("confirmed") is True
+            and bool(_hex_id(tx.get("transaction_id")))
+        }
+        heights_needing_exact_read = sorted(spent_heights - identified_heights)
+        if len(heights_needing_exact_read) > _MAX_HISTORY_PAGES:
+            coin_cap_exceeded = True
+            heights_needing_exact_read = []
+        supplemental_transactions = []
+        for height in heights_needing_exact_read:
+            try:
+                result = height_reader(height)
+            except BaseException:
+                continue
+            read_at = _clock_utc(clock)
+            transactions.setdefault("read_observed_at", []).append(read_at)
+            transactions["observed_at"] = read_at
+            if (
+                type(result) is not dict
+                or result.get("success") is not True
+                or type(result.get("transaction")) is not dict
+                or len(result) > _MAX_PROVIDER_RECORD_FIELDS
+            ):
+                continue
+            try:
+                _require_provider_bounds(result)
+                normalized = _normalized_transaction_row(result["transaction"])
+            except BaseException:
+                continue
+            normalized_spent = normalized.get("spent")
+            normalized_spent_ids = (
+                {flow.get("coin_id") for flow in normalized_spent if type(flow) is dict}
+                if type(normalized_spent) is list
+                else set()
+            )
+            if (
+                normalized.get("confirmed") is True
+                and normalized.get("confirmed_height") == height
+                and bool(selected_ids & normalized_spent_ids)
+            ):
+                supplemental_transactions.append(normalized)
+
+        if supplemental_transactions:
+            try:
+                supplemental_heights = {
+                    tx["confirmed_height"] for tx in supplemental_transactions
+                }
+                combined_transactions = [
+                    *(
+                        tx
+                        for tx in transactions["records"]
+                        if not (
+                            tx.get("confirmed_height") in supplemental_heights
+                            and not _hex_id(tx.get("transaction_id"))
+                        )
+                    ),
+                    *supplemental_transactions,
+                ]
+                transactions["records"] = _dedupe_records(
+                    combined_transactions, "transaction_id"
+                )
+                transactions["provenance"] = (
+                    "wallet.get_transactions_list+get_transaction_by_height"
+                )
+                prior_required_ids = set(required_ids)
+                for tx in supplemental_transactions:
+                    for flow_name in ("spent", "created"):
+                        for flow in tx.get(flow_name) or []:
+                            coin_id = _hex_id(flow.get("coin_id"))
+                            if coin_id:
+                                required_ids.add(coin_id)
+                if len(required_ids) > _MAX_COIN_RECORDS:
+                    coin_cap_exceeded = True
+                elif required_ids != prior_required_ids:
+                    raw_coin_result = coin_reader(sorted(required_ids))
+                    coin_read_at = _clock_utc(clock)
+                    if (
+                        type(raw_coin_result) is dict
+                        and raw_coin_result.get("success") is True
+                        and type(raw_coin_result.get("records")) is dict
+                    ):
+                        raw_coins = raw_coin_result["records"]
+                    else:
+                        raw_coins = raw_coin_result
+            except BaseException:
+                coin_cap_exceeded = True
+
     normalized_coins: dict[str, dict[str, Any]] = {}
     transaction_flows_by_coin: dict[str, list[dict[str, Any]]] = {}
     for transaction in transactions["records"]:
@@ -3182,6 +3379,265 @@ def _derive_single_cancel_context(
         }
         proof = _classify_terminal_evidence(
             intent,
+            evidence,
+            cancel_context=context,
+            now=observed_at,
+        )
+        if proof.get("classification") == CANCELLED_PROVEN:
+            contexts.append(context)
+    return contexts[0] if len(contexts) == 1 else None
+
+
+def _derive_sage_bulk_cancel_context(
+    manifest: Any,
+    blocking_operation_ids: Any,
+    evidence: Any,
+    *,
+    database_module: Any,
+    observed_at: str,
+) -> dict[str, Any] | None:
+    """Bind one native Sage bulk-cancel transaction to its full manifest.
+
+    A native ``cancel_offers`` submission spends every offer root and one
+    explicitly reserved XCH fee coin in a single transaction.  Recovery must
+    therefore prove and reconcile the complete durable cohort, including
+    members already reconciled before a crash, rather than treating each
+    remaining blocker as an unrelated single cancellation.
+    """
+
+    if type(evidence) is not dict or type(blocking_operation_ids) is not list:
+        return None
+    if not blocking_operation_ids or any(
+        type(value) is not str for value in blocking_operation_ids
+    ):
+        return None
+    blocker_ids = set(blocking_operation_ids)
+    if len(blocker_ids) != len(blocking_operation_ids):
+        return None
+    try:
+        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(manifest)
+    except BaseException:
+        return None
+    if exact_manifest["member_count"] < 2:
+        return None
+    manifest_operation_ids = {
+        member["operation_id"] for member in exact_manifest["members"]
+    }
+    if not blocker_ids.issubset(manifest_operation_ids):
+        return None
+
+    shared_wallet_effect = None
+    durable_members: list[dict[str, Any]] = []
+    currently_blocking: set[str] = set()
+    for member in exact_manifest["members"]:
+        try:
+            rows = database_module.get_offer_operation_events(member["operation_id"])
+            events = [
+                database_module.validate_offer_operation_event(row) for row in rows
+            ]
+            prepared = next(
+                row for row in events if row["event_id"] == member["prepared_event_id"]
+            )
+            latest = events[-1]
+            prepared_evidence = json.loads(prepared["evidence_json"])
+            wallet_effect = prepared_evidence["wallet_effect"]
+            effect_claim = database_module.get_offer_cancel_effect_claim(
+                operation_id=member["operation_id"],
+                attempt=member["attempt"],
+            )
+            intent = database_module.get_offer_intent_by_trade_id(member["trade_id"])
+            selected_coin_ids = json.loads(intent["selected_coin_ids_json"])
+        except (BaseException, StopIteration):
+            return None
+        if (
+            prepared["operation_id"] != member["operation_id"]
+            or prepared["intent_id"] != member["intent_id"]
+            or prepared["attempt"] != member["attempt"]
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or prepared["blocks_mutation"] != 1
+            or type(prepared_evidence) is not dict
+            or prepared_evidence.get("cohort_id") != exact_manifest["cohort_id"]
+            or prepared_evidence.get("cohort_size") != exact_manifest["member_count"]
+            or prepared_evidence.get("member_id") != member["member_id"]
+            or prepared_evidence.get("effect_claim_protocol")
+            != "durable_cohort_claim_v1"
+            or type(effect_claim) is not dict
+            or effect_claim.get("prepared_event_id") != prepared["event_id"]
+            or type(intent) is not dict
+            or intent.get("intent_id") != member["intent_id"]
+            or intent.get("sage_trade_id") != member["trade_id"]
+            or type(selected_coin_ids) is not list
+            or len(selected_coin_ids) != 1
+        ):
+            return None
+        if (
+            type(wallet_effect) is not dict
+            or set(wallet_effect) != {"secure", "timeout", "fee_mojos", "batch"}
+            or wallet_effect.get("secure") is not True
+            or wallet_effect.get("timeout") != 60
+            or type(wallet_effect.get("fee_mojos")) is not int
+            or isinstance(wallet_effect.get("fee_mojos"), bool)
+            or wallet_effect["fee_mojos"] <= 0
+            or type(wallet_effect.get("batch")) is not dict
+            or set(wallet_effect["batch"])
+            != {"protocol", "trade_ids", "source_coin_ids", "fee_coin_id"}
+            or wallet_effect["batch"].get("protocol")
+            != "sage_native_cancel_offers_zero_plus_fee_v1"
+        ):
+            return None
+        if shared_wallet_effect is None:
+            shared_wallet_effect = wallet_effect
+        elif wallet_effect != shared_wallet_effect:
+            return None
+        if latest["blocks_mutation"] == 1:
+            currently_blocking.add(member["operation_id"])
+        if (
+            latest["attempt"] != member["attempt"]
+            or latest["operation_id"] != member["operation_id"]
+        ):
+            return None
+        if latest["phase"] == "PREPARED":
+            if latest["event_id"] != prepared["event_id"]:
+                return None
+        elif latest["phase"] == "FINALIZED":
+            try:
+                final_evidence = json.loads(latest["evidence_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if (
+                latest["outcome"]
+                not in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+                or latest["blocks_mutation"] != 1
+                or type(final_evidence) is not dict
+                or final_evidence.get("effect_attempted") is not True
+                or final_evidence.get("cohort_id") != exact_manifest["cohort_id"]
+                or final_evidence.get("member_id") != member["member_id"]
+            ):
+                return None
+        elif latest["phase"] == "RECONCILED":
+            if (
+                latest["outcome"] != "CANCEL_CONFIRMED"
+                or latest["blocks_mutation"] != 0
+            ):
+                return None
+        else:
+            return None
+        durable_members.append(
+            {
+                "manifest": member,
+                "prepared": prepared,
+                "latest": latest,
+                "intent": intent,
+                "selected_coin_ids": selected_coin_ids,
+            }
+        )
+
+    if currently_blocking != blocker_ids or shared_wallet_effect is None:
+        return None
+    batch = shared_wallet_effect["batch"]
+    trade_ids = [member["trade_id"] for member in exact_manifest["members"]]
+    source_coin_ids = batch.get("source_coin_ids")
+    fee_coin_id = _hex_id(batch.get("fee_coin_id"))
+    if (
+        batch.get("trade_ids") != trade_ids
+        or type(source_coin_ids) is not list
+        or len(source_coin_ids) != len(trade_ids)
+        or len({_hex_id(value) for value in source_coin_ids}) != len(source_coin_ids)
+        or not fee_coin_id
+    ):
+        return None
+    for durable, source_coin_id in zip(durable_members, source_coin_ids):
+        selected = [_hex_id(value) for value in durable["selected_coin_ids"]]
+        if selected != [_hex_id(source_coin_id)] or not selected[0]:
+            return None
+    if fee_coin_id in {_hex_id(value) for value in source_coin_ids}:
+        return None
+
+    transaction_source = evidence.get("transaction_history")
+    transactions = (
+        _transaction_rows(transaction_source)
+        if type(transaction_source) is dict
+        else None
+    )
+    if transactions is None:
+        return None
+    expected_spent_ids = {
+        *(_hex_id(value) for value in source_coin_ids),
+        fee_coin_id,
+    }
+    contexts: list[dict[str, Any]] = []
+    representative = durable_members[0]["intent"]
+    for row in transactions:
+        transaction = _exact_confirmed_transaction(row)
+        if transaction is None:
+            continue
+        spent_ids = {
+            flow[0]
+            for entry in transaction["spent"]
+            if (flow := _flow(entry)) is not None
+        }
+        if spent_ids != expected_spent_ids:
+            continue
+        transaction_id = _hex_id(transaction.get("transaction_id")) or None
+        spend_identity = transaction.get("spend_identity")
+        members = []
+        valid_identity = True
+        for durable in durable_members:
+            latest = durable["latest"]
+            member_transaction_id = latest.get("transaction_id")
+            member_spend_identity = latest.get("spend_identity")
+            # Sage's confirmed-by-height record can omit the submission txid.
+            # In that case the exact cohort+fee spent set and the normalized
+            # spend identity are the authoritative binding.  A txid supplied
+            # by both sources must still match exactly.
+            if (
+                transaction_id is not None
+                and member_transaction_id is not None
+                and _hex_id(member_transaction_id) != transaction_id
+            ):
+                valid_identity = False
+                break
+            if (
+                member_spend_identity is not None
+                and member_spend_identity != spend_identity
+            ):
+                valid_identity = False
+                break
+            if member_transaction_id is None:
+                member_transaction_id = transaction_id
+            if member_spend_identity is None:
+                member_spend_identity = spend_identity
+            intent = durable["intent"]
+            manifest_member = durable["manifest"]
+            members.append(
+                {
+                    "intent_id": manifest_member["intent_id"],
+                    "trade_id": manifest_member["trade_id"],
+                    "member_id": manifest_member["member_id"],
+                    "prepared_event_id": manifest_member["prepared_event_id"],
+                    "selected_coin_ids": list(durable["selected_coin_ids"]),
+                    "request_timestamp": durable["prepared"]["request_timestamp"],
+                    "transaction_timestamp": transaction["timestamp"],
+                    "asset_id": intent["asset_id"],
+                    "side": intent["side"],
+                    "offered_amount_atomic": intent["offered_amount_atomic"],
+                    "requested_amount_atomic": intent["requested_amount_atomic"],
+                    "offer_text_sha256": intent["offer_text_sha256"],
+                    "transaction_id": member_transaction_id,
+                    "spend_identity": member_spend_identity,
+                }
+            )
+        if not valid_identity:
+            continue
+        context = {
+            "cohort_id": exact_manifest["cohort_id"],
+            "manifest_sha256": exact_manifest["manifest_sha256"],
+            "members": members,
+            "auxiliary_coin_ids": [fee_coin_id],
+        }
+        proof = _classify_terminal_evidence(
+            representative,
             evidence,
             cancel_context=context,
             now=observed_at,

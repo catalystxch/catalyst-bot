@@ -17,6 +17,27 @@ def _load_build_module():
 
 
 class TestBuildPostBuild(unittest.TestCase):
+    def test_syncs_windows_metadata_from_runtime_version_before_build(self):
+        build = _load_build_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            version_dir = root / "src" / "catalyst"
+            version_dir.mkdir(parents=True)
+            (version_dir / "_version.py").write_text(
+                '__version__ = "9.8.7"\n', encoding="utf-8"
+            )
+            (root / "version_info.txt").write_text(
+                "filevers=(1, 0, 0, 0)\n", encoding="utf-8"
+            )
+
+            with patch.object(build, "HERE", str(root)):
+                self.assertEqual(build._sync_build_metadata(), "9.8.7")
+
+            metadata = (root / "version_info.txt").read_text(encoding="utf-8")
+            self.assertIn("filevers=(9, 8, 7, 0)", metadata)
+            self.assertIn("ProductVersion',   u'9.8.7'", metadata)
+
     def test_accepts_pyinstaller_internal_data_dir(self):
         build = _load_build_module()
 

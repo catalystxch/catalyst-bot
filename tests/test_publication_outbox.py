@@ -904,6 +904,130 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     assert isolated_database.get_offer(trade_id)["status"] == "open"
 
 
+def test_durable_dexie_flush_stops_before_cycle_sla_budget(
+    isolated_database, monkeypatch
+):
+    for index in range(4):
+        _prepare_claimable(
+            isolated_database,
+            intent_id=f"budget-{index}",
+            generation=index + 1,
+        )
+
+    manager = dexie_manager.DexieManager()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "MAX_POSTS_PER_LOOP", 30, raising=False)
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_TIMEOUT", 15, raising=False)
+    monkeypatch.setattr(manager, "_durable_flush_budget_seconds", 45.0, raising=False)
+
+    elapsed = {"seconds": 0.0}
+    monkeypatch.setattr(
+        dexie_manager.time,
+        "monotonic",
+        lambda: elapsed["seconds"],
+    )
+    manager.enable_durable_outbox(
+        owner_run_id="worker-dexie-budget",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    observed = []
+
+    def slow_acknowledged_post(
+        _offer,
+        trade_id=None,
+        _force=False,
+        idempotency_key=None,
+        request_contract=None,
+    ):
+        observed.append(trade_id)
+        elapsed["seconds"] += 16.0
+        return {
+            "outcome": "acknowledged",
+            "provider": "dexie",
+            "provider_response_id": f"dexie-{len(observed)}",
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                request_contract
+            ),
+            "response_sha256": _sha(f"response-{len(observed)}"),
+            "status_code": 201,
+        }
+
+    monkeypatch.setattr(manager, "_post_single", slow_acknowledged_post)
+
+    result = manager.flush_queue()
+
+    assert len(observed) == 2
+    assert result["posted"] == 2
+    assert result["budget_exhausted"] is True
+    rows = isolated_database.list_publication_outbox(publisher="dexie")
+    assert sum(row["state"] == "queued" for row in rows) == 2
+
+
+def test_durable_splash_flush_stops_before_cycle_sla_budget(
+    isolated_database, monkeypatch
+):
+    for index in range(4):
+        _prepare_claimable(
+            isolated_database,
+            intent_id=f"splash-budget-{index}",
+            generation=index + 1,
+        )
+
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_manager.cfg, "MAX_POSTS_PER_LOOP", 30, raising=False)
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_POST_TIMEOUT", 15, raising=False)
+    monkeypatch.setattr(manager, "_durable_flush_budget_seconds", 45.0, raising=False)
+
+    elapsed = {"seconds": 0.0}
+    monkeypatch.setattr(
+        splash_manager.time,
+        "monotonic",
+        lambda: elapsed["seconds"],
+    )
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash-budget",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    observed = []
+
+    def slow_acknowledged_post(
+        _offer,
+        trade_id=None,
+        _force=False,
+        idempotency_key=None,
+        request_contract=None,
+    ):
+        observed.append(trade_id)
+        elapsed["seconds"] += 16.0
+        return {
+            "outcome": "acknowledged",
+            "provider": "splash",
+            "provider_response_id": f"splash-{len(observed)}",
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                request_contract
+            ),
+            "response_sha256": _sha(f"splash-response-{len(observed)}"),
+            "status_code": 201,
+        }
+
+    monkeypatch.setattr(manager, "_post_single", slow_acknowledged_post)
+
+    result = manager.flush_queue()
+
+    assert len(observed) == 2
+    assert result["posted"] == 2
+    assert result["budget_exhausted"] is True
+    rows = isolated_database.list_publication_outbox(publisher="splash")
+    assert sum(row["state"] == "queued" for row in rows) == 2
+
+
 def test_durable_manager_latches_ambiguous_remote_success_unresolved(
     isolated_database, monkeypatch
 ):
@@ -2397,6 +2521,39 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
 
     assert events == [
         "startup_recovery",
+        "enable_outbox",
+        "startup_gate",
+        "drain_outbox",
+    ]
+
+
+def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():
+    events = []
+
+    class Gate:
+        def set(self):
+            events.append("startup_gate")
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = False
+    loop._startup_complete = Gate()
+    loop._startup_sync = lambda: {
+        "open_buys": 36,
+        "open_sells": 36,
+    }
+    loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+
+    def record_state(**updates):
+        if "open_buys" in updates or "open_sells" in updates:
+            events.append(("offer_counts", updates["open_buys"], updates["open_sells"]))
+
+    loop._set_state = record_state
+
+    loop._run_loop()
+
+    assert events == [
+        ("offer_counts", 36, 36),
         "enable_outbox",
         "startup_gate",
         "drain_outbox",

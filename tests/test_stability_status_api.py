@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 
@@ -79,6 +79,18 @@ def _install_diagnostic_counts(monkeypatch, api_server):
 
 def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     import api_server
+
+    class _TimestampContainingPidDigits(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime.now(tz)
+            if current.microsecond < 432100:
+                current -= timedelta(seconds=1)
+            return current.replace(microsecond=432100)
+
+    # Keep the output timestamp realistic while proving that coincidental PID
+    # digits inside an unrelated string do not make this redaction test flaky.
+    monkeypatch.setattr(api_server, "datetime", _TimestampContainingPidDigits)
 
     expected_counts = _install_diagnostic_counts(monkeypatch, api_server)
     monkeypatch.setattr(
@@ -163,7 +175,21 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
     serialized = json.dumps(payload, sort_keys=True)
     assert "raw-owner-run-id" not in serialized
     assert "operation-secret-id" not in serialized
-    assert "4321" not in serialized
+    public_leaf_values = []
+
+    def _collect_leaf_values(value):
+        if isinstance(value, dict):
+            for nested in value.values():
+                _collect_leaf_values(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                _collect_leaf_values(nested)
+        else:
+            public_leaf_values.append(value)
+
+    _collect_leaf_values(payload)
+    assert 4321 not in public_leaf_values
+    assert "4321" not in public_leaf_values
     assert "f" * 64 not in serialized
 
 

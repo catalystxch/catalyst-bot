@@ -272,6 +272,48 @@ class TestBotPriceContract(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestStatusEndpointSmoke(_FlaskBase):
+    def test_status_includes_runtime_safety_for_prebot_and_stopped_bot(self):
+        for bot in (None, _fake_bot_stopped()):
+            with (
+                self.subTest(bot_created=bot is not None),
+                patch.object(api_server, "bot", bot),
+                patch.object(
+                    api_server,
+                    "get_public_stability_status",
+                    return_value={
+                        "allowed": False,
+                        "reason_code": "COIN_PREP_EFFECT_UNKNOWN",
+                        "recovery": {"freshness": {"valid": True}},
+                    },
+                ),
+            ):
+                response = self.client.get("/api/status", environ_base=self._LOOPBACK)
+                self.assertEqual(response.status_code, 200)
+                safety = response.get_json().get("runtime_safety", {})
+                self.assertIs(safety.get("allowed"), False)
+                self.assertEqual(safety.get("reason_code"), "COIN_PREP_EFFECT_UNKNOWN")
+
+    def test_status_safety_read_failure_does_not_break_other_dashboard_data(self):
+        for bot in (None, _fake_bot_stopped()):
+            with (
+                self.subTest(bot_created=bot is not None),
+                patch.object(api_server, "bot", bot),
+                patch.object(
+                    api_server,
+                    "get_public_stability_status",
+                    side_effect=RuntimeError("private diagnostics"),
+                ),
+            ):
+                response = self.client.get("/api/status", environ_base=self._LOOPBACK)
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()
+                self.assertIn("balances", payload)
+                safety = payload.get("runtime_safety", {})
+                self.assertIs(safety.get("allowed"), False)
+                self.assertEqual(safety.get("reason_code"), "DURABLE_STATE_UNAVAILABLE")
+                self.assertIs(safety["recovery"]["freshness"]["valid"], False)
+                self.assertNotIn("private diagnostics", response.get_data(as_text=True))
+
     def setUp(self):
         super().setUp()
         # Patch get_wallet_type to avoid live wallet call
@@ -702,6 +744,68 @@ class TestStatusEndpointSmoke(_FlaskBase):
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
         self.assertEqual(len(tibet_calls), 1)
+
+    def test_cold_stopped_status_uses_dexie_during_tibetswap_outage(self):
+        """TibetSwap outage must not deadlock setup waiting for its first price."""
+        from unittest.mock import Mock
+
+        api_server._active_cat.update(
+            {"asset_id": "cold-start-cat", "ticker_id": "MZ_XCH", "decimals": 3}
+        )
+        stopped_bot = _fake_bot_stopped()
+        stopped_bot.price_engine = types.SimpleNamespace(
+            _last_price_result=None, get_price=Mock()
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+        ]
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.record_price") as record_price,
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+            patch("requests.get", return_value=response) as fetch,
+        ):
+            first = self.client.get("/api/status", environ_base=self._LOOPBACK)
+            second = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["pricing"]["mid"], 0.00008)
+        self.assertEqual(second.get_json()["pricing"]["mid"], 0.00008)
+        self.assertEqual(first.get_json()["pricing"]["source"], "dexie_bid_ask")
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.kwargs["params"], {"ticker_id": "MZ_XCH"})
+        stopped_bot.price_engine.get_price.assert_not_called()
+        record_price.assert_not_called()
+
+    def test_stopped_status_does_not_keep_old_trading_price_during_tibetswap_outage(
+        self,
+    ):
+        from unittest.mock import Mock
+
+        api_server._active_cat.update({"asset_id": "stale-cat", "ticker_id": "MZ_XCH"})
+        stopped_bot = _fake_bot_stopped()
+        state = stopped_bot.get_state()
+        state["mid_price"] = "100"
+        stopped_bot.get_state = lambda: state
+        stopped_bot.price_engine = types.SimpleNamespace(
+            _last_price_result={"mid_price": "100"}, get_price=Mock()
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+        ]
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_coin_summary", return_value={}),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+            patch("requests.get", return_value=response),
+        ):
+            result = self.client.get("/api/status", environ_base=self._LOOPBACK)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.get_json()["pricing"]["mid"], 0.00008)
+        stopped_bot.price_engine.get_price.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

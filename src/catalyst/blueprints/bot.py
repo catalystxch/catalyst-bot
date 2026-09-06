@@ -655,6 +655,19 @@ def api_bot_state():
     return jsonify(api_server._serialize_dict(state))
 
 
+def _runtime_safety_for_status():
+    """Observe the mutation gate without wallet RPC or changing its authority."""
+    try:
+        return api_server.get_public_stability_status()
+    except Exception:
+        # A diagnostics read failure must not hide balances or advertise readiness.
+        return {
+            "allowed": False,
+            "reason_code": "DURABLE_STATE_UNAVAILABLE",
+            "recovery": {"freshness": {"valid": False}},
+        }
+
+
 @bp.route("/api/status")
 def api_status():
     """Main GUI polling endpoint — assembles full state in the format the GUI expects.
@@ -1101,6 +1114,7 @@ def api_status():
                 api_server._serialize_dict(
                     {
                         "running": False,
+                        "runtime_safety": _runtime_safety_for_status(),
                         "stats": {
                             "loop_count": 0,
                             "uptime_seconds": 0,
@@ -1244,7 +1258,8 @@ def api_status():
         # get_price() writes to price_history (DB write), and GUI polls every
         # few seconds from Flask threads. Those writes cause cascading DB lock
         # contention with the bot loop's startup batch cancel.
-        # Instead, use cached price from last bot loop, or show 0 until first loop.
+        # Running bots expose their last loop price. Stopped bots use the
+        # separately expiring setup cache below, never an indefinitely old quote.
         if mid == 0 and hasattr(bot, "price_engine") and bot.price_engine:
             try:
                 # Use cached price if available (read-only, no DB write)
@@ -1254,41 +1269,21 @@ def api_status():
             except Exception:
                 pass
 
-        # Last resort: if still no price (bot created but loop hasn't run yet),
-        # do a lightweight TibetSwap fetch. This is read-only — no DB writes.
-        # Without this, the settings/coin-prep page can't calculate sell amounts.
-        if mid == 0:
-            try:
-                asset_id = api_server._active_cat.get("asset_id") or (
-                    cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
-                )
-                cat_dec = api_server._active_cat.get("decimals") or getattr(
-                    cfg, "CAT_DECIMALS", 3
-                )
-                if asset_id:
-                    from blueprints.market import _get_tibet_pairs_cached
+        # A cold stopped bot needs setup pricing before its first trading loop.
+        # TibetSwap outage: use cached read-only Dexie fallback, not get_price(),
+        # which writes price history and advances trading reference state.
+        startup_pricing = {}
+        if mid == 0 or not raw.get("running", False):
+            from blueprints.market import _get_startup_price_cached
 
-                    pairs = _get_tibet_pairs_cached(
-                        getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
-                        timeout=8,
-                    )
-                    norm_id = asset_id.lower().strip().replace("0x", "")
-                    for p in pairs:
-                        p_id = (
-                            str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                        )
-                        if p_id == norm_id:
-                            xr = float(p.get("xch_reserve", 0)) / 1e12
-                            tr = float(p.get("token_reserve", 0)) / (10 ** int(cat_dec))
-                            if tr > 0:
-                                mid = xr / tr
-                                print(
-                                    f"[STATUS] TibetSwap fallback price: {mid:.8f}",
-                                    flush=True,
-                                )
-                            break
-            except Exception as e:
-                print(f"[STATUS] TibetSwap fallback failed: {e}", flush=True)
+            startup_pricing = _get_startup_price_cached(
+                active_asset_id,
+                api_server._active_cat.get("ticker_id")
+                or getattr(cfg, "CAT_TICKER_ID", ""),
+                api_server._active_cat.get("decimals", getattr(cfg, "CAT_DECIMALS", 3)),
+            )
+            mid = api_server._safe_float(startup_pricing.get("mid", 0))
+            bid = ask = 0
 
         # Compute bid/ask from mid using the EFFECTIVE spread.
         # last_quoted_buy/sell both store mid_price (not actual bid/ask),
@@ -1324,7 +1319,7 @@ def api_status():
                 bid = mid * (1 - spread_frac / 2)
                 ask = mid * (1 + spread_frac / 2)
 
-        pricing_out = {"bid": bid, "mid": mid, "ask": ask}
+        pricing_out = {**startup_pricing, "bid": bid, "mid": mid, "ask": ask}
 
         # --- Offers ---
         is_running = raw.get("running", False)
@@ -1840,6 +1835,7 @@ def api_status():
         # --- Assemble response ---
         result = {
             "running": raw.get("running", False),
+            "runtime_safety": _runtime_safety_for_status(),
             "stats": stats_out,
             "balances": balances_out,
             "pricing": pricing_out,

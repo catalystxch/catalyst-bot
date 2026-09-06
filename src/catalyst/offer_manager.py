@@ -51,7 +51,9 @@ import database
 import mutation_gate
 import offer_registry
 from refresh_safety import RefreshPlan, plan_refresh
+from replacement_capacity import COIN_PURPOSES
 from sage_offer_wire import canonical_sage_offer_text
+from tx_fees import get_effective_transaction_fee_mojos
 import wallet
 from cancel_outcomes import (
     CANCEL_CONFIRMED,
@@ -117,6 +119,13 @@ class _OfferCreationClaimLost(Exception):
 
 def _wallet_mutation_count(result) -> int:
     return result if type(result) is int and result >= 0 else 0
+
+
+def _has_authoritative_coin_purpose(coin: dict) -> bool:
+    """Return whether a tracked coin is bound to one exact policy purpose."""
+
+    purpose = coin.get("purpose")
+    return type(purpose) is str and purpose in COIN_PURPOSES
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +886,11 @@ class OfferManager:
             for coin in db_free:
                 designation = str(coin.get("designation", "") or "")
                 tier = str(coin.get("assigned_tier", "none") or "none").lower()
-                if designation not in _TRADING_DESIGS or tier in _SKIP_TIERS:
+                if (
+                    not _has_authoritative_coin_purpose(coin)
+                    or designation not in _TRADING_DESIGS
+                    or tier in _SKIP_TIERS
+                ):
                     continue
                 usable_total += 1
                 usable_by_tier[tier] = usable_by_tier.get(tier, 0) + 1
@@ -1185,6 +1198,7 @@ class OfferManager:
             strict_pref = bool(pref and strict_preferred_tier)
             db_free_coins = []
             reserve_ids = set()
+            policy_bound_coin_ids = set()
             try:
                 from database import get_free_coins, get_reserve_coins
 
@@ -1216,6 +1230,15 @@ class OfferManager:
                     coin_id = str(coin.get("coin_id", "")).strip().lower()
                     if not coin_id or coin_id in used_coins:
                         continue
+
+                    # The durable creation journal rejects legacy rows whose
+                    # policy purpose is missing or unknown.  Exclude those
+                    # rows during selection so a closer-fitting stale coin
+                    # cannot outrank a freshly prepared, purpose-bound coin
+                    # and fail the slot only after creation has begun.
+                    if not _has_authoritative_coin_purpose(coin):
+                        continue
+                    policy_bound_coin_ids.add(coin_id)
 
                     designation = (coin.get("designation") or "unknown").lower()
                     assigned_tier = (coin.get("assigned_tier") or "none").lower()
@@ -1349,7 +1372,9 @@ class OfferManager:
                 return None
 
             candidates = [
-                item for item in fallback_candidates if item[1] not in reserve_ids
+                item
+                for item in fallback_candidates
+                if item[1] not in reserve_ids and item[1] in policy_bound_coin_ids
             ]
 
             if candidates:
@@ -5101,6 +5126,7 @@ class OfferManager:
                 for c in _db_free
                 if c.get("designation", "") in _TRADING_DESIGS
                 and c.get("assigned_tier", "none") not in _SKIP_TIERS
+                and _has_authoritative_coin_purpose(c)
             )
         except Exception as exc:
             # The durable free-pool query is the reservation authority.  A
@@ -5375,9 +5401,26 @@ class OfferManager:
         cohort_size: int,
         member_id: str,
         journal: dict,
+        batch_contract: Optional[dict] = None,
     ) -> dict:
         safe_reason = reason if type(reason) is str else "manual"
         safe_reason = safe_reason.strip()[:128] or "manual"
+        wallet_effect = {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": None,
+        }
+        if batch_contract is not None:
+            wallet_effect = {
+                "secure": True,
+                "timeout": 60,
+                "fee_mojos": batch_contract["fee_mojos"],
+                "batch": {
+                    key: value
+                    for key, value in batch_contract.items()
+                    if key != "fee_mojos"
+                },
+            }
         evidence = {
             "trade_id": intent.trade_id,
             "intent_id": intent.intent_id,
@@ -5387,16 +5430,128 @@ class OfferManager:
             "member_id": member_id,
             "reason": safe_reason,
             "continuation_journal_sha256": journal["snapshot_sha256"],
-            "wallet_effect": {
-                "secure": True,
-                "timeout": 60,
-                "fee_mojos": None,
-            },
+            "wallet_effect": wallet_effect,
         }
         if cohort_size > 1:
             evidence["cohort_size"] = cohort_size
             evidence["effect_claim_protocol"] = "durable_cohort_claim_v1"
         return evidence
+
+    @staticmethod
+    def _is_exact_cancel_wallet_effect(
+        value: Any,
+        *,
+        trade_id: Optional[str] = None,
+        cohort_size: Optional[int] = None,
+    ) -> bool:
+        if value == {"secure": True, "timeout": 60, "fee_mojos": None}:
+            return True
+        if type(value) is not dict or set(value) != {
+            "secure",
+            "timeout",
+            "fee_mojos",
+            "batch",
+        }:
+            return False
+        fee_mojos = value["fee_mojos"]
+        batch = value["batch"]
+        if (
+            value["secure"] is not True
+            or value["timeout"] != 60
+            or type(fee_mojos) is not int
+            or isinstance(fee_mojos, bool)
+            or fee_mojos <= 0
+            or type(batch) is not dict
+            or set(batch)
+            != {
+                "protocol",
+                "trade_ids",
+                "source_coin_ids",
+                "fee_coin_id",
+            }
+            or batch["protocol"] != "sage_native_cancel_offers_zero_plus_fee_v1"
+        ):
+            return False
+        trade_ids = batch["trade_ids"]
+        source_coin_ids = batch["source_coin_ids"]
+        fee_coin_id = batch["fee_coin_id"]
+        if (
+            type(trade_ids) is not list
+            or type(source_coin_ids) is not list
+            or len(trade_ids) < 2
+            or len(trade_ids) != len(source_coin_ids)
+            or len(set(trade_ids)) != len(trade_ids)
+            or len(set(source_coin_ids)) != len(source_coin_ids)
+            or type(fee_coin_id) is not str
+            or fee_coin_id in source_coin_ids
+            or (cohort_size is not None and len(trade_ids) != cohort_size)
+            or (trade_id is not None and trade_id not in trade_ids)
+        ):
+            return False
+        try:
+            for identifier in [*trade_ids, *source_coin_ids, fee_coin_id]:
+                if (
+                    type(identifier) is not str
+                    or len(identifier) != 64
+                    or identifier != identifier.lower()
+                ):
+                    return False
+                bytes.fromhex(identifier)
+        except ValueError:
+            return False
+        return True
+
+    def _plan_sage_bulk_cancel(self, members: list[tuple]) -> Optional[dict]:
+        """Select exact roots for Sage's one-transaction bulk cancel path."""
+
+        if len(members) < 2 or get_wallet_type() != "sage" or self._fee_pool is None:
+            return None
+        trade_ids = []
+        source_coin_ids = []
+        for intent, _attempt, _member_id in members:
+            offer = database.get_offer(intent.trade_id)
+            raw_coin_id = offer.get("coin_id") if type(offer) is dict else None
+            coin_id = str(raw_coin_id or "").strip().lower().removeprefix("0x")
+            if len(coin_id) != 64:
+                return None
+            try:
+                bytes.fromhex(coin_id)
+            except ValueError:
+                return None
+            trade_ids.append(intent.trade_id)
+            source_coin_ids.append(coin_id)
+        if len(set(source_coin_ids)) != len(source_coin_ids):
+            return None
+        try:
+            fee_mojos = get_effective_transaction_fee_mojos()
+        except Exception:
+            return None
+        if type(fee_mojos) is not int or isinstance(fee_mojos, bool) or fee_mojos <= 0:
+            return None
+        fee_coin_id = self._fee_pool.reserve()
+        fee_coin_id = str(fee_coin_id or "").strip().lower().removeprefix("0x")
+        try:
+            valid_fee_coin = len(fee_coin_id) == 64 and bool(bytes.fromhex(fee_coin_id))
+        except ValueError:
+            valid_fee_coin = False
+        if not valid_fee_coin or fee_coin_id in source_coin_ids:
+            return None
+        contract = {
+            "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+            "trade_ids": trade_ids,
+            "source_coin_ids": source_coin_ids,
+            "fee_coin_id": fee_coin_id,
+            "fee_mojos": fee_mojos,
+        }
+        wallet_effect = {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": fee_mojos,
+            "batch": {
+                key: value for key, value in contract.items() if key != "fee_mojos"
+            },
+        }
+        return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
 
     @staticmethod
     def _prepare_cancel_member(
@@ -5529,8 +5684,11 @@ class OfferManager:
             or type(evidence["reason"]) is not str
             or not 1 <= len(evidence["reason"]) <= 128
             or evidence["continuation_journal_sha256"] != journal["snapshot_sha256"]
-            or evidence["wallet_effect"]
-            != {"secure": True, "timeout": 60, "fee_mojos": None}
+            or not OfferManager._is_exact_cancel_wallet_effect(
+                evidence["wallet_effect"],
+                trade_id=intent.trade_id,
+                cohort_size=cohort_size,
+            )
             or (
                 "prior_lifecycle_state" in evidence
                 and (
@@ -5944,8 +6102,11 @@ class OfferManager:
                 or member_id != expected_member_id
                 or type(prepared_evidence.get("reason")) is not str
                 or not 1 <= len(prepared_evidence["reason"]) <= 128
-                or prepared_evidence.get("wallet_effect")
-                != {"secure": True, "timeout": 60, "fee_mojos": None}
+                or not OfferManager._is_exact_cancel_wallet_effect(
+                    prepared_evidence.get("wallet_effect"),
+                    trade_id=intent.trade_id,
+                    cohort_size=prepared_evidence.get("cohort_size"),
+                )
                 or (
                     "effect_claim_protocol" in prepared_evidence
                     and (
@@ -6323,6 +6484,198 @@ class OfferManager:
             if continuation is not None:
                 wallet.close_offer_cancel_continuation(continuation)
 
+    def _cancel_prepared_sage_batch(
+        self,
+        *,
+        members: list[tuple],
+        manifest: dict,
+        authorities: dict,
+        batch_contract: dict,
+    ) -> Dict[str, dict]:
+        """Run one manifest-bound Sage bulk cancellation wallet effect."""
+
+        representative = members[0][0]
+        member_authorities = {
+            intent.trade_id: authorities[intent.trade_id]
+            for intent, _attempt, _member_id in members
+        }
+        bindings = {
+            (authority[2], authority[3]) for authority in member_authorities.values()
+        }
+        if len(bindings) != 1:
+            raise ValueError("cancellation cohort wallet identities do not match")
+        wallet_hash, network = next(iter(bindings))
+        self._offer_cancel_crash_boundary("after_prepare", representative)
+        claim = database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+        if claim != {
+            "cohort_id": manifest["cohort_id"],
+            "effect_claimed": True,
+            "member_count": manifest["member_count"],
+        }:
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Bulk cancellation effect ownership requires reconciliation",
+                blocking_operation_ids=[
+                    intent.operation_id for intent, _attempt, _member_id in members
+                ],
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return {
+                intent.trade_id: self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=True,
+                    effect_attempted=False,
+                    attempt=attempt,
+                )
+                for intent, attempt, _member_id in members
+            }
+
+        self._offer_cancel_crash_boundary("before_wallet", representative)
+        first_intent, _first_attempt, _first_member_id = members[0]
+        continuation, _journal, _wallet_hash, _network = member_authorities[
+            first_intent.trade_id
+        ]
+        refreshed = wallet.refresh_offer_cancel_continuation(
+            continuation,
+            operation_id=first_intent.operation_id,
+            intent_id=first_intent.intent_id,
+            trade_id=first_intent.trade_id,
+            ttl_seconds=60,
+        )
+        trade_ids = list(batch_contract["trade_ids"])
+        if refreshed:
+            authorities.pop(first_intent.trade_id)
+            raw_results = wallet.cancel_offers_batch(
+                trade_ids,
+                secure=True,
+                max_workers=1,
+                fee_mojos=batch_contract["fee_mojos"],
+                skip_confirmation=False,
+                source_coin_ids=list(batch_contract["source_coin_ids"]),
+                fee_coin_id=batch_contract["fee_coin_id"],
+                _cancel_continuation=continuation,
+                _cancel_operation_id=first_intent.operation_id,
+                _cancel_intent_id=first_intent.intent_id,
+                _cancel_trade_id=first_intent.trade_id,
+            )
+        else:
+            raw_results = {
+                trade_id: cancellation_result(
+                    CANCEL_UNKNOWN,
+                    method="continuation_refresh",
+                    raw_response={"reason_code": "CONTINUATION_REFRESH_BLOCKED"},
+                )
+                for trade_id in trade_ids
+            }
+            raw_results["_catalyst_effect_attempted"] = False
+        effect_attempted = (
+            type(raw_results) is dict
+            and raw_results.get("_catalyst_effect_attempted") is True
+        )
+        raw_members = (
+            {
+                key: value
+                for key, value in raw_results.items()
+                if key != "_catalyst_effect_attempted"
+            }
+            if type(raw_results) is dict
+            else {}
+        )
+        typed_members = []
+        if set(raw_members) == set(trade_ids):
+            try:
+                typed_members = [
+                    validate_cancel_result(raw_members[trade_id])
+                    for trade_id in trade_ids
+                ]
+            except (TypeError, ValueError):
+                typed_members = []
+        shared_result = typed_members[0] if typed_members else None
+        if (
+            shared_result is None
+            or shared_result["outcome"] == CANCEL_CONFIRMED
+            or any(result != shared_result for result in typed_members[1:])
+        ):
+            shared_result = cancellation_result(
+                CANCEL_UNKNOWN,
+                method="wallet_facade",
+                raw_response={"reason_code": "INVALID_BULK_CANCEL_RESULT"},
+            )
+        self._offer_cancel_crash_boundary("after_response", representative)
+
+        requests = []
+        for intent, attempt, member_id in members:
+            journal = member_authorities[intent.trade_id][1]
+            requests.append(
+                {
+                    "operation_id": intent.operation_id,
+                    "event_id": f"{intent.operation_id}:attempt:{attempt}:finalized",
+                    "trade_id": intent.trade_id,
+                    "intent_id": intent.intent_id,
+                    "attempt": attempt,
+                    "cancel_result": shared_result,
+                    "wallet_identity_json": journal,
+                    "evidence_json": {
+                        "trade_id": intent.trade_id,
+                        "attempt": attempt,
+                        "cohort_id": manifest["cohort_id"],
+                        "member_id": member_id,
+                        "effect_attempted": effect_attempted,
+                        "cancel_result": shared_result,
+                    },
+                }
+            )
+        self._offer_cancel_crash_boundary("before_final_commit", representative)
+        try:
+            database.finalize_offer_cancel_cohort(
+                manifest_json=manifest,
+                member_requests_json=requests,
+            )
+        except Exception:
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Bulk cancellation outcome requires reconciliation",
+                blocking_operation_ids=[
+                    intent.operation_id for intent, _attempt, _member_id in members
+                ],
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return {
+                intent.trade_id: self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=False,
+                    effect_attempted=effect_attempted,
+                    attempt=attempt,
+                )
+                for intent, attempt, _member_id in members
+            }
+        if shared_result["outcome"] in {
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            CANCEL_UNKNOWN,
+        }:
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Bulk cancellation outcome requires authoritative reconciliation",
+                blocking_operation_ids=[
+                    intent.operation_id for intent, _attempt, _member_id in members
+                ],
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+        self._offer_cancel_crash_boundary("after_final_commit", representative)
+        results = {}
+        for intent, attempt, _member_id in members:
+            result = dict(shared_result)
+            result["_catalyst_effect_attempted"] = effect_attempted
+            result["_catalyst_idempotent_replay"] = False
+            result["_catalyst_operation_id"] = intent.operation_id
+            result["_catalyst_intent_id"] = intent.intent_id
+            result["_catalyst_attempt"] = attempt
+            results[intent.trade_id] = result
+        return results
+
     def cancel_offers(
         self,
         trade_ids: List[str],
@@ -6334,7 +6687,8 @@ class OfferManager:
         """Cancel a list of offers.
 
         Marks them as bot-cancelled so fill detection doesn't count them as fills.
-        Sequential cancellation with delays (parallel breaks the wallet).
+        Sage cohorts use one native bulk-cancel transaction; the compatibility
+        path remains serialized when that proven batch contract is unavailable.
 
         F20 (2026-04-08): cancel-storm protection. If a single call asks
         to cancel more than CANCEL_STORM_THRESHOLD_PCT of the live book
@@ -6546,6 +6900,16 @@ class OfferManager:
         else:
             manifest = None
 
+        batch_contract = None
+        if (
+            is_cohort
+            and manifest is not None
+            and len(members) == len(ordered_members)
+            and {intent.trade_id for intent, _attempt, _member_id in members}
+            == {intent.trade_id for intent, _attempt, _member_id in ordered_members}
+        ):
+            batch_contract = self._plan_sage_bulk_cancel(members)
+
         authorities = {}
         try:
             # Acquire in reverse dispatch order so the first wallet effect uses
@@ -6590,6 +6954,7 @@ class OfferManager:
                                     cohort_size=len(members),
                                     member_id=member_id,
                                     journal=journal,
+                                    batch_contract=batch_contract,
                                 ),
                             }
                         )
@@ -6654,6 +7019,32 @@ class OfferManager:
                     "after_cohort_prepare",
                     members[0][0],
                 )
+
+            if batch_contract is not None and not recovering_interrupted_cohort:
+                batch_results = self._cancel_prepared_sage_batch(
+                    members=members,
+                    manifest=manifest,
+                    authorities=authorities,
+                    batch_contract=batch_contract,
+                )
+                for intent, attempt, _member_id in members:
+                    result = batch_results[intent.trade_id]
+                    if result.get("outcome") == CANCEL_FAILED:
+                        prior_retry = self._pending_cancel_retries.get(
+                            intent.trade_id, {}
+                        )
+                        self._pending_cancel_retries[intent.trade_id] = {
+                            "attempts": result.get("_catalyst_attempt", attempt),
+                            "first_failed": prior_retry.get(
+                                "first_failed", time.time()
+                            ),
+                        }
+                    else:
+                        self._pending_cancel_retries.pop(intent.trade_id, None)
+                return {
+                    intent.trade_id: batch_results[intent.trade_id]
+                    for intent, _attempt, _member_id in ordered_members
+                }
 
             if recovering_interrupted_cohort:
                 processed_results = {}
@@ -6824,10 +7215,10 @@ class OfferManager:
     ) -> Dict:
         """Cancel all open offers (or only one side's offers) in controlled batches.
 
-        Sage wallet struggles with bulk cancels — each cancel is an on-chain
-        transaction and too many at once can cause long pending states. This
-        method cancels in measured batches with a short pause between batches
-        so we can push harder than one-by-one shutdown without blind fire-and-forget.
+        Sage's native ``cancel_offers`` call can cancel a measured cohort in one
+        transaction. Each cohort is bound to the exact offer roots and one
+        reserved fee coin, then authoritatively reconciled before another wallet
+        effect. The outer batching keeps proof and recovery work bounded.
 
         First checks the database. If the DB has no open offers (e.g. pre-existing
         offers that were never inserted), falls back to fetching directly from the
@@ -7363,6 +7754,206 @@ class OfferManager:
                 self._cancel_settlement_operation_id = None
 
     @staticmethod
+    def _sage_bulk_cancel_manifest_for_blockers(blockers: Any) -> Optional[dict]:
+        """Return the one exact native Sage cohort owning these blockers."""
+
+        if type(blockers) is not list or not blockers:
+            return None
+        blocker_ids = []
+        cohort_ids = set()
+        try:
+            for raw in blockers:
+                event = database.validate_offer_operation_event(raw)
+                operation_id = event["operation_id"]
+                if (
+                    not OfferManager._is_canonical_cancel_digest_id(
+                        operation_id, "cancel:"
+                    )
+                    or event["operation_type"] != "CANCEL"
+                    or event["blocks_mutation"] != 1
+                    or event["phase"] not in {"PREPARED", "FINALIZED"}
+                ):
+                    return None
+                evidence = json.loads(event["evidence_json"])
+                cohort_id = evidence.get("cohort_id")
+                if type(cohort_id) is not str or not cohort_id:
+                    return None
+                blocker_ids.append(operation_id)
+                cohort_ids.add(cohort_id)
+            if len(blocker_ids) != len(set(blocker_ids)) or len(cohort_ids) != 1:
+                return None
+            manifest = database.get_offer_cancel_cohort_manifest(cohort_ids.pop())
+            manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        manifest_ids = {member["operation_id"] for member in manifest["members"]}
+        if manifest["member_count"] < 2 or not set(blocker_ids).issubset(manifest_ids):
+            return None
+        return manifest
+
+    @staticmethod
+    def _settle_submitted_sage_bulk_cancel(
+        manifest: dict,
+        blocking_operation_ids: list[str],
+    ) -> bool:
+        """Prove and settle every unresolved member of one Sage transaction."""
+
+        import offer_reconciliation
+
+        if type(blocking_operation_ids) is not list or not blocking_operation_ids:
+            return False
+        try:
+            exact_manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+            latch = database.get_runtime_safety_latch()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            blocker_ids = [row.get("operation_id") for row in blockers]
+            generation = latch.get("generation")
+            if (
+                latch.get("state") != "tripped"
+                or type(generation) is not int
+                or isinstance(generation, bool)
+                or generation < 1
+                or blocker_ids != blocking_operation_ids
+            ):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        max_wait = max(0.0, float(cfg.CANCEL_MAX_WAIT_SECS))
+        poll_interval = max(0.05, float(cfg.CANCEL_POLL_INTERVAL_SECS))
+        deadline = time.monotonic() + max_wait
+        while True:
+            try:
+                current_blockers = database.get_unresolved_offer_operation_blockers()
+                current_ids = [row.get("operation_id") for row in current_blockers]
+                if not current_ids:
+                    return False
+                current_manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(
+                    current_blockers
+                )
+                if (
+                    current_manifest is None
+                    or current_manifest["manifest_sha256"]
+                    != exact_manifest["manifest_sha256"]
+                ):
+                    return False
+                members_by_operation = {
+                    member["operation_id"]: member
+                    for member in exact_manifest["members"]
+                }
+                representative_member = members_by_operation[current_ids[0]]
+                representative_intent = database.get_offer_intent(
+                    representative_member["intent_id"]
+                )
+                if (
+                    type(representative_intent) is not dict
+                    or representative_intent.get("sage_trade_id")
+                    != representative_member["trade_id"]
+                ):
+                    return False
+                evidence = offer_reconciliation.load_authoritative_evidence(
+                    representative_intent
+                )
+                observed_at = offer_reconciliation._clock_utc()
+                while current_ids:
+                    # Each commit advances one member's Task 8 journal from
+                    # submitted to reconciled.  Re-derive the context from the
+                    # unchanged authoritative wallet evidence and the freshly
+                    # committed journal before settling the next member.
+                    cancel_context = (
+                        offer_reconciliation._derive_sage_bulk_cancel_context(
+                            exact_manifest,
+                            current_ids,
+                            evidence,
+                            database_module=database,
+                            observed_at=observed_at,
+                        )
+                    )
+                    if cancel_context is None:
+                        raise ValueError("native bulk cancellation proof is incomplete")
+                    member = members_by_operation.get(current_ids[0])
+                    if member is None:
+                        raise ValueError("native bulk cancellation blocker set changed")
+                    intent_row = database.get_offer_intent(member["intent_id"])
+                    if (
+                        type(intent_row) is not dict
+                        or intent_row.get("sage_trade_id") != member["trade_id"]
+                    ):
+                        raise ValueError(
+                            "native bulk cancellation intent binding changed"
+                        )
+                    classification = offer_reconciliation.classify_terminal_evidence(
+                        intent_row,
+                        evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
+                    )
+                    if (
+                        classification.get("classification")
+                        != offer_reconciliation.CANCELLED_PROVEN
+                    ):
+                        raise ValueError("native bulk cancellation proof is incomplete")
+                    reconciled = offer_reconciliation.reconcile_offer(
+                        intent_row["intent_id"],
+                        evidence=evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
+                    )
+                    if (
+                        reconciled.get("classification")
+                        != offer_reconciliation.CANCELLED_PROVEN
+                        or reconciled.get("applied") is not True
+                    ):
+                        raise ValueError("native bulk cancellation was not committed")
+                    next_blockers = database.get_unresolved_offer_operation_blockers()
+                    next_ids = [row.get("operation_id") for row in next_blockers]
+                    if len(next_ids) >= len(current_ids) or any(
+                        operation_id not in members_by_operation
+                        for operation_id in next_ids
+                    ):
+                        raise ValueError(
+                            "native bulk cancellation blockers did not advance"
+                        )
+                    current_ids = next_ids
+                if not current_ids:
+                    post_latch = database.get_runtime_safety_latch()
+                    post_blockers = database.get_unresolved_offer_operation_blockers()
+                    if post_latch.get("generation") != generation or post_blockers:
+                        raise ValueError(
+                            "native bulk cancellation blockers remain unresolved"
+                        )
+                    runtime = mutation_gate.current_runtime()
+                    if runtime is None:
+                        return False
+                    released = runtime.release_resolved(
+                        generation,
+                        blocking_operation_ids,
+                    )
+                    if released.get("released") is True:
+                        return True
+                    status_reader = getattr(runtime, "status", None)
+                    runtime_status = (
+                        status_reader() if callable(status_reader) else None
+                    )
+                    runtime_allowed = (
+                        runtime_status.get("allowed") is True
+                        if type(runtime_status) is dict
+                        else getattr(runtime_status, "allowed", False) is True
+                    )
+                    return bool(
+                        post_latch.get("state") == "resolved" and runtime_allowed
+                    )
+            except Exception:
+                # Confirmation and all member evidence may arrive at slightly
+                # different times.  No exception can authorize a retry spend.
+                pass
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
+    @staticmethod
     def _settle_submitted_cancel(
         intent: _CanonicalOfferCancelIntent,
     ) -> bool:
@@ -7417,10 +8008,15 @@ class OfferManager:
                     cancel_context=cancel_context,
                     now=observed_at,
                 )
-                if (
-                    cancel_context is not None
-                    and classification.get("classification")
-                    == offer_reconciliation.CANCELLED_PROVEN
+                terminal_classification = classification.get("classification")
+                terminal_outcomes = {
+                    offer_reconciliation.CANCELLED_PROVEN,
+                    offer_reconciliation.FILLED_PROVEN,
+                    offer_reconciliation.EXPIRED_PROVEN,
+                }
+                if terminal_classification in terminal_outcomes and (
+                    terminal_classification != offer_reconciliation.CANCELLED_PROVEN
+                    or cancel_context is not None
                 ):
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent.intent_id,
@@ -7429,8 +8025,7 @@ class OfferManager:
                         now=observed_at,
                     )
                     if (
-                        reconciled.get("classification")
-                        == offer_reconciliation.CANCELLED_PROVEN
+                        reconciled.get("classification") == terminal_classification
                         and reconciled.get("applied") is True
                     ):
                         runtime = mutation_gate.current_runtime()
@@ -7585,19 +8180,36 @@ class OfferManager:
             )
             return -1
         if blockers:
-            if len(blockers) != 1:
-                return -1
-            operation_id = blockers[0].get("operation_id")
-            if not self._is_canonical_cancel_digest_id(operation_id, "cancel:"):
-                return -1
-            intent = self._canonical_cancel_intent(operation_id.removeprefix("cancel:"))
-            if not self._begin_cancel_settlement(intent.operation_id):
-                return -1
-            try:
-                if not self._settle_submitted_cancel(intent):
+            bulk_manifest = self._sage_bulk_cancel_manifest_for_blockers(blockers)
+            if bulk_manifest is not None:
+                blocker_ids = [row.get("operation_id") for row in blockers]
+                settlement_operation = blocker_ids[0]
+                if not self._begin_cancel_settlement(settlement_operation):
                     return -1
-            finally:
-                self._end_cancel_settlement(intent.operation_id)
+                try:
+                    if not self._settle_submitted_sage_bulk_cancel(
+                        bulk_manifest,
+                        blocker_ids,
+                    ):
+                        return -1
+                finally:
+                    self._end_cancel_settlement(settlement_operation)
+            elif len(blockers) != 1:
+                return -1
+            else:
+                operation_id = blockers[0].get("operation_id")
+                if not self._is_canonical_cancel_digest_id(operation_id, "cancel:"):
+                    return -1
+                intent = self._canonical_cancel_intent(
+                    operation_id.removeprefix("cancel:")
+                )
+                if not self._begin_cancel_settlement(intent.operation_id):
+                    return -1
+                try:
+                    if not self._settle_submitted_cancel(intent):
+                        return -1
+                finally:
+                    self._end_cancel_settlement(intent.operation_id)
 
         try:
             candidates = database.get_retryable_failed_offer_cancels()

@@ -51,6 +51,9 @@ def _binding():
 
 
 def _identity(second: int):
+    observed_at = datetime(2026, 8, 16, 12, tzinfo=timezone.utc) + timedelta(
+        seconds=second
+    )
     return {
         "success": True,
         "backend": "sage",
@@ -59,16 +62,26 @@ def _identity(second: int):
         "network_id": "mainnet",
         "kind": "bls",
         "has_secrets": True,
-        "observed_at_utc": f"2026-08-16T12:00:{second:02d}Z",
+        "observed_at_utc": observed_at.isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        ),
     }
 
 
-def _stub_cancel_continuation_authority(monkeypatch, *, effect, identity_count=3):
+def _stub_cancel_continuation_authority(
+    monkeypatch,
+    *,
+    effect,
+    batch_effect=None,
+    identity_count=3,
+):
     identities = [_identity(index + 1) for index in range(identity_count)]
     adapter = SimpleNamespace(
         get_wallet_identity=lambda: identities.pop(0),
         cancel_offer=effect,
     )
+    if batch_effect is not None:
+        adapter.cancel_offers_batch = batch_effect
     permit = object()
     exits = []
     checks = []
@@ -268,6 +281,7 @@ def _seed_task7_created_offer(
     coin_id: str,
     intent_seed: str,
     expires_at: str | None = None,
+    wallet_fingerprint_hash: str = "f" * 64,
 ) -> str:
     """Persist one Task 7 creation journal and its confirmed trade binding."""
 
@@ -286,7 +300,7 @@ def _seed_task7_created_offer(
         operation_id=operation_id,
         event_id=f"{operation_id}:prepared",
         run_id=f"run-task7-{intent_seed}",
-        wallet_fingerprint_hash="f" * 64,
+        wallet_fingerprint_hash=wallet_fingerprint_hash,
         network="mainnet",
         asset_id=ASSET_ID,
         side="buy",
@@ -399,6 +413,48 @@ def test_cancel_request_is_durable_before_any_wallet_effect(isolated_database):
     assert events[0]["blocks_mutation"] == 1
     assert events[0]["request_timestamp"] == "2026-08-16T12:00:00.000000Z"
     assert prepared == events[0]
+
+
+def test_exact_immutable_journal_row_reuses_canonical_validation(
+    isolated_database,
+    monkeypatch,
+):
+    """Repeated cohort reads must not re-canonicalize byte-identical rows."""
+
+    prepared = _prepare_cancel()
+    cached = getattr(database, "_validate_offer_operation_event_cached", None)
+    if cached is not None:
+        cached.cache_clear()
+
+    original = database._journal_values
+    calls = []
+
+    def counted_journal_values(**kwargs):
+        calls.append(kwargs["event_id"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(database, "_journal_values", counted_journal_values)
+
+    first = database.validate_offer_operation_event(dict(prepared))
+    second = database.validate_offer_operation_event(dict(prepared))
+
+    assert first == second == prepared
+    assert first is not second
+    assert calls == [prepared["event_id"]]
+
+
+def test_cached_journal_validation_rejects_changed_evidence(isolated_database):
+    """An exact-row cache hit must not authorize a changed journal field."""
+
+    prepared = _prepare_cancel()
+    database._validate_offer_operation_event_cached.cache_clear()
+    assert database.validate_offer_operation_event(dict(prepared)) == prepared
+
+    tampered = dict(prepared)
+    tampered["evidence_json"] = '{"trade_id":"tampered"}'
+
+    with pytest.raises(ValueError):
+        database.validate_offer_operation_event(tampered)
 
 
 @pytest.mark.parametrize(
@@ -878,6 +934,90 @@ def test_wallet_cancel_facade_refuses_unjournaled_single_and_batch(monkeypatch):
         CANCEL_UNKNOWN,
     ]
     assert effects == []
+
+
+def test_wallet_batch_cancel_consumes_one_exact_journalled_continuation(monkeypatch):
+    effects = []
+
+    def batch_effect(
+        trade_ids,
+        secure,
+        max_workers,
+        fee_mojos,
+        skip_confirmation,
+        *,
+        source_coin_ids,
+        fee_coin_id,
+        _identity_recheck=None,
+    ):
+        _identity_recheck("cancel_offers")
+        effects.append(
+            (
+                trade_ids,
+                secure,
+                max_workers,
+                fee_mojos,
+                skip_confirmation,
+                source_coin_ids,
+                fee_coin_id,
+            )
+        )
+        return {
+            trade_id: cancellation_result(
+                CANCEL_SUBMITTED_UNCONFIRMED,
+                method="sage_native_cancel_offers",
+                transaction_id="1" * 64,
+            )
+            for trade_id in trade_ids
+        }
+
+    permit, identities, exits, checks = _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=3,
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+        ttl_seconds=30,
+    )
+    trade_ids = [TRADE_ID, "b" * 64]
+    source_coin_ids = ["c" * 64, "d" * 64]
+    result = wallet.cancel_offers_batch(
+        trade_ids,
+        secure=True,
+        max_workers=1,
+        fee_mojos=13_079_100,
+        skip_confirmation=False,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id="e" * 64,
+        _cancel_continuation=continuation,
+        _cancel_operation_id=OPERATION_ID,
+        _cancel_intent_id=INTENT_ID,
+        _cancel_trade_id=TRADE_ID,
+    )
+
+    assert result[TRADE_ID]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert result["_catalyst_effect_attempted"] is True
+    assert effects == [
+        (
+            trade_ids,
+            True,
+            1,
+            13_079_100,
+            False,
+            source_coin_ids,
+            "e" * 64,
+        )
+    ]
+    assert exits == [permit]
+    assert identities == []
+    assert [entry[2:] for entry in checks] == [
+        (OPERATION_ID, INTENT_ID),
+        (OPERATION_ID, INTENT_ID),
+    ]
 
 
 def test_cancel_continuation_wrong_trade_is_consumed_without_effect(monkeypatch):
@@ -1435,6 +1575,665 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
         CANCEL_FAILED,
         CANCEL_FAILED,
         CANCEL_FAILED,
+    ]
+
+
+def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
+    isolated_database,
+    monkeypatch,
+):
+    trade_ids = ["a" * 64, "b" * 64]
+    source_coin_ids = ["c" * 64, "d" * 64]
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"sage-bulk-cancel-{index}",
+        )
+    fee_coin_id = "e" * 64
+    batch_effects = []
+
+    def batch_effect(
+        selected_trade_ids,
+        secure,
+        max_workers,
+        fee_mojos,
+        skip_confirmation,
+        *,
+        source_coin_ids,
+        fee_coin_id,
+        _identity_recheck=None,
+    ):
+        _identity_recheck("cancel_offers")
+        batch_effects.append(
+            {
+                "trade_ids": selected_trade_ids,
+                "secure": secure,
+                "max_workers": max_workers,
+                "fee_mojos": fee_mojos,
+                "skip_confirmation": skip_confirmation,
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+            }
+        )
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": "1" * 64},
+            transaction_id="1" * 64,
+            spend_identity="2" * 64,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=8,
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 13_079_100,
+        raising=False,
+    )
+    reserved = []
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda: reserved.append(fee_coin_id) or fee_coin_id
+    )
+
+    results = manager.cancel_offers(trade_ids, force_storm=True)
+
+    assert reserved == [fee_coin_id]
+    assert batch_effects == [
+        {
+            "trade_ids": trade_ids,
+            "secure": True,
+            "max_workers": 1,
+            "fee_mojos": 13_079_100,
+            "skip_confirmation": False,
+            "source_coin_ids": source_coin_ids,
+            "fee_coin_id": fee_coin_id,
+        }
+    ]
+    assert [results[trade_id]["outcome"] for trade_id in trade_ids] == [
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_SUBMITTED_UNCONFIRMED,
+    ]
+    prepared_effects = []
+    for trade_id in trade_ids:
+        events = database.get_offer_operation_events(f"cancel:{trade_id}")
+        assert [event["phase"] for event in events] == ["PREPARED", "FINALIZED"]
+        prepared_effects.append(json.loads(events[0]["evidence_json"])["wallet_effect"])
+        assert (
+            database.get_offer_cancel_effect_claim(
+                operation_id=f"cancel:{trade_id}", attempt=1
+            )
+            is not None
+        )
+    assert prepared_effects == [
+        {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": 13_079_100,
+            "batch": {
+                "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+                "trade_ids": trade_ids,
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+            },
+        },
+        {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": 13_079_100,
+            "batch": {
+                "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+                "trade_ids": trade_ids,
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+            },
+        },
+    ]
+    assert json.loads(
+        database.get_runtime_safety_latch()["blocking_operation_ids_json"]
+    ) == [f"cancel:{trade_id}" for trade_id in trade_ids]
+
+
+def _confirmed_sage_bulk_cancel_evidence(
+    *,
+    trade_ids: list[str],
+    source_coin_ids: list[str],
+    fee_coin_id: str,
+    transaction_id: str,
+    spend_identity: str,
+) -> dict:
+    request_times = [
+        datetime.fromisoformat(
+            database.get_offer_operation_events(f"cancel:{trade_id}")[0][
+                "request_timestamp"
+            ].replace("Z", "+00:00")
+        )
+        for trade_id in trade_ids
+    ]
+    observed_at = (
+        (max(request_times) + timedelta(seconds=2))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    return_coin_ids = [f"{0x3000 + index:064x}" for index in range(len(trade_ids))]
+    fee_return_coin_id = f"{0x4000:064x}"
+    offers = []
+    spent = []
+    created = []
+    coins = {}
+    for trade_id, source_coin_id, return_coin_id in zip(
+        trade_ids, source_coin_ids, return_coin_ids
+    ):
+        intent = database.get_offer_intent_by_trade_id(trade_id)
+        offers.append(
+            {
+                "trade_id": trade_id,
+                "status": 3,
+                "summary": {
+                    "offered": {"xch": 1_000},
+                    "requested": {ASSET_ID: 2_000},
+                },
+                "selected_coin_ids": [source_coin_id],
+                "transaction_id": transaction_id,
+            }
+        )
+        spent.append(
+            {
+                "coin_id": source_coin_id,
+                "asset_id": "xch",
+                "amount": 1_000,
+                "address_kind": "offer",
+            }
+        )
+        created.append(
+            {
+                "coin_id": return_coin_id,
+                "asset_id": "xch",
+                "amount": 1_000,
+                "address_kind": "own",
+                "parent_coin_id": source_coin_id,
+            }
+        )
+        coins[source_coin_id] = {
+            "coin_id": source_coin_id,
+            "asset_id": "xch",
+            "amount": 1_000,
+            "created_height": 1,
+            "spent_height": 42,
+            "transaction_id": transaction_id,
+            "offer_id": trade_id,
+            "owned": True,
+        }
+        coins[return_coin_id] = {
+            "coin_id": return_coin_id,
+            "asset_id": "xch",
+            "amount": 1_000,
+            "created_height": 42,
+            "spent_height": None,
+            "transaction_id": transaction_id,
+            "offer_id": None,
+            "owned": True,
+        }
+        assert intent["selected_coin_ids_json"] == json.dumps(
+            [source_coin_id], separators=(",", ":")
+        )
+
+    fee_input = 20_000_000
+    fee_mojos = 13_079_100
+    spent.append(
+        {
+            "coin_id": fee_coin_id,
+            "asset_id": "xch",
+            "amount": fee_input,
+            "address_kind": "own",
+        }
+    )
+    created.append(
+        {
+            "coin_id": fee_return_coin_id,
+            "asset_id": "xch",
+            "amount": fee_input - fee_mojos,
+            "address_kind": "own",
+        }
+    )
+    coins[fee_coin_id] = {
+        "coin_id": fee_coin_id,
+        "asset_id": "xch",
+        "amount": fee_input,
+        "created_height": 1,
+        "spent_height": 42,
+        "transaction_id": transaction_id,
+        "offer_id": None,
+        "owned": True,
+    }
+    coins[fee_return_coin_id] = {
+        "coin_id": fee_return_coin_id,
+        "asset_id": "xch",
+        "amount": fee_input - fee_mojos,
+        "created_height": 42,
+        "spent_height": None,
+        "transaction_id": transaction_id,
+        "offer_id": None,
+        "owned": True,
+    }
+
+    def source(records, provenance):
+        return {
+            "observed_at": observed_at,
+            "source_observed_at": None,
+            "read_observed_at": [observed_at],
+            "provenance": provenance,
+            "complete": True,
+            "records": records,
+            "pagination": {
+                "pages_read": 1,
+                "page_size": 50,
+                "remote_bounds_honored": True,
+                "locally_normalized": True,
+            },
+        }
+
+    return {
+        "schema_version": 1,
+        "collection_started_at": observed_at,
+        "observed_at": observed_at,
+        "wallet_fingerprint_hash": database.get_offer_intent_by_trade_id(trade_ids[0])[
+            "wallet_fingerprint_hash"
+        ],
+        "network": "mainnet",
+        "wallet_identity": {
+            "observed_at": observed_at,
+            "source_observed_at": observed_at,
+            "source_observed_at_all": [observed_at],
+            "read_observed_at": [observed_at],
+            "provenance": "wallet.get_wallet_identity",
+            "complete": True,
+        },
+        "offer_history": source(offers, "wallet.get_all_offers"),
+        "transaction_history": source(
+            [
+                {
+                    "transaction_id": transaction_id,
+                    "spend_identity": spend_identity,
+                    "confirmed": True,
+                    "confirmed_height": 42,
+                    "timestamp": observed_at,
+                    "spent": spent,
+                    "created": created,
+                }
+            ],
+            "wallet.get_transactions_list",
+        ),
+        "coin_records": source(coins, "wallet.get_coins_by_ids"),
+        "local_expired": False,
+    }
+
+
+@pytest.mark.parametrize("member_count", [2, 71])
+def test_sage_bulk_cancel_accepts_exact_height_evidence_when_sage_omits_txid(
+    isolated_database,
+    monkeypatch,
+    member_count,
+):
+    """Sage height records omit txid but still bind the exact confirmed spend."""
+
+    trade_ids = [f"{0x100 + index:064x}" for index in range(member_count)]
+    source_coin_ids = [f"{0x1000 + index:064x}" for index in range(member_count)]
+    fee_coin_id = f"{0x2000:064x}"
+    submitted_transaction_id = "1" * 64
+    confirmed_spend_identity = "sha256:" + "2" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"sage-idless-bulk-settlement-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    def batch_effect(selected_trade_ids, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offers")
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="bulk_rpc",
+            raw_response={
+                "success": True,
+                "transaction_id": submitted_transaction_id,
+            },
+            transaction_id=submitted_transaction_id,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=member_count * 4,
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 13_079_100,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    submitted = manager.cancel_offers(trade_ids, force_storm=True)
+    assert all(
+        result["transaction_id"] == submitted_transaction_id
+        for result in submitted.values()
+    )
+
+    evidence = _confirmed_sage_bulk_cancel_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id=fee_coin_id,
+        transaction_id="",
+        spend_identity=confirmed_spend_identity,
+    )
+    blockers = database.get_unresolved_offer_operation_blockers()
+    manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)
+    assert manifest is not None
+
+    import offer_reconciliation
+
+    context = offer_reconciliation._derive_sage_bulk_cancel_context(
+        manifest,
+        [row["operation_id"] for row in blockers],
+        evidence,
+        database_module=database,
+        observed_at=evidence["observed_at"],
+    )
+
+    assert context is not None
+    assert {member["transaction_id"] for member in context["members"]} == {
+        submitted_transaction_id
+    }
+    assert {member["spend_identity"] for member in context["members"]} == {
+        confirmed_spend_identity
+    }
+    reconciled = offer_reconciliation.reconcile_offer(
+        manifest["members"][0]["intent_id"],
+        evidence=evidence,
+        cancel_context=context,
+        now=evidence["observed_at"],
+    )
+    assert reconciled["classification"] == offer_reconciliation.CANCELLED_PROVEN
+    assert reconciled["applied"] is True
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: evidence,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_clock_utc",
+        lambda: evidence["observed_at"],
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+    assert OfferManager().retry_failed_cancels() == 0
+    assert database.get_unresolved_offer_operation_blockers() == []
+
+
+def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
+    isolated_database,
+    monkeypatch,
+):
+    """One shared Sage transaction must clear every manifest-bound blocker."""
+
+    trade_ids = ["a" * 64, "b" * 64]
+    source_coin_ids = ["c" * 64, "d" * 64]
+    fee_coin_id = "e" * 64
+    transaction_id = "1" * 64
+    spend_identity = "sha256:" + "2" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"sage-bulk-settlement-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    def batch_effect(selected_trade_ids, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offers")
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": transaction_id},
+            transaction_id=transaction_id,
+            spend_identity=spend_identity,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=8,
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 13_079_100,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    submitted = manager.cancel_offers(trade_ids, force_storm=True)
+    assert all(
+        result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        for result in submitted.values()
+    )
+
+    import offer_reconciliation
+
+    evidence = _confirmed_sage_bulk_cancel_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id=fee_coin_id,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: evidence,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_clock_utc",
+        lambda: evidence["observed_at"],
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+
+    blockers = database.get_unresolved_offer_operation_blockers()
+    manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)
+    assert manifest is not None
+    derived_context = offer_reconciliation._derive_sage_bulk_cancel_context(
+        manifest,
+        [row["operation_id"] for row in blockers],
+        evidence,
+        database_module=database,
+        observed_at=evidence["observed_at"],
+    )
+    assert derived_context is not None
+    missing_fee_evidence = json.loads(json.dumps(evidence))
+    missing_fee_evidence["transaction_history"]["records"][0]["spent"] = [
+        row
+        for row in missing_fee_evidence["transaction_history"]["records"][0]["spent"]
+        if row["coin_id"] != fee_coin_id
+    ]
+    assert (
+        offer_reconciliation._derive_sage_bulk_cancel_context(
+            manifest,
+            [row["operation_id"] for row in blockers],
+            missing_fee_evidence,
+            database_module=database,
+            observed_at=evidence["observed_at"],
+        )
+        is None
+    )
+    assert OfferManager().retry_failed_cancels() == 0
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert database.get_unresolved_offer_operation_blockers() == []
+    for trade_id, coin_id in zip(trade_ids, source_coin_ids):
+        assert database.get_offer(trade_id)["status"] == "cancelled"
+        assert database.get_coin_state(coin_id)["status"] == "spent"
+        assert database.get_authoritative_terminal_record(trade_id)["outcome"] == (
+            "CANCELLED_PROVEN"
+        )
+
+
+def test_retry_failed_cancels_recovers_after_partial_bulk_settlement_crash(
+    isolated_database,
+    monkeypatch,
+):
+    """A restart must finish the same batch without another wallet effect."""
+
+    trade_ids = ["a" * 64, "b" * 64]
+    source_coin_ids = ["c" * 64, "d" * 64]
+    fee_coin_id = "e" * 64
+    transaction_id = "1" * 64
+    spend_identity = "sha256:" + "2" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"sage-bulk-crash-recovery-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    batch_effects = []
+
+    def batch_effect(selected_trade_ids, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offers")
+        batch_effects.append(list(selected_trade_ids))
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": transaction_id},
+            transaction_id=transaction_id,
+            spend_identity=spend_identity,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=8,
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 13_079_100,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    submitted = manager.cancel_offers(trade_ids, force_storm=True)
+    assert all(
+        result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        for result in submitted.values()
+    )
+
+    import offer_reconciliation
+
+    evidence = _confirmed_sage_bulk_cancel_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id=fee_coin_id,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: evidence,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_clock_utc",
+        lambda: evidence["observed_at"],
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+
+    real_reconcile = offer_reconciliation.reconcile_offer
+    reconciliation_calls = []
+
+    def crash_before_second_commit(intent_id, **kwargs):
+        reconciliation_calls.append(intent_id)
+        if len(reconciliation_calls) == 2:
+            raise RuntimeError("simulated process loss between cohort members")
+        return real_reconcile(intent_id, **kwargs)
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        crash_before_second_commit,
+    )
+    assert OfferManager().retry_failed_cancels() == -1
+    remaining = database.get_unresolved_offer_operation_blockers()
+    assert [row["operation_id"] for row in remaining] == [f"cancel:{trade_ids[1]}"]
+    assert database.get_offer(trade_ids[0])["status"] == "cancelled"
+    assert database.get_offer(trade_ids[1])["status"] == "open"
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        real_reconcile,
+    )
+    assert OfferManager().retry_failed_cancels() == 0
+    assert batch_effects == [trade_ids]
+    assert database.get_unresolved_offer_operation_blockers() == []
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert [database.get_offer(trade_id)["status"] for trade_id in trade_ids] == [
+        "cancelled",
+        "cancelled",
     ]
 
 
@@ -2058,6 +2857,279 @@ def test_prepare_cancel_cohort_transaction_rolls_back_and_exactly_replays(
     assert replay["manifest"] == manifest
     assert [event["event_id"] for event in replay["events"]] == [
         member["prepared_event_id"] for member in manifest["members"]
+    ]
+
+
+def test_claim_cancel_cohort_effects_is_atomic_and_exactly_replayable(
+    isolated_database,
+):
+    trade_ids = ["a" * 64, "b" * 64]
+    manifest = database.canonical_offer_cancel_cohort_manifest(
+        [
+            {
+                "trade_id": trade_id,
+                "operation_id": f"cancel:{trade_id}",
+                "intent_id": f"cancel-target:{trade_id}",
+                "attempt": 1,
+                "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+            }
+            for trade_id in trade_ids
+        ]
+    )
+    requests = []
+    for member in manifest["members"]:
+        requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": member["attempt"],
+                "wallet_identity_json": {"snapshot_sha256": "c" * 64},
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "intent_id": member["intent_id"],
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "cohort_id": manifest["cohort_id"],
+                    "cohort_size": manifest["member_count"],
+                    "member_id": member["member_id"],
+                    "reason": "bulk_cancel_test",
+                    "continuation_journal_sha256": "d" * 64,
+                    "wallet_effect": {"secure": True, "fee_mojos": None},
+                    "effect_claim_protocol": "durable_cohort_claim_v1",
+                },
+            }
+        )
+    database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=requests,
+        prepared_at=AT,
+    )
+
+    first = database.claim_offer_cancel_cohort_effects(
+        manifest_json=manifest,
+        claimed_at="2026-08-16T12:00:01Z",
+    )
+    replay = database.claim_offer_cancel_cohort_effects(
+        manifest_json=json.loads(json.dumps(manifest)),
+        claimed_at="2026-08-16T12:00:09Z",
+    )
+
+    assert first == {
+        "cohort_id": manifest["cohort_id"],
+        "effect_claimed": True,
+        "member_count": 2,
+    }
+    assert replay == {
+        "cohort_id": manifest["cohort_id"],
+        "effect_claimed": False,
+        "member_count": 2,
+    }
+    claims = [
+        database.get_offer_cancel_effect_claim(
+            operation_id=member["operation_id"],
+            attempt=member["attempt"],
+        )
+        for member in manifest["members"]
+    ]
+    assert [claim["claimed_at"] for claim in claims] == [
+        "2026-08-16T12:00:01.000000Z",
+        "2026-08-16T12:00:01.000000Z",
+    ]
+
+
+def test_claim_cancel_cohort_effects_rolls_back_every_member_on_insert_failure(
+    isolated_database,
+):
+    trade_ids = ["1" * 64, "2" * 64]
+    manifest = database.canonical_offer_cancel_cohort_manifest(
+        [
+            {
+                "trade_id": trade_id,
+                "operation_id": f"cancel:{trade_id}",
+                "intent_id": f"cancel-target:{trade_id}",
+                "attempt": 1,
+                "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+            }
+            for trade_id in trade_ids
+        ]
+    )
+    requests = []
+    for member in manifest["members"]:
+        requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": member["attempt"],
+                "wallet_identity_json": {"snapshot_sha256": "e" * 64},
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "intent_id": member["intent_id"],
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "cohort_id": manifest["cohort_id"],
+                    "cohort_size": manifest["member_count"],
+                    "member_id": member["member_id"],
+                    "reason": "bulk_cancel_atomicity_test",
+                    "continuation_journal_sha256": "f" * 64,
+                    "wallet_effect": {"secure": True, "fee_mojos": None},
+                    "effect_claim_protocol": "durable_cohort_claim_v1",
+                },
+            }
+        )
+    database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=requests,
+        prepared_at=AT,
+    )
+    failing_operation_id = manifest["members"][1]["operation_id"]
+    conn = database.get_connection()
+    conn.execute(
+        f"""
+        CREATE TRIGGER fail_second_bulk_cancel_claim
+        BEFORE INSERT ON offer_cancel_effect_claims
+        WHEN NEW.operation_id = '{failing_operation_id}'
+        BEGIN
+            SELECT RAISE(ABORT, 'synthetic second-member insert failure');
+        END
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(Exception, match="synthetic second-member insert failure"):
+        database.claim_offer_cancel_cohort_effects(
+            manifest_json=manifest,
+            claimed_at="2026-08-16T12:00:01Z",
+        )
+
+    assert [
+        database.get_offer_cancel_effect_claim(
+            operation_id=member["operation_id"],
+            attempt=member["attempt"],
+        )
+        for member in manifest["members"]
+    ] == [None, None]
+
+
+def test_finalize_cancel_cohort_is_atomic_after_one_shared_wallet_effect(
+    isolated_database,
+):
+    trade_ids = ["3" * 64, "4" * 64]
+    manifest = database.canonical_offer_cancel_cohort_manifest(
+        [
+            {
+                "trade_id": trade_id,
+                "operation_id": f"cancel:{trade_id}",
+                "intent_id": f"cancel-target:{trade_id}",
+                "attempt": 1,
+                "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+            }
+            for trade_id in trade_ids
+        ]
+    )
+    wallet_identity = {"snapshot_sha256": "5" * 64}
+    prepare_requests = []
+    for member in manifest["members"]:
+        prepare_requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": member["attempt"],
+                "wallet_identity_json": wallet_identity,
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "intent_id": member["intent_id"],
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "cohort_id": manifest["cohort_id"],
+                    "cohort_size": manifest["member_count"],
+                    "member_id": member["member_id"],
+                    "reason": "bulk_cancel_finalize_test",
+                    "continuation_journal_sha256": "5" * 64,
+                    "wallet_effect": {"secure": True, "fee_mojos": 13_079_100},
+                    "effect_claim_protocol": "durable_cohort_claim_v1",
+                },
+            }
+        )
+    database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=prepare_requests,
+        prepared_at=AT,
+    )
+    database.claim_offer_cancel_cohort_effects(
+        manifest_json=manifest,
+        claimed_at="2026-08-16T12:00:01Z",
+    )
+    shared_result = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="sage_native_cancel_offers",
+        raw_response={"success": True, "transaction_id": "6" * 64},
+        transaction_id="6" * 64,
+        spend_identity="7" * 64,
+    )
+    finalize_requests = [
+        {
+            "operation_id": member["operation_id"],
+            "event_id": f"{member['operation_id']}:attempt:1:finalized",
+            "trade_id": member["trade_id"],
+            "intent_id": member["intent_id"],
+            "attempt": member["attempt"],
+            "cancel_result": shared_result,
+            "wallet_identity_json": wallet_identity,
+            "evidence_json": {
+                "trade_id": member["trade_id"],
+                "cohort_id": manifest["cohort_id"],
+                "effect_attempted": True,
+                "cancel_result": shared_result,
+            },
+        }
+        for member in manifest["members"]
+    ]
+    failing_event_id = finalize_requests[1]["event_id"]
+    conn = database.get_connection()
+    conn.execute(
+        f"""
+        CREATE TRIGGER fail_second_bulk_cancel_finalize
+        BEFORE INSERT ON offer_operation_journal
+        WHEN NEW.event_id = '{failing_event_id}'
+        BEGIN
+            SELECT RAISE(ABORT, 'synthetic second-member finalize failure');
+        END
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(Exception, match="synthetic second-member finalize failure"):
+        database.finalize_offer_cancel_cohort(
+            manifest_json=manifest,
+            member_requests_json=finalize_requests,
+            finalized_at="2026-08-16T12:00:02Z",
+        )
+    assert [
+        [
+            event["phase"]
+            for event in database.get_offer_operation_events(member["operation_id"])
+        ]
+        for member in manifest["members"]
+    ] == [["PREPARED"], ["PREPARED"]]
+
+    conn.execute("DROP TRIGGER fail_second_bulk_cancel_finalize")
+    conn.commit()
+    finalized = database.finalize_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=finalize_requests,
+        finalized_at="2026-08-16T12:00:02Z",
+    )
+
+    assert finalized["manifest"] == manifest
+    assert [event["outcome"] for event in finalized["events"]] == [
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        CANCEL_SUBMITTED_UNCONFIRMED,
     ]
 
 
@@ -3672,6 +4744,7 @@ def test_retry_failed_cancel_reconciles_elapsed_offer_before_wallet_effect(
 
     import offer_reconciliation
 
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
     reconcile_calls = []
 
     def reconcile(candidate_intent_id):
@@ -3752,9 +4825,18 @@ def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
-def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
+@pytest.mark.parametrize(
+    "terminal_classification",
+    [
+        "CANCELLED_PROVEN",
+        "FILLED_PROVEN",
+        "EXPIRED_PROVEN",
+    ],
+)
+def test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation(
     isolated_database,
     monkeypatch,
+    terminal_classification,
 ):
     intent_id = _seed_task7_created_offer(
         trade_id=TRADE_ID,
@@ -3792,6 +4874,7 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
 
     import offer_reconciliation
 
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
     reconcile_calls = []
     release_calls = []
     monkeypatch.setattr(
@@ -3808,15 +4891,15 @@ def test_retry_failed_cancel_settles_submitted_result_before_next_mutation(
         offer_reconciliation,
         "classify_terminal_evidence",
         lambda *_args, **_kwargs: {
-            "classification": offer_reconciliation.CANCELLED_PROVEN,
-            "reason_code": "EXACT_CANCEL_RETURN_PROOF",
+            "classification": getattr(offer_reconciliation, terminal_classification),
+            "reason_code": "EXACT_TERMINAL_PROOF",
         },
     )
 
     def reconcile(intent_id, **kwargs):
         reconcile_calls.append((intent_id, kwargs))
         return {
-            "classification": offer_reconciliation.CANCELLED_PROVEN,
+            "classification": getattr(offer_reconciliation, terminal_classification),
             "applied": True,
         }
 

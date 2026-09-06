@@ -163,6 +163,66 @@ class TestSageDaemonStart(_FlaskBase):
 
 
 # ---------------------------------------------------------------------------
+# 2c. GET /api/fingerprint
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestFingerprintEndpoint(_FlaskBase):
+    def test_unauthorised_idle_process_remains_not_started(self):
+        with (
+            patch.object(api_server, "bot", None),
+            patch("chia_node.is_startup_authorised", return_value=False),
+            patch("wallet.get_current_key") as current_key,
+        ):
+            resp = self.client.get("/api/fingerprint", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"fingerprint": "", "source": "not_started"})
+        current_key.assert_not_called()
+
+    def test_running_bot_uses_frozen_runtime_identity_without_wallet_rpc(self):
+        import mutation_gate
+
+        binding = mutation_gate.WalletIdentityBinding(
+            backend="sage",
+            name="TEST 7",
+            fingerprint=736588221,
+            network_id="mainnet",
+            kind="bls",
+            has_secrets=True,
+            bound_at_utc="2026-09-05T12:00:00Z",
+            maximum_age_seconds=10,
+        )
+        runtime = MagicMock()
+        runtime.require_wallet_identity_authority.return_value = binding
+        running_bot = MagicMock()
+        running_bot.is_running.return_value = True
+
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch("chia_node.is_startup_authorised", return_value=False),
+            patch.object(mutation_gate, "current_runtime", return_value=runtime),
+            patch("wallet.get_current_key") as current_key,
+        ):
+            resp = self.client.get("/api/fingerprint", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "success": True,
+                "fingerprint": "736588221",
+                "source": "runtime_identity",
+            },
+        )
+        runtime.require_wallet_identity_authority.assert_called_once_with(
+            "fingerprint:read"
+        )
+        current_key.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 3. GET /api/sage/startup-status
 # ---------------------------------------------------------------------------
 

@@ -258,6 +258,26 @@ class TestSlotSuspension(_OM):
 
         self.assertTrue(self._manager.is_slot_suspended("sell", 0))
 
+    def test_unsuspend_ignores_legacy_coin_without_authoritative_purpose(self):
+        """A stale tier label must not advertise spendable slot capacity."""
+
+        for _ in range(self._manager._slot_suspend_threshold):
+            self._manager.record_slot_coin_failure("sell", 0)
+
+        with patch(
+            "database.get_free_coins",
+            return_value=[
+                {
+                    "designation": "tier_spare",
+                    "assigned_tier": "inner",
+                    "purpose": None,
+                },
+            ],
+        ):
+            self._manager.unsuspend_slots_if_coins_available("sell")
+
+        self.assertTrue(self._manager.is_slot_suspended("sell", 0))
+
 
 class TestPositionHardGuard(_OM):
     def test_blocked_side_records_pause_and_logs_warning(self):
@@ -302,7 +322,11 @@ class TestPositionHardGuard(_OM):
         with patch(
             "database.get_free_coins",
             return_value=[
-                {"designation": "tier_spare", "assigned_tier": "inner"},
+                {
+                    "designation": "tier_spare",
+                    "assigned_tier": "inner",
+                    "purpose": "replacement",
+                },
             ],
         ):
             self._manager.unsuspend_slots_if_coins_available("sell")

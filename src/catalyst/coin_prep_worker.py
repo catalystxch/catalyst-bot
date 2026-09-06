@@ -41,6 +41,7 @@ import mutation_gate
 from super_log import slog
 
 from wallet import (
+    build_transaction_rpc,
     get_all_offers,
     get_pending_transactions,
     get_wallet_sync_status,
@@ -48,6 +49,8 @@ from wallet import (
     get_transaction,
     get_wallet_adapter_authority,
     get_wallet_identity,
+    submit_built_transaction_rpc,
+    validate_unsigned_transaction_effect,
 )
 from coin_prep_utils import (
     remaining_pending_split_poll_seconds,
@@ -311,6 +314,14 @@ def record_coin_prep_operation_outcome(*args, **kwargs):
     """Load the Task 12 outcome API without widening DB bootstrap coupling."""
 
     from database import record_coin_prep_operation_outcome as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def bind_coin_prep_constructed_outputs(*args, **kwargs):
+    """Bind validated Sage output identities without broad DB imports."""
+
+    from database import bind_coin_prep_constructed_outputs as repository_call
 
     return repository_call(*args, **kwargs)
 
@@ -607,6 +618,15 @@ class CoinPrepStatus:
     error: Optional[str] = None
     timestamp: float = 0.0
     run_id: Optional[str] = None
+    execution_mode: Optional[str] = None
+    reused: int = 0
+    missing: int = 0
+    batch_current: int = 0
+    batch_confirmed: int = 0
+    planned_fee_mojos: int = 0
+    paid_fee_mojos: int = 0
+    confirmation_elapsed_seconds: int = 0
+    compatibility_reason: Optional[str] = None
 
     def to_dict(self):
         data = asdict(self)
@@ -2085,6 +2105,458 @@ class CoinPrepWorker:
         )
         self._save_successful_prep_settings(xch_final, cat_final)
         return True
+
+    def _direct_batch_targets(self):
+        """Return the exact final-output plan for the current tier settings."""
+
+        from coin_prep_batch_plan import TargetOutput
+
+        targets = []
+        for asset in ("xch", "cat"):
+            counts = self.xch_tier_counts if asset == "xch" else self.cat_tier_counts
+            sizes = self.tier_xch_sizes if asset == "xch" else self.tier_cat_sizes
+            ordinal = 0
+            for tier_rank, tier_name in enumerate(self.tier_order):
+                count = int(counts.get(tier_name, 0) or 0)
+                if asset == "xch":
+                    amount = int(
+                        Decimal(str(sizes.get(tier_name, 0))) * Decimal("1000000000000")
+                    )
+                else:
+                    amount = cat_display_amount_to_mojos_ceil(
+                        Decimal(str(sizes.get(tier_name, 0))), self.cat_decimals
+                    )
+                if count < 0 or (count and amount <= 0):
+                    raise ValueError("direct batch tier target is invalid")
+                for _index in range(count):
+                    targets.append(
+                        TargetOutput(
+                            asset=asset,
+                            purpose=self._purpose_for_tier(tier_name),
+                            tier_rank=tier_rank,
+                            amount_mojos=amount,
+                            ordinal=ordinal,
+                        )
+                    )
+                    ordinal += 1
+        return tuple(targets)
+
+    def _direct_batch_snapshot(self, targets):
+        """Read strict selectable coins and assign only exact reusable targets."""
+
+        from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
+
+        protected = set()
+        if self._db_ready:
+            for wallet_type in ("xch", "cat"):
+                for coin in get_reserve_coins(wallet_type) or []:
+                    try:
+                        protected.add(self._canonical_coin_id(coin.get("coin_id")))
+                    except (TypeError, ValueError):
+                        continue
+        snapshot = []
+        for asset, wallet_id in (
+            ("xch", self.xch_wallet_id),
+            ("cat", self.cat_wallet_id),
+        ):
+            observed = self._get_coins_via_rpc(
+                wallet_id, f"direct-batch-{asset}-selectable", selectable_only=True
+            )
+            if type(observed) is not list:
+                return None
+            cohorts = {}
+            for target in sorted(
+                (target for target in targets if target.asset == asset),
+                key=lambda target: (
+                    target.amount_mojos,
+                    target.purpose,
+                    target.tier_rank,
+                    target.ordinal,
+                ),
+            ):
+                cohorts.setdefault(target.amount_mojos, []).append(target)
+            for raw in sorted(
+                observed,
+                key=lambda coin: self._canonical_coin_id(
+                    coin.get("coin_id") or coin.get("id")
+                ),
+            ):
+                coin_id = self._canonical_coin_id(raw.get("coin_id") or raw.get("id"))
+                amount = raw.get("amount_mojos", raw.get("amount"))
+                if type(amount) is not int or amount <= 0:
+                    return None
+                is_protected = coin_id in protected
+                cohort = cohorts.get(amount, [])
+                reusable = cohort.pop(0) if cohort and not is_protected else None
+                snapshot.append(
+                    SelectableCoin(
+                        asset=asset,
+                        coin_id=coin_id,
+                        amount_mojos=amount,
+                        purpose=(
+                            "reserve"
+                            if is_protected
+                            else (reusable.purpose if reusable else "")
+                        ),
+                        selectable=True,
+                        protected=is_protected,
+                    )
+                )
+        return CoinSnapshot(tuple(snapshot))
+
+    def _direct_batch_target_contract(self, plan, address: str) -> dict:
+        """Build a version-2 durable target from one deterministic plan."""
+
+        outputs = []
+        for index, output in enumerate(plan.outputs):
+            purpose = {
+                "change": "top_up",
+                "fee_change": "fee_reserve",
+            }.get(output.purpose, output.purpose)
+            outputs.append(
+                {
+                    "output_index": index,
+                    "asset": output.asset,
+                    "address": address,
+                    "amount_mojos": output.amount_mojos,
+                    "purpose": purpose,
+                    "ordinal": output.ordinal,
+                }
+            )
+        target = {
+            "contract_version": 2,
+            "wallet_type": plan.asset,
+            "cat_asset_id": (
+                str(os.getenv("CAT_ASSET_ID", "")).strip()
+                if plan.asset == "cat"
+                else None
+            ),
+            "fee_mojos": plan.fee_mojos,
+            "outputs": outputs,
+        }
+        if plan.fee_source_id:
+            target["external_fee"] = {
+                "fee_mojos": plan.fee_mojos,
+                "coin_ids": [plan.fee_source_id],
+            }
+        return target
+
+    def _direct_batch_actions(self, target: dict) -> list[dict]:
+        actions = []
+        for output in target["outputs"]:
+            action_id = (
+                {"type": "xch"}
+                if output["asset"] == "xch"
+                else {
+                    "type": "existing",
+                    "asset_id": target["cat_asset_id"],
+                }
+            )
+            actions.append(
+                {
+                    "type": "send",
+                    "id": action_id,
+                    "address": output["address"],
+                    "amount": str(output["amount_mojos"]),
+                    "memos": [],
+                }
+            )
+        if target["fee_mojos"]:
+            actions.append({"type": "fee", "amount": str(target["fee_mojos"])})
+        return actions
+
+    def _submit_direct_batch_plan(self, plan, address: str) -> bool:
+        """Journal, validate, sign and reconcile one exact Sage batch."""
+
+        from replacement_capacity import canonical_coin_prep_contract
+
+        fee_coin_ids = [plan.fee_source_id] if plan.fee_source_id else []
+        target = self._direct_batch_target_contract(plan, address)
+        canonical = canonical_coin_prep_contract(
+            operation_kind="split",
+            purpose="replacement",
+            source_coin_ids=list(plan.source_coin_ids),
+            target_contract=target,
+        )
+        target = canonical["target_contract"]
+        claim = claim_wallet_effect(
+            operation_id=canonical["operation_id"],
+            source_coin_ids=list(plan.source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        )
+        if claim is None:
+            self.log("Direct batch denied by exact coin authority")
+            return False
+        try:
+            prepared = prepare_coin_prep_operation(
+                operation_kind="split",
+                purpose="replacement",
+                source_coin_ids=list(plan.source_coin_ids),
+                target_contract=target,
+                wallet_identity_json=self._current_coin_prep_wallet_identity(),
+                evidence_json={
+                    "pre_view_coin_ids": sorted(
+                        set(plan.source_coin_ids) | set(fee_coin_ids)
+                    ),
+                    "execution_mode": "direct_final_batch_v2",
+                },
+                effect_claim_token=claim["claim_token"],
+                effect_claim_generation=claim["generation"],
+            )["operation"]
+        except Exception as exc:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_PREPARED_PERSIST_FAILED",
+            )
+            self.log(f"Direct batch PREPARED journal write failed: {exc}")
+            return False
+        selected_ids = [*plan.source_coin_ids, *fee_coin_ids]
+        actions = self._direct_batch_actions(target)
+        unsigned = build_transaction_rpc(selected_ids, actions)
+        validation_contract = {
+            "source_asset": plan.asset,
+            "source_coin_ids": list(plan.source_coin_ids),
+            "fee_coin_ids": fee_coin_ids,
+            "cat_asset_id": target.get("cat_asset_id"),
+            "fee_mojos": plan.fee_mojos,
+            "outputs": [
+                {
+                    "asset": output["asset"],
+                    "address": output["address"],
+                    "amount_mojos": output["amount_mojos"],
+                    "purpose": output["purpose"],
+                    "ordinal": output["ordinal"],
+                }
+                for output in target["outputs"]
+            ],
+        }
+        validated = validate_unsigned_transaction_effect(unsigned, validation_contract)
+        validation_ok = (
+            type(validated) is dict
+            and validated.get("_catalyst_validated_unsigned") is True
+        )
+        compatibility_reason = None
+        if validation_ok:
+            try:
+                prepared = bind_coin_prep_constructed_outputs(
+                    prepared["operation_id"],
+                    plan_hash=target["plan_hash"],
+                    constructed_outputs=validated["constructed_outputs"],
+                )["operation"]
+            except Exception as exc:
+                retain_wallet_effect_claim_for_reconciliation(
+                    claim["claim_token"],
+                    claim["generation"],
+                    reason_code="DIRECT_BATCH_OUTPUT_BINDING_FAILED",
+                )
+                self.log(f"Direct batch output binding failed: {exc}")
+                raise CoinPrepAuthorityUnresolved(
+                    "direct batch output binding could not be persisted"
+                ) from exc
+        else:
+            validation_reason = (
+                validated.get("reason") if isinstance(validated, dict) else "unknown"
+            )
+            if validation_reason == "UNSIGNED_EFFECT_NOT_INSPECTABLE":
+                compatibility_reason = validation_reason
+            self.log(
+                "Direct batch unsigned validation failed before signing: "
+                f"{validation_reason}"
+            )
+
+        if not wallet_effect_claim_is_current(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=canonical["operation_id"],
+            source_coin_ids=list(plan.source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        ):
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_AUTHORITY_RECHECK_FAILED",
+            )
+            raise CoinPrepAuthorityUnresolved(
+                "direct batch authority changed before wallet dispatch"
+            )
+        dispatch = begin_wallet_effect_dispatch(
+            claim["claim_token"],
+            claim["generation"],
+            operation_id=canonical["operation_id"],
+            source_coin_ids=list(plan.source_coin_ids),
+            fee_coin_ids=fee_coin_ids,
+        )
+        if dispatch is None:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_DISPATCH_DENIED",
+            )
+            raise CoinPrepAuthorityUnresolved(
+                "direct batch dispatch authority could not be established"
+            )
+        try:
+            with wallet_effect_adapter_dispatch_authority(dispatch):
+                if self._is_subprocess:
+                    result = _guarded_wallet_mutation(
+                        "coin_prep.create_final_batch",
+                        submit_built_transaction_rpc,
+                        validated,
+                    )
+                else:
+                    result = submit_built_transaction_rpc(validated)
+        except Exception as exc:
+            dispatch_outcome = complete_wallet_effect_dispatch(dispatch, exception=exc)
+            self._record_coin_prep_dispatch_outcome(
+                prepared,
+                dispatch_outcome=dispatch_outcome,
+                reason_code="DIRECT_BATCH_ADAPTER_EXCEPTION_UNKNOWN",
+            )
+            raise
+        dispatch_outcome = complete_wallet_effect_dispatch(dispatch, result=result)
+        self._record_coin_prep_dispatch_outcome(
+            prepared,
+            dispatch_outcome=dispatch_outcome,
+            reason_code=f"DIRECT_BATCH_{dispatch_outcome}_UNRECONCILED",
+        )
+        if dispatch_outcome == "RELEASED_NO_EFFECT":
+            if compatibility_reason:
+                with self.status_lock:
+                    self.status.compatibility_reason = compatibility_reason
+            return False
+        started = time.monotonic()
+        observation = self._wait_for_coin_prep_post_effect(
+            prepared,
+            timeout_s=self._submitted_split_verify_timeout_seconds(),
+            poll_interval_s=5,
+        )
+        with self.status_lock:
+            self.status.confirmation_elapsed_seconds = int(time.monotonic() - started)
+        if type(observation) is not dict:
+            raise CoinPrepAuthorityUnresolved(
+                "submitted direct batch remained unresolved; coin prep stopped without replay"
+            )
+        return self._verify_authoritative_post_operation_view(
+            operation_id=prepared["operation_id"],
+            source_coin_ids=list(plan.source_coin_ids),
+            expected_outputs=observation.get("expected_outputs"),
+            authoritative_view=observation.get("authoritative_view"),
+            expected_wallet_identity=json.loads(prepared["wallet_identity_json"]),
+            effect_claim_token=prepared["effect_claim_token"],
+            effect_claim_generation=prepared["effect_claim_generation"],
+            dispatch_outcome=dispatch_outcome,
+        )
+
+    def _run_direct_batch_prep(self) -> bool | None:
+        """Prepare exact final Sage tier outputs in at most two transactions."""
+
+        if not self.is_sage or not self.tier_enabled or not DB_AVAILABLE:
+            return None
+        from coin_prep_batch_plan import (
+            BatchConstraints,
+            BatchPlan,
+            BatchRefusal,
+            plan_batch,
+        )
+        from wallet import get_next_address
+
+        address_result = get_next_address(self.xch_wallet_id, new_address=False)
+        address = (
+            address_result.get("address") if type(address_result) is dict else None
+        )
+        if type(address) is not str or not address:
+            self.status.compatibility_reason = "DIRECT_BATCH_ADDRESS_UNAVAILABLE"
+            return False
+        targets = self._direct_batch_targets()
+        xch_reserve = int(
+            Decimal(str(os.getenv("XCH_RESERVE", "0") or "0"))
+            * Decimal("1000000000000")
+        )
+        cat_reserve = cat_display_amount_to_mojos_ceil(
+            self.cat_reserve, self.cat_decimals
+        )
+        constraints = BatchConstraints(
+            reserve_floors={"xch": xch_reserve, "cat": cat_reserve},
+            fee_mojos=self._tx_fee_mojos(),
+        )
+        with self.status_lock:
+            self.status.execution_mode = "direct_final_batch_v2"
+            self.status.compatibility_reason = None
+            self.status.planned_fee_mojos = 0
+            self.status.paid_fee_mojos = 0
+            self.status.batch_current = 0
+            self.status.batch_confirmed = 0
+        effects_confirmed = 0
+        for batch_number in range(1, 3):
+            snapshot = self._direct_batch_snapshot(targets)
+            if snapshot is None:
+                if effects_confirmed:
+                    raise CoinPrepAuthorityUnresolved(
+                        "direct batch snapshot became unavailable after a confirmed batch"
+                    )
+                self.status.compatibility_reason = "DIRECT_BATCH_SNAPSHOT_UNAVAILABLE"
+                return False
+            plan = plan_batch(snapshot, targets, constraints)
+            if isinstance(plan, BatchRefusal):
+                if effects_confirmed:
+                    raise CoinPrepAuthorityUnresolved(
+                        "direct batch replanning was refused after a confirmed batch: "
+                        f"{plan.code}"
+                    )
+                self.status.compatibility_reason = plan.code
+                if not plan.prerequisite_allowed:
+                    self.log(
+                        "Direct final-output Coin Prep refused an unsafe plan: "
+                        f"{plan.code}"
+                    )
+                    return False
+                self.log(
+                    "Direct final-output Coin Prep cannot safely use this wallet "
+                    f"shape ({plan.code}); using compatibility path before any effect"
+                )
+                return None
+            if not isinstance(plan, BatchPlan):
+                self.status.compatibility_reason = "DIRECT_BATCH_PLAN_INVALID"
+                return False
+            with self.status_lock:
+                self.status.reused = len(plan.reused_coin_ids)
+                self.status.missing = len(targets) - len(plan.reused_coin_ids)
+            if not plan.transaction_required:
+                return True
+            with self.status_lock:
+                self.status.batch_current = batch_number
+                self.status.planned_fee_mojos += plan.fee_mojos
+            self.update_status(
+                PrepPhase.SPLITTING,
+                0.30 + (batch_number - 1) * 0.30,
+                f"Building direct final-output batch {batch_number}/2...",
+            )
+            if not self._submit_direct_batch_plan(plan, address):
+                if (
+                    self.status.compatibility_reason
+                    == "UNSIGNED_EFFECT_NOT_INSPECTABLE"
+                ):
+                    if effects_confirmed:
+                        raise CoinPrepAuthorityUnresolved(
+                            "direct batch became incompatible after a confirmed batch"
+                        )
+                    self.log(
+                        "Sage cannot expose an inspectable unsigned final batch; "
+                        "using the compatibility Coin Prep path after proven no effect"
+                    )
+                    return None
+                return False
+            with self.status_lock:
+                self.status.batch_confirmed = batch_number
+                self.status.paid_fee_mojos += plan.fee_mojos
+            effects_confirmed += 1
+
+        snapshot = self._direct_batch_snapshot(targets)
+        final_plan = plan_batch(snapshot, targets, constraints) if snapshot else None
+        return bool(
+            isinstance(final_plan, BatchPlan) and not final_plan.transaction_required
+        )
 
     def _merge_xch_fee_change_into_reserve(self) -> bool:
         """Merge leftover XCH fee-funding change back into reserve before final DB sweep.
@@ -9133,6 +9605,94 @@ class CoinPrepWorker:
                         "pending_transaction_ids": [],
                     }
                 }
+            if target.get("contract_version") == 2:
+                raw_constructed = operation.get("constructed_outputs_json")
+                if type(raw_constructed) is not str:
+                    return None
+                constructed = json.loads(raw_constructed)
+                if type(constructed) is not list or not constructed:
+                    return None
+                xch_observed = (
+                    observed
+                    if target["wallet_type"] == "xch"
+                    else self._get_confirmed_owned_coins_via_rpc(
+                        self.xch_wallet_id, "coin-prep-batch-xch-post-view"
+                    )
+                )
+                cat_observed = (
+                    observed
+                    if target["wallet_type"] == "cat"
+                    else self._get_confirmed_owned_coins_via_rpc(
+                        self.cat_wallet_id, "coin-prep-batch-cat-post-view"
+                    )
+                )
+                if type(xch_observed) is not list or type(cat_observed) is not list:
+                    return None
+
+                def _coin_amounts(coins):
+                    result = {}
+                    for coin in coins:
+                        coin_id = self._canonical_coin_id(
+                            coin.get("coin_id") or coin.get("id")
+                        )
+                        amount = coin.get("amount_mojos", coin.get("amount"))
+                        if type(amount) is not int or amount <= 0 or coin_id in result:
+                            raise ValueError("batch coin view is malformed")
+                        result[coin_id] = amount
+                    return result
+
+                xch_by_id = _coin_amounts(xch_observed)
+                cat_by_id = _coin_amounts(cat_observed)
+                source_view = xch_by_id if target["wallet_type"] == "xch" else cat_by_id
+                if source_ids.intersection(source_view) or fee_ids.intersection(
+                    xch_by_id
+                ):
+                    return None
+                expected_outputs = []
+                for output in constructed:
+                    if type(output) is not dict:
+                        return None
+                    coin_id = self._canonical_coin_id(output.get("coin_id"))
+                    asset = output.get("asset")
+                    asset_view = xch_by_id if asset == "xch" else cat_by_id
+                    amount = output.get("amount_mojos")
+                    purpose = output.get("purpose")
+                    if (
+                        asset not in {"xch", "cat"}
+                        or type(amount) is not int
+                        or amount <= 0
+                        or type(purpose) is not str
+                        or asset_view.get(coin_id) != amount
+                    ):
+                        return None
+                    expected_outputs.append(
+                        {
+                            "coin_id": coin_id,
+                            "amount_mojos": amount,
+                            "purpose": purpose,
+                        }
+                    )
+                observed_text = identity_decision["observed_at_utc"]
+                observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
+                expires_text = (
+                    (
+                        observed_at
+                        + timedelta(seconds=expected_identity["maximum_age_seconds"])
+                    )
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z")
+                )
+                return {
+                    "expected_outputs": expected_outputs,
+                    "authoritative_view": {
+                        "fresh": True,
+                        "complete": True,
+                        "wallet_identity": expected_identity,
+                        "observed_at": observed_text,
+                        "expires_at": expires_text,
+                        "coins": expected_outputs,
+                    },
+                }
             if source_ids.intersection(by_id):
                 return None
             new_coins = sorted(
@@ -9551,6 +10111,21 @@ class CoinPrepWorker:
 
             self._xch_plan_already_satisfied = xch_prepared_ok
             self._cat_plan_already_satisfied = cat_prepared_ok
+
+            direct_batch_result = self._run_direct_batch_prep()
+            if direct_batch_result is True:
+                self.log(
+                    "Direct final-output Coin Prep completed without intermediate pools"
+                )
+                return self._complete_existing_tier_preparation()
+            if direct_batch_result is False:
+                self.update_status(
+                    PrepPhase.ERROR,
+                    self.status.progress,
+                    "Direct final-output Coin Prep failed before completion",
+                    error="DIRECT_BATCH_FAILED",
+                )
+                return False
 
             self.log(f"\n{'=' * 60}")
             self.log("⚡ PARALLEL CONSOLIDATION")

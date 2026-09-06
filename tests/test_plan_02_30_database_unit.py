@@ -638,13 +638,28 @@ class TestGetCoinSummary(_TempDB):
 
     def test_live_tier_counts_mark_reverse_buy_position_order(self):
         _db.upsert_coin(
-            "0xaaa1", "xch", 100, designation="tier_spare", assigned_tier="extreme"
+            "0xaaa1",
+            "xch",
+            100,
+            designation="tier_spare",
+            assigned_tier="extreme",
+            purpose="replacement",
         )
         _db.upsert_coin(
-            "0xaaa2", "xch", 100, designation="tier_spare", assigned_tier="extreme"
+            "0xaaa2",
+            "xch",
+            100,
+            designation="tier_spare",
+            assigned_tier="extreme",
+            purpose="replacement",
         )
         _db.upsert_coin(
-            "0xaaa3", "xch", 200, designation="tier_spare", assigned_tier="inner"
+            "0xaaa3",
+            "xch",
+            200,
+            designation="tier_spare",
+            assigned_tier="inner",
+            purpose="replacement",
         )
 
         from config import cfg

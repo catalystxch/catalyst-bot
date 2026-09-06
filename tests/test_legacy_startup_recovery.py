@@ -7,6 +7,8 @@ import json
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 
 TRADE_ID = "1" * 64
 COIN_ID = "0x" + "2" * 64
@@ -224,6 +226,89 @@ def test_many_legacy_candidates_share_bounded_wallet_history_reads():
 
     assert result == {"examined": 72, "recovered": 0, "remaining": 72}
     assert wallet_calls == {"identity": 1, "offers": 1, "coins": 1}
+
+
+@pytest.mark.parametrize(
+    "terminal_classification",
+    ["CANCELLED_PROVEN", "FILLED_PROVEN", "EXPIRED_PROVEN"],
+)
+def test_submitted_cancel_is_recovered_from_exact_authoritative_sage_proof(
+    terminal_classification,
+):
+    """Any proven terminal offer must not strand the next desktop startup."""
+    import legacy_startup_recovery
+
+    trade_id = "4" * 64
+    intent_id = "5" * 64
+    operation_id = f"cancel:{trade_id}"
+    intent = {
+        "intent_id": intent_id,
+        "sage_trade_id": trade_id,
+        "lifecycle_state": "created",
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "asset_id": ASSET_ID,
+        "side": "buy",
+        "tier": "inner",
+        "selected_coin_ids": ["6" * 64],
+    }
+    blocker = {
+        "operation_id": operation_id,
+        "operation_type": "CANCEL",
+        "intent_id": intent_id,
+        "phase": "FINALIZED",
+        "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+        "blocks_mutation": 1,
+    }
+    evidence = {
+        "observed_at": AT,
+        "offer_history": {"complete": True},
+        "transaction_history": {"complete": True},
+    }
+    cancel_context = {
+        "cohort_id": "cancel-cohort:" + "7" * 64,
+        "members": [{"intent_id": intent_id, "trade_id": trade_id}],
+    }
+    calls = []
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [],
+        get_unresolved_offer_operation_blockers=lambda: [blocker],
+        get_offer_intent=lambda requested: intent if requested == intent_id else None,
+    )
+    reconciliation = SimpleNamespace(
+        EXPIRED_PROVEN="EXPIRED_PROVEN",
+        CANCELLED_PROVEN="CANCELLED_PROVEN",
+        FILLED_PROVEN="FILLED_PROVEN",
+        load_authoritative_evidence=lambda target, wallet_facade=None: (
+            calls.append(("evidence", target, wallet_facade)) or evidence
+        ),
+        _derive_single_cancel_context=lambda target, supplied, **kwargs: (
+            calls.append(("context", target, supplied, kwargs)) or cancel_context
+        ),
+        classify_terminal_evidence=lambda target, supplied, **kwargs: {
+            "classification": terminal_classification,
+            "reason_code": "EXACT_TERMINAL_PROOF",
+        },
+        reconcile_offer=lambda requested, **kwargs: (
+            calls.append(("reconcile", requested, kwargs))
+            or {"classification": terminal_classification, "applied": True}
+        ),
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=SimpleNamespace(),
+        database_module=database,
+        reconciliation_module=reconciliation,
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 1, "recovered": 1, "remaining": 0}
+    assert [call[0] for call in calls] == ["evidence", "context", "reconcile"]
+    assert calls[2][1] == intent_id
+    assert calls[2][2]["cancel_context"] is cancel_context
+    assert calls[2][2]["evidence"] is evidence
 
 
 def test_database_legacy_adoption_never_commits_publishable_state(

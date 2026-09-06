@@ -97,6 +97,8 @@ def test_public_post_flush_reclaims_unsafe_offers_before_dexie(monkeypatch):
 
     assert events.index("reclaim") < events.index("dexie_flush")
     assert events.index("reclaim") < events.index("splash_flush")
+    assert events.index("step11_dexie_post") < events.index("dexie_flush")
+    assert events.index("step11b_splash_post") < events.index("splash_flush")
 
 
 def test_public_post_flush_skips_reclaim_when_no_public_queue(monkeypatch):

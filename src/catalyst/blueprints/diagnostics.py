@@ -26,6 +26,30 @@ def api_health():
     import chia_node
 
     if not chia_node.is_startup_authorised():
+        bot = api_server.bot
+        bot_running = bool(bot and bot.is_running())
+        if bot_running:
+            try:
+                health_data = dict((bot.get_state() or {}).get("chia_health") or {})
+            except Exception:
+                health_data = {}
+            health_data.setdefault("status", "unknown")
+            health_data.setdefault(
+                "healthy",
+                health_data.get("status") in {"healthy", "wallet_sync_unknown"},
+            )
+            health_data.setdefault("consecutive_failures", 0)
+            return jsonify(
+                {
+                    "status": "ok",
+                    "version": api_server.get_app_version(),
+                    "wallet_type": api_server.get_wallet_type(),
+                    "bot_running": True,
+                    "sse_clients": api_server.events.subscriber_count,
+                    "timestamp": int(time.time()),
+                    "chia_health": health_data,
+                }
+            )
         return jsonify(
             {
                 "status": "ok",

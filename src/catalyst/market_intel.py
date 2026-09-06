@@ -332,10 +332,23 @@ class MarketIntel:
         if not v3_buy_offers and not v3_sell_offers:
             return False
         with self._lock:
+            # v3 contains anonymous aggregate levels and therefore cannot
+            # preserve ownership attribution. If v1 successfully identified
+            # any of our offers, replacing the book would turn our own levels
+            # into fake competitors (especially on an own-only market).
+            v1_has_attributed_own_offer = any(
+                offer.get("is_ours")
+                for offer in (
+                    list(self._orderbook.get("buy_offers", []))
+                    + list(self._orderbook.get("sell_offers", []))
+                )
+            )
             best_bid = self._competitors.get("best_bid", Decimal("0"))
             best_ask = self._competitors.get("best_ask", Decimal("0"))
             buy_depth = self._competitors.get("buy_depth_xch", Decimal("0"))
             sell_depth = self._competitors.get("sell_depth_xch", Decimal("0"))
+        if v1_has_attributed_own_offer:
+            return False
         return (v3_buy_offers and (best_bid <= 0 or buy_depth <= 0)) or (
             v3_sell_offers and (best_ask <= 0 or sell_depth <= 0)
         )
@@ -351,11 +364,27 @@ class MarketIntel:
             offered = offer.get("offered", [])
             requested = offer.get("requested", [])
 
+            # Dexie has served both shapes over the lifetime of v1: older
+            # responses used arrays while the current API returns one asset
+            # object for each side. Normalize both without accepting arbitrary
+            # iterables (iterating a dict here previously yielded its keys and
+            # caused every current v1 offer to be discarded).
+            def _asset_rows(value):
+                if isinstance(value, dict):
+                    return [value]
+                if isinstance(value, list):
+                    return value
+                return []
+
+            asset_rows = _asset_rows(offered) + _asset_rows(requested)
+
             xch_amount = Decimal("0")
             cat_amount = Decimal("0")
 
             # Find XCH and CAT amounts in the offer
-            for asset in offered + requested:
+            for asset in asset_rows:
+                if not isinstance(asset, dict):
+                    continue
                 code = str(asset.get("code", "")).upper()
                 asset_id = str(asset.get("id", ""))
 

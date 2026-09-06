@@ -682,6 +682,7 @@ class BotLoop:
         # ---- Price watcher state (V1 parity) ----
         self._watcher_thread: Optional[threading.Thread] = None
         self._watcher_event = threading.Event()  # Wakes main loop early
+        self._watcher_stop_event = threading.Event()
         self._watcher_lock = threading.Lock()
         self._watcher_interval: int = 12  # seconds between polls
         self._watcher_min_change_pct: float = 0.03  # 0.03% reserve change triggers
@@ -4832,6 +4833,7 @@ class BotLoop:
                 f"Could not verify Sage signing capability before start: {str(e)[:160]}",
             )
 
+        self._watcher_stop_event.clear()
         self._running = True
         self._start_time = time.time()
         self._set_state(running=True, status="starting")
@@ -4989,6 +4991,7 @@ class BotLoop:
 
         # Wake sleeping threads promptly. For GUI/API stop we return after
         # this signal and let the finalizer perform joins/cleanup.
+        self._watcher_stop_event.set()
         self._watcher_event.set()
         if not wait:
             if not (
@@ -5095,6 +5098,7 @@ class BotLoop:
                     f"stop_topup raised during shutdown: {e}",
                 )
 
+            self._watcher_stop_event.set()
             self._watcher_event.set()
 
             try:
@@ -5202,6 +5206,13 @@ class BotLoop:
             }
 
         stats["enabled"] = bool(getattr(cfg, "SPLASH_RECEIVE_ENABLED", False))
+        receive_thread = getattr(self, "_splash_receive_thread", None)
+        stats["active"] = bool(
+            stats["enabled"]
+            and getattr(self, "_running", False)
+            and receive_thread is not None
+            and receive_thread.is_alive()
+        )
         stats["pair_asset_id"] = asset_id
         stats["pair_label"] = self._current_splash_pair_label()
         stats["poll_secs"] = getattr(self, "_splash_receive_interval", 5)
@@ -5215,7 +5226,14 @@ class BotLoop:
         # "splash has peers but offer-hook broken".
         try:
             if getattr(self, "splash_node", None) is not None:
-                stats["node_metrics"] = self.splash_node.get_metrics() or {}
+                metrics = self.splash_node.get_metrics() or {}
+                # Preserve cumulative daemon counters as last-known evidence,
+                # but never present them as a live peer snapshot after the
+                # managed process has stopped.  SplashNode.get_status() applies
+                # the same mask; this receive-stat path previously bypassed it.
+                if not self.splash_node.is_running():
+                    metrics["reachable"] = False
+                stats["node_metrics"] = metrics
             else:
                 stats["node_metrics"] = {}
         except Exception:
@@ -5294,7 +5312,9 @@ class BotLoop:
         from database import get_splash_incoming_offers, update_splash_incoming_status
 
         pending = get_splash_incoming_offers(
-            status="new", limit=self._splash_receive_batch_size
+            status="new",
+            limit=self._splash_receive_batch_size,
+            oldest_first=True,
         )
         if not pending:
             return
@@ -5424,7 +5444,12 @@ class BotLoop:
 
         # Startup: sync state from wallet
         # Background threads wait for this to finish before writing to DB.
-        self._startup_sync()
+        startup_state = self._startup_sync() or {}
+        if "open_buys" in startup_state and "open_sells" in startup_state:
+            self._set_state(
+                open_buys=int(startup_state["open_buys"]),
+                open_sells=int(startup_state["open_sells"]),
+            )
         self._enable_durable_publication_outbox()
         slog(
             "STARTUP",
@@ -7952,6 +7977,11 @@ class BotLoop:
             # instead of waiting for the first full cycle to complete (~90s).
             _push_startup_market_snapshot()
 
+            return {
+                "open_buys": len(buy_ids),
+                "open_sells": len(sell_ids),
+            }
+
         except Exception as e:
             log_event("error", "startup_sync_failed", f"Startup sync failed: {e}")
             # Critical: do NOT continue trading without a proper baseline.
@@ -8219,16 +8249,36 @@ class BotLoop:
             latch = database.get_runtime_safety_latch()
             blockers = database.get_unresolved_offer_operation_blockers()
             generation = latch.get("generation") if type(latch) is dict else None
+            blocker_ids = (
+                [row.get("operation_id") for row in blockers]
+                if type(blockers) is list
+                and blockers
+                and all(type(row) is dict for row in blockers)
+                else []
+            )
+            exact_settlement = bool(
+                operation_id in blocker_ids
+                and (
+                    blocker_ids == [operation_id]
+                    or (
+                        callable(
+                            bulk_reader := getattr(
+                                self.offer_manager,
+                                "_sage_bulk_cancel_manifest_for_blockers",
+                                None,
+                            )
+                        )
+                        and type(bulk_reader(blockers)) is dict
+                    )
+                )
+            )
             return bool(
                 latch.get("state") == "tripped"
                 and latch.get("reason_code") == "UNRESOLVED_OPERATIONS"
                 and type(generation) is int
                 and not isinstance(generation, bool)
                 and generation > 0
-                and type(blockers) is list
-                and len(blockers) == 1
-                and type(blockers[0]) is dict
-                and blockers[0].get("operation_id") == operation_id
+                and exact_settlement
             )
         except Exception:
             return False
@@ -8574,6 +8624,8 @@ class BotLoop:
                     ),
                     "num_buy_offers": intel_data.get("num_buy_offers", 0),
                     "num_sell_offers": intel_data.get("num_sell_offers", 0),
+                    "num_competitor_buys": intel_data.get("num_competitor_buys", 0),
+                    "num_competitor_sells": intel_data.get("num_competitor_sells", 0),
                     "thin_side": intel_data.get("thin_side", ""),
                 }
                 try:
@@ -10640,7 +10692,7 @@ class BotLoop:
                 data={"protected_sides": _skipped},
             )
 
-        self._create_offers_if_needed(
+        created_offer_ids = self._create_offers_if_needed(
             mid_price,
             len(current_buy_ids),
             len(current_sell_ids),
@@ -10650,6 +10702,9 @@ class BotLoop:
             skip_buy=_skip_buy,
             skip_sell=_skip_sell,
         )
+        if isinstance(created_offer_ids, dict):
+            current_buy_ids.update(created_offer_ids.get("buy", set()) or set())
+            current_sell_ids.update(created_offer_ids.get("sell", set()) or set())
 
         if self._cycle_stop_requested("post_create"):
             return
@@ -12229,6 +12284,7 @@ class BotLoop:
 
         # Process results from both sides
         _notify_amm_after_create = False
+        created_ids_by_side = {"buy": set(), "sell": set()}
         for side in ["buy", "sell"]:
             new_offers = _parallel_results[side]
             if new_offers:
@@ -12253,6 +12309,8 @@ class BotLoop:
                 for offer in new_offers:
                     bech32 = offer.get("offer_bech32", "")
                     trade_id = offer.get("trade_id", "")
+                    if trade_id:
+                        created_ids_by_side[side].add(trade_id)
                     if bech32 and trade_id:
                         self.dexie_manager.queue_post(bech32, trade_id)
                         if getattr(cfg, "SPLASH_ENABLED", False):
@@ -12301,6 +12359,8 @@ class BotLoop:
                     f"Observed market after creation: {fresh_mid:.8f} "
                     f"(keeping deployed quote baselines)",
                 )
+
+        return created_ids_by_side
 
     # -------------------------------------------------------------------
     # Coin management
@@ -12361,6 +12421,7 @@ class BotLoop:
 
         # ---- Step 11b: Submit to local Splash node after Dexie is live ----
         if getattr(cfg, "SPLASH_ENABLED", False):
+            self._set_cycle_step("step11b_splash_post")
             try:
                 splash_q = len(getattr(self.splash_manager, "_queue", []) or [])
                 if splash_q > 0:
@@ -14433,7 +14494,10 @@ class BotLoop:
         """
         # Wait for startup_sync to finish before writing to DB
         slog("THREAD", "health-monitor waiting for startup_complete gate...")
-        self._startup_complete.wait(timeout=120)
+        while self._running and not self._startup_complete.wait(timeout=0.25):
+            pass
+        if not self._running:
+            return
         slog("THREAD", "health-monitor gate released — starting work")
         log_thread_start("health-monitor")
         startup_wallet_type = (
@@ -14651,7 +14715,11 @@ class BotLoop:
         """
         # Wait for startup_sync to finish before polling prices
         slog("THREAD", "price-watcher waiting for startup_complete gate...")
-        self._startup_complete.wait(timeout=120)
+        while self._running and not self._startup_complete.wait(timeout=0.25):
+            if self._watcher_stop_event.is_set():
+                return
+        if not self._running or self._watcher_stop_event.is_set():
+            return
         slog("THREAD", "price-watcher gate released — starting work")
         log_thread_start("price-watcher")
 
@@ -14674,7 +14742,8 @@ class BotLoop:
             try:
                 # Only poll when bot is running
                 if not self._bot_state.get("running"):
-                    time.sleep(5)
+                    if self._watcher_stop_event.wait(timeout=5):
+                        break
                     continue
 
                 # Fetch Tibet reserves directly (lightweight — just one pair)
@@ -14688,7 +14757,8 @@ class BotLoop:
                             "watcher_error",
                             f"Tibet API unreachable ({consecutive_errors} consecutive failures)",
                         )
-                    time.sleep(self._watcher_interval)
+                    if self._watcher_stop_event.wait(timeout=self._watcher_interval):
+                        break
                     continue
 
                 consecutive_errors = 0
@@ -14748,13 +14818,15 @@ class BotLoop:
                         self._watcher_data["last_token_reserve"] = token_res
 
                 if is_baseline:
-                    time.sleep(self._watcher_interval)
+                    if self._watcher_stop_event.wait(timeout=self._watcher_interval):
+                        break
                     continue
 
             except Exception as e:
                 log_event("debug", "watcher_thread_error", f"Price watcher error: {e}")
 
-            time.sleep(self._watcher_interval)
+            if self._watcher_stop_event.wait(timeout=self._watcher_interval):
+                break
 
         log_event("info", "watcher_exit", "Price watcher stopped")
 

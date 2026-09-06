@@ -151,7 +151,10 @@ class NeedsTopupThresholdTests(unittest.TestCase):
             "records": [],
         }
         fake_wallet.get_wallet_type = lambda: "sage"
-        fake_wallet.get_owned_coins_detailed = lambda *a, **kw: {}
+        # Generic threshold tests exercise the RPC fallback.  ``None`` means
+        # the richer Sage owned snapshot is unavailable; tests for that
+        # authoritative path patch it explicitly below.
+        fake_wallet.get_owned_coins_detailed = lambda *a, **kw: None
         fake_wallet.WALLET_ID_XCH = 1
         fake_wallet.get_all_coins_for_wallet = lambda *a, **kw: []
         fake_wallet.get_wallet_balance = lambda *a, **kw: {
@@ -670,6 +673,234 @@ class TestReversed(NeedsTopupThresholdTests):
 
         self.assertEqual(calls[:1], ["XCH-extreme"])
 
+    def test_sage_drip_worker_excludes_offer_locked_fee_coins(self):
+        """Use Sage's owned snapshot so offer-locked fee coins are not free.
+
+        Sage 0.13 can return coins locked by offers from the selectable query.
+        The detailed owned view carries ``offer_id`` and is the authority used
+        by ``update_coin_counts``.  A live topup must use that same view or a
+        genuinely low fee pool (48/50 in the live reproduction) is misread as
+        adequate and the worker no-ops after the drip trigger fires.
+        """
+        self._ns.TIER_DRIP_PCT = 100
+        self._ns.FEE_POOL_ENABLED = True
+        mgr = self._manager()
+        mgr._topup_is_drip = True
+
+        def records(count):
+            return [
+                {
+                    "coin_id": f"0x{i:064x}",
+                    "coin": {"amount": 1_000_000},
+                }
+                for i in range(1, count + 1)
+            ]
+
+        free_xch = records(48)
+        false_selectable_xch = records(98)
+        cat_records = [{"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}]
+
+        def owned_snapshot(wallet_id):
+            selectable = free_xch if wallet_id == 1 else cat_records
+            return {"selectable_records": selectable}
+
+        def classify(actual_records, wallet_type, _tier_sizes):
+            inventory = {
+                "reserve": [{"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}],
+                "inner": [{}] * 100,
+                "mid": [{}] * 100,
+                "outer": [{}] * 100,
+                "extreme": [{}] * 100,
+                "sniper": [{}] * 100,
+                "fees": [],
+                "small": [],
+            }
+            if wallet_type == "xch":
+                inventory["fees"] = list(actual_records)
+            return inventory
+
+        calls = []
+
+        def fake_smart_topup(name, *_args, **_kwargs):
+            calls.append(name)
+            return True
+
+        active_counts = {"inner": 3, "mid": 4, "outer": 3, "extreme": 2}
+        prepared_counts = {"inner": 13, "mid": 9, "outer": 6, "extreme": 4}
+
+        with (
+            patch.object(
+                mgr, "_get_sage_owned_coin_snapshot", side_effect=owned_snapshot
+            ) as owned,
+            patch.object(mgr, "_classify_coins_by_designation", side_effect=classify),
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(mgr, "_fee_pool_enabled", return_value=True),
+            patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                },
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 4_000_000,
+                    "mid": 3_000_000,
+                    "outer": 2_000_000,
+                    "extreme": 1_500_000,
+                    "sniper": 1_000_000,
+                    "fees": 1_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("4"),
+                    "mid": Decimal("3"),
+                    "outer": Decimal("2"),
+                    "extreme": Decimal("1.5"),
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(
+                self.cm,
+                "_get_free_coins_rpc",
+                side_effect=lambda wallet_id: {
+                    "confirmed_records": (
+                        false_selectable_xch if wallet_id == 1 else cat_records
+                    )
+                },
+            ),
+            patch.object(self.cm, "get_tier_distribution", return_value=active_counts),
+            patch.object(
+                self.cm,
+                "get_weighted_tier_prep_counts",
+                return_value=prepared_counts,
+            ),
+            patch.object(self.cm, "get_fee_pool_count", return_value=50),
+            patch.object(self.cm, "get_fee_coin_size_mojos", return_value=1_000_000),
+        ):
+            mgr._topup_worker(active_buy=12, active_sell=12)
+
+        self.assertEqual(owned.call_count, 2)
+        self.assertIn("XCH-fees", calls)
+
+    def test_sage_drip_worker_uses_authoritative_fee_reserve_count(self):
+        """Legacy same-sized coins must not satisfy the fee-reserve target.
+
+        The live Sage 0.13 reproduction exposed 98 records classified into the
+        ``fees`` size bucket, but only 47 carried the authoritative
+        ``fee_reserve`` purpose.  ``needs_topup`` correctly triggered from the
+        purpose-separated DB count; the worker then incorrectly counted the
+        whole size bucket and logged ``drip_adequate``.  The worker must use the
+        same authoritative spare count as its trigger.
+        """
+        self._ns.TIER_DRIP_PCT = 100
+        self._ns.FEE_POOL_ENABLED = True
+        mgr = self._manager(xch_overrides={"fees": 47})
+        mgr._topup_is_drip = True
+
+        def records(count):
+            return [
+                {
+                    "coin_id": f"0x{i:064x}",
+                    "coin": {"amount": 1_000_000},
+                }
+                for i in range(1, count + 1)
+            ]
+
+        xch_records = records(98)
+        cat_records = [{"coin_id": "0x" + "cc" * 32, "coin": {"amount": 1_000_000}}]
+
+        def owned_snapshot(wallet_id):
+            selectable = xch_records if wallet_id == 1 else cat_records
+            return {"selectable_records": selectable}
+
+        def classify(actual_records, wallet_type, _tier_sizes):
+            inventory = {
+                "reserve": [{"coin_id": "0x" + "aa" * 32, "coin": {"amount": 10**15}}],
+                "inner": [{}] * 100,
+                "mid": [{}] * 100,
+                "outer": [{}] * 100,
+                "extreme": [{}] * 100,
+                "sniper": [{}] * 100,
+                "fees": [],
+                "small": [],
+            }
+            if wallet_type == "xch":
+                inventory["fees"] = list(actual_records)
+            return inventory
+
+        calls = []
+
+        def fake_smart_topup(name, *_args, **_kwargs):
+            calls.append(name)
+            return True
+
+        active_counts = {"inner": 3, "mid": 4, "outer": 3, "extreme": 2}
+        prepared_counts = {"inner": 13, "mid": 9, "outer": 6, "extreme": 4}
+
+        with (
+            patch.object(
+                mgr, "_get_sage_owned_coin_snapshot", side_effect=owned_snapshot
+            ),
+            patch.object(mgr, "_classify_coins_by_designation", side_effect=classify),
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(mgr, "_fee_pool_enabled", return_value=True),
+            patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                },
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 4_000_000,
+                    "mid": 3_000_000,
+                    "outer": 2_000_000,
+                    "extreme": 1_500_000,
+                    "sniper": 1_000_000,
+                    "fees": 1_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("4"),
+                    "mid": Decimal("3"),
+                    "outer": Decimal("2"),
+                    "extreme": Decimal("1.5"),
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(self.cm, "get_tier_distribution", return_value=active_counts),
+            patch.object(
+                self.cm,
+                "get_weighted_tier_prep_counts",
+                return_value=prepared_counts,
+            ),
+            patch.object(self.cm, "get_fee_pool_count", return_value=50),
+            patch.object(self.cm, "get_fee_coin_size_mojos", return_value=1_000_000),
+        ):
+            mgr._topup_worker(active_buy=12, active_sell=12)
+
+        self.assertIn("XCH-fees", calls)
+
     def test_topup_worker_does_not_split_when_missing_offers_already_have_spares(self):
         """Offer slots can be missing while cancels are still settling.
 
@@ -839,6 +1070,81 @@ class TestReversed(NeedsTopupThresholdTests):
         self.assertEqual(len(topup_messages), 1)
         self.assertIn("missing buy offers", topup_messages[0])
         self.assertNotIn("tier low", topup_messages[0])
+
+    def test_sage_runtime_health_does_not_subtract_locked_offers_twice(self):
+        """Sage selectable counts already exclude coins locked in offers.
+
+        The live TEST 7 reproduction had 42 selectable CAT coins and 36 locked
+        sell offers.  Subtracting those offers again made the periodic health
+        check see only six free CAT coins, launch a top-up worker, and have that
+        worker immediately report every tier adequate.
+        """
+        mgr = self._manager()
+        self._ns.ENABLE_RUNTIME_COIN_HEALTH = True
+        self._ns.COIN_PREP_MULTIPLIER = Decimal("1")
+        self._ns.MAX_ACTIVE_BUY_OFFERS = 36
+        self._ns.MAX_ACTIVE_SELL_OFFERS = 36
+        mgr._xch_coins = 161
+        mgr._cat_coins = 42
+        mgr._health_check_counter = 4
+
+        self.assertFalse(
+            mgr.check_runtime_health(active_buy_count=36, active_sell_count=36)
+        )
+
+    def test_sage_runtime_health_still_triggers_for_genuinely_low_selectable_counts(
+        self,
+    ):
+        """Removing the double subtraction must retain the real low-coin gate."""
+        mgr = self._manager()
+        self._ns.ENABLE_RUNTIME_COIN_HEALTH = True
+        self._ns.COIN_PREP_MULTIPLIER = Decimal("1")
+        self._ns.MAX_ACTIVE_BUY_OFFERS = 36
+        self._ns.MAX_ACTIVE_SELL_OFFERS = 36
+        mgr._xch_coins = 6
+        mgr._cat_coins = 6
+        mgr._health_check_counter = 4
+        mgr._last_topup_time = 0
+
+        self.assertTrue(
+            mgr.check_runtime_health(active_buy_count=36, active_sell_count=36)
+        )
+
+    def test_sage_diagnostics_do_not_subtract_locked_offers_twice(self):
+        """Runtime diagnostics must report Sage's authoritative selectable counts.
+
+        TEST 7 exposed 42 selectable CAT coins and 36 separately locked offer
+        coins.  ``get_free_coin_counts`` reported six by subtracting the live
+        offers from a selectable view that had already excluded them.
+        """
+        mgr = self._manager()
+        mgr._xch_coins = 161
+        mgr._cat_coins = 42
+
+        counts = mgr.get_free_coin_counts(
+            active_buy_count=36,
+            active_sell_count=36,
+        )
+
+        self.assertEqual(counts["xch_spendable"], 161)
+        self.assertEqual(counts["cat_spendable"], 42)
+        self.assertEqual(counts["xch_free"], 161)
+        self.assertEqual(counts["cat_free"], 42)
+
+    def test_chia_diagnostics_retain_legacy_active_offer_subtraction(self):
+        """The Chia adapter keeps its historical inclusive count contract."""
+        mgr = self._manager()
+        mgr._xch_coins = 161
+        mgr._cat_coins = 42
+
+        with patch.object(self.cm, "get_wallet_type", return_value="chia"):
+            counts = mgr.get_free_coin_counts(
+                active_buy_count=36,
+                active_sell_count=36,
+            )
+
+        self.assertEqual(counts["xch_free"], 125)
+        self.assertEqual(counts["cat_free"], 6)
 
     def test_routine_topup_progress_events_are_debug_level(self):
         """Keep the GUI logs focused on topup decisions, not every poll step."""

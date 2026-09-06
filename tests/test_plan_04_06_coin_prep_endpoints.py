@@ -8,6 +8,7 @@ Tests /api/coin-prep/status, /api/coin-prep/verify,
   - Reset clears running state
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -141,6 +142,68 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body.get("xch_free_coins"), 5)
         self.assertEqual(body.get("cat_free_coins"), 10)
 
+    def test_running_direct_batch_status_exposes_detailed_progress(self):
+        """The GUI must receive direct-batch mode, fee, and confirmation details."""
+
+        worker_status = {
+            "phase": "splitting",
+            "progress": 0.65,
+            "message": "Waiting for direct batch 1 of 2",
+            "xch_coins_current": 3,
+            "xch_coins_target": 23,
+            "cat_coins_current": 4,
+            "cat_coins_target": 23,
+            "run_id": "current-run",
+            "execution_mode": "direct_final_batch_v2",
+            "reused": 7,
+            "missing": 39,
+            "batch_current": 1,
+            "batch_confirmed": 0,
+            "planned_fee_mojos": 13079100,
+            "paid_fee_mojos": 0,
+            "confirmation_elapsed_seconds": 47,
+            "compatibility_reason": None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+
+            api_server._coin_prep_state.update(
+                {
+                    "running": True,
+                    "complete": False,
+                    "error": None,
+                    "run_id": "current-run",
+                }
+            )
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        for key in (
+            "execution_mode",
+            "reused",
+            "missing",
+            "batch_current",
+            "batch_confirmed",
+            "planned_fee_mojos",
+            "paid_fee_mojos",
+            "confirmation_elapsed_seconds",
+            "compatibility_reason",
+        ):
+            self.assertEqual(body.get(key), worker_status[key], key)
+
     def test_tier_size_drift_marks_status_as_needing_prep(self):
         summary = {
             "xch_free_count": 5,
@@ -163,6 +226,89 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body.get("reason"), "tier_size_drift")
         self.assertEqual(body.get("tier_size_drift"), self._DRIFT)
         self.assertFalse(body.get("complete"))
+
+    def test_completed_tier_prep_rehydrates_asymmetric_xch_and_cat_counts(self):
+        """A restart must validate each asset against its own saved tier plan."""
+
+        xch_records = {
+            "success": True,
+            "records": [
+                {"coin": {"amount": 1_000_000_000_000}},
+                {"coin": {"amount": 1_000_000_000_000}},
+                {"coin": {"amount": 1_000_000_000}},
+            ],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 10_000}}],
+        }
+        last_prep = {
+            "tier_enabled": True,
+            # Retained only for compatibility with older releases.  It must
+            # not override the per-asset plans saved by Smart Settings.
+            "tier_counts": {"inner": 9, "fees": 9},
+            "tier_counts_xch": {"inner": 2, "fees": 1},
+            "tier_counts_cat": {"inner": 1, "fees": 0},
+            "tier_sizes_xch": {"inner": "1", "fees": "0.001"},
+            "tier_sizes_cat": {"inner": "10"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            last_path = os.path.join(temp_dir, "coin_prep_last.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"phase": "complete", "run_id": "old-run"}, handle)
+            with open(last_path, "w", encoding="utf-8") as handle:
+                json.dump(last_prep, handle)
+
+            def spendable(wallet_id):
+                return xch_records if int(wallet_id) == 1 else cat_records
+
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_last_file",
+                    return_value=last_path,
+                ),
+                patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(
+                    api_server,
+                    "_active_cat",
+                    {"wallet_id": 2, "decimals": 3},
+                ),
+                patch(
+                    "database.get_coin_summary",
+                    return_value={
+                        "xch_free_count": 3,
+                        "cat_free_count": 1,
+                        "xch_total": 3,
+                        "cat_total": 1,
+                    },
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_tier_size_drift_findings",
+                    return_value=[],
+                ),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertTrue(body["complete"])
+        self.assertTrue(body["previously_complete"])
+        self.assertEqual(body["phase"], "complete")
+        self.assertEqual(body["xch_target"], 3)
+        self.assertEqual(body["cat_target"], 1)
+        self.assertEqual(body["xch_coins"], 3)
+        self.assertEqual(body["cat_coins"], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +525,13 @@ class TestCoinPrepTrigger(_FlaskBase):
         self._open_offers = patch("database.get_open_offers", return_value=[])
         self._open_offers.start()
         self.addCleanup(self._open_offers.stop)
+        # The trigger also uses the blueprint's import-time binding. Patch that
+        # lookup as well; patching database alone leaves a real, uninitialised DB.
+        self._bound_open_offers = patch.object(
+            coin_prep_blueprint, "get_open_offers", return_value=[]
+        )
+        self._bound_open_offers.start()
+        self.addCleanup(self._bound_open_offers.stop)
         self._wallet_offer_snapshot = patch.object(
             coin_prep_blueprint,
             "_wallet_open_offer_snapshot_before_prep",

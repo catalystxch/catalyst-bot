@@ -276,6 +276,19 @@ class TestSplashIncoming(_FlaskBase):
             resp = self._post_incoming({"offer": "offer1valid"})
         self.assertIn("ok", resp.get_json())
 
+    def test_valid_offer_notes_successful_webhook_delivery_on_splash_node(self):
+        bot = _make_bot()
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch("api_server._splash_incoming_rate_limited", return_value=False),
+            patch("database.record_splash_incoming", return_value=False),
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self._post_incoming({"offer": "offer1duplicate"})
+
+        self.assertEqual(resp.status_code, 200)
+        bot.splash_node.note_webhook_delivery.assert_called_once_with()
+
     def test_rate_limited_returns_429(self):
         with (
             patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
