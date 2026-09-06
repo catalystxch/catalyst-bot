@@ -100,9 +100,7 @@ def test_tibetswap_outage_and_dexie_failure_are_negative_cached(prices, monkeypa
 
 def test_missing_packaged_ca_bundle_is_negative_cached(prices):
     _, fetch = prices
-    fetch.side_effect = OSError(
-        "Could not find a suitable TLS CA certificate bundle"
-    )
+    fetch.side_effect = OSError("Could not find a suitable TLS CA certificate bundle")
 
     assert market._get_startup_price_cached("aa", "MZ_XCH") == {}
     assert fetch.call_count == 1

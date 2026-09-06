@@ -52,9 +52,7 @@ class TestBuildPostBuild(unittest.TestCase):
             (internal / "bot_gui.html").write_text("<html></html>", encoding="utf-8")
             certifi_dir = internal / "certifi"
             certifi_dir.mkdir()
-            (certifi_dir / "cacert.pem").write_text(
-                "test CA bundle", encoding="utf-8"
-            )
+            (certifi_dir / "cacert.pem").write_text("test CA bundle", encoding="utf-8")
             env_example = root / ".env.example"
             env_example.write_text(
                 "SAGE_RPC_URL=https://127.0.0.1:9257\n", encoding="utf-8"
