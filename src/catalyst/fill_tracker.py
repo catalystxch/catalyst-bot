@@ -655,6 +655,8 @@ class FillTracker:
 
         for trade_id, meta in list(self._pending_reverify.items()):
             side = str(meta.get("side") or "")
+            if int(meta.get("attempts", 0)) >= self._pending_reverify_max_attempts:
+                continue
             try:
                 verdict = self._verify_fill_on_chain(trade_id, side)
             except Exception as _vre:
@@ -681,18 +683,33 @@ class FillTracker:
                     )
             elif verdict == "rejected":
                 meta["attempts"] = int(meta.get("attempts", 0)) + 1
-                log_event(
-                    "warning",
-                    "fill_reverify_rejected_nonterminal",
-                    f"{side.upper()} offer {trade_id[:16]}... was rejected by "
-                    "a third-party verifier; retaining its row and coin lock "
-                    "until authoritative reconciliation",
-                    data={
-                        "trade_id": trade_id,
-                        "side": side,
-                        "attempts": meta["attempts"],
-                    },
-                )
+                if meta["attempts"] >= self._pending_reverify_max_attempts:
+                    log_event(
+                        "error",
+                        "fill_verify_exhausted_blocked",
+                        f"{side.upper()} offer {trade_id[:16]}... exhausted "
+                        f"{meta['attempts']} third-party verification attempts; "
+                        "retaining its row and coin lock for authoritative "
+                        "reconciliation",
+                        data={
+                            "trade_id": trade_id,
+                            "side": side,
+                            "attempts": meta["attempts"],
+                        },
+                    )
+                else:
+                    log_event(
+                        "warning",
+                        "fill_reverify_rejected_nonterminal",
+                        f"{side.upper()} offer {trade_id[:16]}... was rejected by "
+                        "a third-party verifier; retaining its row and coin lock "
+                        "until authoritative reconciliation",
+                        data={
+                            "trade_id": trade_id,
+                            "side": side,
+                            "attempts": meta["attempts"],
+                        },
+                    )
             else:
                 backoff_remaining = _spacescan_verify_backoff_remaining()
                 if backoff_remaining > 0:
