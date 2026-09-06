@@ -7529,6 +7529,7 @@ def update_offer_status(trade_id: str, status: str) -> bool:
             try:
                 conn.rollback()
             except Exception:
+                # Preserve the original write error if rollback itself cannot run.
                 pass
             log_event("error", "db_error", f"Failed to update offer {trade_id}: {e}")
             return False

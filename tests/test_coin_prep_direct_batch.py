@@ -2,6 +2,7 @@ import json
 import threading
 from contextlib import nullcontext
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,35 @@ def _worker():
 
 def _coin(asset, coin_id, amount, purpose=""):
     return SelectableCoin(asset, coin_id, amount, purpose)
+
+
+def test_direct_snapshot_labels_database_reserve_for_floor_accounting(monkeypatch):
+    """Dropping the reserve designation makes safe protected balance invisible."""
+    worker = _worker()
+    reserve_id = "a" * 64
+    source_id = "b" * 64
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "get_reserve_coins",
+        lambda wallet_type: [{"coin_id": reserve_id}] if wallet_type == "xch" else [],
+    )
+    worker._get_coins_via_rpc = lambda wallet_id, *_args, **_kwargs: (
+        [
+            {"coin_id": reserve_id, "amount_mojos": 30},
+            {"coin_id": source_id, "amount_mojos": 20},
+        ]
+        if wallet_id == worker.xch_wallet_id
+        else []
+    )
+    target = SimpleNamespace(
+        asset="xch", amount_mojos=10, purpose="mid", tier_rank=0, ordinal=0
+    )
+
+    snapshot = worker._direct_batch_snapshot((target,))
+
+    reserve = next(item for item in snapshot.coins if item.coin_id == reserve_id)
+    assert reserve.protected is True
+    assert reserve.purpose == "reserve"
 
 
 def test_observed_wallet_shape_uses_one_cat_and_one_xch_final_batch(monkeypatch):

@@ -488,6 +488,7 @@ def api_dashboard():
                 ):
                     executable_mid = (public_bid + public_ask) / Decimal("2")
             except (InvalidOperation, ValueError, TypeError, AttributeError):
+                # Malformed public market data leaves the executable mid unavailable.
                 pass
 
         spacescan_context = api_server._get_spacescan_market_context(

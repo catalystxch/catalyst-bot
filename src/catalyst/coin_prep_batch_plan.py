@@ -213,7 +213,9 @@ def plan_batch(
         asset: sum(
             c.amount_mojos
             for c in coins
-            if c.asset == asset and c.selectable and not c.protected
+            if c.asset == asset
+            and c.selectable
+            and (not c.protected or c.purpose == "reserve")
         )
         for asset in ("xch", "cat")
     }

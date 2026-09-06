@@ -177,6 +177,29 @@ def test_protected_balance_cannot_satisfy_reserve_floor():
     assert result.code == "RESERVE_FLOOR"
 
 
+def test_designated_protected_reserve_counts_toward_floor_but_is_not_spent():
+    """Removing reserve-designated balance from floor accounting blocks safe prep."""
+    result = plan_batch(
+        CoinSnapshot(
+            (
+                coin("xch", "source", 20),
+                coin(
+                    "xch",
+                    "protected-reserve",
+                    30,
+                    purpose="reserve",
+                    protected=True,
+                ),
+            )
+        ),
+        (target("xch", "mid", 10, 0),),
+        constraints(reserve_floors={"xch": 30, "cat": 0}, fee_mojos=10),
+    )
+    assert isinstance(result, BatchPlan)
+    assert result.source_coin_ids == ("source",)
+    assert "protected-reserve" not in result.source_coin_ids
+
+
 def test_equal_outputs_remain_separate_planned_outputs():
     result = plan_batch(
         CoinSnapshot((coin("xch", "source", 100),)),

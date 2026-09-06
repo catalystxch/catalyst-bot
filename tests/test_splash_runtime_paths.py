@@ -420,7 +420,7 @@ def test_splash_output_reader_groups_fragmented_hook_connection_failure(monkeypa
             [
                 "error trying to connectReceived Offer: offer1abc123\n",
                 "No connection could be made because the target machine actively "
-                "refused it. (os error 10061)\n",
+                + "refused it. (os error 10061)\n",
                 "error sending requestReceived Offer: offer1def456\n",
                 ": tcp connect error\n",
                 " (os error Received Offer: offer1fedcba\n",

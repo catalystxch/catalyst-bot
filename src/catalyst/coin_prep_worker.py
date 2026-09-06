@@ -2193,7 +2193,11 @@ class CoinPrepWorker:
                         asset=asset,
                         coin_id=coin_id,
                         amount_mojos=amount,
-                        purpose=reusable.purpose if reusable else "",
+                        purpose=(
+                            "reserve"
+                            if is_protected
+                            else (reusable.purpose if reusable else "")
+                        ),
                         selectable=True,
                         protected=is_protected,
                     )
