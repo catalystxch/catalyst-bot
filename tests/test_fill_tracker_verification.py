@@ -204,6 +204,63 @@ class FillTrackerVerificationTests(unittest.TestCase):
             any(evt == "fill_verify_exhausted" for _, evt, _, _ in self.logged)
         )
 
+    def test_exhausted_pending_reverify_stops_retrying_and_logging_errors(self):
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-retry-exhausted"
+        live_trade_id = "trade-still-live"
+        verification_calls = []
+        tracker._verify_fill_on_chain = lambda *args: (
+            verification_calls.append(args) or "unverified"
+        )
+        tracker._previous_ids["buy"] = {live_trade_id}
+        tracker._previous_ids["sell"] = set()
+        tracker._pending_reverify[trade_id] = {
+            "side": "buy",
+            "attempts": tracker._pending_reverify_max_attempts - 1,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+
+        tracker.detect_fills({live_trade_id}, set(), {})
+        tracker.detect_fills({live_trade_id}, set(), {})
+
+        pending = tracker._pending_reverify[trade_id]
+        self.assertEqual(pending["attempts"], tracker._pending_reverify_max_attempts)
+        self.assertEqual(len(verification_calls), 1)
+        exhausted_events = [
+            evt
+            for _, evt, _, _ in self.logged
+            if evt == "fill_verify_exhausted_blocked"
+        ]
+        self.assertEqual(exhausted_events, ["fill_verify_exhausted_blocked"])
+
+    def test_rejected_pending_reverify_reports_exhaustion_once_at_budget(self):
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-rejected-exhausted"
+        live_trade_id = "trade-still-live"
+        tracker._verify_fill_on_chain = lambda *_args: "rejected"
+        tracker._previous_ids["buy"] = {live_trade_id}
+        tracker._previous_ids["sell"] = set()
+        tracker._pending_reverify[trade_id] = {
+            "side": "sell",
+            "attempts": tracker._pending_reverify_max_attempts - 1,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+
+        tracker.detect_fills({live_trade_id}, set(), {})
+        tracker.detect_fills({live_trade_id}, set(), {})
+
+        pending = tracker._pending_reverify[trade_id]
+        self.assertEqual(pending["attempts"], tracker._pending_reverify_max_attempts)
+        self.assertNotIn((trade_id, "cancelled"), self.status_updates)
+        exhausted_events = [
+            evt
+            for _, evt, _, _ in self.logged
+            if evt == "fill_verify_exhausted_blocked"
+        ]
+        self.assertEqual(exhausted_events, ["fill_verify_exhausted_blocked"])
+
     def test_new_unverified_fill_during_spacescan_backoff_starts_at_zero_attempts(
         self,
     ):
