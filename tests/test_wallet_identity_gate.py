@@ -329,7 +329,7 @@ def test_rejected_unsigned_submission_preserves_adapter_no_effect(monkeypatch):
 
     exits = []
     fake_adapter = SimpleNamespace(
-        get_wallet_identity=lambda: _identity(),
+        get_wallet_identity=_identity,
         submit_built_transaction_rpc=lambda *args, **kwargs: {
             "success": False,
             "error": "Unsigned transaction effect was not validated",

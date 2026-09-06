@@ -618,7 +618,7 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
         source_coin_ids=[source],
         fee_coin_ids=[fee_source],
     )
-    prepared = database.prepare_coin_prep_operation(
+    database.prepare_coin_prep_operation(
         operation_kind="split",
         purpose="replacement",
         source_coin_ids=[source],
@@ -627,7 +627,7 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
         evidence_json={"pre_view_coin_ids": [source, fee_source]},
         effect_claim_token=claim["claim_token"],
         effect_claim_generation=claim["generation"],
-    )["operation"]
+    )
     output_cat = hashlib.sha256(b"batch-output-cat").hexdigest()
     output_change = hashlib.sha256(b"batch-output-change").hexdigest()
     constructed = [

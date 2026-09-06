@@ -290,6 +290,7 @@ def api_splash_incoming():
             try:
                 bot.splash_node.note_webhook_delivery()
             except Exception:
+                # Delivery accounting must not reject an already persisted offer.
                 pass
 
         if was_new:
