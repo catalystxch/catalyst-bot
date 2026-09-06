@@ -4,7 +4,6 @@ from unittest.mock import Mock
 
 import pytest
 
-import api_server  # noqa: F401 - initialise the Flask owner before its blueprints
 from blueprints import market
 
 

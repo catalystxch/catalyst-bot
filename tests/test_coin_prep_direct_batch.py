@@ -9,7 +9,6 @@ import pytest
 import coin_prep_worker
 import wallet
 from coin_prep_batch_plan import (
-    BatchConstraints,
     BatchPlan,
     CoinSnapshot,
     PlannedOutput,
