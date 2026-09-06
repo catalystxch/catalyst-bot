@@ -935,6 +935,36 @@ def test_transient_durable_heartbeat_failure_retries_before_process_fence(
     assert gate.status().allowed is True
 
 
+def test_heartbeat_survives_two_transient_database_lock_failures(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    real_heartbeat = database.heartbeat_runtime_mutation_lease
+    calls = 0
+
+    def transient_contention(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_heartbeat(**kwargs)
+
+    monkeypatch.setattr(
+        database,
+        "heartbeat_runtime_mutation_lease",
+        transient_contention,
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is True
+    assert calls == 3
+    assert gate.status().allowed is True
+
+
 def test_release_uses_exact_owner_and_version_and_cannot_be_reused(
     isolated_gate_database,
 ):
@@ -7732,20 +7762,33 @@ def _standalone_test_environment(tmp_path: Path, data_dir: Path, port: int) -> d
     # deterministic, non-secret test identity instead of inheriting operator
     # configuration (or failing closed as unconfigured).
     env["CATALYST_NETWORK_ID"] = "mainnet"
+    # On Windows a venv ``python.exe`` may be a launcher process whose PID is
+    # different from the interpreter it starts.  The ownership tests compare
+    # Popen.pid with CATalyst's durable os.getpid(), so run the base interpreter
+    # directly and expose the active venv packages through PYTHONPATH.
+    active_site_packages = [
+        path for path in sys.path if path.lower().endswith("site-packages")
+    ]
     env["PYTHONPATH"] = os.pathsep.join(
         [
             str(support),
             str(Path(__file__).parents[1] / "src" / "catalyst"),
             str(Path(__file__).parents[1]),
+            *active_site_packages,
         ]
     )
     return env
 
 
 def _start_standalone_process(env: dict) -> subprocess.Popen:
+    executable = (
+        getattr(sys, "_base_executable", sys.executable)
+        if sys.platform == "win32"
+        else sys.executable
+    )
     return subprocess.Popen(
         [
-            sys.executable,
+            executable,
             str(Path(__file__).parents[1] / "src" / "catalyst" / "api_server.py"),
         ],
         cwd=Path(__file__).parents[1],

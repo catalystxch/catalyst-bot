@@ -5,6 +5,7 @@ import ast
 import inspect
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -228,6 +229,76 @@ def test_exported_mutation_reads_identity_again_after_preflight(monkeypatch):
     assert checked == ["wallet:create_offer"]
     assert adapter_calls == []
     assert identities == []
+
+
+def test_parallel_mutations_validate_identity_observations_in_read_order(monkeypatch):
+    """A newer concurrent snapshot must not invalidate an earlier in-flight read."""
+
+    older_waiting = threading.Event()
+    newer_validated = threading.Event()
+    latest_observed = [""]
+    latest_lock = threading.Lock()
+
+    def get_wallet_identity():
+        observed_at = (
+            "2026-08-16T11:59:58.000000Z"
+            if threading.current_thread().name == "older-identity"
+            else "2026-08-16T11:59:59.000000Z"
+        )
+        return _identity(observed_at_utc=observed_at)
+
+    fake_adapter = SimpleNamespace(
+        get_wallet_identity=get_wallet_identity,
+        create_offer=lambda *args, **kwargs: {"success": True},
+    )
+
+    def require_identity(_binding_value, snapshot, operation):
+        observed_at = snapshot["observed_at_utc"]
+        if threading.current_thread().name == "older-identity":
+            older_waiting.set()
+            newer_validated.wait(timeout=0.25)
+        with latest_lock:
+            if latest_observed[0] and observed_at <= latest_observed[0]:
+                raise mutation_gate.MutationBlocked("WALLET_IDENTITY_STALE", operation)
+            latest_observed[0] = observed_at
+        if threading.current_thread().name == "newer-identity":
+            newer_validated.set()
+        return {"allowed": True, "observed_at_utc": observed_at}
+
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(wallet, "_wallet_adapter", fake_adapter)
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_wallet_mutation",
+        lambda operation: f"permit:{threading.current_thread().name}",
+    )
+    monkeypatch.setattr(mutation_gate, "exit_wallet_mutation", lambda permit: True)
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_wallet_mutation_permit_authority",
+        lambda permit, operation: (_binding(), fake_adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate, "require_fresh_wallet_identity", require_identity
+    )
+
+    results = {}
+
+    def create(label):
+        results[label] = wallet.create_offer({1: -1, 2: 1}, validate_only=False)
+
+    older = threading.Thread(target=create, args=("older",), name="older-identity")
+    newer = threading.Thread(target=create, args=("newer",), name="newer-identity")
+    older.start()
+    assert older_waiting.wait(timeout=2)
+    newer.start()
+    older.join(timeout=3)
+    newer.join(timeout=3)
+
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert results["older"]["success"] is True
+    assert results["newer"]["success"] is True
 
 
 @pytest.mark.parametrize(

@@ -212,6 +212,33 @@ class TestSplashReceiveDB(_TempDB):
         connection.rollback.assert_called_once()
         connection.commit.assert_called_once()
 
+    def test_repeated_database_locks_are_retried_before_webhook_failure(self):
+        """Ladder writes can hold SQLite past the first retry on Windows."""
+
+        connection = MagicMock()
+        attempts = {"select": 0}
+
+        def execute(sql, _params=()):
+            if "SELECT id FROM splash_incoming_offers" in sql:
+                attempts["select"] += 1
+                if attempts["select"] <= 2:
+                    raise sqlite3.OperationalError("database is locked")
+                return MagicMock(fetchone=MagicMock(return_value=None))
+            return MagicMock()
+
+        connection.execute.side_effect = execute
+        with patch("database.get_connection", return_value=connection):
+            result = _db.record_splash_incoming(
+                _VALID_OFFER,
+                "repeated-lock-fingerprint",
+                source_ip="127.0.0.1",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(attempts["select"], 3)
+        self.assertEqual(connection.rollback.call_count, 2)
+        connection.commit.assert_called_once()
+
     def test_transient_database_lock_is_retried_before_status_update_is_lost(self):
         """A brief competing write must not leave a classified offer as new."""
 

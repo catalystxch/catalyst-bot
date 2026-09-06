@@ -23,11 +23,11 @@ import sys
 import threading
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 
-from flask import Blueprint, Response, g, jsonify, request, send_file
+from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
 
 import api_server
 from config import cfg
@@ -2885,15 +2885,25 @@ def api_fills_export():
 @bp.route("/api/logs/clear", methods=["POST"])
 def api_logs_clear():
     """Clear the GUI log panel (hides older events, keeps them in DB for debug download)."""
-    bot = api_server.bot
-    from datetime import datetime, timezone
-
-    api_server._logs_cleared_at = datetime.now(timezone.utc).isoformat()
+    server = current_app.config.get("_CATALYST_API_SERVER_MODULE") or api_server
+    with server._logs_clear_lock:
+        cleared_at = datetime.now(timezone.utc)
+        previous_text = server._logs_cleared_at
+        if isinstance(previous_text, str) and previous_text:
+            try:
+                previous = datetime.fromisoformat(previous_text.replace("Z", "+00:00"))
+                if previous.tzinfo is None:
+                    previous = previous.replace(tzinfo=timezone.utc)
+                if cleared_at <= previous:
+                    cleared_at = previous + timedelta(microseconds=1)
+            except ValueError:
+                pass
+        server._logs_cleared_at = cleared_at.isoformat()
     # Persist to database so it survives restarts
     try:
         from database import set_setting
 
-        set_setting("logs_cleared_at", api_server._logs_cleared_at)
+        set_setting("logs_cleared_at", server._logs_cleared_at)
     except Exception:
         pass
     return jsonify({"success": True, "message": "Log panel cleared"})

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from unittest.mock import MagicMock, patch
@@ -131,6 +132,30 @@ class TestLogsClear(_FlaskBase):
             self._post("/api/logs/clear")
         self.assertIsNotNone(api_server._logs_cleared_at)
         self.assertNotEqual(api_server._logs_cleared_at, original)
+
+    def test_clear_updates_the_flask_app_owner_after_module_reference_rebind(self):
+        """A stale blueprint import must not receive shared app state writes."""
+
+        from blueprints import coin_prep
+
+        owner_before = "owner-before-clear"
+        stale = types.SimpleNamespace(
+            bot=None,
+            _logs_cleared_at="stale-before-clear",
+        )
+        original = api_server._logs_cleared_at
+        api_server._logs_cleared_at = owner_before
+        try:
+            with (
+                patch.object(coin_prep, "api_server", stale),
+                patch("database.set_setting"),
+            ):
+                response = self._post("/api/logs/clear")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotEqual(api_server._logs_cleared_at, owner_before)
+            self.assertEqual(stale._logs_cleared_at, "stale-before-clear")
+        finally:
+            api_server._logs_cleared_at = original
 
 
 # ---------------------------------------------------------------------------

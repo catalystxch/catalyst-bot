@@ -607,6 +607,18 @@ def api_cancel_all():
                                 f"proof for {_remaining_count} offer(s)."
                             )
                         time.sleep(min(1.0, _remaining_seconds))
+                    durable_manager.expect_empty_wallet_offer_book(
+                        "manual_cancel_all_confirmed"
+                    )
+                    try:
+                        durable_manager.sync_from_wallet()
+                    except Exception as sync_error:
+                        log_event(
+                            "warning",
+                            "cancel_all_wallet_snapshot_refresh_failed",
+                            "Cancel All completed, but the stopped wallet offer "
+                            f"snapshot could not refresh: {type(sync_error).__name__}",
+                        )
                     _set_cancel_all_state(
                         running=False,
                         complete=True,
