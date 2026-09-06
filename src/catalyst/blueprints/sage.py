@@ -198,6 +198,7 @@ def api_fingerprint():
                             }
                         )
                 except Exception:
+                    # An unavailable runtime binding falls through to not-started.
                     pass
             return jsonify({"fingerprint": "", "source": "not_started"})
 

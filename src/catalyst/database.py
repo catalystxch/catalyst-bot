@@ -18937,6 +18937,7 @@ def record_splash_incoming(
             try:
                 conn.rollback()
             except Exception:
+                # Preserve the original Splash insert error if rollback also fails.
                 pass
             if attempt == 0 and _sqlite_locked(e):
                 continue
@@ -19012,6 +19013,7 @@ def update_splash_incoming_status(
             try:
                 conn.rollback()
             except Exception:
+                # Preserve the original Splash update error if rollback also fails.
                 pass
             if attempt == 0 and _sqlite_locked(e):
                 continue
