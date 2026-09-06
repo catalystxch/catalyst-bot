@@ -6551,17 +6551,6 @@ class CoinManager:
                     xch_tier_mojos,
                     is_cat=False,
                 )
-                _cat_absorbed = (
-                    self._absorb_misfits_to_reserve(
-                        "CAT",
-                        cfg.CAT_WALLET_ID,
-                        cat_inv,
-                        cat_tier_mojos,
-                        is_cat=True,
-                    )
-                    if cfg.ENABLE_SELL
-                    else False
-                )
                 if _xch_absorbed:
                     # XCH reserve consumed — block ALL further ops this cycle.
                     # Sage returns pending coins as selectable, so without this
@@ -6577,6 +6566,17 @@ class CoinManager:
                         "deferred to next cycle (awaiting on-chain confirmation)",
                     )
                     return
+                _cat_absorbed = (
+                    self._absorb_misfits_to_reserve(
+                        "CAT",
+                        cfg.CAT_WALLET_ID,
+                        cat_inv,
+                        cat_tier_mojos,
+                        is_cat=True,
+                    )
+                    if cfg.ENABLE_SELL
+                    else False
+                )
                 if _cat_absorbed:
                     # CAT reserve consumed — CAT tier splits are deferred this
                     # cycle (the pending absorption coin must confirm first).

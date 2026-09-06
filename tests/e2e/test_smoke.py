@@ -1182,6 +1182,53 @@ def test_reload_restores_active_cancel_all_progress_before_resume_prompt(page):
     }
 
 
+def test_cancel_all_completion_clears_stale_resume_dashboard(page):
+    """An empty authoritative wallet book must leave session-recovery mode."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            _resumeSessionSummary = {
+                pair_name: 'Monkeyzoo Token',
+                buy_count: 36,
+                sell_count: 36,
+                offer_count: 72,
+                active_cat: { asset_id: 'mz', name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH' },
+            };
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            _cancelAllInProgress = true;
+            _cancelAllOperationGeneration = 4;
+            addLogEntry = () => {};
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true,
+                running: false,
+                complete: true,
+                phase: 'complete',
+                total: 72,
+                cancelled: 72,
+                confirmed: 72,
+                pending: 0,
+                failed: 0,
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+            await pollCancelAllProgressOnce(72, 4);
+            updateDashboardStartupLayout(bot_state);
+            return {
+                summaryCleared: _resumeSessionSummary === null,
+                kicker: document.getElementById('startupGuideKicker').textContent,
+                title: document.getElementById('startupGuideTitle').textContent,
+            };
+        }"""
+    )
+
+    assert result == {
+        "summaryCleared": True,
+        "kicker": "Quick Start",
+        "title": "Set up this trading pair before you start the bot",
+    }
+
+
 def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
     """A previous completion must not prematurely finish a new wallet request."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
