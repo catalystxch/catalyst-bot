@@ -84,6 +84,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                     }
                 break
         except (InvalidOperation, ValueError, TypeError, AttributeError):
+            # Invalid TibetSwap reserve data leaves startup pricing unavailable.
             pass
         if not price and ticker:
             try:
@@ -126,6 +127,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                 TypeError,
                 AttributeError,
             ):
+                # A failed Dexie fallback leaves startup pricing unavailable.
                 pass
         _STARTUP_PRICE_CACHE.update(
             key=key,
@@ -313,6 +315,7 @@ def api_market_intel():
             ):
                 mid_price = (public_bid + public_ask) / Decimal("2")
         except (InvalidOperation, ValueError, TypeError, AttributeError):
+            # Malformed public quotes cannot supply a safe executable midpoint.
             pass
 
     try:
