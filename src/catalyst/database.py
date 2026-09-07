@@ -8342,7 +8342,7 @@ def get_offer_lifecycle_summary(cat_asset_id: str = None) -> Dict:
         summary["by_lifecycle"][lifecycle] = (
             summary["by_lifecycle"].get(lifecycle, 0) + count
         )
-        if lifecycle in ("cancel_requested", "cancel_sent"):
+        if status == "open" and lifecycle in ("cancel_requested", "cancel_sent"):
             summary["pending_cancel"] += count
 
     return summary

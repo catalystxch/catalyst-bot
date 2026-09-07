@@ -1545,7 +1545,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         smart_topup.assert_called_once()
         self.assertEqual(smart_topup.call_args.args[0], "CAT-inner")
 
-    def test_topup_uses_sell_cap_for_sell_offer_deficit_scan(self):
+    def test_topup_uses_sell_cap_then_stops_after_xch_misfit_absorption(self):
         manager = self._make_manager()
         manager._topup_is_drip = True
 
@@ -1675,7 +1675,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             )
             manager._topup_worker(active_buy=45, active_sell=44)
 
-        self.assertIn("XCH", absorb_calls)
+        self.assertEqual(absorb_calls, ["XCH"])
         self.assertNotIn(
             "topup_missing_offers_prioritized",
             [call.args[1] for call in log_event.call_args_list],

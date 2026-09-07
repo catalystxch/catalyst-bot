@@ -518,6 +518,30 @@ class TestOfferLifecycleSummary(_TempDB):
         self.assertEqual(summary["by_lifecycle"]["cancel_requested"], 1)
         self.assertEqual(summary["pending_cancel"], 1)
 
+    def test_terminal_offer_with_stale_cancel_lifecycle_is_not_pending(self):
+        _db.add_offer(
+            "historical-cancel",
+            "buy",
+            Decimal("1.00"),
+            Decimal("0.5"),
+            Decimal("500"),
+            "assetA",
+        )
+        conn = _db.get_connection()
+        conn.execute(
+            """
+            UPDATE offers
+            SET status='cancelled', lifecycle_state='cancel_requested'
+            WHERE trade_id='historical-cancel'
+            """
+        )
+        conn.commit()
+
+        summary = _db.get_offer_lifecycle_summary(cat_asset_id="assetA")
+
+        self.assertEqual(summary["by_lifecycle"]["cancel_requested"], 1)
+        self.assertEqual(summary["pending_cancel"], 0)
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestRecordFill(_TempDB):

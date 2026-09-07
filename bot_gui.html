@@ -32418,6 +32418,16 @@
                 if (!_cancelAllInProgress && statusPhase !== 'complete' && statusPhase !== 'error') {
                     return;
                 }
+                const terminalEmptyBook = statusPhase === 'complete'
+                    && Number(status.pending || 0) === 0
+                    && Number(status.failed || 0) === 0
+                    && Number(status.cancelled || 0) >= Number(status.total || 0);
+                if (terminalEmptyBook) {
+                    // The resume summary is a startup snapshot. Once Sage has
+                    // authoritatively proved every cancellation terminal, it
+                    // must not keep the dashboard in previous-session mode.
+                    clearResumeSessionSummary();
+                }
                 // Cache for _get_cancel_all_state_local()
                 _cancelAllLastState = status;
 
