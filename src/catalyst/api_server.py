@@ -459,7 +459,22 @@ def _write_endpoint_requires_mutation(endpoint: str) -> bool:
 
 # Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
 # webhook flood cannot amplify into runaway DB writes.
-_SPLASH_RATE_LIMIT = {"window_s": 1.0, "hits": [], "lock": threading.Lock()}
+_SPLASH_RATE_LIMIT = {
+    "window_s": 1.0,
+    "hits": [],
+    "rejected_total": 0,
+    "lock": threading.Lock(),
+}
+_SPLASH_RECENT_DELIVERIES = {
+    # Only successfully persisted/acknowledged fingerprints enter this cache.
+    # That lets Splash retry transient failures while repeated network gossip is
+    # acknowledged without consuming the small DB-write allowance.
+    "fingerprints": {},
+    "duplicate_total": 0,
+    "lock": threading.Lock(),
+}
+_SPLASH_RECENT_DELIVERY_TTL_S = 300.0
+_SPLASH_RECENT_DELIVERY_MAX = 5000
 _SPLASH_BACKLOG_CACHE = {
     "checked_at": 0.0,
     "new_count": 0,
@@ -495,9 +510,72 @@ def _splash_incoming_rate_limited() -> bool:
         while hits and hits[0] < cutoff:
             hits.pop(0)
         if len(hits) >= _splash_incoming_max_per_sec():
+            _SPLASH_RATE_LIMIT["rejected_total"] = (
+                int(_SPLASH_RATE_LIMIT.get("rejected_total") or 0) + 1
+            )
             return True
         hits.append(now)
         return False
+
+
+def _splash_incoming_recent_duplicate(fingerprint: str) -> bool:
+    """Return True for a recently acknowledged Splash offer fingerprint."""
+
+    now = time.time()
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        fingerprints = _SPLASH_RECENT_DELIVERIES["fingerprints"]
+        seen_at = float(fingerprints.get(cache_key) or 0.0)
+        if seen_at and now - seen_at <= _SPLASH_RECENT_DELIVERY_TTL_S:
+            # Refresh insertion order so a frequently repeated offer remains
+            # cheap to acknowledge without growing the bounded cache.
+            fingerprints.pop(cache_key, None)
+            fingerprints[cache_key] = now
+            _SPLASH_RECENT_DELIVERIES["duplicate_total"] = (
+                int(_SPLASH_RECENT_DELIVERIES.get("duplicate_total") or 0) + 1
+            )
+            return True
+        if seen_at:
+            fingerprints.pop(cache_key, None)
+        return False
+
+
+def _splash_incoming_note_delivery(fingerprint: str) -> None:
+    """Remember a successfully acknowledged offer without retaining its body."""
+
+    now = time.time()
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        fingerprints = _SPLASH_RECENT_DELIVERIES["fingerprints"]
+        fingerprints.pop(cache_key, None)
+        fingerprints[cache_key] = now
+        while len(fingerprints) > _SPLASH_RECENT_DELIVERY_MAX:
+            oldest = next(iter(fingerprints))
+            fingerprints.pop(oldest, None)
+
+
+def _splash_incoming_clear_recent_deliveries() -> None:
+    """Clear ephemeral acknowledgements when their backing DB rows are reset."""
+
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        _SPLASH_RECENT_DELIVERIES["fingerprints"].clear()
+
+
+def _splash_incoming_backpressure_stats() -> Dict[str, int]:
+    """Return bounded, non-sensitive counters for Splash webhook diagnostics."""
+
+    with _SPLASH_RATE_LIMIT["lock"]:
+        rate_limited_total = int(_SPLASH_RATE_LIMIT.get("rejected_total") or 0)
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        duplicate_bypassed_total = int(
+            _SPLASH_RECENT_DELIVERIES.get("duplicate_total") or 0
+        )
+        recent_fingerprints = len(_SPLASH_RECENT_DELIVERIES["fingerprints"])
+    return {
+        "rate_limited_total": rate_limited_total,
+        "duplicate_bypassed_total": duplicate_bypassed_total,
+        "recent_fingerprints": recent_fingerprints,
+    }
 
 
 def _splash_incoming_backlog_full() -> bool:
@@ -4435,6 +4513,7 @@ def _reset_runtime_session_stats() -> Dict:
         from database import clear_splash_incoming
 
         reset_summary["splash_incoming_cleared"] = int(clear_splash_incoming() or 0)
+        _splash_incoming_clear_recent_deliveries()
     except Exception:
         reset_summary["splash_incoming_cleared"] = 0
 
@@ -4676,6 +4755,7 @@ def _reset_fresh_run_session(
             from database import clear_splash_incoming
 
             summary["splash_incoming_cleared"] = int(clear_splash_incoming() or 0)
+            _splash_incoming_clear_recent_deliveries()
         except Exception:
             summary["splash_incoming_cleared"] = 0
 
@@ -6267,6 +6347,7 @@ if __name__ == "__main__":
         from database import clear_splash_incoming
 
         clear_splash_incoming()
+        _splash_incoming_clear_recent_deliveries()
     except Exception:
         pass
 
