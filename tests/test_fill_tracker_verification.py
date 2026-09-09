@@ -47,6 +47,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.recorded = []
         self.status_updates = []
         self.lifecycle_updates = []
+        self.fills = []
         self.db_offer = {"trade_id": "", "coin_id": "0xcoin123"}
 
         fake_config = types.ModuleType("config")
@@ -62,6 +63,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
             **self.db_offer,
             "trade_id": trade_id,
         }
+        fake_database.get_fills = lambda *args, **kwargs: list(self.fills)
         fake_database.get_offer_coin_usage_summary = lambda coin_id, cat_asset_id=None: {
             "coin_id": coin_id,
             "offer_count": 1,
@@ -203,6 +205,68 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertFalse(
             any(evt == "fill_verify_exhausted" for _, evt, _, _ in self.logged)
         )
+
+    def test_pending_reverify_drops_offer_already_terminalized_as_cancelled(self):
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-authoritatively-cancelled"
+        tracker._pending_reverify[trade_id] = {
+            "side": "sell",
+            "attempts": 1,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+        self.db_offer = {
+            "trade_id": trade_id,
+            "coin_id": "0xcoin123",
+            "status": "cancelled",
+            "lifecycle_state": "cancelled",
+        }
+        verification_calls = []
+        tracker._verify_fill_on_chain = lambda *args: (
+            verification_calls.append(args) or "filled"
+        )
+
+        result = tracker._retry_pending_reverify({})
+
+        self.assertEqual(result, {"buy_fills": [], "sell_fills": []})
+        self.assertNotIn(trade_id, tracker._pending_reverify)
+        self.assertEqual(verification_calls, [])
+
+    def test_pending_reverify_emits_offer_already_terminalized_as_filled(self):
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "trade-authoritatively-filled"
+        tracker._pending_reverify[trade_id] = {
+            "side": "buy",
+            "attempts": 1,
+            "first_seen": 0,
+            "local_clock_expired": False,
+        }
+        self.db_offer = {
+            "trade_id": trade_id,
+            "coin_id": "0xcoin-filled",
+            "cat_asset_id": "asset-test",
+            "price_xch": "0.0001",
+            "size_xch": "1.25",
+            "size_cat": "12500",
+            "tier": "inner",
+            "status": "filled",
+            "lifecycle_state": "filled",
+        }
+        self.fills = [{"fill_id": 987, "trade_id": trade_id}]
+        verification_calls = []
+        tracker._verify_fill_on_chain = lambda *args: (
+            verification_calls.append(args) or "filled"
+        )
+
+        result = tracker._retry_pending_reverify(
+            {trade_id: {"dexie_link": "https://dexie.space/offers/test"}}
+        )
+
+        self.assertNotIn(trade_id, tracker._pending_reverify)
+        self.assertEqual(verification_calls, [])
+        self.assertEqual(len(result["buy_fills"]), 1)
+        self.assertEqual(result["buy_fills"][0]["fill_id"], 987)
+        self.assertEqual(result["buy_fills"][0]["trade_id"], trade_id)
 
     def test_exhausted_pending_reverify_stops_retrying_and_logging_errors(self):
         tracker = self.fill_tracker.FillTracker()
