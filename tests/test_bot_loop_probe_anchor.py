@@ -407,8 +407,9 @@ class ProbeAnchorTests(unittest.TestCase):
     def tearDown(self):
         self._cfg_patcher.stop()
 
-    def test_submitted_cancel_retry_ends_cycle_before_later_wallet_mutations(self):
+    def test_submitted_cancel_retry_keeps_bot_alive_for_next_proof_poll(self):
         loop = bot_loop.BotLoop()
+        loop._running = True
         loop.offer_manager.retry_failed_cancels = lambda: -1
         events = []
         stop_calls = []
@@ -436,7 +437,8 @@ class ProbeAnchorTests(unittest.TestCase):
                 for _, event, _, _ in events
             )
         )
-        self.assertEqual(stop_calls, [False])
+        self.assertEqual(stop_calls, [])
+        self.assertTrue(loop._running)
 
     def test_exact_cancel_settlement_window_is_the_only_deferred_safety_stop(self):
         import database as runtime_database

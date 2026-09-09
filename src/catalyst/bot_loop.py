@@ -8290,12 +8290,9 @@ class BotLoop:
                 "warning",
                 "cancel_retry_waiting_for_confirmation",
                 "A submitted cancel is awaiting authoritative confirmation; "
-                "ending this cycle before any later wallet mutation",
+                "pausing this cycle before any later wallet mutation and "
+                "keeping the bot active for the next proof poll",
             )
-            try:
-                self.stop(wait=False)
-            except TypeError:
-                self.stop()
             return False
         if retried > 0:
             suffix = "" if retried == 1 else "s"
