@@ -1887,9 +1887,7 @@ class BotLoop:
                 if age_secs < grace:
                     continue
                 if self._offer_expiry_elapsed(offer, now):
-                    retry_after = getattr(
-                        self, "_db_only_offer_reconcile_after", {}
-                    )
+                    retry_after = getattr(self, "_db_only_offer_reconcile_after", {})
                     self._db_only_offer_reconcile_after = retry_after
                     if now >= float(retry_after.get(tid, 0.0) or 0.0):
                         backoff = max(
@@ -1920,7 +1918,9 @@ class BotLoop:
                                 classification = str(
                                     (proof or {}).get("classification") or ""
                                 )
-                                if bool((proof or {}).get("applied")) and classification in {
+                                if bool(
+                                    (proof or {}).get("applied")
+                                ) and classification in {
                                     EXPIRED_PROVEN,
                                     FILLED_PROVEN,
                                     CANCELLED_PROVEN,
@@ -1928,8 +1928,12 @@ class BotLoop:
                                     retired[side].add(tid)
                                     retry_after.pop(tid, None)
                                     self.offer_manager._recently_created.pop(tid, None)
-                                    self.offer_manager._offer_details_cache.pop(tid, None)
-                                    self.offer_manager._pending_cancel_retries.pop(tid, None)
+                                    self.offer_manager._offer_details_cache.pop(
+                                        tid, None
+                                    )
+                                    self.offer_manager._pending_cancel_retries.pop(
+                                        tid, None
+                                    )
                                     log_event(
                                         "info",
                                         "db_only_offer_authoritatively_reconciled",
