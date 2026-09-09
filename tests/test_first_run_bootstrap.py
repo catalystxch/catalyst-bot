@@ -7,6 +7,8 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 
 def _import_desktop_app(monkeypatch):
     """Import without letting Windows stream setup detach pytest capture."""
@@ -445,13 +447,18 @@ def test_legacy_bootstrap_rejects_switching_away_from_pinned_fingerprint(monkeyp
     }
 
 
-def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(monkeypatch):
+@pytest.mark.parametrize(
+    "blocked_reason", ["UNRESOLVED_OPERATIONS", "TASK8_BINDING_CONFLICT"]
+)
+def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(
+    monkeypatch, blocked_reason
+):
     import api_server
 
     calls = []
     authorizations = iter(
         [
-            {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"},
+            {"allowed": False, "reason_code": blocked_reason},
             {"allowed": True, "reason_code": ""},
         ]
     )

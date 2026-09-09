@@ -311,6 +311,150 @@ def test_submitted_cancel_is_recovered_from_exact_authoritative_sage_proof(
     assert calls[2][2]["evidence"] is evidence
 
 
+def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart():
+    """Startup must preserve the shared Sage transaction proof for every member."""
+    import legacy_startup_recovery
+
+    trade_ids = ["a" * 64, "b" * 64]
+    intent_ids = ["c" * 64, "d" * 64]
+    cohort_id = "cancel-cohort:" + "e" * 64
+    operation_ids = [f"cancel:{trade_id}" for trade_id in trade_ids]
+    intents = {
+        intent_id: {
+            "intent_id": intent_id,
+            "sage_trade_id": trade_id,
+            "lifecycle_state": "created",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "asset_id": ASSET_ID,
+            "side": "buy",
+            "tier": "inner",
+            "selected_coin_ids": [f"{index + 6:064x}"],
+        }
+        for index, (intent_id, trade_id) in enumerate(zip(intent_ids, trade_ids))
+    }
+    blockers = {
+        operation_id: {
+            "operation_id": operation_id,
+            "operation_type": "CANCEL",
+            "intent_id": intent_id,
+            "phase": "FINALIZED",
+            "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+            "blocks_mutation": 1,
+            "evidence_json": json.dumps({"cohort_id": cohort_id}),
+        }
+        for operation_id, intent_id in zip(operation_ids, intent_ids)
+    }
+    manifest = {
+        "cohort_id": cohort_id,
+        "manifest_sha256": "f" * 64,
+        "member_count": 2,
+        "members": [
+            {
+                "operation_id": operation_id,
+                "intent_id": intent_id,
+                "trade_id": trade_id,
+                "attempt": 1,
+                "prepared_event_id": f"{operation_id}:attempt:1:prepared",
+                "member_id": f"cancel-member:{index + 1:064x}",
+            }
+            for index, (operation_id, intent_id, trade_id) in enumerate(
+                zip(operation_ids, intent_ids, trade_ids)
+            )
+        ],
+    }
+    active = set(operation_ids)
+    evidence = {"observed_at": AT}
+    calls = []
+
+    def current_blockers():
+        return [
+            blockers[operation_id]
+            for operation_id in operation_ids
+            if operation_id in active
+        ]
+
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [],
+        get_unresolved_offer_operation_blockers=current_blockers,
+        get_offer_intent=lambda intent_id: intents.get(intent_id),
+        get_offer_cancel_cohort_manifest=lambda requested: (
+            manifest if requested == cohort_id else None
+        ),
+        validate_offer_cancel_cohort_manifest=lambda value: value,
+        get_offer_cancel_cohort_prepared_events=lambda requested: (
+            [
+                {
+                    "operation_id": operation_id,
+                    "evidence_json": json.dumps(
+                        {
+                            "cohort_id": cohort_id,
+                            "wallet_effect": {
+                                "batch": {
+                                    "protocol": (
+                                        "sage_native_cancel_offers_zero_plus_fee_v1"
+                                    )
+                                }
+                            },
+                        }
+                    ),
+                }
+                for operation_id in operation_ids
+            ]
+            if requested == cohort_id
+            else []
+        ),
+    )
+
+    def derive_bulk(supplied_manifest, blocking_operation_ids, supplied, **kwargs):
+        calls.append(("bulk_context", list(blocking_operation_ids), kwargs))
+        assert supplied_manifest is manifest
+        assert supplied is evidence
+        assert blocking_operation_ids == [
+            operation_id for operation_id in operation_ids if operation_id in active
+        ]
+        return {"cohort_id": cohort_id, "members": supplied_manifest["members"]}
+
+    def reconcile(intent_id, **kwargs):
+        calls.append(("reconcile", intent_id, kwargs))
+        active.remove(f"cancel:{intents[intent_id]['sage_trade_id']}")
+        return {"classification": "CANCELLED_PROVEN", "applied": True}
+
+    reconciliation = SimpleNamespace(
+        EXPIRED_PROVEN="EXPIRED_PROVEN",
+        CANCELLED_PROVEN="CANCELLED_PROVEN",
+        FILLED_PROVEN="FILLED_PROVEN",
+        load_authoritative_evidence=lambda target, wallet_facade=None: evidence,
+        _derive_single_cancel_context=lambda *_args, **_kwargs: pytest.fail(
+            "native bulk cancellation must not be reduced to one member"
+        ),
+        _derive_sage_bulk_cancel_context=derive_bulk,
+        classify_terminal_evidence=lambda *_args, **_kwargs: {
+            "classification": "CANCELLED_PROVEN",
+            "reason_code": "EXACT_CANCEL_RETURN_PROOF",
+        },
+        reconcile_offer=reconcile,
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=SimpleNamespace(),
+        database_module=database,
+        reconciliation_module=reconciliation,
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 2, "recovered": 2, "remaining": 0}
+    assert active == set()
+    assert [call[0] for call in calls] == [
+        "bulk_context",
+        "reconcile",
+        "bulk_context",
+        "reconcile",
+    ]
+
+
 def test_database_legacy_adoption_never_commits_publishable_state(
     tmp_path, monkeypatch
 ):

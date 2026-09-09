@@ -135,6 +135,50 @@ def _atomic_amount(value: Any, scale: Decimal, label: str) -> str:
     return str(int(integral))
 
 
+def _native_bulk_cancel_manifest(blocker: Any, database_module: Any) -> dict | None:
+    """Identify the exact durable Sage bulk cohort owning one blocker."""
+
+    if type(blocker) is not dict:
+        return None
+    try:
+        evidence = json.loads(blocker["evidence_json"])
+        cohort_id = evidence.get("cohort_id") if type(evidence) is dict else None
+        if type(cohort_id) is not str or not cohort_id:
+            return None
+        manifest = database_module.get_offer_cancel_cohort_manifest(cohort_id)
+        validator = getattr(
+            database_module, "validate_offer_cancel_cohort_manifest", None
+        )
+        if callable(validator):
+            manifest = validator(manifest)
+        if (
+            type(manifest) is not dict
+            or manifest.get("member_count", 0) < 2
+            or type(manifest.get("members")) is not list
+            or blocker.get("operation_id")
+            not in {member.get("operation_id") for member in manifest["members"]}
+        ):
+            return None
+        prepared = database_module.get_offer_cancel_cohort_prepared_events(cohort_id)
+        if type(prepared) is not list or len(prepared) != manifest["member_count"]:
+            return None
+        protocols = []
+        for event in prepared:
+            prepared_evidence = json.loads(event["evidence_json"])
+            wallet_effect = (
+                prepared_evidence.get("wallet_effect")
+                if type(prepared_evidence) is dict
+                else None
+            )
+            batch = wallet_effect.get("batch") if type(wallet_effect) is dict else None
+            protocols.append(batch.get("protocol") if type(batch) is dict else None)
+        if set(protocols) != {"sage_native_cancel_offers_zero_plus_fee_v1"}:
+            return None
+        return manifest
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _legacy_intent(
     candidate: Any, wallet_hash: str, network: str, decimals: int
 ) -> dict:
@@ -384,12 +428,38 @@ def recover_legacy_sage_reservations(
             observed_at = (
                 evidence.get("observed_at") if type(evidence) is dict else None
             )
-            cancel_context = reconciliation_module._derive_single_cancel_context(
-                intent,
-                evidence,
-                database_module=database_module,
-                observed_at=observed_at,
-            )
+            bulk_manifest = _native_bulk_cancel_manifest(blocker, database_module)
+            if bulk_manifest is not None:
+                manifest_operation_ids = {
+                    member["operation_id"] for member in bulk_manifest["members"]
+                }
+                current_blockers = (
+                    database_module.get_unresolved_offer_operation_blockers()
+                )
+                blocking_operation_ids = [
+                    row.get("operation_id")
+                    for row in current_blockers
+                    if type(row) is dict
+                    and row.get("operation_id") in manifest_operation_ids
+                    and row.get("blocks_mutation") == 1
+                ]
+                cancel_context = reconciliation_module._derive_sage_bulk_cancel_context(
+                    bulk_manifest,
+                    blocking_operation_ids,
+                    evidence,
+                    database_module=database_module,
+                    observed_at=observed_at,
+                )
+                if type(cancel_context) is not dict:
+                    result["remaining"] += 1
+                    continue
+            else:
+                cancel_context = reconciliation_module._derive_single_cancel_context(
+                    intent,
+                    evidence,
+                    database_module=database_module,
+                    observed_at=observed_at,
+                )
             classification = reconciliation_module.classify_terminal_evidence(
                 intent,
                 evidence,

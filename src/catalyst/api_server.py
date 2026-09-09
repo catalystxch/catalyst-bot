@@ -3633,6 +3633,7 @@ def promote_wallet_setup_bootstrap() -> dict:
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
+        "TASK8_BINDING_CONFLICT",
     }
     if (
         authorization.get("allowed") is not True
