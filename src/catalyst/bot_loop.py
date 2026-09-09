@@ -1842,6 +1842,19 @@ class BotLoop:
         except Exception:
             return 0.0
 
+    def _offer_expiry_elapsed(self, offer: Dict, now_ts: float) -> bool:
+        """Return True only when a persisted offer has a valid elapsed expiry."""
+        expires_at = str((offer or {}).get("expires_at") or "").strip()
+        if not expires_at:
+            return False
+        try:
+            dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp() <= float(now_ts)
+        except Exception:
+            return False
+
     def _retire_wallet_missing_db_offers(
         self,
         db_buy_offers,
@@ -1851,7 +1864,7 @@ class BotLoop:
         wallet_sync_fresh: bool,
         now_ts: Optional[float] = None,
     ) -> Dict[str, set]:
-        """Park DB-only offers; wallet absence is diagnostic, never terminal proof."""
+        """Reconcile elapsed DB-only offers; absence alone is never terminal proof."""
         retired = {"buy": set(), "sell": set()}
         if not wallet_sync_fresh:
             return retired
@@ -1873,6 +1886,74 @@ class BotLoop:
                 age_secs = self._offer_age_seconds(offer, now)
                 if age_secs < grace:
                     continue
+                if self._offer_expiry_elapsed(offer, now):
+                    retry_after = getattr(
+                        self, "_db_only_offer_reconcile_after", {}
+                    )
+                    self._db_only_offer_reconcile_after = retry_after
+                    if now >= float(retry_after.get(tid, 0.0) or 0.0):
+                        backoff = max(
+                            30.0,
+                            float(
+                                getattr(
+                                    cfg,
+                                    "DB_ONLY_OFFER_RETRY_BACKOFF_SECS",
+                                    300,
+                                )
+                                or 300
+                            ),
+                        )
+                        retry_after[tid] = now + backoff
+                        try:
+                            from database import get_offer_intent_by_trade_id
+                            from offer_reconciliation import (
+                                CANCELLED_PROVEN,
+                                EXPIRED_PROVEN,
+                                FILLED_PROVEN,
+                                reconcile_offer,
+                            )
+
+                            intent = get_offer_intent_by_trade_id(tid)
+                            intent_id = str((intent or {}).get("intent_id") or "")
+                            if intent_id:
+                                proof = reconcile_offer(intent_id)
+                                classification = str(
+                                    (proof or {}).get("classification") or ""
+                                )
+                                if bool((proof or {}).get("applied")) and classification in {
+                                    EXPIRED_PROVEN,
+                                    FILLED_PROVEN,
+                                    CANCELLED_PROVEN,
+                                }:
+                                    retired[side].add(tid)
+                                    retry_after.pop(tid, None)
+                                    self.offer_manager._recently_created.pop(tid, None)
+                                    self.offer_manager._offer_details_cache.pop(tid, None)
+                                    self.offer_manager._pending_cancel_retries.pop(tid, None)
+                                    log_event(
+                                        "info",
+                                        "db_only_offer_authoritatively_reconciled",
+                                        f"{side} offer {tid[:16]}... was retired after "
+                                        "exact authoritative terminal proof",
+                                        data={
+                                            "side": side,
+                                            "trade_id": tid,
+                                            "intent_id": intent_id,
+                                            "classification": classification,
+                                            "reason_code": (proof or {}).get(
+                                                "reason_code"
+                                            ),
+                                        },
+                                    )
+                                    continue
+                        except Exception as exc:
+                            log_event(
+                                "warning",
+                                "db_only_offer_reconciliation_failed",
+                                f"Authoritative reconciliation failed for {side} "
+                                f"offer {tid[:16]}...; preserving the open row: {exc}",
+                                data={"side": side, "trade_id": tid},
+                            )
                 log_event(
                     "warning",
                     "db_only_offer_unproven",
