@@ -407,8 +407,9 @@ class ProbeAnchorTests(unittest.TestCase):
     def tearDown(self):
         self._cfg_patcher.stop()
 
-    def test_submitted_cancel_retry_ends_cycle_before_later_wallet_mutations(self):
+    def test_submitted_cancel_retry_keeps_bot_alive_for_next_proof_poll(self):
         loop = bot_loop.BotLoop()
+        loop._running = True
         loop.offer_manager.retry_failed_cancels = lambda: -1
         events = []
         stop_calls = []
@@ -436,7 +437,8 @@ class ProbeAnchorTests(unittest.TestCase):
                 for _, event, _, _ in events
             )
         )
-        self.assertEqual(stop_calls, [False])
+        self.assertEqual(stop_calls, [])
+        self.assertTrue(loop._running)
 
     def test_exact_cancel_settlement_window_is_the_only_deferred_safety_stop(self):
         import database as runtime_database
@@ -912,6 +914,129 @@ class ProbeAnchorTests(unittest.TestCase):
         ]
         self.assertEqual(len(parked_events), 1)
         self.assertEqual(parked_events[0].args[0], "warning")
+
+    def test_wallet_missing_elapsed_offer_retires_only_after_authoritative_proof(self):
+        loop = bot_loop.BotLoop()
+        now_ts = 1000.0
+        created_at = datetime.fromtimestamp(now_ts - 180, timezone.utc).isoformat()
+        expires_at = datetime.fromtimestamp(now_ts - 60, timezone.utc).isoformat()
+        fake_reconciliation = types.ModuleType("offer_reconciliation")
+        fake_reconciliation.EXPIRED_PROVEN = "EXPIRED_PROVEN"
+        fake_reconciliation.FILLED_PROVEN = "FILLED_PROVEN"
+        fake_reconciliation.CANCELLED_PROVEN = "CANCELLED_PROVEN"
+        fake_reconciliation.reconcile_offer = unittest.mock.Mock(
+            return_value={
+                "applied": True,
+                "classification": "EXPIRED_PROVEN",
+                "reason_code": "AUTHORITATIVE_EXPIRY_PROOF",
+            }
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "database": fake_database,
+                    "offer_reconciliation": fake_reconciliation,
+                },
+            ),
+            patch.object(
+                fake_database,
+                "get_offer_intent_by_trade_id",
+                return_value={"intent_id": "intent-expired-sell"},
+                create=True,
+            ),
+            patch.object(
+                fake_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[],
+                create=True,
+            ),
+            patch.object(bot_loop, "log_event") as log_event_mock,
+        ):
+            result = loop._retire_wallet_missing_db_offers(
+                db_buy_offers=[],
+                db_sell_offers=[
+                    {
+                        "trade_id": "expired-sell",
+                        "created_at": created_at,
+                        "expires_at": expires_at,
+                        "tier": "inner",
+                    }
+                ],
+                wallet_buy_ids=set(),
+                wallet_sell_ids=set(),
+                wallet_sync_fresh=True,
+                now_ts=now_ts,
+            )
+
+        self.assertEqual(result["sell"], {"expired-sell"})
+        fake_reconciliation.reconcile_offer.assert_called_once_with(
+            "intent-expired-sell"
+        )
+        self.assertTrue(
+            any(
+                call.args[1] == "db_only_offer_authoritatively_reconciled"
+                for call in log_event_mock.call_args_list
+            )
+        )
+
+    def test_wallet_missing_submitted_cancel_is_left_for_fence_settlement(self):
+        loop = bot_loop.BotLoop()
+        now_ts = 1000.0
+        created_at = datetime.fromtimestamp(now_ts - 180, timezone.utc).isoformat()
+        expires_at = datetime.fromtimestamp(now_ts - 60, timezone.utc).isoformat()
+        fake_reconciliation = types.ModuleType("offer_reconciliation")
+        fake_reconciliation.EXPIRED_PROVEN = "EXPIRED_PROVEN"
+        fake_reconciliation.FILLED_PROVEN = "FILLED_PROVEN"
+        fake_reconciliation.CANCELLED_PROVEN = "CANCELLED_PROVEN"
+        fake_reconciliation.reconcile_offer = unittest.mock.Mock()
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "database": fake_database,
+                    "offer_reconciliation": fake_reconciliation,
+                },
+            ),
+            patch.object(
+                fake_database,
+                "get_unresolved_offer_operation_blockers",
+                return_value=[
+                    {
+                        "operation_type": "CANCEL",
+                        "operation_id": "cancel:expired-sell",
+                    }
+                ],
+                create=True,
+            ),
+            patch.object(
+                fake_database,
+                "get_offer_intent_by_trade_id",
+                return_value={"intent_id": "intent-expired-sell"},
+                create=True,
+            ),
+            patch.object(bot_loop, "log_event"),
+        ):
+            result = loop._retire_wallet_missing_db_offers(
+                db_buy_offers=[],
+                db_sell_offers=[
+                    {
+                        "trade_id": "expired-sell",
+                        "created_at": created_at,
+                        "expires_at": expires_at,
+                        "tier": "inner",
+                    }
+                ],
+                wallet_buy_ids=set(),
+                wallet_sell_ids=set(),
+                wallet_sync_fresh=True,
+                now_ts=now_ts,
+            )
+
+        self.assertEqual(result["sell"], set())
+        fake_reconciliation.reconcile_offer.assert_not_called()
 
     def test_orphan_offer_cleanup_relocks_without_absence_terminalization(self):
         loop = bot_loop.BotLoop()
