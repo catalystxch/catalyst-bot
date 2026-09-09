@@ -406,8 +406,6 @@ class FillTracker:
 
         try:
             from database import (
-                get_fills,
-                get_offer,
                 get_offer_intent_by_trade_id,
             )
             from offer_reconciliation import FILLED_PROVEN, reconcile_offer
@@ -438,33 +436,11 @@ class FillTracker:
                     },
                 )
                 return None
-            offer = get_offer(trade_id) or {}
-            fill_rows = get_fills(
-                cat_asset_id=offer.get("cat_asset_id"),
-                limit=100,
+            fill_detail = self._materialize_authoritative_fill(
+                trade_id, side, details_cache
             )
-            fill = next(
-                (row for row in fill_rows if row.get("trade_id") == trade_id), None
-            )
-            if fill is None:
+            if fill_detail is None:
                 raise RuntimeError("authoritative terminal commit omitted its fill row")
-            fill_detail = {
-                "fill_id": fill["fill_id"],
-                "trade_id": trade_id,
-                "side": side,
-                "price": Decimal(str(offer.get("price_xch") or 0)),
-                "size_xch": Decimal(str(offer.get("size_xch") or 0)),
-                "size_cat": Decimal(str(offer.get("size_cat") or 0)),
-                "tier": offer.get("tier") or "unknown",
-                "coin_id": offer.get("coin_id") or "unknown",
-                "dexie_link": (details_cache.get(trade_id) or {}).get("dexie_link", ""),
-                "timestamp": time.time(),
-            }
-            if not any(item.get("trade_id") == trade_id for item in self._fill_history):
-                self._fill_history.insert(0, fill_detail)
-                self._fill_history = self._fill_history[: self._max_history]
-            self._pending_reverify.pop(trade_id, None)
-            self._forget_recently_created(trade_id)
             return fill_detail
         except Exception as exc:
             self._park_for_authoritative_reconciliation(trade_id, side)
@@ -475,6 +451,44 @@ class FillTracker:
                 data={"trade_id": trade_id},
             )
             return None
+
+    def _materialize_authoritative_fill(
+        self,
+        trade_id: str,
+        side: str,
+        details_cache: Dict[str, Dict],
+        offer: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Return one already-committed fill in the live event shape."""
+
+        from database import get_fills, get_offer
+
+        durable_offer = offer or get_offer(trade_id) or {}
+        fill_rows = get_fills(
+            cat_asset_id=durable_offer.get("cat_asset_id"),
+            limit=100,
+        )
+        fill = next((row for row in fill_rows if row.get("trade_id") == trade_id), None)
+        if fill is None:
+            return None
+        fill_detail = {
+            "fill_id": fill["fill_id"],
+            "trade_id": trade_id,
+            "side": side,
+            "price": Decimal(str(durable_offer.get("price_xch") or 0)),
+            "size_xch": Decimal(str(durable_offer.get("size_xch") or 0)),
+            "size_cat": Decimal(str(durable_offer.get("size_cat") or 0)),
+            "tier": durable_offer.get("tier") or "unknown",
+            "coin_id": durable_offer.get("coin_id") or "unknown",
+            "dexie_link": (details_cache.get(trade_id) or {}).get("dexie_link", ""),
+            "timestamp": time.time(),
+        }
+        if not any(item.get("trade_id") == trade_id for item in self._fill_history):
+            self._fill_history.insert(0, fill_detail)
+            self._fill_history = self._fill_history[: self._max_history]
+        self._pending_reverify.pop(trade_id, None)
+        self._forget_recently_created(trade_id)
+        return fill_detail
 
     def _park_for_authoritative_reconciliation(self, trade_id: str, side: str) -> None:
         """Retain a candidate offer until the proof-bound reconciler resolves it."""
@@ -654,6 +668,55 @@ class FillTracker:
             return out
 
         for trade_id, meta in list(self._pending_reverify.items()):
+            try:
+                from database import get_offer
+
+                durable_offer = get_offer(trade_id) or {}
+            except Exception:
+                durable_offer = {}
+            durable_status = str(durable_offer.get("status") or "").strip().lower()
+            durable_lifecycle = (
+                str(durable_offer.get("lifecycle_state") or "").strip().lower()
+            )
+            if durable_status == "filled" or durable_lifecycle == "filled":
+                fill_detail = self._materialize_authoritative_fill(
+                    trade_id,
+                    str(meta.get("side") or ""),
+                    details_cache,
+                    durable_offer,
+                )
+                if fill_detail is not None:
+                    key = (
+                        "buy_fills"
+                        if str(meta.get("side") or "") == "buy"
+                        else "sell_fills"
+                    )
+                    out[key].append(fill_detail)
+                else:
+                    log_event(
+                        "warning",
+                        "fill_authoritative_row_missing",
+                        f"Durable offer {trade_id[:16]}... is filled but its "
+                        "authoritative fill row is unavailable",
+                        data={"trade_id": trade_id},
+                    )
+                continue
+            if durable_status in {"cancelled", "canceled", "expired"} or (
+                durable_lifecycle in {"cancelled", "canceled", "expired"}
+            ):
+                self._pending_reverify.pop(trade_id, None)
+                log_event(
+                    "info",
+                    "fill_verify_terminal_pruned",
+                    f"Stopped fill re-verification for {trade_id[:16]}... because "
+                    "the durable offer is already terminal",
+                    data={
+                        "trade_id": trade_id,
+                        "status": durable_status,
+                        "lifecycle_state": durable_lifecycle,
+                    },
+                )
+                continue
             side = str(meta.get("side") or "")
             if int(meta.get("attempts", 0)) >= self._pending_reverify_max_attempts:
                 continue
