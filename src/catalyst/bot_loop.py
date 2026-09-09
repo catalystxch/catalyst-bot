@@ -1868,6 +1868,21 @@ class BotLoop:
         retired = {"buy": set(), "sell": set()}
         if not wallet_sync_fresh:
             return retired
+        try:
+            from database import get_unresolved_offer_operation_blockers
+
+            unresolved = get_unresolved_offer_operation_blockers()
+            submitted_cancel_trade_ids = {
+                str(row.get("operation_id") or "").removeprefix("cancel:")
+                for row in unresolved
+                if isinstance(row, dict)
+                and row.get("operation_type") == "CANCEL"
+                and str(row.get("operation_id") or "").startswith("cancel:")
+            }
+        except Exception:
+            # Without the blocker snapshot we cannot prove that early
+            # reconciliation will also release the process-local fence.
+            submitted_cancel_trade_ids = None
         now = float(now_ts if now_ts is not None else time.time())
         grace = max(
             15.0, float(getattr(cfg, "DB_ONLY_OFFER_CONFIRM_GRACE_SECS", 90) or 90)
@@ -1887,6 +1902,18 @@ class BotLoop:
                 if age_secs < grace:
                     continue
                 if self._offer_expiry_elapsed(offer, now):
+                    if submitted_cancel_trade_ids is None or (
+                        tid in submitted_cancel_trade_ids
+                    ):
+                        log_event(
+                            "info",
+                            "db_only_offer_cancel_settlement_deferred",
+                            f"{side} offer {tid[:16]}... is awaiting the dedicated "
+                            "cancel settlement path so both durable and runtime "
+                            "safety fences are released together",
+                            data={"side": side, "trade_id": tid},
+                        )
+                        continue
                     retry_after = getattr(self, "_db_only_offer_reconcile_after", {})
                     self._db_only_offer_reconcile_after = retry_after
                     if now >= float(retry_after.get(tid, 0.0) or 0.0):
