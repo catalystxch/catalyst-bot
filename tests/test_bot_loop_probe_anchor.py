@@ -403,8 +403,17 @@ class ProbeAnchorTests(unittest.TestCase):
         # regardless of import order.
         self._cfg_patcher = patch.object(bot_loop, "cfg", fake_config.cfg)
         self._cfg_patcher.start()
+        # This legacy suite isolates probe anchoring and offer-count mechanics.
+        # Post-TibetSwap confidence gating has dedicated coverage, so admit the
+        # already-authorized mutation phase here instead of leaving every
+        # partial BotLoop fixture blocked before the behavior under test.
+        self._effect_gate_patcher = patch.object(
+            bot_loop.BotLoop, "_enter_runtime_effect_phase", return_value=True
+        )
+        self._effect_gate_patcher.start()
 
     def tearDown(self):
+        self._effect_gate_patcher.stop()
         self._cfg_patcher.stop()
 
     def test_submitted_cancel_retry_keeps_bot_alive_for_next_proof_poll(self):
@@ -538,20 +547,29 @@ class ProbeAnchorTests(unittest.TestCase):
         loop = bot_loop.BotLoop()
         loop._running = True
 
-        class _StopAfterPrice:
-            def get_price(self, *args, **kwargs):
-                del args, kwargs
-                loop._running = False
-                return {"mid_price": Decimal("1.10"), "arb_gap_bps": 0}
+        def _stop_after_market_refresh(*args, **kwargs):
+            del args, kwargs
+            loop._running = False
+            return types.SimpleNamespace(
+                confidence=types.SimpleNamespace(
+                    trusted_midpoint=Decimal("1.10"), state="GREEN"
+                )
+            )
 
         class _FailingSyncOfferManager(_DummyOfferManager):
             def sync_from_wallet(self):
                 raise AssertionError("wallet sync should not run after stop")
 
-        loop.price_engine = _StopAfterPrice()
         loop.offer_manager = _FailingSyncOfferManager()
 
-        with patch.object(bot_loop, "log_event"):
+        with (
+            patch.object(
+                loop,
+                "_refresh_offer_book_market",
+                side_effect=_stop_after_market_refresh,
+            ),
+            patch.object(bot_loop, "log_event"),
+        ):
             loop._run_one_cycle()
 
         self.assertEqual(loop._current_cycle_step, "idle")
@@ -2460,60 +2478,47 @@ class ProbeAnchorTests(unittest.TestCase):
         ]
         self.assertEqual(len(disabled_events), 1)
 
-    def test_pending_mempool_reprice_updates_cycle_mid(self):
+    def test_pending_legacy_mempool_signal_reprices_from_offer_book(self):
         loop = bot_loop.BotLoop()
         loop._mempool_price_refresh_needed = True
         arb_updates = []
-
-        class _PriceEngine:
-            def get_price(self, *args, **kwargs):
-                del args, kwargs
-                return {
-                    "mid_price": Decimal("1.25"),
-                    "dexie_price": Decimal("1.10"),
-                    "tibet_price": Decimal("1.30"),
-                    "arb_gap_bps": Decimal("1818.18"),
-                }
 
         class _RiskManager:
             def update_arb_gap(self, arb_gap):
                 arb_updates.append(arb_gap)
 
-        loop.price_engine = _PriceEngine()
         loop.risk_manager = _RiskManager()
 
-        mid, arb_gap, fresh = loop._refresh_price_if_mempool_move_pending(
-            Decimal("1.00"),
-            Decimal("0"),
+        market_result = types.SimpleNamespace(
+            confidence=types.SimpleNamespace(
+                trusted_midpoint=Decimal("1.25"), state="GREEN"
+            )
         )
+        with patch.object(
+            loop, "_refresh_offer_book_market", return_value=market_result
+        ):
+            mid, arb_gap, fresh = loop._refresh_price_if_mempool_move_pending(
+                Decimal("1.00"),
+                Decimal("0"),
+            )
 
         self.assertEqual(mid, Decimal("1.25"))
-        self.assertEqual(arb_gap, Decimal("1818.18"))
-        self.assertEqual(fresh["tibet_price"], Decimal("1.30"))
+        self.assertEqual(arb_gap, Decimal("0"))
+        self.assertEqual(fresh["tibet_price"], "")
+        self.assertEqual(fresh["dexie_price"], "1.25")
         self.assertFalse(loop._mempool_price_refresh_needed)
         self.assertEqual(loop._current_mid_price, Decimal("1.25"))
         self.assertEqual(loop._bot_state["mid_price"], "1.25")
-        self.assertEqual(arb_updates, [Decimal("1818.18")])
+        self.assertEqual(arb_updates, [Decimal("0")])
 
-    def test_mempool_reprice_replaces_cycle_price_data_for_probe_launch(self):
+    def test_legacy_mempool_signal_replaces_cycle_data_with_offer_book_evidence(self):
         loop = bot_loop.BotLoop()
         loop._mempool_price_refresh_needed = True
-
-        class _PriceEngine:
-            def get_price(self, *args, **kwargs):
-                del args, kwargs
-                return {
-                    "mid_price": Decimal("1.25"),
-                    "dexie_price": Decimal("1.10"),
-                    "tibet_price": Decimal("1.30"),
-                    "arb_gap_bps": Decimal("1818.18"),
-                }
 
         class _RiskManager:
             def update_arb_gap(self, arb_gap):
                 del arb_gap
 
-        loop.price_engine = _PriceEngine()
         loop.risk_manager = _RiskManager()
         stale_price_data = {
             "mid_price": Decimal("1.00"),
@@ -2522,34 +2527,29 @@ class ProbeAnchorTests(unittest.TestCase):
             "arb_gap_bps": Decimal("0"),
         }
 
-        price_data, mid, arb_gap = loop._refresh_cycle_price_after_mempool_move(
-            stale_price_data,
-            Decimal("1.00"),
-            Decimal("0"),
+        market_result = types.SimpleNamespace(
+            confidence=types.SimpleNamespace(
+                trusted_midpoint=Decimal("1.25"), state="GREEN"
+            )
         )
+        with patch.object(
+            loop, "_refresh_offer_book_market", return_value=market_result
+        ):
+            price_data, mid, arb_gap = loop._refresh_cycle_price_after_mempool_move(
+                stale_price_data,
+                Decimal("1.00"),
+                Decimal("0"),
+            )
 
         self.assertEqual(mid, Decimal("1.25"))
-        self.assertEqual(arb_gap, Decimal("1818.18"))
-        self.assertEqual(price_data["tibet_price"], Decimal("1.30"))
-        self.assertEqual(price_data["dexie_price"], Decimal("1.10"))
+        self.assertEqual(arb_gap, Decimal("0"))
+        self.assertEqual(price_data["tibet_price"], "")
+        self.assertEqual(price_data["dexie_price"], "1.25")
 
-    def test_startup_probe_launches_with_tibet_price_when_dexie_missing(self):
+    def test_startup_never_launches_probe_from_retired_tibet_price(self):
         loop = bot_loop.BotLoop()
         tibet_price = Decimal("0.0001077595337536394661718975617")
         calls = []
-
-        class _ProbeLaunched(Exception):
-            pass
-
-        class _PriceEngine:
-            def get_price(self, *args, **kwargs):
-                del args, kwargs
-                return {
-                    "mid_price": tibet_price,
-                    "dexie_price": None,
-                    "tibet_price": tibet_price,
-                    "arb_gap_bps": Decimal("0"),
-                }
 
         def _try_snipe_single(side, price, arb_gap):
             trade_id = f"{side}-startup-probe"
@@ -2559,15 +2559,10 @@ class ProbeAnchorTests(unittest.TestCase):
                 loop.sniper._active_snipe_sides[trade_id] = side
             return [{"trade_id": trade_id}]
 
-        def _probe_launched(*args, **kwargs):
-            del args, kwargs
-            raise _ProbeLaunched()
-
         def _main_ladder_reached(*args, **kwargs):
             del args, kwargs
             raise AssertionError("startup main ladder was reached before probe launch")
 
-        loop.price_engine = _PriceEngine()
         loop.sniper.try_snipe_single = _try_snipe_single
 
         with (
@@ -2581,18 +2576,14 @@ class ProbeAnchorTests(unittest.TestCase):
             patch.object(
                 loop, "_create_offers_if_needed", side_effect=_main_ladder_reached
             ),
-            patch.object(loop, "_process_active_probe", side_effect=_probe_launched),
+            patch.object(loop, "_refresh_offer_book_market", return_value=None),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            with self.assertRaises(_ProbeLaunched):
-                loop._run_one_cycle()
+            loop._run_one_cycle()
 
-        self.assertEqual({side for side, _, _ in calls}, {"buy", "sell"})
-        self.assertTrue(loop._probe_state["active"])
-        self.assertEqual(loop._probe_state["tibet_price"], tibet_price)
-        self.assertEqual(
-            loop._probe_state["last_discovery_reason"], "startup_empty_book"
-        )
+        self.assertEqual(calls, [])
+        self.assertFalse(loop._probe_state["active"])
+        self.assertNotEqual(loop._probe_state.get("tibet_price"), tibet_price)
 
     def test_handle_requoting_updates_baseline_to_anchored_mid(self):
         loop = bot_loop.BotLoop()

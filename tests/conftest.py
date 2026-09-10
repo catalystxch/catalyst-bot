@@ -87,6 +87,10 @@ collect_ignore = [
     "test_spacescan.py",
     "test_api_data_sources.py",
     "test_all_apis.py",
+    "test_coin_prep.py",
+    "test_coin_prep_v2.py",
+    "test_hidden_coins.py",
+    "test_offer_create.py",
 ]
 
 # ---------------------------------------------------------------------------

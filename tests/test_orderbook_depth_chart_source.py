@@ -22,13 +22,14 @@ def test_orderbook_depth_chart_uses_independent_side_price_lanes():
     assert "ctx.fillText(sellHigh.toFixed(6), w - padR, h - padB + 8)" in html
 
 
-def test_market_intel_slippage_uses_one_xch_default_trade():
+def test_market_intel_retires_amm_slippage_and_shows_independent_depth():
     html = GUI.read_text(encoding="utf-8")
 
-    assert "/api/market/slippage?amount=1&side=buy" in html
-    assert "A 1 XCH test trade is " in html
-    assert "For a 1 XCH test trade" in html
+    assert "/api/market/slippage?amount=1&side=buy" not in html
     assert "/api/market/slippage?amount=0.01&side=buy" not in html
+    assert "Independent Depth" in html
+    assert "independent_bid_depth_xch" in html
+    assert "independent_ask_depth_xch" in html
 
 
 def test_market_intel_shows_crossed_public_book_instead_of_blank_spread():

@@ -324,12 +324,16 @@ def test_dry_run_is_not_user_facing_setting():
     assert "dry_run:" not in html
 
 
-def test_market_diagnostics_uses_live_amm_and_summary_sources():
+def test_market_diagnostics_uses_offer_book_confidence_and_provider_health():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    assert "_lastAmmPriceData" in html
+    assert "_lastAmmPriceData" not in html
     assert "_lastMarketSummary" in html
-    assert "summaryTibetXch" in html
+    assert "_lastMarketConfidence" in html
+    assert "marketProviderHealth" in html
+    assert "independent_bid_depth_xch" in html
+    assert "independent_ask_depth_xch" in html
+    assert "summaryTibetXch" not in html
 
 
 def test_close_gap_recommendation_has_confidence_gate():

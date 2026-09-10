@@ -72,6 +72,7 @@ fake_database.init_database = lambda: None
 fake_database.log_event = lambda *args, **kwargs: None
 fake_database.get_stats = lambda *args, **kwargs: {}
 fake_database.get_offer = lambda *args, **kwargs: None
+fake_database.get_open_offers = lambda *args, **kwargs: []
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
@@ -365,6 +366,15 @@ class RecoveryModeTests(unittest.TestCase):
     def setUp(self):
         self.logged = []
         bot_loop.log_event = self._log_event
+        # Recovery-mode refill mechanics are exercised after the independent
+        # post-TibetSwap confidence gate, which has its own focused suite.
+        self._effect_gate_patcher = patch.object(
+            bot_loop.BotLoop, "_enter_runtime_effect_phase", return_value=True
+        )
+        self._effect_gate_patcher.start()
+
+    def tearDown(self):
+        self._effect_gate_patcher.stop()
 
     def _log_event(self, severity, event_type, message, data=None):
         self.logged.append((severity, event_type, message, data))

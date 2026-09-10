@@ -28,6 +28,9 @@ import subprocess
 import sys
 import time
 
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Each batch is isolated: tests within a batch share a process,
 # but each batch runs in a fresh Python process.
 BATCHES = [
@@ -485,6 +488,7 @@ def main():
             capture_output=True,
             text=True,
             timeout=600,
+            cwd=TESTS_DIR,
             env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
         )
 
@@ -511,6 +515,11 @@ def main():
                 except (ValueError, IndexError):
                     pass
 
+        # Collection/usage failures can produce no pytest summary on stdout.
+        # Never turn a non-zero pytest process into a false green batch.
+        if result.returncode != 0 and failed == 0 and errors == 0:
+            errors = 1
+
         total_passed += passed
         total_failed += failed
         total_errors += errors
@@ -527,6 +536,9 @@ def main():
             failed_batches.append(batch["name"])
             # Show failure details
             for line in result.stdout.split("\n"):
+                if "FAILED" in line or "ERROR" in line:
+                    print(f"       {line.strip()}")
+            for line in result.stderr.split("\n"):
                 if "FAILED" in line or "ERROR" in line:
                     print(f"       {line.strip()}")
 
