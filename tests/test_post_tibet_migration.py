@@ -6,6 +6,7 @@ from decimal import Decimal
 import database
 import pytest
 from market_evidence import migrate_post_tibet_state
+import inspect
 
 
 ASSET_ID = "b8" * 32
@@ -85,3 +86,43 @@ def test_migration_is_idempotent_and_does_not_delete_legacy_history(isolated_db)
     assert second == first
     assert database.count_legacy_tibet_price_rows(ASSET_ID) == 1
     assert database.get_post_tibet_migration_report(ASSET_ID) == first
+
+
+def test_bot_start_enforces_migration_from_fresh_sage_offer_snapshot(
+    isolated_db, monkeypatch
+):
+    import api_server  # noqa: F401 - complete blueprint registration first
+    import blueprints.bot as bot_blueprint
+    import wallet
+
+    _add_offer("owned-offer")
+    monkeypatch.setattr(
+        wallet,
+        "get_all_offers",
+        lambda **_kwargs: [{"trade_id": "owned-offer"}],
+    )
+
+    report = bot_blueprint._enforce_post_tibet_start_migration(ASSET_ID)
+
+    assert report["can_start"] is True
+    assert report["retained_offer_ids"] == ["owned-offer"]
+    assert "_enforce_post_tibet_start_migration" in inspect.getsource(
+        bot_blueprint.api_bot_start
+    )
+
+
+def test_bot_start_migration_fails_closed_when_sage_offer_read_is_unavailable(
+    isolated_db, monkeypatch
+):
+    import api_server  # noqa: F401 - complete blueprint registration first
+    import blueprints.bot as bot_blueprint
+    import wallet
+
+    _add_offer("unknown-offer")
+    monkeypatch.setattr(wallet, "get_all_offers", lambda **_kwargs: None)
+
+    report = bot_blueprint._enforce_post_tibet_start_migration(ASSET_ID)
+
+    assert report["can_start"] is False
+    assert report["reason_code"] == "POST_TIBET_SAGE_OFFERS_UNAVAILABLE"
+    assert database.get_post_tibet_migration_report(ASSET_ID) is None

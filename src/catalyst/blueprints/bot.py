@@ -44,6 +44,49 @@ except Exception:
 bp = Blueprint("bot", __name__)
 
 
+def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
+    """Prove legacy open-offer ownership before the first v1.4 bot start.
+
+    The migration is deliberately read-only and is persisted only after a
+    fresh, structurally valid wallet offer snapshot has been obtained.  A
+    transport or schema failure must remain retryable and must never be
+    mistaken for an empty authoritative offer set.
+    """
+    import database
+    from market_evidence import migrate_post_tibet_state
+    from wallet import get_all_offers
+
+    existing = database.get_post_tibet_migration_report(asset_id)
+    if existing is not None:
+        return existing
+
+    wallet_offers = get_all_offers(include_completed=False, start=0, end=500)
+    if type(wallet_offers) is not list or any(
+        type(offer) is not dict for offer in wallet_offers
+    ):
+        return {
+            "asset_id": str(asset_id).strip().lower(),
+            "migration_version": 1,
+            "can_start": False,
+            "reason_code": "POST_TIBET_SAGE_OFFERS_UNAVAILABLE",
+            "retained_offer_ids": [],
+            "unsafe_offer_ids": [],
+            "tibet_live_features": "retired",
+        }
+
+    authoritative_ids = {
+        str(offer.get("trade_id") or offer.get("offer_id") or "").strip()
+        for offer in wallet_offers
+    }
+    authoritative_ids.discard("")
+    return migrate_post_tibet_state(
+        asset_id=asset_id,
+        authoritative_open_trade_ids=authoritative_ids,
+        ownership_proven=True,
+        now=datetime.now(timezone.utc),
+    )
+
+
 def _api_server():
     """Return the currently loaded api_server module.
 
@@ -345,6 +388,40 @@ def api_bot_start():
                     "reason": reason,
                     "errors": [error],
                     "warnings": warnings,
+                }
+            ), 400
+
+    # First v1.4 start must reconcile persisted legacy offers against a fresh
+    # authoritative Sage snapshot.  This comes after identity preflight so the
+    # evidence cannot be accepted from an unverified wallet.
+    if not errors:
+        try:
+            migration = _enforce_post_tibet_start_migration(cfg.CAT_ASSET_ID)
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Post-TibetSwap startup migration failed closed",
+                {"error": str(exc)[:256]},
+                level="error",
+            )
+            migration = {
+                "can_start": False,
+                "reason_code": "POST_TIBET_MIGRATION_FAILED",
+            }
+        if migration.get("can_start") is not True:
+            reason = str(
+                migration.get("reason_code") or "POST_TIBET_MIGRATION_FAILED"
+            )
+            error = "Post-TibetSwap offer ownership reconciliation blocked bot start"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "error": error,
+                    "reason": reason,
+                    "errors": [error],
+                    "warnings": warnings,
+                    "migration": migration,
                 }
             ), 400
 

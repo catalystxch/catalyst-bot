@@ -142,7 +142,11 @@ class DegradedMarketController:
         elif state == "AMBER":
             cancel_tiers = ()
             can_create = False
-            can_requote = True
+            # Requotes create the replacement before cancelling the parent so
+            # they temporarily increase live exposure.  AMBER is a strict
+            # no-new-exposure state, therefore it cannot safely authorize the
+            # current requote implementation either.
+            can_requote = False
             paused = False
         else:
             cancel_tiers = ()

@@ -123,3 +123,12 @@ def test_notifications_only_mark_transitions_and_recovery_completion(isolated_db
     assert green.notify is True
     assert green_repeat.notify is False
     assert complete.notify is True
+
+
+def test_amber_never_authorizes_create_child_first_requotes(isolated_db):
+    controller = DegradedMarketController(asset_id=ASSET_ID)
+
+    decision = controller.update(confidence_state="AMBER", now=NOW)
+
+    assert decision.can_create is False
+    assert decision.can_requote is False
