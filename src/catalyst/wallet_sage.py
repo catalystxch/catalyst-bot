@@ -5941,7 +5941,9 @@ def _exact_authoritative_offer_asset_ids(offer_ids: set[str]) -> Dict[str, str]:
     return resolved
 
 
-def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
+def get_coins_by_ids(
+    coin_ids: list, *, authoritative_asset_hints: Optional[Dict[str, str]] = None
+) -> Optional[Dict]:
     """Get detailed status for specific coins by their IDs.
 
     Sage endpoint: get_coins_by_ids
@@ -5973,6 +5975,30 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
         normalized.append(clean)
     if len(set(normalized)) != len(normalized):
         return None
+
+    normalized_asset_hints: Dict[str, str] = {}
+    if authoritative_asset_hints is not None:
+        if type(authoritative_asset_hints) is not dict or len(
+            authoritative_asset_hints
+        ) > len(normalized):
+            return None
+        for raw_coin_id, raw_asset_id in authoritative_asset_hints.items():
+            if type(raw_coin_id) is not str or type(raw_asset_id) is not str:
+                return None
+            clean_hint_coin = raw_coin_id.strip().lower()
+            if clean_hint_coin.startswith("0x"):
+                clean_hint_coin = clean_hint_coin[2:]
+            if clean_hint_coin not in normalized:
+                return None
+            clean_hint_asset = raw_asset_id.strip().lower()
+            if clean_hint_asset.startswith("0x"):
+                clean_hint_asset = clean_hint_asset[2:]
+            if clean_hint_asset != "xch" and (
+                len(clean_hint_asset) != 64
+                or re.fullmatch(r"[0-9a-f]{64}", clean_hint_asset) is None
+            ):
+                return None
+            normalized_asset_hints[clean_hint_coin] = clean_hint_asset
 
     result = rpc(
         "get_coins_by_ids",
@@ -6043,7 +6069,21 @@ def get_coins_by_ids(coin_ids: list) -> Optional[Dict]:
                 asset_present = "asset_id" in c["asset"]
                 asset_value = c["asset"].get("asset_id")
             if asset_present:
-                record["asset_id"] = "xch" if asset_value is None else asset_value
+                explicit_asset = "xch" if asset_value is None else asset_value
+                if type(explicit_asset) is not str:
+                    return None
+                normalized_explicit_asset = explicit_asset.strip().lower()
+                if normalized_explicit_asset.startswith("0x"):
+                    normalized_explicit_asset = normalized_explicit_asset[2:]
+                hinted_asset = normalized_asset_hints.get(clean_cid)
+                if (
+                    hinted_asset is not None
+                    and hinted_asset != normalized_explicit_asset
+                ):
+                    return None
+                record["asset_id"] = normalized_explicit_asset
+            elif clean_cid in normalized_asset_hints:
+                record["asset_id"] = normalized_asset_hints[clean_cid]
             elif offer_id is not None:
                 normalized_offer_id = _normalize_offer_lock_id(offer_id)
                 if (
