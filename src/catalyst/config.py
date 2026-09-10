@@ -1677,6 +1677,16 @@ class Config:
                 f"fire after a 20%+ price move; stale offers may fill at bad prices"
             )
 
+        minimum_profit = getattr(self, "MINIMUM_PROFIT_XCH", Decimal("0"))
+        if minimum_profit < 0:
+            errors.append("MINIMUM_PROFIT_XCH cannot be negative")
+        expected_requotes = getattr(self, "EXPECTED_CANCEL_REQUOTES", 0)
+        if expected_requotes < 0:
+            errors.append("EXPECTED_CANCEL_REQUOTES cannot be negative")
+        competition_cooldown = getattr(self, "COMPETITION_COOLDOWN_SECS", 0)
+        if competition_cooldown < 1:
+            errors.append("COMPETITION_COOLDOWN_SECS must be at least 1")
+
         shock_trigger = getattr(self, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", Decimal("0"))
         if shock_trigger < Decimal("0"):
             errors.append("TIBET_SHOCK_CANCEL_TRIGGER_PCT cannot be negative")

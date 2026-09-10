@@ -148,6 +148,22 @@ def validate_config(cfg) -> ValidationReport:
             f"MIN_EDGE_BPS ({min_edge}) >= SPREAD_BPS ({spread}) — edge cannot exceed spread",
         )
 
+    minimum_profit = getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0"))
+    if minimum_profit < Decimal("0"):
+        err("MINIMUM_PROFIT_XCH", "MINIMUM_PROFIT_XCH cannot be negative")
+    expected_requotes = getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0)
+    if expected_requotes < 0:
+        err(
+            "EXPECTED_CANCEL_REQUOTES",
+            "EXPECTED_CANCEL_REQUOTES cannot be negative",
+        )
+    competition_cooldown = getattr(cfg, "COMPETITION_COOLDOWN_SECS", 0)
+    if competition_cooldown < 1:
+        err(
+            "COMPETITION_COOLDOWN_SECS",
+            "COMPETITION_COOLDOWN_SECS must be at least 1",
+        )
+
     shock_trigger = getattr(cfg, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", Decimal("0"))
     try:
         shock_trigger = Decimal(str(shock_trigger))

@@ -43,7 +43,9 @@ def _positive_decimal(value: Any, label: str, *, allow_zero: bool = False) -> De
 
 
 def _text(value: Decimal) -> str:
-    text = format(value, "f").rstrip("0").rstrip(".")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
@@ -98,6 +100,8 @@ def derive_offer_book_policy(
     return {
         "market_model": "offer_book",
         "risk_profile": preset_name,
+        "independent_depth_xch": _text(depth),
+        "independent_depth_sufficient": depth >= minimum_depth,
         "minimum_independent_depth_xch": _text(minimum_depth),
         "profit_floor_xch": _text(profit_floor),
         "spread_floor_bps": _text(spread_floor),

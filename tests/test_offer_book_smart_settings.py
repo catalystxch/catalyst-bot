@@ -23,6 +23,28 @@ def test_market_risk_preset_is_typed_validated_and_api_updatable(monkeypatch):
     assert "MARKET_RISK_PRESET" in config_module.Config._UPDATABLE_KEYS
 
 
+def test_offer_book_cost_controls_fail_config_validation_when_negative(monkeypatch):
+    import config as config_module
+    from config_validator import validate_config
+
+    monkeypatch.setattr(config_module, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("MINIMUM_PROFIT_XCH", "-0.1")
+    monkeypatch.setenv("EXPECTED_CANCEL_REQUOTES", "-1")
+    monkeypatch.setenv("COMPETITION_COOLDOWN_SECS", "0")
+
+    report = config_module.Config().validate()
+
+    assert any("MINIMUM_PROFIT_XCH" in error for error in report["errors"])
+    assert any("EXPECTED_CANCEL_REQUOTES" in error for error in report["errors"])
+    assert any("COMPETITION_COOLDOWN_SECS" in error for error in report["errors"])
+    structured = validate_config(config_module.Config())
+    assert {
+        "MINIMUM_PROFIT_XCH",
+        "EXPECTED_CANCEL_REQUOTES",
+        "COMPETITION_COOLDOWN_SECS",
+    } <= {issue.key for issue in structured.errors}
+
+
 def test_smart_settings_persists_selected_offer_book_risk_preset():
     from pathlib import Path
 
@@ -113,7 +135,10 @@ def test_book_opportunity_is_small_bounded_and_requires_confirmed_depth():
     )
 
     assert thin["opportunity_orders"]["enabled"] is False
+    assert thin["independent_depth_sufficient"] is False
     assert deep["opportunity_orders"]["enabled"] is True
+    assert deep["independent_depth_sufficient"] is True
+    assert deep["independent_depth_xch"] == "10"
     assert deep["opportunity_orders"]["purpose"] == "book_opportunity"
     assert Decimal(deep["opportunity_orders"]["max_size_xch"]) <= Decimal("0.5")
     assert Decimal(deep["opportunity_orders"]["max_size_xch"]) <= Decimal("0.2")

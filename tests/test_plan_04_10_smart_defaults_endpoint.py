@@ -11,7 +11,10 @@ Tests GET /api/smart-defaults:
 import os
 import sys
 import unittest
+from decimal import Decimal
+import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +41,25 @@ def _fake_defaults_response(**kwargs):
                 "risk_profile": kwargs.get("risk_profile", "balanced"),
             }
         )
+
+
+def _green_market_confidence(
+    bid="0.00009", ask="0.00011", depth_mojos=1_000_000_000_000_000
+):
+    bid_value = Decimal(str(bid))
+    ask_value = Decimal(str(ask))
+    return SimpleNamespace(
+        state="GREEN",
+        trusted_midpoint=(bid_value + ask_value) / Decimal("2"),
+        trusted_bid=bid_value,
+        trusted_ask=ask_value,
+        independent_bid_depth_mojos=depth_mojos,
+        independent_ask_depth_mojos=depth_mojos,
+        manipulation_score=0,
+        reason_codes=(),
+        evidence_digests=("a" * 64, "b" * 64),
+        source_health={"dexie": "valid", "splash": "valid"},
+    )
 
 
 class _FlaskBase(unittest.TestCase):
@@ -192,6 +214,138 @@ class TestSmartDefaults(_FlaskBase):
 
 
 class TestSmartDefaultsSourceContract(unittest.TestCase):
+    _ASSET_ID = "b8" * 32
+
+    def test_standalone_dexie_offer_normalization_is_exact_and_attributable(self):
+        from blueprints.smart_defaults import _normalise_standalone_dexie_offer
+
+        offer_text = "offer1qqqqexact"
+        row = _normalise_standalone_dexie_offer(
+            {
+                "id": "dexie-row-1",
+                "offer": offer_text,
+                "offered": {"id": "xch", "code": "XCH", "amount": "0.3"},
+                "requested": {
+                    "id": self._ASSET_ID,
+                    "code": "MZ",
+                    "amount": "3",
+                },
+            },
+            expected_side="buy",
+            asset_id=self._ASSET_ID,
+        )
+
+        self.assertEqual(
+            row,
+            {
+                "offer_id": hashlib.sha256(offer_text.encode("utf-8")).hexdigest(),
+                "provider_offer_id": "dexie-row-1",
+                "trade_id": "",
+                "price": "0.1",
+                "amount_mojos": 300_000_000_000,
+            },
+        )
+
+    def test_standalone_dexie_offer_rejects_fractional_mojos(self):
+        from blueprints.smart_defaults import _normalise_standalone_dexie_offer
+
+        with self.assertRaisesRegex(ValueError, "whole mojos"):
+            _normalise_standalone_dexie_offer(
+                {
+                    "id": "dexie-row-2",
+                    "offered": {
+                        "id": "xch",
+                        "code": "XCH",
+                        "amount": "0.0000000000001",
+                    },
+                    "requested": {"id": self._ASSET_ID, "amount": "1"},
+                },
+                expected_side="buy",
+                asset_id=self._ASSET_ID,
+            )
+
+    def test_standalone_dexie_book_uses_v1_filters_and_excludes_owned_depth(self):
+        from blueprints.smart_defaults import _fetch_dexie_orderbook_standalone
+
+        own_text = "offer1owned"
+        own_identity = hashlib.sha256(own_text.encode("utf-8")).hexdigest()
+        sell_response = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "offers": [
+                    {
+                        "id": "sell-provider-id",
+                        "offer": own_text,
+                        "offered": {"id": self._ASSET_ID, "amount": "10"},
+                        "requested": {"id": "xch", "amount": "1"},
+                    }
+                ]
+            },
+        )
+        buy_response = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "offers": [
+                    {
+                        "id": "buy-provider-id",
+                        "offer": "offer1competitor",
+                        "offered": {"id": "xch", "amount": "0.9"},
+                        "requested": {"id": self._ASSET_ID, "amount": "10"},
+                    }
+                ]
+            },
+        )
+
+        with patch("requests.get", side_effect=[sell_response, buy_response]) as get:
+            result = _fetch_dexie_orderbook_standalone(
+                self._ASSET_ID,
+                own_offer_identities=frozenset({own_identity}),
+            )
+
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["offered"], self._ASSET_ID)
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["requested"], "xch")
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["offered"], "xch")
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["requested"], self._ASSET_ID)
+        self.assertEqual(result["num_sell_offers"], 0)
+        self.assertEqual(result["sell_depth_xch"], Decimal("0"))
+        self.assertEqual(result["best_bid"], Decimal("0.09"))
+        self.assertEqual(result["buy_depth_xch"], Decimal("0.9"))
+        self.assertEqual(result["provider_book"]["asks"][0]["offer_id"], own_identity)
+
+    def test_smart_mid_uses_only_green_trusted_confidence(self):
+        from blueprints.smart_defaults import _resolve_smart_mid_price
+
+        green = {
+            "state": "GREEN",
+            "trusted_midpoint": Decimal("0.1000000000000000001"),
+            "trusted_bid": Decimal("0.09"),
+            "trusted_ask": Decimal("0.11"),
+        }
+        accepted = _resolve_smart_mid_price(
+            ticker={},
+            tibet={},
+            spacescan={},
+            trades={},
+            orderbook={"best_bid": Decimal("9"), "best_ask": Decimal("10")},
+            market_confidence=green,
+            messages=[],
+        )
+        rejected = _resolve_smart_mid_price(
+            ticker={},
+            tibet={},
+            spacescan={},
+            trades={},
+            orderbook={"best_bid": Decimal("0.09"), "best_ask": Decimal("0.11")},
+            market_confidence={**green, "state": "AMBER"},
+            messages=[],
+        )
+
+        self.assertEqual(
+            accepted["mid_price"], Decimal("0.1000000000000000001")
+        )
+        self.assertEqual(accepted["price_source"], "trusted_offer_book")
+        self.assertEqual(rejected["mid_price"], Decimal("0"))
+
     def test_calculation_has_no_live_tibet_decision_inputs(self):
         import inspect
         from blueprints.smart_defaults import _calculate_smart_defaults
@@ -213,13 +367,19 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             spacescan={},
             trades={},
             orderbook={"best_bid": 0.90, "best_ask": 1.10},
+            market_confidence={
+                "state": "GREEN",
+                "trusted_midpoint": Decimal("1"),
+                "trusted_bid": Decimal("0.90"),
+                "trusted_ask": Decimal("1.10"),
+            },
             messages=messages,
         )
 
         self.assertEqual(resolved["mid_price"], 1.0)
         self.assertEqual(resolved["dexie_price"], 1.0)
-        self.assertEqual(resolved["price_source"], "dexie_orderbook")
-        self.assertIn("Dexie orderbook", messages[0])
+        self.assertEqual(resolved["price_source"], "trusted_offer_book")
+        self.assertIn("trusted offer book", messages[0])
 
     def test_price_resolver_ignores_retired_tibet_and_prefers_live_book(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
@@ -230,13 +390,19 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             spacescan={},
             trades={},
             orderbook={"best_bid": 0.90, "best_ask": 1.10},
+            market_confidence={
+                "state": "GREEN",
+                "trusted_midpoint": Decimal("1"),
+                "trusted_bid": Decimal("0.90"),
+                "trusted_ask": Decimal("1.10"),
+            },
             messages=[],
         )
 
         self.assertEqual(resolved["mid_price"], 1.0)
         self.assertEqual(resolved["tibet_price"], 0)
         self.assertEqual(resolved["arb_gap_bps"], 0)
-        self.assertEqual(resolved["price_source"], "dexie_orderbook")
+        self.assertEqual(resolved["price_source"], "trusted_offer_book")
 
     def test_price_resolver_rejects_ticker_and_trade_history_without_two_sided_book(
         self,
@@ -256,13 +422,14 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
                 ]
             },
             orderbook={},
+            market_confidence={"state": "RED"},
             messages=messages,
         )
 
         self.assertEqual(resolved["mid_price"], 0)
         self.assertEqual(resolved["dexie_price"], 0)
         self.assertEqual(resolved["price_source"], "")
-        self.assertTrue(any("two-sided" in message for message in messages))
+        self.assertTrue(any("GREEN" in message for message in messages))
 
     def test_price_resolver_rejects_one_sided_orderbook(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
@@ -274,12 +441,13 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             spacescan={},
             trades={},
             orderbook={"best_bid": 1.0, "best_ask": 0},
+            market_confidence={"state": "RED"},
             messages=messages,
         )
 
         self.assertEqual(resolved["mid_price"], 0)
         self.assertEqual(resolved["price_source"], "")
-        self.assertTrue(any("two-sided" in message for message in messages))
+        self.assertTrue(any("GREEN" in message for message in messages))
 
     def test_response_contract_includes_safety_fields(self):
         root = Path(__file__).resolve().parents[1]
@@ -735,6 +903,16 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             ),
             patch.object(
                 smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=_green_market_confidence("0.0001089", "0.0001100"),
+            ),
+            patch.object(
+                smart_defaults,
                 "_smart_dbx_defaults",
                 return_value={
                     "dbx_max_spread_bps": 500,
@@ -753,7 +931,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                     xch_reserve=0,
                     cat_reserve=0,
                     risk_profile="balanced",
-                    asset_id="asset",
+                    asset_id="a" * 64,
                     cat_wallet_id=2,
                     cat_decimals=3,
                     cat_ticker_id="MZ_XCH",
@@ -867,6 +1045,16 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                     smart_defaults,
                     "_fetch_dexie_orderbook_standalone",
                     return_value=orderbook,
+                ),
+                patch.object(
+                    smart_defaults,
+                    "_smart_market_own_offer_identities",
+                    return_value=frozenset(),
+                ),
+                patch.object(
+                    smart_defaults,
+                    "_derive_smart_market_confidence",
+                    return_value=_green_market_confidence("0.00009", "0.00011"),
                 ),
                 patch.object(
                     smart_defaults,
@@ -992,6 +1180,16 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             ),
             patch.object(
                 smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=_green_market_confidence("0.00010", "0.00012"),
+            ),
+            patch.object(
+                smart_defaults,
                 "_smart_dbx_defaults",
                 return_value={
                     "dbx_max_spread_bps": 500,
@@ -1010,7 +1208,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                     xch_reserve=17.713,
                     cat_reserve=0,
                     risk_profile="aggressive",
-                    asset_id="asset",
+                    asset_id="a" * 64,
                     cat_wallet_id=2,
                     cat_decimals=3,
                     cat_ticker_id="MZ_XCH",
@@ -1111,6 +1309,16 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             ),
             patch.object(
                 smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=_green_market_confidence("0.000079", "0.000085"),
+            ),
+            patch.object(
+                smart_defaults,
                 "_smart_dbx_defaults",
                 return_value={
                     "dbx_max_spread_bps": 500,
@@ -1129,7 +1337,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                     xch_reserve=0,
                     cat_reserve=0,
                     risk_profile="balanced",
-                    asset_id="asset",
+                    asset_id="a" * 64,
                     cat_wallet_id=2,
                     cat_decimals=3,
                     cat_ticker_id="MZ_XCH",
@@ -1234,6 +1442,16 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             ),
             patch.object(
                 smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=_green_market_confidence("0.0000815", "0.0000824"),
+            ),
+            patch.object(
+                smart_defaults,
                 "_smart_dbx_defaults",
                 return_value={
                     "dbx_max_spread_bps": 500,
@@ -1252,7 +1470,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                     xch_reserve=0,
                     cat_reserve=0,
                     risk_profile="balanced",
-                    asset_id="asset",
+                    asset_id="a" * 64,
                     cat_wallet_id=2,
                     cat_decimals=3,
                     cat_ticker_id="MZ_XCH",

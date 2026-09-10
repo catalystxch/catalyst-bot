@@ -9,7 +9,9 @@ routes in blueprints/market.py call them via api_server.*).
 
 from __future__ import annotations
 
+import hashlib
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from flask import Blueprint, jsonify, request
@@ -482,12 +484,80 @@ def _smart_trade_vwap(trades: dict) -> float:
     return (sum_pv / sum_v) if sum_v > 0 else 0
 
 
+def _normalise_standalone_dexie_offer(
+    offer: dict, *, expected_side: str, asset_id: str
+) -> dict:
+    """Return one exact Dexie offer row for the confidence provider."""
+
+    if type(offer) is not dict:
+        raise TypeError("Dexie offer must be an object")
+    if expected_side not in {"buy", "sell"}:
+        raise ValueError("Dexie offer side is invalid")
+    target_asset = str(asset_id or "").strip().lower().removeprefix("0x")
+    if len(target_asset) != 64 or any(
+        character not in "0123456789abcdef" for character in target_asset
+    ):
+        raise ValueError("Dexie CAT asset identity is invalid")
+
+    def rows(value):
+        if type(value) is dict:
+            return [value]
+        if type(value) is list:
+            return value
+        raise TypeError("Dexie asset amounts must be objects or arrays")
+
+    xch_amount = Decimal("0")
+    cat_amount = Decimal("0")
+    for item in rows(offer.get("offered", [])) + rows(offer.get("requested", [])):
+        if type(item) is not dict:
+            raise TypeError("Dexie asset amount must be an object")
+        try:
+            amount = Decimal(str(item.get("amount", "0")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("Dexie asset amount is invalid") from exc
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Dexie asset amount is invalid")
+        item_id = str(item.get("id", "")).strip().lower().removeprefix("0x")
+        code = str(item.get("code", "")).strip().upper()
+        if code == "XCH" or item_id in {"", "xch"}:
+            xch_amount += amount
+        elif item_id == target_asset:
+            cat_amount += amount
+    if xch_amount <= 0 or cat_amount <= 0:
+        raise ValueError("Dexie offer does not contain positive XCH and CAT amounts")
+
+    atomic_xch = xch_amount * Decimal("1000000000000")
+    integral_xch = atomic_xch.to_integral_value()
+    if atomic_xch != integral_xch:
+        raise ValueError("Dexie XCH amount must resolve to whole mojos")
+    offer_text = str(offer.get("offer") or "").strip()
+    provider_offer_id = str(offer.get("id") or "").strip()
+    trade_id = str(offer.get("trade_id") or "").strip().lower().removeprefix("0x")
+    offer_identity = (
+        hashlib.sha256(offer_text.encode("utf-8")).hexdigest()
+        if offer_text
+        else trade_id or provider_offer_id
+    )
+    if not offer_identity:
+        raise ValueError("Dexie offer identity is missing")
+    price = xch_amount / cat_amount
+    price_text = format(price, "f").rstrip("0").rstrip(".") or "0"
+    return {
+        "offer_id": offer_identity,
+        "provider_offer_id": provider_offer_id,
+        "trade_id": trade_id,
+        "price": price_text,
+        "amount_mojos": int(integral_xch),
+    }
+
+
 def _resolve_smart_mid_price(
     ticker: dict,
     tibet: dict,
     spacescan: dict,
     trades: dict,
     orderbook: dict,
+    market_confidence: object | None = None,
     messages: list | None = None,
 ) -> dict:
     """Resolve the best CAT-specific mid price Smart Settings can use.
@@ -499,33 +569,52 @@ def _resolve_smart_mid_price(
     """
     messages = messages if messages is not None else []
     del ticker
-    dexie_price = 0
-    tibet_price = 0
+    dexie_price = Decimal("0")
+    tibet_price = Decimal("0")
     spacescan_price = (
         spacescan.get("price_xch", 0)
         if isinstance(spacescan, dict) and spacescan.get("has_data")
         else 0
     )
-    mid_price = 0
-    arb_gap_bps = 0
-    spacescan_gap_bps = 0
+    mid_price = Decimal("0")
+    arb_gap_bps = Decimal("0")
+    spacescan_gap_bps = Decimal("0")
     price_source = ""
 
     has_both_prices = False
-    best_bid = orderbook.get("best_bid", 0) if isinstance(orderbook, dict) else 0
-    best_ask = orderbook.get("best_ask", 0) if isinstance(orderbook, dict) else 0
-    if best_bid > 0 and best_ask > 0 and best_bid <= best_ask:
-        mid_price = (best_bid + best_ask) / 2
-        dexie_price = mid_price
-        price_source = "dexie_orderbook"
-        messages.append(f"Price: {mid_price:.8f} (Dexie orderbook)")
-    else:
-        messages.append(
-            "Price unavailable: a trusted two-sided Dexie order book is required"
-        )
 
-    if spacescan_price > 0 and mid_price > 0:
-        spacescan_gap_bps = abs(spacescan_price - mid_price) / mid_price * 10000
+    def confidence_field(name):
+        if isinstance(market_confidence, dict):
+            return market_confidence.get(name)
+        return getattr(market_confidence, name, None)
+
+    state = confidence_field("state")
+    trusted_midpoint = confidence_field("trusted_midpoint")
+    trusted_bid = confidence_field("trusted_bid")
+    trusted_ask = confidence_field("trusted_ask")
+    if (
+        state == "GREEN"
+        and type(trusted_midpoint) is Decimal
+        and type(trusted_bid) is Decimal
+        and type(trusted_ask) is Decimal
+        and trusted_bid > 0
+        and trusted_bid <= trusted_midpoint <= trusted_ask
+    ):
+        mid_price = trusted_midpoint
+        dexie_price = trusted_midpoint
+        price_source = "trusted_offer_book"
+        messages.append(f"Price: {mid_price:.8f} (trusted offer book)")
+    else:
+        messages.append("Price unavailable: GREEN offer-book confidence is required")
+
+    try:
+        exact_spacescan_price = Decimal(str(spacescan_price))
+    except (InvalidOperation, TypeError, ValueError):
+        exact_spacescan_price = Decimal("0")
+    if exact_spacescan_price > 0 and mid_price > 0:
+        spacescan_gap_bps = (
+            abs(exact_spacescan_price - mid_price) / mid_price * Decimal("10000")
+        )
 
     return {
         "dexie_price": dexie_price,
@@ -681,7 +770,9 @@ def _fetch_price_standalone(asset_id, decimals):
     )
 
 
-def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
+def _fetch_dexie_orderbook_standalone(
+    asset_id: str, *, own_offer_identities: frozenset[str] = frozenset()
+) -> dict:
     """Fetch Dexie orderbook and calculate competitor spread/depth.
 
     Standalone version (no bot/market_intel needed) for Smart Defaults.
@@ -698,23 +789,28 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
     import requests as _req
 
     result = {
-        "best_bid": 0,
-        "best_ask": 0,
-        "competitor_spread_bps": 0,
-        "buy_depth_xch": 0,
-        "sell_depth_xch": 0,
+        "best_bid": Decimal("0"),
+        "best_ask": Decimal("0"),
+        "competitor_spread_bps": Decimal("0"),
+        "buy_depth_xch": Decimal("0"),
+        "sell_depth_xch": Decimal("0"),
         "num_buy_offers": 0,
         "num_sell_offers": 0,
         "has_data": False,
         "api_ok": False,
         "error": "",
+        "provider_book": {"bids": [], "asks": []},
     }
     if not asset_id:
         result["error"] = "no asset_id"
         return result
 
     dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
-    our_tag = getattr(cfg, "DEXIE_BOT_TAG", "")
+    our_tag = str(getattr(cfg, "BOT_TAG", "") or "").strip()
+    own_identities = frozenset(
+        str(value or "").strip() for value in own_offer_identities if str(value or "").strip()
+    )
+    page_size = max(20, int(getattr(cfg, "DEXIE_ORDERBOOK_PAGE_SIZE", 200) or 200))
 
     try:
         # Sell side: CAT offered for XCH (ascending = cheapest first = best ask)
@@ -723,9 +819,10 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
         sell_resp = _req.get(
             f"{dexie_base}/v1/offers",
             params={
-                "offered_asset_id": asset_id,
+                "offered": asset_id,
+                "requested": "xch",
                 "status": 0,
-                "page_size": 20,
+                "page_size": page_size,
                 "sort": "price_asc",
             },
             timeout=8,
@@ -738,9 +835,10 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
         buy_resp = _req.get(
             f"{dexie_base}/v1/offers",
             params={
-                "requested_asset_id": asset_id,
+                "offered": "xch",
+                "requested": asset_id,
                 "status": 0,
-                "page_size": 20,
+                "page_size": page_size,
                 "sort": "price_desc",
             },
             timeout=8,
@@ -759,58 +857,49 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
             return result
         result["api_ok"] = True
 
-        # Filter out our own offers (by tag)
-        def is_ours(offer):
-            tags = offer.get("tags", [])
-            return our_tag and our_tag in tags
+        def is_ours(raw_offer, normalized):
+            tags = raw_offer.get("tags", [])
+            identities = {
+                normalized["offer_id"],
+                normalized["provider_offer_id"],
+                normalized["trade_id"],
+            }
+            return bool(
+                (isinstance(tags, list) and our_tag and our_tag in tags)
+                or (identities - {""}) & own_identities
+            )
 
-        # Parse sell side (extract prices)
-        for offer in sell_offers:
-            if is_ours(offer):
-                continue
-            offered = offer.get("offered", [])
-            requested = offer.get("requested", [])
-            cat_amount = 0
-            xch_amount = 0
-            for item in offered:
-                if str(item.get("id", "")).lower().replace(
-                    "0x", ""
-                ) == asset_id.lower().replace("0x", ""):
-                    cat_amount = float(item.get("amount", 0))
-            for item in requested:
-                code = str(item.get("code", "")).upper()
-                if code == "XCH" or str(item.get("id", "")).lower() == "xch":
-                    xch_amount = float(item.get("amount", 0))
-            if cat_amount > 0 and xch_amount > 0:
-                price = xch_amount / cat_amount
-                if result["best_ask"] == 0 or price < result["best_ask"]:
-                    result["best_ask"] = price
-                result["sell_depth_xch"] += xch_amount
-                result["num_sell_offers"] += 1
-
-        # Parse buy side
-        for offer in buy_offers:
-            if is_ours(offer):
-                continue
-            offered = offer.get("offered", [])
-            requested = offer.get("requested", [])
-            xch_amount = 0
-            cat_amount = 0
-            for item in offered:
-                code = str(item.get("code", "")).upper()
-                if code == "XCH" or str(item.get("id", "")).lower() == "xch":
-                    xch_amount = float(item.get("amount", 0))
-            for item in requested:
-                if str(item.get("id", "")).lower().replace(
-                    "0x", ""
-                ) == asset_id.lower().replace("0x", ""):
-                    cat_amount = float(item.get("amount", 0))
-            if cat_amount > 0 and xch_amount > 0:
-                price = xch_amount / cat_amount
-                if price > result["best_bid"]:
-                    result["best_bid"] = price
-                result["buy_depth_xch"] += xch_amount
-                result["num_buy_offers"] += 1
+        for side, raw_rows, provider_key in (
+            ("sell", sell_offers, "asks"),
+            ("buy", buy_offers, "bids"),
+        ):
+            for raw_offer in raw_rows:
+                normalized = _normalise_standalone_dexie_offer(
+                    raw_offer, expected_side=side, asset_id=asset_id
+                )
+                result["provider_book"][provider_key].append(
+                    {
+                        "offer_id": normalized["offer_id"],
+                        "price": normalized["price"],
+                        "amount_mojos": normalized["amount_mojos"],
+                    }
+                )
+                if is_ours(raw_offer, normalized):
+                    continue
+                price = Decimal(normalized["price"])
+                xch_amount = Decimal(normalized["amount_mojos"]) / Decimal(
+                    "1000000000000"
+                )
+                if side == "sell":
+                    if result["best_ask"] == 0 or price < result["best_ask"]:
+                        result["best_ask"] = price
+                    result["sell_depth_xch"] += xch_amount
+                    result["num_sell_offers"] += 1
+                else:
+                    if price > result["best_bid"]:
+                        result["best_bid"] = price
+                    result["buy_depth_xch"] += xch_amount
+                    result["num_buy_offers"] += 1
 
         # Sanity check: if bid > ask (inverted), the data is garbage — reset
         if result["best_bid"] > 0 and result["best_ask"] > 0:
@@ -819,15 +908,17 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
                     f"[SMART_DEFAULTS] Orderbook inverted (bid {result['best_bid']:.10f} "
                     f">= ask {result['best_ask']:.10f}) — discarding"
                 )
-                result["best_bid"] = 0
-                result["best_ask"] = 0
+                result["best_bid"] = Decimal("0")
+                result["best_ask"] = Decimal("0")
 
         # Calculate competitor spread
         if result["best_bid"] > 0 and result["best_ask"] > 0:
-            mid = (result["best_bid"] + result["best_ask"]) / 2
+            mid = (result["best_bid"] + result["best_ask"]) / Decimal("2")
             if mid > 0:
                 result["competitor_spread_bps"] = (
-                    (result["best_ask"] - result["best_bid"]) / mid * 10000
+                    (result["best_ask"] - result["best_bid"])
+                    / mid
+                    * Decimal("10000")
                 )
 
         # has_data means "API succeeded AND competitors were found".
@@ -853,6 +944,78 @@ def _fetch_dexie_orderbook_standalone(asset_id: str) -> dict:
         result["error"] = f"exception: {e}"
         print(f"[SMART_DEFAULTS] Orderbook fetch failed: {e}")
         return result
+
+
+def _smart_market_own_offer_identities(asset_id: str) -> frozenset[str]:
+    """Collect every durable and legacy identity owned by the active bot."""
+
+    from database import get_active_offer_market_identities, get_open_offers
+
+    identities = set(get_active_offer_market_identities(asset_id))
+    for row in get_open_offers(cat_asset_id=asset_id):
+        for key in (
+            "trade_id",
+            "dexie_id",
+            "offer_hash",
+            "publication_identity",
+            "coin_id",
+        ):
+            value = str(row.get(key) or "").strip()
+            if value:
+                identities.add(value)
+    return frozenset(identities)
+
+
+def _derive_smart_market_confidence(
+    *,
+    asset_id: str,
+    risk_profile: str,
+    provider_book: dict,
+    own_offer_identities: frozenset[str],
+    configured_offer_size_xch: Decimal,
+    now: datetime,
+):
+    """Persist and derive Smart Settings from the normal runtime evidence path."""
+
+    from market_runtime import OfferBookMarketRuntime
+
+    size_mojos_decimal = configured_offer_size_xch * Decimal("1000000000000")
+    size_mojos = int(size_mojos_decimal.to_integral_value())
+    if size_mojos <= 0:
+        raise ValueError("configured Smart Settings offer size is invalid")
+
+    active_bot = getattr(api_server, "bot", None)
+
+    def splash_health():
+        if active_bot is None or not hasattr(active_bot, "_splash_confidence_health"):
+            return {"running": False, "api_reachable": False, "peers": 0}
+        return active_bot._splash_confidence_health()
+
+    def splash_offers(requested_asset: str):
+        if active_bot is None or not hasattr(
+            active_bot, "_get_fresh_splash_confidence_offers"
+        ):
+            return []
+        return active_bot._get_fresh_splash_confidence_offers(
+            requested_asset, now=now
+        )
+
+    runtime = OfferBookMarketRuntime(
+        asset_id=asset_id,
+        risk_preset=risk_profile,
+        fetch_dexie_book=lambda requested_asset: (
+            provider_book
+            if requested_asset == asset_id
+            else (_ for _ in ()).throw(ValueError("Smart Settings asset changed"))
+        ),
+        fetch_splash_offers=splash_offers,
+        fetch_splash_health=splash_health,
+    )
+    return runtime.refresh(
+        own_offer_identities=own_offer_identities,
+        configured_offer_size_mojos=size_mojos,
+        now=now,
+    ).confidence
 
 
 @bp.route("/api/smart-defaults")
@@ -1051,6 +1214,14 @@ def _calculate_smart_defaults(
 
     if not asset_id:
         return jsonify({"error": "No trading pair selected"})
+    normalized_asset_id = str(asset_id).strip().lower().removeprefix("0x")
+    if len(normalized_asset_id) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized_asset_id
+    ):
+        return jsonify({"error": "Selected CAT asset identity is invalid"}), 400
+    asset_id = normalized_asset_id
+
+    trade_size = api_server._safe_float(request.args.get("trade_size", 0))
 
     print("\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
     log_event(
@@ -1193,7 +1364,57 @@ def _calculate_smart_defaults(
 
     # Fetch before price resolution: asset-id orderbook evidence is the
     # authoritative live market input in the post-TibetSwap model.
-    orderbook = _fetch_dexie_orderbook_standalone(asset_id)
+    own_offer_identities = _smart_market_own_offer_identities(asset_id)
+    orderbook = _fetch_dexie_orderbook_standalone(
+        asset_id, own_offer_identities=own_offer_identities
+    )
+    configured_size_candidates = [
+        Decimal(str(trade_size or 0)),
+        Decimal(str(getattr(cfg, "XCH_COIN_SIZE", 0) or 0)),
+    ]
+    for side in ("BUY", "SELL"):
+        for tier in ("INNER", "MID", "OUTER", "EXTREME"):
+            configured_size_candidates.append(
+                Decimal(str(getattr(cfg, f"{side}_{tier}_SIZE_XCH", 0) or 0))
+            )
+    configured_market_size = max(
+        (value for value in configured_size_candidates if value > 0),
+        default=Decimal("0.005"),
+    )
+    market_confidence = _derive_smart_market_confidence(
+        asset_id=asset_id,
+        risk_profile=_risk_profile_name,
+        provider_book=orderbook.get("provider_book", {"bids": [], "asks": []}),
+        own_offer_identities=own_offer_identities,
+        configured_offer_size_xch=configured_market_size,
+        now=datetime.now(timezone.utc),
+    )
+    if market_confidence.state != "GREEN":
+        reason_codes = list(market_confidence.reason_codes)
+        log_event(
+            "warning",
+            "smart_defaults_market_confidence_blocked",
+            "Smart Settings requires GREEN attributable offer-book confidence",
+        )
+        return (
+            jsonify(
+                {
+                    "error": "Smart Settings requires GREEN offer-book confidence",
+                    "code": "MARKET_CONFIDENCE_NOT_GREEN",
+                    "market_confidence": market_confidence.state,
+                    "reason_codes": reason_codes,
+                }
+            ),
+            409,
+        )
+    orderbook["best_bid"] = market_confidence.trusted_bid or Decimal("0")
+    orderbook["best_ask"] = market_confidence.trusted_ask or Decimal("0")
+    orderbook["buy_depth_xch"] = Decimal(
+        market_confidence.independent_bid_depth_mojos
+    ) / Decimal("1000000000000")
+    orderbook["sell_depth_xch"] = Decimal(
+        market_confidence.independent_ask_depth_mojos
+    ) / Decimal("1000000000000")
     if orderbook["has_data"]:
         messages.append(
             f"Competitors: {orderbook['num_buy_offers']}B/{orderbook['num_sell_offers']}S"
@@ -1201,23 +1422,25 @@ def _calculate_smart_defaults(
 
     # ---- 3. Prices (from collected data + orderbook/trade fallbacks) ----
     price_info = _resolve_smart_mid_price(
-        ticker, tibet, spacescan, trades, orderbook, messages
+        ticker,
+        tibet,
+        spacescan,
+        trades,
+        orderbook,
+        market_confidence=market_confidence,
+        messages=messages,
     )
-    dexie_price = price_info["dexie_price"]
-    tibet_price = price_info["tibet_price"]
-    mid_price = price_info["mid_price"]
-    arb_gap_bps = price_info["arb_gap_bps"]
-    spacescan_gap_bps = price_info["spacescan_gap_bps"]
+    trusted_mid_price = price_info["mid_price"]
+    dexie_price = float(price_info["dexie_price"])
+    tibet_price = float(price_info["tibet_price"])
+    mid_price = float(trusted_mid_price)
+    arb_gap_bps = float(price_info["arb_gap_bps"])
+    spacescan_gap_bps = float(price_info["spacescan_gap_bps"])
     has_both_prices = price_info["has_both_prices"]
     price_source = price_info["price_source"]
     vwap_price = price_info["vwap_price"]
     if not mid_price:
         return jsonify({"error": "No executable Dexie price available"})
-
-    # ---- 5. Read user inputs (trade size, max offers) ----
-    from flask import request as flask_request
-
-    trade_size = api_server._safe_float(flask_request.args.get("trade_size", 0))
 
     # ══════════════════════════════════════════════════════════════
     # V2 CALCULATION PHASE — data-driven from 30 days of history
@@ -1301,15 +1524,8 @@ def _calculate_smart_defaults(
                 f"(vs live Dexie {dexie_price:.8f})"
             )
             messages.append(f"VWAP (30d): {vwap_price:.8f}")
-    # Use VWAP as mid_price when it diverges from current price by <10%
-    # (avoids anchoring to a stale or thin snapshot price)
-    if (
-        vwap_price > 0
-        and mid_price > 0
-        and abs(vwap_price - mid_price) / mid_price < 0.10
-    ):
-        mid_price = (mid_price + vwap_price) / 2  # Blend: 50% current, 50% VWAP
-        messages.append("Mid blended with VWAP")
+    # Settled-trade VWAP is diagnostic context only. It cannot replace or
+    # blend the exact trusted offer-book midpoint used for Smart Settings.
 
     if regime == "extreme":
         vol_adj = 200  # +2%
@@ -3890,11 +4106,30 @@ def _calculate_smart_defaults(
         configured_offer_size_xch=_offer_size_for_policy,
         independent_depth_xch=max(Decimal("0"), _independent_depth),
         volatility_bps=Decimal(str(max(0.0, max_move * 100))),
-        churn_score=0,
+        churn_score=int(market_confidence.manipulation_score),
         network_fee_xch=Decimal(str(max(0.0, _smart_fee_xch))),
-        expected_cancel_requotes=2,
-        minimum_profit_xch=Decimal("0.0001"),
+        expected_cancel_requotes=int(
+            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0
+        ),
+        minimum_profit_xch=Decimal(
+            str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
+        ),
     )
+    if not _offer_book_policy["independent_depth_sufficient"]:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Smart Settings cannot safely size this ladder from the "
+                        "current independent offer-book depth"
+                    ),
+                    "code": "INSUFFICIENT_INDEPENDENT_DEPTH",
+                    "market_confidence": market_confidence.state,
+                    "offer_book_policy": _offer_book_policy,
+                }
+            ),
+            409,
+        )
     _policy_spread_bps = Decimal(_offer_book_policy["recommended_spread_bps"])
     if _policy_spread_bps > Decimal(str(base_spread_bps)):
         base_spread_bps = float(_policy_spread_bps)
@@ -3952,7 +4187,25 @@ def _calculate_smart_defaults(
     result = {
         "market_model": "offer_book",
         "market_risk_preset": _risk_profile_name,
+        "market_confidence": market_confidence.state,
+        "market_confidence_reason_codes": list(market_confidence.reason_codes),
+        "market_evidence_digests": list(market_confidence.evidence_digests),
+        "market_source_health": dict(market_confidence.source_health),
+        "market_trusted_bid": market_confidence.trusted_bid,
+        "market_trusted_ask": market_confidence.trusted_ask,
+        "market_trusted_midpoint": market_confidence.trusted_midpoint,
+        "market_independent_bid_depth_xch": orderbook["buy_depth_xch"],
+        "market_independent_ask_depth_xch": orderbook["sell_depth_xch"],
         "offer_book_policy": _offer_book_policy,
+        "minimum_profit_xch": str(
+            getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001"))
+        ),
+        "expected_cancel_requotes": int(
+            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0
+        ),
+        "competition_cooldown_secs": int(
+            getattr(cfg, "COMPETITION_COOLDOWN_SECS", 30) or 30
+        ),
         "tibet_status": "retired",
         # Smart Pricing
         "dynamic_spread_enabled": bool(
