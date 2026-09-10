@@ -20,6 +20,8 @@ authorization policy before persisting a terminal registry state.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Mapping
 
 try:
     from enum import StrEnum
@@ -68,6 +70,161 @@ class OfferTransition:
     signal: OfferSignal
     action: str  # what the caller should do
     reason: str  # human-readable explanation
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDiscoveryDecision:
+    """Mutation instruction derived from exact public discovery evidence."""
+
+    action: str
+    reason_code: str
+    exact_providers: tuple[str, ...] = ()
+    mismatched_providers: tuple[str, ...] = ()
+    retry_after_seconds: int = 0
+
+
+class OfferDiscoveryTracker:
+    """Require exact rediscovery within 90 seconds before an offer stays live."""
+
+    publication_targets = ("dexie", "splash")
+    discovery_deadline_seconds = 90
+
+    def __init__(self, *, offer_identity: str, created_at: datetime) -> None:
+        self.offer_identity = self._identity(offer_identity)
+        self.created_at = self._time(created_at, "created_at")
+        self._submissions: dict[str, bool] = {}
+        self._exact_providers: set[str] = set()
+        self._mismatched_providers: set[str] = set()
+
+    def record_submission(self, *, provider: str, succeeded: bool) -> None:
+        provider_id = self._provider(provider)
+        if type(succeeded) is not bool:
+            raise TypeError("succeeded must be a boolean")
+        self._submissions[provider_id] = succeeded
+
+    def record_discovery(self, *, provider: str, observed_offer_identity: str) -> None:
+        provider_id = self._provider(provider)
+        observed = self._identity(observed_offer_identity)
+        if observed == self.offer_identity:
+            self._exact_providers.add(provider_id)
+            self._mismatched_providers.discard(provider_id)
+        elif provider_id not in self._exact_providers:
+            self._mismatched_providers.add(provider_id)
+
+    def evaluate(self, *, now: datetime) -> PublicationDiscoveryDecision:
+        current = self._time(now, "now")
+        exact = tuple(sorted(self._exact_providers))
+        mismatched = tuple(sorted(self._mismatched_providers))
+        if exact:
+            return PublicationDiscoveryDecision(
+                action="KEEP_LIVE",
+                reason_code="PUBLICATION_EXACTLY_DISCOVERED",
+                exact_providers=exact,
+                mismatched_providers=mismatched,
+            )
+        elapsed = (current - self.created_at).total_seconds()
+        if elapsed >= self.discovery_deadline_seconds:
+            return PublicationDiscoveryDecision(
+                action="CANCEL_VIA_SAGE",
+                reason_code="PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
+                mismatched_providers=mismatched,
+            )
+        return PublicationDiscoveryDecision(
+            action="WAIT_FOR_DISCOVERY",
+            reason_code="PUBLICATION_DISCOVERY_PENDING",
+            mismatched_providers=mismatched,
+            retry_after_seconds=max(0, self.discovery_deadline_seconds - int(elapsed)),
+        )
+
+    def replacement_decision(
+        self,
+        *,
+        authoritative_terminal: bool,
+        terminal_at: datetime | None,
+        attempt: int,
+        now: datetime,
+    ) -> PublicationDiscoveryDecision:
+        if type(authoritative_terminal) is not bool:
+            raise TypeError("authoritative_terminal must be a boolean")
+        if type(attempt) is not int or attempt < 0:
+            raise ValueError("attempt must be a nonnegative integer")
+        current = self._time(now, "now")
+        if not authoritative_terminal or terminal_at is None:
+            return PublicationDiscoveryDecision(
+                action="BLOCK_REPLACEMENT",
+                reason_code="AUTHORITATIVE_TERMINAL_PROOF_REQUIRED",
+            )
+        terminal = self._time(terminal_at, "terminal_at")
+        delay = min(300, 5 * (2**attempt))
+        remaining = delay - int((current - terminal).total_seconds())
+        if remaining > 0:
+            return PublicationDiscoveryDecision(
+                action="WAIT_REPLACEMENT_BACKOFF",
+                reason_code="REPLACEMENT_BACKOFF_ACTIVE",
+                retry_after_seconds=remaining,
+            )
+        return PublicationDiscoveryDecision(
+            action="ALLOW_REPLACEMENT",
+            reason_code="TERMINAL_PROOF_AND_BACKOFF_SATISFIED",
+        )
+
+    def authorize_duplicate_create(self, offer_identity: str) -> bool:
+        """Reject a retry for the same still-tracked economic offer."""
+
+        return self._identity(offer_identity) != self.offer_identity
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "offer_identity": self.offer_identity,
+            "created_at": self.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "submissions": dict(sorted(self._submissions.items())),
+            "exact_providers": sorted(self._exact_providers),
+            "mismatched_providers": sorted(self._mismatched_providers),
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> "OfferDiscoveryTracker":
+        if not isinstance(state, Mapping):
+            raise TypeError("discovery state must be a mapping")
+        timestamp = str(state["created_at"])
+        created_at = datetime.fromisoformat(
+            timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp
+        )
+        tracker = cls(
+            offer_identity=str(state["offer_identity"]), created_at=created_at
+        )
+        submissions = state.get("submissions", {})
+        if not isinstance(submissions, Mapping):
+            raise ValueError("submissions must be a mapping")
+        for provider, succeeded in submissions.items():
+            tracker.record_submission(provider=str(provider), succeeded=succeeded)
+        for provider in state.get("exact_providers", []):
+            tracker._exact_providers.add(tracker._provider(provider))
+        for provider in state.get("mismatched_providers", []):
+            tracker._mismatched_providers.add(tracker._provider(provider))
+        return tracker
+
+    @staticmethod
+    def _provider(value: str) -> str:
+        provider = str(value).strip().lower()
+        if provider not in OfferDiscoveryTracker.publication_targets:
+            raise ValueError("provider must be dexie or splash")
+        return provider
+
+    @staticmethod
+    def _identity(value: str) -> str:
+        identity = str(value).strip().lower()
+        if len(identity) != 64 or any(
+            character not in "0123456789abcdef" for character in identity
+        ):
+            raise ValueError("offer identity must be a 32-byte hex value")
+        return identity
+
+    @staticmethod
+    def _time(value: datetime, label: str) -> datetime:
+        if type(value) is not datetime or value.tzinfo is None:
+            raise TypeError(f"{label} must be a timezone-aware datetime")
+        return value.astimezone(timezone.utc)
 
 
 # Terminal states — no further transitions allowed
