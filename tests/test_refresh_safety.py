@@ -956,6 +956,39 @@ def test_parent_absent_completion_resume_replays_before_and_after_commit(
     assert commits == ["absent-parent", "absent-parent", "absent-parent"]
 
 
+def test_cycle_resume_checks_both_sides_before_normal_offer_maintenance(monkeypatch):
+    """Every fresh wallet cycle must advance durable refresh work without drift."""
+
+    from offer_manager import OfferManager
+
+    manager = OfferManager.__new__(OfferManager)
+    calls = []
+    monkeypatch.setattr(
+        manager,
+        "_advance_pending_refresh_lineage",
+        lambda offers, side: calls.append((side, offers)) or None,
+    )
+    buys = [{"trade_id": _sha("cycle-buy")}]
+    sells = [{"trade_id": _sha("cycle-sell")}]
+
+    result = manager.resume_pending_refresh_lineages(buys, sells)
+
+    assert result == {"buy": None, "sell": None}
+    assert calls == [("buy", buys), ("sell", sells)]
+
+
+def test_bot_cycle_resumes_refresh_lineages_before_fill_detection():
+    """Crash recovery cannot depend on price drift, requote, or excess trimming."""
+
+    import inspect
+    from bot_loop import BotLoop
+
+    source = inspect.getsource(BotLoop._run_one_cycle)
+    assert source.index("resume_pending_refresh_lineages(") < source.index(
+        "self.fill_tracker.detect_fills("
+    )
+
+
 def test_refresh_blocker_incidents_are_exact_cohort_scoped_and_replayable(
     isolated_database,
 ):

@@ -543,6 +543,23 @@ class OfferManager:
         _parents, cohort_pause = self._collect_staged_refresh_parents(open_offers, side)
         return cohort_pause or "awaiting_refresh_lineage"
 
+    def resume_pending_refresh_lineages(
+        self,
+        open_buys: List[Dict[str, Any]],
+        open_sells: List[Dict[str, Any]],
+    ) -> Dict[str, Optional[str]]:
+        """Advance crash-safe replacement lineages on every fresh wallet cycle.
+
+        This explicit recovery seam keeps progression independent of price drift,
+        requote eligibility, tier selection, and offer-cap trimming.  Callers must
+        establish the runtime cancellation effect phase before invoking it.
+        """
+
+        return {
+            "buy": self._advance_pending_refresh_lineage(open_buys, "buy"),
+            "sell": self._advance_pending_refresh_lineage(open_sells, "sell"),
+        }
+
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
         # Used by fill_tracker to distinguish own-cancel from counterparty fill.

@@ -39,8 +39,8 @@ def test_pair_lookup_is_retired_and_only_dexie_is_contacted(monkeypatch):
     assert calls and all("dexie" in url.lower() for url in calls)
 
 
-def test_cat_selection_classifies_provider_outage_as_unavailable():
-    """CAT selection must not tell operators an unavailable pair is absent."""
+def test_cat_selection_labels_retired_provider_metadata_as_historical():
+    """CAT selection must not present a permanently retired provider as an outage."""
 
     event_builder = getattr(cat_blueprint, "_tibet_resolution_event", None)
     assert callable(event_builder), "CAT selection has no provider-state classifier"
@@ -51,7 +51,8 @@ def test_cat_selection_classifies_provider_outage_as_unavailable():
         "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
     )
 
-    assert event["level"] == "warning"
-    assert event["event_type"] == "cat_tibet_pair_unavailable"
-    assert "unavailable" in event["message"].lower()
-    assert "has no TibetSwap pair" not in event["message"]
+    assert event["level"] == "info"
+    assert event["event_type"] == "cat_retired_provider_metadata"
+    assert "historical" in event["message"].lower()
+    assert "outage" not in event["message"].lower()
+    assert "degraded" not in event["message"].lower()

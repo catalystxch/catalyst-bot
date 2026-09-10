@@ -125,6 +125,21 @@ def test_status_and_doctor_health_paths_never_contact_tibetswap():
     assert "retired" in doctor_source.lower()
 
 
+def test_live_health_paths_do_not_describe_retirement_as_an_outage():
+    dashboard_source = inspect.getsource(
+        __import__("blueprints.dashboard", fromlist=["api_dashboard"]).api_dashboard
+    )
+    augment_source = inspect.getsource(
+        bot_loop.BotLoop._augment_health_with_provider_context
+    )
+
+    for source in (dashboard_source, augment_source):
+        assert "TibetSwap API unavailable" not in source
+        assert "Market degraded — TibetSwap" not in source
+        assert "Dexie-only pricing" not in source
+        assert '"pricing_mode"] = "offer_book_confidence"' in source
+
+
 def test_legacy_slippage_endpoint_is_explicitly_retired(monkeypatch):
     fake_engine = Mock()
     fake_engine.get_tibet_quote.side_effect = AssertionError("retired provider called")

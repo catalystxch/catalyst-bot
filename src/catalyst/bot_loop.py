@@ -1697,32 +1697,11 @@ class BotLoop:
     def _augment_health_with_provider_context(self, health_data: dict) -> dict:
         """Add external-provider state required by live dashboard SSE updates."""
         health_data = self._augment_health_with_spacescan(health_data)
-        startup_results = getattr(self, "_startup_self_test_results", {}) or {}
-        tibet_health = startup_results.get("tibet") or {}
-        if tibet_health.get("ok") is not False:
-            return health_data
-
-        outage_text = (
-            "TibetSwap API unavailable — Dexie-only pricing; "
-            "AMM drift protection and reference price unavailable"
-        )
-        conditions = health_data.setdefault("conditions", [])
-        if not any(
-            isinstance(condition, dict) and condition.get("text") == outage_text
-            for condition in conditions
-        ):
-            conditions.append({"level": "amber", "text": outage_text})
-
         metrics = health_data.setdefault("metrics", {})
         metrics["tibetswap_available"] = False
-        metrics["tibetswap_status_code"] = tibet_health.get("status_code")
-        metrics["pricing_mode"] = "dexie_only"
-        if health_data.get("status") == "green":
-            health_data["status"] = "amber"
-            health_data["message"] = (
-                "Market degraded — TibetSwap unavailable; Dexie-only pricing "
-                "active without AMM drift protection"
-            )
+        metrics["tibetswap_retired"] = True
+        metrics["tibetswap_reason"] = "TIBETSWAP_SHUTDOWN"
+        metrics["pricing_mode"] = "offer_book_confidence"
         return health_data
 
     def _emit_alert(
@@ -9486,6 +9465,25 @@ class BotLoop:
                 )
             self._clear_alert("wallet_offer_sync")
             self._wallet_sync_was_stale = False
+
+            # Resume durable child-first refresh work on every fresh wallet
+            # cycle.  Recovery must not depend on a later price move, requote
+            # budget, tier filter, or cap trim happening to select the parent.
+            if not self._enter_runtime_effect_phase("cancel"):
+                return
+            lineage_state = self.offer_manager.resume_pending_refresh_lineages(
+                _db_buy_all, _db_sell_all
+            )
+            pending_lineages = {
+                side: reason for side, reason in lineage_state.items() if reason
+            }
+            if pending_lineages:
+                log_event(
+                    "info",
+                    "refresh_lineage_cycle_resume",
+                    "Durable offer refresh lineage recovery advanced before fill detection",
+                    data=pending_lineages,
+                )
 
         if self._cycle_stop_requested("post_wallet_sync"):
             return

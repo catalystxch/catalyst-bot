@@ -52,29 +52,15 @@ def _active_cat_wallet_id(wallet_id, asset_id: str = "") -> int:
 
 
 def _tibet_resolution_event(meta: dict, name: str, asset_id: str) -> dict:
-    """Describe the CAT pair lookup without conflating absence and outage."""
+    """Describe retired provider metadata without implying a live dependency."""
     pair_id = str(meta.get("pair_id") or "").strip()
-    if pair_id:
-        return {
-            "level": "info",
-            "event_type": "cat_tibet_pair_resolved",
-            "message": (f"TIBET_PAIR_ID auto-resolved for {name}: {pair_id[:20]}..."),
-        }
-    if meta.get("pair_lookup_status") == "unavailable":
-        return {
-            "level": "warning",
-            "event_type": "cat_tibet_pair_unavailable",
-            "message": (
-                f"TibetSwap pair lookup unavailable for {name} "
-                f"({asset_id[:12]}...) — AMM monitoring is degraded"
-            ),
-        }
+    suffix = f"; preserved pair ID {pair_id[:20]}..." if pair_id else ""
     return {
         "level": "info",
-        "event_type": "cat_tibet_pair_not_found",
+        "event_type": "cat_retired_provider_metadata",
         "message": (
-            f"CAT {name} ({asset_id[:12]}...) has no TibetSwap pair — "
-            f"AMM monitoring disabled for this token"
+            f"CAT {name} ({asset_id[:12]}...) keeps TibetSwap metadata as "
+            f"historical compatibility only{suffix}"
         ),
     }
 
