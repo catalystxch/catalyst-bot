@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from database import get_connection, log_event
+from database import get_connection, log_event, open_critical_write_connection
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,8 +184,12 @@ class ReservationManager:
             status = "completed"
 
         with self._lock:
+            conn = None
             try:
-                conn = get_connection()
+                # This closes a capacity hold after the wallet operation. Use
+                # a fresh connection so a contended worker-local transaction
+                # cannot strand the lease until its TTL expires.
+                conn = open_critical_write_connection()
                 now_iso = datetime.now(timezone.utc).isoformat()
                 conn.execute(
                     """UPDATE reservation_leases
@@ -203,6 +207,9 @@ class ReservationManager:
                     )
                 except Exception:
                     pass
+            finally:
+                if conn is not None:
+                    conn.close()
 
     def expire_stale(self) -> int:
         """Expire all active leases past their TTL. Returns count expired."""

@@ -1744,6 +1744,67 @@ def _retire_expired_dead_startup_lease() -> dict:
     )
 
 
+def _recover_startup_publication_claims(api_server, authorization: dict) -> dict:
+    """Run the ordered publication recovery stages for the current blocker."""
+
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from database import recover_preprojection_publications_at_startup
+
+            projection_recovery = recover_preprojection_publications_at_startup()
+            if projection_recovery.get("recovered", 0) > 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from database import recover_undispatched_publication_claims_at_startup
+
+            local_recovery = recover_undispatched_publication_claims_at_startup()
+            if local_recovery.get("recovered", 0) > 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from dexie_manager import recover_expired_dexie_publications_at_startup
+
+            recovery = recover_expired_dexie_publications_at_startup()
+            if recovery.get("recovered", 0) > 0 and recovery.get("remaining") == 0:
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            pass
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "publication_claims"
+        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
+    ):
+        try:
+            from database import suppress_orphaned_dispatched_publications_at_startup
+
+            suppression = suppress_orphaned_dispatched_publications_at_startup()
+            if (
+                suppression.get("suppressed", 0) > 0
+                and suppression.get("remaining") == 0
+            ):
+                authorization = api_server.initialize_mutation_runtime()
+        except Exception:
+            pass
+    return authorization
+
+
 def _initialize_startup_ownership() -> dict:
     """Initialize storage, reconcile exact prep evidence, and acquire ownership."""
 
@@ -1780,59 +1841,7 @@ def _initialize_startup_ownership() -> dict:
             # Recovery is fail-closed. The original authorization keeps the
             # app in diagnostics mode with its durable reason intact.
             pass
-    if (
-        authorization.get("allowed") is False
-        and authorization.get("failed_check") == "publication_claims"
-        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
-    ):
-        try:
-            from database import (
-                recover_undispatched_publication_claims_at_startup,
-            )
-
-            local_recovery = recover_undispatched_publication_claims_at_startup()
-            if local_recovery.get("recovered", 0) > 0:
-                authorization = api_server.initialize_mutation_runtime()
-        except Exception:
-            # A claim without dispatch evidence is recoverable only while no
-            # mutation owner exists. Any uncertainty keeps the blocker intact.
-            pass
-    if (
-        authorization.get("allowed") is False
-        and authorization.get("failed_check") == "publication_claims"
-        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
-    ):
-        try:
-            from dexie_manager import recover_expired_dexie_publications_at_startup
-
-            recovery = recover_expired_dexie_publications_at_startup()
-            if recovery.get("recovered", 0) > 0 and recovery.get("remaining") == 0:
-                authorization = api_server.initialize_mutation_runtime()
-        except Exception:
-            # Provider readback recovery is exact and fail-closed. Keep the
-            # diagnostics blocker when the public offer cannot be proven.
-            pass
-    if (
-        authorization.get("allowed") is False
-        and authorization.get("failed_check") == "publication_claims"
-        and authorization.get("reason_code") == "PUBLICATION_CLAIM_RECOVERY_REQUIRED"
-    ):
-        try:
-            from database import (
-                suppress_orphaned_dispatched_publications_at_startup,
-            )
-
-            suppression = suppress_orphaned_dispatched_publications_at_startup()
-            if (
-                suppression.get("suppressed", 0) > 0
-                and suppression.get("remaining") == 0
-            ):
-                authorization = api_server.initialize_mutation_runtime()
-        except Exception:
-            # Abandoned requests are terminalized only when their durable
-            # identity is intact and no mutation owner exists. Any malformed
-            # or unlinked evidence remains blocked for explicit recovery.
-            pass
+    authorization = _recover_startup_publication_claims(api_server, authorization)
     legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
@@ -1848,6 +1857,9 @@ def _initialize_startup_ownership() -> dict:
                 recovery = api_server.recover_legacy_startup_reservations()
                 if recovery.get("recovered", 0) > 0:
                     authorization = api_server.initialize_mutation_runtime()
+                    authorization = _recover_startup_publication_claims(
+                        api_server, authorization
+                    )
             except Exception:
                 # Legacy migration is proof-bound and fail-closed. A Sage
                 # restart can make its read-only evidence briefly unavailable.

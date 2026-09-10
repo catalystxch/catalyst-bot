@@ -26,6 +26,7 @@ COIN_PURPOSES = (
 _PURPOSE_SET = frozenset(COIN_PURPOSES)
 COIN_PREP_OPERATION_KINDS = ("split", "combine")
 _COIN_ID_RE = re.compile(r"[0-9a-f]{64}")
+_ATTEMPT_ID_RE = re.compile(r"[0-9a-f]{32}")
 _CANONICAL_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 _MAX_CAPACITY_COINS = 4096
 _MAX_TARGET_OUTPUTS = 512
@@ -206,6 +207,15 @@ def _canonical_target_contract(target_contract: Any) -> dict[str, Any]:
         )
     canonical_outputs.sort(key=lambda output: output["output_index"])
     canonical_target = {"wallet_type": wallet_type, "outputs": canonical_outputs}
+
+    # Runtime top-ups may safely retry the same source and output plan after an
+    # authoritative no-effect result.  Preserve a per-attempt nonce so each
+    # retry receives its own immutable journal identity and evidence row.
+    attempt_id = target_contract.get("attempt_id")
+    if attempt_id is not None:
+        if type(attempt_id) is not str or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
+            raise ValueError("target_contract attempt_id is invalid")
+        canonical_target["attempt_id"] = attempt_id
 
     # CAT operations can consume a separately selected XCH coin for their fee.
     # That cohort is part of the immutable wallet-effect contract: omitting it
