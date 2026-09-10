@@ -3519,6 +3519,64 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
     recorded_at                TEXT NOT NULL,
     resolved_at                TEXT
 );
+
+-- v1.4 provider evidence. Raw evidence is bounded and redacted before this
+-- database boundary; exact digests make retries idempotent.
+CREATE TABLE IF NOT EXISTS market_provider_observations (
+    observation_id            TEXT PRIMARY KEY,
+    asset_id                  TEXT NOT NULL,
+    provider_id               TEXT NOT NULL,
+    capability                TEXT NOT NULL,
+    observed_at               TEXT NOT NULL,
+    source_time               TEXT,
+    source_height             INTEGER CHECK(source_height IS NULL OR source_height >= 0),
+    fresh_until               TEXT NOT NULL,
+    identity_keys_json        TEXT NOT NULL,
+    payload_sha256            TEXT NOT NULL,
+    quality                   TEXT NOT NULL CHECK(quality IN ('valid','degraded','invalid')),
+    reason_codes_json         TEXT NOT NULL,
+    raw_evidence_json         TEXT NOT NULL,
+    created_at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_provider_observations_asset_time
+    ON market_provider_observations(asset_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_evidence_summaries (
+    asset_id                  TEXT NOT NULL,
+    summary_day               TEXT NOT NULL,
+    provider_id               TEXT NOT NULL,
+    capability                TEXT NOT NULL,
+    quality                   TEXT NOT NULL,
+    observation_count         INTEGER NOT NULL CHECK(observation_count > 0),
+    summarized_at             TEXT NOT NULL,
+    PRIMARY KEY(asset_id, summary_day, provider_id, capability, quality)
+);
+
+CREATE TABLE IF NOT EXISTS market_confidence_snapshots (
+    snapshot_id               TEXT PRIMARY KEY,
+    asset_id                  TEXT NOT NULL,
+    state                     TEXT NOT NULL CHECK(state IN ('GREEN','AMBER','RED')),
+    derived_at                TEXT NOT NULL,
+    trusted_midpoint          TEXT,
+    trusted_bid               TEXT,
+    trusted_ask               TEXT,
+    degraded_since            TEXT,
+    withdrawal_stage          TEXT NOT NULL,
+    recovery_refreshes        INTEGER NOT NULL CHECK(recovery_refreshes >= 0),
+    reason_codes_json         TEXT NOT NULL,
+    source_health_json        TEXT NOT NULL,
+    evidence_digests_json     TEXT NOT NULL,
+    material                  INTEGER NOT NULL DEFAULT 1 CHECK(material IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_market_confidence_asset_time
+    ON market_confidence_snapshots(asset_id, derived_at DESC);
+
+CREATE TABLE IF NOT EXISTS post_tibet_migration_reports (
+    asset_id                  TEXT PRIMARY KEY,
+    migration_version        INTEGER NOT NULL CHECK(migration_version = 1),
+    report_json               TEXT NOT NULL,
+    completed_at              TEXT NOT NULL
+);
 """
 
 
@@ -30836,3 +30894,229 @@ def _suppress_publication_outbox_rows(
         (proof, proof_sha256, at, at, safe_intent),
     )
     return int(cursor.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# v1.4 market-provider evidence and post-TibetSwap migration state
+# ---------------------------------------------------------------------------
+
+
+def _market_evidence_timestamp(value: datetime, label: str) -> str:
+    if type(value) is not datetime or value.tzinfo is None:
+        raise TypeError(f"{label} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def record_market_provider_observation(record: Dict[str, Any]) -> str:
+    """Persist one immutable provider observation idempotently."""
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO market_provider_observations (
+            observation_id, asset_id, provider_id, capability, observed_at,
+            source_time, source_height, fresh_until, identity_keys_json,
+            payload_sha256, quality, reason_codes_json, raw_evidence_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["observation_id"],
+            record["asset_id"],
+            record["provider_id"],
+            record["capability"],
+            record["observed_at"],
+            record.get("source_time"),
+            record.get("source_height"),
+            record["fresh_until"],
+            json.dumps(record["identity_keys"], separators=(",", ":")),
+            record["payload_sha256"],
+            record["quality"],
+            json.dumps(record["reason_codes"], separators=(",", ":")),
+            record["raw_evidence_json"],
+            record["created_at"],
+        ),
+    )
+    conn.commit()
+    return str(record["observation_id"])
+
+
+def get_market_provider_observations(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    rows = get_connection().execute(
+        """
+        SELECT * FROM market_provider_observations
+        WHERE asset_id=? ORDER BY observed_at DESC, observation_id DESC LIMIT ?
+        """,
+        (asset_id, limit),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["identity_keys"] = json.loads(item.pop("identity_keys_json"))
+        item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
+        item["raw_evidence"] = json.loads(item.pop("raw_evidence_json"))
+        result.append(item)
+    return result
+
+
+def record_market_confidence_snapshot(record: Dict[str, Any]) -> str:
+    """Persist one immutable derived confidence snapshot idempotently."""
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO market_confidence_snapshots (
+            snapshot_id, asset_id, state, derived_at, trusted_midpoint,
+            trusted_bid, trusted_ask, degraded_since, withdrawal_stage,
+            recovery_refreshes, reason_codes_json, source_health_json,
+            evidence_digests_json, material
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["snapshot_id"],
+            record["asset_id"],
+            record["state"],
+            record["derived_at"],
+            record.get("trusted_midpoint"),
+            record.get("trusted_bid"),
+            record.get("trusted_ask"),
+            record.get("degraded_since"),
+            record["withdrawal_stage"],
+            record["recovery_refreshes"],
+            json.dumps(record["reason_codes"], separators=(",", ":")),
+            json.dumps(record["source_health"], sort_keys=True, separators=(",", ":")),
+            json.dumps(record["evidence_digests"], separators=(",", ":")),
+            int(bool(record.get("material", True))),
+        ),
+    )
+    conn.commit()
+    return str(record["snapshot_id"])
+
+
+def get_latest_market_confidence_snapshot(
+    asset_id: str,
+) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        """
+        SELECT * FROM market_confidence_snapshots
+        WHERE asset_id=? ORDER BY derived_at DESC, snapshot_id DESC LIMIT 1
+        """,
+        (asset_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["reason_codes"] = json.loads(result.pop("reason_codes_json"))
+    result["source_health"] = json.loads(result.pop("source_health_json"))
+    result["evidence_digests"] = json.loads(result.pop("evidence_digests_json"))
+    result["material"] = bool(result["material"])
+    return result
+
+
+def compact_market_provider_evidence(
+    *, before: datetime, summarized_at: datetime
+) -> Dict[str, int]:
+    """Replace detailed old evidence with non-sensitive daily counts."""
+
+    cutoff = _market_evidence_timestamp(before, "before")
+    summarized = _market_evidence_timestamp(summarized_at, "summarized_at")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        groups = conn.execute(
+            """
+            SELECT asset_id, substr(observed_at, 1, 10) AS summary_day,
+                   provider_id, capability, quality, COUNT(*) AS observation_count
+            FROM market_provider_observations
+            WHERE observed_at < ?
+            GROUP BY asset_id, summary_day, provider_id, capability, quality
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in groups:
+            conn.execute(
+                """
+                INSERT INTO market_evidence_summaries (
+                    asset_id, summary_day, provider_id, capability, quality,
+                    observation_count, summarized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id, summary_day, provider_id, capability, quality)
+                DO UPDATE SET
+                    observation_count=observation_count + excluded.observation_count,
+                    summarized_at=excluded.summarized_at
+                """,
+                (
+                    row["asset_id"],
+                    row["summary_day"],
+                    row["provider_id"],
+                    row["capability"],
+                    row["quality"],
+                    row["observation_count"],
+                    summarized,
+                ),
+            )
+        deleted = conn.execute(
+            "DELETE FROM market_provider_observations WHERE observed_at < ?", (cutoff,)
+        ).rowcount
+        conn.commit()
+        return {"deleted": int(deleted), "summaries_written": len(groups)}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_market_evidence_summaries(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    rows = get_connection().execute(
+        """
+        SELECT * FROM market_evidence_summaries
+        WHERE asset_id=? ORDER BY summary_day DESC, provider_id LIMIT ?
+        """,
+        (asset_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_legacy_tibet_price_rows(asset_id: str) -> int:
+    row = get_connection().execute(
+        """
+        SELECT COUNT(*) AS row_count FROM price_history
+        WHERE cat_asset_id=? AND tibet_price IS NOT NULL
+        """,
+        (asset_id,),
+    ).fetchone()
+    return int(row["row_count"])
+
+
+def store_post_tibet_migration_report(
+    asset_id: str, report: Dict[str, Any], completed_at: datetime
+) -> Dict[str, Any]:
+    """Store the one-time migration result without overwriting prior authority."""
+
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO post_tibet_migration_reports (
+            asset_id, migration_version, report_json, completed_at
+        ) VALUES (?, 1, ?, ?)
+        """,
+        (asset_id, encoded, _market_evidence_timestamp(completed_at, "completed_at")),
+    )
+    conn.commit()
+    return get_post_tibet_migration_report(asset_id)
+
+
+def get_post_tibet_migration_report(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT report_json FROM post_tibet_migration_reports WHERE asset_id=?",
+        (asset_id,),
+    ).fetchone()
+    return json.loads(row["report_json"]) if row is not None else None
