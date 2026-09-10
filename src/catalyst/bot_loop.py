@@ -8319,9 +8319,7 @@ class BotLoop:
         retried = self.offer_manager.retry_failed_cancels()
         retry_finished = self._runtime_recovery_monotonic()
         try:
-            retry_elapsed = Decimal(str(retry_finished)) - Decimal(
-                str(retry_started)
-            )
+            retry_elapsed = Decimal(str(retry_finished)) - Decimal(str(retry_started))
         except Exception:
             retry_elapsed = self._runtime_recovery_gap_seconds
 
