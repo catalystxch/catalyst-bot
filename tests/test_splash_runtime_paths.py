@@ -477,7 +477,7 @@ def test_splash_output_reader_classifies_isolated_failure_as_backpressure_when_h
 
     assert events == [
         (
-            "warning",
+            "info",
             "splash_node_output",
             "Splash webhook backpressure active; inbound delivery remains live; "
             "suppressing repeated hook errors for 60s",

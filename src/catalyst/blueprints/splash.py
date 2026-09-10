@@ -42,7 +42,11 @@ def api_splash_stats():
     health = bot.splash_manager.check_health()
     stats["health"] = health
     try:
-        stats["receive"] = bot.get_splash_receive_stats()
+        receive = bot.get_splash_receive_stats()
+        receive["webhook_backpressure"] = (
+            _api_server()._splash_incoming_backpressure_stats()
+        )
+        stats["receive"] = receive
     except Exception:
         pass
     return jsonify(stats)
@@ -242,11 +246,6 @@ def api_splash_incoming():
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 415
 
-    # Dedicated rate limiter (defined in api_server) — 200/sec is generous
-    # for a real local Splash binary but stops abuse.
-    if server._splash_incoming_rate_limited():
-        return jsonify({"error": "rate_limited"}), 429
-
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid request body"}), 400
@@ -262,11 +261,26 @@ def api_splash_incoming():
     if not offer_bech32.lower().startswith("offer1"):
         return jsonify({"error": "Invalid offer format"}), 400
 
+    fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
+    if server._splash_incoming_recent_duplicate(fp):
+        bot = server.bot
+        if bot:
+            try:
+                bot.splash_node.note_webhook_delivery()
+            except Exception:
+                pass
+        return jsonify({"ok": True, "new": False, "duplicate": True})
+
+    # Only previously unseen offers consume the bounded DB-write allowance.
+    # Exact network-gossip duplicates are acknowledged above from a bounded,
+    # short-lived fingerprint cache without retaining their offer bodies.
+    if server._splash_incoming_rate_limited():
+        return jsonify({"error": "rate_limited"}), 429
+
     if server._splash_incoming_backlog_full():
         return jsonify({"error": "backlog_full"}), 429
 
     try:
-        fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
         source_ip = request.remote_addr
 
         was_new = server._record_splash_incoming_locked(
@@ -283,6 +297,7 @@ def api_splash_incoming():
                 ),
                 503,
             )
+        server._splash_incoming_note_delivery(fp)
         server._splash_incoming_note_recorded(was_new)
 
         bot = server.bot
