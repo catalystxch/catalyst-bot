@@ -42,7 +42,11 @@ def api_splash_stats():
     health = bot.splash_manager.check_health()
     stats["health"] = health
     try:
-        stats["receive"] = bot.get_splash_receive_stats()
+        receive = bot.get_splash_receive_stats()
+        receive["webhook_backpressure"] = (
+            _api_server()._splash_incoming_backpressure_stats()
+        )
+        stats["receive"] = receive
     except Exception:
         pass
     return jsonify(stats)
@@ -242,11 +246,6 @@ def api_splash_incoming():
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 415
 
-    # Dedicated rate limiter (defined in api_server) — 200/sec is generous
-    # for a real local Splash binary but stops abuse.
-    if server._splash_incoming_rate_limited():
-        return jsonify({"error": "rate_limited"}), 429
-
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid request body"}), 400
@@ -262,11 +261,47 @@ def api_splash_incoming():
     if not offer_bech32.lower().startswith("offer1"):
         return jsonify({"error": "Invalid offer format"}), 400
 
-    if server._splash_incoming_backlog_full():
-        return jsonify({"error": "backlog_full"}), 429
+    fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
+    if server._splash_incoming_recent_duplicate(fp):
+        bot = server.bot
+        if bot:
+            try:
+                bot.splash_node.note_webhook_delivery()
+            except Exception:
+                pass
+        return jsonify({"ok": True, "new": False, "duplicate": True})
+
+    owns_delivery, delivery_event = server._splash_incoming_claim_delivery(fp)
+    if not owns_delivery:
+        delivery_event.wait(timeout=server._SPLASH_INFLIGHT_WAIT_S)
+        if server._splash_incoming_recent_duplicate(fp):
+            bot = server.bot
+            if bot:
+                try:
+                    bot.splash_node.note_webhook_delivery()
+                except Exception:
+                    pass
+            return jsonify({"ok": True, "new": False, "duplicate": True})
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "persistence_in_progress",
+                    "message": "Incoming offer persistence is unresolved; retry delivery.",
+                }
+            ),
+            503,
+        )
 
     try:
-        fp = hashlib.sha256(offer_bech32.strip().encode("utf-8")).hexdigest()
+        # Only the elected persistence owner consumes the bounded DB-write
+        # allowance. Followers wait without holding the in-flight registry lock.
+        if server._splash_incoming_rate_limited():
+            return jsonify({"error": "rate_limited"}), 429
+
+        if server._splash_incoming_backlog_full():
+            return jsonify({"error": "backlog_full"}), 429
+
         source_ip = request.remote_addr
 
         was_new = server._record_splash_incoming_locked(
@@ -283,6 +318,7 @@ def api_splash_incoming():
                 ),
                 503,
             )
+        server._splash_incoming_note_delivery(fp)
         server._splash_incoming_note_recorded(was_new)
 
         bot = server.bot
@@ -310,6 +346,8 @@ def api_splash_incoming():
         return jsonify({"ok": True, "new": was_new})
     except Exception:
         return server._api_exception(request.path)
+    finally:
+        server._splash_incoming_finish_delivery(fp, delivery_event)
 
 
 @bp.route("/api/splash/incoming/list")

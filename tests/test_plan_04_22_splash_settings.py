@@ -18,7 +18,10 @@ Tests:
 
 import os
 import sys
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,12 +62,20 @@ class _FlaskBase(unittest.TestCase):
         api_server._rate_limit_log.clear()
         permit_api_mutations(self, api_server)
         api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_RATE_LIMIT["rejected_total"] = 0
+        api_server._SPLASH_RECENT_DELIVERIES["fingerprints"].clear()
+        api_server._SPLASH_RECENT_DELIVERIES["duplicate_total"] = 0
+        api_server._SPLASH_INFLIGHT_DELIVERIES["events"].clear()
         api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
         api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
         api_server._SPLASH_RATE_LIMIT["hits"].clear()
+        api_server._SPLASH_RATE_LIMIT["rejected_total"] = 0
+        api_server._SPLASH_RECENT_DELIVERIES["fingerprints"].clear()
+        api_server._SPLASH_RECENT_DELIVERIES["duplicate_total"] = 0
+        api_server._SPLASH_INFLIGHT_DELIVERIES["events"].clear()
         api_server._SPLASH_BACKLOG_CACHE["checked_at"] = 0.0
         api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
@@ -107,6 +118,16 @@ class TestSplashStats(_FlaskBase):
         with patch.object(api_server, "bot", _make_bot()):
             resp = self._get("/api/splash/stats")
         self.assertIn("health", resp.get_json())
+
+    def test_response_exposes_webhook_backpressure_counters(self):
+        api_server._SPLASH_RATE_LIMIT["rejected_total"] = 7
+        api_server._SPLASH_RECENT_DELIVERIES["duplicate_total"] = 11
+        with patch.object(api_server, "bot", _make_bot()):
+            resp = self._get("/api/splash/stats")
+
+        counters = resp.get_json()["receive"]["webhook_backpressure"]
+        self.assertEqual(counters["rate_limited_total"], 7)
+        self.assertEqual(counters["duplicate_bypassed_total"], 11)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +317,145 @@ class TestSplashIncoming(_FlaskBase):
         ):
             resp = self._post_incoming({"offer": "offer1valid"})
         self.assertEqual(resp.status_code, 429)
+
+    def test_concurrent_duplicate_delivery_persists_once(self):
+        """Concurrent gossip for one offer must share one persistence attempt."""
+
+        request_barrier = threading.Barrier(2)
+        first_persist_started = threading.Event()
+        second_persist_started = threading.Event()
+        release_persist = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def persist_once(*_args, **_kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                first_persist_started.set()
+            else:
+                second_persist_started.set()
+            release_persist.wait(timeout=2)
+            return current_call == 1
+
+        def post_offer():
+            request_barrier.wait(timeout=2)
+            with api_server.app.test_client() as client:
+                return client.post(
+                    "/api/splash/incoming",
+                    json={"offer": "offer1concurrentduplicate"},
+                    environ_base=_LOOPBACK,
+                )
+
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch("api_server._splash_incoming_rate_limited", return_value=False),
+            patch(
+                "api_server._record_splash_incoming_locked",
+                side_effect=persist_once,
+            ),
+            patch.object(api_server, "bot", None),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(post_offer) for _ in range(2)]
+                self.assertTrue(first_persist_started.wait(timeout=2))
+                time.sleep(0.1)
+                release_persist.set()
+                responses = [future.result(timeout=2) for future in futures]
+
+        self.assertFalse(second_persist_started.is_set())
+        self.assertEqual(call_count, 1)
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+    def test_recent_duplicate_bypasses_rate_limit_and_second_db_write(self):
+        """A repeated network offer must not consume scarce webhook capacity."""
+        bot = _make_bot()
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch(
+                "api_server._splash_incoming_rate_limited",
+                side_effect=[False, True],
+            ) as rate_limited,
+            patch("database.record_splash_incoming", return_value=False) as record_mock,
+            patch.object(api_server, "bot", bot),
+        ):
+            first = self._post_incoming({"offer": "offer1duplicate"})
+            second = self._post_incoming({"offer": "offer1duplicate"})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.get_json()["new"])
+        self.assertTrue(second.get_json()["duplicate"])
+        self.assertEqual(rate_limited.call_count, 1)
+        self.assertEqual(record_mock.call_count, 1)
+        self.assertEqual(
+            api_server._splash_incoming_backpressure_stats()[
+                "duplicate_bypassed_total"
+            ],
+            1,
+        )
+
+    def test_unseen_offer_remains_rate_limited_after_acknowledged_offer(self):
+        """De-duplication must not weaken backpressure for genuinely new data."""
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch(
+                "api_server._splash_incoming_rate_limited",
+                side_effect=[False, True],
+            ),
+            patch("database.record_splash_incoming", return_value=True) as record_mock,
+            patch.object(api_server, "bot", None),
+        ):
+            first = self._post_incoming({"offer": "offer1first"})
+            second = self._post_incoming({"offer": "offer1second"})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.get_json()["error"], "rate_limited")
+        self.assertEqual(record_mock.call_count, 1)
+
+    def test_duplicate_gossip_burst_is_acknowledged_without_db_amplification(self):
+        """A realistic repeated-gossip burst writes once and preserves protection."""
+        with (
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", True, create=True),
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_MAX_PER_SEC", 1, create=True),
+            patch("database.record_splash_incoming", return_value=True) as record_mock,
+            patch.object(api_server, "bot", None),
+        ):
+            responses = [
+                self._post_incoming({"offer": "offer1networkgossip"})
+                for _ in range(100)
+            ]
+            unseen = self._post_incoming({"offer": "offer1unseen"})
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertTrue(
+            all(
+                response.get_json().get("duplicate") is True
+                for response in responses[1:]
+            )
+        )
+        self.assertEqual(record_mock.call_count, 1)
+        self.assertEqual(unseen.status_code, 429)
+        stats = api_server._splash_incoming_backpressure_stats()
+        self.assertEqual(stats["duplicate_bypassed_total"], 99)
+        self.assertEqual(stats["rate_limited_total"], 1)
+
+    def test_recent_delivery_cache_expires_and_is_bounded(self):
+        with (
+            patch.object(api_server, "_SPLASH_RECENT_DELIVERY_TTL_S", 10.0),
+            patch.object(api_server, "_SPLASH_RECENT_DELIVERY_MAX", 2),
+            patch("api_server.time.time", side_effect=[100.0, 101.0, 102.0, 113.0]),
+        ):
+            api_server._splash_incoming_note_delivery("first")
+            api_server._splash_incoming_note_delivery("second")
+            api_server._splash_incoming_note_delivery("third")
+            self.assertFalse(api_server._splash_incoming_recent_duplicate("second"))
+
+        stats = api_server._splash_incoming_backpressure_stats()
+        self.assertLessEqual(stats["recent_fingerprints"], 2)
+        self.assertEqual(stats["duplicate_bypassed_total"], 0)
 
     def test_backlog_full_returns_429_without_db_write(self):
         """A full incoming backlog must reject before attempting another DB write."""
