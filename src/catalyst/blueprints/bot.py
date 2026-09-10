@@ -693,11 +693,9 @@ def api_status():
             cat_bal = {"spendable": 0, "total": 0}
 
             # Pre-start pricing cache. Without this, every /api/status poll
-            # (every 5 s) fires a live TibetSwap and Dexie fetch AND writes
-            # a price_lookup / price_found log row — opening the dashboard
-            # before the bot started generated ~720 log rows per hour and
-            # put pointless load on the oracles. Cache the lookup result
-            # for 60 s so log entries and HTTP calls drop to 1 per minute.
+            # (every 5 s) fires a Dexie lookup and writes a price event.
+            # Cache the result for 60 s and remain quiet until an operator
+            # actually selects a pair.
             global _prebot_price_cache  # noqa: PLW0603
             if "_prebot_price_cache" not in globals():
                 _prebot_price_cache = {
@@ -783,14 +781,6 @@ def api_status():
                     log_event(
                         "error", "price_lookup", "No price available from any source"
                     )
-            elif not active_asset_id:
-                print("[STATUS] No asset_id available for pricing", flush=True)
-                log_event(
-                    "warning",
-                    "price_lookup",
-                    "No asset_id configured — cannot fetch price",
-                )
-
             # Compute actual bid/ask from mid using configured spread
             try:
                 _mid_for_spread = Decimal(str(pricing.get("mid", 0)))

@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 import unittest
+import hashlib
 from decimal import Decimal
 
 
@@ -78,6 +79,29 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertTrue(parsed["is_ours"])
 
+    def test_parse_dexie_offer_preserves_exact_publication_identity(self):
+        offer_text = "offer1exact-publication"
+        parsed = self.intel._parse_dexie_offer(
+            {
+                "id": "dexie-row-1",
+                "trade_id": "0x" + "ab" * 32,
+                "offer": offer_text,
+                "offered": {"code": "XCH", "amount": "1"},
+                "requested": {
+                    "id": "test-cat",
+                    "code": "MZ",
+                    "amount": "10000",
+                },
+            },
+            "buy",
+        )
+
+        self.assertEqual(
+            parsed["offer_identity"],
+            hashlib.sha256(offer_text.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(parsed["trade_id"], "ab" * 32)
+
     def test_parse_current_dexie_v1_single_asset_objects(self):
         """Dexie v1 currently returns offered/requested as objects, not arrays."""
         self.intel._known_dexie_ids = {"dexie-current-shape"}
@@ -143,6 +167,48 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         self.assertFalse(
             self.intel._should_use_v3_orderbook(anonymous_v3_buy, anonymous_v3_sell)
         )
+
+    def test_attributable_snapshot_never_returns_anonymous_v3_levels(self):
+        exact_buy = {
+            "offer_id": "dexie-buy-1",
+            "price": Decimal("0.00008"),
+            "xch_amount": Decimal("1.25"),
+            "cat_amount": Decimal("15625"),
+            "side": "buy",
+            "is_ours": False,
+        }
+        exact_sell = {
+            "offer_id": "dexie-sell-1",
+            "price": Decimal("0.00009"),
+            "xch_amount": Decimal("1.35"),
+            "cat_amount": Decimal("15000"),
+            "side": "sell",
+            "is_ours": False,
+        }
+        anonymous_v3 = {
+            "offer_id": "v3-level-buy-0",
+            "price": Decimal("0.000081"),
+            "xch_amount": Decimal("99"),
+            "cat_amount": Decimal("1"),
+            "side": "buy",
+            "is_ours": False,
+        }
+        self.intel._orderbook.update(
+            {
+                "exact_buy_offers": [exact_buy],
+                "exact_sell_offers": [exact_sell],
+                "buy_offers": [anonymous_v3],
+                "sell_offers": [],
+                "last_refresh": 123.0,
+            }
+        )
+
+        snapshot = self.intel.get_attributable_orderbook()
+
+        self.assertEqual(snapshot["bids"][0]["offer_id"], "dexie-buy-1")
+        self.assertEqual(snapshot["asks"][0]["offer_id"], "dexie-sell-1")
+        self.assertEqual(snapshot["bids"][0]["amount_mojos"], 1_250_000_000_000)
+        self.assertEqual(snapshot["observed_at_unix"], 123.0)
 
 
 if __name__ == "__main__":

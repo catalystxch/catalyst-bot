@@ -50,6 +50,30 @@ _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
 
 
+def _confirmed_fill_authority(fill_id) -> dict:
+    """Expose the immutable receipt behind an economically visible fill."""
+
+    try:
+        receipt = database.get_authoritative_fill_by_id(int(fill_id))
+    except (TypeError, ValueError):
+        receipt = None
+    except Exception as exc:
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load confirmed fill authority for UI",
+            {"fill_id": fill_id, "error": type(exc).__name__},
+            level="warning",
+        )
+        receipt = None
+    if not receipt:
+        return {}
+    return {
+        "spent_block_height": receipt.get("spent_block_height"),
+        "transaction_id": receipt.get("transaction_id"),
+        "evidence_sha256": receipt.get("evidence_sha256"),
+    }
+
+
 def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
     """Return exact retry authority for wallet-active, no-effect failures."""
 
@@ -197,6 +221,80 @@ def _calculate_pnl_breakdown(
     return realised, unrealised, total
 
 
+def _offers_with_durable_authority(wallet_offers: list) -> list:
+    """Attach bounded publication/discovery truth to wallet offer rows."""
+
+    serialized = api_server._serialize_offers(wallet_offers)
+    for item in serialized:
+        trade_id = str(item.get("trade_id") or "").strip()
+        intent = None
+        try:
+            if trade_id:
+                intent = database.get_offer_intent_by_trade_id(trade_id)
+        except Exception:
+            intent = None
+        if not intent:
+            item["authority"] = None
+            item["discovery"] = {
+                "state": "untracked",
+                "provider_identity": None,
+                "first_visible_at": None,
+                "providers": {},
+            }
+            item["publication"] = {}
+            continue
+
+        intent_id = str(intent.get("intent_id") or "")
+        item["authority"] = {
+            "intent_id": intent_id,
+            "lifecycle_state": intent.get("lifecycle_state"),
+            "generation": intent.get("generation"),
+            "parent_intent_id": intent.get("parent_intent_id"),
+            "child_intent_id": intent.get("child_intent_id"),
+            "updated_at": intent.get("updated_at"),
+        }
+        discovery_providers = {}
+        try:
+            discovery_rows = database.get_offer_publication_discoveries(intent_id)
+        except Exception:
+            discovery_rows = []
+        for row in discovery_rows:
+            provider = str(row.get("provider") or "").strip().lower()
+            if provider not in {"dexie", "splash"}:
+                continue
+            discovery_providers[provider] = {
+                "state": row.get("state"),
+                "deadline_at": row.get("deadline_at"),
+                "first_observed_at": row.get("first_observed_at"),
+                "observed_identity": row.get("observed_identity"),
+            }
+        item["discovery"] = {
+            "state": (
+                "visible" if intent.get("first_visible_at") else "pending"
+            ),
+            "provider_identity": intent.get("publication_identity"),
+            "first_visible_at": intent.get("first_visible_at"),
+            "providers": discovery_providers,
+        }
+        provider_rows = {}
+        try:
+            publications = database.list_publication_outbox(intent_id=intent_id)
+        except Exception:
+            publications = []
+        for row in publications:
+            publisher = str(row.get("publisher") or "").strip().lower()
+            if publisher not in {"dexie", "splash"}:
+                continue
+            provider_rows[publisher] = {
+                "state": row.get("state"),
+                "queued_at": row.get("queued_at"),
+                "updated_at": row.get("updated_at"),
+                "terminal_at": row.get("terminal_at"),
+            }
+        item["publication"] = provider_rows
+    return serialized
+
+
 def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
     """Return DB-backed fill history in the shape the Offers history tab expects."""
     if not asset_id:
@@ -252,6 +350,8 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
             "age": api_server._history_age_label(filled_at),
             "filled_at": filled_at,
             "dexie_link": dexie_link,
+            "fill_confidence": "Confirmed",
+            "fill_authority": _confirmed_fill_authority(row.get("fill_id")),
             "_sort_key": str(filled_at),
         }
 
@@ -296,8 +396,8 @@ def api_offers():
 
     return jsonify(
         {
-            "buys": api_server._serialize_offers(open_buys),
-            "sells": api_server._serialize_offers(open_sells),
+            "buys": _offers_with_durable_authority(open_buys),
+            "sells": _offers_with_durable_authority(open_sells),
             "buy_count": len(open_buys),
             "sell_count": len(open_sells),
         }
@@ -878,6 +978,9 @@ def api_fills():
         limit=limit,
         since=api_server._get_run_history_cutoff(),
     )
+    for fill in fills:
+        fill["fill_confidence"] = "Confirmed"
+        fill["fill_authority"] = _confirmed_fill_authority(fill.get("fill_id"))
     return jsonify({"fills": api_server._serialize_list(fills)})
 
 

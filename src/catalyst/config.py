@@ -355,6 +355,11 @@ class Config:
         self.MAX_TRADE_XCH = _decimal("MAX_TRADE_XCH", "0.050")
         self.DEFAULT_TRADE_XCH = _decimal("DEFAULT_TRADE_XCH", "0.0275")
 
+        _market_risk_preset = _str("MARKET_RISK_PRESET", "balanced").strip().lower()
+        if _market_risk_preset not in ("conservative", "balanced", "aggressive"):
+            _market_risk_preset = "balanced"
+        self.MARKET_RISK_PRESET = _market_risk_preset
+
         # ----- Spread & Pricing -----
         self.SPREAD_BPS = _decimal("SPREAD_BPS", "800")
         self.MIN_EDGE_BPS = _decimal("MIN_EDGE_BPS", "300")
@@ -1052,6 +1057,7 @@ class Config:
         "MIN_TRADE_XCH",
         "MAX_TRADE_XCH",
         "DEFAULT_TRADE_XCH",
+        "MARKET_RISK_PRESET",
         # Spread & pricing
         "SPREAD_BPS",
         "MIN_EDGE_BPS",

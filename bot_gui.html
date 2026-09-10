@@ -1525,7 +1525,7 @@
 
         /* ================================================================
            V4 DATA STRIP — reusable labeled horizontal info bar
-           Used by TibetSwap Live AMM and Dexie Volume strips so they
+           Used by offer-book confidence and Dexie volume strips so they
            share visual rhythm and both clearly show their data source.
            ================================================================ */
         .v4-data-strip {
@@ -8301,7 +8301,7 @@
                         <div style="padding: 8px 10px; background: rgba(15,23,42,0.42); border: 1px solid rgba(148,163,184,0.16); border-radius: 10px;">
                             <div style="color: var(--slate-50); font-size: 12px; font-weight: 600; margin-bottom: 3px;">Third-party dependency risk</div>
                             <div style="color: var(--slate-400); font-size: 11px; line-height: 1.45;">
-                                Sage, Dexie, Splash, TibetSwap, and Spacescan are external. If any fail, the app may pause or need manual intervention.
+                                Sage, Dexie, Splash, Coinset, and Spacescan are external. CATalyst degrades safely when attributable evidence becomes incomplete.
                             </div>
                         </div>
                         <div style="padding: 8px 10px; background: rgba(15,23,42,0.42); border: 1px solid rgba(148,163,184,0.16); border-radius: 10px;">
@@ -8698,7 +8698,7 @@
             </div>
             <div class="spacescan-intro">
                 <a href="https://www.spacescan.io" target="_blank" rel="noopener" style="color: var(--accent-cyan); text-decoration: none; font-weight: 600;">Spacescan</a>
-                is the bot's on-chain intelligence layer. <strong>Dexie and TibetSwap still provide the live executable prices</strong>; Spacescan adds the chain context around fills, self-spends, top-ups, and token health.
+                is a corroborating on-chain intelligence layer. <strong>Dexie's attributable live offer book provides primary executable market evidence</strong>; Spacescan adds chain context around fills, self-spends, top-ups, and token health without gaining wallet authority.
             </div>
 
             <div class="spacescan-layout">
@@ -8707,7 +8707,7 @@
             <div class="spacescan-snapshot">
                 <div class="spacescan-snapshot-title">What Spacescan adds to the bot</div>
                 <div class="spacescan-snapshot-copy">
-                    Think of Spacescan as the bot's chain-side sense check. It helps confirm suspicious closes and adds token context, while Dexie and TibetSwap still drive live tradable pricing.
+                    Think of Spacescan as the bot's chain-side sense check. It helps corroborate suspicious closes and adds token context, while current attributable offer evidence determines whether CATalyst may trade.
                 </div>
                 <div class="spacescan-bullet-list">
                     <div class="spacescan-bullet">Free mode covers suspicious fill checks and top-up self-spend cross-checks.</div>
@@ -9124,32 +9124,28 @@
                         </div>
                     </div>
 
-                    <!-- ===== TIBETSWAP LIVE AMM: live pool state ===== -->
-                    <div id="ammStatusBar" class="v4-data-strip v4-data-strip--amm is-loading">
+                    <!-- ===== OFFER-BOOK CONFIDENCE: one server-side safety truth ===== -->
+                    <div id="marketConfidenceBar" class="v4-data-strip v4-data-strip--amm is-loading">
                         <div class="v4-data-strip-header">
-                            <span class="v4-data-strip-title">TibetSwap Live AMM</span>
-                            <span class="v4-data-strip-source" title="Prices and reserves pulled from the TibetSwap AMM pool for the selected pair">Source · TibetSwap</span>
+                            <span class="v4-data-strip-title">Offer-book Market Confidence</span>
+                            <span class="v4-data-strip-source" title="One durable safety snapshot derived from attributable provider evidence">Sources · Dexie / Splash / Sage / chain</span>
                         </div>
-                        <div class="v4-data-strip-placeholder" id="ammPlaceholder">Gathering TibetSwap pool data<span class="v4-data-strip-placeholder-dots"></span></div>
+                        <div class="v4-data-strip-placeholder" id="marketConfidencePlaceholder">Gathering attributable offer-book evidence<span class="v4-data-strip-placeholder-dots"></span></div>
                         <div class="v4-data-strip-body">
                             <span class="v4-data-strip-field">
-                                <span class="v4-data-strip-key">Price</span>
-                                <span id="ammLivePrice" class="v4-data-strip-val">—</span>
+                                <span class="v4-data-strip-key">Confidence</span>
+                                <span id="marketConfidenceState" class="v4-data-strip-val">WARMING</span>
                             </span>
                             <span class="v4-data-strip-field">
-                                <span class="v4-data-strip-key">Drift</span>
-                                <span id="ammDriftBps" class="v4-data-strip-val">—</span>
-                                <span id="ammDriftBadge" class="v4-data-strip-badge v4-data-strip-badge--danger" style="display: none;">REQUOTE</span>
+                                <span class="v4-data-strip-key">Trusted range</span>
+                                <span id="marketTrustedRange" class="v4-data-strip-val">—</span>
                             </span>
                             <span class="v4-data-strip-field">
-                                <span class="v4-data-strip-key">Reserves</span>
-                                <span class="v4-data-strip-val"><span id="ammXchReserve">—</span> XCH / <span id="ammTokenReserve">—</span> token</span>
+                                <span class="v4-data-strip-key">Withdrawal</span>
+                                <span id="marketWithdrawalStage" class="v4-data-strip-val">NONE</span>
                             </span>
-                            <span id="ammBufferBadge" class="v4-data-strip-badge v4-data-strip-badge--warn" style="display: none;">BUFFER ON</span>
-                            <span id="ammArbPressure" class="v4-data-strip-badge" style="display: none;">ARB LOW</span>
-                            <span id="ammSweepProtection" class="v4-data-strip-badge v4-data-strip-badge--violet" style="display: none;">SWEEP GUARD</span>
-                            <span id="ammStaleWarning" class="v4-data-strip-badge v4-data-strip-badge--danger" style="display: none;">STALE</span>
-                            <span id="ammLastUpdate" class="v4-data-strip-last">—</span>
+                            <span id="marketConfidenceReasons" class="v4-data-strip-badge v4-data-strip-badge--warn">market evidence warming</span>
+                            <span id="marketProviderHealth" class="v4-data-strip-last">providers —</span>
                         </div>
                     </div>
 
@@ -9197,7 +9193,7 @@
                     <!-- ===== HERO STRIP: Key numbers at a glance ===== -->
                     <div class="v4-hero-strip" id="heroStrip">
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label">Mid Price <span class="cc-help">?<span class="cc-tooltip">Best available mid-price blended from Dexie orderbook and TibetSwap AMM. Used as the reference point for calculating your buy and sell prices. If TibetSwap has no pool for this token, Dexie alone is used.</span></span></div>
+                            <div class="v4-hero-label">Trusted Mid Price <span class="cc-help">?<span class="cc-tooltip">Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.</span></span></div>
                             <div class="v4-hero-value data-pending" id="heroMidPrice">—</div>
                             <div class="v4-hero-sub data-pending" id="heroSpread">spread —</div>
                             <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 6px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
@@ -9242,16 +9238,16 @@
                             <div class="v4-market-sub">XCH on Dexie</div>
                         </div>
                         <div class="v4-market-card">
-                            <div class="v4-market-label">Liquidity <span class="cc-help">?<span class="cc-tooltip">Total liquidity available across Dexie orderbook and TibetSwap AMM pool (in XCH).</span></span></div>
+                            <div class="v4-market-label">Independent Depth <span class="cc-help">?<span class="cc-tooltip">Attributable bid and ask depth after CATalyst removes its own offers and deduplicates provider observations.</span></span></div>
                             <div class="v4-market-value" id="mktPoolDepth">—</div>
                             <div class="v4-market-sub" id="mktPoolSub" style="font-size: 10px; line-height: 1.4;">
-                                <span id="mktDexieDepth">Dexie: —</span> · <span id="mktTibetDepth">Tibet: —</span>
+                                <span id="mktDexieDepth">Bid: —</span> · <span id="mktAskDepth">Ask: —</span>
                             </div>
                         </div>
                         <div class="v4-market-card">
-                            <div class="v4-market-label">Arb Gap <span class="cc-help">?<span class="cc-tooltip">Price difference between Dexie and TibetSwap as a percentage. Large gaps mean opportunity — or risk.</span></span></div>
+                            <div class="v4-market-label">Market Confidence <span class="cc-help">?<span class="cc-tooltip">Green permits normal creation, amber restricts exposure, and red progressively withdraws the book.</span></span></div>
                             <div class="v4-market-value" id="mktArbGap">—</div>
-                            <div class="v4-market-sub" id="mktArbSub">Dexie vs Tibet</div>
+                            <div class="v4-market-sub" id="mktArbSub">Attributable evidence</div>
                         </div>
                     </div>
 
@@ -9447,11 +9443,11 @@
                         <div class="cc-metric-val" id="ccCompetitors" style="opacity: 0.3;">pending</div>
                     </div>
                     <div class="cc-metric-box">
-                        <div class="cc-metric-label">Arb Gap <span class="cc-help">?<span class="cc-tooltip">Price difference between Dexie orderbook and TibetSwap AMM. Sniper triggers when this is large enough.</span></span></div>
+                        <div class="cc-metric-label">Confidence State <span class="cc-help">?<span class="cc-tooltip">GREEN permits new exposure; AMBER freezes increases; RED progressively withdraws the ladder.</span></span></div>
                         <div class="cc-metric-val" id="ccArbGap" style="opacity: 0.3;">pending</div>
                     </div>
                     <div class="cc-metric-box" style="grid-column: span 2;">
-                        <div class="cc-metric-label">Pool Depth <span class="cc-help">?<span class="cc-tooltip">Your trade size relative to TibetSwap pool. Higher = more price impact per trade.</span></span></div>
+                        <div class="cc-metric-label">Required Independent Depth <span class="cc-help">?<span class="cc-tooltip">Attributable depth required on both sides after excluding your own and duplicate offers.</span></span></div>
                         <div class="cc-metric-val" id="ccPoolDepth" style="opacity: 0.3;">pending</div>
                     </div>
                     <div class="cc-metric-box">
@@ -9471,7 +9467,7 @@
                         <div class="cc-metric-val" id="ccTradingPace" style="opacity: 0.3;">pending</div>
                     </div>
                     <div class="cc-metric-box">
-                        <div class="cc-metric-label">Sniper Probe <span class="cc-help">?<span class="cc-tooltip">Startup sniper probe status. The bot fires a small sniper probe offer to confirm the safe price range before deploying the main ladder.</span></span></div>
+                        <div class="cc-metric-label">Withdrawal Stage <span class="cc-help">?<span class="cc-tooltip">Shows whether degraded evidence has frozen creation or withdrawn inner, middle, or all remaining offers.</span></span></div>
                         <div class="cc-metric-val" id="ccProbeState" style="opacity: 0.3;">pending</div>
                     </div>
                     <div class="cc-metric-box">
@@ -9499,7 +9495,6 @@
                 <!-- External links -->
                 <div class="cc-links">
                     <a class="cc-link-btn" id="ccDexieLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)"><img src="/brand/dexie_logo_official.png" alt="Dexie logo">Dexie Orderbook</a>
-                    <a class="cc-link-btn" id="ccTibetLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)"><img src="/assets/tibetswap_logo_official.png" alt="TibetSwap logo">TibetSwap Pool</a>
                     <a class="cc-link-btn" id="ccSpacescanLink" href="#" target="_blank" rel="noopener" onclick="return handleDashboardExternalLink(event, this)">Spacescan</a>
                 </div>
             </div>
@@ -9665,7 +9660,7 @@
                 <!-- LEFT: Feature Toggles -->
                 <div class="lc-toggles" id="lcToggles">
                     <div class="lc-toggle-row" data-key="DYNAMIC_SPREAD_ENABLED">
-                        <span class="lc-toggle-label">Dynamic Spreads <span class="cc-help">?<span class="cc-tooltip">Auto-adjust spread width based on volatility, arb gap, fill rate, and pool depth. Turning this off disables that dynamic engine, but inventory skew and competitor nudges still have their own effect if those toggles stay on.</span></span></span>
+                        <span class="lc-toggle-label">Dynamic Spreads <span class="cc-help">?<span class="cc-tooltip">Auto-adjust spread width from trusted offer-book depth, volatility, churn, and fill rate. Turning this off disables that dynamic engine; inventory skew and competitor nudges remain independent.</span></span></span>
                         <div class="lc-toggle-wrap">
                             <div class="lc-switch" id="lcToggleDynSpread" onclick="lcToggle('DYNAMIC_SPREAD_ENABLED', this)"></div>
                             <span class="lc-applied" id="lcAppliedDynSpread">Applied ✓</span>
@@ -9678,7 +9673,7 @@
                             <span class="lc-applied" id="lcAppliedInventory">Applied ✓</span>
                         </div>
                     </div>
-                    <div class="lc-toggle-row" data-key="SNIPER_ENABLED">
+                    <div class="lc-toggle-row" data-key="SNIPER_ENABLED" hidden>
                         <span class="lc-toggle-label">Sniper <span class="cc-help">?<span class="cc-tooltip">Automatically takes arb opportunities when the Dexie-Tibet price gap exceeds the threshold. Sizes scale with gap magnitude.</span></span></span>
                         <div class="lc-toggle-wrap">
                             <div class="lc-switch" id="lcToggleSniper" onclick="lcToggle('SNIPER_ENABLED', this)"></div>
@@ -9738,7 +9733,7 @@
                     </div>
                 </div>
 
-                <div class="lc-manual-panel">
+                <div class="lc-manual-panel" hidden>
                     <div class="lc-manual-copy">
                         <div class="lc-manual-title">Close the Gap <span class="cc-help">?<span class="cc-tooltip">Manual probing mode. Starts a small buy and sell pair inside your normal spread, then tightens over time until it finds the tightest safe level above the current arb floor. This is separate from Dynamic Spreads, Inventory Mgmt, and Competitor Aware because it actively tests a tighter book instead of just nudging quote calculations.</span></span></div>
                         <div class="lc-manual-sub">Use this when you want the bot to deliberately test whether the market can support a tighter spread than the normal live controls would choose on their own.</div>
@@ -9746,7 +9741,7 @@
                     </div>
                     <div class="lc-manual-actions">
                         <div id="lcGapDisplay" style="font-size:0.85em; color: var(--text-secondary); margin-bottom: 8px;">Current arb gap: <strong id="lcGapValue">—</strong></div>
-                        <button class="btn" id="boostBtn" onclick="toggleGapCloser()" style="width: 100%; background: linear-gradient(135deg, rgba(245,158,11,0.28), rgba(16,185,129,0.22)); border: 1px solid rgba(245,158,11,0.55); color: var(--warning-200); font-weight: 600; box-shadow: 0 0 6px rgba(245,158,11,0.18), inset 0 1px 0 rgba(255,255,255,0.08);">📈 Close the Gap</button>
+                        <button class="btn" id="boostBtn" hidden onclick="toggleGapCloser()" style="width: 100%;">Retired</button>
                     </div>
                 </div>
             </div>
@@ -10112,7 +10107,7 @@
                     </div>
 
                     <!-- Sniper Stats -->
-                    <div class="mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlSniperStatsPanel" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-4);">
+                    <div class="mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlSniperStatsPanel" hidden style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-4);">
                         <div style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: var(--space-3);">Sniper Stats <span class="cc-help">?<span class="cc-tooltip">All sniper probe activity — automatic arb snipes plus manual Close the Gap probes. Both use the sniper pool to probe price levels.</span></span></div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--space-2); margin-bottom: var(--space-3);">
                             <div>
@@ -10181,7 +10176,7 @@
                     <div class="v4-view-header">
                         <div class="v4-view-kicker">Live Market Data</div>
                         <h1 class="v4-view-title">Market Intelligence</h1>
-                        <p class="v4-view-subtitle">Competitor orderbook, TibetSwap pool depth, price history, and Splash P2P network status.</p>
+                        <p class="v4-view-subtitle">Attributed offer-book depth, confidence history, settled trades, and provider capability health.</p>
                         <div class="v4-tab-token-pill"><img class="cc-token-icon cc-token-icon-sm" src="" alt="" onerror="if(this.dataset.fallbackSrc&&this.src!==this.dataset.fallbackSrc){this.src=this.dataset.fallbackSrc;}else{this.style.display='none';}" style="display:none;"><span class="v4-tab-token-name"></span><span class="v4-tab-token-xch">&nbsp;/ XCH</span></div>
                     </div>
                     <div class="intel-brand-row">
@@ -10208,14 +10203,15 @@
                             <div class="diagnostic-panel-title">Market Diagnostics</div>
                             <div class="source-coverage-list" id="intelSourceCoverage">
                                 <div class="coverage-row"><span>Dexie orderbook</span><span class="coverage-pill" id="coverageDexie">waiting</span></div>
-                                <div class="coverage-row"><span>TibetSwap pool</span><span class="coverage-pill" id="coverageTibet">waiting</span></div>
+                                <div class="coverage-row"><span>Splash offers</span><span class="coverage-pill" id="coverageTibet">waiting</span></div>
                                 <div class="coverage-row"><span>Spacescan</span><span class="coverage-pill" id="coverageSpacescan">waiting</span></div>
                                 <div class="coverage-row"><span>Sage wallet</span><span class="coverage-pill" id="coverageSage">waiting</span></div>
                             </div>
                             <div style="margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--border-subtle);">
-                                <div class="diagnostic-label">Arb Gap</div>
-                                <div class="diagnostic-value" id="intelArbGapTrend">—</div>
-                                <div class="diagnostic-sub" id="intelArbGapTrendSub">Dexie vs Tibet live spread</div>
+                                <div class="diagnostic-label">Confidence Timeline</div>
+                                <div class="diagnostic-value" id="intelConfidenceTimeline">WARMING</div>
+                                <div class="diagnostic-sub" id="intelArbGapTrendSub">Waiting for attributable evidence</div>
+                                <div id="intelArbGapTrend" style="display:none;">—</div>
                             </div>
                         </div>
                     </div>
@@ -10244,7 +10240,7 @@
                 </div>
 
                 <div style="background: var(--bg-surface); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">🛰️ Spacescan Token Context <span class="cc-help">?<span class="cc-tooltip">Non-executable explorer context from Spacescan. This helps the bot judge token maturity, holder depth, on-chain activity, and whether explorer price is drifting away from the live Dexie/Tibet market.</span></span></div>
+                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">🛰️ Spacescan Token Context <span class="cc-help">?<span class="cc-tooltip">Non-executable explorer context from Spacescan. It corroborates token maturity and on-chain activity but never authorizes a wallet action.</span></span></div>
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px;">
                         <div>
                             <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Holders</div>
@@ -10292,22 +10288,29 @@
                     </div>
                 </div>
 
-                <!-- Pool Depth & Slippage -->
+                <!-- Derived confidence thresholds -->
                 <div style="background: var(--bg-surface); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">🌊 TibetSwap Pool Intelligence <span class="cc-help">?<span class="cc-tooltip">Data from the TibetSwap AMM liquidity pool. The bot uses this to estimate slippage and adjust spreads based on available pool depth.</span></span></div>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div style="font-weight: 600; margin-bottom: 12px; color: rgba(255,255,255,0.8);">🛡️ Offer-book Safety Thresholds <span class="cc-help">?<span class="cc-tooltip">Read-only thresholds derived from the selected risk preset and current configured offer size.</span></span></div>
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;">
                         <div>
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Pool Depth Ratio <span class="cc-help">?<span class="cc-tooltip">Your typical trade size as a percentage of the TibetSwap pool. Higher ratios mean more price impact. Above 1% the bot widens spreads.</span></span></div>
-                            <div id="intelPoolRatio" style="font-size: 16px; font-weight: 600; color: var(--accent-primary);">—</div>
-                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Our trade vs pool size</div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Required independent depth</div>
+                            <div id="derivedDepthThreshold" style="font-size: 16px; font-weight: 600; color: var(--accent-primary);">—</div>
+                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Per side, scaled to offer size</div>
                         </div>
                         <div>
-                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Est. Slippage <span class="cc-help">?<span class="cc-tooltip">Estimated price impact if you traded your default size through TibetSwap. Calculated from the constant product formula (x×y=k).</span></span></div>
-                            <div id="intelSlippage" style="font-size: 16px; font-weight: 600; color: var(--status-warning);">—</div>
-                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">For a 1 XCH test trade</div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Manipulation limit</div>
+                            <div id="derivedManipulationThreshold" style="font-size: 16px; font-weight: 600; color: var(--status-warning);">—</div>
+                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Red confidence threshold</div>
+                        </div>
+                        <div>
+                            <div style="color: rgba(255,255,255,0.5); font-size: 11px;">Churn limit</div>
+                            <div id="derivedChurnLimit" style="font-size: 16px; font-weight: 600; color: var(--status-warning);">—</div>
+                            <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Rapid add/remove score</div>
                         </div>
                     </div>
-                    <div id="intelTibetContext" style="margin-top: 10px; color: rgba(255,255,255,0.58); font-size: 11px;">Waiting for TibetSwap pool data...</div>
+                    <div id="intelTibetContext" style="margin-top: 10px; color: rgba(255,255,255,0.58); font-size: 11px;">TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives a live decision.</div>
+                    <div id="intelPoolRatio" style="display:none;">—</div>
+                    <div id="intelSlippage" style="display:none;">—</div>
                 </div>
 
                 <!-- DBX Rewards -->
@@ -10458,25 +10461,25 @@
 
                     </div><!-- /.card (intel) -->
 
-        <!-- TibetSwap Liquidity Card (in Intel view) -->
+        <!-- Retired provider history card (kept hidden for one-release DOM compatibility) -->
         <div class="card liquidity-card" id="liquidityCard" style="margin-bottom: 20px; display: none;">
-            <div class="card-title">🔄 TibetSwap Liquidity <span id="tibetCatName" style="color: rgba(255,255,255,0.6); font-size: 0.85em; font-weight: normal;"></span></div>
+            <div class="card-title">Retired provider history <span id="tibetCatName" style="color: rgba(255,255,255,0.6); font-size: 0.85em; font-weight: normal;"></span></div>
             <div class="liquidity-metrics">
                 <div class="liquidity-metric">
-                    <div class="liquidity-label">XCH Reserve <span class="cc-help">?<span class="cc-tooltip">Amount of XCH locked in the TibetSwap liquidity pool for this pair.</span></span></div>
+                    <div class="liquidity-label">Historical XCH reserve</div>
                     <div class="liquidity-value" id="liqXchReserve">0.00</div>
                 </div>
                 <div class="liquidity-metric">
-                    <div class="liquidity-label">Token Reserve <span class="cc-help">?<span class="cc-tooltip">Amount of CAT tokens locked in the TibetSwap liquidity pool for this pair.</span></span></div>
+                    <div class="liquidity-label">Historical token reserve</div>
                     <div class="liquidity-value" id="liqTokenReserve">0</div>
                 </div>
             </div>
             <div class="stat-row" style="margin-top: 15px;">
-                <span class="stat-label">Pool Price <span class="cc-help">?<span class="cc-tooltip">Current price derived from TibetSwap pool reserves (XCH reserve ÷ token reserve). Used as reference price for the bot.</span></span></span>
+                <span class="stat-label">Historical pool price</span>
                 <span class="stat-value" id="liqPoolPrice">0.00000000</span>
             </div>
             <div class="stat-row">
-                <span class="stat-label">Price Gap (Dexie vs Tibet) <span class="cc-help">?<span class="cc-tooltip">Difference between Dexie orderbook mid-price and TibetSwap pool price. Large gaps may signal arbitrage opportunities.</span></span></span>
+                <span class="stat-label">Historical venue gap</span>
                 <span class="stat-value">
                     <span id="liqGapBps">0</span>%
                     <span id="liqGapBadge" class="gap-badge"></span>
@@ -10491,7 +10494,7 @@
                     font-size: 13px;
                 ">
                     <strong style="color: #FFC107;">Suggestion:</strong>
-                    <span id="arbSuggestionText">Checking gap...</span>
+                    <span id="arbSuggestionText">Retired — read-only history</span>
                 </div>
             </div>
 
@@ -10733,7 +10736,7 @@
                     <!-- ══ Smart Defaults ══ -->
                     <div class="v4-settings-section v4-settings-purple" style="background: rgba(139,92,246,0.08); text-align: center;">
                         <div style="font-size: 1.05em; font-weight: bold; color: var(--violet-300); margin-bottom: 8px;" id="smartDefaultsTitle">Auto-Fill Settings</div>
-                        <div class="v4-settings-hint" style="margin-bottom: 10px;" id="smartDefaultsSubtitle">Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what's left: fee pool → sniper pool → trading capital → tier sizes &amp; offer counts.</div>
+                        <div class="v4-settings-hint" style="margin-bottom: 10px;" id="smartDefaultsSubtitle">Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what's left: fee pool → opportunity pool → trading capital → tier sizes &amp; offer counts.</div>
 
                         <!-- Risk Profile selector -->
                         <div style="margin-bottom: 12px;">
@@ -10909,17 +10912,11 @@
                                 <div class="v4-settings-hint">Max single-loop price change — 0 = disabled</div>
                             </div>
                         </div>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;">
-                            <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 0.85em;">Tibet Shock Cancel (%) <span class="cc-help">?<span class="cc-tooltip">Confirmed TibetSwap pool move that triggers defensive cancel on the at-risk side before stale offers can be arbed. Set 0 for auto from inner edge.</span></span></label>
-                                <input type="number" id="configTibetShockCancelPct" value="0" min="0" max="50" step="0.01">
-                                <div class="v4-settings-hint">0 = auto from inner edge; positive value = explicit TibetSwap move trigger</div>
-                            </div>
-                            <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 0.85em;">Arb Alert Threshold (%) <span class="cc-help">?<span class="cc-tooltip">Dexie/Tibet gap, as a percentage, that marks an arbitrage alert. Smart Settings calibrates this from liquidity, volatility, and the live venue gap.</span></span></label>
-                                <input type="number" id="configArbThreshold" value="2.0" min="0.01" max="50" step="0.1">
-                                <div class="v4-settings-hint">Used by alerting and sniper re-arm calibration</div>
-                            </div>
+                        <div style="background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.22); border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+                            <div style="font-size: 0.85em; font-weight: 600;">Offer-book confidence thresholds are derived automatically</div>
+                            <div class="v4-settings-hint">Smart Settings derives minimum attributable depth, movement persistence, churn, manipulation, and profitability limits from the selected risk preset. They are visible in Market Intel and intentionally read-only in v1.4.</div>
+                            <input type="hidden" id="configTibetShockCancelPct" value="0">
+                            <input type="hidden" id="configArbThreshold" value="0">
                         </div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                             <div class="form-group" style="margin-bottom: 0;">
@@ -11186,14 +11183,14 @@
 
                     <!-- ══ SECTION: Smart Pricing ══ -->
                     <div class="v4-settings-section v4-settings-amber" id="settings-section-smart-pricing">
-                        <div class="v4-settings-section-title" style="color: var(--warning-300);">Smart Pricing <span class="cc-help">?<span class="cc-tooltip">Dynamic spread calculation and inventory-aware skewing. When enabled, spreads auto-adjust based on volatility, pool depth, fill rate, and your position.</span></span></div>
+                        <div class="v4-settings-section-title" style="color: var(--warning-300);">Smart Pricing <span class="cc-help">?<span class="cc-tooltip">Dynamic spread calculation and inventory-aware skewing. When enabled, spreads adjust from trusted attributable depth, volatility, churn, fill rate, and your position.</span></span></div>
 
                         <!-- Dynamic Spreads -->
                         <div style="padding-bottom: 12px; border-bottom: 1px solid rgba(255,255,255,0.06);">
                             <div class="form-group" style="margin-bottom: 8px;">
                                 <label style="display: flex; align-items: center; gap: 10px;">
                                     <input type="checkbox" id="configDynamicSpreadEnabled" style="width: auto; margin: 0;">
-                                    <span style="font-weight: bold; color: var(--warning-300);">Dynamic Spreads <span class="cc-help">?<span class="cc-tooltip">Automatically adjusts spread width using the configured base spread plus volatility, arb gap, recent fills, and pool depth. Inventory skew and competitor nudges are separate features and can still adjust pricing even when this is off.</span></span></span>
+                                    <span style="font-weight: bold; color: var(--warning-300);">Dynamic Spreads <span class="cc-help">?<span class="cc-tooltip">Automatically adjusts spread width using the configured base spread plus trusted book depth, volatility, churn, and recent fills. Inventory skew and competitor nudges remain separate.</span></span></span>
                                 </label>
                             </div>
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;">
@@ -11343,7 +11340,7 @@
                              book to work. In single-sided modes we hide the
                              controls and surface a small "unavailable" hint in
                              place of the sniper config. -->
-                        <div class="mode-hide-on-buy-only mode-hide-on-sell-only">
+                        <div class="mode-hide-on-buy-only mode-hide-on-sell-only" hidden>
                             <div class="form-group" style="margin-bottom: 8px;">
                                 <label style="display: flex; align-items: center; gap: 10px;">
                                     <input type="checkbox" id="configSniperEnabled" style="width: auto; margin: 0;">
@@ -11361,13 +11358,13 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="mode-hide-on-two-sided" style="display: none; margin-bottom: 10px; padding: 8px 12px; background: rgba(100,116,139,0.08); border: 1px solid rgba(100,116,139,0.2); border-radius: 6px; font-size: 0.82em; color: var(--text-tertiary); line-height: 1.5;">
+                        <div class="mode-hide-on-two-sided" hidden style="display: none; margin-bottom: 10px; padding: 8px 12px; background: rgba(100,116,139,0.08); border: 1px solid rgba(100,116,139,0.2); border-radius: 6px; font-size: 0.82em; color: var(--text-tertiary); line-height: 1.5;">
                             🎯 <strong>Sniper unavailable</strong> in single-sided mode — the arb-discovery probe places buy AND sell orders simultaneously, which requires both sides of the book. It will re-enable automatically if you switch back to Two-Sided.
                         </div>
                         <!-- Re-arm fields + hint are sniper knobs; hide them
                              together with the rest of the sniper block when
                              in single-sided mode. -->
-                        <div class="mode-hide-on-buy-only mode-hide-on-sell-only">
+                        <div class="mode-hide-on-buy-only mode-hide-on-sell-only" hidden>
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Re-arm Price Move (%) <span class="cc-help">?<span class="cc-tooltip">Minimum mid-price move before sniper is allowed to run discovery again after the first launch. Higher = calmer sniper, lower = more reactive.</span></span></label>
@@ -11557,7 +11554,7 @@
                                 <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
                                     <div style="flex: 1;">
                                         <div style="font-weight: 600; font-size: 0.95em; color: var(--sell-color);">Full Reset</div>
-                                        <div class="v4-settings-hint" style="margin-top: 4px;">Both of the above, plus runtime stat counters (sniper history, watchdog streaks, fill-tracker state). Coin designations, settings, and wallet state are preserved.</div>
+                                        <div class="v4-settings-hint" style="margin-top: 4px;">Both of the above, plus runtime stat counters (opportunity history, watchdog streaks, fill-tracker state). Coin designations, settings, and wallet state are preserved.</div>
                                     </div>
                                     <button class="btn" id="btnResetFull" onclick="handleFullReset()" style="padding: 8px 14px; background: rgba(248,113,113,0.25); border: 1px solid var(--sell-color); color: var(--sell-color); border-radius: 6px; white-space: nowrap; font-weight: 600;">Full Reset</button>
                                 </div>
@@ -11819,7 +11816,7 @@
                         <input type="checkbox" id="prepResetCountersCb" style="margin-top: 3px;">
                         <span style="flex: 1;">
                             <span style="font-weight: 600;">Reset runtime counters</span>
-                            <span class="v4-settings-hint" style="display: block; margin-top: 2px;">Zeroes sniper history, watchdog streaks, and fill-tracker state. Harmless — resets on next restart anyway.</span>
+                            <span class="v4-settings-hint" style="display: block; margin-top: 2px;">Zeroes opportunity history, watchdog streaks, and fill-tracker state. Harmless — resets on next restart anyway.</span>
                         </span>
                     </label>
                 </div>
@@ -12278,7 +12275,7 @@
                     <div>
                         <div class="v4-modal-kicker">About</div>
                         <h2 class="v4-modal-title"><span class="catalyst-cat">CAT</span><span class="catalyst-alyst">alyst</span></h2>
-                        <p class="v4-modal-copy">A native desktop app for automated Chia CAT market making from Sage Wallet. CATalyst builds and manages a live buy/sell ladder on Dexie, watches TibetSwap and Coinset for fast market and mempool signals, verifies fills with Sage, Dexie, and Spacescan evidence, and keeps coin pools prepared for the next cycle.</p>
+                        <p class="v4-modal-copy">A native desktop app for automated Chia CAT offer-book liquidity from Sage Wallet. Sage is the wallet and transaction authority. Dexie is the primary attributable offer book. Splash provides peer discovery and publication evidence. Coinset and Spacescan provide corroborating chain evidence.</p>
                         <div class="about-modal-brand">
                             <div class="about-modal-brand-note">Created by <strong>MonkeyZoo</strong></div>
                             <img class="about-modal-brand-logo" src="/assets/MonkeyZoo_Logo.png" alt="MonkeyZoo logo">
@@ -12290,7 +12287,7 @@
                     <div class="v4-modal-panel v4-modal-panel--info">
                         <div class="v4-modal-panel-title">What the app does</div>
                         <div class="v4-modal-panel-copy">
-                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, posts offers to Dexie, optionally broadcasts through Splash P2P, monitors live market data, tracks fills, updates PnL, and applies spread, inventory, sniper, TibetSwap shock, cancel-settle, topup, and recovery guards while trading.
+                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, updates confirmed PnL, and progressively withdraws exposure when attributable market evidence degrades. TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives live trading.
                         </div>
                     </div>
                     <div class="v4-modal-panel">
@@ -12298,13 +12295,13 @@
                         <div class="v4-modal-panel-copy">
                             <strong>Public beta release flow</strong> - The website, installer metadata, and in-app update badge now track the current release so testers can download the latest build from one place.<br>
                             <strong>Sage wallet selection</strong> - Startup asks testers to choose the Sage signing wallet/fingerprint on every launch, then runs RPC, version, Spacescan, Splash, Smart Settings, coin prep, and start-guard checks against that wallet.<br>
-                            <strong>Smart Settings refresh</strong> - Smart Settings uses the selected CAT, live Dexie/TibetSwap/Spacescan/Sage context where available, handles thin or new CATs conservatively, and writes TibetSwap shock-cancel fields, reserves, ladder depth, tier sizes, topup pool, and safety limits together.<br>
-                            <strong>Safer requote, cancel, and Close the Gap recovery</strong> - Dynamic pricing can tighten when the market supports it while stale-cancel and shock-cancel guards keep replacement offers from stacking on top of older wallet-active offers.<br>
-                            <strong>Coin prep and topup improvements</strong> - Prepared XCH/CAT pools, fee coins, reserve coins, and sniper/topup outputs are classified immediately so live topup does not churn useful coins back into reserve.<br>
-                            <strong>Close the Gap probes</strong> - Manual gap closing uses small per-side probes to discover where active arbers respond, then plants tighter inner-tier offers while cancelling the furthest inner offers to keep the book from stacking.<br>
+                            <strong>Offer-book Smart Settings</strong> - Smart Settings derives spread, attributable depth, movement persistence, manipulation limits, reserves, tier sizes, fees, and profitability floors from Dexie, Splash, Sage, and corroborating chain evidence.<br>
+                            <strong>Confidence and degraded recovery</strong> - Green, amber, and red confidence states prevent new exposure when evidence is weak and withdraw inner, middle, then outer offers on a durable 0/3/10-minute schedule.<br>
+                            <strong>Coin prep and topup improvements</strong> - Prepared XCH/CAT pools, dedicated fee coins, reserve coins, and topup outputs are classified immediately so live topup does not churn useful coins back into reserve.<br>
+                            <strong>Publication discovery</strong> - A submission response is only an acknowledgement. CATalyst requires exact rediscovery through Dexie or Splash before treating an offer as public and active.<br>
                             <strong>Beta feedback and diagnostics</strong> - Debug Bundle, crash reports, and public issue forms are ready for early testers to report bugs or rough edges in the bot repo.<br>
                             <strong>Dashboard guidance cleanup</strong> - Guidance waits for stronger tipping points before showing advice, deduplicates overlapping alerts, and keeps action items separate from lower-confidence advisor notes.<br>
-                            <strong>Diagnostics and charts</strong> - Market Diagnostics show Dexie, TibetSwap, Spacescan, Sage, Splash, and arb-gap health in the relevant tabs, with longer price context and more detailed order/depth views where the data exists.
+                            <strong>Diagnostics and charts</strong> - Market Diagnostics show source health, attributable depth, own-offer exclusions, confidence reasons, withdrawal stage, and chain corroboration without treating an indexer as wallet authority.
                         </div>
                     </div>
                     <div class="v4-modal-panel">
@@ -12313,7 +12310,7 @@
                             <strong>Desktop shell</strong> — native window, system tray, and OS notifications.<br>
                             <strong>Mempool watcher</strong> — fill detection in 5–18 seconds via Coinset mempool scanning.<br>
                             <strong>Hardened safeguards</strong> — silent-loss rate alerts, position sanity checks, cancel-storm protection, daily DB↔wallet reconciliation, background-thread liveness watchdog, WAL monitoring, and per-cycle SLA timing.<br>
-                            <strong>Startup self-test</strong> — pings every external service used by the app (Sage, Coinset, TibetSwap, Dexie, Spacescan, Splash where enabled) and tells you what will be missing if anything is down.<br>
+                            <strong>Startup self-test</strong> — checks every active service used by the app (Sage, Coinset, Dexie, Spacescan, and Splash where enabled) and identifies missing capabilities without contacting retired providers.<br>
                             <strong>Settings audit log</strong> — every config change is recorded with who/when/what so you can investigate after the fact.<br>
                             <strong>Light mode polish</strong> — every panel and modal now reads cleanly on a light background.<br>
                             <strong>PnL statistics</strong> — volume, avg fill size, avg trip time, avg profit per trip, open legs panel.<br>
@@ -12431,8 +12428,8 @@
                 <button class="help-tab-btn" onclick="switchHelpTab('inventory')" id="helpTab_inventory">Inventory &amp; PnL</button>
                 <button class="help-tab-btn" onclick="switchHelpTab('coins')" id="helpTab_coins">Coin Management</button>
                 <button class="help-tab-btn" onclick="switchHelpTab('intel')" id="helpTab_intel">Market Intel</button>
-                <button class="help-tab-btn" onclick="switchHelpTab('sniper')" id="helpTab_sniper">Sniper</button>
-                <button class="help-tab-btn" onclick="switchHelpTab('gap-closer')" id="helpTab_gap-closer">Close the Gap</button>
+                <button class="help-tab-btn" onclick="switchHelpTab('sniper')" id="helpTab_sniper">Book Opportunities</button>
+                <button class="help-tab-btn" onclick="switchHelpTab('gap-closer')" id="helpTab_gap-closer">Confidence Recovery</button>
                 <button class="help-tab-btn" onclick="switchHelpTab('wallet')" id="helpTab_wallet">Sage Wallet</button>
                 <button class="help-tab-btn" onclick="switchHelpTab('config')" id="helpTab_config">Config Guide</button>
                 <button class="help-tab-btn" onclick="switchHelpTab('troubleshooting')" id="helpTab_troubleshooting">Troubleshooting</button>
@@ -12444,19 +12441,19 @@
                 <!-- OVERVIEW -->
                 <div id="help_overview" class="help-panel">
                     <h3 style="color: var(--accent-primary-hover); margin-top: 0;">What does this bot do?</h3>
-                    <p>This bot is an <strong>automated market maker</strong> for Chia blockchain CAT tokens using <strong>Sage Wallet</strong>, <strong>Dexie</strong>, <strong>TibetSwap</strong>, <strong>Coinset</strong>, <strong>Spacescan</strong>, and optional <strong>Splash P2P</strong>. It continuously creates buy and sell offers around a reference price, protects against obvious arb pressure, and tracks fills, inventory, PnL, coins, and service health from one local desktop app.</p>
+                    <p>This bot provides automated offer-book liquidity for Chia CAT tokens. Sage is the wallet and transaction authority; Dexie is the primary attributable offer book; Splash supplies optional peer publication and discovery evidence; Coinset and Spacescan provide corroborating chain context.</p>
                     <h3 style="color: var(--accent-primary-hover);">How it works — the cycle</h3>
-                    <p>The bot runs a complete cycle on the configured loop interval (default 90s, often lowered by Smart Settings for active markets). Background watchers keep it reactive between full cycles: the price watcher polls TibetSwap for swaps, the AMM monitor tracks pool reserve drift, and the mempool watcher checks Coinset for pending spends of the Tibet pool coin and coins locked by your live offers. These signals can wake the main loop early, so fill detection and price-shift response usually happen much faster than the main loop interval.</p>
+                    <p>The bot runs a complete cycle on the configured interval and refreshes attributable offers, publication discovery, Sage state, and corroborating chain evidence. Confidence transitions can freeze creation immediately and progressively withdraw the book without trusting an indexer to mutate the wallet.</p>
                     <p>Each cycle runs these steps:</p>
                     <ol style="padding-left: 20px;">
-                        <li><strong>Fetch prices</strong> from Dexie and TibetSwap where available to find the current mid-price and arb gap</li>
+                        <li><strong>Build a trusted book</strong> from fresh attributable Dexie and Splash offers, excluding CATalyst's own offers</li>
                         <li><strong>Check health</strong> - is Sage reachable, is the wallet ready, and are any circuit breakers active?</li>
                         <li><strong>Detect fills</strong> - compare Sage, Dexie, and on-chain evidence before booking fills</li>
                         <li><strong>Match PnL</strong> — pair up buy fills with sell fills to calculate profit</li>
                         <li><strong>Update inventory</strong> — track net position (are we accumulating CAT or XCH?)</li>
                         <li><strong>Clean expired offers</strong> and pre-emptively refresh any expiring within 5 minutes</li>
-                        <li><strong>Fire sniper</strong> if there's an arb opportunity between Dexie and TibetSwap</li>
-                        <li><strong>Defensive cancel</strong> if a TibetSwap price shock is detected, then wait for Sage to stop reporting cancelled offers before replacements are created</li>
+                        <li><strong>Evaluate confidence</strong> from depth, source health, movement persistence, and manipulation signals</li>
+                        <li><strong>Withdraw safely</strong> when confidence is red, then require durable healthy recovery before new exposure</li>
                         <li><strong>Regular requote</strong> if the price has drifted beyond the threshold</li>
                         <li><strong>Create new offers</strong> with tiered sizing, inventory skew, competitor awareness, and pending-cancel guards</li>
                         <li><strong>Post to Dexie</strong> (and optionally Splash P2P) for visibility</li>
@@ -12465,7 +12462,7 @@
                     <h3 style="color: var(--accent-primary-hover);">Key concepts</h3>
                     <p><strong>Spread:</strong> The difference between your buy and sell price, shown as a %. Wider = safer but fewer fills. Narrower = more fills but more risk.</p>
                     <p><strong>Inventory:</strong> Your net position. If people keep buying your CAT, you accumulate XCH (go short CAT). The bot skews spreads to rebalance.</p>
-                    <p><strong>Coins:</strong> Chia uses a UTXO model - each offer locks a specific coin. Coin prep and topup keep correctly sized XCH, CAT, fee, reserve, and sniper coins available so the ladder can rebuild cleanly.</p>
+                    <p><strong>Coins:</strong> Chia uses a UTXO model - each offer locks a specific coin. Coin prep and topup keep correctly sized XCH, CAT, dedicated fee, reserve, and ladder coins available so the book can rebuild cleanly.</p>
                 </div>
 
                 <!-- GETTING STARTED -->
@@ -12475,15 +12472,15 @@
                     <ol style="padding-left: 20px;">
                         <li><strong>Open Sage and enable RPC</strong> - Sage must be running, unlocked, and have its RPC server enabled in Settings -> Advanced.</li>
                         <li><strong>Select the wallet fingerprint</strong> - Choose the Sage fingerprint the app should use. Use a signing wallet, not watch-only, for live trading.</li>
-                        <li><strong>Pick your CAT pair</strong> - Choose the CAT / XCH pair. New or thin CATs are allowed, but Smart Settings will be more conservative when Dexie, TibetSwap, or Spacescan data is limited.</li>
-                        <li><strong>Run Smart Settings</strong> - Review the suggested spread, reserves, tier sizes, offer count, topup pool, and TibetSwap shock cancel settings before saving.</li>
-                        <li><strong>Prepare your coins</strong> - Coin prep cancels existing offers first, then splits XCH and CAT into the right fee, reserve, ladder, topup, and sniper pools for the saved plan.</li>
+                        <li><strong>Pick your CAT pair</strong> - Choose the CAT / XCH pair. New or thin CATs are allowed, but confidence stays restricted until a fresh two-sided attributable book exists.</li>
+                        <li><strong>Run Smart Settings</strong> - Review the suggested spread, reserves, tier sizes, offer count, topup pool, fees, and read-only confidence thresholds before saving.</li>
+                        <li><strong>Prepare your coins</strong> - Coin prep cancels existing offers first, then splits XCH and CAT into the right dedicated fee, reserve, ladder, and topup pools for the saved plan.</li>
                         <li><strong>Start the bot</strong> - The start guard checks wallet readiness, prepared coins, service health, and settings before the first offer wave.</li>
                     </ol>
                     <h3 style="color: var(--accent-primary-hover);">Tips for beginners</h3>
                     <p><strong>Start small</strong> - Use small trade sizes while you're learning. You can always increase them later in Settings.</p>
                     <p><strong>Everything is in Settings</strong> - All normal app configuration is done through the Settings screen. No manual file editing should be needed for day-to-day use.</p>
-                    <p><strong>Use Smart Settings per CAT</strong> - Do not reuse one token's plan blindly on another CAT. Each CAT can have different liquidity, volume, holder count, pool depth, and orderbook behavior.</p>
+                    <p><strong>Use Smart Settings per CAT</strong> - Do not reuse one token's plan blindly on another CAT. Each CAT can have different attributable depth, volume, holder count, churn, and order-book behavior.</p>
                     <p><strong>Live vs Setup</strong> — Settings has two sub-tabs. <em>Live</em> holds the hot-reloadable tweaks (spread slider, skew, feature toggles) and is safe to touch while the bot is running. <em>Setup</em> holds the full configuration; saved changes apply on next restart when the bot is live.</p>
                     <p><strong>Guidance + Activity</strong> — Once running, the two panels below the info cards show what to act on (Guidance) and what the bot is doing right now (Activity). Anything with a button goes to Guidance; informational notes sit below the same card.</p>
                     <p><strong>Command Centre</strong> — The three-panel summary further down shows your settings, market health, and wallet performance at a glance. Hover over any <strong>?</strong> icon for an explanation.</p>
@@ -12496,9 +12493,9 @@
                     <ol style="padding-left: 20px;">
                         <li><strong>Token pill</strong> — the active CAT / XCH pair.</li>
                         <li><strong>Running bar</strong> — Start / Stop / Cancel All on the left, status badge in the middle, Sync indicator + wallet badge + fingerprint on the right.</li>
-                        <li><strong>TibetSwap Live AMM</strong> — labelled strip showing live pool price, drift from your mid, reserves, and freshness. Source chip reads <em>Source · TibetSwap</em>.</li>
+                        <li><strong>Offer-book Market Confidence</strong> — one durable snapshot showing green/amber/red state, trusted range, provider health, reasons, and withdrawal stage.</li>
                         <li><strong>Volume &amp; Token Info</strong> — 7d / 30d volume, 7d range, description, and website link. Source chip reads <em>Source · Dexie</em>. While data is loading, a "Gathering…" placeholder shows instead of an empty row.</li>
-                        <li><strong>10 info cards</strong> (5×2 symmetric grid) — Mid Price, Active Offers, Session PnL, Position, Uptime / Best Bid, Best Ask, 24h Volume, Liquidity, Arb Gap.</li>
+                        <li><strong>10 info cards</strong> (5×2 symmetric grid) — Trusted Mid, Active Offers, confirmed Session PnL, Position, Uptime / Best Bid, Best Ask, 24h Volume, Independent Depth, Market Confidence.</li>
                         <li><strong>Guidance + Activity row</strong> — two equal-width panels side by side (see below).</li>
                         <li><strong>Market Health / Command Centre</strong> — the three-column summary of your settings, market health metrics, and wallet performance. Sits just below the fold on 1080p windows so you see the top of it without scrolling.</li>
                     </ol>
@@ -12514,11 +12511,11 @@
                     <h3 style="color: var(--accent-primary-hover);">Command Centre metrics</h3>
                     <ul style="padding-left: 20px;">
                         <li><strong>Active Settings</strong> (left) — Read-only view of your current trading, spread, inventory, tier, and safety settings.</li>
-                        <li><strong>Market Health</strong> (centre) — Traffic light + market metrics including spreads, competitors, arb gap, pool depth, and the side-aware adverse-selection guard.</li>
+                        <li><strong>Market Health</strong> (centre) — Traffic light plus trusted range, attributable depth, provider capability health, manipulation reasons, and the side-aware adverse-selection guard.</li>
                         <li><strong>Wallet &amp; Performance</strong> (right) — Sage balances, coin breakdown, reserves, and session uptime / fills / PnL / errors.</li>
                     </ul>
                     <h3 style="color: var(--accent-primary-hover);">Where did Live Controls go?</h3>
-                    <p>Live Controls (Dynamic Spreads, Inventory Mgmt, Sniper, Competitor Aware toggles + Base Spread / Skew sliders + Close the Gap) moved to <strong>Settings → Live</strong> tab. Click Settings in the left sidebar while the bot is running and the Live sub-tab auto-opens.</p>
+                    <p>Live Controls (Dynamic Spreads, Inventory Mgmt, Competitor Aware, Base Spread, and Skew) live under <strong>Settings → Live</strong>. Legacy AMM probe controls are retired and hidden.</p>
                 </div>
 
                 <!-- OFFERS & FILLS -->
@@ -12538,23 +12535,23 @@
                 <!-- SPREADS & PRICING -->
                 <div id="help_spreads" class="help-panel" style="display: none;">
                     <h3 style="color: var(--accent-primary-hover); margin-top: 0;">How pricing works</h3>
-                    <p>The bot builds live executable pricing from the two venues it can actually trade against:</p>
+                    <p>The bot builds live executable pricing from attributable offer-book evidence:</p>
                     <ul style="padding-left: 20px;">
-                        <li><strong>Dexie</strong> — the current orderbook and ticker context</li>
-                        <li><strong>TibetSwap</strong> — the pool-implied price and slippage context</li>
+                        <li><strong>Dexie</strong> — the primary exact public offer book and settled-trade context</li>
+                        <li><strong>Splash</strong> — optional exact peer offers plus independent publication/discovery evidence</li>
                     </ul>
-                    <p>The <strong>mid-price</strong> and <strong>arb gap</strong> come from Dexie and TibetSwap because those are the executable market venues. <strong>Spacescan</strong> is not used as a direct live price source; instead it supports on-chain verification, balance checks, and token-health context where available.</p>
+                    <p>The <strong>trusted midpoint</strong> requires fresh two-sided depth after CATalyst removes its own offers and deduplicates provider observations. Coinset and Spacescan corroborate chain effects; Sage remains authoritative for wallet actions and terminal state.</p>
                     <h3 style="color: var(--accent-primary-hover);">Dynamic spreads</h3>
                     <p>When enabled, the spread adjusts automatically based on:</p>
                     <ul style="padding-left: 20px;">
                         <li><strong>Volatility</strong> — More volatile = wider spread (self-protection)</li>
-                        <li><strong>Arb gap</strong> — Large gap = wider spread (don't get picked off)</li>
+                        <li><strong>Book movement</strong> — unconfirmed large moves are held until persistence or settled-trade evidence exists</li>
                         <li><strong>Fill rate</strong> — Too many fills = wider spread; too few = tighter</li>
-                        <li><strong>Pool depth</strong> — Shallow TibetSwap pool = wider spread (more slippage risk)</li>
+                        <li><strong>Independent depth</strong> — thin or one-sided attributable depth restricts new exposure</li>
                         <li><strong>Competitors</strong> — If Competitor Awareness is enabled, pricing also nudges based on what other market makers are doing on Dexie</li>
                     </ul>
                     <h3 style="color: var(--accent-primary-hover);">Spread settings</h3>
-                    <p><strong>Base Spread</strong> — Starting point as a percentage for the dynamic engine, not a minor "aggression" trim. <strong>Inner Edge</strong> — Where your closest offers start (the ladder begins here and widens to the full spread). <strong>Min/Max Spread</strong> — Hard limits the dynamic engine can't exceed. Turning Dynamic Spreads off disables the volatility/fill-rate/pool-depth engine, but inventory skew and competitor nudges can still move quotes if those features stay on.</p>
+                    <p><strong>Base Spread</strong> is the starting point. <strong>Inner Edge</strong> controls where the closest tier begins. <strong>Min/Max Spread</strong> bounds the dynamic engine. No order may enter a price war outside the trusted profitable envelope after fees, expected cancellation cost, and minimum profit.</p>
                 </div>
 
                 <!-- INVENTORY & PNL -->
@@ -12601,7 +12598,7 @@
                 <!-- MARKET INTEL -->
                 <div id="help_intel" class="help-panel" style="display: none;">
                     <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Market Intelligence</h3>
-                    <p>The Market Intel tab provides ecosystem awareness for the live CAT pair. Dexie orderbook and TibetSwap pool context drive executable pricing, Coinset supports mempool and coin checks, and Spacescan adds token-health and on-chain verification context when data is available.</p>
+                    <p>The Market Intel tab explains the live CAT pair through attributed exact offers, own-offer exclusions, depth ratios, settled trades, confidence reasons, and provider capability health.</p>
                     <h3 style="color: var(--accent-primary-hover);">Competitor monitoring</h3>
                     <p>When Competitor Aware is enabled, the bot scans the Dexie orderbook for other market makers and adjusts your spread:</p>
                     <ul style="padding-left: 20px;">
@@ -12609,8 +12606,8 @@
                         <li>If competitors are <strong>tighter</strong> — you tighten to stay competitive (30% of the gap)</li>
                         <li>If one side is <strong>thin</strong> (few offers) — bonus spread on that side</li>
                     </ul>
-                    <h3 style="color: var(--accent-primary-hover);">TibetSwap pool depth</h3>
-                    <p>Shows the ratio of your trade size to the TibetSwap pool. If your trade is large relative to the pool, the bot widens spreads to account for slippage.</p>
+                    <h3 style="color: var(--accent-primary-hover);">Independent depth</h3>
+                    <p>Shows whether each side contains enough attributable depth relative to your configured offer size. Aggregate or self-attributed levels may be displayed but cannot authorize a mutation.</p>
                     <h3 style="color: var(--accent-primary-hover);">Where Spacescan helps</h3>
                     <p>Spacescan is used in this app as an on-chain helper rather than a live orderbook feed. It assists with fill verification, balance discrepancy checks, and token-health inputs used by Smart Settings and safety checks. If a token is new or missing from Spacescan, the app continues with reduced confidence and Smart Settings falls back to conservative assumptions. Spacescan data is cached for 24 hours due to API rate limits, so it will not update every cycle.</p>
                     <p><strong>Free tier vs Pro tier.</strong> If you skipped the API-key step during setup you're on the <em>free tier</em>, which only returns the token icon and basic price/supply data. The <strong>Activity Level</strong>, <strong>On-Chain Risk</strong>, and <strong>Holders</strong> panels will show "Free tier" instead of a value — that's expected, not a fault. Adding a Spacescan Pro API key (Settings → Spacescan → Save &amp; Verify) unlocks all three fields and improves the Smart Settings risk estimate.</p>
@@ -12629,45 +12626,34 @@
                     <p>Enable these in ⚙️ Settings under the Features section.</p>
                 </div>
 
-                <!-- SNIPER -->
+                <!-- BOOK OPPORTUNITIES -->
                 <div id="help_sniper" class="help-panel" style="display: none;">
-                    <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Arb Sniper</h3>
-                    <p>The sniper module watches for arbitrage opportunities between Dexie and TibetSwap.</p>
+                    <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Bounded Book Opportunities</h3>
+                    <p>The retired AMM sniper is replaced by conservative, separately labelled opportunity offers.</p>
                     <h3 style="color: var(--accent-primary-hover);">How it works</h3>
-                    <p>When the <strong>arb gap</strong> (price difference between Dexie and TibetSwap) exceeds the configured threshold, the sniper fires a small probe pair to test the edge before deploying the main book.</p>
+                    <p>An opportunity is considered only against confirmed attributable depth inside the trusted range and only when it remains profitable after fees and expected cancellation cost.</p>
                     <ul style="padding-left: 20px;">
-                        <li><strong>Probe-first</strong> — fires a small pair (one buy + one sell) at the safe edge. If both probes <strong>survive</strong> on the book, the safe edge is confirmed and the main ladder follows behind. If one is filled, the bot widens that side's buffer and retries.</li>
-                        <li><strong>Inventory-aware</strong> — won't probe in the direction that worsens your position</li>
-                        <li><strong>30-second cooldown</strong> (configurable via SNIPER_COOLDOWN_SECS)</li>
-                        <li><strong>Max 2 active probes</strong> — at most one buy + one sell at any time</li>
-                        <li><strong>Direct Dexie post</strong> — bypasses the normal queue for speed</li>
-                        <li><strong>Dedicated coin pool</strong> — uses pre-split sniper coins (SNIPER_PREP_COUNT in settings) so it never starves the main ladder</li>
+                        <li><strong>Confidence-gated</strong> — no opportunity order under amber or red confidence</li>
+                        <li><strong>Inventory-aware</strong> — never increases exposure on a blocked side</li>
+                        <li><strong>Rate-limited</strong> — repeated undercutting cannot trigger an offer war</li>
+                        <li><strong>Publication-proven</strong> — the exact offer must be rediscovered within 90 seconds</li>
                     </ul>
-                    <h3 style="color: var(--accent-primary-hover);">Fast response</h3>
-                    <p>The background price watcher checks TibetSwap every 12 seconds. When it detects a swap, it wakes the main loop immediately — so the sniper can fire within seconds of an opportunity appearing, not minutes.</p>
-                    <h3 style="color: var(--accent-primary-hover);">Sniper stats</h3>
-                    <p>The dashboard shows: attempts, successes, last gap detected, and total profit from snipes.</p>
+                    <p>TibetSwap shut down. Its historical pool and sniper records remain read-only for continuity and never affect a live quote.</p>
                 </div>
 
                 <!-- CLOSE THE GAP -->
                 <div id="help_gap-closer" class="help-panel" style="display: none;">
-                    <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Close the Gap</h3>
-                    <p>This feature probes for the tightest useful inner book without blindly stacking new offers. It is a manual testing mode for finding where Dexie/TibetSwap arbers actually respond on the current pair.</p>
+                    <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Confidence Recovery</h3>
+                    <p>When live evidence degrades, CATalyst freezes creation and progressively withdraws offers while preserving the last trusted price for display only.</p>
                     <h3 style="color: var(--accent-primary-hover);">How it works</h3>
                     <ol style="padding-left: 20px;">
-                        <li>Creates a small buy probe and sell probe using the dedicated sniper/gap coin pool</li>
-                        <li>Tests one side at a time, waiting roughly 60 seconds between pushes so cancel/create activity has time to settle</li>
-                        <li>Moves each surviving side deeper in fixed bps steps until it is filled by arbers or reaches the configured ceiling</li>
-                        <li>Tracks buy and sell floors separately because arbers can react asymmetrically</li>
-                        <li>When both sides settle, it plants tighter real inner-tier offers and cancels the furthest inner offers on each side</li>
-                        <li>The normal ladder then converges behind the proven level while the gap-closing probe state is cleared</li>
+                        <li>Red confidence immediately cancels inner offers and blocks create/requote work.</li>
+                        <li>Continuous degradation cancels middle offers after three minutes.</li>
+                        <li>At ten minutes the remaining outer, extreme, and opportunity offers are withdrawn.</li>
+                        <li>Recovery requires three healthy refreshes spanning at least 60 seconds.</li>
+                        <li>Compliant owned offers are retained; unsafe offers are cancelled before missing slots rebuild gradually.</li>
                     </ol>
-                    <h3 style="color: var(--accent-primary-hover);">The arb floor</h3>
-                    <p>The gap closer uses the current arb gap between Dexie and TibetSwap plus configured probe limits to avoid pushing indefinitely. A filled probe is treated as useful evidence that the tested side has reached an active arb zone.</p>
-                    <h3 style="color: var(--accent-primary-hover);">Floor handoff</h3>
-                    <p>When both sides are settled, the gap closer creates a small cascade of tighter inner-tier offers and cancels the same number of furthest inner offers. That is the "close the gap" swap: more competitive inner liquidity without leaving the old wider inner offers stacked behind it.</p>
-                    <h3 style="color: var(--accent-primary-hover);">Using it</h3>
-                    <p>Open <strong>Settings -> Live</strong> and use the <strong>"Close the Gap"</strong> control there. You can set the aggression level (how wide to start). The control shows the current gap-closer spread while active. Stop it any time by clicking again.</p>
+                    <p>Every transition and reason code appears in Market Intel and Logs. A brief provider recovery cannot reset the durable degraded timer.</p>
                 </div>
 
                 <!-- WALLET TYPES -->
@@ -12709,7 +12695,7 @@
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
                             <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Dynamic Spread</strong></td>
-                            <td style="padding: 8px 4px;">Enable automatic spread adjustment based on volatility, arb gap, fill rate, pool depth, and competitors.</td>
+                            <td style="padding: 8px 4px;">Enable automatic spread adjustment from trusted attributable depth, volatility, fill rate, churn, and competitors.</td>
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
                             <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Inventory Mgmt</strong></td>
@@ -12724,8 +12710,8 @@
                             <td style="padding: 8px 4px;">Circuit breaker limit in XCH. If position exceeds this, the bot stops one side until it rebalances.</td>
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
-                            <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Sniper</strong></td>
-                            <td style="padding: 8px 4px;">Fires targeted offers when the arb gap between Dexie and TibetSwap is large enough to capture.</td>
+                            <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Book Opportunities</strong></td>
+                            <td style="padding: 8px 4px;">Allows small, bounded opportunity offers only with green confidence, confirmed independent depth, and a profitable fee-adjusted envelope.</td>
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
                             <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Competitor Aware</strong></td>
@@ -12737,11 +12723,11 @@
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
                             <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Smart Settings</strong></td>
-                            <td style="padding: 8px 4px;">Calculates a CAT-specific plan from wallet balances, reserves, Dexie liquidity, TibetSwap pool data, Spacescan token context, and fallback assumptions when data is thin.</td>
+                            <td style="padding: 8px 4px;">Calculates a CAT-specific plan from wallet balances, reserves, attributable offer-book liquidity, settled trade history, chain evidence, and conservative fallbacks.</td>
                         </tr>
                         <tr style="border-bottom: 1px solid rgba(255,255,255,0.1);">
-                            <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Tibet Shock Cancel</strong></td>
-                            <td style="padding: 8px 4px;">Defensively cancels exposed offers after a large TibetSwap move, then waits for Sage/Dexie state to settle before creating replacements.</td>
+                            <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Confidence Withdrawal</strong></td>
+                            <td style="padding: 8px 4px;">Freezes new exposure immediately when evidence degrades, then withdraws inner, middle, and remaining tiers on durable timers.</td>
                         </tr>
                         <tr>
                             <td style="padding: 8px 4px; color: var(--status-warning); white-space: nowrap;"><strong>Reserves</strong></td>
@@ -12751,7 +12737,7 @@
                     <h3 style="color: var(--accent-primary-hover); margin-top: 16px;">Live vs Setup sub-tabs</h3>
                     <p>The Settings view has two sub-tabs. Pick the one that matches what you need to change:</p>
                     <ul style="padding-left: 20px;">
-                        <li><strong>Live</strong> — safe while the bot is running. Hot-reloads on the next loop cycle. Contains: Dynamic Spreads toggle, Inventory Mgmt toggle, Sniper toggle, Competitor Aware toggle, Base Spread slider, Skew Sensitivity slider, Close the Gap button. Auto-selected when the bot is running.</li>
+                        <li><strong>Live</strong> — safe while the bot is running. Hot-reloads on the next loop cycle. Contains Dynamic Spreads, Inventory Management, Competitor Awareness, Base Spread, and Skew Sensitivity. Retired AMM probe controls are unavailable.</li>
                         <li><strong>Setup</strong> — full configuration (trading pair, reserves, tier sizes, safety limits, ladder shape, coin-prep, etc). Saves persist across runs. If you save Setup changes while the bot is running, they <em>apply on next restart</em> — an amber banner at the top of the tab reminds you, and the Save button relabels to "Save (applies on restart)".</li>
                     </ul>
                     <p style="margin-top: 12px; opacity: 0.7; font-size: 0.85em;">Click Settings in the left sidebar to open this view. Dashboard no longer hosts Live Controls — they live in Settings → Live.</p>
@@ -12780,10 +12766,10 @@
                     <p>If Sage or Dexie still reports cancelled offers as fillable, the bot keeps replacement creation blocked on that side. The stale pending-cancel watchdog will retry cancels, but the anti-stack guard stays active until the old offers disappear.</p>
 
                     <h4 style="color: var(--status-warning); margin-bottom: 4px;">Price shows as 0 or "N/A"</h4>
-                    <p>The bot cannot yet build a usable market view from Dexie and TibetSwap, or market intel is still warming up after startup. Check your internet connection and give the dashboard a little time to refresh.</p>
+                    <p>The bot cannot yet derive a trusted two-sided market from attributable offer-book evidence, or providers are still warming after startup. Check provider health and the reason codes in Market Intel.</p>
 
                     <h4 style="color: var(--status-warning); margin-bottom: 4px;">New CAT or missing market data</h4>
-                    <p>If the CAT has no TibetSwap pool, very little Dexie history, or no Spacescan profile yet, Smart Settings falls back to conservative defaults and labels confidence lower. The bot can still run, but start with smaller offers and watch the first cycles closely.</p>
+                    <p>If the CAT has thin attributable depth, very little settled trade history, or no Spacescan profile, Smart Settings uses conservative assumptions. Amber or red confidence prevents the bot from increasing exposure.</p>
 
                     <h4 style="color: var(--status-warning); margin-bottom: 4px;">Logs show RPC errors</h4>
                     <p>The Sage RPC is not responding cleanly. Make sure Sage is open, the selected wallet fingerprint is loaded, and the app has not fallen into a watch-only or degraded wallet state. Restarting the app is often the quickest reset after repeated RPC timeouts.</p>
@@ -12798,7 +12784,7 @@
                     <p>Restart the app if a panel looks stale after an update. On startup or resume, Market Health and Advisor can take a short time to warm up while wallet and market data settle.</p>
 
                     <h4 style="color: var(--status-warning); margin-bottom: 4px;">Market Health shows amber/red</h4>
-                    <p>Check the conditions listed below the traffic light. Common causes: position near circuit breaker limit, large arb gap, spread hitting the max clamp, too many competitors, or the Adverse Selection Guard reacting to sweep-like flow. The guard is closest to order-flow toxicity / VPIN-style flow imbalance: it scores buy and sell separately, then widens or pauses only the risky side where possible.</p>
+                    <p>Check the reason codes below the traffic light. Common causes include stale or single-provider evidence, one-sided or shallow attributable depth, provider conflict, excessive churn, position limits, or the Adverse Selection Guard reacting to sweep-like flow.</p>
 
                     <hr style="border: none; border-top: 1px solid var(--border-subtle); margin: 24px 0 16px 0;">
                     <h3 style="color: var(--accent-primary-hover); margin-top: 0;">Diagnostics &amp; support</h3>
@@ -13487,6 +13473,15 @@
                         if (tm > 0) document.getElementById('configToxicityMaxSpreadMultiplier').value = tm;
                         const ts = parseInt(g('TOXICITY_THROTTLE_SECS') || 0);
                         if (ts > 0) document.getElementById('configToxicityThrottleSecs').value = ts;
+
+                        const marketRiskPreset = String(g('MARKET_RISK_PRESET') || 'balanced').toLowerCase();
+                        const marketRiskRadio = document.querySelector(
+                            `input[name="riskProfile"][value="${['conservative', 'balanced', 'aggressive'].includes(marketRiskPreset) ? marketRiskPreset : 'balanced'}"]`
+                        );
+                        if (marketRiskRadio) {
+                            marketRiskRadio.checked = true;
+                            onRiskProfileChange();
+                        }
 
                         // INVENTORY_ENABLED toggle is a user preference — always load
                         const ie = g('INVENTORY_ENABLED'); if (ie !== null) document.getElementById('configInventoryEnabled').checked = ie === true || ie === 'true' || ie === '1' || ie === 'True';
@@ -14823,44 +14818,22 @@
         function updateIntelDiagnostics(data = {}) {
             const pricing = data.pricing || {};
             const hasDexie = Number(pricing.bid || 0) > 0 || Number(pricing.ask || 0) > 0;
-            const amm = (typeof _lastAmmPriceData !== 'undefined' && _lastAmmPriceData) || {};
-            const summary = (typeof _lastMarketSummary !== 'undefined' && _lastMarketSummary) || {};
-            const tibetOutage = summary.tibet_available === false
-                && summary.tibet_reason === 'provider_outage';
-            const tibetNoPool = summary.tibet_reason === 'no_pool';
-            const summaryTibetXch = Number(summary.pool_xch || 0);
-            const hasTibet = Number(pricing.tibet_price || 0) > 0
-                || String(pricing.source || '').toLowerCase() === 'tibetswap'
-                || Boolean(amm.available)
-                || Number(amm.amm_price || 0) > 0
-                || Number(amm.xch_reserve || 0) > 0
-                || summaryTibetXch > 0;
+            const confidenceData = (typeof _lastMarketConfidence !== 'undefined' && _lastMarketConfidence) || {};
+            const providers = confidenceData.providers || {};
+            const splashStatus = String((providers.splash || {}).status || 'unavailable');
+            const splashReady = splashStatus === 'valid' || splashStatus === 'healthy';
             const health = data.chia_health || {};
             const healthText = String(health.status || health.wallet || '').toLowerCase();
             const sageOk = healthText.indexOf('error') === -1 && healthText.indexOf('offline') === -1;
             const spacescan = data.diagnostics && data.diagnostics.spacescan_enabled !== false;
             _diagPill('coverageDexie', hasDexie, hasDexie ? 'ready' : 'thin');
-            _diagPill(
-                'coverageTibet',
-                hasTibet && !tibetOutage && !tibetNoPool,
-                tibetOutage ? 'outage' : (tibetNoPool ? 'none' : (hasTibet ? 'ready' : 'none'))
-            );
+            _diagPill('coverageTibet', splashReady, splashReady ? 'ready' : splashStatus);
             _diagPill('coverageSpacescan', spacescan, spacescan ? 'enabled' : 'limited');
             _diagPill('coverageSage', sageOk, sageOk ? 'ready' : 'check');
 
-            if (tibetOutage) {
-                _diagText('intelArbGapTrend', 'Unavailable');
-                _diagText('intelArbGapTrendSub', 'TibetSwap outage — Dexie-only');
-                return;
-            }
-            if (tibetNoPool) {
-                _diagText('intelArbGapTrend', 'Unavailable');
-                _diagText('intelArbGapTrendSub', 'No TibetSwap pool — Dexie-only');
-                return;
-            }
-            const gap = Number(data.arb_gap_bps || 0);
-            _diagText('intelArbGapTrend', gap > 0 ? (gap / 100).toFixed(2) + '%' : '0.00%');
-            _diagText('intelArbGapTrendSub', gap >= 500 ? 'shock-risk range' : gap >= 200 ? 'sniper watch' : 'normal watch');
+            const state = String((confidenceData.confidence || {}).state || 'WARMING').toUpperCase();
+            _diagText('intelArbGapTrend', state);
+            _diagText('intelArbGapTrendSub', 'attributable offer-book evidence');
         }
         function updatePnlFlowDiagnostics(data = {}) {
             const stats = data.stats || {};
@@ -19840,7 +19813,7 @@
                 sdBtn.textContent = '⏳ Analysing 30 days of data...';
             }
             if (sdProgress) sdProgress.classList.add('active');
-            if (sdStatus) { sdStatus.textContent = 'Fetching wallet + Dexie trades + TibetSwap + Spacescan...'; sdStatus.classList.add('active'); }
+            if (sdStatus) { sdStatus.textContent = 'Fetching wallet, attributable offer-book, chain, and token evidence...'; sdStatus.classList.add('active'); }
 
             // Put the Coin Prep Summary into an explicit "calculating" state
             // so the user cannot glance at a stale preview while Smart
@@ -20346,7 +20319,7 @@
                     const badge = (ok, label) => `<span style="background:${ok?'rgba(34,197,94,0.12)':'rgba(255,255,255,0.06)'};color:${ok?'var(--success-200)':'var(--slate-500)'};border-radius:3px;padding:1px 6px;font-size:0.78em;margin-right:3px;">${ok?'✓':'–'} ${label}</span>`;
                     const srcBadges = badge(src.has_wallet_balance,'Wallet')
                         + badge(src.has_both_prices || src.has_wallet_balance,'Dexie')
-                        + badge(src.has_tibet_pool,'Tibet')
+                        + badge(data.market_model === 'offer_book','Offer-book')
                         + badge(src.has_trade_history,'Trades')
                         + badge(src.has_competitor_data,'Book')
                         + badge(src.has_spacescan,'Spacescan');
@@ -20368,7 +20341,7 @@
                             <span style="color:${regimeColour};">● ${regime}</span>
                             <span>${fpd > 0 ? fpd.toFixed(1) + ' fills/day' : 'no fills data'}</span>
                             <span style="color:${riskColour};">${riskLabel} risk</span>
-                            ${src.arb_gap_bps > 50 ? `<span style="color:var(--orange-400);">arb gap ${(src.arb_gap_bps / 100).toFixed(2)}%</span>` : ''}
+                            <span style="color:var(--slate-400);">attributable book model</span>
                         </div>
                     </div>`;
 
@@ -20398,7 +20371,7 @@
                                     <div style="color:var(--slate-500);font-size:0.78em;">${pct(feeXch)}%</div>
                                 </div>
                                 <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
-                                    <div style="color:var(--slate-500);font-size:0.78em;">Sniper pool</div>
+                                    <div style="color:var(--slate-500);font-size:0.78em;">Opportunity pool</div>
                                     <div style="font-weight:600;">${sniperXch.toFixed(3)} XCH</div>
                                     <div style="color:var(--slate-500);font-size:0.78em;">${pct(sniperXch)}%</div>
                                 </div>
@@ -20611,7 +20584,7 @@
                         <div style="color:var(--slate-500);font-size:0.78em;">${pct(feeXch)}%</div>
                     </div>
                     <div style="background:rgba(255,255,255,0.04);border-radius:4px;padding:4px 7px;">
-                        <div style="color:var(--slate-500);font-size:0.78em;">Sniper pool</div>
+                        <div style="color:var(--slate-500);font-size:0.78em;">Opportunity pool</div>
                         <div style="font-weight:600;">${sniperXch.toFixed(3)} XCH</div>
                         <div style="color:var(--slate-500);font-size:0.78em;">${pct(sniperXch)}%</div>
                     </div>
@@ -22228,7 +22201,7 @@
         const _SMART_DEFAULTS_LABELS = {
             two_sided: {
                 title: 'Auto-Fill Settings',
-                subtitle: 'Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what\'s left: fee pool → sniper pool → trading capital → tier sizes &amp; offer counts.',
+                subtitle: 'Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what\'s left: fee pool → opportunity pool → trading capital → tier sizes &amp; offer counts.',
             },
             buy_only: {
                 title: 'Auto-Fill — Accumulation Plan',
@@ -23776,36 +23749,83 @@
         // =================================================================
         let _marketSummaryTimer = null;
         let _lastMarketSummary = null;
+        let _lastMarketConfidence = null;
 
-        function renderMarketSummaryVenueState(data = {}) {
-            _lastMarketSummary = data;
-            const tibetReason = String(data.tibet_reason || '').toLowerCase();
-            const tibetOutage = data.tibet_available === false
-                && tibetReason === 'provider_outage';
-            const tibetNoPool = tibetReason === 'no_pool';
-            if (!tibetOutage && !tibetNoPool) return false;
+        function renderMarketConfidence(data = {}) {
+            _lastMarketConfidence = data;
+            const confidence = data.confidence || {};
+            const metrics = data.metrics || {};
+            const state = String(confidence.state || 'RED').toUpperCase();
+            const stateColor = state === 'GREEN'
+                ? 'var(--status-success)'
+                : state === 'AMBER'
+                    ? 'var(--status-warning)'
+                    : 'var(--status-danger)';
+            const setText = (id, value) => {
+                const node = document.getElementById(id);
+                if (node) node.textContent = value;
+                return node;
+            };
+            const stateNode = setText('marketConfidenceState', state);
+            if (stateNode) stateNode.style.color = stateColor;
+            const intelState = setText('intelConfidenceTimeline', state);
+            if (intelState) intelState.style.color = stateColor;
 
-            const tibetDepthEl = document.getElementById('mktTibetDepth');
-            const gapEl = document.getElementById('mktArbGap');
-            const gapSub = document.getElementById('mktArbSub');
-            const lcGapVal = document.getElementById('lcGapValue');
-            if (tibetDepthEl) {
-                tibetDepthEl.textContent = tibetOutage
-                    ? 'Tibet: unavailable'
-                    : 'Tibet: no pool';
+            const bid = confidence.trusted_bid;
+            const ask = confidence.trusted_ask;
+            setText('marketTrustedRange', bid && ask ? `${bid} – ${ask} XCH` : 'No tradable range');
+            const reasons = Array.isArray(confidence.reason_codes)
+                ? confidence.reason_codes.map(code => String(code).replaceAll('_', ' ')).join(' · ')
+                : 'market evidence warming';
+            setText('marketConfidenceReasons', reasons || 'healthy');
+            const stage = String(
+                (data.degraded && data.degraded.withdrawal_stage)
+                || confidence.withdrawal_stage
+                || 'NONE'
+            ).toUpperCase();
+            setText('marketWithdrawalStage', stage);
+
+            const providers = data.providers || {};
+            const providerText = ['dexie', 'splash', 'sage', 'coinset', 'spacescan']
+                .map(name => `${name} ${String((providers[name] || {}).status || 'unavailable')}`)
+                .join(' · ');
+            setText('marketProviderHealth', providerText || 'providers unavailable');
+            const bar = document.getElementById('marketConfidenceBar');
+            const placeholder = document.getElementById('marketConfidencePlaceholder');
+            if (bar) bar.classList.remove('is-loading');
+            if (placeholder) placeholder.style.display = 'none';
+
+            const confidenceCard = setText('mktArbGap', state);
+            if (confidenceCard) confidenceCard.style.color = stateColor;
+            setText('mktArbSub', reasons || 'Attributable evidence');
+
+            const bidDepth = Number(metrics.independent_bid_depth_xch || 0);
+            const askDepth = Number(metrics.independent_ask_depth_xch || 0);
+            setText('mktPoolDepth', bidDepth || askDepth ? `${(bidDepth + askDepth).toFixed(2)} XCH` : '—');
+            setText('mktDexieDepth', `Bid: ${bidDepth.toFixed(2)} XCH`);
+            setText('mktAskDepth', `Ask: ${askDepth.toFixed(2)} XCH`);
+
+            const thresholds = metrics.derived_thresholds || {};
+            setText('derivedDepthThreshold', metrics.required_depth_xch
+                ? `${Number(metrics.required_depth_xch).toFixed(4)} XCH`
+                : (thresholds.depth_multiple ? `${thresholds.depth_multiple}× offer size` : '—'));
+            setText('derivedManipulationThreshold', thresholds.manipulation_red
+                ? `${thresholds.manipulation_red}/100`
+                : '—');
+            setText('derivedChurnLimit', metrics.manipulation_score !== undefined
+                ? `${metrics.manipulation_score}/100 current`
+                : '—');
+        }
+
+        async function fetchMarketConfidence() {
+            try {
+                const response = await apiFetch('/api/market/confidence', {
+                    signal: AbortSignal.timeout(10000)
+                });
+                renderMarketConfidence(await response.json());
+            } catch (error) {
+                debugWarn('[MARKET CONFIDENCE] Fetch failed:', error.message);
             }
-            if (gapEl) {
-                gapEl.textContent = 'Unavailable';
-                gapEl.style.color = 'var(--status-warning)';
-            }
-            if (gapSub) {
-                gapSub.textContent = tibetOutage
-                    ? 'TibetSwap outage — Dexie-only'
-                    : 'No TibetSwap pool — Dexie-only';
-            }
-            if (lcGapVal) lcGapVal.textContent = '—';
-            _latestFastArbGapBps = null;
-            return true;
         }
 
         async function fetchMarketSummary() {
@@ -23826,14 +23846,15 @@
                 var volEl = document.getElementById('mktVolume24h');
                 if (volEl) { volEl.textContent = noPairMsg; volEl.style.color = noPairColor; volEl.style.fontSize = '13px'; }
                 var dexieD2 = document.getElementById('mktDexieDepth');
-                var tibetD2 = document.getElementById('mktTibetDepth');
+                var askDepth = document.getElementById('mktAskDepth');
                 if (dexieD2) dexieD2.textContent = '';
-                if (tibetD2) tibetD2.textContent = 'Choose a trading pair in Settings';
+                if (askDepth) askDepth.textContent = 'Choose a trading pair in Settings';
                 var gapSub = document.getElementById('mktArbSub');
                 if (gapSub) gapSub.textContent = '';
                 return;
             }
             try {
+                fetchMarketConfidence();
                 const resp = await apiFetch(`${API_URL}/market/summary`, { signal: AbortSignal.timeout(15000) });
                 const d = await resp.json();
                 if (!d.has_data) return;
@@ -23853,7 +23874,9 @@
                     var el = document.getElementById(id);
                     if (el) { el.style.fontSize = ''; el.style.color = ''; }
                 });
-                const tibetOutage = renderMarketSummaryVenueState(d);
+                // Confidence/depth are rendered only from the coherent durable
+                // /api/market/confidence snapshot. Summary supplies display-only
+                // best bid/ask and volume context.
 
                 // Best Bid / Ask
                 const bidEl = document.getElementById('mktBestBid');
@@ -23868,46 +23891,7 @@
                     volEl.textContent = v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v > 0 ? v.toFixed(3) : '0';
                 }
 
-                // Pool Depth — breakdown: Dexie orderbook + TibetSwap AMM + total
-                const poolEl = document.getElementById('mktPoolDepth');
-                const dexieDepthEl = document.getElementById('mktDexieDepth');
-                const tibetDepthEl = document.getElementById('mktTibetDepth');
-                if (poolEl) {
-                    const tibetXch = parseFloat(d.pool_xch) || 0;
-                    const dexieXch = parseFloat(d.dexie_depth_xch) || 0;
-                    const totalXch = tibetXch + dexieXch;
-                    poolEl.textContent = totalXch > 0 ? totalXch.toFixed(1) + ' XCH' : '—';
-                    if (dexieDepthEl) dexieDepthEl.textContent = 'Dexie: ' + (dexieXch > 0 ? dexieXch.toFixed(1) : '0');
-                    if (tibetDepthEl && !tibetOutage) tibetDepthEl.textContent = 'Tibet: ' + (tibetXch > 0 ? tibetXch.toFixed(1) : '0');
-                }
-
-                // Arb Gap
-                const gapEl = document.getElementById('mktArbGap');
-                const gapSub = document.getElementById('mktArbSub');
-                if (gapEl && !tibetOutage) {
-                    const g = parseFloat(d.arb_gap_bps) || 0;
-                    _latestFastArbGapBps = g;
-                    if (!bot_state) bot_state = {};
-                    bot_state.arb_gap_bps = g;
-                    gapEl.textContent = g > 0 ? (g / 100).toFixed(1) + '%' : '0%';
-                    gapEl.style.color = g > 500 ? 'var(--status-danger)' : g > 200 ? 'var(--status-warning)' : 'var(--status-success)';
-                    // Update Close the Gap display
-                    const lcGapVal = document.getElementById('lcGapValue');
-                    if (lcGapVal) lcGapVal.textContent = g > 0 ? (g / 100).toFixed(2) + '%' : '—';
-                }
-                if (gapSub && !tibetOutage) {
-                    const g = parseFloat(d.arb_gap_bps) || 0;
-                    if (g > 0) {
-                        if (g > 200) gapSub.textContent = 'Sniper opportunity';
-                        else if (g >= 50) gapSub.textContent = 'Moderate gap';
-                        else gapSub.textContent = 'Within normal range';
-                    } else {
-                        gapSub.textContent = 'Dexie vs Tibet';
-                    }
-                }
-
                 mergeLiveMarketHealthMetrics({
-                    ...(tibetOutage ? {} : { arb_gap_bps: d.arb_gap_bps }),
                     best_bid: d.best_bid,
                     best_ask: d.best_ask,
                 }, {
@@ -24071,9 +24055,9 @@
                 if (el) { el.textContent = '...'; el.style.color = ''; }
             });
             const dexieD = document.getElementById('mktDexieDepth');
-            const tibetD = document.getElementById('mktTibetDepth');
+            const askDepth = document.getElementById('mktAskDepth');
             if (dexieD) dexieD.textContent = 'Dexie: ...';
-            if (tibetD) tibetD.textContent = 'Tibet: ...';
+            if (askDepth) askDepth.textContent = 'Ask: ...';
             const gapSub = document.getElementById('mktArbSub');
             if (gapSub) gapSub.textContent = 'Loading...';
         }
@@ -24585,13 +24569,6 @@
             // Logs — system log is now purely SSE-driven (addLogEntry via allowlist).
             // Status poll no longer overwrites the log panel.
 
-            // TibetSwap liquidity (show if user has actively selected a CAT or if currentCAT is set from resume)
-            const catSelector = document.getElementById('catSelector');
-            const hasActiveSelection = (catSelector && catSelector.value && !catSelector.options[catSelector.selectedIndex]?.disabled) || (currentCAT.asset_id && currentCAT.name);
-            if (hasActiveSelection) {
-                try { updateTibetSuggestion(data); } catch(e) { /* Tibet not available */ }
-            }
-            
             // Coin prep is now handled by the dedicated confirmation modal
             // (no auto-detect needed)
             
@@ -25853,58 +25830,7 @@
 
             // Pending claimable rewards (rendered inside the DBX panel)
             refreshDbxPending();
-
-            // Also fetch slippage data
-            apiFetch('/api/market/slippage?amount=1&side=buy')
-                .then(r => r.json())
-                .then(data => renderTibetSlippageContext(data))
-                .catch(() => {});
-        }
-
-        function renderTibetSlippageContext(data = {}) {
-            const el = id => document.getElementById(id);
-            const slippageEl = el('intelSlippage');
-            const poolRatioEl = el('intelPoolRatio');
-            const contextEl = el('intelTibetContext');
-
-            if (data.reason === 'provider_outage') {
-                if (slippageEl) {
-                    slippageEl.textContent = 'Unavailable';
-                    slippageEl.style.color = 'var(--status-warning)';
-                }
-                if (poolRatioEl) {
-                    poolRatioEl.textContent = 'Unavailable';
-                    poolRatioEl.style.color = 'var(--status-warning)';
-                }
-                if (contextEl) {
-                    contextEl.textContent = data.message ||
-                        'TibetSwap outage: pool depth and slippage are unavailable. CATalyst is using Dexie-only pricing; AMM drift protection is unavailable.';
-                }
-                return;
-            }
-
-            if (data.slippage_bps && slippageEl) {
-                const slipBps = parseFloat(data.slippage_bps);
-                slippageEl.textContent = bps2pct(slipBps);
-                slippageEl.style.color = slipBps < 50 ? 'var(--status-success)' : slipBps < 200 ? 'var(--status-warning)' : 'var(--status-danger)';
-            }
-            if (data.pool_depth_xch) {
-                const depth = parseFloat(data.pool_depth_xch);
-                const ratio = 1 / depth * 100;
-                if (poolRatioEl) {
-                    poolRatioEl.textContent = ratio.toFixed(2) + '%';
-                    poolRatioEl.style.color = ratio < 1 ? 'var(--status-success)' : ratio < 5 ? 'var(--status-warning)' : 'var(--status-danger)';
-                }
-                if (contextEl) {
-                    const slipBps = parseFloat(data.slippage_bps || 0) || 0;
-                    const slipText = slipBps > 0 ? bps2pct(slipBps) + ' estimated slippage' : 'slippage unavailable';
-                    contextEl.textContent =
-                        'Pool depth ' + depth.toFixed(2) + ' XCH. A 1 XCH test trade is ' +
-                        ratio.toFixed(2) + '% of pool depth with ' + slipText + '.';
-                }
-            } else if (contextEl) {
-                contextEl.textContent = 'No TibetSwap pool depth available for this pair yet.';
-            }
+            fetchMarketConfidence();
         }
 
         async function toggleSplashListening() {
@@ -27279,42 +27205,29 @@
                     compEl.style.opacity = '1';
                 }
             }
-            const tibetSwapOutage = (
-                m.tibetswap_available === false
-                && String(m.pricing_mode || '').toLowerCase() === 'dexie_only'
-            );
-            const tibetNoPool = String(
-                (_lastMarketSummary && _lastMarketSummary.tibet_reason)
-                || m.tibet_reason
-                || ''
-            ).toLowerCase() === 'no_pool';
-            const tibetReferenceUnavailable = tibetSwapOutage || tibetNoPool;
+            const confidenceData = _lastMarketConfidence || {};
+            const confidence = confidenceData.confidence || {};
+            const confidenceMetrics = confidenceData.metrics || {};
             const arbEl = el('ccArbGap');
             const poolDepthEl = el('ccPoolDepth');
-            if (tibetReferenceUnavailable) {
-                arbEl.textContent = 'Unavailable';
-                arbEl.title = tibetSwapOutage
-                    ? 'TibetSwap outage — Dexie-only pricing'
-                    : 'No TibetSwap pool — Dexie-only pricing';
-                arbEl.style.color = 'var(--status-warning)';
-                arbEl.style.opacity = '1';
-                poolDepthEl.textContent = 'Unavailable';
-                poolDepthEl.title = tibetSwapOutage
-                    ? 'TibetSwap outage — pool depth unavailable'
-                    : 'No TibetSwap pool — pool depth unavailable';
-                poolDepthEl.style.color = 'var(--status-warning)';
-                poolDepthEl.style.opacity = '1';
-            } else if (m.arb_gap_bps !== undefined) {
-                const arbVal = parseFloat(m.arb_gap_bps);
-                arbEl.textContent = bps2pct(m.arb_gap_bps);
-                arbEl.title = '';
-                arbEl.style.color = arbVal > 200 ? 'var(--status-warning)' : 'var(--slate-200)';
+            if (arbEl) {
+                const state = String(confidence.state || 'WARMING').toUpperCase();
+                arbEl.textContent = state;
+                arbEl.title = Array.isArray(confidence.reason_codes)
+                    ? confidence.reason_codes.join(', ')
+                    : 'Attributable market evidence is warming';
+                arbEl.style.color = state === 'GREEN'
+                    ? 'var(--status-success)'
+                    : state === 'RED' ? 'var(--status-danger)' : 'var(--status-warning)';
                 arbEl.style.opacity = '1';
             }
-            if (!tibetReferenceUnavailable && m.pool_depth_ratio !== undefined) {
-                poolDepthEl.textContent = (parseFloat(m.pool_depth_ratio) * 100).toFixed(2) + '%';
-                poolDepthEl.title = '';
-                poolDepthEl.style.color = '';
+            if (poolDepthEl) {
+                const requiredDepth = Number(confidenceMetrics.required_depth_xch || 0);
+                poolDepthEl.textContent = requiredDepth > 0
+                    ? requiredDepth.toFixed(4) + ' XCH / side'
+                    : 'Warming';
+                poolDepthEl.title = 'Derived from the selected risk preset and configured offer size';
+                poolDepthEl.style.color = requiredDepth > 0 ? '' : 'var(--status-warning)';
                 poolDepthEl.style.opacity = '1';
             }
 
@@ -27367,20 +27280,18 @@
                 paceEl.style.color = pace === 'busy' ? 'var(--success-400)' : (pace === 'slow' ? 'var(--slate-400)' : 'var(--slate-200)');
             }
 
-            // Probe state
+            // Degraded-market withdrawal stage
             const probeEl = el('ccProbeState');
-            if (probeEl && m.probe_status !== undefined) {
-                const ps = String(m.probe_status);
-                if (ps === 'confirmed') {
-                    probeEl.textContent = '✓ Confirmed';
-                    probeEl.style.color = 'var(--success-400)';
-                } else if (ps === 'searching') {
-                    probeEl.textContent = '⟳ Searching';
-                    probeEl.style.color = 'var(--status-warning)';
-                } else {
-                    probeEl.textContent = 'Idle';
-                    probeEl.style.color = 'var(--slate-400)';
-                }
+            if (probeEl) {
+                const stage = String(
+                    (confidenceData.degraded || {}).withdrawal_stage
+                    || confidence.withdrawal_stage
+                    || 'NONE'
+                ).toUpperCase();
+                probeEl.textContent = stage;
+                probeEl.style.color = stage === 'NONE'
+                    ? 'var(--success-400)'
+                    : 'var(--status-warning)';
             }
 
             // Circuit breaker blocked side
@@ -30288,9 +30199,6 @@
             }
         }, 10000);
 
-        // Fetch boost state on page load
-        setTimeout(fetchBoostState, 1500);
-
         // ============ CONSOLE WINDOW CONTROL ============
         // ── Inline Coin Prep Log Viewer ──────────────────────────────────
         let _coinPrepLogVisible = false;
@@ -30963,6 +30871,16 @@
                     : sideVal === 'sell'
                         ? '<span class="offer-side-badge offer-side-sell" aria-label="Sell offer">▼ SELL</span>'
                         : '';
+                const publication = offer.publication || {};
+                const publicationDisplay = ['dexie', 'splash'].map(provider => {
+                    const state = String((publication[provider] || {}).state || 'not queued');
+                    return provider.charAt(0).toUpperCase() + provider.slice(1) + ' ' + state.replace(/_/g, ' ');
+                }).join(' · ');
+                const discoveries = (offer.discovery && offer.discovery.providers) || {};
+                const discoveryDisplay = ['dexie', 'splash'].map(provider => {
+                    const state = String((discoveries[provider] || {}).state || 'not observed');
+                    return provider.charAt(0).toUpperCase() + provider.slice(1) + ' ' + state.replace(/_/g, ' ');
+                }).join(' · ');
                 return `
                     <div class="offer-item ${collapsedClass}" id="offer-${escapeHtml(offer.full_id)}">
                         <div class="offer-header" data-offer-id="${escapeHtml(offer.full_id)}" onclick="toggleOfferCollapse(this.dataset.offerId)">
@@ -31000,6 +30918,14 @@
                             <div class="offer-detail">
                                 <span class="offer-label">Dexie:</span>
                                 <span class="offer-value">${escapeHtml(dexieDisplay)}</span>
+                            </div>
+                            <div class="offer-detail">
+                                <span class="offer-label">Publication:</span>
+                                <span class="offer-value">${escapeHtml(publicationDisplay)}</span>
+                            </div>
+                            <div class="offer-detail">
+                                <span class="offer-label">Discovery:</span>
+                                <span class="offer-value">${escapeHtml(discoveryDisplay)}</span>
                             </div>
                             <div class="offer-detail">
                                 <span class="offer-label">Created:</span>
@@ -31084,6 +31010,11 @@
                 const itemStyle = isCancelled ? 'opacity: 0.5;' : '';
                 const timeAgo = item.age || 'Recently';
                 const catName = item.cat_name || currentCAT.name || 'tokens';
+                const fillConfidence = String(item.fill_confidence || '').trim();
+                const fillAuthority = item.fill_authority || {};
+                const evidenceLabel = fillConfidence === 'Confirmed'
+                    ? 'Confirmed evidence' + (fillAuthority.spent_block_height ? ' · block ' + String(fillAuthority.spent_block_height) : '')
+                    : 'Pending verification';
 
                 // Smart price display for history too — tolerate raw fill rows
                 // that use `price_xch` instead of `price`.
@@ -31113,6 +31044,7 @@
                         <div class="history-details">
                             💰 ${escapeHtml(item.size_xch || 'N/A')} XCH &nbsp;·&nbsp; 🪙 ${escapeHtml(item.size_cat || 'N/A')} ${escapeHtml(catName)} &nbsp;·&nbsp; 📈 ${escapeHtml(priceDisplay)}
                             ${item.spread_pct && item.spread_pct !== 'N/A' ? ` &nbsp;·&nbsp; 📊 ${escapeHtml(item.spread_pct)}` : ''}
+                            &nbsp;·&nbsp; 🔐 ${escapeHtml(evidenceLabel)}
                         </div>
                     </div>
                 `;
@@ -32788,21 +32720,6 @@
             }
         }
 
-        // Poll gap-closer state on startup
-        async function fetchBoostState() {
-            try {
-                const resp = await apiFetch(`${API_URL}/boost/state`);
-                if (resp.ok) {
-                    const state = await resp.json();
-                    _gapCloserActive = state.active || false;
-                    _gapCloserSpreadBps = state.current_spread_bps || 0;
-                    _gapCloserFloorBps = state.arb_floor_bps || 0;
-                    _gapCloserSteps = state.steps_taken || 0;
-                    updateGapCloserButton();
-                }
-            } catch (e) { /* ignore */ }
-        }
-
         async function startSageServices() {
             const btn = document.getElementById('startChiaBtn');
             if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
@@ -34023,7 +33940,7 @@
                 icon: '💣',
                 title: 'Full Reset',
                 message: 'This combines P&L reset and offer history clear, '
-                       + 'plus resets runtime stat counters (sniper history, '
+                       + 'plus resets runtime stat counters (opportunity history, '
                        + 'watchdog streaks, fill-tracker state). Coin '
                        + 'designations, settings, and wallet state are '
                        + 'preserved.',
@@ -34302,6 +34219,7 @@
             const toxicityMaxMultiplier = parseFloat(document.getElementById('configToxicityMaxSpreadMultiplier')?.value) || toxicityPreset.toxicity_max_spread_multiplier;
 
             let config = {
+                market_risk_preset: getSelectedRiskProfile(),
                 loop_seconds: parseInt(document.getElementById('configLoopSeconds').value),
                 spread_bps: Math.round(parseFloat(document.getElementById('configSpreadBps').value) * 100),
                 default_trade_xch: parseFloat(document.getElementById('configTradeXch').value),
@@ -35836,331 +35754,10 @@ function previewCtgOffers() {
 
 // Confirm and start Close the Gap
 
-// ============================================================
-// TibetSwap Monitoring - Status Polling
-// ============================================================
-
-let pollingInterval = null;
-
-function updateTibetSuggestion(data) {
-    const arbSuggestion = document.getElementById('arbSuggestionText');
-    const liquidityCard = document.getElementById('liquidityCard');
-    const tibetCatName = document.getElementById('tibetCatName');
-    
-    // Show trading pair name
-    if (tibetCatName && currentCAT && currentCAT.name) {
-        tibetCatName.textContent = `(${currentCAT.name})`;
-    }
-    
-    // Check if we have Tibet data in the response
-    const pricing = data.pricing || {};
-    const tibetPrice = parseFloat(pricing.tibet_price || 0);
-    const dexiePrice = parseFloat(pricing.dexie_price || pricing.mid || 0);
-    const liquidity = pricing.liquidity || {};
-    
-    const hasTibetData = tibetPrice > 0 && pricing.tibet_enabled;
-    
-    if (hasTibetData) {
-        // Show liquidity card
-        if (liquidityCard) liquidityCard.style.display = 'block';
-        
-        // Calculate gap
-        const diff = Math.abs(dexiePrice - tibetPrice);
-        const diffBps = dexiePrice > 0 ? (diff / dexiePrice) * 10000 : 0;
-        
-        // Update suggestion text with arb gap closing estimate
-        if (arbSuggestion && dexiePrice > 0 && tibetPrice > 0) {
-            const tokenName = (currentCAT && currentCAT.name) || 'tokens';
-            const xchReserve = parseFloat(liquidity.xch_reserve || 0);
-            const tokenReserve = parseFloat(liquidity.token_reserve || 0);
-            
-            if (diffBps > 50 && xchReserve > 0 && tokenReserve > 0) {
-                // AMM constant product: k = xchReserve * tokenReserve
-                // To move Tibet price to match Dexie:
-                // new_price = new_xch / new_tokens = dexiePrice
-                // new_xch * new_tokens = k
-                // new_xch = sqrt(k * dexiePrice)
-                // new_tokens = sqrt(k / dexiePrice)
-                const k = xchReserve * tokenReserve;
-                const targetPrice = dexiePrice;
-                const newXch = Math.sqrt(k * targetPrice);
-                const newTokens = Math.sqrt(k / targetPrice);
-                
-                const xchDelta = newXch - xchReserve;   // positive = add XCH to pool
-                const tokenDelta = newTokens - tokenReserve; // negative = remove tokens from pool
-                
-                let suggestionHTML = `<strong>Gap: ${(diffBps/100).toFixed(2)}%</strong><br>`;
-                
-                if (dexiePrice > tibetPrice) {
-                    // Tibet is cheaper → buy from Tibet (add XCH, get tokens), sell on Dexie
-                    const xchCost = Math.abs(xchDelta);
-                    const tokensReceived = Math.abs(tokenDelta);
-                    const dexieRevenue = tokensReceived * dexiePrice;
-                    
-                    suggestionHTML += `<strong>To close gap:</strong><br>`;
-                    suggestionHTML += `→ Buy ~${Math.round(tokensReceived).toLocaleString()} ${escapeHtml(tokenName)} on TibetSwap for ~${xchCost.toFixed(4)} XCH<br>`;
-                    suggestionHTML += `→ Sell on Dexie for ~${dexieRevenue.toFixed(4)} XCH<br>`;
-                    suggestionHTML += `→ Net cost: ~${Math.abs(xchCost - dexieRevenue).toFixed(4)} XCH ${xchCost > dexieRevenue ? '(loss)' : '(profit)'}`;
-                } else {
-                    // Dexie is cheaper → buy from Dexie, sell to Tibet (add tokens, get XCH)
-                    const tokensNeeded = Math.abs(tokenDelta);
-                    const dexieCost = tokensNeeded * dexiePrice;
-                    const xchReceived = Math.abs(xchDelta);
-                    
-                    suggestionHTML += `<strong>To close gap:</strong><br>`;
-                    suggestionHTML += `→ Buy ~${Math.round(tokensNeeded).toLocaleString()} ${escapeHtml(tokenName)} on Dexie for ~${dexieCost.toFixed(4)} XCH<br>`;
-                    suggestionHTML += `→ Sell on TibetSwap for ~${xchReceived.toFixed(4)} XCH<br>`;
-                    suggestionHTML += `→ Net cost: ~${Math.abs(dexieCost - xchReceived).toFixed(4)} XCH ${dexieCost > xchReceived ? '(loss)' : '(profit)'}`;
-                }
-                
-                arbSuggestion.innerHTML = suggestionHTML;
-            } else if (diffBps > 50) {
-                // No pool reserves available, simple directional hint
-                const direction = dexiePrice > tibetPrice ? 
-                    'Buy on TibetSwap, sell on Dexie' : 
-                    'Buy on Dexie, sell on TibetSwap';
-                arbSuggestion.innerHTML = 
-                    `<strong>Gap: ${(diffBps/100).toFixed(2)}%</strong> → ${direction}`;
-            } else {
-                arbSuggestion.innerHTML = 
-                    `Gap: ${(diffBps/100).toFixed(2)}% (prices aligned ✓)`;
-            }
-        }
-        
-        // Update liquidity display elements
-        const liqXchReserve = document.getElementById('liqXchReserve');
-        const liqTokenReserve = document.getElementById('liqTokenReserve');
-        const liqPoolPrice = document.getElementById('liqPoolPrice');
-        const liqGapBps = document.getElementById('liqGapBps');
-        
-        if (liqXchReserve) liqXchReserve.textContent = 
-            (liquidity.xch_reserve || 0).toFixed(2);
-        if (liqTokenReserve) liqTokenReserve.textContent = 
-            (liquidity.token_reserve || 0).toLocaleString();
-        if (liqPoolPrice) liqPoolPrice.textContent = 
-            tibetPrice.toFixed(10);
-        if (liqGapBps) liqGapBps.textContent = (diffBps / 100).toFixed(2);
-    } else {
-        // Hide liquidity card if no Tibet data
-        if (liquidityCard) liquidityCard.style.display = 'none';
-        if (arbSuggestion) arbSuggestion.textContent = 'TibetSwap monitoring disabled';
-    }
-}
-
-function pollBotStatus() {
-    if (isWalletSwitchBusy()) return;
-    apiFetch(`${API_URL}/bot/state`)
-        .then(r => r.json())
-        .then(data => {
-            // Update TibetSwap suggestion (only if CAT actively selected)
-            const catSel = document.getElementById('catSelector');
-            const hasSelection = (catSel && catSel.value && !catSel.options[catSel.selectedIndex]?.disabled) || (currentCAT.asset_id && currentCAT.name);
-            if (hasSelection) {
-                updateTibetSuggestion(data);
-            }
-            
-            // Update other status displays if needed
-        })
-        .catch(err => {
-            debugError('Status poll error:', err);
-        });
-}
-
-// Start polling when page loads
+// TibetSwap live polling was retired in v1.4. Market confidence is fetched
+// from /api/market/confidence as one coherent, durable offer-book snapshot.
 document.addEventListener('DOMContentLoaded', () => {
-    // Load alerts
     loadAlerts();
-
-    // Initial poll
-    pollBotStatus();
-
-    // Poll every 30 seconds (SSE provides real-time updates)
-    pollingInterval = setInterval(pollBotStatus, 30000);
-});
-
-// ── AMM Monitor UI ────────────────────────────────────────────────────────────
-// Polls /api/amm/price every AMM_POLL_INTERVAL_SECS (default 30s) and updates
-// the AMM status bar in the dashboard.
-
-let _ammPollInterval = null;
-let _lastAmmPriceData = null;
-
-async function pollAmmPrice() {
-    try {
-        const resp = await apiFetch(`${API_URL}/amm/price`);
-        if (!resp.ok) return;
-        const data = await resp.json();
-        updateAmmStatusBar(data);
-    } catch (e) {
-        // Silently ignore — AMM bar is informational
-    }
-}
-
-function updateAmmStatusBar(data) {
-    _lastAmmPriceData = data || null;
-    const bar = document.getElementById('ammStatusBar');
-    if (!bar) return;
-
-    // The bar stays visible always. When no usable data, we keep the
-    // "Gathering TibetSwap pool data…" placeholder overlay (is-loading
-    // class) up instead of hiding the whole strip.
-    bar.style.display = '';
-    if (!data || !data.available) {
-        bar.classList.add('is-loading');
-        const placeholder = document.getElementById('ammPlaceholder');
-        if (placeholder) {
-            const noPool = data && data.reason === 'no_pool';
-            const monitorInactive = data
-                && !String(data.pair_id || '').trim()
-                && Number(data.total_polls || 0) === 0;
-            const fetchUnavailable = data
-                && (Boolean(data.error) || Number(data.failed_polls || 0) > 0);
-            const placeholderText = noPool
-                ? 'No TibetSwap pool for this token'
-                : fetchUnavailable
-                    ? 'TibetSwap data unavailable'
-                    : monitorInactive
-                        ? 'TibetSwap monitor inactive'
-                        : 'Gathering TibetSwap pool data';
-            placeholder.firstChild && (placeholder.firstChild.nodeValue = placeholderText);
-            const dots = placeholder.querySelector('.v4-data-strip-placeholder-dots');
-            if (dots) dots.style.display = placeholderText === 'Gathering TibetSwap pool data' ? '' : 'none';
-        }
-        return;
-    }
-    bar.classList.remove('is-loading');
-
-    // Price
-    const priceEl = document.getElementById('ammLivePrice');
-    if (priceEl && data.amm_price) {
-        priceEl.textContent = parseFloat(data.amm_price).toFixed(8) + ' XCH';
-    }
-
-    // Drift
-    const driftEl = document.getElementById('ammDriftBps');
-    const driftBadge = document.getElementById('ammDriftBadge');
-    const driftThreshold = parseFloat(data.drift_threshold_bps || 40);
-    if (driftEl) {
-        if (data.drift_bps !== null && data.drift_bps !== undefined) {
-            const drift = parseFloat(data.drift_bps);
-            driftEl.textContent = (drift / 100).toFixed(2) + '%';
-            if (drift >= driftThreshold) {
-                driftEl.style.color = 'var(--status-danger)';
-                if (driftBadge) driftBadge.style.display = 'inline';
-            } else if (drift >= driftThreshold * 0.6) {
-                driftEl.style.color = 'var(--status-warning)';
-                if (driftBadge) driftBadge.style.display = 'none';
-            } else {
-                driftEl.style.color = 'var(--status-success)';
-                if (driftBadge) driftBadge.style.display = 'none';
-            }
-        } else {
-            driftEl.textContent = '—';
-            driftEl.style.color = 'var(--text-tertiary)';
-            if (driftBadge) driftBadge.style.display = 'none';
-        }
-    }
-
-    // Reserves
-    const xchEl = document.getElementById('ammXchReserve');
-    const tokenEl = document.getElementById('ammTokenReserve');
-    if (xchEl && data.xch_reserve) {
-        xchEl.textContent = parseFloat(data.xch_reserve).toLocaleString(undefined, {maximumFractionDigits: 2});
-    }
-    if (tokenEl && data.token_reserve) {
-        tokenEl.textContent = parseFloat(data.token_reserve).toLocaleString(undefined, {maximumFractionDigits: 2});
-    }
-
-    // Buffer badge
-    const bufferBadge = document.getElementById('ammBufferBadge');
-    if (bufferBadge) {
-        const dynBuf = data.dynamic_buffer || {};
-        const effBps = dynBuf.effective_bps ? parseFloat(dynBuf.effective_bps) : null;
-        const baseBps = dynBuf.base_bps ? parseFloat(dynBuf.base_bps) : null;
-        const isWidened = effBps && baseBps && effBps > baseBps;
-        if (data.buffer_enabled) {
-            bufferBadge.style.display = 'inline';
-            bufferBadge.textContent = isWidened
-                ? `BUFFER ${(effBps/100).toFixed(1)}% (×${parseFloat(dynBuf.multiplier||1).toFixed(1)})`
-                : 'BUFFER ON';
-            bufferBadge.style.background = isWidened
-                ? 'rgba(239,68,68,0.15)' : 'rgba(251,191,36,0.15)';
-            bufferBadge.style.color = isWidened
-                ? 'var(--status-danger)' : 'var(--status-warning)';
-        } else {
-            bufferBadge.style.display = 'none';
-        }
-    }
-
-    // Arb pressure indicator (Tier 3)
-    const arbEl = document.getElementById('ammArbPressure');
-    if (arbEl && data.arb_pressure != null) {
-        const score = parseFloat(data.arb_pressure);
-        const label = (data.arb_pressure_label || 'low').toUpperCase();
-        arbEl.textContent = 'ARB ' + label;
-        if (score >= 0.9) {
-            arbEl.style.display = 'inline';
-            arbEl.style.background = 'rgba(239,68,68,0.2)';
-            arbEl.style.color = 'var(--status-danger)';
-        } else if (score >= 0.6) {
-            arbEl.style.display = 'inline';
-            arbEl.style.background = 'rgba(239,68,68,0.12)';
-            arbEl.style.color = 'var(--sell-color)';
-        } else if (score >= 0.3) {
-            arbEl.style.display = 'inline';
-            arbEl.style.background = 'rgba(251,191,36,0.12)';
-            arbEl.style.color = 'var(--status-warning)';
-        } else {
-            // Low pressure — don't clutter the bar
-            arbEl.style.display = 'none';
-        }
-    }
-
-    // Sweep protection countdown
-    const sweepEl = document.getElementById('ammSweepProtection');
-    if (sweepEl) {
-        const prot = data.sweep_protection || {};
-        const sides = Object.entries(prot).filter(([,secs]) => secs > 0);
-        if (sides.length > 0) {
-            const maxSecs = Math.max(...sides.map(([,s]) => s));
-            const sideStr = sides.map(([side]) => side).join('+').toUpperCase();
-            sweepEl.textContent = `SWEEP GUARD ${sideStr} ${maxSecs.toFixed(0)}s`;
-            sweepEl.style.display = 'inline';
-        } else {
-            sweepEl.style.display = 'none';
-        }
-    }
-
-    // Stale warning (no poll in > 2 × poll interval)
-    const staleEl = document.getElementById('ammStaleWarning');
-    const pollInterval = parseInt(data.poll_interval_secs || 30);
-    if (staleEl) {
-        const staleThreshold = pollInterval * 2;
-        staleEl.style.display = (data.last_success_ago_secs && data.last_success_ago_secs > staleThreshold) ? 'inline' : 'none';
-    }
-
-    // Last update time
-    const lastEl = document.getElementById('ammLastUpdate');
-    if (lastEl && data.last_success_ago_secs != null) {
-        const ago = Math.round(data.last_success_ago_secs);
-        lastEl.textContent = `${ago}s ago`;
-    }
-}
-
-// Start AMM polling
-document.addEventListener('DOMContentLoaded', () => {
-    pollAmmPrice();
-    _ammPollInterval = setInterval(pollAmmPrice, 30000);
-});
-
-// Stop polling when page unloads
-window.addEventListener('beforeunload', (e) => {
-    if (pollingInterval) {
-        clearInterval(pollingInterval);
-    }
-    if (_ammPollInterval) {
-        clearInterval(_ammPollInterval);
-    }
 });
 
 

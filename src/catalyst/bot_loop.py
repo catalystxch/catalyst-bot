@@ -28,7 +28,7 @@ import requests
 import mutation_gate
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Dict, Optional
 
 from config import cfg
@@ -37,6 +37,7 @@ from database import (
     log_event,
     get_stats,
     get_offer,
+    get_open_offers,
 )
 
 try:
@@ -72,6 +73,7 @@ from sniper import Sniper
 from boost_manager import BoostManager
 from market_intel import MarketIntel
 from market_toxicity import MarketToxicityGuard, ToxicityContext
+from market_runtime import OfferBookMarketRuntime
 from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
@@ -416,6 +418,14 @@ class BotLoop:
         self.splash_node = SplashNode()
         self.coinset_client = CoinsetClient()
         self.market_toxicity_guard = MarketToxicityGuard()
+        self._market_runtime_required = True
+        self._market_runtime = None
+        self._market_runtime_asset_id = ""
+        self._market_confidence_result = None
+        self._market_degraded_decision = None
+        self._market_refresh_now = datetime.now(timezone.utc)
+        self._splash_confidence_offers: Dict[str, Dict] = {}
+        self._splash_confidence_lock = threading.Lock()
         # F34 (2026-04-08): wire coinset_client into offer_manager so
         # fill_tracker can reach it for the Coinset fill verification
         # fallback when Spacescan is unavailable.
@@ -1041,7 +1051,406 @@ class BotLoop:
             # Keep isolated off-cycle utility calls compatible, but a partial
             # object that claims to be in a running cycle must fail closed.
             return not bool(getattr(self, "_cycle_started_running", False))
-        return self._runtime_recovery_cycle_boundary()
+        if not self._runtime_recovery_cycle_boundary():
+            return False
+        if not bool(getattr(self, "_market_runtime_required", False)):
+            return True
+        if phase_name in {"cancel", "trim", "coin_prep"}:
+            return True
+        decision = getattr(self, "_market_degraded_decision", None)
+        if decision is None:
+            return False
+        if phase_name == "requote":
+            return bool(getattr(decision, "can_requote", False))
+        if phase_name in {"create", "publication"}:
+            return bool(getattr(decision, "can_create", False))
+        return False
+
+    def _remember_splash_confidence_offer(
+        self,
+        *,
+        fingerprint: str,
+        classified: Dict,
+        observed_at: datetime,
+    ) -> bool:
+        """Cache one parsed Splash offer without changing its evidence time."""
+
+        identity = str(fingerprint or "").strip()
+        side = str((classified or {}).get("side") or "").strip().lower()
+        summary = (classified or {}).get("summary") or {}
+        offered = summary.get("offered") or {}
+        requested = summary.get("requested") or {}
+        if not identity or side not in {"buy", "sell"}:
+            return False
+        if type(observed_at) is not datetime or observed_at.tzinfo is None:
+            return False
+        asset_ids = sorted((set(offered) | set(requested)) - {"xch"})
+        if len(asset_ids) != 1:
+            return False
+        asset_id = str(asset_ids[0]).strip().lower()
+        try:
+            if side == "buy":
+                xch_mojos = abs(int(offered["xch"]))
+                cat_atoms = abs(int(requested[asset_id]))
+            else:
+                xch_mojos = abs(int(requested["xch"]))
+                cat_atoms = abs(int(offered[asset_id]))
+            if xch_mojos <= 0 or cat_atoms <= 0:
+                return False
+            cat_scale = Decimal(10) ** Decimal(str(getattr(cfg, "CAT_DECIMALS", 3)))
+            price = (
+                Decimal(xch_mojos)
+                / Decimal("1000000000000")
+                / (Decimal(cat_atoms) / cat_scale)
+            )
+            price_text = format(price, "f").rstrip("0").rstrip(".")
+            if not price_text:
+                return False
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+
+        lock = getattr(self, "_splash_confidence_lock", None)
+        cache = getattr(self, "_splash_confidence_offers", None)
+        if lock is None or cache is None:
+            return False
+        with lock:
+            cache[identity] = {
+                "asset_id": asset_id,
+                "offer_id": identity,
+                "side": side,
+                "price": price_text,
+                "amount_mojos": xch_mojos,
+                "observed_at": observed_at.astimezone(timezone.utc),
+            }
+        return True
+
+    def _get_fresh_splash_confidence_offers(
+        self, asset_id: str, *, now: datetime
+    ) -> list[Dict]:
+        """Return only Splash offers received in the last 20 seconds."""
+
+        current = now.astimezone(timezone.utc)
+        target = str(asset_id or "").strip().lower()
+        result = []
+        with self._splash_confidence_lock:
+            stale = []
+            for identity, row in self._splash_confidence_offers.items():
+                age = (current - row["observed_at"]).total_seconds()
+                if age > 20:
+                    stale.append(identity)
+                    continue
+                if row["asset_id"] != target:
+                    continue
+                result.append(
+                    {
+                        "offer_id": row["offer_id"],
+                        "side": row["side"],
+                        "price": row["price"],
+                        "amount_mojos": row["amount_mojos"],
+                    }
+                )
+            for identity in stale:
+                self._splash_confidence_offers.pop(identity, None)
+        return sorted(result, key=lambda row: row["offer_id"])
+
+    def _apply_market_withdrawal(self, decision) -> int:
+        """Submit authoritative cancellation for the current withdrawal tiers."""
+
+        requested = set(getattr(decision, "cancel_tiers", ()) or ())
+        if not requested:
+            return 0
+        requested = {"mid" if tier == "middle" else tier for tier in requested}
+        rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        trade_ids = [
+            str(row.get("trade_id") or "").strip()
+            for row in rows
+            if str(row.get("tier") or "").strip().lower() in requested
+            and str(row.get("trade_id") or "").strip()
+        ]
+        if not trade_ids or not self._enter_runtime_effect_phase("cancel"):
+            return 0
+        self.offer_manager.cancel_offers(
+            trade_ids,
+            reason=str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
+            force_storm=True,
+        )
+        log_event(
+            "warning",
+            "market_confidence_withdrawal",
+            f"Market confidence withdrawal submitted for {len(trade_ids)} "
+            f"{','.join(sorted(requested))} offer(s)",
+            data={
+                "reason_code": str(
+                    getattr(decision, "reason_code", "MARKET_DEGRADED")
+                ),
+                "trade_ids": trade_ids,
+            },
+        )
+        return len(trade_ids)
+
+    def _reconcile_offer_publication_discovery(
+        self,
+        *,
+        dexie_book: Dict,
+        splash_offers: list[Dict],
+        now: datetime,
+    ) -> Dict[str, int]:
+        """Prove exact rediscovery or cancel an unproven offer at 90 seconds."""
+
+        from database import (
+            ensure_offer_publication_discoveries,
+            expire_offer_publication_discoveries,
+            get_offer_intents_for_registry,
+            record_offer_intent_visibility,
+            record_offer_publication_discovery,
+        )
+
+        def canonical_identity(value) -> str:
+            text = str(value or "").strip().lower()
+            if len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
+                return ""
+            return text
+
+        dexie_identities: set[str] = set()
+        dexie_by_trade: Dict[str, str] = {}
+        for row in list((dexie_book or {}).get("bids") or []) + list(
+            (dexie_book or {}).get("asks") or []
+        ):
+            if type(row) is not dict:
+                continue
+            identity = canonical_identity(
+                row.get("offer_identity") or row.get("offer_id")
+            )
+            trade_id = canonical_identity(row.get("trade_id"))
+            if identity:
+                dexie_identities.add(identity)
+                if trade_id:
+                    dexie_by_trade[trade_id] = identity
+
+        splash_identities = {
+            identity
+            for identity in (
+                canonical_identity((row or {}).get("offer_id"))
+                for row in (splash_offers or [])
+                if type(row) is dict
+            )
+            if identity
+        }
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        result = {"visible": 0, "pending": 0, "cancel_requested": 0}
+        cancel_trade_ids: list[str] = []
+
+        for intent in get_offer_intents_for_registry():
+            if (
+                intent.get("lifecycle_state") != "created"
+                or str(intent.get("asset_id") or "").strip().lower() != asset_id
+            ):
+                continue
+            intent_id = str(intent.get("intent_id") or "")
+            trade_id = canonical_identity(intent.get("sage_trade_id"))
+            identity = canonical_identity(intent.get("offer_text_sha256"))
+            if not intent_id or not trade_id or not identity:
+                result["pending"] += 1
+                continue
+
+            ensure_offer_publication_discoveries(intent_id)
+            observed_dexie = dexie_by_trade.get(trade_id)
+            if identity in dexie_identities:
+                observed_dexie = identity
+            if observed_dexie:
+                record_offer_publication_discovery(
+                    intent_id,
+                    provider="dexie",
+                    observed_offer_identity=observed_dexie,
+                    observed_at=now,
+                )
+            if identity in splash_identities:
+                record_offer_publication_discovery(
+                    intent_id,
+                    provider="splash",
+                    observed_offer_identity=identity,
+                    observed_at=now,
+                )
+
+            discoveries = expire_offer_publication_discoveries(intent_id, now=now)
+            exact = sorted(row["provider"] for row in discoveries if row["state"] == "exact")
+            if exact:
+                provider = exact[0]
+                record_offer_intent_visibility(
+                    intent_id,
+                    publication_identity=f"{provider}:{identity}",
+                    visible_at=now,
+                )
+                result["visible"] += 1
+                log_event(
+                    "info",
+                    "offer_publication_discovered",
+                    f"Exact offer rediscovered by {','.join(exact)}",
+                    data={
+                        "intent_id": intent_id,
+                        "trade_id": trade_id,
+                        "providers": exact,
+                        "offer_identity": identity,
+                    },
+                )
+            elif discoveries and all(
+                row["state"] == "deadline_expired" for row in discoveries
+            ):
+                cancel_trade_ids.append(trade_id)
+            else:
+                result["pending"] += 1
+
+        if cancel_trade_ids and self._enter_runtime_effect_phase("cancel"):
+            unique_trade_ids = sorted(set(cancel_trade_ids))
+            self.offer_manager.cancel_offers(
+                unique_trade_ids,
+                reason="PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
+                force_storm=True,
+            )
+            result["cancel_requested"] = len(unique_trade_ids)
+            log_event(
+                "warning",
+                "offer_publication_discovery_expired",
+                f"Sage cancellation submitted for {len(unique_trade_ids)} "
+                "offer(s) not rediscovered within 90 seconds",
+                data={
+                    "reason_code": "PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
+                    "trade_ids": unique_trade_ids,
+                },
+            )
+        else:
+            result["pending"] += len(cancel_trade_ids)
+        return result
+
+    def _market_own_offer_identities(self, asset_id: str) -> frozenset[str]:
+        identities: set[str] = set()
+        for row in get_open_offers(cat_asset_id=asset_id):
+            for key in (
+                "trade_id",
+                "dexie_id",
+                "offer_hash",
+                "publication_identity",
+                "coin_id",
+            ):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    identities.add(value)
+        return frozenset(identities)
+
+    @staticmethod
+    def _configured_market_offer_size_mojos() -> int:
+        from config import get_tier_sizes_for_side
+
+        sizes = []
+        for side in ("buy", "sell"):
+            sizes.extend(
+                Decimal(str(value or 0))
+                for value in get_tier_sizes_for_side(side).values()
+            )
+        sizes.append(Decimal(str(getattr(cfg, "XCH_COIN_SIZE", 0) or 0)))
+        positive = [value for value in sizes if value > 0]
+        size_xch = max(positive, default=Decimal("0.001"))
+        return max(
+            1,
+            int(
+                (size_xch * Decimal("1000000000000")).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+
+    def _splash_confidence_health(self) -> Dict:
+        try:
+            status = self.splash_node.get_status() or {}
+            metrics = status.get("metrics") or {}
+            return {
+                "running": status.get("process_running") is True,
+                "api_reachable": status.get("api_reachable") is True
+                and metrics.get("reachable") is not False,
+                "peers": max(0, int(metrics.get("peers", 0) or 0)),
+            }
+        except Exception:
+            return {"running": False, "api_reachable": False, "peers": 0}
+
+    def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
+        asset = str(asset_id or "").strip().lower()
+        if (
+            self._market_runtime is not None
+            and self._market_runtime_asset_id == asset
+        ):
+            return self._market_runtime
+
+        def fetch_dexie(_asset_id: str) -> Dict:
+            if _asset_id != asset:
+                raise ValueError("Dexie confidence asset changed during refresh")
+            self.market_intel.refresh_orderbook(force=True)
+            snapshot = self.market_intel.get_attributable_orderbook()
+            return {"bids": snapshot["bids"], "asks": snapshot["asks"]}
+
+        self._market_runtime = OfferBookMarketRuntime(
+            asset_id=asset,
+            risk_preset=str(
+                getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced"
+            ),
+            fetch_dexie_book=fetch_dexie,
+            fetch_splash_offers=lambda requested_asset: (
+                self._get_fresh_splash_confidence_offers(
+                    requested_asset, now=self._market_refresh_now
+                )
+            ),
+            fetch_splash_health=self._splash_confidence_health,
+        )
+        self._market_runtime_asset_id = asset
+        return self._market_runtime
+
+    def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
+        """Refresh, persist, expose, and enforce one confidence decision."""
+
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) != 64:
+            return None
+        observed_at = now or datetime.now(timezone.utc)
+        self._market_refresh_now = observed_at
+        runtime = self._ensure_market_runtime(asset_id)
+        result = runtime.refresh(
+            own_offer_identities=self._market_own_offer_identities(asset_id),
+            configured_offer_size_mojos=self._configured_market_offer_size_mojos(),
+            now=observed_at,
+        )
+        self._market_confidence_result = result.confidence
+        self._market_degraded_decision = result.degraded
+        dexie_snapshot = self.market_intel.get_attributable_orderbook()
+        splash_snapshot = self._get_fresh_splash_confidence_offers(
+            asset_id, now=observed_at
+        )
+        self._reconcile_offer_publication_discovery(
+            dexie_book=dexie_snapshot,
+            splash_offers=splash_snapshot,
+            now=observed_at,
+        )
+        self._apply_market_withdrawal(result.degraded)
+
+        self._set_state(
+            market_confidence=result.confidence.state,
+            market_confidence_reason_codes=list(result.confidence.reason_codes),
+            market_withdrawal_stage=result.degraded.stage,
+            market_confidence_snapshot_id=result.snapshot_id,
+        )
+        if result.degraded.notify:
+            level = "error" if result.confidence.state == "RED" else "info"
+            log_event(
+                level,
+                "market_confidence_transition",
+                f"Market confidence is {result.confidence.state}: "
+                f"{result.degraded.reason_code}",
+                data={
+                    "reason_code": result.degraded.reason_code,
+                    "confidence_reasons": list(result.confidence.reason_codes),
+                    "withdrawal_stage": result.degraded.stage,
+                    "snapshot_id": result.snapshot_id,
+                },
+            )
+        return result
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -5516,6 +5925,11 @@ class BotLoop:
             pair_hint = classified.get("pair_hint") or "unknown"
 
             if classified.get("relevant"):
+                self._remember_splash_confidence_offer(
+                    fingerprint=str(offer.get("fingerprint") or f"splash:{offer_id}"),
+                    classified=classified,
+                    observed_at=datetime.now(timezone.utc),
+                )
                 update_splash_incoming_status(
                     offer_id, "processed", pair_hint=pair_hint
                 )
@@ -6529,37 +6943,42 @@ class BotLoop:
     def _refresh_price_if_mempool_move_pending(
         self, mid_price: Decimal, arb_gap: Decimal
     ):
-        """Refresh the current cycle's price after an in-cycle reserve move."""
+        """Refresh the cycle from attributable offer-book evidence only."""
         if not getattr(self, "_mempool_price_refresh_needed", False):
             return mid_price, arb_gap, None
 
         self._mempool_price_refresh_needed = False
         try:
-            fresh_price = self.price_engine.get_price(
-                cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+            market_result = self._refresh_offer_book_market()
+            fresh_mid = (
+                market_result.confidence.trusted_midpoint
+                if market_result is not None
+                else None
             )
-            if not fresh_price:
+            if fresh_mid is None or fresh_mid <= 0:
                 return mid_price, arb_gap, None
-
-            fresh_mid = Decimal(str(fresh_price.get("mid_price", 0) or 0))
-            if fresh_mid <= 0:
-                return mid_price, arb_gap, fresh_price
-
-            fresh_arb = Decimal(str(fresh_price.get("arb_gap_bps", arb_gap) or 0))
+            fresh_arb = Decimal("0")
+            fresh_price = {
+                "mid_price": str(fresh_mid),
+                "dexie_price": str(fresh_mid),
+                "tibet_price": "",
+                "arb_gap_bps": "0",
+                "source": "attributable_offer_book",
+            }
             old_mid = mid_price
             self._current_mid_price = fresh_mid
             self._set_state(mid_price=str(fresh_mid), arb_gap_bps=str(fresh_arb))
             self.risk_manager.update_arb_gap(fresh_arb)
             log_event(
                 "info",
-                "mempool_reprice_applied",
-                f"Applied confirmed reserve price before trading decisions: "
+                "offer_book_reprice_applied",
+                f"Applied refreshed offer-book price before trading decisions: "
                 f"{old_mid:.8f} -> {fresh_mid:.8f}",
                 data={
                     "old_mid": str(old_mid),
                     "new_mid": str(fresh_mid),
                     "arb_gap_bps": str(fresh_arb),
-                    "tibet_price": str(fresh_price.get("tibet_price", "")),
+                    "market_confidence": market_result.confidence.state,
                 },
             )
             self._emit(
@@ -6567,7 +6986,7 @@ class BotLoop:
                 {
                     "mid_price": str(fresh_mid),
                     "dexie_price": str(fresh_price.get("dexie_price", "")),
-                    "tibet_price": str(fresh_price.get("tibet_price", "")),
+                    "tibet_price": "",
                     "arb_gap_bps": str(fresh_arb),
                     "spread_bps": self._bot_state.get("spread_bps", "0"),
                 },
@@ -6576,8 +6995,8 @@ class BotLoop:
         except Exception as e:
             log_event(
                 "warning",
-                "mempool_reprice_failed",
-                f"Could not refresh price after confirmed reserve move: {e}",
+                "offer_book_reprice_failed",
+                f"Could not refresh attributable offer-book price: {e}",
             )
             return mid_price, arb_gap, None
 
@@ -8028,19 +8447,18 @@ class BotLoop:
             # and ALL requoting (normal + emergency) is disabled because the
             # "if last_price <= 0: continue" check skips both sides.
             try:
-                startup_price = self.price_engine.get_price(
-                    cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+                startup_market = self._refresh_offer_book_market()
+                startup_mid = (
+                    startup_market.confidence.trusted_midpoint
+                    if startup_market is not None
+                    else None
                 )
-                startup_mid = Decimal(str(startup_price.get("mid_price", 0)))
-                startup_arb_gap = Decimal(str(startup_price.get("arb_gap_bps", 0) or 0))
-                startup_tibet = Decimal(str(startup_price.get("tibet_price", 0) or 0))
-                if startup_mid > 0:
+                if startup_mid is not None and startup_mid > 0:
                     self._last_quoted_price["buy"] = startup_mid
                     self._last_quoted_price["sell"] = startup_mid
                     # F67: plain mid == startup mid at this point (no probe yet)
                     self._last_quoted_plain_mid["buy"] = startup_mid
                     self._last_quoted_plain_mid["sell"] = startup_mid
-                    self.amm_monitor.notify_quoted_price(startup_mid, startup_mid)
                     self._current_mid_price = startup_mid
                     with self._probe_lock:
                         if self._probe_state.get("confirmed_price") in (
@@ -8048,12 +8466,6 @@ class BotLoop:
                             Decimal("0"),
                         ):
                             self._probe_state["confirmed_price"] = startup_mid
-                    self._remember_probe_market_snapshot(
-                        startup_mid,
-                        startup_arb_gap,
-                        startup_tibet,
-                        "startup_baseline",
-                    )
                     baseline_msg = (
                         f"📌 Requote baseline set: {startup_mid:.8f} XCH "
                         f"(enables requoting + emergency requote)"
@@ -8497,164 +8909,48 @@ class BotLoop:
         except Exception:
             pass  # Sweep coordinator is additive — never block main cycle
 
-        # ---- Step 1: Fetch prices ----
+        # ---- Step 1: Derive price from attributable offer-book evidence ----
         self._set_cycle_step("step1_price_fetch")
-        price_data = self.price_engine.get_price(
-            cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+        try:
+            market_result = self._refresh_offer_book_market()
+        except Exception as market_error:
+            market_result = None
+            log_event(
+                "error",
+                "market_confidence_refresh_failed",
+                f"Offer-book confidence refresh failed closed: {market_error}",
+            )
+        trusted_midpoint = (
+            market_result.confidence.trusted_midpoint if market_result else None
+        )
+        price_data = (
+            {
+                "mid_price": str(trusted_midpoint),
+                "dexie_price": str(trusted_midpoint),
+                "tibet_price": "",
+                "arb_gap_bps": "0",
+                "source": "attributable_offer_book",
+            }
+            if trusted_midpoint is not None
+            else None
         )
 
         if price_data is None:
-            # get_price() returns None for two different failure modes:
-            #   (a) a safety-guard rail breach (handled below via CB), or
-            #   (b) both oracles (Dexie + TibetSwap) failed to produce a
-            #       usable number. Case (b) is an oracle OUTAGE — if we
-            #       don't track how long it has lasted, stale offers sit
-            #       on the book at the old mid while the market may have
-            #       moved. The stale-age counter below escalates the
-            #       response from soft warn (>60s) to hard pause (>120s)
-            #       so the book cannot stay exposed indefinitely.
-            now_outage = time.time()
-            prev_success = float(self._last_pricing_success_ts or 0)
-            outage_age = (now_outage - prev_success) if prev_success > 0 else 0.0
-            stale_threshold = int(getattr(cfg, "PRICE_STALE_ALERT_SECS", 60))
-            hard_pause_threshold = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
-
-            rail_dir = getattr(self.price_engine, "_last_rail_breach", None)
-            rail_kind = getattr(self.price_engine, "_last_rail_breach_kind", None)
-            rail_price = getattr(self.price_engine, "_last_rail_breach_price", None)
-            if rail_dir in ("above", "below"):
-                _direction_note = {
-                    "above": "rail breach ABOVE — price spike past upper rail",
-                    "below": "rail breach BELOW — price drop past lower rail",
-                }.get(rail_dir, f"rail breach ({rail_dir})")
-                _kind_note = f" [{rail_kind}]" if rail_kind else ""
-                _price_note = f" at {rail_price}" if rail_price is not None else ""
-                _reason = f"{_direction_note}{_kind_note}{_price_note}"
-                try:
-                    self.risk_manager.trip_price_rail_breach(_reason)
-                    self._set_state(status="circuit_breaker")
-                    self._emit_alert(
-                        "circuit_breaker",
-                        "error",
-                        "Price Rail Breach",
-                        _reason,
-                        action="stop_bot",
-                        action_label="Stop Bot",
-                    )
-                    log_event(
-                        "critical",
-                        "rail_breach",
-                        f"Price rail breach detected — tripping price CB and "
-                        f"cancelling stale offers ({_reason})",
-                        data={
-                            "direction": rail_dir,
-                            "kind": rail_kind,
-                            "rejected_price": str(rail_price)
-                            if rail_price is not None
-                            else None,
-                        },
-                    )
-                    # _safeguard cancels ALL offers for a price CB. Without
-                    # this call, stale offers stay on the book at the old
-                    # mid until the CB clears or the operator intervenes.
-                    self._safeguard_offers_for_circuit_breaker()
-                except Exception as _e:
-                    log_event(
-                        "error",
-                        "rail_breach_safeguard_failed",
-                        f"Rail breach safeguard failed: {_e}",
-                    )
-            # Oracle outage escalation (runs regardless of rail-breach path).
-            # Only escalate once we have a prior success timestamp to measure
-            # against — the first post-startup failure is not yet an outage.
-            if prev_success > 0 and rail_dir not in ("above", "below"):
-                if outage_age >= hard_pause_threshold:
-                    log_event(
-                        "critical",
-                        "price_outage_hard_pause",
-                        f"Oracle outage has lasted {outage_age:.0f}s "
-                        f"(>= {hard_pause_threshold}s hard-pause threshold). "
-                        f"Cancelling all offers and tripping the price CB "
-                        f"so the book does not stay exposed on a stale mid.",
-                        data={
-                            "outage_age_secs": outage_age,
-                            "hard_pause_threshold": hard_pause_threshold,
-                        },
-                    )
-                    try:
-                        self.risk_manager.trip_price_rail_breach(
-                            f"oracle outage >= {hard_pause_threshold}s"
-                        )
-                        self._set_state(status="circuit_breaker")
-                        self._emit_alert(
-                            "circuit_breaker",
-                            "error",
-                            "Oracle Outage — Hard Pause",
-                            f"Price oracle has been unavailable for "
-                            f"{outage_age:.0f}s. All offers cancelled.",
-                            action="stop_bot",
-                            action_label="Stop Bot",
-                        )
-                        self._safeguard_offers_for_circuit_breaker()
-                    except Exception as _e:
-                        log_event(
-                            "error",
-                            "price_outage_safeguard_failed",
-                            f"Oracle-outage safeguard failed: {_e}",
-                        )
-                elif outage_age >= stale_threshold:
-                    log_event(
-                        "warning",
-                        "price_outage_stale",
-                        f"Oracle stale for {outage_age:.0f}s "
-                        f"(alert threshold {stale_threshold}s; hard pause "
-                        f"at {hard_pause_threshold}s). Offers still live "
-                        f"on last-known mid.",
-                        data={
-                            "outage_age_secs": outage_age,
-                            "stale_threshold": stale_threshold,
-                        },
-                    )
-                    try:
-                        self._emit_alert(
-                            "price_stale",
-                            "warning",
-                            "Oracle Stale",
-                            f"Price sources have not responded for "
-                            f"{outage_age:.0f}s — offers still live. If this "
-                            f"reaches {hard_pause_threshold}s the bot will "
-                            f"hard-pause automatically.",
-                        )
-                    except Exception as _alert_err:
-                        log_event(
-                            "debug",
-                            "price_outage_alert_failed",
-                            f"Price-stale alert emit failed: {_alert_err}",
-                        )
-
-            # Run self-heal / reconcile passes even when we can't trade.
-            # These are read/repair-only and do not create or requote offers,
-            # so they are safe during an oracle outage and — critically —
-            # prevent stuck pending-cancel rows, orphan coin locks, and
-            # phantom fills from piling up while pricing is unavailable.
-            # Each check has its own internal throttle (see bot_health.py)
-            # so calling it here does not create extra load.
             try:
-                from bot_health import run_runtime_checks as _no_price_health
+                from bot_health import run_runtime_checks as _no_market_health
 
-                _no_price_health(auto_repair=True)
-            except Exception as _hc_err:
+                _no_market_health(auto_repair=True)
+            except Exception as health_error:
                 log_event(
                     "debug",
-                    "no_price_self_heal_failed",
-                    f"Self-heal during oracle outage failed: {_hc_err}",
+                    "no_market_self_heal_failed",
+                    f"Self-heal during market confidence loss failed: {health_error}",
                 )
-
             log_event(
                 "warning",
-                "no_price",
-                "Price rejected by safety guard — skipping cycle. "
-                "Check HARD_MAX_PRICE_XCH / HARD_MIN_PRICE_XCH or dynamic band settings.",
+                "market_confidence_no_trusted_price",
+                "No attributable trusted offer-book price is available; "
+                "new exposure and requotes remain blocked",
             )
             return
 
@@ -10180,47 +10476,18 @@ class BotLoop:
                 f"(startup or material market shift) — keeping sniper idle",
             )
 
-        # ---- Step 8b: Re-evaluate prices after sniper ----
-        # If the sniper just fired, the market has moved. Fetch fresh prices
-        # so the main offer batch (Step 10) uses post-snipe pricing.
+        # ---- Step 8b: Legacy sniper compatibility fence ----
+        # v1.4 never derives a second intra-cycle price from the retired AMM
+        # path. If an upgraded configuration somehow fires legacy sniper code,
+        # keep the coherent snapshot and prevent a follow-on ladder expansion.
         if sniper_fired:
             log_event(
-                "info",
-                "post_snipe_reprice",
-                "Sniper fired — re-fetching prices before creating main offer batch",
+                "error",
+                "legacy_sniper_runtime_blocked",
+                "Legacy sniper activity was detected after retirement; "
+                "skipping the remainder of this cycle",
             )
-            fresh_price = self.price_engine.get_price(
-                cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
-            )
-            fresh_mid = Decimal(str(fresh_price.get("mid_price", 0)))
-            if fresh_mid > 0:
-                old_mid = mid_price
-                mid_price = fresh_mid
-                self._current_mid_price = mid_price
-                self._set_state(mid_price=str(mid_price))
-
-                # Update arb gap with fresh data
-                arb_gap = Decimal(str(fresh_price.get("arb_gap_bps", 0)))
-                self.risk_manager.update_arb_gap(arb_gap)
-
-                log_event(
-                    "info",
-                    "post_snipe_price",
-                    f"Post-snipe price: {old_mid:.8f} → {fresh_mid:.8f} "
-                    f"(arb gap now {_bps_to_pct(arb_gap)})",
-                )
-
-                # Push updated price to GUI
-                self._emit(
-                    "price_update",
-                    {
-                        "mid_price": str(mid_price),
-                        "dexie_price": str(fresh_price.get("dexie_price", "")),
-                        "tibet_price": str(fresh_price.get("tibet_price", "")),
-                        "arb_gap_bps": str(arb_gap),
-                        "spread_bps": self._bot_state.get("spread_bps", "0"),
-                    },
-                )
+            return
 
         # ---- Step 8b2: Emergency requote of stale offers on price shock ----
         # When a TibetSwap swap causes a large arb gap, old offers on the
@@ -11185,44 +11452,28 @@ class BotLoop:
             log_event("debug", "requote_skip", "Coin manager busy — skipping requote")
             return
 
-        # ---- Fresh price for forced requotes ----
-        # When AMM drift forces a requote, the mid_price from Step 1 (cycle
-        # start) may already be stale — the AMM monitor may have detected a
-        # move AFTER get_price() ran but BEFORE we reach this point. The old
-        # mid_price would make us requote at the SAME price, wasting coins.
-        # Re-fetch now so the new offers are at the correct price.
+        # ---- Coherent price for forced requotes ----
+        # The cycle's persisted confidence snapshot is the sole mutation
+        # authority. Never replace it mid-cycle with an anonymous ticker or
+        # aggregate level because that would split the decision evidence.
         force_buy = self._force_requote.get("buy", False)
         force_sell = self._force_requote.get("sell", False)
         if force_buy or force_sell:
             try:
-                fresh_price = self.price_engine.get_price(
-                    cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
-                )
-                if fresh_price:
-                    fresh_mid = Decimal(str(fresh_price.get("mid_price", 0)))
-                    if fresh_mid > 0 and fresh_mid != mid_price:
-                        old_mid = mid_price
-                        mid_price = fresh_mid
-                        self._current_mid_price = mid_price
-                        self._set_state(mid_price=str(mid_price))
-                        log_event(
-                            "info",
-                            "requote_price_refresh",
-                            f"Refreshed mid_price before forced requote: "
-                            f"{old_mid:.8f} -> {mid_price:.8f}",
-                            data={"old_mid": str(old_mid), "new_mid": str(mid_price)},
-                        )
-                        # Push updated price to GUI
-                        self._emit(
-                            "price_update",
-                            {
-                                "mid_price": str(mid_price),
-                                "dexie_price": str(fresh_price.get("dexie_price", "")),
-                                "tibet_price": str(fresh_price.get("tibet_price", "")),
-                                "arb_gap_bps": str(fresh_price.get("arb_gap_bps", "0")),
-                                "spread_bps": self._bot_state.get("spread_bps", "0"),
-                            },
-                        )
+                confidence = getattr(self, "_market_confidence_result", None)
+                fresh_mid = Decimal(str(getattr(confidence, "trusted_midpoint", 0) or 0))
+                if fresh_mid > 0 and fresh_mid != mid_price:
+                    old_mid = mid_price
+                    mid_price = fresh_mid
+                    self._current_mid_price = mid_price
+                    self._set_state(mid_price=str(mid_price))
+                    log_event(
+                        "info",
+                        "requote_price_refresh",
+                        f"Applied coherent confidence midpoint before forced requote: "
+                        f"{old_mid:.8f} -> {mid_price:.8f}",
+                        data={"old_mid": str(old_mid), "new_mid": str(mid_price)},
+                    )
             except Exception as _e:
                 log_event(
                     "warning",
@@ -12526,9 +12777,13 @@ class BotLoop:
             # requote baseline pinned to the price we actually deployed.
             # Using the post-create market mid here can include our own fresh
             # book and trigger needless "replace what we just posted" churn.
-            fresh = self.price_engine.get_price()
-            if fresh and fresh.get("mid_price"):
-                fresh_mid = fresh["mid_price"]
+            fresh_market = self._refresh_offer_book_market()
+            fresh_mid = (
+                fresh_market.confidence.trusted_midpoint
+                if fresh_market is not None
+                else None
+            )
+            if fresh_mid is not None and fresh_mid > 0:
                 self._current_mid_price = fresh_mid
                 self._set_state(mid_price=str(fresh_mid))
                 log_event(
@@ -15538,9 +15793,11 @@ class BotLoop:
             # ── Step 3: Sort by distance from mid price, keep 2 tightest per side ──
             mid_price = self._current_mid_price
             if mid_price <= 0:
-                price_data = self.price_engine.get_price()
-                if price_data:
-                    mid_price = Decimal(str(price_data.get("mid_price", 0)))
+                market_result = self._refresh_offer_book_market()
+                if market_result is not None:
+                    trusted_midpoint = market_result.confidence.trusted_midpoint
+                    if trusted_midpoint is not None:
+                        mid_price = trusted_midpoint
 
             if mid_price <= 0:
                 self._graceful_in_progress = False

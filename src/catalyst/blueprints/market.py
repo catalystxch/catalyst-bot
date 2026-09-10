@@ -16,11 +16,13 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
 
 import api_server
+import database
 from config import cfg
 from database import log_event
 
@@ -617,6 +619,161 @@ def api_price():
 
     # Bot not running — lightweight price lookup via api_server helper
     return api_server._fetch_price_standalone(asset_id, decimals)
+
+
+def _post_tibet_provider_status(asset_id: str) -> dict:
+    """Return the newest durable evidence for each provider capability."""
+
+    declared = {
+        "dexie": ["discover_offer", "order_book", "publish_offer", "settled_trades"],
+        "splash": ["discover_offer", "order_book", "peer_health", "publish_offer"],
+        "sage": ["chain_observation", "wallet_authority"],
+        "coinset": ["chain_observation", "mempool_observation"],
+        "spacescan": ["chain_observation", "token_metadata"],
+    }
+    providers = {
+        provider: {
+            "status": "unavailable",
+            "capabilities": capabilities,
+            "observed_at": None,
+            "fresh_until": None,
+            "reason_codes": ["no_current_evidence"],
+        }
+        for provider, capabilities in declared.items()
+    }
+    try:
+        rows = database.get_market_provider_observations(asset_id, limit=100)
+    except Exception:
+        rows = []
+    for row in rows:
+        provider = str(row.get("provider_id") or "").lower()
+        if provider not in providers or providers[provider]["observed_at"] is not None:
+            continue
+        quality = str(row.get("quality") or "unavailable").lower()
+        providers[provider].update(
+            status=quality,
+            observed_at=row.get("observed_at"),
+            fresh_until=row.get("fresh_until"),
+            reason_codes=list(row.get("reason_codes") or []),
+        )
+    providers["tibetswap"] = {"status": "retired", "capabilities": []}
+    return providers
+
+
+def _runtime_confidence_metrics() -> dict:
+    result = getattr(api_server.bot, "_market_confidence_result", None)
+    if result is None:
+        return {}
+
+    def _xch(mojos) -> str:
+        value = Decimal(int(mojos or 0)) / Decimal("1000000000000")
+        return format(value, "f").rstrip("0").rstrip(".") or "0"
+
+    return {
+        "independent_bid_depth_xch": _xch(
+            getattr(result, "independent_bid_depth_mojos", 0)
+        ),
+        "independent_ask_depth_xch": _xch(
+            getattr(result, "independent_ask_depth_mojos", 0)
+        ),
+        "required_depth_xch": _xch(getattr(result, "required_depth_mojos", 0)),
+        "bid_depth_ratio": str(getattr(result, "bid_depth_ratio", "0")),
+        "ask_depth_ratio": str(getattr(result, "ask_depth_ratio", "0")),
+        "manipulation_score": int(getattr(result, "manipulation_score", 0)),
+        "pending_movement_refreshes": int(
+            getattr(result, "pending_movement_refreshes", 0)
+        ),
+        "excluded_own_offer_count": int(
+            getattr(result, "excluded_own_offer_count", 0)
+        ),
+        "deduplicated_offer_count": int(
+            getattr(result, "deduplicated_offer_count", 0)
+        ),
+        "derived_thresholds": dict(
+            getattr(result, "derived_thresholds", {}) or {}
+        ),
+    }
+
+
+@bp.route("/api/market/confidence")
+def api_market_confidence():
+    """Expose the single durable market/safety truth used by every UI tab."""
+
+    asset_id = str(
+        api_server._active_cat.get("asset_id")
+        or getattr(api_server.cfg, "CAT_ASSET_ID", "")
+        or ""
+    ).strip().lower().removeprefix("0x")
+    if not asset_id:
+        return jsonify(
+            {
+                "market_model": "offer_book",
+                "asset_id": "",
+                "confidence": {
+                    "state": "RED",
+                    "derived_at": None,
+                    "reason_codes": ["asset_not_selected"],
+                    "source_health": {},
+                },
+                "degraded": None,
+                "migration": None,
+                "providers": {"tibetswap": {"status": "retired", "capabilities": []}},
+                "can_create": False,
+                "can_requote": False,
+                "can_increase_exposure": False,
+            }
+        )
+
+    try:
+        confidence = database.get_latest_market_confidence_snapshot(asset_id)
+    except Exception:
+        confidence = None
+    try:
+        degraded = database.get_degraded_market_state(asset_id)
+    except Exception:
+        degraded = None
+    try:
+        migration = database.get_post_tibet_migration_report(asset_id)
+    except Exception:
+        migration = None
+
+    if confidence is None:
+        confidence = {
+            "asset_id": asset_id,
+            "state": "RED",
+            "derived_at": None,
+            "trusted_midpoint": None,
+            "trusted_bid": None,
+            "trusted_ask": None,
+            "degraded_since": None,
+            "withdrawal_stage": "NONE",
+            "recovery_refreshes": 0,
+            "reason_codes": ["market_evidence_warming"],
+            "source_health": {},
+            "evidence_digests": [],
+            "material": True,
+        }
+
+    state = str(confidence.get("state") or "RED").upper()
+    degraded_active = bool(
+        degraded and degraded.get("degraded_since")
+    )
+    can_create = state == "GREEN" and not degraded_active
+    can_requote = state in {"GREEN", "AMBER"} and not degraded_active
+    payload = {
+        "market_model": "offer_book",
+        "asset_id": asset_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "confidence": confidence,
+        "degraded": degraded,
+        "migration": migration,
+        "providers": _post_tibet_provider_status(asset_id),
+        "metrics": _runtime_confidence_metrics(),
+        "can_create": can_create,
+        "can_requote": can_requote,
+        "can_increase_exposure": can_create,
+    }
+    return jsonify(payload)
 
 
 @bp.route("/api/market/summary")

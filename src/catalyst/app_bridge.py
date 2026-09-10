@@ -910,6 +910,15 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def get_market_confidence(self):
+        """Get durable offer-book confidence. Maps to GET /api/market/confidence."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/market/confidence"):
+            resp = api_server.api_market_confidence()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     def get_market_slippage(self, params=None):
         """Get market slippage. Maps to GET /api/market/slippage."""
         import api_server
@@ -1816,6 +1825,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_inventory",
     "get_logs",
     "get_market_intel",
+    "get_market_confidence",
     "get_market_orderbook",
     "get_market_slippage",
     "get_market_summary",

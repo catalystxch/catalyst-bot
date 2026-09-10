@@ -6028,6 +6028,7 @@ from blueprints.market import (
     api_coinset_stats,
     api_price,
     api_market_summary,
+    api_market_confidence,
     api_tibet_price,
     api_amm_price,
     api_debug_coinprep,

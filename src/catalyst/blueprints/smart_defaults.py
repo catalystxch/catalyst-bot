@@ -3958,6 +3958,7 @@ def _calculate_smart_defaults(
 
     result = {
         "market_model": "offer_book",
+        "market_risk_preset": _risk_profile_name,
         "offer_book_policy": _offer_book_policy,
         "tibet_status": "retired",
         # Smart Pricing

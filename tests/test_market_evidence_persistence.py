@@ -105,3 +105,42 @@ def test_evidence_compaction_keeps_daily_non_sensitive_summary(isolated_db):
     assert summaries[0]["observation_count"] == 1
     assert summaries[0]["provider_id"] == "dexie"
     assert "raw_evidence" not in summaries[0]
+
+
+def test_guarded_price_reset_clears_derived_market_evidence_but_preserves_migration(
+    isolated_db,
+):
+    persist_provider_observation(_provider_observation())
+    persist_confidence_snapshot(
+        MarketConfidenceSnapshot(
+            asset_id=ASSET_ID,
+            state="AMBER",
+            derived_at=NOW,
+            trusted_midpoint=Decimal("0.125"),
+            trusted_bid=Decimal("0.12"),
+            trusted_ask=Decimal("0.13"),
+            degraded_since=None,
+            withdrawal_stage="NONE",
+            recovery_refreshes=0,
+            reason_codes=("single_provider_dependency",),
+            source_health={"dexie": "valid", "splash": "unavailable"},
+            evidence_digests=("ab" * 32,),
+        )
+    )
+    database.store_post_tibet_migration_report(
+        ASSET_ID,
+        {"migration_version": 1, "can_start": True},
+        NOW,
+    )
+
+    result = database.guarded_reset_authoritative_state(clear_price_history=True)
+
+    assert result["success"] is True
+    assert result["market_evidence_cleared"] == {
+        "provider_observations": 1,
+        "confidence_snapshots": 1,
+        "summaries": 0,
+    }
+    assert database.get_market_provider_observations(ASSET_ID, limit=10) == []
+    assert database.get_latest_market_confidence_snapshot(ASSET_ID) is None
+    assert database.get_post_tibet_migration_report(ASSET_ID)["can_start"] is True

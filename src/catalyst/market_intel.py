@@ -15,6 +15,7 @@ Key responsibilities:
     - Flag whether current placement qualifies for DBX rewards
 """
 
+import hashlib
 import time
 import requests
 import threading
@@ -56,6 +57,11 @@ class MarketIntel:
         self._orderbook: Dict = {
             "buy_offers": [],  # Sorted best (highest) to worst
             "sell_offers": [],  # Sorted best (lowest) to worst
+            # Exact v1 offers are retained separately because the display-only
+            # v3 aggregate fallback is anonymous and must never authorize a
+            # trading mutation.
+            "exact_buy_offers": [],
+            "exact_sell_offers": [],
             "last_refresh": 0,
             "refresh_count": 0,
             "errors": 0,
@@ -224,6 +230,8 @@ class MarketIntel:
             with self._lock:
                 self._orderbook["buy_offers"] = buy_offers
                 self._orderbook["sell_offers"] = sell_offers
+                self._orderbook["exact_buy_offers"] = list(buy_offers)
+                self._orderbook["exact_sell_offers"] = list(sell_offers)
                 self._orderbook["last_refresh"] = now
                 self._orderbook["refresh_count"] += 1
 
@@ -361,6 +369,15 @@ class MarketIntel:
         """
         try:
             offer_id = offer.get("id", "")
+            offer_text = str(offer.get("offer") or "").strip()
+            offer_identity = (
+                hashlib.sha256(offer_text.encode("utf-8")).hexdigest()
+                if offer_text
+                else ""
+            )
+            trade_id = str(offer.get("trade_id") or "").strip().lower()
+            if trade_id.startswith("0x"):
+                trade_id = trade_id[2:]
             offered = offer.get("offered", [])
             requested = offer.get("requested", [])
 
@@ -415,6 +432,9 @@ class MarketIntel:
 
             return {
                 "offer_id": offer_id,
+                "provider_offer_id": offer_id,
+                "offer_identity": offer_identity,
+                "trade_id": trade_id,
                 "side": expected_side,
                 "price": price,
                 "xch_amount": xch_amount,
@@ -871,6 +891,58 @@ class MarketIntel:
             "source": source,
             "our_best_bid": str(our_best_bid),
             "our_best_ask": str(our_best_ask),
+        }
+
+    def get_attributable_orderbook(self) -> Dict:
+        """Return exact Dexie v1 rows suitable for confidence decisions.
+
+        Anonymous v3 aggregate levels intentionally never appear here. Amounts
+        are normalized to XCH mojos so depth can be compared directly with the
+        configured per-offer XCH size without float conversion.
+        """
+
+        with self._lock:
+            buys = list(self._orderbook.get("exact_buy_offers", []))
+            sells = list(self._orderbook.get("exact_sell_offers", []))
+            observed_at = float(self._orderbook.get("last_refresh", 0) or 0)
+
+        def rows(values):
+            normalized = []
+            for row in values:
+                offer_id = str(
+                    row.get("offer_identity") or row.get("offer_id") or ""
+                ).strip()
+                price = row.get("price")
+                xch_amount = row.get("xch_amount")
+                if not offer_id or type(price) is not Decimal:
+                    continue
+                try:
+                    amount_mojos = int(
+                        (Decimal(xch_amount) * Decimal("1000000000000")).to_integral_exact()
+                    )
+                except Exception:
+                    continue
+                if price <= 0 or amount_mojos <= 0:
+                    continue
+                normalized.append(
+                    {
+                        "offer_id": offer_id,
+                        "provider_offer_id": str(
+                            row.get("provider_offer_id") or row.get("offer_id") or ""
+                        ).strip(),
+                        "offer_identity": str(row.get("offer_identity") or "").strip(),
+                        "trade_id": str(row.get("trade_id") or "").strip(),
+                        "price": str(price),
+                        "amount_mojos": amount_mojos,
+                    }
+                )
+            return normalized
+
+        return {
+            "bids": rows(buys),
+            "asks": rows(sells),
+            "observed_at_unix": observed_at,
+            "source": "dexie_v1_offers",
         }
 
     def get_stats(self) -> Dict:

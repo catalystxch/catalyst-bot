@@ -3590,6 +3590,26 @@ CREATE TABLE IF NOT EXISTS degraded_market_state (
                               CHECK(withdrawal_stage IN ('NONE','INNER','MIDDLE','ALL')),
     updated_at                TEXT NOT NULL
 );
+
+-- Exact public rediscovery is distinct from a provider's submission ACK.
+-- Rows are created for both destinations after Sage confirms creation.  An
+-- exact observation is irreversible; deadline expiry remains nonterminal so
+-- the offer continues to own its slot until Sage cancellation is proven.
+CREATE TABLE IF NOT EXISTS offer_publication_discoveries (
+    intent_id                 TEXT NOT NULL,
+    provider                  TEXT NOT NULL CHECK(provider IN ('dexie','splash')),
+    offer_identity            TEXT NOT NULL,
+    state                     TEXT NOT NULL
+                              CHECK(state IN ('pending','mismatch','exact','deadline_expired')),
+    observed_identity         TEXT,
+    deadline_at               TEXT NOT NULL,
+    first_observed_at         TEXT,
+    updated_at                TEXT NOT NULL,
+    PRIMARY KEY(intent_id, provider),
+    FOREIGN KEY(intent_id) REFERENCES offer_intents(intent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_publication_discovery_deadline
+    ON offer_publication_discoveries(state, deadline_at);
 """
 
 
@@ -3621,6 +3641,16 @@ _STABILITY_REQUIRED_COLUMNS = {
         "confirmed_at",
         "first_visible_at",
         "terminal_at",
+        "updated_at",
+    },
+    "offer_publication_discoveries": {
+        "intent_id",
+        "provider",
+        "offer_identity",
+        "state",
+        "observed_identity",
+        "deadline_at",
+        "first_observed_at",
         "updated_at",
     },
     "offer_operation_journal": {
@@ -4353,6 +4383,13 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("intent_id", "state"),
+        None,
+    ),
+    "idx_offer_publication_discovery_deadline": (
+        "offer_publication_discoveries",
+        False,
+        False,
+        ("state", "deadline_at"),
         None,
     ),
 }
@@ -7844,6 +7881,11 @@ def guarded_reset_authoritative_state(
                 "open_offers_cancelled": 0,
                 "offers_deleted": 0,
                 "price_history_cleared": False,
+                "market_evidence_cleared": {
+                    "provider_observations": 0,
+                    "confidence_snapshots": 0,
+                    "summaries": 0,
+                },
                 "inventory_cleared": False,
             }
 
@@ -7855,6 +7897,11 @@ def guarded_reset_authoritative_state(
             "open_offers_cancelled": 0,
             "offers_deleted": 0,
             "price_history_cleared": False,
+            "market_evidence_cleared": {
+                "provider_observations": 0,
+                "confidence_snapshots": 0,
+                "summaries": 0,
+            },
             "inventory_cleared": False,
         }
         # A positive fill count is refused above.  Keeping the statement out
@@ -7880,6 +7927,20 @@ def guarded_reset_authoritative_state(
             summary["offers_deleted"] = int(cursor.rowcount or 0)
         if clear_price_history:
             conn.execute("DELETE FROM price_history")
+            evidence_tables = {
+                "provider_observations": "market_provider_observations",
+                "confidence_snapshots": "market_confidence_snapshots",
+                "summaries": "market_evidence_summaries",
+            }
+            for summary_key, table_name in evidence_tables.items():
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table_name,),
+                ).fetchone():
+                    cursor = conn.execute(f"DELETE FROM {table_name}")
+                    summary["market_evidence_cleared"][summary_key] = int(
+                        cursor.rowcount or 0
+                    )
             summary["price_history_cleared"] = True
         if (
             clear_inventory
@@ -25167,6 +25228,199 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+_OFFER_DISCOVERY_PROVIDERS = ("dexie", "splash")
+
+
+def _offer_discovery_identity(value: Any, label: str) -> str:
+    identity = _required_stability_text(value, label)
+    if (
+        len(identity) != 64
+        or identity.lower() != identity
+        or any(character not in "0123456789abcdef" for character in identity)
+    ):
+        raise ValueError(f"{label} must be canonical lowercase 32-byte hex")
+    return identity
+
+
+def ensure_offer_publication_discoveries(
+    intent_id: str, *, deadline_seconds: int = 90
+) -> List[Dict[str, Any]]:
+    """Create and return the durable per-provider discovery obligations."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    if type(deadline_seconds) is not int or deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be a positive integer")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if intent_row is None:
+            raise ValueError("offer intent does not exist")
+        intent = dict(intent_row)
+        if intent["lifecycle_state"] not in {"created", "visible"}:
+            raise ValueError("discovery requires a confirmed created offer")
+        identity = _offer_discovery_identity(
+            intent.get("offer_text_sha256"), "offer_text_sha256"
+        )
+        confirmed_at = _canonical_stored_stability_timestamp(
+            intent.get("confirmed_at") or intent.get("prepared_at")
+        )
+        confirmed_dt = _parse_iso_timestamp(
+            confirmed_at, "confirmed_at", require_timezone=True
+        )
+        deadline_at = _stability_timestamp(
+            confirmed_dt + timedelta(seconds=deadline_seconds), "discovery deadline"
+        )
+        updated_at = _stability_wall_clock()
+        for provider in _OFFER_DISCOVERY_PROVIDERS:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO offer_publication_discoveries (
+                    intent_id, provider, offer_identity, state,
+                    observed_identity, deadline_at, first_observed_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', NULL, ?, NULL, ?)
+                """,
+                (safe_intent_id, provider, identity, deadline_at, updated_at),
+            )
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        if len(rows) != len(_OFFER_DISCOVERY_PROVIDERS):
+            raise RuntimeError("offer discovery obligations are incomplete")
+        for row in rows:
+            current = dict(row)
+            if (
+                current["offer_identity"] != identity
+                or current["deadline_at"] != deadline_at
+            ):
+                raise ValueError("offer discovery replay conflicts with durable authority")
+        conn.commit()
+        return [dict(row) for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_offer_publication_discoveries(intent_id: str) -> List[Dict[str, Any]]:
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_offer_publication_discovery(
+    intent_id: str,
+    *,
+    provider: str,
+    observed_offer_identity: str,
+    observed_at: Any = None,
+) -> Dict[str, Any]:
+    """Persist exact or mismatched public evidence without downgrading exact proof."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    safe_provider = _required_stability_text(provider, "provider").lower()
+    if safe_provider not in _OFFER_DISCOVERY_PROVIDERS:
+        raise ValueError("provider must be dexie or splash")
+    observed = _offer_discovery_identity(
+        observed_offer_identity, "observed_offer_identity"
+    )
+    when = _stability_timestamp_or_now(observed_at, "observed_at")
+    ensure_offer_publication_discoveries(safe_intent_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? AND provider=?",
+            (safe_intent_id, safe_provider),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("offer discovery obligation is missing")
+        current = dict(row)
+        next_state = (
+            "exact" if observed == current["offer_identity"] else "mismatch"
+        )
+        if current["state"] == "exact":
+            conn.commit()
+            return current
+        first_observed_at = current.get("first_observed_at") or when
+        conn.execute(
+            """
+            UPDATE offer_publication_discoveries
+            SET state=?, observed_identity=?, first_observed_at=?, updated_at=?
+            WHERE intent_id=? AND provider=?
+            """,
+            (
+                next_state,
+                observed,
+                first_observed_at,
+                when,
+                safe_intent_id,
+                safe_provider,
+            ),
+        )
+        updated = dict(
+            conn.execute(
+                "SELECT * FROM offer_publication_discoveries "
+                "WHERE intent_id=? AND provider=?",
+                (safe_intent_id, safe_provider),
+            ).fetchone()
+        )
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def expire_offer_publication_discoveries(
+    intent_id: str, *, now: Any = None
+) -> List[Dict[str, Any]]:
+    """Record a missed deadline while retaining the intent's slot authority."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    when = _stability_timestamp_or_now(now, "discovery expiry time")
+    ensure_offer_publication_discoveries(safe_intent_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE offer_publication_discoveries
+            SET state='deadline_expired', updated_at=?
+            WHERE intent_id=? AND state IN ('pending','mismatch') AND deadline_at<=?
+            """,
+            (when, safe_intent_id, when),
+        )
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        conn.commit()
+        return [dict(row) for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 _REFRESH_CHILD_CREATED_STATES = frozenset({"created", "visible"})

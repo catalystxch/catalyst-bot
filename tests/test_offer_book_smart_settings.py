@@ -11,6 +11,31 @@ from offer_manager import OfferBookCompetitionLimiter, offer_is_profitable
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
 
 
+def test_market_risk_preset_is_typed_validated_and_api_updatable(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("MARKET_RISK_PRESET", "aggressive")
+    assert config_module.Config().MARKET_RISK_PRESET == "aggressive"
+
+    monkeypatch.setenv("MARKET_RISK_PRESET", "not-a-preset")
+    assert config_module.Config().MARKET_RISK_PRESET == "balanced"
+    assert "MARKET_RISK_PRESET" in config_module.Config._UPDATABLE_KEYS
+
+
+def test_smart_settings_persists_selected_offer_book_risk_preset():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    backend = (root / "src" / "catalyst" / "blueprints" / "smart_defaults.py").read_text(
+        encoding="utf-8"
+    )
+    html = (root / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert '"market_risk_preset": _risk_profile_name' in backend
+    assert "market_risk_preset: getSelectedRiskProfile()" in html
+
+
 @pytest.mark.parametrize(
     ("preset", "depth_multiple", "move_persistence", "churn_limit"),
     [
