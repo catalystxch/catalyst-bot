@@ -1846,6 +1846,7 @@ def _initialize_startup_ownership() -> dict:
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
+        "TASK8_BINDING_CONFLICT",
     }
     if (
         authorization.get("allowed") is False

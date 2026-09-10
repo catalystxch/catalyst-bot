@@ -1323,6 +1323,7 @@ def api_status():
 
         # --- Offers ---
         is_running = raw.get("running", False)
+        used_wallet_snapshot = False
         if is_running:
             # Bot running — use database records (kept in sync by bot loop)
             try:
@@ -1338,7 +1339,6 @@ def api_status():
             # produced a fresh wallet-authoritative snapshot, though. Prefer
             # that snapshot so an externally filled/cancelled offer is not
             # resurrected in the UI by an older durable DB row.
-            used_wallet_snapshot = False
             try:
                 offer_manager = getattr(bot, "offer_manager", None)
                 snapshot_getter = getattr(
@@ -1679,6 +1679,38 @@ def api_status():
                 "xch_topup_pool_amount": inv.get("xch_reserve_total", "0"),
                 "cat_topup_pool_amount": inv.get("cat_reserve_total", "0"),
             }
+
+        # A fresh stopped-state Sage snapshot is authoritative for offer
+        # membership. When it proves the book empty, do not pair that empty
+        # offer view with legacy DB rows that still label the same coins locked.
+        if (
+            not is_running
+            and used_wallet_snapshot
+            and not offers_buy
+            and not offers_sell
+        ):
+            xch_owned = max(
+                int(coin_tracking.get("xch_spendable", 0) or 0),
+                int(coin_tracking.get("xch_total", 0) or 0),
+            )
+            cat_owned = max(
+                int(coin_tracking.get("cat_spendable", 0) or 0),
+                int(coin_tracking.get("cat_total", 0) or 0),
+            )
+            coin_tracking.update(
+                {
+                    "xch_spendable": xch_owned,
+                    "xch_free": xch_owned,
+                    "xch_locked": 0,
+                    "xch_total": xch_owned,
+                    "cat_spendable": cat_owned,
+                    "cat_free": cat_owned,
+                    "cat_locked": 0,
+                    "cat_total": cat_owned,
+                    "xch_locked_amount": "0.0000",
+                    "cat_locked_amount": "0.00",
+                }
+            )
 
         # If coin tracking is all zeros (bot hasn't run), query Sage directly.
         # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
