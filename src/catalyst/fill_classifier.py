@@ -21,6 +21,7 @@ classifier bug or missing upstream data.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, List, Optional, Set
 
 
@@ -35,6 +36,143 @@ class FillType:
     ARB_SWEEP_SELL = "arb_sweep_sell"
     DEXIE_COMBINED = "dexie_combined"
     UNKNOWN = "unknown"
+
+
+class FillConfidence(str, Enum):
+    """Evidence maturity for economic accounting and replacement authority."""
+
+    OBSERVED = "Observed"
+    PROBABLE = "Probable"
+    CONFIRMED = "Confirmed"
+
+
+@dataclass(frozen=True, slots=True)
+class FillAuthorityDecision:
+    confidence: FillConfidence
+    outcome: str
+    authority_source: str
+    reason_codes: tuple[str, ...]
+    market_confidence_impact: str | None = None
+
+    @property
+    def can_account(self) -> bool:
+        return self.confidence is FillConfidence.CONFIRMED and self.outcome == "FILL"
+
+    @property
+    def can_replace(self) -> bool:
+        return self.can_account
+
+
+def assess_fill_confidence(evidence: Dict) -> FillAuthorityDecision:
+    """Classify untrusted fill hints without authorizing premature accounting.
+
+    Sage remains authoritative.  When Sage is delayed, exact Coinset and
+    Spacescan transaction/height agreement is sufficient corroborated chain
+    proof.  Marketplace statuses alone can reach only ``Probable``.
+    """
+
+    if type(evidence) is not dict:
+        raise TypeError("fill evidence must be a dict")
+    sage_status = str(evidence.get("sage_status") or "").strip().lower()
+    dexie_status = str(evidence.get("dexie_status") or "").strip().lower()
+    splash_status = str(evidence.get("splash_status") or "").strip().lower()
+    provider_hint = dexie_status in {"spent", "taken", "filled", "completed"} or (
+        splash_status in {"spent", "taken", "filled", "completed"}
+    )
+
+    if evidence.get("reorg") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "CONFLICT",
+            "CHAIN",
+            ("chain_reorg_observed",),
+            "AMBER",
+        )
+    if evidence.get("self_spend") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "SAGE",
+            ("self_spend_rejected",),
+        )
+    if evidence.get("external_cancel") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "CHAIN",
+            ("external_cancellation_proven",),
+        )
+    if sage_status in {"cancelled", "canceled", "expired"}:
+        reasons = ["sage_terminal_non_fill"]
+        if provider_hint:
+            reasons.append("sage_cancel_overrides_provider_hint")
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "SAGE",
+            tuple(reasons),
+            "AMBER" if provider_hint else None,
+        )
+
+    sage_height = evidence.get("sage_confirmed_height")
+    if sage_status in {"confirmed", "completed", "filled"} and (
+        type(sage_height) is int and sage_height > 0
+    ):
+        return FillAuthorityDecision(
+            FillConfidence.CONFIRMED,
+            "FILL",
+            "SAGE",
+            ("sage_confirmed_fill",),
+        )
+
+    coinset_tx = evidence.get("coinset_transaction_id")
+    spacescan_tx = evidence.get("spacescan_transaction_id")
+    coinset_height = evidence.get("coinset_height")
+    spacescan_height = evidence.get("spacescan_height")
+    coinset_complete = _exact_chain_reference(coinset_tx, coinset_height)
+    spacescan_complete = _exact_chain_reference(spacescan_tx, spacescan_height)
+    if coinset_complete and spacescan_complete:
+        if coinset_tx == spacescan_tx and coinset_height == spacescan_height:
+            reasons = ["exact_chain_evidence_agreement"]
+            if sage_status in {"", "pending", "delayed", "unknown"}:
+                reasons.append("sage_delayed_chain_confirmation")
+            return FillAuthorityDecision(
+                FillConfidence.CONFIRMED,
+                "FILL",
+                "CORROBORATED_CHAIN",
+                tuple(reasons),
+            )
+        return FillAuthorityDecision(
+            FillConfidence.PROBABLE,
+            "LIKELY_FILL",
+            "CONFLICTED_CHAIN",
+            ("chain_evidence_conflict",),
+            "AMBER",
+        )
+
+    if provider_hint:
+        return FillAuthorityDecision(
+            FillConfidence.PROBABLE,
+            "LIKELY_FILL",
+            "MARKETPLACE_HINT",
+            ("third_party_fill_hint",),
+        )
+    return FillAuthorityDecision(
+        FillConfidence.OBSERVED,
+        "POSSIBLE_FILL",
+        "LOCAL_OBSERVATION",
+        ("offer_disappearance_observed",),
+    )
+
+
+def _exact_chain_reference(transaction_id, height) -> bool:
+    return bool(
+        type(transaction_id) is str
+        and len(transaction_id) == 64
+        and all(character in "0123456789abcdef" for character in transaction_id)
+        and type(height) is int
+        and height > 0
+    )
 
 
 @dataclass
