@@ -10602,6 +10602,7 @@ class BotLoop:
                         price_floor=price_floor,
                         live_offer_ids=_live_ids,
                         force_cancel_storm=True,
+                        market_confidence=self._market_confidence_result,
                     )
                     # Note: do NOT add to _requoted_this_cycle until we
                     # know progress was made. Previously we stamped this
@@ -11867,6 +11868,7 @@ class BotLoop:
                         RequoteSeverity.FULL,
                         RequoteSeverity.EMERGENCY,
                     ),
+                    market_confidence=self._market_confidence_result,
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force
@@ -12564,6 +12566,7 @@ class BotLoop:
                 price_floor=price_floor,
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
+                market_confidence=self._market_confidence_result,
             )
             _parallel_results[side] = offers or []
 

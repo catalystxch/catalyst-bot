@@ -3571,6 +3571,16 @@ CREATE TABLE IF NOT EXISTS market_confidence_snapshots (
 CREATE INDEX IF NOT EXISTS idx_market_confidence_asset_time
     ON market_confidence_snapshots(asset_id, derived_at DESC);
 
+-- Restart-safe price-war limiter. A changing book digest cannot bypass the
+-- per-asset/per-side cooldown; the digest records the decision input.
+CREATE TABLE IF NOT EXISTS offer_book_competition_claims (
+    asset_id                  TEXT NOT NULL,
+    side                      TEXT NOT NULL CHECK(side IN ('buy','sell')),
+    evidence_digest           TEXT NOT NULL,
+    claimed_at                TEXT NOT NULL,
+    PRIMARY KEY(asset_id, side)
+);
+
 CREATE TABLE IF NOT EXISTS market_confidence_engine_state (
     asset_id                  TEXT PRIMARY KEY,
     risk_preset               TEXT NOT NULL,
@@ -3661,6 +3671,12 @@ _STABILITY_REQUIRED_COLUMNS = {
         "deadline_at",
         "first_observed_at",
         "updated_at",
+    },
+    "offer_book_competition_claims": {
+        "asset_id",
+        "side",
+        "evidence_digest",
+        "claimed_at",
     },
     "offer_operation_journal": {
         "sequence",
@@ -31387,6 +31403,56 @@ def get_latest_market_confidence_snapshot(
     result["evidence_digests"] = json.loads(result.pop("evidence_digests_json"))
     result["material"] = bool(result["material"])
     return result
+
+
+def claim_offer_book_improvement(
+    *,
+    asset_id: str,
+    side: str,
+    evidence_digest: str,
+    cooldown_seconds: int,
+    now: datetime,
+) -> bool:
+    """Atomically claim one public-book improvement after its side cooldown."""
+
+    safe_asset = str(asset_id or "").strip().lower()
+    safe_side = str(side or "").strip().lower()
+    safe_digest = str(evidence_digest or "").strip().lower()
+    if not safe_asset:
+        raise ValueError("asset_id is required")
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if len(safe_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in safe_digest
+    ):
+        raise ValueError("evidence_digest must be lowercase sha256")
+    if type(cooldown_seconds) is not int or cooldown_seconds < 1:
+        raise ValueError("cooldown_seconds must be a positive integer")
+    claimed_at = _market_evidence_timestamp(now, "now")
+    cutoff_at = _market_evidence_timestamp(
+        now - timedelta(seconds=cooldown_seconds), "cooldown cutoff"
+    )
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            INSERT INTO offer_book_competition_claims (
+                asset_id, side, evidence_digest, claimed_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(asset_id, side) DO UPDATE SET
+                evidence_digest=excluded.evidence_digest,
+                claimed_at=excluded.claimed_at
+            WHERE offer_book_competition_claims.claimed_at <= ?
+            """,
+            (safe_asset, safe_side, safe_digest, claimed_at, cutoff_at),
+        )
+        accepted = cursor.rowcount == 1
+        conn.commit()
+        return accepted
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def compact_market_provider_evidence(

@@ -87,32 +87,103 @@ def offer_is_profitable(
     return expected_gross_xch >= required
 
 
-class OfferBookCompetitionLimiter:
-    """Per-side monotonic rate limit for public-book price improvements."""
+def assess_offer_book_candidate(
+    *,
+    side: str,
+    candidate_price: Decimal,
+    size_xch: Decimal,
+    confidence: Any,
+    network_fee_xch: Decimal,
+    expected_cancel_requotes: int,
+    minimum_profit_xch: Decimal,
+    now: Optional[datetime] = None,
+    max_confidence_age_seconds: int = 20,
+) -> Dict[str, Any]:
+    """Validate one exact candidate against its attributable GREEN snapshot."""
 
-    def __init__(self, *, cooldown_seconds: int) -> None:
-        if type(cooldown_seconds) is not int or cooldown_seconds < 1:
-            raise ValueError("cooldown_seconds must be a positive integer")
-        self.cooldown_seconds = cooldown_seconds
-        self._last_improvement: dict[str, datetime] = {}
-        self._competition_lock = threading.Lock()
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if type(candidate_price) is not Decimal or type(size_xch) is not Decimal:
+        raise TypeError("candidate price and size must be Decimal")
+    if not candidate_price.is_finite() or candidate_price <= 0:
+        raise ValueError("candidate price must be finite and positive")
+    if not size_xch.is_finite() or size_xch <= 0:
+        raise ValueError("candidate size must be finite and positive")
 
-    def allow_improvement(self, *, side: str, now: datetime) -> bool:
-        normalized_side = str(side).strip().lower()
-        if normalized_side not in {"buy", "sell"}:
-            raise ValueError("side must be buy or sell")
-        if type(now) is not datetime or now.tzinfo is None:
-            raise TypeError("now must be a timezone-aware datetime")
-        current = now.astimezone(timezone.utc)
-        with self._competition_lock:
-            previous = self._last_improvement.get(normalized_side)
-            if (
-                previous is not None
-                and (current - previous).total_seconds() < self.cooldown_seconds
-            ):
-                return False
-            self._last_improvement[normalized_side] = current
-            return True
+    def field(name: str) -> Any:
+        if isinstance(confidence, dict):
+            return confidence.get(name)
+        return getattr(confidence, name, None)
+
+    if field("state") != "GREEN":
+        return {"eligible": False, "reason_code": "market_confidence_not_green"}
+    if now is not None:
+        derived_at = field("derived_at")
+        if (
+            type(now) is not datetime
+            or now.tzinfo is None
+            or type(derived_at) is not datetime
+            or derived_at.tzinfo is None
+            or type(max_confidence_age_seconds) is not int
+            or max_confidence_age_seconds < 1
+        ):
+            return {"eligible": False, "reason_code": "confidence_time_invalid"}
+        age = (
+            now.astimezone(timezone.utc) - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if age < -2 or age > max_confidence_age_seconds:
+            return {"eligible": False, "reason_code": "market_confidence_stale"}
+    midpoint = field("trusted_midpoint")
+    bid = field("trusted_bid")
+    ask = field("trusted_ask")
+    if any(type(value) is not Decimal for value in (midpoint, bid, ask)):
+        return {"eligible": False, "reason_code": "trusted_range_missing"}
+    if not (bid > 0 and bid <= midpoint <= ask):
+        return {"eligible": False, "reason_code": "trusted_range_invalid"}
+    digests = tuple(field("evidence_digests") or ())
+    if not digests or any(
+        type(value) is not str
+        or len(value) != 64
+        or value.lower() != value
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in digests
+    ):
+        return {"eligible": False, "reason_code": "snapshot_evidence_missing"}
+
+    if normalized_side == "buy":
+        edge_per_cat = midpoint - candidate_price
+        improves_book = candidate_price > bid
+    else:
+        edge_per_cat = candidate_price - midpoint
+        improves_book = candidate_price < ask
+    if edge_per_cat <= 0:
+        return {
+            "eligible": False,
+            "reason_code": "candidate_outside_profitable_side",
+        }
+    cat_amount = size_xch / candidate_price
+    gross = edge_per_cat * cat_amount
+    required = network_fee_xch * Decimal(1 + expected_cancel_requotes)
+    required += minimum_profit_xch
+    evidence_digest = hashlib.sha256(
+        "|".join(sorted(digests)).encode("ascii")
+    ).hexdigest()
+    return {
+        "eligible": offer_is_profitable(
+            expected_gross_xch=gross,
+            network_fee_xch=network_fee_xch,
+            expected_cancel_requotes=expected_cancel_requotes,
+            minimum_profit_xch=minimum_profit_xch,
+        ),
+        "reason_code": (
+            "candidate_profitable" if gross >= required else "profit_floor_not_met"
+        ),
+        "expected_gross_xch": gross,
+        "required_xch": required,
+        "improves_book": improves_book,
+        "evidence_digest": evidence_digest,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3622,6 +3693,7 @@ class OfferManager:
         price_floor: Decimal = None,
         interpolate_refill_prices: bool = True,
         refresh_parent_ids: Dict[int, str] = None,
+        market_confidence: Any = None,
     ) -> List[Dict]:
         """Create a ladder of offers on one side (buy or sell).
 
@@ -3650,6 +3722,8 @@ class OfferManager:
             refresh_parent_ids: Exact durable parent intent keyed by ladder
                 slot.  When supplied, creation is a Task 11 child and is
                 bound only after its confirmed Sage identity is durable.
+            market_confidence: Exact current offer-book decision authorizing
+                price, profitability, and any public-book improvement.
 
         Returns list of created offer details (trade_id, price, size, etc.)
         """
@@ -3930,6 +4004,15 @@ class OfferManager:
         # ── Phase 1: Pre-compute all offer specs ──────────────────────────
         # Calculate prices, sizes, tiers, and offer dicts for all slots upfront.
         # This is pure math — no RPC calls, instant.
+        network_fee_xch = Decimal(get_effective_transaction_fee_mojos()) / Decimal(
+            "1000000000000"
+        )
+        expected_cancel_requotes = int(
+            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0
+        )
+        minimum_profit_xch = Decimal(
+            str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
+        )
         offer_specs = []
         for i in range(num):
             if self._stop_requested:
@@ -4059,6 +4142,27 @@ class OfferManager:
                     str(cfg.WALLET_ID_XCH): int(xch_mojos),
                 }
 
+            market_guard = None
+            if market_confidence is not None:
+                market_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=price,
+                    size_xch=size_xch,
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                if not market_guard.get("eligible"):
+                    log_event(
+                        "info",
+                        "offer_profitability_blocked",
+                        f"Skipping {side} slot {slot}: "
+                        f"{market_guard.get('reason_code', 'market_guard_failed')}",
+                    )
+                    continue
+
             offer_specs.append(
                 {
                     "i": i,
@@ -4069,6 +4173,7 @@ class OfferManager:
                     "cat_amount": cat_amount,
                     "offer_dict": offer_dict,
                     "stagger": i,
+                    "market_guard": market_guard,
                 }
             )
 
@@ -4257,6 +4362,25 @@ class OfferManager:
                         str(cfg.WALLET_ID_XCH): int(unique_requested_xch_mojos),
                     }
 
+        # Exact-tier alignment can change the final size and requested amount.
+        # Re-evaluate the resulting price/size immediately before the wallet
+        # effect so clamping or atomic rounding cannot evade the profit floor.
+        if market_confidence is not None:
+            for spec in offer_specs:
+                final_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=spec["price"],
+                    size_xch=spec["size_xch"],
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                spec["market_guard"] = final_guard
+                if not final_guard.get("eligible"):
+                    spec["market_blocked"] = True
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading as _threading
 
@@ -4278,6 +4402,13 @@ class OfferManager:
 
         def _create_one(spec):
             """Create a single offer (runs in thread pool)."""
+            if spec.get("market_blocked"):
+                return spec["i"], {
+                    "success": False,
+                    "error": spec.get("market_guard", {}).get(
+                        "reason_code", "market_guard_failed"
+                    ),
+                }
             if coin_ids_enabled and not spec.get("coin_id"):
                 # Pre-selection returned no coin. In exact tier mode, never
                 # let Sage auto-select a fallback coin: it can pick a reserve
@@ -4302,6 +4433,50 @@ class OfferManager:
                     f"No pre-selected coin for {side} slot {spec['slot']} "
                     f"— serial mode, letting Sage pick from wallet",
                 )
+
+            market_guard = spec.get("market_guard") or {}
+            if market_confidence is not None:
+                market_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=spec["price"],
+                    size_xch=spec["size_xch"],
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                if not market_guard.get("eligible"):
+                    return spec["i"], {
+                        "success": False,
+                        "error": market_guard.get(
+                            "reason_code", "market_guard_failed"
+                        ),
+                    }
+            if market_guard.get("improves_book"):
+                try:
+                    improvement_allowed = database.claim_offer_book_improvement(
+                        asset_id=asset_id,
+                        side=side,
+                        evidence_digest=market_guard["evidence_digest"],
+                        cooldown_seconds=int(
+                            getattr(cfg, "COMPETITION_COOLDOWN_SECS", 30) or 30
+                        ),
+                        now=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:
+                    log_event(
+                        "warning",
+                        "competition_claim_failed",
+                        f"Skipping {side} slot {spec['slot']}: durable "
+                        f"competition claim failed closed: {exc}",
+                    )
+                    improvement_allowed = False
+                if not improvement_allowed:
+                    return spec["i"], {
+                        "success": False,
+                        "error": "competition_cooldown_active",
+                    }
 
             parent_intent_id = (
                 refresh_parent_ids.get(int(spec["slot"]))
@@ -4500,8 +4675,6 @@ class OfferManager:
             # DB: record offer
             _omt = res.get("offer_max_time", 0)
             if _omt and int(_omt) > 0:
-                from datetime import datetime, timezone
-
                 expires_at = datetime.fromtimestamp(
                     int(_omt), tz=timezone.utc
                 ).isoformat()
@@ -4988,6 +5161,7 @@ class OfferManager:
         max_offers: int = 0,
         allowed_tiers: set = None,
         force_cancel_storm: bool = False,
+        market_confidence: Any = None,
     ) -> List[Dict]:
         """Single-pass requote: cancel old offers, then create replacements.
 
@@ -5158,6 +5332,7 @@ class OfferManager:
                 coin_ids_enabled=cfg.COIN_IDS_ENABLED,
                 price_cap=price_cap,
                 price_floor=price_floor,
+                market_confidence=market_confidence,
             )
             if dexie_manager and fresh:
                 for offer in fresh:
@@ -5317,6 +5492,7 @@ class OfferManager:
             price_cap=price_cap,
             price_floor=price_floor,
             refresh_parent_ids=refresh_parent_ids,
+            market_confidence=market_confidence,
         )
         if dexie_manager:
             for offer in new_offers:

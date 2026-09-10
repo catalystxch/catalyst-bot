@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 from offer_book_policy import derive_offer_book_policy
-from offer_manager import OfferBookCompetitionLimiter, offer_is_profitable
+from offer_manager import offer_is_profitable
 
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
@@ -159,19 +159,4 @@ def test_offer_profitability_uses_full_cost_floor():
         network_fee_xch=Decimal("0.0001"),
         expected_cancel_requotes=2,
         minimum_profit_xch=Decimal("0.0005"),
-    )
-
-
-def test_price_war_limiter_is_per_side_and_rate_limited():
-    limiter = OfferBookCompetitionLimiter(cooldown_seconds=30)
-
-    assert limiter.allow_improvement(side="buy", now=NOW) is True
-    assert (
-        limiter.allow_improvement(side="buy", now=NOW + timedelta(seconds=29)) is False
-    )
-    assert (
-        limiter.allow_improvement(side="sell", now=NOW + timedelta(seconds=10)) is True
-    )
-    assert (
-        limiter.allow_improvement(side="buy", now=NOW + timedelta(seconds=30)) is True
     )

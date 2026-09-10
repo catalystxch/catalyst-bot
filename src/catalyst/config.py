@@ -359,6 +359,9 @@ class Config:
         if _market_risk_preset not in ("conservative", "balanced", "aggressive"):
             _market_risk_preset = "balanced"
         self.MARKET_RISK_PRESET = _market_risk_preset
+        self.MINIMUM_PROFIT_XCH = _decimal("MINIMUM_PROFIT_XCH", "0.0001")
+        self.EXPECTED_CANCEL_REQUOTES = _int("EXPECTED_CANCEL_REQUOTES", 2)
+        self.COMPETITION_COOLDOWN_SECS = _int("COMPETITION_COOLDOWN_SECS", 30)
 
         # ----- Spread & Pricing -----
         self.SPREAD_BPS = _decimal("SPREAD_BPS", "800")
@@ -1058,6 +1061,9 @@ class Config:
         "MAX_TRADE_XCH",
         "DEFAULT_TRADE_XCH",
         "MARKET_RISK_PRESET",
+        "MINIMUM_PROFIT_XCH",
+        "EXPECTED_CANCEL_REQUOTES",
+        "COMPETITION_COOLDOWN_SECS",
         # Spread & pricing
         "SPREAD_BPS",
         "MIN_EDGE_BPS",
