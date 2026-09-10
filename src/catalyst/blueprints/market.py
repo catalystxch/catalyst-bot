@@ -621,8 +621,26 @@ def api_price():
     return api_server._fetch_price_standalone(asset_id, decimals)
 
 
-def _post_tibet_provider_status(asset_id: str) -> dict:
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_utc_timestamp(value) -> datetime | None:
+    if type(value) is not str or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _post_tibet_provider_status(asset_id: str, *, now: datetime | None = None) -> dict:
     """Return the newest durable evidence for each provider capability."""
+
+    current_time = now or _utc_now()
 
     declared = {
         "dexie": ["discover_offer", "order_book", "publish_offer", "settled_trades"],
@@ -650,14 +668,51 @@ def _post_tibet_provider_status(asset_id: str) -> dict:
         if provider not in providers or providers[provider]["observed_at"] is not None:
             continue
         quality = str(row.get("quality") or "unavailable").lower()
+        fresh_until = _parse_utc_timestamp(row.get("fresh_until"))
+        reasons = list(row.get("reason_codes") or [])
+        if fresh_until is None or fresh_until < current_time:
+            quality = "unavailable"
+            if "evidence_expired" not in reasons:
+                reasons.append("evidence_expired")
         providers[provider].update(
             status=quality,
             observed_at=row.get("observed_at"),
             fresh_until=row.get("fresh_until"),
-            reason_codes=list(row.get("reason_codes") or []),
+            reason_codes=reasons,
         )
     providers["tibetswap"] = {"status": "retired", "capabilities": []}
     return providers
+
+
+def _age_confidence_snapshot(confidence: dict, providers: dict) -> dict:
+    """Project persisted confidence through current provider freshness.
+
+    A durable snapshot is historical evidence, not an evergreen mutation
+    permit.  When its book sources expire, the API must immediately degrade
+    the displayed state even before the next runtime refresh is able to write
+    another snapshot.
+    """
+    aged = dict(confidence)
+    reasons = list(aged.get("reason_codes") or [])
+    source_health = dict(aged.get("source_health") or {})
+    fresh_books = 0
+    for provider_id in ("dexie", "splash"):
+        status = str((providers.get(provider_id) or {}).get("status") or "")
+        if status == "valid":
+            fresh_books += 1
+        elif provider_id in source_health:
+            source_health[provider_id] = "unavailable"
+    if fresh_books == 0:
+        aged["state"] = "RED"
+        if aged.get("derived_at") is not None and "market_evidence_expired" not in reasons:
+            reasons.append("market_evidence_expired")
+    elif fresh_books == 1 and str(aged.get("state") or "RED").upper() == "GREEN":
+        aged["state"] = "AMBER"
+        if "single_provider_dependency" not in reasons:
+            reasons.append("single_provider_dependency")
+    aged["reason_codes"] = reasons
+    aged["source_health"] = source_health
+    return aged
 
 
 def _runtime_confidence_metrics() -> dict:
@@ -754,20 +809,23 @@ def api_market_confidence():
             "material": True,
         }
 
+    current_time = _utc_now()
+    providers = _post_tibet_provider_status(asset_id, now=current_time)
+    confidence = _age_confidence_snapshot(confidence, providers)
     state = str(confidence.get("state") or "RED").upper()
     degraded_active = bool(
         degraded and degraded.get("degraded_since")
     )
     can_create = state == "GREEN" and not degraded_active
-    can_requote = state in {"GREEN", "AMBER"} and not degraded_active
+    can_requote = state == "GREEN" and not degraded_active
     payload = {
         "market_model": "offer_book",
         "asset_id": asset_id,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": current_time.isoformat(),
         "confidence": confidence,
         "degraded": degraded,
         "migration": migration,
-        "providers": _post_tibet_provider_status(asset_id),
+        "providers": providers,
         "metrics": _runtime_confidence_metrics(),
         "can_create": can_create,
         "can_requote": can_requote,

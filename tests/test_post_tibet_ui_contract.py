@@ -4,6 +4,7 @@ from unittest.mock import Mock
 from pathlib import Path
 from types import SimpleNamespace
 from decimal import Decimal
+from datetime import datetime, timezone
 
 import api_server
 from blueprints import market
@@ -54,6 +55,22 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
         market.database, "get_post_tibet_migration_report", Mock(return_value=migration)
     )
     monkeypatch.setattr(
+        market.database,
+        "get_market_provider_observations",
+        Mock(
+            return_value=[
+                {
+                    "provider_id": provider,
+                    "quality": "valid",
+                    "observed_at": "2999-01-01T00:00:00.000000Z",
+                    "fresh_until": "2999-01-01T00:01:00.000000Z",
+                    "reason_codes": [],
+                }
+                for provider in ("dexie", "splash")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
         api_server,
         "bot",
         SimpleNamespace(
@@ -89,6 +106,62 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
     assert payload["metrics"]["independent_ask_depth_xch"] == "3"
     assert payload["metrics"]["required_depth_xch"] == "1"
     assert payload["metrics"]["manipulation_score"] == 12
+
+
+def test_market_confidence_endpoint_ages_expired_provider_evidence(monkeypatch):
+    monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
+    monkeypatch.setattr(
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(
+            return_value={
+                "asset_id": ASSET_ID,
+                "state": "GREEN",
+                "derived_at": "2026-09-10T12:00:00.000000Z",
+                "reason_codes": [],
+                "source_health": {"dexie": "valid", "splash": "valid"},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        market.database, "get_degraded_market_state", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        market.database, "get_post_tibet_migration_report", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        market.database,
+        "get_market_provider_observations",
+        Mock(
+            return_value=[
+                {
+                    "provider_id": provider,
+                    "quality": "valid",
+                    "observed_at": "2026-09-10T12:00:00.000000Z",
+                    "fresh_until": "2026-09-10T12:00:20.000000Z",
+                    "reason_codes": [],
+                }
+                for provider in ("dexie", "splash")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        market,
+        "_utc_now",
+        lambda: datetime(2026, 9, 10, 12, 1, tzinfo=timezone.utc),
+        raising=False,
+    )
+
+    with api_server.app.test_request_context("/api/market/confidence"):
+        response = market.api_market_confidence()
+
+    payload = response.get_json()
+    assert payload["confidence"]["state"] == "RED"
+    assert "market_evidence_expired" in payload["confidence"]["reason_codes"]
+    assert payload["providers"]["dexie"]["status"] == "unavailable"
+    assert payload["providers"]["splash"]["status"] == "unavailable"
+    assert payload["can_create"] is False
+    assert payload["can_requote"] is False
 
 
 def test_market_confidence_endpoint_fails_closed_while_evidence_is_warming(monkeypatch):
