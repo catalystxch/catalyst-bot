@@ -637,10 +637,16 @@ def _parse_utc_timestamp(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _post_tibet_provider_status(asset_id: str, *, now: datetime | None = None) -> dict:
+def _post_tibet_provider_status(
+    asset_id: str,
+    *,
+    now: datetime | None = None,
+    evidence_digests: tuple[str, ...] = (),
+) -> dict:
     """Return the newest durable evidence for each provider capability."""
 
     current_time = now or _utc_now()
+    snapshot_digests = frozenset(str(value) for value in evidence_digests if value)
 
     declared = {
         "dexie": ["discover_offer", "order_book", "publish_offer", "settled_trades"],
@@ -667,6 +673,11 @@ def _post_tibet_provider_status(asset_id: str, *, now: datetime | None = None) -
         provider = str(row.get("provider_id") or "").lower()
         if provider not in providers or providers[provider]["observed_at"] is not None:
             continue
+        if provider in {"dexie", "splash"}:
+            if str(row.get("capability") or "").lower() != "order_book":
+                continue
+            if snapshot_digests and row.get("payload_sha256") not in snapshot_digests:
+                continue
         quality = str(row.get("quality") or "unavailable").lower()
         fresh_until = _parse_utc_timestamp(row.get("fresh_until"))
         reasons = list(row.get("reason_codes") or [])
@@ -678,13 +689,21 @@ def _post_tibet_provider_status(asset_id: str, *, now: datetime | None = None) -
             status=quality,
             observed_at=row.get("observed_at"),
             fresh_until=row.get("fresh_until"),
+            capability=row.get("capability"),
+            payload_sha256=row.get("payload_sha256"),
             reason_codes=reasons,
         )
+    if snapshot_digests:
+        for provider in ("dexie", "splash"):
+            if providers[provider]["observed_at"] is None:
+                providers[provider]["reason_codes"] = ["snapshot_evidence_missing"]
     providers["tibetswap"] = {"status": "retired", "capabilities": []}
     return providers
 
 
-def _age_confidence_snapshot(confidence: dict, providers: dict) -> dict:
+def _age_confidence_snapshot(
+    confidence: dict, providers: dict, *, now: datetime | None = None
+) -> dict:
     """Project persisted confidence through current provider freshness.
 
     A durable snapshot is historical evidence, not an evergreen mutation
@@ -693,6 +712,7 @@ def _age_confidence_snapshot(confidence: dict, providers: dict) -> dict:
     another snapshot.
     """
     aged = dict(confidence)
+    current_time = now or _utc_now()
     reasons = list(aged.get("reason_codes") or [])
     source_health = dict(aged.get("source_health") or {})
     fresh_books = 0
@@ -702,6 +722,11 @@ def _age_confidence_snapshot(confidence: dict, providers: dict) -> dict:
             fresh_books += 1
         elif provider_id in source_health:
             source_health[provider_id] = "unavailable"
+    derived_at = _parse_utc_timestamp(aged.get("derived_at"))
+    if derived_at is not None and (current_time - derived_at).total_seconds() > 20:
+        fresh_books = 0
+        if "confidence_snapshot_expired" not in reasons:
+            reasons.append("confidence_snapshot_expired")
     if fresh_books == 0:
         aged["state"] = "RED"
         if aged.get("derived_at") is not None and "market_evidence_expired" not in reasons:
@@ -810,8 +835,12 @@ def api_market_confidence():
         }
 
     current_time = _utc_now()
-    providers = _post_tibet_provider_status(asset_id, now=current_time)
-    confidence = _age_confidence_snapshot(confidence, providers)
+    providers = _post_tibet_provider_status(
+        asset_id,
+        now=current_time,
+        evidence_digests=tuple(confidence.get("evidence_digests") or ()),
+    )
+    confidence = _age_confidence_snapshot(confidence, providers, now=current_time)
     state = str(confidence.get("state") or "RED").upper()
     degraded_active = bool(
         degraded and degraded.get("degraded_since")

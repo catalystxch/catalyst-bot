@@ -492,12 +492,14 @@ def _resolve_smart_mid_price(
 ) -> dict:
     """Resolve the best CAT-specific mid price Smart Settings can use.
 
-    Prefer the executable two-sided Dexie order book, then Dexie ticker data,
-    then settled-trade VWAP. ``tibet`` is accepted only for one-release call
-    compatibility and is never consumed as live evidence.
+    Require an executable two-sided Dexie order book. Ticker, explorer, and
+    settled-trade values remain diagnostics only: none proves that both sides
+    of the current public market can actually trade. ``tibet`` is accepted
+    only for one-release call compatibility and is never consumed as evidence.
     """
     messages = messages if messages is not None else []
-    dexie_price = ticker.get("price", 0) if isinstance(ticker, dict) else 0
+    del ticker
+    dexie_price = 0
     tibet_price = 0
     spacescan_price = (
         spacescan.get("price_xch", 0)
@@ -517,19 +519,10 @@ def _resolve_smart_mid_price(
         dexie_price = mid_price
         price_source = "dexie_orderbook"
         messages.append(f"Price: {mid_price:.8f} (Dexie orderbook)")
-    elif dexie_price > 0:
-        mid_price = dexie_price
-        price_source = "dexie_ticker"
-        messages.append(f"Price: {mid_price:.8f} (Dexie only)")
     else:
-        vwap_price = _smart_trade_vwap(trades)
-        if vwap_price > 0:
-            mid_price = vwap_price
-            price_source = "dexie_trade_vwap"
-            messages.append(f"Price: {mid_price:.8f} (Dexie trade VWAP)")
-
-    if price_source.startswith("dexie_") and dexie_price <= 0 and mid_price > 0:
-        dexie_price = mid_price
+        messages.append(
+            "Price unavailable: a trusted two-sided Dexie order book is required"
+        )
 
     if spacescan_price > 0 and mid_price > 0:
         spacescan_gap_bps = abs(spacescan_price - mid_price) / mid_price * 10000

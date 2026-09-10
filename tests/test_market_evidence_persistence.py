@@ -107,6 +107,25 @@ def test_evidence_compaction_keeps_daily_non_sensitive_summary(isolated_db):
     assert "raw_evidence" not in summaries[0]
 
 
+def test_bot_housekeeping_compacts_provider_evidence_after_thirty_days(monkeypatch):
+    from bot_loop import BotLoop
+
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "compact_market_provider_evidence",
+        lambda **kwargs: calls.append(kwargs) or {
+            "deleted": 0,
+            "summaries_written": 0,
+        },
+    )
+
+    result = BotLoop._compact_market_evidence(now=NOW)
+
+    assert result == {"deleted": 0, "summaries_written": 0}
+    assert calls == [{"before": NOW - timedelta(days=30), "summarized_at": NOW}]
+
+
 def test_guarded_price_reset_clears_derived_market_evidence_but_preserves_migration(
     isolated_db,
 ):

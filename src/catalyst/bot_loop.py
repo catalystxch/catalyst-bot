@@ -13295,6 +13295,20 @@ class BotLoop:
     # Housekeeping
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _compact_market_evidence(*, now: datetime | None = None) -> dict:
+        """Retain detailed provider evidence for 30 days, then summarize it."""
+
+        from database import compact_market_provider_evidence
+
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError("market evidence compaction time must be timezone-aware")
+        current = current.astimezone(timezone.utc)
+        return compact_market_provider_evidence(
+            before=current - timedelta(days=30), summarized_at=current
+        )
+
     def _handle_housekeeping(self):
         """Periodic cleanup tasks (every 5 minutes)."""
         now = time.time()
@@ -13518,6 +13532,15 @@ class BotLoop:
             cleanup_old_events(days=30, severity_keep_days=90)
         except Exception:
             pass
+
+        try:
+            self._compact_market_evidence()
+        except Exception as evidence_error:
+            log_event(
+                "warning",
+                "market_evidence_compaction_failed",
+                f"Market evidence compaction failed: {evidence_error}",
+            )
 
         # ---- Proof-safe coin/offer drift diagnostics ----
         try:

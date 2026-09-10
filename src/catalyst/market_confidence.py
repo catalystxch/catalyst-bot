@@ -172,10 +172,21 @@ class MarketConfidenceEngine:
             "prior_observed_at": iso(self._prior_observed_at),
         }
 
-    def hydrate(self, state: Mapping[str, Any]) -> None:
-        """Restore only strictly validated state written by :meth:`export_state`."""
+    def hydrate(
+        self, state: Mapping[str, Any], *, allow_preset_rebase: bool = False
+    ) -> None:
+        """Restore strictly validated state, optionally rebased to a new preset.
 
-        if not isinstance(state, Mapping) or state.get("risk_preset") != self.risk_preset:
+        A preset change preserves trusted anchors and churn history but clears a
+        partially observed move because its persistence threshold may differ.
+        """
+
+        if type(allow_preset_rebase) is not bool:
+            raise TypeError("allow_preset_rebase must be an exact bool")
+        if not isinstance(state, Mapping):
+            raise ValueError("market confidence state is invalid")
+        preset_changed = state.get("risk_preset") != self.risk_preset
+        if preset_changed and not allow_preset_rebase:
             raise ValueError("market confidence state risk preset does not match")
 
         def optional_price(key: str) -> Decimal | None:
@@ -189,8 +200,8 @@ class MarketConfidenceEngine:
             raise ValueError("trusted restart range is incomplete")
         if bid is not None and (bid > ask or midpoint is None or not bid <= midpoint <= ask):
             raise ValueError("trusted restart range is invalid")
-        pending_midpoint = optional_price("pending_midpoint")
-        pending_refreshes = state.get("pending_refreshes")
+        pending_midpoint = None if preset_changed else optional_price("pending_midpoint")
+        pending_refreshes = 0 if preset_changed else state.get("pending_refreshes")
         if type(pending_refreshes) is not int or pending_refreshes < 0:
             raise ValueError("pending refresh count is invalid")
         if (pending_midpoint is None) != (pending_refreshes == 0):

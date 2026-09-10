@@ -52,7 +52,7 @@ class OfferBookMarketRuntime:
         self._engine = MarketConfidenceEngine(risk_preset=risk_preset)
         persisted_state = load_confidence_engine_state(self.asset_id)
         if persisted_state is not None:
-            self._engine.hydrate(persisted_state)
+            self._engine.hydrate(persisted_state, allow_preset_rebase=True)
         self._degraded = DegradedMarketController(asset_id=self.asset_id)
 
     def refresh(

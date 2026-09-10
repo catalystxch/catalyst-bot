@@ -465,8 +465,10 @@ class OfferManager:
         # Phase two begins only after the whole selected/open cohort passed
         # exact identity, state, and slot validation.  Task 8 remains the
         # only cancellation authority and owns its wallet effect.
+        action_priority = {"commit": 0, "cancel": 1, "wait": 2}
         for action, parent, pause in sorted(
-            resume_actions, key=lambda item: item[1]["intent_id"]
+            resume_actions,
+            key=lambda item: (action_priority[item[0]], item[1]["intent_id"]),
         ):
             if action == "wait":
                 return {}, pause
@@ -510,6 +512,36 @@ class OfferManager:
             )
             return {}, "awaiting_task8_task9"
         return candidates, None
+
+    def _advance_pending_refresh_lineage(
+        self, open_offers: List[Dict[str, Any]], side: str
+    ) -> Optional[str]:
+        """Advance durable child-first replacement work before quote selection.
+
+        Price reversion, graduated tier filtering, and per-cycle budgets must not
+        hide a parent once its replacement child is durable.  Likewise, generic
+        cap trimming must not cancel that child while the parent still owns the
+        incomplete lineage edge.
+        """
+
+        try:
+            pending_parent_ids = database.get_pending_refresh_lineage_parent_ids(
+                asset_id=cfg.CAT_ASSET_ID, side=side, limit=128
+            )
+        except Exception as exc:
+            log_event(
+                "warning",
+                "refresh_lineage_query_failed",
+                f"Refresh lineage {side}: durable query failed closed: {exc}",
+            )
+            return "lineage_query_failed"
+        if not pending_parent_ids:
+            return None
+        completion_pause = self._resume_pending_refresh_lineage_completions(side)
+        if completion_pause is not None:
+            return completion_pause
+        _parents, cohort_pause = self._collect_staged_refresh_parents(open_offers, side)
+        return cohort_pause or "awaiting_refresh_lineage"
 
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
@@ -4967,6 +4999,25 @@ class OfferManager:
         # ── Gather open offers to replace ──
         all_open = get_open_offers(side=side, cat_asset_id=cfg.CAT_ASSET_ID)
         open_offers = [o for o in all_open if o.get("tier") not in ("boost", "sniper")]
+        pending_lineage_pause = self._advance_pending_refresh_lineage(open_offers, side)
+        if pending_lineage_pause is not None:
+            log_event(
+                "info",
+                "requote_pending_lineage_paused",
+                f"Requote {side}: {pending_lineage_pause}; holding new children",
+            )
+            pending_count = len(open_offers)
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": pending_count,
+                "original_target_count": pending_count,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
+            }
         # Wallet omission is diagnostic only.  Durable nonterminal rows remain
         # capacity-owning until Task 9 commits exact terminal proof.
         # Sort most-at-risk first so cancels prioritise the stale-est offers.
@@ -5112,25 +5163,6 @@ class OfferManager:
                 "target_count": 0,
                 "original_target_count": 0,
                 "tier_filter_drained": False,
-            }
-
-        pending_lineage_pause = self._resume_pending_refresh_lineage_completions(side)
-        if pending_lineage_pause is not None:
-            log_event(
-                "info",
-                "requote_pending_lineage_paused",
-                f"Requote {side}: {pending_lineage_pause}; holding new children",
-            )
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": 0,
-                "failed_cancel_count": 0,
-                "tier_filter_drained": False,
-                "refresh_paused": True,
             }
 
         # Pending children normally consume the overlap coin that makes the
@@ -7717,6 +7749,17 @@ class OfferManager:
                 }
             except Exception:
                 _excluded_ids = set()
+                _db_open = []
+            pending_lineage_pause = self._advance_pending_refresh_lineage(
+                list(_db_open), side
+            )
+            if pending_lineage_pause is not None:
+                log_event(
+                    "info",
+                    "trim_pending_lineage_paused",
+                    f"Trim {side}: {pending_lineage_pause}; preserving staged child",
+                )
+                continue
             open_offers = [
                 o
                 for o in open_offers_all

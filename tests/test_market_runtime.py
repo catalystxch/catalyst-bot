@@ -322,6 +322,42 @@ def test_bot_rebuilds_market_runtime_when_risk_preset_changes(isolated_db, monke
     assert aggressive._engine.risk_preset == "aggressive"
 
 
+def test_runtime_rebases_persisted_confidence_state_when_risk_preset_changes(
+    isolated_db,
+):
+    balanced = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: _book(),
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    balanced.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    before = balanced._engine.export_state()
+
+    aggressive = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="aggressive",
+        fetch_dexie_book=lambda _asset: _book(),
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    after = aggressive._engine.export_state()
+
+    assert after["risk_preset"] == "aggressive"
+    assert after["last_trusted_midpoint"] == before["last_trusted_midpoint"]
+    assert after["last_trusted_bid"] == before["last_trusted_bid"]
+    assert after["last_trusted_ask"] == before["last_trusted_ask"]
+    assert after["prior_offer_ids"] == before["prior_offer_ids"]
+    assert after["prior_observed_at"] == before["prior_observed_at"]
+    assert after["pending_midpoint"] is None
+    assert after["pending_refreshes"] == 0
+
+
 def test_bot_runtime_phase_gate_blocks_exposure_but_never_safety_cancel(monkeypatch):
     import bot_loop
 

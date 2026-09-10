@@ -238,12 +238,14 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(resolved["arb_gap_bps"], 0)
         self.assertEqual(resolved["price_source"], "dexie_orderbook")
 
-    def test_price_resolver_uses_trade_vwap_as_last_resort(self):
+    def test_price_resolver_rejects_ticker_and_trade_history_without_two_sided_book(
+        self,
+    ):
         from blueprints.smart_defaults import _resolve_smart_mid_price
 
         messages = []
         resolved = _resolve_smart_mid_price(
-            ticker={},
+            ticker={"price": 9.0},
             tibet={},
             spacescan={},
             trades={
@@ -257,10 +259,27 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             messages=messages,
         )
 
-        self.assertEqual(resolved["mid_price"], 3.5)
-        self.assertEqual(resolved["dexie_price"], 3.5)
-        self.assertEqual(resolved["price_source"], "dexie_trade_vwap")
-        self.assertIn("Dexie trade VWAP", messages[0])
+        self.assertEqual(resolved["mid_price"], 0)
+        self.assertEqual(resolved["dexie_price"], 0)
+        self.assertEqual(resolved["price_source"], "")
+        self.assertTrue(any("two-sided" in message for message in messages))
+
+    def test_price_resolver_rejects_one_sided_orderbook(self):
+        from blueprints.smart_defaults import _resolve_smart_mid_price
+
+        messages = []
+        resolved = _resolve_smart_mid_price(
+            ticker={"price": 2.0},
+            tibet={},
+            spacescan={},
+            trades={},
+            orderbook={"best_bid": 1.0, "best_ask": 0},
+            messages=messages,
+        )
+
+        self.assertEqual(resolved["mid_price"], 0)
+        self.assertEqual(resolved["price_source"], "")
+        self.assertTrue(any("two-sided" in message for message in messages))
 
     def test_response_contract_includes_safety_fields(self):
         root = Path(__file__).resolve().parents[1]
@@ -693,13 +712,13 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             },
         }
         orderbook = {
-            "has_data": False,
+            "has_data": True,
             "api_ok": True,
-            "num_buy_offers": 0,
-            "num_sell_offers": 0,
-            "competitor_spread_bps": 0,
-            "best_bid": 0,
-            "best_ask": 0,
+            "num_buy_offers": 1,
+            "num_sell_offers": 1,
+            "competitor_spread_bps": 100,
+            "best_bid": 0.0001089,
+            "best_ask": 0.0001100,
         }
 
         with (
@@ -1204,13 +1223,13 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                 smart_defaults,
                 "_fetch_dexie_orderbook_standalone",
                 return_value={
-                    "has_data": False,
+                    "has_data": True,
                     "api_ok": True,
-                    "num_buy_offers": 0,
-                    "num_sell_offers": 0,
-                    "competitor_spread_bps": 0,
-                    "best_bid": 0,
-                    "best_ask": 0,
+                    "num_buy_offers": 1,
+                    "num_sell_offers": 1,
+                    "competitor_spread_bps": 100,
+                    "best_bid": 0.0000815,
+                    "best_ask": 0.0000824,
                 },
             ),
             patch.object(
