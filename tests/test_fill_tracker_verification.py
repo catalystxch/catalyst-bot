@@ -8,7 +8,7 @@ import unittest
 class _FakeCfg:
     SPACESCAN_ENABLED = True
     WALLET_ADDRESS = "xch1ourwalletaddress"
-    CAT_ASSET_ID = "asset-test"
+    CAT_ASSET_ID = "34" * 32
     SAGE_SET_CHANGE_ADDRESS = False
     WALLET_TYPE = "sage"
 
@@ -47,6 +47,7 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.recorded = []
         self.status_updates = []
         self.lifecycle_updates = []
+        self.fill_confidence_assessments = []
         self.fills = []
         self.db_offer = {"trade_id": "", "coin_id": "0xcoin123"}
 
@@ -56,6 +57,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         fake_database = types.ModuleType("database")
         fake_database.record_fill = self._record_fill
+        fake_database.record_fill_confidence_assessment = (
+            self.fill_confidence_assessments.append
+        )
         fake_database.get_unmatched_fills = lambda *args, **kwargs: []
         fake_database.match_round_trip = lambda *args, **kwargs: None
         fake_database.get_open_offers = lambda *args, **kwargs: []
@@ -149,6 +153,52 @@ class FillTrackerVerificationTests(unittest.TestCase):
         self.assertTrue(
             any(evt == "fill_verify_pending" for _, evt, _, _ in self.logged)
         )
+
+    def test_disappearance_persists_observed_fill_confidence_without_authority(self):
+        tracker = self.fill_tracker.FillTracker()
+        trade_id = "ab" * 32
+        tracker._previous_ids["buy"] = {trade_id}
+
+        result = tracker.detect_fills(set(), set(), {})
+
+        self.assertEqual(result["buy_fills"], [])
+        self.assertTrue(self.fill_confidence_assessments)
+        assessment = self.fill_confidence_assessments[0]
+        self.assertEqual(assessment["trade_id"], trade_id)
+        self.assertEqual(assessment["confidence"], "OBSERVED")
+        self.assertFalse(assessment["can_account"])
+        self.assertFalse(assessment["can_replace"])
+
+    def test_dexie_and_spacescan_hints_persist_probable_without_accounting(self):
+        trade_id = "ab" * 32
+        self.db_offer = {
+            "trade_id": trade_id,
+            "coin_id": "0xcoin123",
+            "dexie_id": "dexie-completed",
+        }
+        self.fake_dexie_manager.get_offer_detail = lambda *args, **kwargs: {
+            "status": 4,
+            "trade_id": f"0x{trade_id}",
+            "involved_coins": ["0xcoin123"],
+        }
+        self.fake_spacescan.verify_fill = lambda coin_id, our_address: True
+        tracker = self.fill_tracker.FillTracker()
+        tracker._previous_ids["sell"] = {trade_id}
+
+        result = tracker.detect_fills(set(), set(), {})
+
+        self.assertEqual(result["sell_fills"], [])
+        probable = [
+            item
+            for item in self.fill_confidence_assessments
+            if item["confidence"] == "PROBABLE"
+        ]
+        self.assertEqual(len(probable), 1)
+        self.assertEqual(
+            probable[0]["reason_codes"], ["multiple_third_party_fill_hints"]
+        )
+        self.assertFalse(probable[0]["can_account"])
+        self.assertIn(trade_id, tracker._pending_reverify)
 
     def test_spacescan_backoff_does_not_consume_reverify_attempt_budget(self):
         self.fake_spacescan.verify_fill = lambda coin_id, our_address: None

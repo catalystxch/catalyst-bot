@@ -981,7 +981,25 @@ def api_fills():
     for fill in fills:
         fill["fill_confidence"] = "Confirmed"
         fill["fill_authority"] = _confirmed_fill_authority(fill.get("fill_id"))
-    return jsonify({"fills": api_server._serialize_list(fills)})
+    try:
+        activity = database.get_fill_confidence_assessments(
+            cfg.CAT_ASSET_ID,
+            limit=min(max(limit * 3, 20), 200),
+        )
+    except Exception as exc:
+        activity = []
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load fill confidence activity for UI",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+    return jsonify(
+        {
+            "fills": api_server._serialize_list(fills),
+            "activity": api_server._serialize_list(activity),
+        }
+    )
 
 
 @bp.route("/api/fills/classified")

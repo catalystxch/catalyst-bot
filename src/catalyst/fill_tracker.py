@@ -3,13 +3,14 @@
 The `FillTracker` class detects offer fills by diffing the set of trade IDs
 present on the wallet between polls. Disappearances that were not caused by
 bot-initiated cancels (tracked via `OfferManager._bot_cancelled_ids`) are
-treated as candidate fills, then verified on-chain through a Sage -> Dexie ->
-Spacescan fallback chain before being recorded.
+treated as candidate fills. Provider observations remain preliminary hints until
+the exact Sage reconciliation path proves the terminal wallet effect; only that
+authoritative result may create accounting or replacement effects.
 
 Key responsibilities:
     - Diff trade-ID snapshots each cycle to find candidate fills
-    - Verify fills on-chain via the Sage/Dexie/Spacescan fallback chain
-    - Record verified fills and drive `OfferState` transitions
+    - Collect preliminary Sage/Dexie/Spacescan fill evidence
+    - Record fills and drive `OfferState` transitions only after exact Sage proof
     - Match buy<->sell round-trips for PnL via a 4-pass algorithm
 
 A 3-strike mass-disappearance guard absorbs transient wallet-RPC blips where
@@ -154,7 +155,7 @@ class FillTracker:
         # Dexie detail cache used for third-party diagnostics and exact-trade
         # correlation before Task 9 performs authoritative reconciliation.
         self._last_dexie_details: Dict[str, Optional[Dict]] = {}
-        self._exact_trade_confirmations: Set[str] = set()
+        self._last_fill_verification_sources: Dict[str, Set[str]] = {}
 
         # Unverified-fill retry bookkeeping. A disappeared offer whose
         # source-truth verification is inconclusive (provider unreachable,
@@ -471,6 +472,18 @@ class FillTracker:
         fill = next((row for row in fill_rows if row.get("trade_id") == trade_id), None)
         if fill is None:
             return None
+        confirmed_height = fill.get("spent_block_height") or fill.get(
+            "spent_block_index"
+        )
+        if type(confirmed_height) is int and confirmed_height > 0:
+            self._persist_fill_confidence_assessment(
+                trade_id,
+                {
+                    "offer_missing": True,
+                    "sage_status": "confirmed",
+                    "sage_confirmed_height": confirmed_height,
+                },
+            )
         fill_detail = {
             "fill_id": fill["fill_id"],
             "trade_id": trade_id,
@@ -489,6 +502,57 @@ class FillTracker:
         self._pending_reverify.pop(trade_id, None)
         self._forget_recently_created(trade_id)
         return fill_detail
+
+    def _persist_fill_confidence_assessment(
+        self, trade_id: str, evidence: Dict
+    ) -> Optional[Dict]:
+        """Persist diagnostic fill maturity without granting wallet authority."""
+
+        try:
+            from database import record_fill_confidence_assessment
+            from fill_classifier import (
+                assess_fill_confidence,
+                build_fill_confidence_record,
+            )
+
+            decision = assess_fill_confidence(evidence)
+            record = build_fill_confidence_record(
+                trade_id=trade_id,
+                asset_id=str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower(),
+                decision=decision,
+                evidence=evidence,
+                observed_at=_dt.datetime.now(_dt.timezone.utc),
+            )
+            record_fill_confidence_assessment(record)
+            return record
+        except Exception as exc:
+            log_event(
+                "debug",
+                "fill_confidence_assessment_unavailable",
+                "Could not persist non-authoritative fill confidence evidence",
+                data={"trade_id": trade_id, "error": type(exc).__name__},
+            )
+            return None
+
+    def _persist_provider_fill_confidence(
+        self, trade_id: str, verification: str
+    ) -> Optional[Dict]:
+        """Translate non-authoritative provider results into maturity evidence."""
+
+        evidence = {"offer_missing": True}
+        sources = set(self._last_fill_verification_sources.get(trade_id, set()))
+        detail = self._last_dexie_details.get(trade_id)
+        if isinstance(detail, dict) and _dexie_detail_confirms_fill(detail):
+            sources.add("dexie")
+        if verification == "filled" and not sources:
+            # The legacy verifier's direct-true branch is Spacescan.  More
+            # authoritative Sage materialization is recorded separately only
+            # after exact reconciliation commits the fill row.
+            sources.add("spacescan")
+        for source in sorted(sources):
+            if source in {"dexie", "splash", "spacescan"}:
+                evidence[f"{source}_status"] = "filled"
+        return self._persist_fill_confidence_assessment(trade_id, evidence)
 
     def _park_for_authoritative_reconciliation(self, trade_id: str, side: str) -> None:
         """Retain a candidate offer until the proof-bound reconciler resolves it."""
@@ -730,6 +794,8 @@ class FillTracker:
                 )
                 verdict = "unverified"
 
+            self._persist_provider_fill_confidence(trade_id, verdict)
+
             if verdict == "filled":
                 fill_detail = self._record_verified_fill(trade_id, side, details_cache)
                 if fill_detail:
@@ -892,7 +958,7 @@ class FillTracker:
                 # Spacescan. If Dexie already reports a terminal cancel/fill
                 # for an offer we cancelled, use that verdict before spending
                 # an on-chain verifier call. Unknown Dexie states still fall
-                # through to the Spacescan golden gate below.
+                # through to the independent Spacescan evidence check below.
                 try:
                     _terminal = self._dexie_terminal_status(_pv_tid)
                 except Exception:
@@ -954,6 +1020,10 @@ class FillTracker:
                 )
 
         for trade_id in disappeared_ids:
+            self._persist_fill_confidence_assessment(
+                trade_id,
+                {"offer_missing": True},
+            )
             # Do NOT early-exit on bot-cancelled here. The _bot_cancelled_ids
             # flag is set BEFORE the cancel RPC lands (offer_manager._cancel
             # path), so a fill that beats the cancel is silently lost if we
@@ -1029,7 +1099,7 @@ class FillTracker:
                         "fill_beat_cancel_dexie",
                         f"{side.upper()} offer {trade_id[:16]}... was marked "
                         f"bot-cancelled but Dexie reports COMPLETED — "
-                        f"recording fill before Spacescan.",
+                        f"requesting exact Sage reconciliation.",
                         data={"trade_id": trade_id, "side": side},
                     )
                 fill_detail = self._record_verified_fill(trade_id, side, details_cache)
@@ -1101,9 +1171,9 @@ class FillTracker:
                 )
                 continue
 
-            # ---- Spacescan Verification Gate (Golden Source of Truth) ----
-            # Before recording ANY fill, verify the coin was actually spent
-            # on-chain to an external address. This prevents ALL phantom fills.
+            # ---- Preliminary external evidence gate ----
+            # Collect a provider view of the spend before exact Sage
+            # reconciliation. No result here can independently book a fill.
 
             # Lifecycle: MEMPOOL_SEEN signal → mempool_observed intermediate state.
             # Offer has left the wallet — awaiting on-chain confirmation.
@@ -1118,18 +1188,19 @@ class FillTracker:
             verification = _verify_cache.get(trade_id)
             if verification is None:
                 verification = self._verify_fill_on_chain(trade_id, side)
+            self._persist_provider_fill_confidence(trade_id, verification)
             if verification == "filled":
                 if was_cancelled:
                     # Cancel/fill race: the bot issued a cancel but the
-                    # counterparty took the offer first. Spacescan confirmed
-                    # the on-chain spend as a fill, so we record it and the
-                    # local cancel assumption is overridden.
+                    # counterparty may have taken the offer first. Spacescan
+                    # observed the spend, so exact Sage reconciliation decides
+                    # whether the local cancel assumption can be overridden.
                     log_event(
                         "warning",
                         "fill_beat_cancel",
                         f"{side.upper()} offer {trade_id[:16]}... was marked "
-                        f"bot-cancelled but Spacescan confirms a fill — "
-                        f"recording fill and overriding local cancel state.",
+                        f"bot-cancelled but Spacescan suggests a fill — "
+                        f"requesting exact Sage reconciliation.",
                         data={"trade_id": trade_id, "side": side},
                     )
                 fill_detail = self._record_verified_fill(trade_id, side, details_cache)
@@ -1372,6 +1443,7 @@ class FillTracker:
             "rejected" = Confirmed not a fill
             "unverified" = Offer vanished but on-chain verification is unavailable
         """
+        self._last_fill_verification_sources.pop(trade_id, None)
         try:
             from spacescan import verify_fill as spacescan_verify
         except ImportError:
@@ -1439,9 +1511,9 @@ class FillTracker:
         # we short-circuit before spending a Spacescan call. All other
         # Dexie states (mismatches, expired-without-completion, etc.)
         # used to veto here but that let stale Dexie data reject real
-        # fills before Spacescan (the agreed golden gate) could weigh in.
-        # Those cases now fall through to Spacescan for the authoritative
-        # answer; the Dexie detail remains cached for reconciliation diagnostics.
+        # fills before Spacescan could add its independent provider hint.
+        # Those cases now fall through to Spacescan for preliminary evidence;
+        # the Dexie detail remains cached for reconciliation diagnostics.
         primary_coin_id = candidate_coin_ids[0]
         dexie_still_open = self._check_dexie_offer_still_open(
             trade_id, db_offer, primary_coin_id
@@ -1466,6 +1538,7 @@ class FillTracker:
         coin_id = verified_coin_id  # use the coin that gave a decisive answer
 
         if is_real_fill:
+            self._last_fill_verification_sources[trade_id] = {"spacescan"}
             reused_coin_verdict = self._reused_coin_fill_verdict(
                 trade_id, side, coin_id, db_offer
             )
@@ -1473,9 +1546,9 @@ class FillTracker:
                 return reused_coin_verdict
             log_event(
                 "success",
-                "fill_verified",
-                f"Spacescan CONFIRMED {side} fill for {trade_id[:16]}... "
-                f"(coin {coin_id[:16]}...)",
+                "fill_candidate_observed_spacescan",
+                f"Spacescan observed a likely {side} fill for {trade_id[:16]}... "
+                f"(coin {coin_id[:16]}...); awaiting exact Sage reconciliation",
             )
             return "filled"
         elif is_real_fill is False:
@@ -1496,6 +1569,7 @@ class FillTracker:
             ):
                 sage_confirmed = self._check_sage_offer_confirmed(trade_id)
                 if sage_confirmed:
+                    self._last_fill_verification_sources[trade_id] = {"sage"}
                     log_event(
                         "success",
                         "fill_sage_override",
@@ -1503,12 +1577,10 @@ class FillTracker:
                         f"{trade_id[:16]}... (batch settlement via own address). "
                         f"Recording fill.",
                     )
-                    self._exact_trade_confirmations.add(trade_id)
                     return "filled"
 
-                # Sage also non-confirmatory — try Dexie as a final tiebreaker.
-                # Dexie independently verifies the on-chain spend bundle;
-                # its status=4 is authoritative even when Spacescan + Sage disagree.
+                # Sage also non-confirmatory — collect Dexie as another provider
+                # hint. It cannot override the exact Sage authority boundary.
                 try:
                     _dexie_id_false = (db_offer or {}).get("dexie_id")
                     if _dexie_id_false:
@@ -1533,8 +1605,8 @@ class FillTracker:
                                     "fill_spacescan_rejected_dexie_disagrees",
                                     f"Spacescan self-spend AND Sage non-confirm BUT "
                                     f"Dexie status={_detail_f.get('status')} suggests FILL for "
-                                    f"{trade_id[:16]}... — Spacescan remains authoritative; "
-                                    f"NOT recording fill.",
+                                    f"{trade_id[:16]}... — provider evidence conflicts; "
+                                    f"NOT recording a fill without exact Sage proof.",
                                 )
                 except Exception as _dexie_err_f:
                     log_event(
@@ -1552,13 +1624,10 @@ class FillTracker:
                 )
                 return "rejected"
 
-            # SAGE_SET_CHANGE_ADDRESS not active — Spacescan is authoritative.
-            # Per agreed source-of-truth policy (Spacescan golden gate →
-            # Sage → Dexie), Dexie CANNOT override an explicit Spacescan
-            # rejection: that inversion caused phantom fills from stale
-            # Dexie completions. We still surface the disagreement loudly
-            # so the operator can manually reconcile if Dexie turns out
-            # to be right — but we do NOT book the fill automatically.
+            # With no exact Sage confirmation, an explicit Spacescan rejection
+            # prevents this candidate from advancing. Dexie cannot override it:
+            # that inversion caused phantom fills from stale completions. Surface
+            # the disagreement for diagnosis, but never book it automatically.
             try:
                 _dexie_id_rej = (db_offer or {}).get("dexie_id")
                 if _dexie_id_rej:
@@ -1582,10 +1651,8 @@ class FillTracker:
                                 f"Spacescan REJECTED {side} fill for "
                                 f"{trade_id[:16]}... but Dexie status="
                                 f"{_detail_r.get('status')} "
-                                f"suggests COMPLETED. Spacescan is "
-                                f"authoritative — NOT recording fill. "
-                                f"Operator should reconcile manually if "
-                                f"Dexie turns out to be right.",
+                                f"suggests COMPLETED. Provider evidence conflicts; "
+                                f"NOT recording a fill without exact Sage proof.",
                                 data={
                                     "trade_id": trade_id,
                                     "side": side,
@@ -1615,19 +1682,19 @@ class FillTracker:
             # the operator does manually when checking if a fill was real.
 
             # Fallback 1: Ask Sage directly if the offer is confirmed/completed.
-            # This catches fills where Spacescan can't determine direction
-            # (common during AMM-mediated fills via TibetSwap where the on-chain
-            # spend pattern doesn't match direct peer-to-peer fills).
+            # This catches offers whose provider evidence is incomplete. Sage's
+            # exact terminal status is the only fallback that may advance the
+            # candidate to authoritative reconciliation.
             try:
                 sage_confirmed = self._check_sage_offer_confirmed(trade_id)
                 if sage_confirmed:
+                    self._last_fill_verification_sources[trade_id] = {"sage"}
                     log_event(
                         "success",
-                        "fill_verified_via_sage",
+                        "fill_candidate_confirmed_via_sage",
                         f"Spacescan inconclusive BUT Sage confirms FILL for "
-                        f"{trade_id[:16]}... — recording fill.",
+                        f"{trade_id[:16]}... — requesting exact reconciliation.",
                     )
-                    self._exact_trade_confirmations.add(trade_id)
                     return "filled"
             except Exception as _sage_err:
                 log_event(
@@ -1636,10 +1703,8 @@ class FillTracker:
                     f"Sage fallback check failed for {trade_id[:16]}...: {_sage_err}",
                 )
 
-            # Fallback 2: Check Dexie API for the offer's completion status.
-            # If Dexie reports the offer as completed (status=4), that's
-            # authoritative — Dexie processes the on-chain spend bundle and
-            # knows definitively whether the offer was taken.
+            # Fallback 2: Check Dexie for a completion hint. Dexie status is
+            # useful evidence but is not economic authority.
             try:
                 dexie_id = (db_offer or {}).get("dexie_id")
                 if dexie_id:
@@ -1658,14 +1723,14 @@ class FillTracker:
                             or not _dexie_trade  # no trade_id in response = trust dexie_id match
                         )
                         if _dexie_detail_confirms_fill(detail) and _trade_match:
+                            self._last_fill_verification_sources[trade_id] = {"dexie"}
                             log_event(
                                 "success",
-                                "fill_verified_via_dexie",
-                                f"Spacescan inconclusive BUT Dexie confirms FILL "
+                                "fill_candidate_observed_via_dexie",
+                                f"Spacescan inconclusive and Dexie suggests FILL "
                                 f"(status={detail.get('status')}) for "
-                                f"{trade_id[:16]}... — recording fill.",
+                                f"{trade_id[:16]}... — awaiting exact Sage reconciliation.",
                             )
-                            self._exact_trade_confirmations.add(trade_id)
                             return "filled"
                         elif _dexie_detail_confirms_cancel(detail):
                             log_event(
@@ -1755,7 +1820,6 @@ class FillTracker:
                     "source": "dexie",
                 },
             )
-            self._exact_trade_confirmations.add(trade_id)
             return None
         if dexie_terminal == "cancelled":
             log_event(
@@ -1792,7 +1856,6 @@ class FillTracker:
                     "source": "sage",
                 },
             )
-            self._exact_trade_confirmations.add(trade_id)
             return None
 
         if verified_fill_count > 0:
@@ -1980,10 +2043,9 @@ class FillTracker:
         cache blip and not a fill, so we short-circuit.
 
         All other Dexie signals (trade_id mismatch, coin mismatch, expired,
-        completed, errored, API failure) return None — we defer to the
-        Spacescan golden-gate verification for the authoritative verdict,
-        and Dexie is only used later as a tiebreaker when Spacescan cannot
-        decide.
+        completed, errored, API failure) return None. We collect an independent
+        Spacescan hint next; neither provider can create an economic effect
+        without the later exact Sage reconciliation.
 
         The Dexie detail dict (when successfully fetched) is still cached
         into ``self._last_dexie_details[trade_id]`` for later reconciliation
@@ -2018,7 +2080,7 @@ class FillTracker:
                 "fill_dexie_trade_mismatch_defer",
                 f"Dexie detail {dexie_id[:16]}... maps to trade "
                 f"{detail_trade_id[:16]}..., not {norm_trade_id[:16]}... "
-                f"Deferring to Spacescan for authoritative verdict.",
+                f"Deferring to independent Spacescan evidence.",
             )
             return None
 
@@ -2054,8 +2116,8 @@ class FillTracker:
                     "info",
                     "fill_dexie_open_expired_defer",
                     f"Dexie still shows {trade_id[:16]}... as OPEN, but the "
-                    f"offer expiry has passed; deferring to Spacescan for "
-                    f"the authoritative verdict.",
+                    f"offer expiry has passed; deferring to independent "
+                    f"Spacescan evidence.",
                     data={
                         "trade_id": trade_id,
                         "dexie_id": dexie_id,

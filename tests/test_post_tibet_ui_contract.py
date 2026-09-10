@@ -488,14 +488,35 @@ def test_fills_endpoint_labels_only_authoritative_rows_as_confirmed(monkeypatch)
         ),
         raising=False,
     )
+    monkeypatch.setattr(
+        offers.database,
+        "get_fill_confidence_assessments",
+        Mock(
+            return_value=[
+                {
+                    "assessment_id": "c" * 64,
+                    "trade_id": "d" * 64,
+                    "confidence": "PROBABLE",
+                    "outcome": "LIKELY_FILL",
+                    "reason_codes": ["multiple_third_party_fill_hints"],
+                    "can_account": False,
+                    "can_replace": False,
+                }
+            ]
+        ),
+        raising=False,
+    )
 
     with api_server.app.test_request_context("/api/fills"):
         response = offers.api_fills()
 
-    row = response.get_json()["fills"][0]
+    payload = response.get_json()
+    row = payload["fills"][0]
     assert row["fill_confidence"] == "Confirmed"
     assert row["fill_authority"]["spent_block_height"] == 123
     assert row["fill_authority"]["transaction_id"] == "a" * 64
+    assert payload["activity"][0]["confidence"] == "PROBABLE"
+    assert payload["activity"][0]["can_account"] is False
 
 
 def test_prestart_status_does_not_warn_when_operator_has_not_selected_a_pair(monkeypatch):

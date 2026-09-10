@@ -3541,6 +3541,43 @@ CREATE TABLE IF NOT EXISTS market_provider_observations (
 CREATE INDEX IF NOT EXISTS idx_market_provider_observations_asset_time
     ON market_provider_observations(asset_id, observed_at DESC);
 
+-- Immutable fill-candidate evidence.  Observed/Probable rows are diagnostic
+-- only; database checks make it impossible to mark them as economic authority.
+CREATE TABLE IF NOT EXISTS fill_confidence_assessments (
+    assessment_id             TEXT PRIMARY KEY,
+    trade_id                  TEXT NOT NULL,
+    asset_id                  TEXT NOT NULL,
+    confidence                TEXT NOT NULL
+                              CHECK(confidence IN ('OBSERVED','PROBABLE','CONFIRMED')),
+    outcome                   TEXT NOT NULL,
+    authority_source          TEXT NOT NULL,
+    reason_codes_json         TEXT NOT NULL CHECK(json_valid(reason_codes_json)),
+    market_confidence_impact  TEXT CHECK(market_confidence_impact IS NULL OR
+                                         market_confidence_impact='AMBER'),
+    can_account               INTEGER NOT NULL CHECK(can_account IN (0,1)),
+    can_replace               INTEGER NOT NULL CHECK(can_replace IN (0,1)),
+    evidence_json             TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    evidence_sha256           TEXT NOT NULL,
+    observed_at               TEXT NOT NULL,
+    CHECK((confidence='CONFIRMED' AND outcome='FILL' AND
+           can_account=1 AND can_replace=1) OR
+          (NOT (confidence='CONFIRMED' AND outcome='FILL') AND
+           can_account=0 AND can_replace=0))
+);
+CREATE INDEX IF NOT EXISTS idx_fill_confidence_asset_time
+    ON fill_confidence_assessments(asset_id, observed_at DESC, assessment_id DESC);
+CREATE INDEX IF NOT EXISTS idx_fill_confidence_trade_time
+    ON fill_confidence_assessments(trade_id, observed_at DESC, assessment_id DESC);
+CREATE TRIGGER IF NOT EXISTS fill_confidence_assessments_no_update
+BEFORE UPDATE ON fill_confidence_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'fill_confidence_assessments is append-only');
+END;
+-- Deletion is allowed only through guarded_reset_authoritative_state after it
+-- proves that no unresolved wallet effect exists. Remove the early-development
+-- trigger as part of migration so that guarded evidence reset remains possible.
+DROP TRIGGER IF EXISTS fill_confidence_assessments_no_delete;
+
 CREATE TABLE IF NOT EXISTS market_evidence_summaries (
     asset_id                  TEXT NOT NULL,
     summary_day               TEXT NOT NULL,
@@ -3677,6 +3714,21 @@ _STABILITY_REQUIRED_COLUMNS = {
         "side",
         "evidence_digest",
         "claimed_at",
+    },
+    "fill_confidence_assessments": {
+        "assessment_id",
+        "trade_id",
+        "asset_id",
+        "confidence",
+        "outcome",
+        "authority_source",
+        "reason_codes_json",
+        "market_confidence_impact",
+        "can_account",
+        "can_replace",
+        "evidence_json",
+        "evidence_sha256",
+        "observed_at",
     },
     "offer_operation_journal": {
         "sequence",
@@ -7864,6 +7916,22 @@ def guarded_reset_authoritative_state(
             return int(conn.execute(sql, params).fetchone()[0])
 
         fill_count = count("SELECT COUNT(*) FROM fills")
+        fill_assessment_count = count(
+            "SELECT COUNT(*) FROM fill_confidence_assessments"
+        )
+        unresolved_fill_evidence_count = count(
+            "SELECT COUNT(*) FROM fill_confidence_assessments AS candidate "
+            "WHERE candidate.confidence <> 'CONFIRMED' "
+            "AND candidate.outcome IN ('POSSIBLE_FILL','LIKELY_FILL','CONFLICT') "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM fill_confidence_assessments AS newer "
+            "  WHERE newer.trade_id=candidate.trade_id AND ("
+            "    newer.observed_at > candidate.observed_at OR "
+            "    (newer.observed_at=candidate.observed_at "
+            "     AND newer.assessment_id > candidate.assessment_id)"
+            "  )"
+            ")"
+        )
         intent_count = count("SELECT COUNT(*) FROM offer_intents")
         journal_count = count("SELECT COUNT(*) FROM offer_operation_journal")
         open_offer_count = count("SELECT COUNT(*) FROM offers WHERE status='open'")
@@ -7886,6 +7954,8 @@ def guarded_reset_authoritative_state(
             or protected_coin_count
         ):
             conflicts.append("authoritative_session_state")
+        if clear_fills and unresolved_fill_evidence_count:
+            conflicts.append("unresolved_fill_evidence")
         if clear_coins and (
             intent_count or journal_count or open_offer_count or protected_coin_count
         ):
@@ -7901,6 +7971,7 @@ def guarded_reset_authoritative_state(
                 "error": "authoritative_state_conflict",
                 "conflicts": sorted(set(conflicts)),
                 "fills_cleared": 0,
+                "fill_confidence_assessments_cleared": 0,
                 "round_trips_cleared": 0,
                 "coins_cleared": 0,
                 "open_offers_cancelled": 0,
@@ -7917,6 +7988,7 @@ def guarded_reset_authoritative_state(
         summary: Dict[str, Any] = {
             "success": True,
             "fills_cleared": 0,
+            "fill_confidence_assessments_cleared": 0,
             "round_trips_cleared": 0,
             "coins_cleared": 0,
             "open_offers_cancelled": 0,
@@ -7931,6 +8003,11 @@ def guarded_reset_authoritative_state(
         }
         # A positive fill count is refused above.  Keeping the statement out
         # entirely ensures no future FK topology can turn reset into data loss.
+        if clear_fills and fill_assessment_count:
+            cursor = conn.execute("DELETE FROM fill_confidence_assessments")
+            summary["fill_confidence_assessments_cleared"] = int(
+                cursor.rowcount or 0
+            )
         if (
             clear_round_trips
             and conn.execute(
@@ -31302,6 +31379,140 @@ def get_market_provider_observations(
         item["identity_keys"] = json.loads(item.pop("identity_keys_json"))
         item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
         item["raw_evidence"] = json.loads(item.pop("raw_evidence_json"))
+        result.append(item)
+    return result
+
+
+def record_fill_confidence_assessment(record: Dict[str, Any]) -> str:
+    """Persist one immutable fill-confidence decision idempotently."""
+
+    if type(record) is not dict:
+        raise TypeError("fill confidence assessment must be a dict")
+    required = {
+        "assessment_id",
+        "trade_id",
+        "asset_id",
+        "confidence",
+        "outcome",
+        "authority_source",
+        "reason_codes",
+        "market_confidence_impact",
+        "can_account",
+        "can_replace",
+        "evidence_json",
+        "evidence_sha256",
+        "observed_at",
+    }
+    if set(record) != required:
+        raise ValueError("fill confidence assessment fields are invalid")
+    assessment_id = _reconciliation_coin_identity(
+        record["assessment_id"], "assessment_id"
+    )[0]
+    trade_id = _reconciliation_coin_identity(record["trade_id"], "trade_id")[0]
+    asset_id = _reconciliation_coin_identity(record["asset_id"], "asset_id")[0]
+    confidence = str(record["confidence"] or "").strip().upper()
+    outcome = _required_stability_text(record["outcome"], "outcome")
+    authority_source = _required_stability_text(
+        record["authority_source"], "authority_source"
+    )
+    if confidence not in {"OBSERVED", "PROBABLE", "CONFIRMED"}:
+        raise ValueError("fill confidence is invalid")
+    reason_codes = record["reason_codes"]
+    if (
+        type(reason_codes) is not list
+        or not reason_codes
+        or any(type(code) is not str or not code for code in reason_codes)
+    ):
+        raise ValueError("fill confidence reason codes are invalid")
+    reason_codes_json = json.dumps(reason_codes, separators=(",", ":"))
+    evidence_json = _canonical_json_text(
+        record["evidence_json"],
+        "fill confidence evidence",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    evidence_sha256 = _reconciliation_coin_identity(
+        record["evidence_sha256"], "evidence_sha256"
+    )[0]
+    if hashlib.sha256(evidence_json.encode("utf-8")).hexdigest() != evidence_sha256:
+        raise ValueError("fill confidence evidence digest mismatch")
+    observed_at = _stability_timestamp(record["observed_at"], "observed_at")
+    impact = record["market_confidence_impact"]
+    if impact not in {None, "AMBER"}:
+        raise ValueError("market confidence impact is invalid")
+    can_account = record["can_account"]
+    can_replace = record["can_replace"]
+    if type(can_account) is not bool or type(can_replace) is not bool:
+        raise TypeError("fill authority flags must be bool")
+    should_authorize = confidence == "CONFIRMED" and outcome == "FILL"
+    if can_account is not should_authorize or can_replace is not should_authorize:
+        raise ValueError("fill authority flags conflict with confidence")
+
+    values = (
+        assessment_id,
+        trade_id,
+        asset_id,
+        confidence,
+        outcome,
+        authority_source,
+        reason_codes_json,
+        impact,
+        int(can_account),
+        int(can_replace),
+        evidence_json,
+        evidence_sha256,
+        observed_at,
+    )
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO fill_confidence_assessments (
+                assessment_id, trade_id, asset_id, confidence, outcome,
+                authority_source, reason_codes_json, market_confidence_impact,
+                can_account, can_replace, evidence_json, evidence_sha256,
+                observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        stored = conn.execute(
+            "SELECT * FROM fill_confidence_assessments WHERE assessment_id=?",
+            (assessment_id,),
+        ).fetchone()
+        if stored is None or tuple(stored[key] for key in stored.keys()) != values:
+            raise RuntimeError("fill confidence assessment identity collision")
+        conn.commit()
+        return assessment_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_fill_confidence_assessments(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    """Return recent candidate/confirmed fill decisions for one asset."""
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 500:
+        raise ValueError("limit must be an integer between 1 and 500")
+    rows = get_connection().execute(
+        """
+        SELECT * FROM fill_confidence_assessments
+        WHERE asset_id=?
+        ORDER BY observed_at DESC, assessment_id DESC LIMIT ?
+        """,
+        (safe_asset, limit),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
+        item["evidence"] = json.loads(item.pop("evidence_json"))
+        item["can_account"] = bool(item["can_account"])
+        item["can_replace"] = bool(item["can_replace"])
         result.append(item)
     return result
 
