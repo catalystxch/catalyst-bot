@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+from offer_book_policy import derive_offer_book_policy
+from offer_manager import OfferBookCompetitionLimiter, offer_is_profitable
+
+
+NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("preset", "depth_multiple", "move_persistence", "churn_limit"),
+    [
+        ("conservative", "3", 3, 35),
+        ("balanced", "2", 2, 50),
+        ("aggressive", "1.5", 2, 65),
+    ],
+)
+def test_presets_expose_noneditable_offer_book_thresholds(
+    preset, depth_multiple, move_persistence, churn_limit
+):
+    policy = derive_offer_book_policy(
+        risk_profile=preset,
+        configured_offer_size_xch=Decimal("0.5"),
+        independent_depth_xch=Decimal("2"),
+        volatility_bps=Decimal("80"),
+        churn_score=0,
+        network_fee_xch=Decimal("0.00001"),
+        expected_cancel_requotes=2,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+
+    assert policy["market_model"] == "offer_book"
+    assert policy["derived_thresholds"]["editable"] is False
+    assert policy["derived_thresholds"]["depth_multiple"] == depth_multiple
+    assert (
+        policy["derived_thresholds"]["movement_persistence_refreshes"]
+        == move_persistence
+    )
+    assert policy["derived_thresholds"]["churn_amber"] == churn_limit
+    assert Decimal(policy["minimum_independent_depth_xch"]) == Decimal("0.5") * Decimal(
+        depth_multiple
+    )
+    assert "tibet" not in str(policy).lower()
+    assert "amm" not in str(policy).lower()
+    assert "sniper" not in str(policy).lower()
+
+
+def test_profit_floor_includes_network_cancel_requote_and_configured_profit():
+    policy = derive_offer_book_policy(
+        risk_profile="balanced",
+        configured_offer_size_xch=Decimal("1"),
+        independent_depth_xch=Decimal("4"),
+        volatility_bps=Decimal("0"),
+        churn_score=0,
+        network_fee_xch=Decimal("0.00002"),
+        expected_cancel_requotes=3,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+
+    assert policy["profit_floor_xch"] == "0.00018"
+    assert Decimal(policy["spread_floor_bps"]) >= Decimal("1.8")
+
+
+def test_book_opportunity_is_small_bounded_and_requires_confirmed_depth():
+    thin = derive_offer_book_policy(
+        risk_profile="balanced",
+        configured_offer_size_xch=Decimal("1"),
+        independent_depth_xch=Decimal("1.5"),
+        volatility_bps=Decimal("20"),
+        churn_score=0,
+        network_fee_xch=Decimal("0.00001"),
+        expected_cancel_requotes=1,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+    deep = derive_offer_book_policy(
+        risk_profile="balanced",
+        configured_offer_size_xch=Decimal("1"),
+        independent_depth_xch=Decimal("10"),
+        volatility_bps=Decimal("20"),
+        churn_score=0,
+        network_fee_xch=Decimal("0.00001"),
+        expected_cancel_requotes=1,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+
+    assert thin["opportunity_orders"]["enabled"] is False
+    assert deep["opportunity_orders"]["enabled"] is True
+    assert deep["opportunity_orders"]["purpose"] == "book_opportunity"
+    assert Decimal(deep["opportunity_orders"]["max_size_xch"]) <= Decimal("0.5")
+    assert Decimal(deep["opportunity_orders"]["max_size_xch"]) <= Decimal("0.2")
+
+
+def test_high_churn_widens_spread_and_disables_opportunity_orders():
+    quiet = derive_offer_book_policy(
+        risk_profile="balanced",
+        configured_offer_size_xch=Decimal("1"),
+        independent_depth_xch=Decimal("10"),
+        volatility_bps=Decimal("20"),
+        churn_score=0,
+        network_fee_xch=Decimal("0.00001"),
+        expected_cancel_requotes=1,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+    churn = derive_offer_book_policy(
+        risk_profile="balanced",
+        configured_offer_size_xch=Decimal("1"),
+        independent_depth_xch=Decimal("10"),
+        volatility_bps=Decimal("20"),
+        churn_score=55,
+        network_fee_xch=Decimal("0.00001"),
+        expected_cancel_requotes=1,
+        minimum_profit_xch=Decimal("0.0001"),
+    )
+
+    assert Decimal(churn["recommended_spread_bps"]) > Decimal(
+        quiet["recommended_spread_bps"]
+    )
+    assert churn["opportunity_orders"]["enabled"] is False
+
+
+def test_offer_profitability_uses_full_cost_floor():
+    assert offer_is_profitable(
+        expected_gross_xch=Decimal("0.001"),
+        network_fee_xch=Decimal("0.0001"),
+        expected_cancel_requotes=2,
+        minimum_profit_xch=Decimal("0.0005"),
+    )
+    assert not offer_is_profitable(
+        expected_gross_xch=Decimal("0.00079"),
+        network_fee_xch=Decimal("0.0001"),
+        expected_cancel_requotes=2,
+        minimum_profit_xch=Decimal("0.0005"),
+    )
+
+
+def test_price_war_limiter_is_per_side_and_rate_limited():
+    limiter = OfferBookCompetitionLimiter(cooldown_seconds=30)
+
+    assert limiter.allow_improvement(side="buy", now=NOW) is True
+    assert (
+        limiter.allow_improvement(side="buy", now=NOW + timedelta(seconds=29)) is False
+    )
+    assert (
+        limiter.allow_improvement(side="sell", now=NOW + timedelta(seconds=10)) is True
+    )
+    assert (
+        limiter.allow_improvement(side="buy", now=NOW + timedelta(seconds=30)) is True
+    )

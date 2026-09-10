@@ -66,6 +66,55 @@ from cancel_outcomes import (
 )
 
 
+def offer_is_profitable(
+    *,
+    expected_gross_xch: Decimal,
+    network_fee_xch: Decimal,
+    expected_cancel_requotes: int,
+    minimum_profit_xch: Decimal,
+) -> bool:
+    """Require gross edge to cover every expected lifecycle cost."""
+
+    values = (expected_gross_xch, network_fee_xch, minimum_profit_xch)
+    if any(type(value) is not Decimal or not value.is_finite() for value in values):
+        raise TypeError("profitability values must be finite Decimal values")
+    if any(value < 0 for value in values):
+        raise ValueError("profitability values must be nonnegative")
+    if type(expected_cancel_requotes) is not int or expected_cancel_requotes < 0:
+        raise ValueError("expected_cancel_requotes must be nonnegative")
+    required = network_fee_xch * Decimal(1 + expected_cancel_requotes)
+    required += minimum_profit_xch
+    return expected_gross_xch >= required
+
+
+class OfferBookCompetitionLimiter:
+    """Per-side monotonic rate limit for public-book price improvements."""
+
+    def __init__(self, *, cooldown_seconds: int) -> None:
+        if type(cooldown_seconds) is not int or cooldown_seconds < 1:
+            raise ValueError("cooldown_seconds must be a positive integer")
+        self.cooldown_seconds = cooldown_seconds
+        self._last_improvement: dict[str, datetime] = {}
+        self._competition_lock = threading.Lock()
+
+    def allow_improvement(self, *, side: str, now: datetime) -> bool:
+        normalized_side = str(side).strip().lower()
+        if normalized_side not in {"buy", "sell"}:
+            raise ValueError("side must be buy or sell")
+        if type(now) is not datetime or now.tzinfo is None:
+            raise TypeError("now must be a timezone-aware datetime")
+        current = now.astimezone(timezone.utc)
+        with self._competition_lock:
+            previous = self._last_improvement.get(normalized_side)
+            if (
+                previous is not None
+                and (current - previous).total_seconds() < self.cooldown_seconds
+            ):
+                return False
+            self._last_improvement[normalized_side] = current
+            return True
+
+
 @dataclass(frozen=True, slots=True)
 class _CanonicalOfferCreationIntent:
     intent_id: str
