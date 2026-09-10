@@ -8315,7 +8315,24 @@ class BotLoop:
 
         if not self._enter_runtime_effect_phase("cancel"):
             return False
+        retry_started = self._runtime_recovery_monotonic()
         retried = self.offer_manager.retry_failed_cancels()
+        retry_finished = self._runtime_recovery_monotonic()
+        try:
+            retry_elapsed = Decimal(str(retry_finished)) - Decimal(
+                str(retry_started)
+            )
+        except Exception:
+            retry_elapsed = self._runtime_recovery_gap_seconds
+
+        # A recovery pass can legitimately spend several minutes collecting
+        # full-history Sage evidence for old bulk-cancel members.  Rebase the
+        # detector at this known effect boundary so that the elapsed RPC work
+        # is not mistaken for an unattended runtime suspension.  If the pass
+        # exceeded the normal continuity window, defer every later mutation
+        # to a fresh cycle (and therefore a fresh price read).
+        if not self._establish_runtime_recovery_baseline():
+            return False
         if retried < 0:
             log_event(
                 "warning",
@@ -8323,6 +8340,15 @@ class BotLoop:
                 "A submitted cancel is awaiting authoritative confirmation; "
                 "pausing this cycle before any later wallet mutation and "
                 "keeping the bot active for the next proof poll",
+            )
+            return False
+        if retry_elapsed >= self._runtime_recovery_gap_seconds:
+            log_event(
+                "warning",
+                "cancel_retry_long_pass",
+                "Cancel recovery exceeded the runtime continuity window; "
+                "deferring later wallet mutations to a fresh market cycle",
+                data={"elapsed_seconds": str(retry_elapsed)},
             )
             return False
         if retried > 0:
@@ -9493,6 +9519,7 @@ class BotLoop:
                 )
 
         # ---- Step 7c: Retry failed cancels (V1 parity) ----
+        self._set_cycle_step("step7c_cancel_recovery")
         if not self._run_cancel_retry_pass():
             return False
 

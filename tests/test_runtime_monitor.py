@@ -775,6 +775,41 @@ class RuntimeMonitorTests(unittest.TestCase):
             )
         )
 
+    def test_cancel_recovery_uses_longer_external_proof_stall_threshold(self):
+        bot = _FakeBot()
+        bot._start_time = time.time() - 3600
+        bot._current_cycle_step = "step7c_cancel_recovery"
+        bot._cycle_step_started_at = 9700.0
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+
+        with (
+            patch("runtime_monitor.get_events_since", return_value=[]),
+            patch(
+                "runtime_monitor.get_open_offers", return_value=_open_offer_rows(30, 30)
+            ),
+            patch("runtime_monitor.log_event") as log_event_mock,
+            patch.object(monitor, "_resolve_superlog_path", return_value=""),
+            patch("runtime_monitor.cfg.RUNTIME_MONITOR_CYCLE_STALL_SECS", 180),
+            patch("runtime_monitor.cfg.LOOP_SECONDS", 90),
+            patch("runtime_monitor.time.monotonic", return_value=10000.0),
+        ):
+            monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertNotIn("cycle_step_stalled", active_codes, state)
+        self.assertEqual(
+            state["bot"]["cycle_stall_threshold_secs"],
+            600.0,
+        )
+        self.assertFalse(
+            any(
+                call.args[1] == "bot_health_cycle_stalled"
+                for call in log_event_mock.call_args_list
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

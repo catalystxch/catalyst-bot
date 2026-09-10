@@ -614,6 +614,13 @@ class RuntimeMonitor:
             configured_stall_secs = max(
                 180.0, float(getattr(cfg, "LOOP_SECONDS", 90) or 90) * 3.0
             )
+        # Exact Sage cancel settlement may need several full-history and
+        # chain-evidence calls before it can prove one submitted operation
+        # terminal.  This is a bounded, read-only recovery phase rather than
+        # a normal cycle step.  Keep genuine hang detection, but allow the
+        # observed external-proof latency before raising a critical alert.
+        if cycle_step == "step7c_cancel_recovery":
+            configured_stall_secs = max(configured_stall_secs, 600.0)
 
         return {
             "market": {
