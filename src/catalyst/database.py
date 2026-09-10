@@ -3577,6 +3577,19 @@ CREATE TABLE IF NOT EXISTS post_tibet_migration_reports (
     report_json               TEXT NOT NULL,
     completed_at              TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS degraded_market_state (
+    asset_id                  TEXT PRIMARY KEY,
+    degraded_since            TEXT,
+    recovery_started_at       TEXT,
+    recovery_refreshes        INTEGER NOT NULL DEFAULT 0
+                              CHECK(recovery_refreshes >= 0),
+    last_confidence_state     TEXT NOT NULL
+                              CHECK(last_confidence_state IN ('GREEN','AMBER','RED')),
+    withdrawal_stage          TEXT NOT NULL
+                              CHECK(withdrawal_stage IN ('NONE','INNER','MIDDLE','ALL')),
+    updated_at                TEXT NOT NULL
+);
 """
 
 
@@ -31120,3 +31133,41 @@ def get_post_tibet_migration_report(asset_id: str) -> Optional[Dict[str, Any]]:
         (asset_id,),
     ).fetchone()
     return json.loads(row["report_json"]) if row is not None else None
+
+
+def get_degraded_market_state(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT * FROM degraded_market_state WHERE asset_id=?", (asset_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_degraded_market_state(record: Dict[str, Any]) -> None:
+    """Atomically persist the restart-safe degraded-market controller state."""
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO degraded_market_state (
+            asset_id, degraded_since, recovery_started_at, recovery_refreshes,
+            last_confidence_state, withdrawal_stage, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            degraded_since=excluded.degraded_since,
+            recovery_started_at=excluded.recovery_started_at,
+            recovery_refreshes=excluded.recovery_refreshes,
+            last_confidence_state=excluded.last_confidence_state,
+            withdrawal_stage=excluded.withdrawal_stage,
+            updated_at=excluded.updated_at
+        """,
+        (
+            record["asset_id"],
+            record.get("degraded_since"),
+            record.get("recovery_started_at"),
+            record["recovery_refreshes"],
+            record["last_confidence_state"],
+            record["withdrawal_stage"],
+            record["updated_at"],
+        ),
+    )
+    conn.commit()
