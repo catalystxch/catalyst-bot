@@ -358,6 +358,77 @@ def test_runtime_rebases_persisted_confidence_state_when_risk_preset_changes(
     assert after["pending_refreshes"] == 0
 
 
+def test_first_large_move_after_risk_preset_rebase_still_hard_blocks(isolated_db):
+    balanced = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: _book(),
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
+    )
+    balanced.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    moved_book = {
+        "bids": [
+            {
+                "offer_id": "moved-buy",
+                "price": "0.000139",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "moved-sell",
+                "price": "0.000141",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+    }
+    moved_splash = [
+        {
+            "offer_id": "splash-moved-buy",
+            "side": "buy",
+            "price": "0.000139",
+            "amount_mojos": 3_000_000_000_000,
+        },
+        {
+            "offer_id": "splash-moved-sell",
+            "side": "sell",
+            "price": "0.000141",
+            "amount_mojos": 3_000_000_000_000,
+        },
+    ]
+
+    aggressive = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="aggressive",
+        fetch_dexie_book=lambda _asset: moved_book,
+        fetch_splash_offers=lambda _asset: moved_splash,
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
+    )
+    result = aggressive.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert result.confidence.derived_thresholds["hard_move_cap_bps"] == 2500
+    assert result.confidence.state == "RED"
+    assert "hard_price_move_cap" in result.confidence.reason_codes
+    assert result.confidence.trusted_midpoint == Decimal("0.0001")
+
+
 def test_bot_runtime_phase_gate_blocks_exposure_but_never_safety_cancel(monkeypatch):
     import bot_loop
 
