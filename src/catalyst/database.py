@@ -7145,29 +7145,50 @@ def add_offer(
     Returns:
         True if inserted successfully, False on error
     """
+    conn = None
+    close_conn = False
     try:
-        conn = get_connection()
-        conn.execute(
-            """INSERT INTO offers (trade_id, side, price_xch, size_xch, size_cat,
+        sql = """INSERT INTO offers (trade_id, side, price_xch, size_xch, size_cat,
                tier, status, cat_asset_id, created_at, expires_at, coin_id, fee_mojos_xch)
-               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
-            (
-                trade_id,
-                side,
-                str(price_xch),
-                str(size_xch),
-                str(size_cat),
-                tier,
-                cat_asset_id,
-                _now(),
-                expires_at,
-                coin_id,
-                int(fee_mojos_xch),
-            ),
+               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)"""
+        values = (
+            trade_id,
+            side,
+            str(price_xch),
+            str(size_xch),
+            str(size_cat),
+            tier,
+            cat_asset_id,
+            _now(),
+            expires_at,
+            coin_id,
+            int(fee_mojos_xch),
         )
+
+        try:
+            conn = get_connection()
+            conn.execute(sql, values)
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            # Sage has already created the wallet offer. If a worker's cached
+            # connection is contended, retry on a fresh bounded connection so
+            # we do not cancel an otherwise-valid on-chain offer.
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            conn = open_critical_write_connection()
+            close_conn = True
+            conn.execute(sql, values)
         conn.commit()
         return True
     except sqlite3.IntegrityError as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         err = str(e)
         if "UNIQUE constraint failed" in err:
             # trade_id already exists — this is fine on restart/resume
@@ -7193,9 +7214,16 @@ def add_offer(
         )
         return False
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         print(f"  ❌ [DB] add_offer FAILED for {trade_id[:16]}...: {e}", flush=True)
         log_event("error", "db_error", f"Failed to add offer {trade_id}: {e}")
         return False
+    finally:
+        if close_conn and conn is not None:
+            conn.close()
 
 
 def recover_unknown_offers(wallet_offers: list, cat_asset_id: str) -> dict:
@@ -8513,7 +8541,18 @@ def upsert_coin(
         # Normalize coin_id before any DB operation — ensures consistency
         # with reconcile_coins_with_wallet() which also normalizes.
         coin_id = norm_coin_id(coin_id)
-        if _coin_terminal_mutation_is_protected(conn, coin_id):
+        protection_snapshot = kwargs.get("_protection_snapshot")
+        if (
+            protection_snapshot is not None
+            and type(protection_snapshot) is not frozenset
+        ):
+            raise TypeError("coin protection snapshot must be an exact frozenset")
+        protected = (
+            coin_id in protection_snapshot
+            if protection_snapshot is not None
+            else _coin_terminal_mutation_is_protected(conn, coin_id)
+        )
+        if protected:
             if started_transaction:
                 conn.rollback()
             return False
@@ -8629,21 +8668,31 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
 
     Returns number of coins successfully upserted.
     """
+    if type(coins) is not list or not coins:
+        return 0
     count = 0
     failures = 0
     first_error: Optional[str] = None
     conn = get_connection()
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
+    protection_snapshot = frozenset(
+        _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
+    )
     for c in coins:
         try:
-            upsert_coin(
+            inserted = upsert_coin(
                 c["coin_id"],
                 wallet_type,
                 c["amount_mojos"],
                 tier=c.get("tier", "unknown"),
                 purpose=c.get("purpose"),
                 _skip_commit=True,
+                _protection_snapshot=protection_snapshot,
             )
-            count += 1
+            if inserted:
+                count += 1
         except Exception as e:
             failures += 1
             if first_error is None:
@@ -8689,7 +8738,7 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
     conn = None
     try:
         normalized = norm_coin_id(coin_id)
-        conn = _stability_connection()
+        conn = open_critical_write_connection()
         conn.execute("BEGIN IMMEDIATE")
         # Get coin details before locking (for logging)
         row = conn.execute(
@@ -10776,6 +10825,47 @@ def _coin_terminal_mutation_is_protected(
         "SELECT status FROM offers WHERE trade_id=?", (row["trade_id"],)
     ).fetchone()
     return bool(offer is not None and offer["status"] == "open")
+
+
+def _batch_coin_terminal_mutation_protection(
+    conn: sqlite3.Connection, coin_ids: list[str]
+) -> set[str]:
+    """Snapshot every mutation fence once for a wallet coin batch.
+
+    The single-coin guard intentionally revalidates all durable authorities on
+    every call. A Sage wallet snapshot contains hundreds of coins, so repeating
+    those global scans for each row can hold SQLite's writer lock longer than
+    the runtime lease. This helper preserves the same fences while evaluating
+    the global sets once per snapshot transaction.
+    """
+
+    requested = {norm_coin_id(coin_id) for coin_id in coin_ids}
+    protected = _active_wallet_effect_coin_ids(conn) | _nonterminal_registry_coin_ids(
+        conn
+    )
+
+    outcome_candidates = {
+        norm_coin_id(row["coin_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT coin_id FROM offer_reconciliation_coin_outcomes"
+        ).fetchall()
+        if row["coin_id"]
+    }
+    for coin_id in requested & outcome_candidates:
+        if _authoritative_coin_outcome(conn, coin_id) is not None:
+            protected.add(coin_id)
+
+    protected.update(
+        norm_coin_id(row["coin_id"])
+        for row in conn.execute(
+            """SELECT c.coin_id
+                 FROM coins AS c
+                 JOIN offers AS o ON o.trade_id=c.trade_id
+                WHERE o.status='open' AND c.coin_id IS NOT NULL"""
+        ).fetchall()
+        if row["coin_id"]
+    )
+    return protected & requested
 
 
 def _coin_has_authoritative_permanent_spend(
@@ -19313,24 +19403,42 @@ def clear_market_analysis_cache(
 # ---------------------------------------------------------------------------
 
 
-def _stability_connection() -> sqlite3.Connection:
-    """Return a short-lived autocommit connection for stability CAS writes."""
+def open_critical_write_connection(
+    timeout_seconds: float = 30.0,
+) -> sqlite3.Connection:
+    """Open a fresh autocommit connection for post-wallet integrity writes.
 
-    conn = _sqlite_connect(DB_PATH, timeout=10, isolation_level=None)
+    These writes record or release state after an external wallet effect. A
+    longer busy timeout is preferable to losing the durable record and having
+    to compensate on chain.
+    """
+
+    timeout_seconds = max(1.0, float(timeout_seconds))
+    conn = _sqlite_connect(
+        DB_PATH,
+        timeout=timeout_seconds,
+        isolation_level=None,
+    )
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
         try:
             from super_log import trace_connection
 
-            trace_connection(conn, f"stability-{threading.current_thread().name}")
+            trace_connection(conn, f"critical-{threading.current_thread().name}")
         except ImportError:
             pass
         return conn
     except BaseException:
         conn.close()
         raise
+
+
+def _stability_connection() -> sqlite3.Connection:
+    """Return a short-lived autocommit connection for stability CAS writes."""
+
+    return open_critical_write_connection(timeout_seconds=5.0)
 
 
 def _stability_read_only_connection() -> sqlite3.Connection:
@@ -21593,10 +21701,10 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
     """Attach one pre-Task-12 runtime top-up claim to exact recovery evidence.
 
     This narrow migration never replays a wallet effect. It accepts only a
-    historical runtime split or reserve-absorption operation after its adapter
-    outcome is durably SUBMITTED/UNKNOWN, and requires separate authoritative
-    proof for every pinned XCH fee input before the resulting prep operation can
-    resolve the safety latch.
+    historical runtime split, reserve absorption, or CAT consolidation after its
+    adapter outcome is durably SUBMITTED/UNKNOWN, and requires separate
+    authoritative proof for every pinned XCH fee input before the resulting prep
+    operation can resolve the safety latch.
     """
 
     from replacement_capacity import (
@@ -21652,16 +21760,24 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
             norm_coin_id(coin_id) for coin_id in contract["source_coin_ids"]
         )
         claim_operation = str(claim["operation_id"] or "") if claim is not None else ""
-        exact_operation_shape = (
-            claim_operation == "coin_manager.topup_split_sage"
-            and contract["operation_kind"] == "split"
-        ) or (
-            claim_operation == "coin_manager.absorb_sage"
-            and contract["operation_kind"] == "combine"
+        exact_combine_shape = (
+            contract["operation_kind"] == "combine"
             and contract["purpose"] == "top_up"
             and len(contract["source_coin_ids"]) >= 2
             and len(contract["target_contract"]["outputs"]) == 1
             and contract["target_contract"]["outputs"][0]["purpose"] == "top_up"
+        )
+        exact_operation_shape = (
+            claim_operation == "coin_manager.topup_split_sage"
+            and contract["operation_kind"] == "split"
+        ) or (
+            claim_operation
+            in {
+                "coin_manager.absorb_sage",
+                "coin_manager.absorb_cat_sage",
+                "coin_manager.consolidate_cat_sage",
+            }
+            and exact_combine_shape
         )
         if (
             claim is None
@@ -29307,6 +29423,154 @@ def recover_undispatched_publication_claims_at_startup(
         conn.close()
 
 
+def recover_preprojection_publications_at_startup(
+    *, recovered_at: Any = None
+) -> Dict[str, int]:
+    """Requeue the exact pre-projection publication race from older builds."""
+
+    from publication_outbox import canonical_publication_identity
+
+    recovered = _stability_timestamp_or_now(recovered_at, "recovered_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch = conn.execute(
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if (
+            latch is None
+            or latch["state"] != "resolved"
+            or lease is None
+            or bool(lease["active"])
+        ):
+            remaining = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM publication_outbox "
+                    "WHERE state IN ('claimed','unresolved')"
+                ).fetchone()[0]
+            )
+            conn.commit()
+            return {"examined": 0, "recovered": 0, "remaining": remaining}
+        rows = conn.execute(
+            "SELECT * FROM publication_outbox WHERE state='unresolved' "
+            "AND attempt_count=0 AND claim_generation=0 "
+            "AND claim_owner_run_id IS NULL AND claim_token IS NULL "
+            "AND claim_expires_at IS NULL AND dispatch_started_at IS NULL "
+            "AND request_sha256 IS NULL ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup pre-projection recovery limit exceeded")
+        expected_error = {
+            "code": "PUBLICATION_OFFER_REFERENCE_MISSING",
+            "offer_ref": "[redacted]",
+        }
+        latch_generation = _exact_integer(
+            latch["generation"], "runtime safety generation", minimum=0
+        )
+        recovered_count = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            try:
+                error_text = _canonical_json_text(
+                    row.get("last_error_json"),
+                    "publication error evidence",
+                    expected_type=dict,
+                    max_bytes=16384,
+                )
+                if json.loads(error_text) != expected_error or hashlib.sha256(
+                    error_text.encode("utf-8")
+                ).hexdigest() != row.get("last_error_sha256"):
+                    continue
+                payload_text = _canonical_json_text(
+                    row.get("payload_json"),
+                    "publication payload",
+                    expected_type=dict,
+                    max_bytes=4096,
+                )
+                payload = json.loads(payload_text)
+                if (
+                    set(payload) != {"offer_ref"}
+                    or type(payload["offer_ref"]) is not str
+                    or not payload["offer_ref"]
+                    or hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                    != row.get("payload_sha256")
+                ):
+                    continue
+                identity = canonical_publication_identity(
+                    row.get("network"),
+                    row.get("offer_fingerprint"),
+                    row.get("publication_epoch"),
+                )
+                if row.get("idempotency_key") != identity.idempotency_key:
+                    continue
+                if row.get("publisher") not in {"dexie", "splash"}:
+                    continue
+                intent = conn.execute(
+                    "SELECT lifecycle_state,sage_trade_id,offer_text_sha256,"
+                    "confirmed_at FROM offer_intents WHERE intent_id=?",
+                    (row.get("intent_id"),),
+                ).fetchone()
+                offer = conn.execute(
+                    "SELECT status,offer_bech32 FROM offers WHERE trade_id=?",
+                    (payload["offer_ref"],),
+                ).fetchone()
+                if (
+                    intent is None
+                    or intent["lifecycle_state"] not in {"created", "visible"}
+                    or intent["sage_trade_id"] != payload["offer_ref"]
+                    or intent["offer_text_sha256"] != identity.offer_fingerprint
+                    or intent["confirmed_at"] != row.get("queued_at")
+                    or offer is None
+                    or offer["status"] != "open"
+                    or type(offer["offer_bech32"]) is not str
+                    or not offer["offer_bech32"]
+                    or hashlib.sha256(offer["offer_bech32"].encode("utf-8")).hexdigest()
+                    != identity.offer_fingerprint
+                ):
+                    continue
+                row_version = _exact_integer(
+                    row.get("row_version"), "row_version", minimum=1
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            cursor = conn.execute(
+                "UPDATE publication_outbox SET state='queued', "
+                "last_error_json=NULL,last_error_sha256=NULL,next_attempt_at=NULL,"
+                "row_version=row_version+1,updated_at=?,recovery_generation=? "
+                "WHERE publication_id=? AND row_version=? AND state='unresolved' "
+                "AND attempt_count=0 AND dispatch_started_at IS NULL "
+                "AND request_sha256 IS NULL",
+                (
+                    recovered,
+                    latch_generation,
+                    row["publication_id"],
+                    row_version,
+                ),
+            )
+            recovered_count += int(cursor.rowcount)
+        remaining = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM publication_outbox "
+                "WHERE state IN ('claimed','unresolved')"
+            ).fetchone()[0]
+        )
+        conn.commit()
+        return {
+            "examined": len(rows),
+            "recovered": recovered_count,
+            "remaining": remaining,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def suppress_orphaned_dispatched_publications_at_startup(
     *, recovered_at: Any = None
 ) -> Dict[str, int]:
@@ -29740,6 +30004,53 @@ def claim_publication_outbox(
             "SELECT offer_bech32,status FROM offers WHERE trade_id=?",
             (offer_ref,),
         ).fetchone()
+        projection_pending = False
+        try:
+            projection_wait_seconds = (
+                at_dt
+                - _parse_iso_timestamp(
+                    current["queued_at"], "queued_at", require_timezone=True
+                )
+            ).total_seconds()
+        except (TypeError, ValueError):
+            projection_wait_seconds = -1
+        if (
+            current["state"] == "queued"
+            and current["attempt_count"] == 0
+            and current["claim_generation"] == 0
+            and current["row_version"] == 0
+            and current.get("claim_owner_run_id") is None
+            and current.get("claim_token") is None
+            and current.get("claim_expires_at") is None
+            and current.get("dispatch_started_at") is None
+            and current.get("request_sha256") is None
+            and projection_wait_seconds >= 0
+            and (
+                offer_row is None
+                or (offer_row["status"] == "open" and not offer_row["offer_bech32"])
+            )
+        ):
+            intent_row = conn.execute(
+                "SELECT lifecycle_state,sage_trade_id,offer_text_sha256,"
+                "confirmed_at FROM offer_intents WHERE intent_id=?",
+                (current.get("intent_id"),),
+            ).fetchone()
+            projection_pending = bool(
+                intent_row is not None
+                and intent_row["lifecycle_state"] == "created"
+                and intent_row["sage_trade_id"] == offer_ref
+                and intent_row["offer_text_sha256"] == current["offer_fingerprint"]
+                and intent_row["confirmed_at"] == current["queued_at"]
+            )
+        if projection_pending:
+            # finalize_offer_intent() atomically queues publication before the
+            # legacy offers projection and bech32 cache are committed. Slow
+            # Sage ladder batches can hold that projection for minutes while
+            # completed futures wait for the remaining wallet calls. Leave an
+            # exact pristine row queued for the whole hand-off; startup
+            # recovery handles a process exit before the projection commits.
+            conn.commit()
+            return None
         if (
             offer_row is None
             or offer_row["status"] != "open"

@@ -1459,8 +1459,8 @@ class BotLoop:
     def _wallet_type_for_offer_side(self, side: str) -> str:
         return "xch" if str(side or "").lower() == "buy" else "cat"
 
-    def _available_tier_spares_for_side(self, side: str) -> Optional[int]:
-        """Return free tier-spare count for the asset that funds a side."""
+    def _tier_spares_for_side(self, side: str) -> Optional[Dict[str, int]]:
+        """Return free tier-spare counts for the asset that funds a side."""
         wallet_type = self._wallet_type_for_offer_side(side)
         tier_names = ("inner", "mid", "outer", "extreme")
         spares = {}
@@ -1484,7 +1484,14 @@ class BotLoop:
                 spares = {}
         if not known:
             return None
-        return sum(max(0, int(spares.get(tier, 0) or 0)) for tier in tier_names)
+        return {tier: max(0, int(spares.get(tier, 0) or 0)) for tier in tier_names}
+
+    def _available_tier_spares_for_side(self, side: str) -> Optional[int]:
+        """Return total free tier-spare count for the asset that funds a side."""
+        spares = self._tier_spares_for_side(side)
+        if spares is None:
+            return None
+        return sum(spares.values())
 
     def _position_guard_pauses(self) -> Dict[str, Dict]:
         getter = getattr(self.offer_manager, "get_position_guard_pause", None)
@@ -1562,8 +1569,40 @@ class BotLoop:
     ) -> bool:
         """Let missing offer creation run before non-critical spare refills."""
         deficits = self._offer_rebuild_deficits(active_buy_count, active_sell_count)
+        tier_deficits = None
+        tier_deficit_getter = getattr(
+            self.coin_manager, "_topup_offer_deficits_by_tier", None
+        )
+        if callable(tier_deficit_getter):
+            try:
+                tier_deficits = tier_deficit_getter()
+            except Exception:
+                tier_deficits = None
+
         for side, info in deficits.items():
             deficit = int(info.get("deficit", 0) or 0)
+            wallet_type = self._wallet_type_for_offer_side(side)
+            by_tier = (
+                dict((tier_deficits or {}).get(wallet_type, {}) or {})
+                if isinstance(tier_deficits, dict)
+                else None
+            )
+            spares_by_tier = self._tier_spares_for_side(side)
+            if by_tier is not None and spares_by_tier is not None:
+                tier_deficit_total = sum(
+                    max(0, int(by_tier.get(tier, 0) or 0))
+                    for tier in ("inner", "mid", "outer", "extreme")
+                )
+                if tier_deficit_total < deficit:
+                    return False
+                if any(
+                    int(spares_by_tier.get(tier, 0) or 0)
+                    < int(by_tier.get(tier, 0) or 0)
+                    for tier in ("inner", "mid", "outer", "extreme")
+                ):
+                    return False
+                info["spares"] = sum(spares_by_tier.values())
+                continue
             spare_count = self._available_tier_spares_for_side(side)
             if spare_count is None or int(spare_count) < deficit:
                 return False
