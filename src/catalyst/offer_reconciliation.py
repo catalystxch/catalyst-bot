@@ -2352,6 +2352,11 @@ def load_authoritative_evidence(
         max_records=max_records,
     )
     required_ids = set(exact_intent["selected_coin_ids"])
+    authoritative_asset_hints = {
+        coin_id: ("xch" if exact_intent["side"] == "buy" else exact_intent["asset_id"])
+        for coin_id in exact_intent["selected_coin_ids"]
+    }
+    conflicting_asset_hints = set()
     coin_cap_exceeded = False
     for tx in transactions["records"]:
         for flow_name in ("spent", "created"):
@@ -2369,9 +2374,25 @@ def load_authoritative_evidence(
                         coin_cap_exceeded = True
                         continue
                     required_ids.add(flow[0])
+                    previous_asset = authoritative_asset_hints.get(flow[0])
+                    if previous_asset is not None and previous_asset != flow[1]:
+                        conflicting_asset_hints.add(flow[0])
+                    else:
+                        authoritative_asset_hints[flow[0]] = flow[1]
+    for coin_id in conflicting_asset_hints:
+        authoritative_asset_hints.pop(coin_id, None)
     try:
         coin_reader = getattr(wallet_facade, "get_coins_by_ids")
-        raw_coin_result = coin_reader(sorted(required_ids))
+        hint_aware_coin_reader = getattr(
+            wallet_facade, "get_coins_by_ids_with_asset_hints", None
+        )
+        if wallet_backend == "sage" and callable(hint_aware_coin_reader):
+            raw_coin_result = hint_aware_coin_reader(
+                sorted(required_ids),
+                authoritative_asset_hints=authoritative_asset_hints,
+            )
+        else:
+            raw_coin_result = coin_reader(sorted(required_ids))
         coin_error = None
     except BaseException:
         raw_coin_result = None
@@ -2490,10 +2511,29 @@ def load_authoritative_evidence(
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:
                                 required_ids.add(coin_id)
+                                asset_id = _asset(flow.get("asset_id"))
+                                previous_asset = authoritative_asset_hints.get(coin_id)
+                                if (
+                                    asset_id
+                                    and previous_asset is not None
+                                    and previous_asset != asset_id
+                                ):
+                                    conflicting_asset_hints.add(coin_id)
+                                    authoritative_asset_hints.pop(coin_id, None)
+                                elif (
+                                    asset_id and coin_id not in conflicting_asset_hints
+                                ):
+                                    authoritative_asset_hints[coin_id] = asset_id
                 if len(required_ids) > _MAX_COIN_RECORDS:
                     coin_cap_exceeded = True
                 elif required_ids != prior_required_ids:
-                    raw_coin_result = coin_reader(sorted(required_ids))
+                    if wallet_backend == "sage" and callable(hint_aware_coin_reader):
+                        raw_coin_result = hint_aware_coin_reader(
+                            sorted(required_ids),
+                            authoritative_asset_hints=authoritative_asset_hints,
+                        )
+                    else:
+                        raw_coin_result = coin_reader(sorted(required_ids))
                     coin_read_at = _clock_utc(clock)
                     if (
                         type(raw_coin_result) is dict

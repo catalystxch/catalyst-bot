@@ -239,7 +239,9 @@ def get_wallet_type() -> str:
     return WALLET_TYPE
 
 
-def get_coins_by_ids(coin_ids: list) -> dict | None:
+def get_coins_by_ids(
+    coin_ids: list, *, authoritative_asset_hints: dict | None = None
+) -> dict | None:
     """Read exact owned/spent coin records through the selected adapter.
 
     Sage provides the authoritative targeted endpoint.  Older Chia adapters do
@@ -256,10 +258,26 @@ def get_coins_by_ids(coin_ids: list) -> dict | None:
     if not callable(reader):
         return None
     try:
-        result = reader(list(coin_ids))
+        kwargs = {}
+        if WALLET_TYPE == "sage" and authoritative_asset_hints is not None:
+            kwargs["authoritative_asset_hints"] = dict(authoritative_asset_hints)
+        result = reader(list(coin_ids), **kwargs)
     except Exception:
         return None
     return result if type(result) is dict else None
+
+
+def get_coins_by_ids_with_asset_hints(
+    coin_ids: list, *, authoritative_asset_hints: dict
+) -> dict | None:
+    """Read Sage coin records using asset authority already collected upstream."""
+
+    if WALLET_TYPE != "sage" or type(authoritative_asset_hints) is not dict:
+        return None
+    return get_coins_by_ids(
+        coin_ids,
+        authoritative_asset_hints=authoritative_asset_hints,
+    )
 
 
 def get_transaction_by_height(height: int) -> dict | None:

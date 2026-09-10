@@ -1885,6 +1885,61 @@ def test_authoritative_loader_uses_wallet_facade_readers_and_marks_coin_complete
     assert {kind for kind, _args in calls} == {"offers", "transactions", "coins"}
 
 
+def test_sage_authoritative_loader_reuses_collected_asset_evidence_for_coin_read():
+    received_hints = []
+
+    def read_coins(coin_ids, *, authoritative_asset_hints=None):
+        received_hints.append(authoritative_asset_hints)
+        return {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RECEIVE: _coin(
+                RECEIVE,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        }
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offer_history=lambda **_kwargs: {
+            "offers": [_offer()],
+            "total": 1,
+            "end_of_history": True,
+        },
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [_transaction()],
+            "total": 1,
+        },
+        get_coins_by_ids=lambda _coin_ids: (_ for _ in ()).throw(
+            AssertionError("hint-aware Sage coin reader was bypassed")
+        ),
+        get_coins_by_ids_with_asset_hints=read_coins,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at()
+    )
+
+    assert evidence["coin_records"]["complete"] is True
+    assert received_hints == [{COIN: "xch", RECEIVE: ASSET}]
+
+
 @pytest.mark.parametrize("list_has_idless_partial", [False, True])
 def test_sage_loader_recovers_omitted_cancel_transaction_by_spent_height(
     list_has_idless_partial,
@@ -1928,8 +1983,8 @@ def test_sage_loader_recovers_omitted_cancel_transaction_by_spent_height(
         },
     }
 
-    def read_coins(coin_ids):
-        calls.append(("coins", list(coin_ids)))
+    def read_coins(coin_ids, *, authoritative_asset_hints):
+        calls.append(("coins", list(coin_ids), dict(authoritative_asset_hints)))
         return {key: value for key, value in coins.items() if key[2:] in coin_ids}
 
     listed_transactions = (
@@ -2017,7 +2072,10 @@ def test_sage_loader_recovers_omitted_cancel_transaction_by_spent_height(
                 },
             }
         ),
-        get_coins_by_ids=read_coins,
+        get_coins_by_ids=lambda _coin_ids: (_ for _ in ()).throw(
+            AssertionError("plain Sage coin reader was used")
+        ),
+        get_coins_by_ids_with_asset_hints=read_coins,
     )
 
     evidence = load_authoritative_evidence(
@@ -2034,9 +2092,18 @@ def test_sage_loader_recovers_omitted_cancel_transaction_by_spent_height(
     }
     assert evidence["coin_records"]["complete"] is True
     assert calls == [
-        ("coins", [COIN]),
+        ("coins", [COIN], {COIN: "xch"}),
         ("height", 42),
-        ("coins", [COIN, FEE_COIN, RETURN, FEE_RETURN]),
+        (
+            "coins",
+            [COIN, FEE_COIN, RETURN, FEE_RETURN],
+            {
+                COIN: "xch",
+                FEE_COIN: "xch",
+                RETURN: "xch",
+                FEE_RETURN: "xch",
+            },
+        ),
     ]
 
 
@@ -2335,6 +2402,66 @@ def test_sage_coin_adapter_recovers_missing_asset_from_exact_offer_lock(monkeypa
     records = wallet_sage.get_coins_by_ids([COIN])
 
     assert records["0x" + COIN]["asset_id"] == ASSET
+
+
+def test_sage_coin_adapter_uses_exact_asset_hint_without_rescanning_offer_history(
+    monkeypatch,
+):
+    """A caller's collected authority avoids a second 3k-row Sage offer scan."""
+    import wallet_sage
+
+    calls = []
+
+    def sage_rpc(method, *_args, **_kwargs):
+        calls.append(method)
+        if method == "get_coins_by_ids":
+            return {
+                "coins": [
+                    {
+                        "coin_id": COIN,
+                        "amount": "33887186",
+                        "owned": True,
+                        "offer_id": TRADE,
+                        "spent_height": None,
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected Sage RPC: {method}")
+
+    monkeypatch.setattr(wallet_sage, "rpc", sage_rpc)
+
+    records = wallet_sage.get_coins_by_ids(
+        [COIN], authoritative_asset_hints={COIN: ASSET}
+    )
+
+    assert records["0x" + COIN]["asset_id"] == ASSET
+    assert calls == ["get_coins_by_ids"]
+
+
+def test_sage_coin_adapter_rejects_asset_hint_that_conflicts_with_coin_record(
+    monkeypatch,
+):
+    import wallet_sage
+
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda *_args, **_kwargs: {
+            "coins": [
+                {
+                    "coin_id": COIN,
+                    "amount": "33887186",
+                    "asset_id": ASSET,
+                    "owned": True,
+                }
+            ]
+        },
+    )
+
+    assert (
+        wallet_sage.get_coins_by_ids([COIN], authoritative_asset_hints={COIN: "xch"})
+        is None
+    )
 
 
 def test_sage_coin_adapter_does_not_infer_ambiguous_offer_asset(monkeypatch):
