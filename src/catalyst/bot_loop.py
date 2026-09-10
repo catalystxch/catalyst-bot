@@ -971,7 +971,9 @@ class BotLoop:
         self._runtime_recovery_baseline = sample
         return True
 
-    def _runtime_recovery_cycle_boundary(self) -> bool:
+    def _runtime_recovery_cycle_boundary(
+        self, *, maximum_monotonic_gap_seconds=None
+    ) -> bool:
         """Fence a discontinuity before any later cycle mutation."""
 
         from runtime_recovery import ClockSample, detect_discontinuity
@@ -983,7 +985,11 @@ class BotLoop:
         decision = detect_discontinuity(
             self._runtime_recovery_baseline,
             sample,
-            maximum_monotonic_gap_seconds=self._runtime_recovery_gap_seconds,
+            maximum_monotonic_gap_seconds=(
+                self._runtime_recovery_gap_seconds
+                if maximum_monotonic_gap_seconds is None
+                else maximum_monotonic_gap_seconds
+            ),
             maximum_wall_skew_seconds=self._runtime_recovery_skew_seconds,
         )
         if not decision.discontinuity:
@@ -8315,7 +8321,28 @@ class BotLoop:
 
         if not self._enter_runtime_effect_phase("cancel"):
             return False
+        retry_started = self._runtime_recovery_monotonic()
         retried = self.offer_manager.retry_failed_cancels()
+        retry_finished = self._runtime_recovery_monotonic()
+        try:
+            retry_elapsed = Decimal(str(retry_finished)) - Decimal(str(retry_started))
+        except Exception:
+            retry_elapsed = self._runtime_recovery_gap_seconds
+
+        # A recovery pass can legitimately spend several minutes collecting
+        # full-history Sage evidence for old bulk-cancel members. Preserve the
+        # pre-pass sample so rollback or wall/monotonic skew is still detected,
+        # while allowing the observed monotonic duration of this known RPC
+        # boundary. If it exceeded the normal continuity window, defer every
+        # later mutation to a fresh cycle (and therefore a fresh price read).
+        allowed_retry_gap = max(
+            self._runtime_recovery_gap_seconds,
+            retry_elapsed + Decimal("1"),
+        )
+        if not self._runtime_recovery_cycle_boundary(
+            maximum_monotonic_gap_seconds=allowed_retry_gap
+        ):
+            return False
         if retried < 0:
             log_event(
                 "warning",
@@ -8323,6 +8350,15 @@ class BotLoop:
                 "A submitted cancel is awaiting authoritative confirmation; "
                 "pausing this cycle before any later wallet mutation and "
                 "keeping the bot active for the next proof poll",
+            )
+            return False
+        if retry_elapsed >= self._runtime_recovery_gap_seconds:
+            log_event(
+                "warning",
+                "cancel_retry_long_pass",
+                "Cancel recovery exceeded the runtime continuity window; "
+                "deferring later wallet mutations to a fresh market cycle",
+                data={"elapsed_seconds": str(retry_elapsed)},
             )
             return False
         if retried > 0:
@@ -9493,6 +9529,7 @@ class BotLoop:
                 )
 
         # ---- Step 7c: Retry failed cancels (V1 parity) ----
+        self._set_cycle_step("step7c_cancel_recovery")
         if not self._run_cancel_retry_pass():
             return False
 

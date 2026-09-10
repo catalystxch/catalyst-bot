@@ -552,6 +552,100 @@ def test_successful_recovery_establishes_fresh_detector_baseline():
     )
 
 
+def test_long_cancel_retry_pass_refreshes_clock_baseline_and_defers_later_mutations():
+    import bot_loop
+
+    clock = {
+        "monotonic": Decimal("100"),
+        "wall": NOW,
+    }
+
+    class _OfferManager:
+        @staticmethod
+        def retry_failed_cancels():
+            clock["monotonic"] = Decimal("320")
+            clock["wall"] = NOW + timedelta(seconds=220)
+            return 0
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._runtime_recovery_baseline = _sample(Decimal("100"), NOW)
+    loop._runtime_recovery_monotonic = lambda: clock["monotonic"]
+    loop._runtime_recovery_wall_clock = lambda: clock["wall"]
+    loop._runtime_recovery_gap_seconds = Decimal("135")
+    loop._runtime_recovery_skew_seconds = Decimal("45")
+    loop._enter_runtime_effect_phase = lambda phase: phase == "cancel"
+    loop.offer_manager = _OfferManager()
+
+    assert loop._run_cancel_retry_pass() is False
+    assert loop._runtime_recovery_baseline == _sample(
+        Decimal("320"), NOW + timedelta(seconds=220)
+    )
+
+
+def test_pending_cancel_retry_refreshes_clock_baseline_before_next_proof_poll():
+    import bot_loop
+
+    clock = {
+        "monotonic": Decimal("100"),
+        "wall": NOW,
+    }
+
+    class _OfferManager:
+        @staticmethod
+        def retry_failed_cancels():
+            clock["monotonic"] = Decimal("320")
+            clock["wall"] = NOW + timedelta(seconds=220)
+            return -1
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._runtime_recovery_baseline = _sample(Decimal("100"), NOW)
+    loop._runtime_recovery_monotonic = lambda: clock["monotonic"]
+    loop._runtime_recovery_wall_clock = lambda: clock["wall"]
+    loop._runtime_recovery_gap_seconds = Decimal("135")
+    loop._runtime_recovery_skew_seconds = Decimal("45")
+    loop._enter_runtime_effect_phase = lambda phase: phase == "cancel"
+    loop.offer_manager = _OfferManager()
+
+    assert loop._run_cancel_retry_pass() is False
+    assert loop._runtime_recovery_baseline == _sample(
+        Decimal("320"), NOW + timedelta(seconds=220)
+    )
+
+
+def test_cancel_retry_does_not_hide_wall_clock_jump_during_sage_proof_pass():
+    import bot_loop
+
+    clock = {
+        "monotonic": Decimal("100"),
+        "wall": NOW,
+    }
+    decisions = []
+
+    class _OfferManager:
+        @staticmethod
+        def retry_failed_cancels():
+            clock["monotonic"] = Decimal("130")
+            clock["wall"] = NOW + timedelta(seconds=220)
+            return 0
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._runtime_recovery_baseline = _sample(Decimal("100"), NOW)
+    loop._runtime_recovery_monotonic = lambda: clock["monotonic"]
+    loop._runtime_recovery_wall_clock = lambda: clock["wall"]
+    loop._runtime_recovery_gap_seconds = Decimal("135")
+    loop._runtime_recovery_skew_seconds = Decimal("45")
+    loop._enter_runtime_effect_phase = lambda phase: phase == "cancel"
+    loop._runtime_recovery_coordinator = lambda decision, sample: (
+        decisions.append((decision, sample))
+        or {"allowed": False, "reason_code": "DURABLE_STATE_UNAVAILABLE"}
+    )
+    loop.offer_manager = _OfferManager()
+
+    assert loop._run_cancel_retry_pass() is False
+    assert decisions[0][0].reason_code == "WALL_CLOCK_JUMP"
+    assert loop._runtime_recovery_baseline == _sample(Decimal("100"), NOW)
+
+
 def test_runtime_recovery_reuses_ordered_startup_coordinator_and_retries_same_epoch(
     monkeypatch,
 ):
