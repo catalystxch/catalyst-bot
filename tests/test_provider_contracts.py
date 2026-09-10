@@ -44,9 +44,7 @@ def _observation(provider_id: str = "dexie") -> ProviderObservation:
 def test_capabilities_are_immutable_and_normalized():
     capabilities = ProviderCapabilities(
         provider_id="DEXIE",
-        capabilities=frozenset(
-            {Capability.ORDER_BOOK, Capability.DISCOVER_OFFER}
-        ),
+        capabilities=frozenset({Capability.ORDER_BOOK, Capability.DISCOVER_OFFER}),
     )
 
     assert capabilities.provider_id == "dexie"

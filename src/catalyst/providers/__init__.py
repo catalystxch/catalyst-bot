@@ -8,7 +8,12 @@ from .models import (
     ProviderCapabilities,
     ProviderObservation,
 )
+from .coinset import CoinsetEvidenceProvider
+from .dexie import DexieOrderbookProvider
 from .registry import ProviderRegistry
+from .sage import SageAuthorityProvider
+from .spacescan import SpacescanEvidenceProvider
+from .splash import SplashOfferProvider
 
 __all__ = [
     "BookObservation",
@@ -18,4 +23,9 @@ __all__ = [
     "ProviderCapabilities",
     "ProviderObservation",
     "ProviderRegistry",
+    "CoinsetEvidenceProvider",
+    "DexieOrderbookProvider",
+    "SageAuthorityProvider",
+    "SpacescanEvidenceProvider",
+    "SplashOfferProvider",
 ]

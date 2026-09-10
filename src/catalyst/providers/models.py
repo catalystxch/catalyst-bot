@@ -176,14 +176,17 @@ class ProviderObservation:
         if (
             type(self.identity_keys) is not tuple
             or not self.identity_keys
-            or any(type(key) is not str or not key.strip() for key in self.identity_keys)
+            or any(
+                type(key) is not str or not key.strip() for key in self.identity_keys
+            )
         ):
             raise ValueError("identity_keys must contain non-empty strings")
         if len(set(self.identity_keys)) != len(self.identity_keys):
             raise ValueError("identity_keys must be unique")
-        if type(self.payload_sha256) is not str or _DIGEST.fullmatch(
-            self.payload_sha256
-        ) is None:
+        if (
+            type(self.payload_sha256) is not str
+            or _DIGEST.fullmatch(self.payload_sha256) is None
+        ):
             raise ValueError("payload_sha256 is invalid")
         if type(self.quality) is not ObservationQuality:
             raise TypeError("quality is invalid")
@@ -238,7 +241,9 @@ class MarketQuote:
             self, "quote_asset_id", _asset_id(self.quote_asset_id, allow_xch=True)
         )
         object.__setattr__(self, "provider_id", _provider_id(self.provider_id))
-        object.__setattr__(self, "observed_at", _aware_utc(self.observed_at, "observed_at"))
+        object.__setattr__(
+            self, "observed_at", _aware_utc(self.observed_at, "observed_at")
+        )
         if type(self.bid) is not Decimal or type(self.ask) is not Decimal:
             raise TypeError("market prices must be Decimal values")
         if not self.bid.is_finite() or not self.ask.is_finite():
@@ -266,7 +271,9 @@ class BookObservation:
             self, "quote_asset_id", _asset_id(self.quote_asset_id, allow_xch=True)
         )
         object.__setattr__(self, "provider_id", _provider_id(self.provider_id))
-        object.__setattr__(self, "observed_at", _aware_utc(self.observed_at, "observed_at"))
+        object.__setattr__(
+            self, "observed_at", _aware_utc(self.observed_at, "observed_at")
+        )
         identities: set[str] = set()
         for side, levels in (("bid", self.bids), ("ask", self.asks)):
             if type(levels) is not tuple:
@@ -274,7 +281,9 @@ class BookObservation:
             prior_price = None
             for level in levels:
                 if type(level) is not tuple or len(level) != 3:
-                    raise TypeError("book levels must be (price, amount, identity) tuples")
+                    raise TypeError(
+                        "book levels must be (price, amount, identity) tuples"
+                    )
                 price, amount, identity = level
                 if type(price) is not Decimal or not price.is_finite() or price <= 0:
                     raise ValueError("book level price is invalid")
