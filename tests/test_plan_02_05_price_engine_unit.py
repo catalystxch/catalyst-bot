@@ -446,7 +446,7 @@ class TestDexieTickerFreshness(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
 class TestTibetCacheInjection(unittest.TestCase):
-    """Fresh reserve signals can update the Tibet cache without waiting for /pairs."""
+    """Retired reserve signals cannot revive the legacy Tibet cache."""
 
     def setUp(self):
         self._p = patch.object(_pe_mod, "cfg", _CfgPatch())
@@ -464,7 +464,7 @@ class TestTibetCacheInjection(unittest.TestCase):
             _pe_mod._tibet_cache["cache_ttl"] = self._old_cache["cache_ttl"]
         self._p.stop()
 
-    def test_inject_tibet_reserves_updates_matching_cached_pair(self):
+    def test_inject_tibet_reserves_ignores_matching_cached_pair(self):
         with _pe_mod._tibet_lock:
             _pe_mod._tibet_cache["pairs"] = [
                 {
@@ -484,14 +484,14 @@ class TestTibetCacheInjection(unittest.TestCase):
             fetched_at=123,
         )
 
-        self.assertTrue(injected)
+        self.assertFalse(injected)
         with _pe_mod._tibet_lock:
             pair = _pe_mod._tibet_cache["pairs"][0]
-            self.assertEqual(pair["xch_reserve"], 3000)
-            self.assertEqual(pair["token_reserve"], 4000)
-            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 123)
+            self.assertEqual(pair["xch_reserve"], 1000)
+            self.assertEqual(pair["token_reserve"], 2000)
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 10)
 
-    def test_inject_tibet_reserves_invalidates_cache_when_pair_missing(self):
+    def test_inject_tibet_reserves_is_noop_when_pair_missing(self):
         with _pe_mod._tibet_lock:
             _pe_mod._tibet_cache["pairs"] = [
                 {
@@ -513,7 +513,7 @@ class TestTibetCacheInjection(unittest.TestCase):
 
         self.assertFalse(injected)
         with _pe_mod._tibet_lock:
-            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 0)
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 10)
 
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")

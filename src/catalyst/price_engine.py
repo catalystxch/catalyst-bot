@@ -1,18 +1,16 @@
-"""Unified price discovery for Chia CAT trading pairs
+"""Offer-book price discovery for Chia CAT trading pairs.
 
-The `PriceEngine` class is the central price oracle for the bot. It blends
-quotes from Dexie (`/v2/prices/tickers`) and TibetSwap (`/pairs`) with an
-EMA reference price, applies dynamic safety rails, and tracks realized
-volatility. `AMMMonitor` injects fresh reserves into `_tibet_cache` to
-keep pool-derived prices from going stale, and `risk_manager` and
-`amm_monitor` receive the engine via constructor injection. `bot_loop`
-calls `get_price()` directly on every cycle.
+The `PriceEngine` class is the central price oracle for the bot. It derives
+quotes from trusted offer-book evidence, applies dynamic safety rails, and
+tracks realized volatility. TibetSwap network access was retired in v1.4;
+the remaining Tibet-named methods and cache are inert compatibility surfaces
+for one upgrade cycle and must never provide live pricing.
 
 Key responsibilities:
-    - Fetch and cache Dexie ticker data and TibetSwap pair reserves
-    - Blend sources into a single mid-price with strategy metadata
+    - Fetch and cache trusted offer-book data
+    - Derive a single mid-price with source and confidence metadata
     - Maintain an EMA reference and volatility signal for risk logic
-    - Provide the injection point that `AMMMonitor` uses for live reserves
+    - Keep historical TibetSwap compatibility methods network-free and inert
 """
 
 import time
@@ -26,15 +24,12 @@ from database import record_price, get_recent_prices, log_event
 
 
 # ---------------------------------------------------------------------------
-# TibetSwap pair cache (pairs don't change often)
+# Retired TibetSwap cache retained only for one-release import compatibility.
 # ---------------------------------------------------------------------------
 _tibet_cache = {
     "pairs": [],
     "fetched_at": 0,
-    "cache_ttl": 120,  # 2 minutes — reduced from 30min so AMM drift is caught sooner
-    # AMMMonitor injects fresh reserves every AMM_POLL_INTERVAL_SECS
-    # and resets fetched_at, so the effective refresh rate is
-    # whichever is shorter: this TTL or the AMM poll interval.
+    "cache_ttl": 120,
 }
 _tibet_lock = threading.Lock()
 _tibet_warning_state = {
@@ -478,102 +473,16 @@ class PriceEngine:
         return None
 
     def _find_tibet_pair(self, asset_id: str) -> Optional[Dict]:
-        """Find TibetSwap pair by asset ID, with caching."""
-        pairs = self._get_tibet_pairs()
-        if not pairs:
-            return None
-
-        # Normalize asset ID (handle trailing 00 variants)
-        normalized = asset_id.lower().strip()
-        if normalized.startswith("0x"):
-            normalized = normalized[2:]
-
-        for pair in pairs:
-            pair_asset = str(pair.get("asset_id", "")).lower().strip()
-            if pair_asset.startswith("0x"):
-                pair_asset = pair_asset[2:]
-
-            # Match exact only — never strip trailing zeros from hex asset IDs
-            # as distinct CATs can differ only in trailing hex digits.
-            if pair_asset == normalized:
-                return pair
-
+        """Compatibility stub: retired TibetSwap pairs are never resolved."""
         return None
 
     def _get_tibet_pairs(self) -> List[Dict]:
-        """Fetch all TibetSwap pairs (cached for 30 minutes, thread-safe)."""
-        with _tibet_lock:
-            now = time.time()
-            if (
-                _tibet_cache["pairs"]
-                and (now - _tibet_cache["fetched_at"]) < _tibet_cache["cache_ttl"]
-            ):
-                return _tibet_cache["pairs"]
-            # Mark as fetching to prevent duplicate requests
-            stale_pairs = list(_tibet_cache.get("pairs", []))
-
-        # Fetch outside lock to avoid blocking other threads
-        try:
-            self._tibet_price_fetches += 1
-            url = f"{cfg.TIBET_API_BASE}/pairs"
-            resp = self._session.get(
-                url, params={"skip": 0, "limit": 200}, timeout=cfg.TIBET_TIMEOUT
-            )
-            if resp.status_code == 429:
-                self._log_tibet_warning(
-                    "tibet_rate_limited",
-                    "TibetSwap returned 429 — will use cached price if available",
-                )
-                # Fall through to stale cache logic below
-                raise requests.RequestException("HTTP 429 rate limited")
-            resp.raise_for_status()
-            pairs = resp.json()
-
-            if isinstance(pairs, list):
-                with _tibet_lock:
-                    _tibet_cache["pairs"] = pairs
-                    _tibet_cache["fetched_at"] = time.time()
-                return pairs
-
-        except requests.RequestException as e:
-            self._log_tibet_warning("tibet_error", f"TibetSwap fetch failed: {e}")
-        except (ValueError, KeyError, TypeError) as e:
-            self._log_tibet_warning(
-                "tibet_parse_error",
-                f"TibetSwap returned unparseable response: {e}",
-            )
-
-        # Return stale cache only if within the maximum staleness bound.
-        # The ceiling is capped by PRICE_HARD_PAUSE_SECS (default 120s) so
-        # the cached fallback cannot outlive the oracle hard-pause policy.
-        # Operators can still tighten TIBET_MAX_STALE_SECS further via env
-        # but not past PRICE_HARD_PAUSE_SECS without reconfiguring the
-        # overall staleness policy in concert.
-        _hard_pause = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
-        max_stale_secs = min(
-            int(getattr(cfg, "TIBET_MAX_STALE_SECS", _hard_pause)),
-            _hard_pause,
-        )
-        stale_age = time.time() - _tibet_cache["fetched_at"]
-        if stale_pairs and stale_age <= max_stale_secs:
-            self._log_tibet_warning(
-                "tibet_stale_cache",
-                f"TibetSwap API error — using {stale_age:.0f}s old cached price "
-                f"(max allowed: {max_stale_secs}s)",
-            )
-            return stale_pairs
-        elif stale_pairs:
-            self._log_tibet_warning(
-                "tibet_cache_expired",
-                f"TibetSwap API error AND cache is {stale_age:.0f}s old "
-                f"(> {max_stale_secs}s max) — refusing to return stale price",
-            )
+        """Compatibility stub: the retired provider can never perform I/O."""
         return []
 
     def invalidate_tibet_cache(self):
-        """Force refresh of TibetSwap data on next call."""
-        with _tibet_lock:
-            _tibet_cache["fetched_at"] = 0
+        """Compatibility no-op for callers retained during the v1.4 migration."""
+        return None
 
     def inject_tibet_reserves(
         self,
@@ -583,55 +492,8 @@ class PriceEngine:
         token_reserve=None,
         fetched_at: float = None,
     ) -> bool:
-        """Inject freshly observed Tibet reserves into the pair cache.
-
-        Confirmed reserve watchers already know the post-swap reserves.  Push
-        those into the shared cache immediately so the next get_price() call
-        cannot reuse a pre-swap Tibet price while the /pairs TTL is still hot.
-        Returns True when a cached pair was updated; otherwise invalidates the
-        cache so the next caller performs a full refresh.
-        """
-        try:
-            xch_int = int(xch_reserve)
-            token_int = int(token_reserve)
-        except (TypeError, ValueError):
-            return False
-
-        pair_id_norm = str(pair_id or "").strip()
-        asset_norm = str(asset_id or cfg.CAT_ASSET_ID or "").lower().strip()
-        if asset_norm.startswith("0x"):
-            asset_norm = asset_norm[2:]
-
-        with _tibet_lock:
-            pairs = _tibet_cache.get("pairs", []) or []
-            for pair in pairs:
-                cached_pair_id = str(pair.get("pair_id") or "").strip()
-                cached_asset = str(pair.get("asset_id") or "").lower().strip()
-                if cached_asset.startswith("0x"):
-                    cached_asset = cached_asset[2:]
-
-                pair_matches = bool(pair_id_norm and cached_pair_id == pair_id_norm)
-                asset_matches = bool(
-                    not pair_id_norm and asset_norm and cached_asset == asset_norm
-                )
-                if not (pair_matches or asset_matches):
-                    continue
-
-                pair["xch_reserve"] = xch_int
-                pair["token_reserve"] = token_int
-                _tibet_cache["fetched_at"] = (
-                    float(fetched_at) if fetched_at is not None else time.time()
-                )
-                log_event(
-                    "debug",
-                    "tibet_cache_injected",
-                    f"Injected confirmed Tibet reserves into price cache "
-                    f"(xch={xch_int}, token={token_int})",
-                )
-                return True
-
-            _tibet_cache["fetched_at"] = 0
-            return False
+        """Compatibility no-op; retired reserve evidence is never accepted."""
+        return False
 
     def get_live_amm_price(self) -> Optional[Decimal]:
         """Compatibility stub: no Chia AMM price source is active."""

@@ -230,9 +230,9 @@ class CoinManagerSniperPoolTests(unittest.TestCase):
         self.cfg.LIQUIDITY_MODE = "sell_only"
         self.assertFalse(self._mgr()._sniper_pool_enabled())
 
-    def test_sniper_pool_on_in_two_sided(self):
+    def test_sniper_pool_remains_retired_in_two_sided(self):
         self.cfg.LIQUIDITY_MODE = "two_sided"
-        self.assertTrue(self._mgr()._sniper_pool_enabled())
+        self.assertFalse(self._mgr()._sniper_pool_enabled())
 
 
 if __name__ == "__main__":

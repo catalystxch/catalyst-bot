@@ -1,9 +1,10 @@
 """Central trading-loop orchestrator that wires all bot subsystems together
 
 The `BotLoop` class owns instances of `PriceEngine`, `OfferManager`, `FillTracker`,
-`DexieManager`, `SplashManager`, `CoinManager`, `RiskManager`, `Sniper`,
-`BoostManager`, `MarketIntel`, `RuntimeMonitor`, `AMMMonitor`, and `MempoolWatcher`,
-then completes cross-module wiring via attribute injection after construction.
+`DexieManager`, `SplashManager`, `CoinManager`, `RiskManager`, `BoostManager`,
+`MarketIntel`, and `RuntimeMonitor`, then completes cross-module wiring via
+attribute injection after construction. Legacy AMM/sniper objects remain inert
+for one upgrade cycle; v1.4 never starts their network or trading paths.
 The main entry point `_run_one_cycle()` runs on a background thread every
 `cfg.LOOP_SECONDS` and drives the per-cycle pipeline: price fetch, risk checks,
 fill detection, round-trip matching, requote, new-offer creation, Dexie posting,
@@ -4360,65 +4361,16 @@ class BotLoop:
             )
 
     def _try_start_mempool_watcher(self, *, log_skip: bool = False) -> bool:
-        """F78 (2026-04-17): attempt to start the mempool watcher.
+        """Keep the TibetSwap-pair mempool watcher retired in v1.4."""
 
-        Split out from :meth:`start` so the main loop can call it each
-        cycle when the initial attempt at boot failed (usually because
-        the TibetSwap pair_id hadn't been resolved yet).
-
-        Returns True on successful start or when already running;
-        False when it couldn't start (caller should retry next cycle).
-        """
-        if not (
-            _mempool_watcher_mod
-            and getattr(cfg, "COINSET_ENABLED", True)
-            and cfg.CAT_ASSET_ID
-        ):
-            return False
-        # Already running?
-        try:
-            if getattr(_mempool_watcher_mod, "_watcher_instance", None) is not None:
-                return True
-        except Exception:
-            pass
-
-        try:
-            pair_id = getattr(cfg, "_cached_tibet_pair_id", "") or ""
-            if not pair_id:
-                from price_engine import PriceEngine as _PE
-
-                _tmp_pe = _PE()
-                _tmp_pair = _tmp_pe._find_tibet_pair(cfg.CAT_ASSET_ID) or {}
-                pair_id = _tmp_pair.get("pair_id", "")
-            if not pair_id:
-                if log_skip:
-                    log_event(
-                        "info",
-                        "mempool_watcher_deferred",
-                        "Mempool watcher deferred — TibetSwap pair_id "
-                        "not resolved yet; will retry on next cycle",
-                    )
-                return False
-            _mempool_watcher_mod.start_watcher(
-                pair_id=pair_id,
-                asset_id=cfg.CAT_ASSET_ID,
-                cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3) or 3),
-                wake_callback=self._watcher_event.set,
-            )
+        if log_skip:
             log_event(
                 "info",
-                "mempool_watcher_init",
-                f"Mempool watcher started (pair {pair_id[:16]}...)",
+                "tibetswap_mempool_watcher_retired",
+                "Legacy pair-specific mempool watching is retired; "
+                "offer-book and exact chain evidence remain active",
             )
-            return True
-        except Exception as _mw_err:
-            if log_skip:
-                log_event(
-                    "warning",
-                    "mempool_watcher_skip",
-                    f"Mempool watcher could not start: {_mw_err}",
-                )
-            return False
+        return False
 
     def _run_ladder_watchdog(self) -> None:
         """F72: Periodic ladder + coin-accounting integrity audit.
@@ -5510,7 +5462,7 @@ class BotLoop:
         log_event(
             "info",
             "bot_started",
-            "Bot loop started (with health, price, coin, AMM, and runtime monitors)",
+            "Bot loop started (with health, offer-book, coin, and runtime monitors)",
         )
         return True
 
@@ -9595,7 +9547,10 @@ class BotLoop:
         # generating a requote storm. We now refuse to re-trigger drift
         # requote within REQUOTE_COOLDOWN_SECS of the last AMM-drift force.
         try:
-            if self.amm_monitor.is_available() and self._loop_count > 5:
+            # One-release compatibility body only. The literal False is a
+            # non-configurable fence: neither an upgraded .env nor a mocked
+            # legacy monitor can reactivate TibetSwap-derived requotes.
+            if False and self.amm_monitor.is_available() and self._loop_count > 5:
                 amm_drift_bps = self.amm_monitor.get_drift_bps()
                 if amm_drift_bps is not None:
                     _drift_threshold = Decimal(
@@ -9907,7 +9862,9 @@ class BotLoop:
         #   5. If both taken → widen both → retry
         #   6. Only after probe confirms do main offers deploy
         sniper_fired = False
-        _sniper_on = getattr(cfg, "SNIPER_ENABLED", True)
+        # v1.4: legacy AMM sniper/probe execution is permanently fenced even
+        # when an upgraded .env still contains SNIPER_ENABLED=true.
+        _sniper_on = False
         recovery_active_now = self._recovery_is_active()
         launch_reason = self._get_sniper_launch_reason(
             mid_price,

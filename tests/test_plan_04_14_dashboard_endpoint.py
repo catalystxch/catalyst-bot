@@ -364,7 +364,7 @@ class TestDashboard(_FlaskBase):
             "Market conditions healthy — bot stopped",
         )
 
-    def test_market_health_reports_tibetswap_outage_as_degraded(self):
+    def test_retired_tibetswap_check_does_not_degrade_offer_book_health(self):
         risk_manager = MagicMock()
         risk_manager.get_inventory_state.return_value = {}
         risk_manager.get_circuit_breaker_blocked_side.return_value = ""
@@ -440,15 +440,12 @@ class TestDashboard(_FlaskBase):
 
         self.assertEqual(resp.status_code, 200)
         market_health = resp.get_json()["market_health"]
-        self.assertEqual(market_health["status"], "amber")
-        self.assertIn("TibetSwap", market_health["message"])
-        self.assertIn("Dexie-only", market_health["message"])
-        self.assertTrue(
-            any(
-                condition.get("level") == "amber"
-                and "AMM drift protection" in condition.get("text", "")
-                for condition in market_health["conditions"]
-            )
+        self.assertEqual(market_health["status"], "green")
+        self.assertEqual(
+            market_health["message"], "Market healthy — bot operating normally"
+        )
+        self.assertFalse(
+            any("TibetSwap" in condition.get("text", "") for condition in market_health["conditions"])
         )
 
     def test_wallet_has_balance_keys(self):

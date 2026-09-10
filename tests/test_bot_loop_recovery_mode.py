@@ -73,6 +73,7 @@ fake_database.log_event = lambda *args, **kwargs: None
 fake_database.get_stats = lambda *args, **kwargs: {}
 fake_database.get_offer = lambda *args, **kwargs: None
 fake_database.get_open_offers = lambda *args, **kwargs: []
+fake_database.get_active_offer_market_identities = lambda *args, **kwargs: set()
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None

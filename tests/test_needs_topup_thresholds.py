@@ -305,8 +305,8 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         self.assertTrue(mgr.needs_topup())
         self.assertTrue(mgr._topup_is_drip)
 
-    def test_sniper_drip_waits_when_cat_pool_has_no_source(self):
-        """Do not start noisy drip topups for optional CAT sniper gaps with no pool."""
+    def test_retired_sniper_pool_never_triggers_drip_topup(self):
+        """Upgraded configs cannot reactivate the retired TibetSwap sniper pool."""
         self._ns.SNIPER_ENABLED = True
         self._ns.SNIPER_PREP_COUNT = 25
         self._ns.SNIPER_SIZE_XCH = "0.001"
@@ -332,7 +332,7 @@ class NeedsTopupThresholdTests(unittest.TestCase):
             self.assertFalse(mgr.needs_topup())
 
         event_types = [call.args[1] for call in log_event.call_args_list]
-        self.assertIn("drip_source_unavailable", event_types)
+        self.assertNotIn("drip_source_unavailable", event_types)
         self.assertNotIn("drip_trigger", event_types)
 
     def test_drip_source_unavailable_notice_is_hourly(self):

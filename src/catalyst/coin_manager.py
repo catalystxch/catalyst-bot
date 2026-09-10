@@ -2162,28 +2162,8 @@ class CoinManager:
             pass  # non-fatal — keep existing pool
 
     def _sniper_pool_enabled(self) -> bool:
-        """Whether the dedicated sniper pool should be prepared and maintained.
-
-        The sniper is an arb-discovery tool that fires a simultaneous buy +
-        sell probe, so it only works in two-sided mode. Under any single-
-        sided ``LIQUIDITY_MODE`` the sniper pool is forced off even if the
-        ``SNIPER_ENABLED`` flag is still set — stops stale config from
-        preparing coins the bot will never use.
-        """
-        # Single-sided mode → arb snipe cannot operate; skip pool entirely.
-        _mode = (getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided").lower()
-        if _mode in ("buy_only", "sell_only"):
-            return False
-        try:
-            sniper_size = Decimal(str(getattr(cfg, "SNIPER_SIZE_XCH", "0") or "0"))
-        except Exception:
-            sniper_size = Decimal("0")
-        return (
-            bool(getattr(cfg, "TIER_ENABLED", False))
-            and bool(getattr(cfg, "SNIPER_ENABLED", False))
-            and int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0) > 0
-            and sniper_size > 0
-        )
+        """Return False: the dedicated TibetSwap sniper pool is retired."""
+        return False
 
     def _optional_topup_source_available(
         self, wallet_type: str, target_size_mojos: int = 0

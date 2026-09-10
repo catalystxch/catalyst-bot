@@ -180,6 +180,28 @@ def test_retired_pool_and_quote_methods_do_not_use_network(monkeypatch):
     engine._session.get = Mock(side_effect=AssertionError("network call attempted"))
 
     assert engine._fetch_tibet_price(ASSET_ID) is None
+    assert engine._find_tibet_pair(ASSET_ID) is None
+    assert engine._get_tibet_pairs() == []
+    assert engine.inject_tibet_reserves(
+        asset_id=ASSET_ID,
+        xch_reserve=1,
+        token_reserve=1,
+    ) is False
     assert engine.get_tibet_pool_info(ASSET_ID)["status"] == "retired"
     assert engine.get_tibet_quote(Decimal("1"), "buy")["status"] == "retired"
     engine._session.get.assert_not_called()
+
+
+def test_legacy_tibet_mempool_and_sniper_paths_are_runtime_fenced():
+    mempool_source = inspect.getsource(bot_loop.BotLoop._try_start_mempool_watcher)
+    coin_prep_source = inspect.getsource(
+        __import__("coin_manager").CoinManager._sniper_pool_enabled
+    )
+    cycle_source = inspect.getsource(bot_loop.BotLoop._run_one_cycle)
+
+    assert "_find_tibet_pair" not in mempool_source
+    assert "start_watcher" not in mempool_source
+    assert '"tibetswap_mempool_watcher_retired"' in mempool_source
+    assert "return False" in coin_prep_source
+    assert "_sniper_on = False" in cycle_source
+    assert "if False and self.amm_monitor.is_available()" in cycle_source

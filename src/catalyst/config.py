@@ -844,7 +844,9 @@ class Config:
         self.RECONCILE_EVERY_N_LOOPS = _int("RECONCILE_EVERY_N_LOOPS", 2)
 
         # ----- Sniper (V2) -----
-        self.SNIPER_ENABLED = _bool("SNIPER_ENABLED", True)
+        # One-release compatibility key. Runtime remains fenced even when an
+        # upgraded .env explicitly contains True.
+        self.SNIPER_ENABLED = _bool("SNIPER_ENABLED", False)
         self.SNIPER_SIZE_XCH = _decimal("SNIPER_SIZE_XCH", "0.001")
         self.SNIPER_PREP_COUNT = _int("SNIPER_PREP_COUNT", 20)
         self.SNIPER_EXPIRY_SECS = _int(
