@@ -753,172 +753,33 @@ def api_status():
                     f"Looking up price for {api_server._active_cat.get('name', 'unknown')}",
                 )
             if pricing_asset_id:
-                import requests as _req
+                from blueprints.market import _get_startup_price_cached
 
-                mid = 0
-
-                # --- Try TibetSwap ---
-                try:
-                    from blueprints.market import _get_tibet_pairs_cached
-
-                    pairs = _get_tibet_pairs_cached(
-                        getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
-                        timeout=8,
-                    )
-                    norm_id = pricing_asset_id.lower().strip().replace("0x", "")
-                    for p in pairs:
-                        p_id = (
-                            str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                        )
-                        if p_id == norm_id:
-                            xr = Decimal(str(p.get("xch_reserve", 0))) / Decimal(
-                                "1000000000000"
-                            )
-                            tr = Decimal(str(p.get("token_reserve", 0))) / (
-                                Decimal(10) ** int(cat_dec)
-                            )
-                            if tr > 0:
-                                mid = xr / tr
-                                pricing = {
-                                    "bid": mid,
-                                    "mid": mid,
-                                    "ask": mid,
-                                    "tibet_price": mid,
-                                    "tibet_enabled": True,
-                                    "source": "tibetswap",
-                                    "liquidity": {
-                                        "xch_reserve": str(xr),
-                                        "token_reserve": str(tr),
-                                    },
-                                }
-                                print(f"[STATUS] TibetSwap price: {mid}", flush=True)
-                                log_event(
-                                    "success",
-                                    "price_found",
-                                    f"TibetSwap price: {mid:.8f} XCH",
-                                )
-                            break
-                except Exception as e:
-                    print(f"[STATUS] TibetSwap failed: {e}")
-                    slog(
-                        "API_STATUS",
-                        f"TibetSwap price lookup failed: {e!r}",
-                        level="debug",
-                    )
+                ticker_id = (
+                    api_server._active_cat.get("ticker_id")
+                    or getattr(cfg, "CAT_TICKER_ID", "")
+                    or ""
+                )
+                snapshot = _get_startup_price_cached(
+                    pricing_asset_id, ticker_id, int(cat_dec)
+                )
+                mid = Decimal(str(snapshot.get("mid") or 0))
+                if mid > 0:
+                    pricing = {
+                        "bid": mid,
+                        "mid": mid,
+                        "ask": mid,
+                        "dexie_price": mid,
+                        "tibet_enabled": False,
+                        "tibet_status": "retired",
+                        "source": snapshot.get("source", "dexie_bid_ask"),
+                    }
                     log_event(
-                        "warning", "price_lookup", "TibetSwap price lookup failed"
+                        "success",
+                        "price_found",
+                        f"Dexie executable-book price: {mid:.8f} XCH",
                     )
-
-                # --- Fallback to Dexie if TibetSwap had no match ---
-                if mid == 0:
-                    print("[STATUS] No TibetSwap price, trying Dexie...", flush=True)
-                    log_event(
-                        "info",
-                        "price_lookup",
-                        "No TibetSwap price, trying Dexie fallback",
-                    )
-                    try:
-                        ticker_id = (
-                            api_server._active_cat.get("ticker_id")
-                            or getattr(cfg, "CAT_TICKER_ID", "")
-                            or ""
-                        )
-                        # Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
-                        if ticker_id and "_" not in ticker_id:
-                            ticker_id = f"{ticker_id}_XCH"
-                        dexie_base = getattr(
-                            cfg, "DEXIE_API_BASE", "https://api.dexie.space"
-                        )
-                        if ticker_id:
-                            _record_api_call("dexie", "/v2/prices/tickers")
-                            resp = _req.get(
-                                f"{dexie_base}/v2/prices/tickers",
-                                params={"ticker_id": ticker_id},
-                                timeout=8,
-                            )
-                            if resp.status_code == 200:
-                                tickers = resp.json().get("tickers", [])
-                                if tickers:
-                                    tk = tickers[0]
-                                    tk_bid = Decimal(
-                                        str(tk.get("bid") or tk.get("best_bid") or 0)
-                                    )
-                                    tk_ask = Decimal(
-                                        str(tk.get("ask") or tk.get("best_ask") or 0)
-                                    )
-                                    if tk_bid > 0 and tk_ask > 0 and tk_bid <= tk_ask:
-                                        mid = (tk_bid + tk_ask) / 2
-                                        pricing = {
-                                            "bid": tk_bid,
-                                            "mid": mid,
-                                            "ask": tk_ask,
-                                            "dexie_price": mid,
-                                            "tibet_enabled": False,
-                                            "source": "dexie_bid_ask",
-                                        }
-                                        print(
-                                            f"[STATUS] Dexie live bid/ask price: {mid}"
-                                        )
-                                        log_event(
-                                            "success",
-                                            "price_found",
-                                            f"Dexie live bid/ask price: {mid:.8f} XCH",
-                                        )
-                                    else:
-                                        log_event(
-                                            "info",
-                                            "dexie_ticker_unusable",
-                                            "Dexie ticker had no sane live bid/ask; ignoring historical price fields",
-                                        )
-                        # If no ticker_id or no result, try orderbook
-                        if mid == 0:
-                            _record_api_call("dexie", "/v1/offers")
-                            resp = _req.get(
-                                f"{dexie_base}/v1/offers",
-                                params={
-                                    "offered": pricing_asset_id,
-                                    "requested": "xch",
-                                    "status": 0,
-                                    "page_size": 1,
-                                    "sort": "price_asc",
-                                },
-                                timeout=8,
-                            )
-                            if resp.status_code == 200:
-                                offers = resp.json().get("offers", [])
-                                if offers:
-                                    best_ask = Decimal(str(offers[0].get("price", 0)))
-                                    if best_ask > 0:
-                                        mid = best_ask
-                                        pricing = {
-                                            "bid": mid,
-                                            "mid": mid,
-                                            "ask": mid,
-                                            "dexie_price": mid,
-                                            "tibet_enabled": False,
-                                            "source": "dexie_orderbook",
-                                        }
-                                        print(f"[STATUS] Dexie orderbook price: {mid}")
-                                        log_event(
-                                            "success",
-                                            "price_found",
-                                            f"Dexie orderbook price: {mid:.8f} XCH",
-                                        )
-                    except Exception as e:
-                        print(f"[STATUS] Dexie fallback failed: {e}")
-                        slog(
-                            "API_STATUS",
-                            f"Dexie fallback price lookup failed: {e!r}",
-                            level="debug",
-                        )
-                        log_event(
-                            "warning",
-                            "price_lookup",
-                            "Dexie fallback price lookup failed",
-                        )
-
-                if mid == 0:
-                    print("[STATUS] No price from any source")
+                else:
                     log_event(
                         "error", "price_lookup", "No price available from any source"
                     )

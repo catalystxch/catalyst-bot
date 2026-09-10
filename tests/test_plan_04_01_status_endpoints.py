@@ -752,14 +752,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(resp.status_code, 200)
         get_spendable_coin_count.assert_not_called()
 
-    def test_stopped_status_reuses_tibet_pairs_for_immediate_polls(self):
-        from blueprints import market as market_routes
-
-        with market_routes._TIBET_PAIRS_CACHE_LOCK:
-            market_routes._TIBET_PAIRS_CACHE.update(
-                {"base": "", "fetched_at": 0.0, "pairs": []}
-            )
-
+    def test_stopped_status_never_contacts_retired_tibetswap(self):
         asset_id = "abc123cat"
         api_server._active_cat.update(
             {
@@ -801,7 +794,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
             api_server._active_cat.update(self._orig_cat)
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
-        self.assertEqual(len(tibet_calls), 1)
+        self.assertEqual(tibet_calls, [])
 
     def test_cold_stopped_status_uses_dexie_during_tibetswap_outage(self):
         """TibetSwap outage must not deadlock setup waiting for its first price."""

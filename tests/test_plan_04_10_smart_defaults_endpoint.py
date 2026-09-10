@@ -192,11 +192,16 @@ class TestSmartDefaults(_FlaskBase):
 
 
 class TestSmartDefaultsSourceContract(unittest.TestCase):
-    def test_tibet_shock_trigger_derives_from_inner_edge(self):
-        from blueprints.smart_defaults import _smart_tibet_shock_trigger_pct
+    def test_calculation_has_no_live_tibet_decision_inputs(self):
+        import inspect
+        from blueprints.smart_defaults import _calculate_smart_defaults
 
-        self.assertEqual(_smart_tibet_shock_trigger_pct(324), 1.62)
-        self.assertEqual(_smart_tibet_shock_trigger_pct(50), 0.5)
+        source = inspect.getsource(_calculate_smart_defaults)
+        self.assertNotIn('tibet.get("xch_reserve"', source)
+        self.assertNotIn("tibet_quote.get", source)
+        self.assertNotIn("_smart_tibet_shock_trigger_pct", source)
+        self.assertIn('"market_model": "offer_book"', source)
+        self.assertIn('"tibet_status": "retired"', source)
 
     def test_price_resolver_uses_orderbook_when_ticker_and_tibet_missing(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
@@ -215,6 +220,23 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(resolved["dexie_price"], 1.0)
         self.assertEqual(resolved["price_source"], "dexie_orderbook")
         self.assertIn("Dexie orderbook", messages[0])
+
+    def test_price_resolver_ignores_retired_tibet_and_prefers_live_book(self):
+        from blueprints.smart_defaults import _resolve_smart_mid_price
+
+        resolved = _resolve_smart_mid_price(
+            ticker={"price": 2.0},
+            tibet={"has_data": True, "price": 100.0},
+            spacescan={},
+            trades={},
+            orderbook={"best_bid": 0.90, "best_ask": 1.10},
+            messages=[],
+        )
+
+        self.assertEqual(resolved["mid_price"], 1.0)
+        self.assertEqual(resolved["tibet_price"], 0)
+        self.assertEqual(resolved["arb_gap_bps"], 0)
+        self.assertEqual(resolved["price_source"], "dexie_orderbook")
 
     def test_price_resolver_uses_trade_vwap_as_last_resort(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
@@ -245,12 +267,17 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         src = (
             root / "src" / "catalyst" / "blueprints" / "smart_defaults.py"
         ).read_text(encoding="utf-8")
-        result_block = src.split("    result = {\n        # Smart Pricing", 1)[1].split(
+        result_block = src.split(
+            '    result = {\n        "market_model": "offer_book"', 1
+        )[1].split(
             'print(f"[SMART_DEFAULTS v2]', 1
         )[0]
 
-        self.assertIn('"tibet_shock_cancel_trigger_pct"', result_block)
-        self.assertIn('"arb_alert_threshold_bps"', result_block)
+        self.assertIn(
+            'result = {\n        "market_model": "offer_book"', src
+        )
+        self.assertIn('"offer_book_policy"', result_block)
+        self.assertIn('"tibet_status": "retired"', result_block)
         self.assertIn('"market_toxicity_enabled"', result_block)
         self.assertIn('"toxicity_protection_level"', result_block)
         self.assertIn('"toxicity_max_spread_multiplier"', result_block)

@@ -136,72 +136,36 @@ class PriceEngine:
             tibet_available: Whether Tibet data was available
         """
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
-        decimals = cat_decimals if cat_decimals is not None else cfg.CAT_DECIMALS
         ticker = ticker_id or cfg.CAT_TICKER_ID
 
-        # Fetch from both sources
+        # v1.4: TibetSwap shut down permanently.  Historical compatibility
+        # fields remain for one release, but no live path may query or derive a
+        # trading price from the retired AMM.
         dexie_price = self._fetch_dexie_price(ticker)
-        tibet_price = self._fetch_tibet_price(asset_id, decimals)
-
-        # Apply pricing strategy
-        strategy = cfg.PRICE_STRATEGY
-        mid_price = None
-        strategy_used = strategy
-
-        if strategy == "dexie_only" or (
-            strategy != "tibet_only" and tibet_price is None
-        ):
-            mid_price = dexie_price
-            strategy_used = "dexie_only"
-        elif strategy == "tibet_only" or (
-            strategy != "dexie_only" and dexie_price is None
-        ):
-            mid_price = tibet_price
-            strategy_used = "tibet_only"
-        elif strategy == "average" and dexie_price and tibet_price:
-            mid_price = (dexie_price + tibet_price) / Decimal("2")
-            strategy_used = "average"
-        elif strategy == "weighted" and dexie_price and tibet_price:
-            weight = cfg.TIBET_WEIGHT
-            mid_price = dexie_price * (Decimal("1") - weight) + tibet_price * weight
-            strategy_used = "weighted"
-        else:
-            # Fallback: use whatever we have
-            mid_price = dexie_price or tibet_price
-            strategy_used = "fallback"
+        tibet_price = None
+        mid_price = dexie_price
+        strategy_used = "dexie_offer_book"
 
         if mid_price is None:
             log_event("warning", "price_error", "No price available from any source")
             return None
 
-        # Log strategy on first call and whenever it changes (detect flip-flops)
+        # Log strategy on first call and whenever it changes.
         _prev_strategy = getattr(self, "_last_strategy_used", None)
         if _prev_strategy != strategy_used:
-            _weight_info = (
-                f" (Tibet={cfg.TIBET_WEIGHT})" if strategy_used == "weighted" else ""
-            )
             if _prev_strategy is None:
                 log_event(
                     "info",
                     "price_strategy",
-                    f"Pricing strategy: {strategy_used}{_weight_info} — "
-                    f"Dexie={dexie_price}, Tibet={tibet_price}, "
-                    f"Mid={mid_price:.8f}",
+                    f"Pricing strategy: {strategy_used} — Dexie={dexie_price}, "
+                    f"Mid={mid_price:.8f}; TibetSwap is retired",
                 )
             else:
-                _provider_availability_flip = strategy in (
-                    "weighted",
-                    "average",
-                ) and (
-                    strategy_used in ("dexie_only", "tibet_only")
-                    or _prev_strategy in ("dexie_only", "tibet_only")
-                )
                 log_event(
-                    "info" if _provider_availability_flip else "warning",
+                    "info",
                     "price_strategy",
-                    f"Pricing strategy changed: {_prev_strategy} → {strategy_used}{_weight_info} — "
-                    f"Dexie={dexie_price}, Tibet={tibet_price}, "
-                    f"Mid={mid_price:.8f}",
+                    f"Pricing strategy changed: {_prev_strategy} → {strategy_used} — "
+                    f"Dexie={dexie_price}, Mid={mid_price:.8f}",
                 )
             self._last_strategy_used = strategy_used
 
@@ -210,18 +174,9 @@ class PriceEngine:
         if mid_price is None:
             return None
 
-        # Calculate arb opportunity
+        # Cross-venue AMM arbitrage was retired with TibetSwap.
         arb_direction = None
         arb_gap_bps = Decimal("0")
-        if dexie_price and tibet_price and dexie_price > 0:
-            arb_gap_bps = (
-                abs(dexie_price - tibet_price) / dexie_price * Decimal("10000")
-            )
-            if arb_gap_bps > cfg.ARB_ALERT_THRESHOLD_BPS:
-                if dexie_price < tibet_price:
-                    arb_direction = "BUY_DEXIE_SELL_TIBET"
-                else:
-                    arb_direction = "BUY_TIBET_SELL_DEXIE"
 
         # Update state
         with self._price_lock:
@@ -251,7 +206,8 @@ class PriceEngine:
             "strategy_used": strategy_used,
             "arb_opportunity": arb_direction,
             "arb_gap_bps": arb_gap_bps,
-            "tibet_available": tibet_price is not None,
+            "tibet_available": False,
+            "tibet_status": "retired",
         }
         # Cache for read-only access by GUI polling (avoids DB write contention)
         self._last_price_result = result
@@ -332,46 +288,14 @@ class PriceEngine:
         return volatility
 
     def get_tibet_pool_info(self, cat_asset_id: str = None) -> Optional[Dict]:
-        """Get TibetSwap pool details (reserves, price, liquidity).
-
-        Used for the GUI's TibetSwap card display.  `xch_reserve` and
-        `token_reserve` are returned in their human-readable units (XCH
-        and CAT tokens) so the price equals XCH-per-token and agrees with
-        `_fetch_tibet_price`.
-        """
-        asset_id = cat_asset_id or cfg.CAT_ASSET_ID
-        pair = self._find_tibet_pair(asset_id)
-        if not pair:
-            return None
-
-        # CAT_DECIMALS for the active CAT (almost always 3 on Chia)
-        decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
-        cat_scale = Decimal(10) ** Decimal(decimals)
-
-        xch_reserve_mojos = Decimal(str(pair.get("xch_reserve", 0)))
-        token_reserve_mojos = Decimal(str(pair.get("token_reserve", 0)))
-        # Tibet can retain a pair record after its spendable reserves have
-        # drained to zero.  Treat that as unavailable pool data; otherwise a
-        # one-mojo XCH sentinel becomes a fantastically large and misleading
-        # trade-to-pool ratio on the dashboard.
-        if xch_reserve_mojos <= 0 or token_reserve_mojos <= 0:
-            return None
-
-        xch_reserve = xch_reserve_mojos / Decimal("1e12")
-        # Raw token_reserve is in token mojos — scale down to display units
-        # so price = xch_reserve / token_reserve is in XCH-per-token.
-        token_reserve = (
-            token_reserve_mojos / cat_scale if cat_scale > 0 else token_reserve_mojos
-        )
-
-        price = xch_reserve / token_reserve if token_reserve > 0 else Decimal("0")
-
+        """Return the one-release compatibility marker for retired TibetSwap."""
         return {
-            "price": price,
-            "xch_reserve": xch_reserve,
-            "token_reserve": token_reserve,
-            "pair_id": pair.get("pair_id", ""),
-            "available": True,
+            "available": False,
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+            "price": None,
+            "xch_reserve": None,
+            "token_reserve": None,
         }
 
     # -------------------------------------------------------------------
@@ -550,35 +474,8 @@ class PriceEngine:
         log_event("warning", event, message)
 
     def _fetch_tibet_price(self, asset_id: str, decimals: int = 3) -> Optional[Decimal]:
-        """Fetch price from TibetSwap AMM reserves.
-
-        Price = xch_reserve / token_reserve (adjusted for decimals)
-        """
-        if not asset_id:
-            return None
-
-        pair = self._find_tibet_pair(asset_id)
-        if not pair:
-            return None
-
-        try:
-            xch_reserve = Decimal(str(pair.get("xch_reserve", 0)))
-            token_reserve = Decimal(str(pair.get("token_reserve", 0)))
-
-            if token_reserve <= 0 or xch_reserve <= 0:
-                return None
-
-            # Convert reserves to actual units
-            # XCH reserve is in mojos (divide by 1e12)
-            # Token reserve is in token mojos (divide by 10^decimals)
-            xch_amount = xch_reserve / Decimal("1000000000000")
-            token_amount = token_reserve / (Decimal(10) ** Decimal(decimals))
-
-            price = xch_amount / token_amount
-            return price
-
-        except (InvalidOperation, ZeroDivisionError):
-            return None
+        """Compatibility stub: TibetSwap is retired and never queried."""
+        return None
 
     def _find_tibet_pair(self, asset_id: str) -> Optional[Dict]:
         """Find TibetSwap pair by asset ID, with caching."""
@@ -737,34 +634,9 @@ class PriceEngine:
             return False
 
     def get_live_amm_price(self) -> Optional[Decimal]:
-        """Return the most up-to-date AMM price from AMMMonitor if available,
-        falling back to the standard Tibet price fetch.
+        """Compatibility stub: no Chia AMM price source is active."""
 
-        AMMMonitor injects live reserves into the Tibet cache every
-        AMM_POLL_INTERVAL_SECS, so this method transparently uses those
-        fresh values when they exist.
-
-        Returns Decimal or None.
-        """
-        # Try cached price first (may have been injected by AMMMonitor)
-        # Only use cached price if it's fresh enough for AMM calculations
-        max_amm_cache_age = int(getattr(cfg, "TIBET_MAX_STALE_SECS", 300))
-        with self._price_lock:
-            _tibet_price = self._last_tibet_price
-            _tibet_ts = self._last_tibet_price_time
-        tibet_age = time.time() - _tibet_ts
-        if (
-            _tibet_price
-            and _tibet_price > 0
-            and _tibet_ts > 0
-            and tibet_age < max_amm_cache_age
-        ):
-            return _tibet_price
-
-        # Otherwise fetch fresh
-        asset_id = getattr(cfg, "CAT_ASSET_ID", "")
-        decimals = getattr(cfg, "CAT_DECIMALS", 3)
-        return self._fetch_tibet_price(asset_id, decimals)
+        return None
 
     # -------------------------------------------------------------------
     # TibetSwap Quote-Based Slippage Estimation (NEW — ecosystem upgrade)
@@ -776,7 +648,7 @@ class PriceEngine:
         amount_xch: Decimal = Decimal("0.01"),
         side: str = "buy",
     ) -> Optional[Dict]:
-        """Get a swap quote from TibetSwap to estimate slippage.
+        """Return an explicit retired marker without contacting a network.
 
         TibetSwap's /quote endpoint simulates a swap and returns the
         price_impact field — this tells us how much slippage our trade
@@ -796,40 +668,12 @@ class PriceEngine:
             input_amount, output_amount, price_impact, effective_price,
             pool_depth_xch, slippage_bps
         """
-        asset_id = asset_id or cfg.CAT_ASSET_ID
-        if not asset_id:
-            return None
-
-        pair = self._find_tibet_pair(asset_id)
-        if not pair:
-            return None
-
-        try:
-            pair_id = pair.get("pair_id", "")
-            if not pair_id:
-                # Fallback: calculate slippage from reserves directly
-                return self._estimate_slippage_from_reserves(pair, amount_xch, side)
-
-            # Try the /quote endpoint
-            url = f"{cfg.TIBET_API_BASE}/quote"
-            params = {
-                "pair_id": pair_id,
-                "amount_in": str(
-                    int(amount_xch * Decimal("1000000000000"))
-                ),  # Convert to mojos
-                "xch_is_input": "true" if side == "buy" else "false",
-            }
-
-            resp = self._session.get(url, params=params, timeout=8)
-            if resp.status_code == 200:
-                data = resp.json()
-                return self._parse_tibet_quote(data, amount_xch, side, pair)
-
-        except Exception:
-            pass
-
-        # Fallback: estimate from reserves using constant product formula
-        return self._estimate_slippage_from_reserves(pair, amount_xch, side)
+        return {
+            "available": False,
+            "provider": "tibetswap",
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+        }
 
     def _parse_tibet_quote(
         self, data: Dict, amount_xch: Decimal, side: str, pair: Dict
@@ -955,28 +799,9 @@ class PriceEngine:
             return None
 
     def get_pool_depth_ratio(self, trade_size_xch: Decimal = None) -> Decimal:
-        """Get the ratio of our trade size to the Tibet pool depth.
+        """Compatibility stub; AMM depth cannot authorize a live decision."""
 
-        A ratio of 0.01 means our trade is 1% of the pool — minimal impact.
-        A ratio of 0.10 means our trade is 10% of the pool — significant impact.
-
-        This ratio feeds into the risk manager for spread sizing.
-        """
-        if trade_size_xch is None:
-            trade_size_xch = cfg.DEFAULT_TRADE_XCH
-
-        pool = self.get_tibet_pool_info()
-        if not pool:
-            return Decimal("0")
-
-        depth = pool.get("xch_reserve", Decimal("0"))
-        if isinstance(depth, str):
-            depth = Decimal(depth)
-
-        if depth <= 0:
-            return Decimal("1")  # No pool data = assume max impact
-
-        return trade_size_xch / depth
+        return Decimal("0")
 
     # -------------------------------------------------------------------
     # Safety guards

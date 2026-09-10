@@ -43,7 +43,7 @@ _STARTUP_PRICE_CACHE = {"key": None, "expires_at": 0.0, "price": {}}
 
 
 def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
-    """Read-only setup pricing, including Dexie fallback during a TibetSwap outage.
+    """Read-only setup pricing from the executable Dexie offer book.
 
     Never call PriceEngine.get_price here: GUI polling must not write price
     history or advance the trading engine's risk/reference state. Cache both
@@ -55,9 +55,8 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
         ticker += "_XCH"
     if not asset:
         return {}
-    tibet_base = getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
     dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space").rstrip("/")
-    key = (asset, ticker, decimals, tibet_base, dexie_base)
+    key = (asset, ticker, decimals, dexie_base)
     with _STARTUP_PRICE_LOCK:
         if (
             _STARTUP_PRICE_CACHE["key"] == key
@@ -65,28 +64,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
         ):
             return dict(_STARTUP_PRICE_CACHE["price"])
         price = {}
-        try:
-            for pair in _get_tibet_pairs_cached(tibet_base, timeout=3):
-                if (
-                    str(pair.get("asset_id", "")).strip().lower().removeprefix("0x")
-                    != asset
-                ):
-                    continue
-                xch = Decimal(str(pair.get("xch_reserve", 0))) / Decimal(10**12)
-                cat = Decimal(str(pair.get("token_reserve", 0))) / Decimal(
-                    10 ** int(decimals)
-                )
-                if xch.is_finite() and cat.is_finite() and xch > 0 and cat > 0:
-                    price = {
-                        "mid": str(xch / cat),
-                        "source": "tibetswap",
-                        "tibet_available": True,
-                    }
-                break
-        except (InvalidOperation, ValueError, TypeError, AttributeError):
-            # Invalid TibetSwap reserve data leaves startup pricing unavailable.
-            pass
-        if not price and ticker:
+        if ticker:
             try:
                 import requests
 
@@ -117,6 +95,7 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                             "mid": str((bid + ask) / 2),
                             "source": "dexie_bid_ask",
                             "tibet_available": False,
+                            "tibet_status": "retired",
                         }
                     # Historical last_price is not a current executable quote.
                     break
@@ -162,48 +141,8 @@ def _confirmed_tibetswap_outage(bot=None) -> dict:
 
 
 def _get_tibet_pairs_cached(base: str = None, timeout: int = 8) -> list:
-    """Return a short-lived cached TibetSwap /pairs list for GUI polling."""
-    base_url = (
-        base
-        or getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
-        or "https://api.v2.tibetswap.io"
-    ).rstrip("/")
-    now = time.time()
-    with _TIBET_PAIRS_CACHE_LOCK:
-        if (
-            _TIBET_PAIRS_CACHE.get("base") == base_url
-            and _TIBET_PAIRS_CACHE.get("pairs")
-            and now - float(_TIBET_PAIRS_CACHE.get("fetched_at") or 0)
-            < _TIBET_PAIRS_CACHE_TTL_SECS
-        ):
-            return list(_TIBET_PAIRS_CACHE.get("pairs") or [])
+    """One-release compatibility stub for the retired provider."""
 
-    try:
-        import requests as _req
-
-        _record_api_call("tibetswap", "/pairs")
-        resp = _req.get(
-            f"{base_url}/pairs",
-            params={"skip": 0, "limit": 200},
-            timeout=timeout,
-        )
-        if resp.status_code == 200:
-            pairs = resp.json()
-            if isinstance(pairs, list):
-                with _TIBET_PAIRS_CACHE_LOCK:
-                    _TIBET_PAIRS_CACHE["base"] = base_url
-                    _TIBET_PAIRS_CACHE["pairs"] = list(pairs)
-                    _TIBET_PAIRS_CACHE["fetched_at"] = time.time()
-                return list(pairs)
-    except Exception as e:
-        try:
-            log_event(
-                "warning",
-                "tibet_pairs_cache_fetch_failed",
-                f"Failed to fetch TibetSwap pair cache: {e}",
-            )
-        except Exception:
-            return []
     return []
 
 
@@ -599,38 +538,16 @@ def api_market_orderbook():
 
 @bp.route("/api/market/slippage")
 def api_market_slippage():
-    """Get TibetSwap slippage estimate for a given trade size.
+    """One-release compatibility endpoint for retired AMM slippage."""
 
-    Query params: amount (XCH), side (buy/sell)
-    """
-    bot = api_server.bot
-    if not bot:
-        return jsonify({"error": "Bot not initialised"}), 500
-
-    amount = request.args.get("amount", "1")
-    side = request.args.get("side", "buy")
-
-    try:
-        quote = bot.price_engine.get_tibet_quote(amount_xch=Decimal(amount), side=side)
-        if quote:
-            return jsonify(quote)
-        result = {
+    return jsonify(
+        {
             "available": False,
-            "error": "TibetSwap quote unavailable",
             "provider": "tibetswap",
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
         }
-        outage = _confirmed_tibetswap_outage(bot)
-        if outage:
-            result.update(
-                {
-                    "message": outage["message"],
-                    "reason": outage["reason"],
-                    "status_code": outage["status_code"],
-                }
-            )
-        return jsonify(result)
-    except Exception:
-        return api_server._api_exception(request.path)
+    )
 
 
 @bp.route("/api/market/dbx")
@@ -706,9 +623,8 @@ def api_price():
 def api_market_summary():
     """Lightweight market overview for the dashboard.
 
-    Returns best bid/ask from Dexie orderbook, 24h volume, TibetSwap pool
-    depth, and price sources — all in one call. Works whether the bot is
-    running or not.
+    Returns best bid/ask from the Dexie orderbook and 24h volume. Retired
+    TibetSwap fields remain explicit read-only compatibility markers.
     """
     cfg = api_server.cfg
     import requests as _req
@@ -727,28 +643,19 @@ def api_market_summary():
         "best_bid": 0,
         "best_ask": 0,
         "dexie_price": 0,
-        "tibet_price": 0,
+        "tibet_price": None,
         "mid_price": 0,
         "volume_24h": 0,
         "pool_xch": 0,
         "pool_cat": 0,
         "dexie_depth_xch": 0,
         "arb_gap_bps": 0,
-        "tibet_available": None,
-        "tibet_reason": "",
+        "tibet_available": False,
+        "tibet_reason": "TIBETSWAP_SHUTDOWN",
+        "tibet_status": "retired",
         "tibet_status_code": None,
         "has_data": False,
     }
-
-    tibet_outage = _confirmed_tibetswap_outage()
-    if tibet_outage:
-        result.update(
-            {
-                "tibet_available": False,
-                "tibet_reason": tibet_outage["reason"],
-                "tibet_status_code": tibet_outage["status_code"],
-            }
-        )
 
     if not asset_id:
         return jsonify(result)
@@ -875,56 +782,14 @@ def api_market_summary():
     except Exception:
         pass
 
-    if not tibet_outage:
-        try:
-            norm_id = asset_id.lower().strip().replace("0x", "")
-            pairs = _get_tibet_pairs_cached(
-                getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
-                timeout=8,
-            )
-            for p in pairs:
-                p_id = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                if p_id == norm_id:
-                    xr = float(p.get("xch_reserve", 0)) / 1e12
-                    tr = float(p.get("token_reserve", 0)) / (10**decimals)
-                    if tr > 0:
-                        result["tibet_price"] = xr / tr
-                        result["pool_xch"] = round(xr, 2)
-                        result["pool_cat"] = round(tr, 0)
-                        result["tibet_available"] = True
-                    break
-            if result["tibet_available"] is None:
-                startup_results = (
-                    getattr(api_server.bot, "_startup_self_test_results", {}) or {}
-                )
-                tibet_health = (
-                    startup_results.get("tibet", {})
-                    if isinstance(startup_results, dict)
-                    else {}
-                )
-                if isinstance(tibet_health, dict) and tibet_health.get("ok") is True:
-                    result["tibet_available"] = True
-                    result["tibet_reason"] = "no_pool"
-        except Exception:
-            pass
-
     bb = result["best_bid"]
     ba = result["best_ask"]
     dexie_live_mid = (bb + ba) / 2 if bb > 0 and ba > 0 else result["dexie_price"]
     dp = result["dexie_price"]
-    tp = result["tibet_price"]
-    if dexie_live_mid > 0 and tp > 0:
-        result["mid_price"] = (dexie_live_mid + tp) / 2
-        result["arb_gap_bps"] = round(
-            abs(dexie_live_mid - tp) / dexie_live_mid * 10000, 1
-        )
-    elif dp > 0 and tp > 0:
-        result["mid_price"] = (dp + tp) / 2
-        result["arb_gap_bps"] = round(abs(dp - tp) / dp * 10000, 1)
+    if dexie_live_mid > 0:
+        result["mid_price"] = dexie_live_mid
     elif dp > 0:
         result["mid_price"] = dp
-    elif tp > 0:
-        result["mid_price"] = tp
 
     result["has_data"] = result["mid_price"] > 0
     return jsonify(result)
@@ -932,70 +797,30 @@ def api_market_summary():
 
 @bp.route("/api/price/tibet")
 def api_tibet_price():
-    """Get TibetSwap pool info."""
-    bot = api_server.bot
-    cfg = api_server.cfg
-    asset_id = api_server._active_cat.get("asset_id") or (
-        cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
+    """One-release compatibility endpoint for retired TibetSwap pricing."""
+
+    return jsonify(
+        {
+            "available": False,
+            "provider": "tibetswap",
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+        }
     )
-    decimals = api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
-
-    if bot:
-        pool = bot.price_engine.get_tibet_pool_info(asset_id)
-        return jsonify(api_server._serialize_dict(pool))
-
-    return api_server._fetch_price_standalone(asset_id, decimals)
 
 
 @bp.route("/api/amm/price")
 def api_amm_price():
-    """Get live TibetSwap AMM state from the AMMMonitor background poller."""
-    bot = api_server.bot
-    if not bot or not hasattr(bot, "amm_monitor"):
-        return jsonify({"available": False, "error": "AMM monitor not running"})
+    """One-release compatibility endpoint for retired AMM telemetry."""
 
-    try:
-        state = bot.amm_monitor.get_amm_state()
-        stats = bot.amm_monitor.get_stats()
-        drift = bot.amm_monitor.get_drift_bps()
-
-        result = {
-            "available": bool(state and state.get("available")),
-            "amm_price": str(state["amm_price"])
-            if state and state.get("amm_price")
-            else None,
-            "xch_reserve": str(state["xch_reserve"])
-            if state and state.get("xch_reserve")
-            else None,
-            "token_reserve": str(state["token_reserve"])
-            if state and state.get("token_reserve")
-            else None,
-            "fetched_at": state.get("fetched_at", 0) if state else 0,
-            "drift_bps": str(drift.quantize(Decimal("0.1")))
-            if drift is not None
-            else None,
-            "pair_id": stats.get("pair_id", ""),
-            "total_polls": stats.get("total_polls", 0),
-            "failed_polls": stats.get("failed_polls", 0),
-            "consecutive_failures": stats.get("consecutive_failures", 0),
-            "last_success_ago_secs": stats.get("last_success_ago_secs"),
-            "poll_interval_secs": getattr(cfg, "AMM_POLL_INTERVAL_SECS", 30),
-            "drift_threshold_bps": str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "40")),
-            "buffer_enabled": getattr(cfg, "ENABLE_AMM_BUFFER", False),
-            "buffer_bps": str(getattr(cfg, "AMM_BUFFER_BPS", "30")),
-            "arb_pressure": stats.get("arb_pressure"),
-            "arb_pressure_label": stats.get("arb_pressure_label"),
-            "dynamic_buffer": stats.get("dynamic_buffer", {}),
-            "sweep_protection": {
-                side: round(max(0, expiry - time.time()), 1)
-                for side, expiry in getattr(bot, "_sweep_protection", {}).items()
-                if expiry > time.time()
-            },
+    return jsonify(
+        {
+            "available": False,
+            "provider": "tibetswap",
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
         }
-        return jsonify(result)
-    except Exception as e:
-        log_event("warning", "amm_price_unavailable", str(e))
-        return jsonify({"available": False, "error": "amm_price_unavailable"})
+    )
 
 
 @bp.route("/api/debug/coinprep")
@@ -1065,7 +890,6 @@ def api_debug_pricing():
     result["bot_exists"] = bot is not None
 
     asset_id = api_server._active_cat.get("asset_id") or ""
-    cat_dec = api_server._active_cat.get("decimals") or 3
     ticker_id = api_server._active_cat.get("ticker_id") or ""
     result["asset_id"] = asset_id
     result["ticker_id"] = ticker_id
@@ -1084,95 +908,28 @@ def api_debug_pricing():
     except Exception as e:
         result["price_error"] = str(e)
 
-    try:
-        resp = _req.get(
-            "https://api.v2.tibetswap.io/pairs",
-            params={"skip": 0, "limit": 200},
-            timeout=10,
-        )
-        pairs = resp.json() if resp.status_code == 200 else []
-        result["tibet_total_pairs"] = len(pairs)
-        if asset_id:
-            norm = asset_id.lower().strip().replace("0x", "")
-            for p in pairs:
-                pid = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                if pid == norm:
-                    xr = float(p.get("xch_reserve", 0)) / 1e12
-                    tr = float(p.get("token_reserve", 0)) / (10 ** int(cat_dec))
-                    result["tibet_match"] = {
-                        "name": p.get("short_name", "?"),
-                        "price": xr / tr if tr > 0 else 0,
-                        "xch_reserve": xr,
-                        "token_reserve": tr,
-                    }
-                    break
-            else:
-                result["tibet_match"] = "NOT FOUND"
-    except Exception as e:
-        result["tibet_error"] = str(e)
+    result["tibet"] = {
+        "provider": "tibetswap",
+        "status": "retired",
+        "available": False,
+        "reason": "TIBETSWAP_SHUTDOWN",
+    }
 
     return jsonify(result)
 
 
 @bp.route("/api/debug/tibet-test")
 def api_debug_tibet_test():
-    """Debug endpoint: test TibetSwap API connectivity directly."""
-    cfg = api_server.cfg
-    result = {"test": "TibetSwap API connectivity"}
-    asset_id = api_server._active_cat.get("asset_id") or (
-        cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
+    """One-release compatibility diagnostic for the retired provider."""
+
+    return jsonify(
+        {
+            "provider": "tibetswap",
+            "status": "retired",
+            "available": False,
+            "reason": "TIBETSWAP_SHUTDOWN",
+        }
     )
-    result["asset_id_used"] = asset_id
-    result["_active_cat"] = {
-        k: str(v)[:30] if v else None for k, v in api_server._active_cat.items()
-    }
-
-    try:
-        import requests as _req
-
-        resp = _req.get(
-            "https://api.v2.tibetswap.io/pairs",
-            params={"skip": 0, "limit": 200},
-            timeout=10,
-        )
-        result["tibet_status"] = resp.status_code
-        if resp.status_code == 200:
-            pairs = resp.json()
-            result["total_pairs"] = len(pairs)
-            result["sample_pairs"] = [
-                {
-                    "name": p.get("short_name", p.get("name", "?")),
-                    "asset_id": str(p.get("asset_id", ""))[:20] + "...",
-                }
-                for p in pairs[:3]
-            ]
-            if asset_id:
-                norm = asset_id.lower().strip().replace("0x", "")
-                for p in pairs:
-                    pid = str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                    if pid == norm:
-                        xr = float(p.get("xch_reserve", 0)) / 1e12
-                        dec = api_server._active_cat.get("decimals") or getattr(
-                            cfg, "CAT_DECIMALS", 3
-                        )
-                        tr = float(p.get("token_reserve", 0)) / (10 ** int(dec))
-                        result["matched_pair"] = {
-                            "name": p.get("short_name", p.get("name")),
-                            "xch_reserve": xr,
-                            "token_reserve": tr,
-                            "price": xr / tr if tr > 0 else 0,
-                        }
-                        break
-                else:
-                    result["matched_pair"] = None
-                    result["error"] = f"No pair found matching asset_id {norm[:20]}..."
-        else:
-            result["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
-    except Exception as e:
-        result["error"] = str(e)
-        result["tibet_status"] = "FAILED"
-
-    return jsonify(result)
 
 
 @bp.route("/api/debug/sage-single-offer-test", methods=["POST"])

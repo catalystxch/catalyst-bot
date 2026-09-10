@@ -167,38 +167,20 @@ def collect_all_market_data(
         print(f"[MARKET_DATA] Dexie ticker failed: {e}")
         meta["sources_failed"].append("dexie_ticker")
 
-    # ---- 3. TibetSwap Pool + Quote ----
-    _progress(3, "Fetching TibetSwap pool data...")
-    try:
-        cached = get_market_analysis_cache(asset_id, "tibet_pool")
-        if cached:
-            result["tibet_pool"] = cached
-            meta["cache_hits"].append("tibet_pool")
-        else:
-            pool = _fetch_tibet_pool(asset_id, decimals)
-            if pool and pool.get("has_data"):
-                result["tibet_pool"] = pool
-                set_market_analysis_cache(asset_id, "tibet_pool", pool, CACHE_TTL_TIBET)
-                # Store snapshot for historical tracking
-                record_pool_snapshot(
-                    asset_id, pool["xch_reserve"], pool["cat_reserve"], pool["price"]
-                )
-        if result["tibet_pool"]:
-            meta["sources_ok"].append("tibet_pool")
-            # Also get a quote for slippage estimation
-            pair_id = result["tibet_pool"].get("pair_id", "")
-            if pair_id:
-                quote = _fetch_tibet_quote(
-                    pair_id, amount_mojos=10000000000
-                )  # 0.01 XCH
-                if quote:
-                    result["tibet_quote"] = quote
-                    meta["sources_ok"].append("tibet_quote")
-        else:
-            meta["sources_failed"].append("tibet_pool")
-    except Exception as e:
-        print(f"[MARKET_DATA] Tibet failed: {e}")
-        meta["sources_failed"].append("tibet_pool")
+    # ---- 3. Retired TibetSwap compatibility fields ----
+    _progress(3, "Recording retired TibetSwap compatibility status...")
+    result["tibet_pool"] = {
+        "has_data": False,
+        "available": False,
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+    }
+    result["tibet_quote"] = {
+        "available": False,
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+    }
+    meta.setdefault("sources_retired", []).append("tibetswap")
 
     # ---- 4. Spacescan Token Analytics ----
     _progress(4, "Fetching Spacescan token data...")

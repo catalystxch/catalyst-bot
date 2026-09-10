@@ -1,4 +1,4 @@
-"""Regression tests for TibetSwap CAT metadata provider state."""
+"""Regression tests for retired TibetSwap CAT metadata compatibility state."""
 
 import requests
 
@@ -20,19 +20,23 @@ class _Response:
         return self._payload
 
 
-def test_pair_lookup_reports_unavailable_when_tibet_pairs_request_fails(monkeypatch):
-    """A provider failure must not be represented as a genuine missing pair."""
+def test_pair_lookup_is_retired_and_only_dexie_is_contacted(monkeypatch):
+    """The retired provider must never be contacted during metadata lookup."""
+
+    calls = []
 
     def get(url, **_kwargs):
-        if url.endswith("/tokens"):
-            return _Response([])
-        return _Response(None, status_code=502)
+        calls.append(url)
+        assert "tibet" not in url.lower()
+        return _Response({"tickers": []})
 
     monkeypatch.setattr(cat_resolver.requests, "get", get)
 
     metadata = cat_resolver.resolve_cat_metadata("a" * 64)
 
-    assert metadata["pair_lookup_status"] == "unavailable"
+    assert metadata["pair_lookup_status"] == "retired"
+    assert metadata["retired_provider"] == "TibetSwap"
+    assert calls and all("dexie" in url.lower() for url in calls)
 
 
 def test_cat_selection_classifies_provider_outage_as_unavailable():

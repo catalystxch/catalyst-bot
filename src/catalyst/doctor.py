@@ -579,42 +579,15 @@ def _check_dexie_reachable() -> DoctorCheck:
 
 
 def _check_tibet_reachable() -> DoctorCheck:
-    """Check if TibetSwap API is reachable."""
-    try:
-        import requests
-        from config import cfg
+    """Report the retired provider without performing a network probe."""
 
-        try:
-            from api_call_tracker import record as _t
-
-            _t("tibetswap", "/tokens (doctor)")
-        except Exception:
-            pass
-        tibet_url = getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
-        resp = requests.get(f"{tibet_url}/tokens", timeout=5)
-        if resp.status_code < 500:
-            return DoctorCheck(
-                name="tibet_reachable",
-                category="exchange",
-                status="pass",
-                message=f"TibetSwap API reachable (HTTP {resp.status_code})",
-                severity="info",
-            )
-        return DoctorCheck(
-            name="tibet_reachable",
-            category="exchange",
-            status="warn",
-            message=f"TibetSwap API returned HTTP {resp.status_code}",
-            severity="warning",
-        )
-    except Exception as e:
-        return DoctorCheck(
-            name="tibet_reachable",
-            category="exchange",
-            status="warn",
-            message=f"TibetSwap API unreachable: {e}",
-            severity="warning",
-        )
+    return DoctorCheck(
+        name="tibet_reachable",
+        category="exchange",
+        status="skip",
+        message="TibetSwap retired after service shutdown; no live dependency remains",
+        severity="info",
+    )
 
 
 def _check_splash_reachable() -> DoctorCheck:

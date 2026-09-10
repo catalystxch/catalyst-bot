@@ -38,10 +38,12 @@ _CACHE_TTL_SECS = 300  # 5 minutes — refresh if bot is long-running
 
 def resolve_cat_metadata(
     asset_id: str,
-    tibet_api_base: str = "https://api.v2.tibetswap.io",
+    tibet_api_base: str | None = None,
     timeout: int = 10,
+    *,
+    dexie_api_base: str = "https://api.dexie.space",
 ) -> Dict:
-    """Query TibetSwap to resolve CAT metadata from asset_id.
+    """Query Dexie to resolve CAT metadata from an exact asset ID.
 
     Returns dict with keys: pair_id, ticker_id, name, short_name, verified,
     and pair_lookup_status.  The status distinguishes a successful lookup
@@ -55,70 +57,65 @@ def resolve_cat_metadata(
         "name": None,
         "short_name": None,
         "verified": None,
-        "pair_lookup_status": "not_found",
+        "pair_lookup_status": "retired",
+        "retired_provider": "TibetSwap",
+        "metadata_provider": "dexie",
+        "metadata_lookup_status": "not_found",
     }
 
     if not asset_id:
         return result
 
     asset_id_norm = asset_id.lower().strip()
-    base = tibet_api_base.rstrip("/")
+    base = dexie_api_base.rstrip("/")
 
-    # --- Step 1: Token metadata (name, short_name) ---
     try:
-        _record_api_call("tibetswap", "/tokens")
+        _record_api_call("dexie", "/v2/prices/tickers")
         resp = requests.get(
-            f"{base}/tokens",
+            f"{base}/v2/prices/tickers",
+            params={"asset_id": asset_id_norm.removeprefix("0x")},
             timeout=timeout,
         )
         resp.raise_for_status()
-        tokens = resp.json()
-        if isinstance(tokens, list):
-            for t in tokens:
-                if str(t.get("asset_id", "")).lower() == asset_id_norm:
-                    result["name"] = t.get("name") or None
-                    result["short_name"] = t.get("short_name") or None
-                    result["verified"] = t.get("verified", False)
-                    if result["short_name"]:
-                        result["ticker_id"] = f"{result['short_name']}_XCH"
-                    break
+        payload = resp.json()
+        rows = payload.get("tickers", []) if isinstance(payload, dict) else payload
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            row_asset = (
+                str(
+                    row.get("base_id")
+                    or row.get("asset_id")
+                    or row.get("base_asset_id")
+                    or ""
+                )
+                .lower()
+                .removeprefix("0x")
+            )
+            if row_asset and row_asset != asset_id_norm.removeprefix("0x"):
+                continue
+            ticker_id = str(row.get("ticker_id") or "").strip().upper()
+            short_name = str(
+                row.get("base_currency")
+                or row.get("base_code")
+                or (ticker_id.split("_", 1)[0] if ticker_id else "")
+            ).strip()
+            result["ticker_id"] = ticker_id or (
+                f"{short_name}_XCH" if short_name else None
+            )
+            result["short_name"] = short_name or None
+            result["name"] = (
+                row.get("base_name") or row.get("asset_name") or row.get("name") or None
+            )
+            result["verified"] = row.get("verified")
+            result["metadata_lookup_status"] = "resolved"
+            break
     except Exception as e:
+        result["metadata_lookup_status"] = "unavailable"
         log_event(
             "warning",
-            "cat_resolver_token_fetch_failed",
-            f"CAT resolver: could not fetch token metadata from Tibet: {e}",
-        )
-
-    # --- Step 2: Pair ID ---
-    try:
-        _record_api_call("tibetswap", "/pairs")
-        resp2 = requests.get(
-            f"{base}/pairs",
-            params={"skip": 0, "limit": 200},
-            timeout=timeout,
-        )
-        resp2.raise_for_status()
-        pairs = resp2.json()
-        if isinstance(pairs, list):
-            for p in pairs:
-                if str(p.get("asset_id", "")).lower() == asset_id_norm:
-                    result["pair_id"] = p.get("pair_id") or None
-                    if result["pair_id"]:
-                        result["pair_lookup_status"] = "resolved"
-                    # Fill name/short_name from pairs if /tokens didn't have it
-                    if not result["name"]:
-                        result["name"] = p.get("asset_name") or None
-                    if not result["short_name"]:
-                        result["short_name"] = p.get("asset_short_name") or None
-                    if result["short_name"] and not result["ticker_id"]:
-                        result["ticker_id"] = f"{result['short_name']}_XCH"
-                    break
-    except Exception as e:
-        result["pair_lookup_status"] = "unavailable"
-        log_event(
-            "warning",
-            "cat_resolver_pair_fetch_failed",
-            f"CAT resolver: could not fetch pair data from Tibet: {e}",
+            "cat_resolver_dexie_fetch_failed",
+            f"CAT resolver: could not fetch token metadata from Dexie: {e}",
         )
 
     return result
@@ -152,14 +149,16 @@ def resolve_and_apply(cfg_obj, force: bool = False) -> Dict:
             _apply_to_cfg(_cache, cfg_obj)
             return dict(_cache)
 
-    # Fetch fresh
-    tibet_base = str(
-        getattr(cfg_obj, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
-        or "https://api.v2.tibetswap.io"
+    # Fetch fresh from the active offer-book ecosystem.
+    dexie_base = str(
+        getattr(cfg_obj, "DEXIE_API_BASE", "https://api.dexie.space")
+        or "https://api.dexie.space"
     )
-    tibet_timeout = int(getattr(cfg_obj, "TIBET_TIMEOUT", 10) or 10)
-
-    metadata = resolve_cat_metadata(asset_id, tibet_base, tibet_timeout)
+    metadata = resolve_cat_metadata(
+        asset_id,
+        timeout=int(getattr(cfg_obj, "DEXIE_TIMEOUT", 10) or 10),
+        dexie_api_base=dexie_base,
+    )
 
     with _cache_lock:
         _cache = metadata
@@ -209,7 +208,7 @@ def _apply_to_cfg(metadata: Dict, cfg_obj) -> None:
         log_event(
             "info",
             "cat_resolver_applied",
-            f"CAT metadata resolved from TibetSwap — "
+            f"CAT metadata resolved from Dexie — "
             f"applied: [{', '.join(applied) or 'none'}] | "
             f"kept .env: [{', '.join(skipped) or 'none'}]",
         )

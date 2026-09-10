@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import inspect
+from decimal import Decimal
+from unittest.mock import Mock
+
+import api_server
+import bot_loop
+import cat_resolver
+import market_data_collector
+import pytest
+import doctor
+from blueprints import bot as bot_routes
+from blueprints import market
+from blueprints.smart_defaults import _fetch_price_standalone
+from price_engine import PriceEngine
+
+
+ASSET_ID = "b8" * 32
+
+
+def test_price_engine_is_dexie_only_and_never_calls_retired_provider(monkeypatch):
+    engine = PriceEngine()
+    engine._fetch_dexie_price = Mock(return_value=Decimal("0.1"))
+    engine._fetch_tibet_price = Mock(
+        side_effect=AssertionError("retired provider called")
+    )
+    engine._apply_safety_guards = lambda value: value
+    engine._update_reference_price = lambda value: None
+    monkeypatch.setattr("price_engine.record_price", lambda **kwargs: True)
+
+    result = engine.get_price(cat_asset_id=ASSET_ID, ticker_id="MZ_XCH")
+
+    engine._fetch_tibet_price.assert_not_called()
+    assert result["mid_price"] == Decimal("0.1")
+    assert result["strategy_used"] == "dexie_offer_book"
+    assert result["tibet_price"] is None
+    assert result["tibet_available"] is False
+    assert result["tibet_status"] == "retired"
+    assert result["arb_opportunity"] is None
+
+
+def test_smart_settings_and_market_collection_have_no_live_tibet_fetch_call():
+    standalone_source = inspect.getsource(_fetch_price_standalone)
+    collection_source = inspect.getsource(market_data_collector.collect_all_market_data)
+
+    assert "api.v2.tibetswap.io" not in standalone_source
+    assert '_record_api_call("tibetswap"' not in standalone_source
+    assert "_fetch_tibet_pool(" not in collection_source
+    assert "_fetch_tibet_quote(" not in collection_source
+    assert '"status": "retired"' in collection_source
+
+
+def test_cat_metadata_resolver_never_contacts_tibet(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"tickers": []}
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        assert "tibet" not in url.lower()
+        return Response()
+
+    monkeypatch.setattr(cat_resolver.requests, "get", fake_get)
+
+    result = cat_resolver.resolve_cat_metadata(ASSET_ID)
+
+    assert result["pair_lookup_status"] == "retired"
+    assert result["retired_provider"] == "TibetSwap"
+    assert calls and all("dexie" in url.lower() for url in calls)
+
+
+def test_bot_price_watcher_is_retired_and_cannot_poll_reserves():
+    source = inspect.getsource(bot_loop.BotLoop._price_watcher_thread)
+
+    assert "_fetch_tibet_reserves" not in source
+    assert "requests.Session" not in source
+    assert "retired" in source.lower()
+
+
+def test_startup_health_check_marks_tibetswap_retired_without_network_probe():
+    source = inspect.getsource(bot_loop.BotLoop._run_startup_self_test)
+
+    assert "api.v2.tibetswap.io" not in source
+    assert 'results["tibet"]' in source
+    assert '"status": "retired"' in source
+
+
+def test_market_summary_and_startup_price_never_read_tibetswap():
+    startup_source = inspect.getsource(market._get_startup_price_cached)
+    summary_source = inspect.getsource(market.api_market_summary)
+
+    assert "_get_tibet_pairs_cached" not in startup_source
+    assert "TIBET_API_BASE" not in startup_source
+    assert "_get_tibet_pairs_cached" not in summary_source
+    assert "TIBET_API_BASE" not in summary_source
+    assert '"tibet_status": "retired"' in summary_source
+
+
+def test_retired_tibet_debug_endpoint_cannot_contact_network():
+    source = inspect.getsource(market.api_debug_tibet_test)
+
+    assert "requests" not in source
+    assert "api.v2.tibetswap.io" not in source
+    assert '"status": "retired"' in source
+
+
+def test_status_and_doctor_health_paths_never_contact_tibetswap():
+    status_source = inspect.getsource(bot_routes.api_status)
+    doctor_source = inspect.getsource(doctor._check_tibet_reachable)
+
+    assert "_get_tibet_pairs_cached" not in status_source
+    assert "TIBET_API_BASE" not in status_source
+    assert "requests" not in doctor_source
+    assert 'status="skip"' in doctor_source
+    assert "retired" in doctor_source.lower()
+
+
+def test_legacy_slippage_endpoint_is_explicitly_retired(monkeypatch):
+    fake_engine = Mock()
+    fake_engine.get_tibet_quote.side_effect = AssertionError("retired provider called")
+    monkeypatch.setattr(api_server, "bot", Mock(price_engine=fake_engine))
+
+    with api_server.app.test_request_context("/api/market/slippage?amount=1&side=buy"):
+        response = market.api_market_slippage()
+
+    payload = response.get_json()
+    fake_engine.get_tibet_quote.assert_not_called()
+    assert payload == {
+        "available": False,
+        "provider": "tibetswap",
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+    }
+
+
+def test_legacy_amm_endpoint_is_explicitly_retired(monkeypatch):
+    fake_monitor = Mock()
+    fake_monitor.get_amm_state.side_effect = AssertionError("retired monitor called")
+    monkeypatch.setattr(api_server, "bot", Mock(amm_monitor=fake_monitor))
+
+    with api_server.app.test_request_context("/api/amm/price"):
+        response = market.api_amm_price()
+
+    fake_monitor.get_amm_state.assert_not_called()
+    assert response.get_json() == {
+        "available": False,
+        "provider": "tibetswap",
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+    }
+
+
+def test_retired_pool_and_quote_methods_do_not_use_network(monkeypatch):
+    engine = PriceEngine()
+    engine._session.get = Mock(side_effect=AssertionError("network call attempted"))
+
+    assert engine._fetch_tibet_price(ASSET_ID) is None
+    assert engine.get_tibet_pool_info(ASSET_ID)["status"] == "retired"
+    assert engine.get_tibet_quote(Decimal("1"), "buy")["status"] == "retired"
+    engine._session.get.assert_not_called()

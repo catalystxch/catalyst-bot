@@ -492,17 +492,13 @@ def _resolve_smart_mid_price(
 ) -> dict:
     """Resolve the best CAT-specific mid price Smart Settings can use.
 
-    Prefer executable live markets. Fall back to Dexie orderbook and then
-    trade VWAP so CATs without a ticker row or Tibet pool still get a
-    conservative, token-specific plan when enough asset-id data exists.
+    Prefer the executable two-sided Dexie order book, then Dexie ticker data,
+    then settled-trade VWAP. ``tibet`` is accepted only for one-release call
+    compatibility and is never consumed as live evidence.
     """
     messages = messages if messages is not None else []
     dexie_price = ticker.get("price", 0) if isinstance(ticker, dict) else 0
-    tibet_price = (
-        tibet.get("price", 0)
-        if isinstance(tibet, dict) and tibet.get("has_data")
-        else 0
-    )
+    tibet_price = 0
     spacescan_price = (
         spacescan.get("price_xch", 0)
         if isinstance(spacescan, dict) and spacescan.get("has_data")
@@ -513,43 +509,24 @@ def _resolve_smart_mid_price(
     spacescan_gap_bps = 0
     price_source = ""
 
-    has_both_prices = dexie_price > 0 and tibet_price > 0
-    if has_both_prices:
-        mid_price = (dexie_price + tibet_price) / 2
-        arb_gap_bps = abs(dexie_price - tibet_price) / mid_price * 10000
-        price_source = "dexie_tibet"
-        messages.append(f"Price: {mid_price:.8f} (Dexie + Tibet)")
-        if arb_gap_bps > 50:
-            messages.append(f"Arb gap: {api_server._bps_to_pct(arb_gap_bps)}")
+    has_both_prices = False
+    best_bid = orderbook.get("best_bid", 0) if isinstance(orderbook, dict) else 0
+    best_ask = orderbook.get("best_ask", 0) if isinstance(orderbook, dict) else 0
+    if best_bid > 0 and best_ask > 0 and best_bid <= best_ask:
+        mid_price = (best_bid + best_ask) / 2
+        dexie_price = mid_price
+        price_source = "dexie_orderbook"
+        messages.append(f"Price: {mid_price:.8f} (Dexie orderbook)")
     elif dexie_price > 0:
         mid_price = dexie_price
         price_source = "dexie_ticker"
         messages.append(f"Price: {mid_price:.8f} (Dexie only)")
-    elif tibet_price > 0:
-        mid_price = tibet_price
-        price_source = "tibet_pool"
-        messages.append(f"Price: {mid_price:.8f} (Tibet only)")
     else:
-        best_bid = orderbook.get("best_bid", 0) if isinstance(orderbook, dict) else 0
-        best_ask = orderbook.get("best_ask", 0) if isinstance(orderbook, dict) else 0
-        if best_bid > 0 and best_ask > 0:
-            mid_price = (best_bid + best_ask) / 2
-            price_source = "dexie_orderbook"
-            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook)")
-        elif best_ask > 0:
-            mid_price = best_ask
-            price_source = "dexie_orderbook_ask"
-            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook ask)")
-        elif best_bid > 0:
-            mid_price = best_bid
-            price_source = "dexie_orderbook_bid"
-            messages.append(f"Price: {mid_price:.8f} (Dexie orderbook bid)")
-        else:
-            vwap_price = _smart_trade_vwap(trades)
-            if vwap_price > 0:
-                mid_price = vwap_price
-                price_source = "dexie_trade_vwap"
-                messages.append(f"Price: {mid_price:.8f} (Dexie trade VWAP)")
+        vwap_price = _smart_trade_vwap(trades)
+        if vwap_price > 0:
+            mid_price = vwap_price
+            price_source = "dexie_trade_vwap"
+            messages.append(f"Price: {mid_price:.8f} (Dexie trade VWAP)")
 
     if price_source.startswith("dexie_") and dexie_price <= 0 and mid_price > 0:
         dexie_price = mid_price
@@ -612,8 +589,7 @@ def _smart_dbx_defaults(asset_id: str) -> dict:
 def _fetch_price_standalone(asset_id, decimals):
     """Lightweight price fetch when bot isn't running.
 
-    Tries TibetSwap first (AMM pool price), then falls back to Dexie (order book price).
-    Many CATs are only on Dexie and not on TibetSwap, so both sources matter.
+    Uses current Dexie bid/ask or exact public offers. TibetSwap is retired.
     """
     print(f"[PRICE_STANDALONE] Called with asset_id={asset_id!r}, decimals={decimals}")
     if not asset_id:
@@ -625,44 +601,7 @@ def _fetch_price_standalone(asset_id, decimals):
     price = None
     source = None
 
-    # --- Try TibetSwap first ---
-    try:
-        _record_api_call("tibetswap", "/pairs")
-        resp = _req.get(
-            "https://api.v2.tibetswap.io/pairs",
-            params={"skip": 0, "limit": 200},
-            timeout=8,
-        )
-        pairs = resp.json() if resp.status_code == 200 else []
-        print(
-            f"[PRICE_STANDALONE] TibetSwap API: status={resp.status_code}, pairs={len(pairs)}"
-        )
-
-        normalized = asset_id.lower().strip()
-        if normalized.startswith("0x"):
-            normalized = normalized[2:]
-
-        for p in pairs:
-            p_id = str(p.get("asset_id", "")).lower().strip()
-            if p_id.startswith("0x"):
-                p_id = p_id[2:]
-            if p_id == normalized:
-                xch_reserve = Decimal(str(p.get("xch_reserve", 0)))
-                token_reserve = Decimal(str(p.get("token_reserve", 0)))
-                if token_reserve > 0 and xch_reserve > 0:
-                    xch_amount = xch_reserve / Decimal("1000000000000")
-                    token_amount = token_reserve / (Decimal(10) ** int(decimals))
-                    price = xch_amount / token_amount
-                    source = "tibetswap"
-                    print(f"[PRICE_STANDALONE] TibetSwap match! price={price}")
-                break
-
-        if not price:
-            print("[PRICE_STANDALONE] CAT not found on TibetSwap, trying Dexie...")
-    except Exception as e:
-        print(f"[PRICE_STANDALONE] TibetSwap failed ({e}), trying Dexie...")
-
-    # --- Fallback to Dexie ---
+    # --- Dexie offer book ---
     if not price:
         try:
             ticker_id = (
@@ -730,7 +669,7 @@ def _fetch_price_standalone(asset_id, decimals):
 
     if not price:
         return jsonify(
-            {"success": False, "error": "No price available from TibetSwap or Dexie"}
+            {"success": False, "error": "No current two-sided Dexie price available"}
         )
 
     return jsonify(
@@ -738,9 +677,10 @@ def _fetch_price_standalone(asset_id, decimals):
             {
                 "success": True,
                 "mid": price,
-                "tibet_price": price if source == "tibetswap" else None,
+                "tibet_price": None,
                 "dexie_price": price if source and source.startswith("dexie") else None,
-                "tibet_enabled": source == "tibetswap",
+                "tibet_enabled": False,
+                "tibet_status": "retired",
                 "source": source,
                 "liquidity": {},
             }
@@ -997,7 +937,7 @@ def _calculate_smart_defaults(
     Replaces v1's snapshot-only approach with deep analysis:
     - 30 days of Dexie trade history (fill rate, volume, trends)
     - 30d/90d ticker ranges (real volatility, not just 24h)
-    - TibetSwap pool depth + quote-based slippage
+    - Dexie executable-book depth and settled-trade evidence
     - Spacescan token health (holders, activity, supply)
     - Bot's own performance history (if available)
 
@@ -1246,8 +1186,8 @@ def _calculate_smart_defaults(
     # Extract key data for calculations
     ticker = raw.get("dexie_ticker") or {}
     trades = raw.get("dexie_trades") or {}
-    tibet = raw.get("tibet_pool") or {}
-    tibet_quote = raw.get("tibet_quote") or {}
+    tibet = {"has_data": False, "status": "retired"}
+    tibet_quote = {"available": False, "status": "retired"}
     spacescan = raw.get("spacescan") or {}
     db_hist = raw.get("internal_db") or {}
 
@@ -1258,8 +1198,8 @@ def _calculate_smart_defaults(
     quality = analysis.get("data_quality", {})
     risk_level = health.get("risk_level", "moderate")
 
-    # Fetch before price resolution: some CATs have no Dexie ticker or Tibet
-    # pool yet, but do have live asset-id orderbook offers we can price from.
+    # Fetch before price resolution: asset-id orderbook evidence is the
+    # authoritative live market input in the post-TibetSwap model.
     orderbook = _fetch_dexie_orderbook_standalone(asset_id)
     if orderbook["has_data"]:
         messages.append(
@@ -1279,7 +1219,7 @@ def _calculate_smart_defaults(
     price_source = price_info["price_source"]
     vwap_price = price_info["vwap_price"]
     if not mid_price:
-        return jsonify({"error": "No price available from Dexie or TibetSwap"})
+        return jsonify({"error": "No executable Dexie price available"})
 
     # ---- 5. Read user inputs (trade size, max offers) ----
     from flask import request as flask_request
@@ -1365,7 +1305,7 @@ def _calculate_smart_defaults(
             vwap_price = _sum_pv / _sum_v
             print(
                 f"[SMART_DEFAULTS v2] VWAP (30d): {vwap_price:.8f} XCH "
-                f"(vs Dexie {dexie_price:.8f}, Tibet {tibet_price:.8f})"
+                f"(vs live Dexie {dexie_price:.8f})"
             )
             messages.append(f"VWAP (30d): {vwap_price:.8f}")
     # Use VWAP as mid_price when it diverges from current price by <10%
@@ -1387,27 +1327,10 @@ def _calculate_smart_defaults(
     else:
         vol_adj = 0  # normal — no adjustment
 
-    # V2: Pool depth adjustment (use real quote slippage if available)
+    # Retired AMM compatibility values. No spread decision consumes them.
     pool_adj = 0
-    pool_xch = tibet.get("xch_reserve", 0) if tibet.get("has_data") else 0
+    pool_xch = 0
     real_slippage_bps = 0
-    if tibet_quote and tibet_quote.get("price_impact", 0) > 0:
-        # Real slippage from TibetSwap quote — much better than formula!
-        real_slippage_bps = abs(tibet_quote["price_impact"]) * 10000
-        if real_slippage_bps > 500:
-            pool_adj = 100  # Very thin pool: +1%
-        elif real_slippage_bps > 200:
-            pool_adj = 50  # Thin pool: +0.5%
-        messages.append(
-            f"Pool: {pool_xch:.1f} XCH, slippage: {api_server._bps_to_pct(real_slippage_bps)} for 0.01 XCH"
-        )
-    elif pool_xch > 0:
-        # Fallback: estimate from pool depth
-        if pool_xch < 50:
-            pool_adj = 100
-        elif pool_xch < 200:
-            pool_adj = 50
-        messages.append(f"Pool: {pool_xch:.1f} XCH")
 
     # V2: Competition adjustment
     comp_adj = 0
@@ -1446,8 +1369,8 @@ def _calculate_smart_defaults(
             f"Spacescan price is {api_server._bps_to_pct(spacescan_gap_bps)} away from live venues — sanity buffer added"
         )
 
-    # V2: Arb buffer (same as v1 — still valid)
-    arb_buffer = min(100, int(arb_gap_bps * 0.1)) if arb_gap_bps > 100 else 0
+    # One-release compatibility value; cross-provider AMM arbitrage is retired.
+    arb_buffer = 0
 
     # V2: Quiet-phase buffer — token is in a temporary lull; widen spread to
     # survive the (likely inevitable) return to normal volatility.
@@ -1459,16 +1382,8 @@ def _calculate_smart_defaults(
             f"— spread widened for snap-back protection"
         )
 
-    # V2: Pool-trend buffer — if the AMM pool is shrinking, slippage will worsen
-    # over time and spreads need to compensate.
+    # One-release compatibility value; AMM pool trends are retired.
     pool_trend_adj = 0
-    pool_trend = db_hist.get("pool_trend", "unknown")
-    if pool_trend == "shrinking":
-        pool_trend_adj = 75  # +0.75% — compensate for worsening slippage
-        messages.append("Pool trend: shrinking — spread widened for slippage buffer")
-    elif pool_trend == "growing":
-        pool_trend_adj = -25  # −0.25% — growing pool = better execution
-        messages.append("Pool trend: growing — slight spread tightening")
 
     # ═══ FINAL BASE SPREAD ═══
     base_spread_bps = (
@@ -1527,20 +1442,9 @@ def _calculate_smart_defaults(
         volatility_window = 4  # New bot — keep it responsive
 
     # ═══ REQUOTE ═══
-    # V2: Use real TibetSwap slippage instead of formula
-    if real_slippage_bps > 0:
-        # Set requote above the noise caused by typical AMM trades
-        typical_impact_bps = (
-            real_slippage_bps * 100
-        )  # Scale: 0.01 XCH quote → full trade
-        if trade_size > 0 and pool_xch > 0:
-            # Better estimate: scale by our actual trade size vs pool
-            trade_ratio = trade_size / pool_xch
-            typical_impact_bps = trade_ratio * 10000  # Direct estimate
-    elif pool_xch > 0:
-        typical_impact_bps = 500 * (1.0 + max(0, (100 - pool_xch) / 100) * 0.5)
-    else:
-        typical_impact_bps = 500
+    # Offer-book noise allowance: use the observed competitor spread when a
+    # two-sided book exists, otherwise retain a conservative fixed baseline.
+    typical_impact_bps = comp_spread / 2 if comp_spread > 0 else 500
 
     # Base: 60% of the full spread.
     # An offer placed at ±(spread/2) from mid should survive until mid has moved
@@ -1577,7 +1481,7 @@ def _calculate_smart_defaults(
 
     print(
         f"[SMART_DEFAULTS v2] Requote: {api_server._bps_to_pct(requote_bps)} "
-        f"(slippage={api_server._bps_to_pct(real_slippage_bps)}, pool={pool_xch:.0f} XCH)"
+        f"(book noise={api_server._bps_to_pct(typical_impact_bps)})"
     )
 
     # ═══ RESERVES ═══
@@ -1668,14 +1572,9 @@ def _calculate_smart_defaults(
         dynamic_limit_pct = max(20, round(band_basis * 1.5 / 5) * 5)  # ≥20%
     else:
         dynamic_limit_pct = max(40, round(band_basis * 1.5 / 5) * 5)  # ≥40% normal
-    # Pool-depth correction: thin AMM pools amplify price shocks because even a
-    # modest buy moves the quoted price significantly.  Widen the band so a
-    # sudden pool-driven price tick doesn't falsely reject a valid price feed.
+    # AMM pool-depth correction is retired; book depth and churn are handled by
+    # the visible offer-book confidence thresholds below.
     _pool_band_bump = 0
-    if pool_xch > 0 and pool_xch < 200:
-        # Linear bump: 0 XCH pool → +50%, 100 XCH → +25%, 200 XCH → 0%
-        _pool_band_bump = max(0, round((200 - pool_xch) / 4 / 5) * 5)
-        dynamic_limit_pct = min(200, dynamic_limit_pct + _pool_band_bump)
 
     dynamic_limit_pct = min(dynamic_limit_pct, 200)  # Hard ceiling 200%
     if dynamic_limit_pct == 0:
@@ -1712,10 +1611,8 @@ def _calculate_smart_defaults(
     else:
         max_step_change_pct = 0  # No data — leave disabled
 
-    # ═══ ARB ALERT THRESHOLD ═══
-    # The Dexie-vs-Tibet gap that triggers an emergency mid-cycle requote.
-    # Volatile tokens naturally have wider gaps so the threshold needs raising
-    # to avoid constant false-trigger emergency requotes.
+    # Legacy arb threshold remains readable for one release but no longer
+    # authorizes a decision. Material movement is governed by book confidence.
     if regime == "extreme":
         arb_alert_threshold_bps = 500
     elif regime == "volatile":
@@ -1724,15 +1621,8 @@ def _calculate_smart_defaults(
         arb_alert_threshold_bps = 100
     else:
         arb_alert_threshold_bps = 200
-    # Also factor in the live arb gap — if the gap is normally wide, set above it
-    if arb_gap_bps > arb_alert_threshold_bps * 0.8:
-        arb_alert_threshold_bps = max(arb_alert_threshold_bps, int(arb_gap_bps * 1.5))
     arb_alert_threshold_bps = min(arb_alert_threshold_bps, 1000)
-    tibet_shock_cancel_trigger_pct = _smart_tibet_shock_trigger_pct(inner_edge_bps)
-    messages.append(
-        f"Tibet shock cancel: {tibet_shock_cancel_trigger_pct:.2f}% "
-        f"(half of inner edge)"
-    )
+    tibet_shock_cancel_trigger_pct = 0
 
     # ═══ LOOP SECONDS (volatility + fill-rate aware) ═══
     # Primary driver: volatility regime (price shock response speed).
@@ -1778,12 +1668,8 @@ def _calculate_smart_defaults(
 
     # Safety floor: rails must straddle the price the bot actually trades
     # against, which is what the Save validator checks (bot_state.pricing.mid).
-    # bot.py prefers TibetSwap's pool ratio and only falls back to Dexie when
-    # Tibet is unavailable. Anchoring on the (Dexie + Tibet)/2 blend used
-    # elsewhere here breaks for illiquid CATs: a stale Dexie last_price drags
-    # the blend well below the live Tibet price, so max_mid lands beneath the
-    # current market and the GUI refuses to save the result of Smart Settings.
-    live_price = tibet_price if tibet_price > 0 else dexie_price
+    # The executable Dexie book is the only live price authority.
+    live_price = dexie_price
     if live_price > 0:
         min_max_mid = live_price * 1.15
         if max_mid < min_max_mid:
@@ -1810,9 +1696,6 @@ def _calculate_smart_defaults(
         coin_prep_headroom_pct = 7
     else:
         coin_prep_headroom_pct = 10
-    # Shallow pool adds price uncertainty → extra 3%
-    if 0 < pool_xch < 100:
-        coin_prep_headroom_pct = min(20, coin_prep_headroom_pct + 3)
 
     # ═══ TIER SPARE COUNTS (F62) ═══
     # How many backup prepared coins to keep per tier.
@@ -2009,57 +1892,19 @@ def _calculate_smart_defaults(
     _MIN_OFFER_XCH = 0.005
 
     # ── Percentage-based pool allocation ──
-    # Fee pool:    3% of available → buy fee coins at Coinset-estimated size
-    # Sniper pool: market-scaled % of available → split into prep coins
-    # Trading:     remaining ~93%
+    # Fee pool: 3% of available → buy fee coins at Coinset-estimated size.
+    # The former AMM sniper pool is retired; bounded opportunity orders reuse
+    # ordinary prepared tier coins and are governed by trusted book depth.
     _FEE_PCT = 0.03
-    _SNIPER_MIN_SIZE_XCH = 0.01
-    _smart_sniper_size = _smart_sniper_size_xch(
-        avail_xch=_avail_xch,
-        fills_per_day=fills_per_day,
-        daily_volume_xch=daily_volume,
-        orderbook=orderbook,
-        arb_gap_bps=arb_gap_bps,
-        fee_coin_size_xch=_fee_coin_size,
-        min_size_xch=_SNIPER_MIN_SIZE_XCH,
-    )
-
-    # ── Fee < Sniper enforcement ──
-    # Sage auto-picks the smallest available coin for fees.  Fee coins MUST
-    # be smaller than sniper coins so Sage always grabs the right pool.
-    # If Coinset-estimated fee size is ≥ sniper size, clamp it to half the
-    # sniper size — still large enough for ~10 reuses but clearly smaller.
-    if _smart_sniper_size > 0 and _fee_coin_size >= _smart_sniper_size:
-        _fee_coin_size = round(max(0.001, _smart_sniper_size / 2), 6)
-        messages.append(
-            f"Fee coin size clamped to {_fee_coin_size} XCH "
-            f"(must be < sniper size {_smart_sniper_size} XCH)"
-        )
+    _SNIPER_PCT = 0.0
+    _smart_sniper_size = 0.0
 
     _fee_pool_target = _avail_xch * _FEE_PCT
     _fee_prep_count = _smart_fee_prep_count(_avail_xch, _fee_coin_size, _FEE_PCT)
     _fee_pool_xch = _fee_coin_size * _fee_prep_count
 
-    _SNIPER_PCT = _smart_sniper_pool_pct(_avail_xch, fills_per_day)
-    _sniper_pool_raw = _avail_xch * _SNIPER_PCT
-    # Sniper offers are expendable probes — keep them at Dexie's minimum
-    # displayable size only in thin markets. Liquid active markets get larger
-    # probes so the allocated sniper pool is not stranded in the top-up budget.
-
-    # Prep count: more fills = faster sniper coin burn = need more ready.
-    # Cap scales with the sniper pool so we never prep more than the pool
-    # can fund at the derived probe size.
-    _sniper_plan = _smart_sniper_prep_plan(
-        _avail_xch, fills_per_day, _smart_sniper_size
-    )
-    _smart_sniper_prep = int(_sniper_plan.get("count") or 0)
-    _sniper_pool_xch = float(_sniper_plan.get("pool_xch") or 0.0)
-    if _smart_sniper_prep > 0:
-        messages.append(
-            f"Sniper pool: {_smart_sniper_prep} coins at "
-            f"{_smart_sniper_size:.4f} XCH "
-            f"({_sniper_pool_xch:.4f}/{_sniper_pool_raw:.4f} XCH target)"
-        )
+    _smart_sniper_prep = 0
+    _sniper_pool_xch = 0.0
 
     # ── Bottleneck-driven capital allocation ─────────────────────────────────
     # The bot is symmetric: every buy needs XCH, every sell needs CAT.
@@ -2168,19 +2013,9 @@ def _calculate_smart_defaults(
     _max_possible_n = max(2, int(_trading_xch / (_MIN_OFFER_XCH * 2.5)))
     _target_n = min(_market_n, _max_possible_n)
 
-    # ── Pool impact cap ──
-    # If the user's capital is large vs the pool, takers face high slippage on outer
-    # offers — cap depth so the ladder stays effective.
-    # Caps are also scaled 3× to match the wider distribution goal.
+    # AMM pool-impact caps are retired; the market-confidence layer scales
+    # independent order-book depth to configured offer size.
     _pool_note = ""
-    if pool_xch > 0 and _trading_xch > 0:
-        _pool_ratio = _trading_xch / pool_xch
-        if _pool_ratio > 0.5:
-            _target_n = max(2, min(_target_n, 24))
-            _pool_note = "pool-dominated"
-        elif _pool_ratio > 0.2:
-            _target_n = max(2, min(_target_n, 36))
-            _pool_note = "pool-aware"
 
     # ── RISK PROFILE: capital deployment ──────────────────────────────────────
     # Scales the trading XCH pool, not the offer count.  This keeps the same
@@ -2220,15 +2055,6 @@ def _calculate_smart_defaults(
     else:
         _size_mults = (2.5, 1.0, 0.40, 0.15)
         _tier_style = "concentrated"  # quiet, put capital where fills happen
-
-    # Shallow pool: large outer orders face slippage takers won't accept
-    if 0 < pool_xch < 100:
-        _sm = list(_size_mults)
-        _sm[2] = round(_sm[2] * 0.7, 3)
-        _sm[3] = round(_sm[3] * 0.4, 3)
-        _size_mults = tuple(_sm)
-        if not _pool_note:
-            _pool_note = "shallow-pool"
 
     # ── Market regime → count distribution ──
     # What fraction of total offers goes to each tier.
@@ -4058,15 +3884,37 @@ def _calculate_smart_defaults(
     # round-trips correctly. Direct API callers can apply the response
     # straight to /api/config without conversion now.
     #
-    # Sniper auto-enable: when Smart Settings has allocated a real sniper
-    # pool in two-sided mode (pool budget was already carved before
-    # trading_xch so totals fit), turn the feature on. See the matching
-    # "Bot Operations" block below for the rationale.
-    _sniper_auto = (
-        liquidity_mode == "two_sided"
-        and float(_smart_sniper_size or 0) > 0
-        and int(_smart_sniper_prep or 0) > 0
+    # The AMM sniper is retired. Conservative opportunity orders are described
+    # by the offer-book policy and reuse normal prepared tier coins.
+    _sniper_auto = False
+
+    _buy_depth = Decimal(str(orderbook.get("buy_depth_xch") or 0))
+    _sell_depth = Decimal(str(orderbook.get("sell_depth_xch") or 0))
+    _independent_depth = min(_buy_depth, _sell_depth)
+    _offer_size_for_policy = Decimal(str(_smart_trade_size or _MIN_OFFER_XCH))
+    _offer_book_policy = derive_offer_book_policy(
+        risk_profile=_risk_profile_name,
+        configured_offer_size_xch=_offer_size_for_policy,
+        independent_depth_xch=max(Decimal("0"), _independent_depth),
+        volatility_bps=Decimal(str(max(0.0, max_move * 100))),
+        churn_score=0,
+        network_fee_xch=Decimal(str(max(0.0, _smart_fee_xch))),
+        expected_cancel_requotes=2,
+        minimum_profit_xch=Decimal("0.0001"),
     )
+    _policy_spread_bps = Decimal(_offer_book_policy["recommended_spread_bps"])
+    if _policy_spread_bps > Decimal(str(base_spread_bps)):
+        base_spread_bps = float(_policy_spread_bps)
+        inner_edge_bps = max(100, int(base_spread_bps * 0.4))
+        required_outer_bps = (inner_edge_bps * 3 + 1) // 2
+        min_spread_bps = max(200, int(base_spread_bps * 0.6), required_outer_bps)
+        max_spread_bps = max(
+            min_spread_bps * 2, min(int(base_spread_bps * 2), 1500)
+        )
+        requote_bps = max(
+            150,
+            min(base_spread_bps * 0.80, max(base_spread_bps * 0.55, requote_bps)),
+        )
 
     _toxicity_defaults = _smart_toxicity_defaults(
         avail_xch=_avail_xch,
@@ -4099,7 +3947,6 @@ def _calculate_smart_defaults(
         _smart_sell_mid,
         _smart_sell_outer,
         _smart_sell_extreme,
-        _smart_sniper_size if _sniper_auto else 0,
     ]
     _smart_max_trade_xch = round(
         max(
@@ -4110,8 +3957,13 @@ def _calculate_smart_defaults(
     )
 
     result = {
+        "market_model": "offer_book",
+        "offer_book_policy": _offer_book_policy,
+        "tibet_status": "retired",
         # Smart Pricing
-        "dynamic_spread_enabled": has_both_prices,
+        "dynamic_spread_enabled": bool(
+            orderbook.get("best_bid", 0) > 0 and orderbook.get("best_ask", 0) > 0
+        ),
         "base_spread_bps": int(round(base_spread_bps)),
         "volatility_window_hours": volatility_window,
         "min_edge_bps": int(round(inner_edge_bps)),  # env key is MIN_EDGE_BPS
@@ -4405,8 +4257,9 @@ def _calculate_smart_defaults(
             "has_both_prices": has_both_prices,
             "has_trade_history": bool(trades),
             "has_competitor_data": orderbook["has_data"],
-            "has_tibet_pool": tibet.get("has_data", False),
-            "has_tibet_quote": bool(tibet_quote),
+            "has_tibet_pool": False,
+            "has_tibet_quote": False,
+            "tibet_status": "retired",
             "has_spacescan": spacescan.get("has_data", False),
             "has_bot_history": bot_perf.get("has_history", False),
             "mid_price": mid_price,

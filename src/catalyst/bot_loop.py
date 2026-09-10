@@ -5042,14 +5042,11 @@ class BotLoop:
         # self._mempool_watcher_needs_start. Previously this block
         # failed silently and the watcher never started for the session.
         self._mempool_watcher_needs_start = False
-        if (
-            _mempool_watcher_mod
-            and getattr(cfg, "COINSET_ENABLED", True)
-            and cfg.CAT_ASSET_ID
-        ):
-            started = self._try_start_mempool_watcher(log_skip=True)
-            if not started:
-                self._mempool_watcher_needs_start = True
+        log_event(
+            "info",
+            "tibetswap_mempool_watcher_retired",
+            "TibetSwap reserve-spend watcher retired after the service shutdown",
+        )
 
         # Coin watcher thread (lifecycle tracking)
         self._coin_watcher_thread = threading.Thread(
@@ -5095,16 +5092,12 @@ class BotLoop:
                     f"Failed to auto-start Splash node: {e}",
                 )
 
-        # AMM monitor — starts background polling thread for live reserve data
-        if getattr(cfg, "TIBET_PAIR_ID", "").strip():
-            try:
-                self.amm_monitor.start()
-            except Exception as _amm_err:
-                log_event(
-                    "warning",
-                    "amm_monitor_start_failed",
-                    f"AMM Monitor could not start: {_amm_err}",
-                )
+        # The AMM monitor is intentionally not started in the post-TibetSwap model.
+        log_event(
+            "info",
+            "tibetswap_amm_monitor_retired",
+            "TibetSwap AMM monitoring is retired; offer-book evidence is active",
+        )
 
         # Runtime monitor — tracks fill activity, conditions, diagnostics
         try:
@@ -13512,7 +13505,7 @@ class BotLoop:
         Services tested:
           - Sage RPC (critical — required for everything)
           - Coinset API (degrades fast fill detection if down)
-          - TibetSwap API (degrades pricing if down)
+          - TibetSwap compatibility state (retired; never probed)
           - Dexie API (degrades offer posting + competitor intel)
           - Spacescan API (degrades fill verification + token context)
           - SQLite DB write (critical — bot can't track state without it)
@@ -13606,20 +13599,17 @@ class BotLoop:
                 "error": f"check failed: {e}",
             }
 
-        # 2. TibetSwap API — pricing source
-        # F32 fix: use the real /pairs endpoint that price_engine actually
-        # consumes (was /router which doesn't exist on tibetswap.io v2).
-        tibet_url = str(
-            getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
-            or "https://api.v2.tibetswap.io"
-        )
-        r = _check_http("TibetSwap API", f"{tibet_url}/pairs?skip=0&limit=1")
-        r["missing_if_down"] = (
-            "Real-time price feed. Bot will fall back to Dexie-only pricing "
-            "(less accurate) and AMM drift detection will not work."
-        )
-        r["critical"] = False
-        results["tibet"] = r
+        # 2. One-release compatibility marker. TibetSwap shut down and must
+        # never be contacted by startup health checks or trading paths.
+        results["tibet"] = {
+            "name": "TibetSwap (retired)",
+            "ok": True,
+            "skipped": True,
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+            "missing_if_down": "n/a (provider permanently retired)",
+            "critical": False,
+        }
 
         # 3. Dexie API — offer posting + competitor orderbook
         # F32 fix: use the real /v1/offers endpoint that dexie_manager and
@@ -15016,43 +15006,17 @@ class BotLoop:
         log_event("info", "watcher_exit", "Price watcher stopped")
 
     def _fetch_tibet_reserves(self, session: requests.Session):
-        """Fetch TibetSwap reserves directly (lightweight).
-
-        Returns (xch_reserve, token_reserve) or (None, None) on failure.
-        """
-        try:
-            pair_info = self.price_engine.get_tibet_pool_info(cfg.CAT_ASSET_ID)
-            if pair_info:
-                xch_res = float(pair_info.get("xch_reserve", 0))
-                token_res = float(pair_info.get("token_reserve", 0))
-                if xch_res > 0 and token_res > 0:
-                    return xch_res, token_res
-        except Exception:
-            pass
-
-        # Fallback: direct API call
-        try:
-            url = f"{cfg.TIBET_API_BASE}/pairs"
-            resp = session.get(url, params={"skip": 0, "limit": 100}, timeout=5)
-            if resp.status_code == 200:
-                pairs = resp.json()
-                normalized = cfg.CAT_ASSET_ID.lower().strip()
-                cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
-                cat_scale = 10**cat_decimals
-                for pair in pairs:
-                    pair_asset = str(pair.get("short_name", "")).lower().strip()
-                    pair_asset_id = str(pair.get("asset_id", "")).lower().strip()
-                    # Exact match only — avoid zero-appending false matches.
-                    if normalized in (pair_asset, pair_asset_id):
-                        # API returns mojos — divide to match price_engine units
-                        xch_res = float(pair.get("xch_reserve", 0)) / 1e12
-                        token_res = float(pair.get("token_reserve", 0)) / cat_scale
-                        if xch_res > 0 and token_res > 0:
-                            return xch_res, token_res
-        except Exception:
-            pass
-
+        """Retired compatibility stub; never contacts TibetSwap."""
         return None, None
+
+    def _price_watcher_thread(self):
+        """Retired: TibetSwap reserve polling must never perform live I/O."""
+
+        log_event(
+            "info",
+            "tibetswap_price_watcher_retired",
+            "TibetSwap reserve watcher is retired in the offer-book market model",
+        )
 
     # -------------------------------------------------------------------
     # Coin Watcher Thread (lifecycle tracking)
