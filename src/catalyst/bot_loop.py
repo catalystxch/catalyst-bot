@@ -971,7 +971,9 @@ class BotLoop:
         self._runtime_recovery_baseline = sample
         return True
 
-    def _runtime_recovery_cycle_boundary(self) -> bool:
+    def _runtime_recovery_cycle_boundary(
+        self, *, maximum_monotonic_gap_seconds=None
+    ) -> bool:
         """Fence a discontinuity before any later cycle mutation."""
 
         from runtime_recovery import ClockSample, detect_discontinuity
@@ -983,7 +985,11 @@ class BotLoop:
         decision = detect_discontinuity(
             self._runtime_recovery_baseline,
             sample,
-            maximum_monotonic_gap_seconds=self._runtime_recovery_gap_seconds,
+            maximum_monotonic_gap_seconds=(
+                self._runtime_recovery_gap_seconds
+                if maximum_monotonic_gap_seconds is None
+                else maximum_monotonic_gap_seconds
+            ),
             maximum_wall_skew_seconds=self._runtime_recovery_skew_seconds,
         )
         if not decision.discontinuity:
@@ -8324,12 +8330,18 @@ class BotLoop:
             retry_elapsed = self._runtime_recovery_gap_seconds
 
         # A recovery pass can legitimately spend several minutes collecting
-        # full-history Sage evidence for old bulk-cancel members.  Rebase the
-        # detector at this known effect boundary so that the elapsed RPC work
-        # is not mistaken for an unattended runtime suspension.  If the pass
-        # exceeded the normal continuity window, defer every later mutation
-        # to a fresh cycle (and therefore a fresh price read).
-        if not self._establish_runtime_recovery_baseline():
+        # full-history Sage evidence for old bulk-cancel members. Preserve the
+        # pre-pass sample so rollback or wall/monotonic skew is still detected,
+        # while allowing the observed monotonic duration of this known RPC
+        # boundary. If it exceeded the normal continuity window, defer every
+        # later mutation to a fresh cycle (and therefore a fresh price read).
+        allowed_retry_gap = max(
+            self._runtime_recovery_gap_seconds,
+            retry_elapsed + Decimal("1"),
+        )
+        if not self._runtime_recovery_cycle_boundary(
+            maximum_monotonic_gap_seconds=allowed_retry_gap
+        ):
             return False
         if retried < 0:
             log_event(
