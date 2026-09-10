@@ -9144,8 +9144,17 @@
                                 <span class="v4-data-strip-key">Withdrawal</span>
                                 <span id="marketWithdrawalStage" class="v4-data-strip-val">NONE</span>
                             </span>
+                            <span class="v4-data-strip-field">
+                                <span class="v4-data-strip-key">Evidence time</span>
+                                <span id="marketConfidenceDerivedAt" class="v4-data-strip-val">—</span>
+                            </span>
+                            <span class="v4-data-strip-field">
+                                <span class="v4-data-strip-key">Next safety step</span>
+                                <span id="marketConfidenceCountdown" class="v4-data-strip-val">—</span>
+                            </span>
                             <span id="marketConfidenceReasons" class="v4-data-strip-badge v4-data-strip-badge--warn">market evidence warming</span>
                             <span id="marketProviderHealth" class="v4-data-strip-last">providers —</span>
+                            <span id="marketMigrationReport" class="v4-data-strip-last">migration —</span>
                         </div>
                     </div>
 
@@ -9560,10 +9569,10 @@
 
                 <!-- Coin breakdown -->
                 <div class="cc-group" id="coinTrackingSection" style="display: none;">
-                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">Spendable = all coins not locked in an active offer (includes fee pool &amp; sniper pool coins). Locked = committed to active offers. Total = spendable + locked.</span></span></div>
+                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">Spendable = all coins not locked in an active offer, including dedicated fee coins. Locked = committed to active offers. Total = spendable + locked.</span></span></div>
                     <div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 3px 10px; font-size: 0.82em;">
                         <div style="opacity: 0.5;"></div>
-                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="All coins not locked in an active offer. Includes fee pool and sniper pool coins.">Spendable</span></div>
+                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="All coins not locked in an active offer, including dedicated fee coins.">Spendable</span></div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Locked</div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Total</div>
                         <div>XCH</div>
@@ -9815,6 +9824,7 @@
         <!-- Offers Card -->
         <div class="card" style="margin-bottom: var(--space-5);">
             <div id="offersModeBanner" class="one-sided-mode-banner"></div>
+            <div id="offerDiscoveryState" class="panel-context-note">Publication acknowledgement is provisional until the exact offer is rediscovered through Dexie or Splash.</div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3);">
                 <div class="offers-tabs">
                     <button class="offers-tab active" onclick="switchOffersTab('active')">
@@ -9924,6 +9934,7 @@
                         </div>
                     </div>
                 </div>
+                <div id="fillEvidenceActivity" class="panel-context-note">PnL and fill totals include Confirmed evidence only. Observed and Probable activity remains non-economic until Sage or exact dual-chain evidence confirms it.</div>
 
                 <div class="pnl-terms-panel" aria-label="PnL summary">
                     <div class="pnl-term">
@@ -10736,7 +10747,7 @@
                     <!-- ══ Smart Defaults ══ -->
                     <div class="v4-settings-section v4-settings-purple" style="background: rgba(139,92,246,0.08); text-align: center;">
                         <div style="font-size: 1.05em; font-weight: bold; color: var(--violet-300); margin-bottom: 8px;" id="smartDefaultsTitle">Auto-Fill Settings</div>
-                        <div class="v4-settings-hint" style="margin-bottom: 10px;" id="smartDefaultsSubtitle">Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what's left: fee pool → opportunity pool → trading capital → tier sizes &amp; offer counts.</div>
+                        <div class="v4-settings-hint" style="margin-bottom: 10px;" id="smartDefaultsSubtitle">Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what's left: fee pool → trading capital → tier sizes &amp; offer counts.</div>
 
                         <!-- Risk Profile selector -->
                         <div style="margin-bottom: 12px;">
@@ -11359,7 +11370,7 @@
                             </div>
                         </div>
                         <div class="mode-hide-on-two-sided" hidden style="display: none; margin-bottom: 10px; padding: 8px 12px; background: rgba(100,116,139,0.08); border: 1px solid rgba(100,116,139,0.2); border-radius: 6px; font-size: 0.82em; color: var(--text-tertiary); line-height: 1.5;">
-                            🎯 <strong>Sniper unavailable</strong> in single-sided mode — the arb-discovery probe places buy AND sell orders simultaneously, which requires both sides of the book. It will re-enable automatically if you switch back to Two-Sided.
+                            <strong>Legacy opportunity probes retired</strong> — v1.4 uses attributable offer-book confidence and does not prepare or launch the former AMM probe pool.
                         </div>
                         <!-- Re-arm fields + hint are sniper knobs; hide them
                              together with the rest of the sniper block when
@@ -11957,7 +11968,7 @@
                     <div>
                         <div class="v4-modal-kicker">Probe Ladder</div>
                         <h3 class="v4-modal-title">Start Close the Gap?</h3>
-                        <p class="v4-modal-copy">This sends two small market-testing offers, then tightens toward the safest edge that still survives against TibetSwap arb pressure. It is meant to map the edge before the main body follows.</p>
+                        <p class="v4-modal-copy">This legacy market-testing workflow is retired in v1.4. Offer-book confidence now controls exposure without placing speculative discovery probes.</p>
                     </div>
                 </div>
 
@@ -11994,7 +12005,7 @@
                         <li>Starts with two small offers away from the main book.</li>
                         <li>If they survive, tightens by 10% every 60 seconds.</li>
                         <li>If arb bots snap them, widens and waits before probing again.</li>
-                        <li>Never tightens below the TibetSwap arb gap plus the configured safety buffer.</li>
+                        <li>Live exposure is now governed by attributable offer-book depth, freshness, and manipulation checks.</li>
                         <li>At the floor, plants an inner-tier offer at the proven price and swaps out the furthest inner offer.</li>
                         <li>The main ladder then adjusts naturally via the incremental reaction strategy.</li>
                     </ol>
@@ -12308,7 +12319,7 @@
                         <div class="v4-modal-panel-title">Earlier milestones</div>
                         <div class="v4-modal-panel-copy">
                             <strong>Desktop shell</strong> — native window, system tray, and OS notifications.<br>
-                            <strong>Mempool watcher</strong> — fill detection in 5–18 seconds via Coinset mempool scanning.<br>
+                            <strong>Chain corroboration</strong> — Coinset and Spacescan evidence can corroborate Sage state without becoming wallet authority.<br>
                             <strong>Hardened safeguards</strong> — silent-loss rate alerts, position sanity checks, cancel-storm protection, daily DB↔wallet reconciliation, background-thread liveness watchdog, WAL monitoring, and per-cycle SLA timing.<br>
                             <strong>Startup self-test</strong> — checks every active service used by the app (Sage, Coinset, Dexie, Spacescan, and Splash where enabled) and identifies missing capabilities without contacting retired providers.<br>
                             <strong>Settings audit log</strong> — every config change is recorded with who/when/what so you can investigate after the fact.<br>
@@ -12414,7 +12425,7 @@
                 <div>
                     <div class="v4-modal-kicker">Guide</div>
                     <h2 class="v4-modal-title">Help & field notes</h2>
-                    <p class="v4-modal-copy">A detailed operator guide covering the full bot workflow: startup, dashboard, pricing, offers, fills, inventory, coin preparation, sniper behaviour, market intel, wallet handling, and troubleshooting. Use the tabs below to jump to the area you need.</p>
+                    <p class="v4-modal-copy">A detailed operator guide covering the full bot workflow: startup, dashboard, offer-book confidence, offers, fills, inventory, coin preparation, market intel, wallet handling, and troubleshooting. Use the tabs below to jump to the area you need.</p>
                 </div>
             </div>
 
@@ -12503,7 +12514,7 @@
                     <p>One merged card replaces the old separate Recommendations and Advisor panels. It has two sections, divided by a subtle dashed line:</p>
                     <ul style="padding-left: 20px;">
                         <li><strong>Actions</strong> (top) — everything you can act on with one click: circuit-breaker tripped, wallet sync stale, Restart Sage, <em>Tighten to X%</em>, <em>Widen to X%</em>, <em>Enable Inventory Mgmt</em>, <em>Allocate deposit</em>, etc.</li>
-                        <li><strong>Advisor notes</strong> (bottom) — context that explains what the current state means: quiet token, wide arb gap, price-gap sanity warnings. Tips that depend on the Spacescan 24h cache automatically hide themselves when the cache is stale.</li>
+                        <li><strong>Advisor notes</strong> (bottom) — context that explains attributable depth, provider freshness, confidence restrictions, and manipulation warnings. Tips that depend on the Spacescan 24h cache automatically hide themselves when the cache is stale.</li>
                     </ul>
                     <p>Dedup logic ensures each concern surfaces once: if a backend alert has raised <em>circuit_breaker</em>, the advisor won't push a duplicate tip about the same breaker.</p>
                     <h3 style="color: var(--accent-primary-hover);">Activity feed (right of Guidance)</h3>
@@ -12579,10 +12590,10 @@
                     <h3 style="color: var(--accent-primary-hover);">Coin preparation</h3>
                     <p>Click <strong>"Prepare Coins"</strong> after saving settings to split your wallet into offer-sized coins. Coin prep starts by cancelling existing offers so old locks do not collide with the fresh plan. It then:</p>
                     <ol style="padding-left: 20px;">
-                        <li>Calculates how many XCH, CAT, fee, reserve, topup, and sniper coins the saved ladder needs</li>
+                        <li>Calculates how many XCH, CAT, fee, reserve, and topup coins the saved ladder needs</li>
                         <li>Builds the fee pool first, then creates the prepared XCH and CAT pools using Sage transactions</li>
                         <li>Tracks split landing checks through Sage and Coinset where available</li>
-                        <li>Labels outputs immediately as reserve, tier spare, fee, topup, or sniper coins so they do not get mistaken for dust</li>
+                        <li>Labels outputs immediately as reserve, tier spare, fee, or topup coins so they do not get mistaken for dust</li>
                     </ol>
                     <h3 style="color: var(--accent-primary-hover);">Adaptive live topup</h3>
                     <p>While running, the bot monitors coin counts and tops up automatically based on trading pace and per-tier spare levels. The topup pool is working fuel, not a safety reserve; the true reserve is the XCH/CAT amount held back from trading in Settings.</p>
@@ -22201,7 +22212,7 @@
         const _SMART_DEFAULTS_LABELS = {
             two_sided: {
                 title: 'Auto-Fill Settings',
-                subtitle: 'Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what\'s left: fee pool → opportunity pool → trading capital → tier sizes &amp; offer counts.',
+                subtitle: 'Set your <strong>Reserves</strong> above first, then choose a risk profile, then click — everything is sized from what\'s left: fee pool → trading capital → tier sizes &amp; offer counts.',
             },
             buy_only: {
                 title: 'Auto-Fill — Accumulation Plan',
@@ -23785,11 +23796,50 @@
             ).toUpperCase();
             setText('marketWithdrawalStage', stage);
 
+            const derivedAt = String((data.evidence || {}).derived_at || confidence.derived_at || '');
+            let derivedLabel = 'Not yet derived';
+            if (derivedAt) {
+                const parsed = new Date(derivedAt);
+                derivedLabel = Number.isNaN(parsed.getTime()) ? derivedAt : parsed.toLocaleTimeString();
+            }
+            setText('marketConfidenceDerivedAt', derivedLabel);
+            const timeline = (data.degraded && data.degraded.timeline) || null;
+            let countdown = 'No withdrawal scheduled';
+            if (timeline && timeline.next_stage && timeline.seconds_until_next_stage !== null) {
+                const seconds = Math.max(0, Number(timeline.seconds_until_next_stage) || 0);
+                countdown = `${timeline.next_stage} in ${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+            } else if (timeline && timeline.current_stage === 'ALL') {
+                countdown = 'All exposure withdrawn';
+            }
+            setText('marketConfidenceCountdown', countdown);
+            const migration = data.migration || {};
+            setText(
+                'marketMigrationReport',
+                migration.reason_code
+                    ? `migration ${migration.can_start === true ? 'ready' : 'blocked'} · ${migration.reason_code}`
+                    : 'migration report pending'
+            );
+
             const providers = data.providers || {};
             const providerText = ['dexie', 'splash', 'sage', 'coinset', 'spacescan']
-                .map(name => `${name} ${String((providers[name] || {}).status || 'unavailable')}`)
+                .map(name => {
+                    const provider = providers[name] || {};
+                    const observed = provider.observed_at ? new Date(provider.observed_at) : null;
+                    const timeLabel = observed && !Number.isNaN(observed.getTime())
+                        ? ` @ ${observed.toLocaleTimeString()}`
+                        : '';
+                    const providerReasons = Array.isArray(provider.reason_codes) && provider.reason_codes.length
+                        ? ` (${provider.reason_codes.join(', ').replaceAll('_', ' ')})`
+                        : '';
+                    return `${name} ${String(provider.status || 'unavailable')}${timeLabel}${providerReasons}`;
+                })
                 .join(' · ');
             setText('marketProviderHealth', providerText || 'providers unavailable');
+            setText(
+                'offerDiscoveryState',
+                'Publication acknowledgement is provisional until exact rediscovery. Current sources: '
+                    + ((data.evidence || {}).source_ids || []).join(', ')
+            );
             const bar = document.getElementById('marketConfidenceBar');
             const placeholder = document.getElementById('marketConfidencePlaceholder');
             if (bar) bar.classList.remove('is-loading');
@@ -29348,7 +29398,7 @@
                         ` : '<div style="color:var(--text-tertiary);">Dexie manager not running.</div>'}
                     </div>
                     <div class="v4-modal-panel">
-                        <div class="v4-modal-panel-title">TibetSwap ${ts.available ? '✅' : '❌'}</div>
+                        <div class="v4-modal-panel-title">TibetSwap · retired</div>
                         ${ts.available ? `
                           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
                             <div style="color:var(--text-secondary);">AMM price</div><div>${ts.amm_price ? Number(ts.amm_price).toFixed(8) : '—'}</div>
@@ -29368,7 +29418,7 @@
                             <div style="color:var(--text-secondary);">Direct calls</div><div>${fmtN(ts.direct_calls)}</div>
                           </div>
                           ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
-                        ` : '<div style="color:var(--text-tertiary);">TibetSwap AMM monitor not running.</div>')}
+                        ` : '<div style="color:var(--text-tertiary);">TibetSwap is retired. Historical counters are read-only and no live AMM capability is used.</div>')}
                     </div>
                     <div class="v4-modal-panel">
                         <div class="v4-modal-panel-title">Splash ${sp.available ? (sp.healthy ? '✅' : '⚠️') : '❌'}</div>

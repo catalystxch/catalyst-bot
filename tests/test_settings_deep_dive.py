@@ -203,8 +203,15 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     with (
         api_mutations_permitted(api_server),
         patch.object(api_server, "bot", fake_bot),
-        patch.object(api_server, "cfg", fake_cfg),
-        patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch(
+                "blueprints.bot._enforce_post_tibet_start_migration",
+                return_value={
+                    "can_start": True,
+                    "reason_code": "POST_TIBET_MIGRATION_READY",
+                },
+            ),
+            patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),
         patch(
             "wallet.get_wallet_sync_status",
             return_value={"reachable": True, "sync_state": "synced"},

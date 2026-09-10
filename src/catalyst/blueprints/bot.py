@@ -1863,7 +1863,7 @@ def api_runtime_diagnostics():
 
 @bp.route("/api/diagnostics/api-stats")
 def api_diagnostics_api_stats():
-    """F45 (2026-04-08): unified usage stats for all 3 external APIs.
+    """Return live provider usage and explicit retired-provider status.
 
     Returns counters for Spacescan (paid call budget), Coinset (hit
     rate vs wallet RPC fallback) and Dexie (post queue, v3 cache),
@@ -2075,6 +2075,19 @@ def api_diagnostics_api_stats():
         if _direct:
             payload["dexie"]["direct_calls"] = _direct
             payload["dexie"]["direct_calls_by_endpoint"] = _tracker_endpoints("dexie")
+        price_engine = getattr(bot, "price_engine", None) if bot is not None else None
+        payload["dexie"]["price_fetches"] = int(
+            getattr(price_engine, "_dexie_price_fetches", 0) or 0
+        )
+        try:
+            payload["dexie"]["orderbook_refreshes"] = int(
+                (getattr(bot, "_bot_state", {}) or {}).get(
+                    "orderbook_refreshes", 0
+                )
+                or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            payload["dexie"]["orderbook_refreshes"] = 0
 
     # --- Splash (P2P offer broadcast) ---------------------------------
     # Splash has its own /api/splash/stats endpoint, but callers of the
@@ -2115,7 +2128,7 @@ def api_diagnostics_api_stats():
 
     # --- TibetSwap / AMM Monitor --------------------------------------
     try:
-        if bot is not None and getattr(bot, "amm_monitor", None):
+        if False and bot is not None and getattr(bot, "amm_monitor", None):
             amm_stats = bot.amm_monitor.get_stats() or {}
             # Also grab price engine stats
             _pe = getattr(bot, "price_engine", None)
@@ -2184,7 +2197,11 @@ def api_diagnostics_api_stats():
                     dyn.get("current_buffer_bps") is not None
                 )
         else:
-            payload["tibetswap"] = {"available": False}
+            payload["tibetswap"] = {
+                "available": False,
+                "status": "retired",
+                "capabilities": [],
+            }
     except Exception as e:
         payload["tibetswap"] = {"available": False, "error": str(e)}
 
@@ -2193,7 +2210,9 @@ def api_diagnostics_api_stats():
     # bypass amm_monitor so they're invisible to its stats. Always
     # surface the counter; if amm_monitor isn't running we still want
     # the direct counts to show up.
-    _tibet_direct = int(_tracker_get_count("tibetswap"))
+    # Historical counters are intentionally not promoted into live provider
+    # health. TibetSwap is permanently retired in v1.4.
+    _tibet_direct = 0
     if _tibet_direct:
         if not isinstance(payload.get("tibetswap"), dict):
             payload["tibetswap"] = {"available": False}

@@ -4,9 +4,10 @@ from unittest.mock import Mock
 from pathlib import Path
 from types import SimpleNamespace
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import api_server
+from blueprints import bot as bot_routes
 from blueprints import market
 
 
@@ -114,6 +115,123 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
     assert payload["metrics"]["independent_ask_depth_xch"] == "3"
     assert payload["metrics"]["required_depth_xch"] == "1"
     assert payload["metrics"]["manipulation_score"] == 12
+
+
+def test_market_confidence_exposes_exact_evidence_and_withdrawal_countdown(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+    derived_at = (now - timedelta(seconds=5)).isoformat()
+    degraded_since = (now - timedelta(minutes=2)).isoformat()
+    digests = ["a" * 64, "b" * 64]
+    snapshot = {
+        "asset_id": ASSET_ID,
+        "state": "RED",
+        "derived_at": derived_at,
+        "trusted_midpoint": "0.1",
+        "trusted_bid": "0.09",
+        "trusted_ask": "0.11",
+        "degraded_since": degraded_since,
+        "withdrawal_stage": "INNER",
+        "recovery_refreshes": 0,
+        "reason_codes": ["provider_conflict"],
+        "source_health": {"dexie": "valid", "splash": "invalid"},
+        "evidence_digests": digests,
+        "material": True,
+    }
+    degraded = {
+        "asset_id": ASSET_ID,
+        "degraded_since": degraded_since,
+        "recovery_started_at": None,
+        "recovery_refreshes": 0,
+        "last_confidence_state": "RED",
+        "withdrawal_stage": "INNER",
+        "updated_at": now.isoformat(),
+    }
+    observations = [
+        {
+            "provider_id": provider,
+            "capability": "order_book",
+            "quality": quality,
+            "observed_at": derived_at,
+            "fresh_until": (now + timedelta(seconds=10)).isoformat(),
+            "payload_sha256": digest,
+            "reason_codes": reasons,
+        }
+        for provider, quality, digest, reasons in (
+            ("dexie", "valid", digests[0], []),
+            ("splash", "invalid", digests[1], ["crossed_book"]),
+        )
+    ]
+    monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
+    monkeypatch.setattr(market, "_utc_now", lambda: now)
+    monkeypatch.setattr(
+        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=snapshot)
+    )
+    monkeypatch.setattr(
+        market.database, "get_degraded_market_state", Mock(return_value=degraded)
+    )
+    monkeypatch.setattr(
+        market.database, "get_post_tibet_migration_report", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        market.database,
+        "get_market_provider_observations",
+        Mock(return_value=observations),
+    )
+
+    with api_server.app.test_request_context("/api/market/confidence"):
+        payload = market.api_market_confidence().get_json()
+
+    assert payload["evidence"] == {
+        "derived_at": derived_at,
+        "reason_codes": ["provider_conflict"],
+        "source_ids": ["dexie", "splash"],
+        "snapshot_digests": digests,
+    }
+    assert payload["providers"]["dexie"]["observed_at"] == derived_at
+    assert payload["providers"]["splash"]["reason_codes"] == ["crossed_book"]
+    assert payload["degraded"]["timeline"] == {
+        "policy": "0/3/10-minute",
+        "current_stage": "INNER",
+        "elapsed_seconds": 120,
+        "next_stage": "MIDDLE",
+        "seconds_until_next_stage": 60,
+        "recovery_refreshes": 0,
+        "recovery_refreshes_required": 3,
+        "recovery_minimum_seconds": 60,
+    }
+
+
+def test_api_diagnostics_never_reads_retired_amm_monitor(monkeypatch):
+    monitor = Mock()
+    monitor.get_stats.side_effect = AssertionError("retired AMM monitor read")
+    dexie_manager = SimpleNamespace(
+        get_stats=lambda: {},
+        _rate_limited_until=0,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "bot",
+        SimpleNamespace(
+            amm_monitor=monitor,
+            dexie_manager=dexie_manager,
+            price_engine=SimpleNamespace(_dexie_price_fetches=7),
+            _bot_state={"orderbook_refreshes": 9},
+        ),
+    )
+
+    with api_server.app.test_request_context("/api/diagnostics/api-stats"):
+        payload = bot_routes.api_diagnostics_api_stats().get_json()
+
+    monitor.get_stats.assert_not_called()
+    assert payload["tibetswap"] == {
+        "available": False,
+        "status": "retired",
+        "capabilities": [],
+    }
+    assert payload["dexie"]["price_fetches"] == 7
+    assert payload["dexie"]["orderbook_refreshes"] == 9
 
 
 def test_market_confidence_endpoint_ages_expired_provider_evidence(monkeypatch):
@@ -266,6 +384,11 @@ def test_dashboard_and_market_intel_render_offer_book_confidence_contract():
         "marketConfidenceReasons",
         "marketProviderHealth",
         "marketWithdrawalStage",
+        "marketConfidenceDerivedAt",
+        "marketConfidenceCountdown",
+        "marketMigrationReport",
+        "offerDiscoveryState",
+        "fillEvidenceActivity",
         "intelConfidenceTimeline",
         "derivedDepthThreshold",
         "derivedManipulationThreshold",

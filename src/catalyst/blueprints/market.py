@@ -775,6 +775,38 @@ def _runtime_confidence_metrics() -> dict:
     }
 
 
+def _degraded_timeline(degraded: dict | None, *, now: datetime) -> dict | None:
+    """Project the durable 0/3/10-minute policy into operator-facing time."""
+
+    if not degraded or not degraded.get("degraded_since"):
+        return None
+    started = _parse_utc_timestamp(degraded.get("degraded_since"))
+    if started is None:
+        return None
+    elapsed = max(0, int((now - started).total_seconds()))
+    if elapsed < 180:
+        next_stage = "MIDDLE"
+        next_at = 180
+    elif elapsed < 600:
+        next_stage = "ALL"
+        next_at = 600
+    else:
+        next_stage = None
+        next_at = None
+    return {
+        "policy": "0/3/10-minute",
+        "current_stage": str(degraded.get("withdrawal_stage") or "INNER").upper(),
+        "elapsed_seconds": elapsed,
+        "next_stage": next_stage,
+        "seconds_until_next_stage": (
+            max(0, next_at - elapsed) if next_at is not None else None
+        ),
+        "recovery_refreshes": int(degraded.get("recovery_refreshes") or 0),
+        "recovery_refreshes_required": 3,
+        "recovery_minimum_seconds": 60,
+    }
+
+
 @bp.route("/api/market/confidence")
 def api_market_confidence():
     """Expose the single durable market/safety truth used by every UI tab."""
@@ -785,10 +817,12 @@ def api_market_confidence():
         or ""
     ).strip().lower().removeprefix("0x")
     if not asset_id:
+        generated_at = _utc_now().isoformat()
         return jsonify(
             {
                 "market_model": "offer_book",
                 "asset_id": "",
+                "generated_at": generated_at,
                 "confidence": {
                     "state": "RED",
                     "derived_at": None,
@@ -798,6 +832,13 @@ def api_market_confidence():
                 "degraded": None,
                 "migration": None,
                 "providers": {"tibetswap": {"status": "retired", "capabilities": []}},
+                "evidence": {
+                    "derived_at": None,
+                    "reason_codes": ["asset_not_selected"],
+                    "source_ids": [],
+                    "snapshot_digests": [],
+                },
+                "metrics": {},
                 "can_create": False,
                 "can_requote": False,
                 "can_increase_exposure": False,
@@ -842,6 +883,11 @@ def api_market_confidence():
     )
     confidence = _age_confidence_snapshot(confidence, providers, now=current_time)
     state = str(confidence.get("state") or "RED").upper()
+    if degraded is not None:
+        degraded = dict(degraded)
+        timeline = _degraded_timeline(degraded, now=current_time)
+        if timeline is not None:
+            degraded["timeline"] = timeline
     degraded_active = bool(
         degraded and degraded.get("degraded_since")
     )
@@ -855,6 +901,16 @@ def api_market_confidence():
         "degraded": degraded,
         "migration": migration,
         "providers": providers,
+        "evidence": {
+            "derived_at": confidence.get("derived_at"),
+            "reason_codes": list(confidence.get("reason_codes") or []),
+            "source_ids": sorted(
+                provider_id
+                for provider_id, provider in providers.items()
+                if provider_id != "tibetswap" and provider.get("observed_at")
+            ),
+            "snapshot_digests": list(confidence.get("evidence_digests") or []),
+        },
         "metrics": _runtime_confidence_metrics(),
         "can_create": can_create,
         "can_requote": can_requote,
