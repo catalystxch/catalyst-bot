@@ -7013,7 +7013,12 @@ def test_desktop_upgrade_restart_recovers_undispatched_publication_before_readba
     ]
 
 
-def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
+@pytest.mark.parametrize(
+    "blocked_reason", ["UNRESOLVED_OPERATIONS", "TASK8_BINDING_CONFLICT"]
+)
+def test_desktop_resumes_interrupted_legacy_reservation_recovery(
+    monkeypatch, blocked_reason
+):
     import api_server
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
@@ -7022,7 +7027,7 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
         [
             {
                 "allowed": False,
-                "reason_code": "UNRESOLVED_OPERATIONS",
+                "reason_code": blocked_reason,
                 "failed_check": "unresolved_operations",
             },
             {"allowed": True, "reason_code": "", "failed_check": None},

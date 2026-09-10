@@ -612,6 +612,64 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(offers["sell"], [])
         get_all_offers.assert_not_called()
 
+    def test_stopped_status_clears_stale_lock_counts_for_fresh_empty_wallet_book(self):
+        """Coin counts must follow the same fresh Sage offer view shown by the UI."""
+        asset_id = "ce" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        stopped_bot = _fake_bot_stopped()
+        stopped_bot.offer_manager = types.SimpleNamespace(
+            get_wallet_sync_snapshot=lambda: {
+                "buy": [],
+                "sell": [],
+                "closed": [],
+                "meta": {"fresh": True},
+            }
+        )
+        stale_coin_summary = {
+            "xch_free_count": 177,
+            "xch_locked_count": 33,
+            "xch_locked_mojos": 106_289_411_260_800,
+            "xch_total": 210,
+            "cat_free_count": 92,
+            "cat_locked_count": 35,
+            "cat_locked_mojos": 1_336_812_877,
+            "cat_total": 127,
+        }
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_coin_summary", return_value=stale_coin_summary),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_events_since", return_value=[]),
+            patch("database.get_offer_lifecycle_summary", return_value={}),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        tracking = resp.get_json()["coin_tracking"]
+        self.assertEqual(tracking["xch_locked"], 0)
+        self.assertEqual(tracking["xch_locked_amount"], "0.0000")
+        self.assertEqual(tracking["xch_free"], 210)
+        self.assertEqual(tracking["xch_spendable"], 210)
+        self.assertEqual(tracking["xch_total"], 210)
+        self.assertEqual(tracking["cat_locked"], 0)
+        self.assertEqual(tracking["cat_locked_amount"], "0.00")
+        self.assertEqual(tracking["cat_free"], 127)
+        self.assertEqual(tracking["cat_spendable"], 127)
+        self.assertEqual(tracking["cat_total"], 127)
+        get_all_offers.assert_not_called()
+
     def test_stopped_status_enriches_zero_formatted_wallet_amounts_from_db(self):
         """Sage controls membership while CATalyst retains known display amounts."""
         asset_id = "ef" * 32
