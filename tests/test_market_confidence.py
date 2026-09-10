@@ -193,6 +193,43 @@ def test_depth_threshold_scales_with_offer_size_and_preset():
     assert aggressive.state == "GREEN"
 
 
+def test_far_away_junk_offers_cannot_satisfy_executable_depth():
+    dexie = _observation(
+        "dexie",
+        {
+            "bids": [
+                {"offer_id": "top-bid", "price": "0.099", "amount_mojos": 100},
+                {
+                    "offer_id": "junk-bid",
+                    "price": "0.001",
+                    "amount_mojos": 1_000_000,
+                },
+            ],
+            "asks": [
+                {"offer_id": "top-ask", "price": "0.101", "amount_mojos": 100},
+                {
+                    "offer_id": "junk-ask",
+                    "price": "10",
+                    "amount_mojos": 1_000_000,
+                },
+            ],
+        },
+    )
+
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(dexie,),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "RED"
+    assert result.independent_bid_depth_mojos == 100
+    assert result.independent_ask_depth_mojos == 100
+    assert "insufficient_bid_depth" in result.reason_codes
+    assert "insufficient_ask_depth" in result.reason_codes
+
+
 def test_material_move_requires_persistence_but_settled_trade_can_confirm():
     engine = MarketConfidenceEngine(risk_preset="balanced")
     baseline = engine.evaluate(

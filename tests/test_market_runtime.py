@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import inspect
 from types import SimpleNamespace
 
@@ -88,6 +89,237 @@ def test_runtime_fails_closed_when_only_our_offers_remain(isolated_db):
     assert result.degraded.can_requote is False
     assert result.degraded.cancel_tiers == ("inner",)
     assert "one_sided_book" in result.confidence.reason_codes
+
+
+def test_bot_own_offer_identities_include_durable_offer_fingerprints(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "trade-1", "dexie_id": "dexie-1", "coin_id": "coin-1"}
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "get_active_offer_market_identities",
+        lambda asset_id: frozenset(
+            {"intent-trade-1", "offer-fingerprint-1", "dexie:offer-fingerprint-1"}
+        ),
+        raising=False,
+    )
+
+    identities = loop._market_own_offer_identities(ASSET_ID)
+
+    assert {
+        "trade-1",
+        "dexie-1",
+        "coin-1",
+        "intent-trade-1",
+        "offer-fingerprint-1",
+        "dexie:offer-fingerprint-1",
+    } <= identities
+
+
+def test_active_intent_market_identities_bridge_dexie_fingerprint_space(isolated_db):
+    offer_text_sha256 = hashlib.sha256(b"exact-offer").hexdigest()
+    trade_id = hashlib.sha256(b"sage-trade").hexdigest()
+    coin_id = hashlib.sha256(b"input-coin").hexdigest()
+    at = NOW.isoformat().replace("+00:00", "Z")
+    database.prepare_offer_intent(
+        intent_id="intent-market-identity",
+        operation_id="create:intent-market-identity",
+        event_id="create:intent-market-identity:prepared",
+        run_id="run:test",
+        wallet_fingerprint_hash=hashlib.sha256(b"wallet").hexdigest(),
+        network="mainnet",
+        asset_id=ASSET_ID,
+        side="buy",
+        tier="inner",
+        purpose="ladder",
+        slot_key="slot:market-identity",
+        generation=1,
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[coin_id],
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={"phase": "prepared"},
+        prepared_at=at,
+    )
+    database.finalize_offer_intent(
+        intent_id="intent-market-identity",
+        operation_id="create:intent-market-identity",
+        event_id="create:intent-market-identity:confirmed",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256=offer_text_sha256,
+        wallet_identity_json={"network": "mainnet"},
+        evidence_json={"phase": "confirmed"},
+        finalized_at=at,
+    )
+
+    identities = database.get_active_offer_market_identities(ASSET_ID)
+
+    assert {trade_id, offer_text_sha256, coin_id} <= identities
+
+
+def test_restart_hydrates_trusted_price_and_rejects_a_hard_move(isolated_db):
+    baseline = _book()
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: baseline,
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    original = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    moved = {
+        "bids": [{"offer_id": "moved-bid", "price": "0.00014", "amount_mojos": 3_000_000_000_000}],
+        "asks": [{"offer_id": "moved-ask", "price": "0.00016", "amount_mojos": 3_000_000_000_000}],
+    }
+    restarted = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: moved,
+        fetch_splash_offers=lambda _asset: [
+            {"offer_id": "s-moved-bid", "side": "buy", "price": "0.00014", "amount_mojos": 3_000_000_000_000},
+            {"offer_id": "s-moved-ask", "side": "sell", "price": "0.00016", "amount_mojos": 3_000_000_000_000},
+        ],
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+
+    result = restarted.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert result.confidence.state == "RED"
+    assert result.confidence.trusted_midpoint == original.confidence.trusted_midpoint
+    assert "hard_price_move_cap" in result.confidence.reason_codes
+
+
+def test_restart_preserves_pending_movement_state(isolated_db):
+    current_book = _book()
+    current_splash = _splash()
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: current_book,
+        fetch_splash_offers=lambda _asset: current_splash,
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    current_book = {
+        "bids": [{"offer_id": "move-bid", "price": "0.000104", "amount_mojos": 3_000_000_000_000}],
+        "asks": [{"offer_id": "move-ask", "price": "0.000116", "amount_mojos": 3_000_000_000_000}],
+    }
+    current_splash = [
+        {"offer_id": "s-move-bid", "side": "buy", "price": "0.000104", "amount_mojos": 3_000_000_000_000},
+        {"offer_id": "s-move-ask", "side": "sell", "price": "0.000116", "amount_mojos": 3_000_000_000_000},
+    ]
+    first = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+    assert first.confidence.pending_movement_refreshes == 1
+
+    restarted = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: current_book,
+        fetch_splash_offers=lambda _asset: current_splash,
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    second = restarted.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=40),
+    )
+
+    assert "movement_persistence_satisfied" in second.confidence.reason_codes
+    assert second.confidence.trusted_midpoint == Decimal("0.00011")
+
+
+def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: _book(),
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+    )
+    runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    changed = {
+        "bids": [{"offer_id": "changed-bid", "price": "0.00009", "amount_mojos": 3_000_000_000_000}],
+        "asks": [{"offer_id": "changed-ask", "price": "0.00011", "amount_mojos": 3_000_000_000_000}],
+    }
+    restarted = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: changed,
+        fetch_splash_offers=lambda _asset: [],
+        fetch_splash_health=lambda: {"running": False, "api_reachable": False, "peers": 0},
+    )
+
+    result = restarted.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert result.confidence.manipulation_score > 0
+    assert "rapid_offer_churn" in result.confidence.reason_codes
+
+
+def test_bot_rebuilds_market_runtime_when_risk_preset_changes(isolated_db, monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    loop._market_runtime_asset_id = ""
+    loop._market_runtime_risk_preset = ""
+    loop._market_refresh_now = NOW
+    loop.market_intel = SimpleNamespace(
+        refresh_orderbook=lambda force=False: None,
+        get_attributable_orderbook=lambda: {
+            **_book(),
+            "source_time": NOW.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    loop.splash_node = SimpleNamespace(
+        get_status=lambda: {
+            "process_running": False,
+            "api_reachable": False,
+            "metrics": {"peers": 0},
+        }
+    )
+    loop._splash_confidence_offers = {}
+    loop._splash_confidence_lock = __import__("threading").Lock()
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
+
+    balanced = loop._ensure_market_runtime(ASSET_ID)
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "aggressive", raising=False)
+    aggressive = loop._ensure_market_runtime(ASSET_ID)
+
+    assert aggressive is not balanced
+    assert aggressive._engine.risk_preset == "aggressive"
 
 
 def test_bot_runtime_phase_gate_blocks_exposure_but_never_safety_cancel(monkeypatch):

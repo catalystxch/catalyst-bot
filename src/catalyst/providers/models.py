@@ -164,8 +164,9 @@ class ProviderObservation:
         )
         if source_time is not None and source_time > observed_at:
             raise ValueError("source_time cannot be later than observed_at")
-        if fresh_until < observed_at:
-            raise ValueError("fresh_until cannot be earlier than observed_at")
+        freshness_origin = source_time if source_time is not None else observed_at
+        if fresh_until < freshness_origin:
+            raise ValueError("fresh_until cannot be earlier than its freshness origin")
         object.__setattr__(self, "observed_at", observed_at)
         object.__setattr__(self, "source_time", source_time)
         object.__setattr__(self, "fresh_until", fresh_until)

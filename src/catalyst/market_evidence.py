@@ -191,10 +191,19 @@ def persist_provider_observation(observation: ProviderObservation) -> str:
     )
 
 
-def persist_confidence_snapshot(snapshot: MarketConfidenceSnapshot) -> str:
+def persist_confidence_snapshot(
+    snapshot: MarketConfidenceSnapshot, *, engine_state: Mapping[str, Any] | None = None
+) -> str:
     if type(snapshot) is not MarketConfidenceSnapshot:
         raise TypeError("snapshot must be a MarketConfidenceSnapshot")
-    return database.record_market_confidence_snapshot(snapshot.to_record())
+    normalized_state = dict(engine_state) if engine_state is not None else None
+    return database.record_market_confidence_snapshot(
+        snapshot.to_record(), normalized_state
+    )
+
+
+def load_confidence_engine_state(asset_id: str) -> dict[str, Any] | None:
+    return database.get_market_confidence_engine_state(_asset_id(asset_id))
 
 
 def migrate_post_tibet_state(

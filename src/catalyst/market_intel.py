@@ -942,6 +942,9 @@ class MarketIntel:
             "bids": rows(buys),
             "asks": rows(sells),
             "observed_at_unix": observed_at,
+            "source_time": datetime.fromtimestamp(
+                observed_at, tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
             "source": "dexie_v1_offers",
         }
 

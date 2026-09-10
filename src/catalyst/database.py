@@ -3571,6 +3571,15 @@ CREATE TABLE IF NOT EXISTS market_confidence_snapshots (
 CREATE INDEX IF NOT EXISTS idx_market_confidence_asset_time
     ON market_confidence_snapshots(asset_id, derived_at DESC);
 
+CREATE TABLE IF NOT EXISTS market_confidence_engine_state (
+    asset_id                  TEXT PRIMARY KEY,
+    risk_preset               TEXT NOT NULL,
+    state_json                TEXT NOT NULL CHECK(json_valid(state_json)),
+    snapshot_id               TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    FOREIGN KEY(snapshot_id) REFERENCES market_confidence_snapshots(snapshot_id)
+);
+
 CREATE TABLE IF NOT EXISTS post_tibet_migration_reports (
     asset_id                  TEXT PRIMARY KEY,
     migration_version        INTEGER NOT NULL CHECK(migration_version = 1),
@@ -26167,6 +26176,55 @@ def get_offer_intents_for_registry() -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_active_offer_market_identities(asset_id: str) -> frozenset[str]:
+    """Return every public identity owned by a nonterminal offer intent.
+
+    Dexie identifies exact offers by the offer-text SHA-256 while legacy offer
+    rows usually expose only Sage and Dexie trade IDs.  Confidence policy must
+    exclude both identity spaces before deriving price or depth.
+    """
+
+    safe_asset_id = _required_stability_text(asset_id, "asset_id").lower()
+    active_states = (
+        "prepared",
+        "submitted_unconfirmed",
+        "creation_unknown",
+        "created",
+        "visible",
+        "unknown",
+        "conflicted",
+    )
+    placeholders = ",".join("?" for _ in active_states)
+    rows = (
+        get_connection()
+        .execute(
+            f"""
+            SELECT sage_trade_id, offer_text_sha256, publication_identity,
+                   selected_coin_ids_json
+            FROM offer_intents
+            WHERE asset_id=? AND lifecycle_state IN ({placeholders})
+            """,
+            (safe_asset_id, *active_states),
+        )
+        .fetchall()
+    )
+    identities: set[str] = set()
+    for row in rows:
+        for key in ("sage_trade_id", "offer_text_sha256", "publication_identity"):
+            value = str(row[key] or "").strip()
+            if value:
+                identities.add(value)
+        try:
+            coin_ids = json.loads(row["selected_coin_ids_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            coin_ids = []
+        for coin_id in coin_ids if isinstance(coin_ids, list) else []:
+            value = str(coin_id or "").strip()
+            if value:
+                identities.add(value)
+    return frozenset(identities)
+
+
 def get_active_offer_slot_keys(*, asset_id: str, side: str) -> List[str]:
     """Return exact durable slot keys that still block new offer creation."""
 
@@ -31232,38 +31290,83 @@ def get_market_provider_observations(
     return result
 
 
-def record_market_confidence_snapshot(record: Dict[str, Any]) -> str:
-    """Persist one immutable derived confidence snapshot idempotently."""
+def record_market_confidence_snapshot(
+    record: Dict[str, Any], engine_state: Optional[Dict[str, Any]] = None
+) -> str:
+    """Persist one snapshot and its restart state in a single transaction."""
 
     conn = get_connection()
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO market_confidence_snapshots (
-            snapshot_id, asset_id, state, derived_at, trusted_midpoint,
-            trusted_bid, trusted_ask, degraded_since, withdrawal_stage,
-            recovery_refreshes, reason_codes_json, source_health_json,
-            evidence_digests_json, material
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            record["snapshot_id"],
-            record["asset_id"],
-            record["state"],
-            record["derived_at"],
-            record.get("trusted_midpoint"),
-            record.get("trusted_bid"),
-            record.get("trusted_ask"),
-            record.get("degraded_since"),
-            record["withdrawal_stage"],
-            record["recovery_refreshes"],
-            json.dumps(record["reason_codes"], separators=(",", ":")),
-            json.dumps(record["source_health"], sort_keys=True, separators=(",", ":")),
-            json.dumps(record["evidence_digests"], separators=(",", ":")),
-            int(bool(record.get("material", True))),
-        ),
-    )
-    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO market_confidence_snapshots (
+                snapshot_id, asset_id, state, derived_at, trusted_midpoint,
+                trusted_bid, trusted_ask, degraded_since, withdrawal_stage,
+                recovery_refreshes, reason_codes_json, source_health_json,
+                evidence_digests_json, material
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["snapshot_id"],
+                record["asset_id"],
+                record["state"],
+                record["derived_at"],
+                record.get("trusted_midpoint"),
+                record.get("trusted_bid"),
+                record.get("trusted_ask"),
+                record.get("degraded_since"),
+                record["withdrawal_stage"],
+                record["recovery_refreshes"],
+                json.dumps(record["reason_codes"], separators=(",", ":")),
+                json.dumps(
+                    record["source_health"], sort_keys=True, separators=(",", ":")
+                ),
+                json.dumps(record["evidence_digests"], separators=(",", ":")),
+                int(bool(record.get("material", True))),
+            ),
+        )
+        if engine_state is not None:
+            state_json = json.dumps(
+                engine_state, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            conn.execute(
+                """
+                INSERT INTO market_confidence_engine_state (
+                    asset_id, risk_preset, state_json, snapshot_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    risk_preset=excluded.risk_preset,
+                    state_json=excluded.state_json,
+                    snapshot_id=excluded.snapshot_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    record["asset_id"],
+                    str(engine_state["risk_preset"]),
+                    state_json,
+                    record["snapshot_id"],
+                    record["derived_at"],
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return str(record["snapshot_id"])
+
+
+def get_market_confidence_engine_state(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = get_connection().execute(
+        "SELECT state_json FROM market_confidence_engine_state WHERE asset_id=?",
+        (str(asset_id).strip().lower(),),
+    ).fetchone()
+    if row is None:
+        return None
+    value = json.loads(row["state_json"])
+    if not isinstance(value, dict):
+        raise RuntimeError("market confidence engine state is malformed")
+    return value
 
 
 def get_latest_market_confidence_snapshot(

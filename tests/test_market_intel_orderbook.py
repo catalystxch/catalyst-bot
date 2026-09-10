@@ -209,6 +209,7 @@ class MarketIntelOrderbookTests(unittest.TestCase):
         self.assertEqual(snapshot["asks"][0]["offer_id"], "dexie-sell-1")
         self.assertEqual(snapshot["bids"][0]["amount_mojos"], 1_250_000_000_000)
         self.assertEqual(snapshot["observed_at_unix"], 123.0)
+        self.assertEqual(snapshot["source_time"], "1970-01-01T00:02:03Z")
 
 
 if __name__ == "__main__":

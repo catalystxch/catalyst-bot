@@ -14,7 +14,11 @@ from typing import Callable
 
 from degraded_market import DegradedMarketController, DegradedMarketDecision
 from market_confidence import MarketConfidenceEngine, MarketConfidenceResult
-from market_evidence import persist_confidence_snapshot, persist_provider_observation
+from market_evidence import (
+    load_confidence_engine_state,
+    persist_confidence_snapshot,
+    persist_provider_observation,
+)
 from providers.dexie import DexieOrderbookProvider
 from providers.splash import SplashOfferProvider
 
@@ -46,6 +50,9 @@ class OfferBookMarketRuntime:
             get_health=fetch_splash_health,
         )
         self._engine = MarketConfidenceEngine(risk_preset=risk_preset)
+        persisted_state = load_confidence_engine_state(self.asset_id)
+        if persisted_state is not None:
+            self._engine.hydrate(persisted_state)
         self._degraded = DegradedMarketController(asset_id=self.asset_id)
 
     def refresh(
@@ -85,7 +92,9 @@ class OfferBookMarketRuntime:
             withdrawal_stage=degraded.stage,
             recovery_refreshes=degraded.recovery_refreshes,
         )
-        snapshot_id = persist_confidence_snapshot(snapshot)
+        snapshot_id = persist_confidence_snapshot(
+            snapshot, engine_state=self._engine.export_state()
+        )
         return OfferBookRuntimeResult(
             confidence=confidence,
             degraded=degraded,

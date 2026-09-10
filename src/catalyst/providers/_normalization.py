@@ -70,13 +70,14 @@ def observation(
     source_height: int | None = None,
 ) -> ProviderObservation:
     raw = canonical_evidence_json(payload)
+    freshness_origin = source_time if source_time is not None else observed_at
     return ProviderObservation(
         provider_id=provider_id,
         capability=capability,
         observed_at=observed_at,
         source_time=source_time,
         source_height=source_height,
-        fresh_until=observed_at + timedelta(seconds=freshness_seconds),
+        fresh_until=freshness_origin + timedelta(seconds=freshness_seconds),
         identity_keys=identity_keys,
         payload_sha256=evidence_digest(raw),
         quality=quality,

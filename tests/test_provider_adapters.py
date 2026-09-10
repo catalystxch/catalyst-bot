@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from providers.coinset import CoinsetEvidenceProvider
@@ -82,6 +82,22 @@ def test_dexie_timeout_is_bounded_provider_failure():
     assert observation.quality is ObservationQuality.INVALID
     assert observation.reason_codes == ("provider_timeout",)
     assert _payload(observation) == {"available": False, "error_type": "TimeoutError"}
+
+
+def test_dexie_cached_book_keeps_source_age_instead_of_becoming_fresh_again():
+    cached_at = NOW - timedelta(minutes=5)
+    provider = DexieOrderbookProvider(
+        fetch_book=lambda _asset: {
+            "bids": [{"price": "0.10", "amount_mojos": 3_000, "offer_id": "bid"}],
+            "asks": [{"price": "0.11", "amount_mojos": 3_000, "offer_id": "ask"}],
+            "source_time": cached_at.isoformat().replace("+00:00", "Z"),
+        }
+    )
+
+    observation = provider.observe_order_book(ASSET_ID, now=NOW)
+
+    assert observation.source_time == cached_at
+    assert observation.fresh_until == cached_at + timedelta(seconds=20)
 
 
 def test_splash_normalizes_peer_health_and_exact_offer_set():

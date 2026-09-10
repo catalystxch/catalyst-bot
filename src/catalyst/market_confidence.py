@@ -21,6 +21,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_amber": 35,
         "manipulation_red": 70,
         "source_conflict_bps": 250,
+        "depth_price_envelope_bps": 250,
     },
     "balanced": {
         "depth_multiple": Decimal("2"),
@@ -30,6 +31,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_amber": 50,
         "manipulation_red": 80,
         "source_conflict_bps": 400,
+        "depth_price_envelope_bps": 400,
     },
     "aggressive": {
         "depth_multiple": Decimal("1.5"),
@@ -39,6 +41,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_amber": 65,
         "manipulation_red": 90,
         "source_conflict_bps": 600,
+        "depth_price_envelope_bps": 600,
     },
 }
 
@@ -149,6 +152,73 @@ class MarketConfidenceEngine:
             for key, value in self._thresholds.items()
         }
 
+    def export_state(self) -> dict[str, Any]:
+        """Return exact mutable policy state needed for fail-closed restart."""
+
+        def decimal_text(value: Decimal | None) -> str | None:
+            return str(value) if value is not None else None
+
+        def iso(value: datetime | None) -> str | None:
+            return value.isoformat().replace("+00:00", "Z") if value else None
+
+        return {
+            "risk_preset": self.risk_preset,
+            "last_trusted_midpoint": decimal_text(self._last_trusted_midpoint),
+            "last_trusted_bid": decimal_text(self._last_trusted_bid),
+            "last_trusted_ask": decimal_text(self._last_trusted_ask),
+            "pending_midpoint": decimal_text(self._pending_midpoint),
+            "pending_refreshes": self._pending_refreshes,
+            "prior_offer_ids": sorted(self._prior_offer_ids),
+            "prior_observed_at": iso(self._prior_observed_at),
+        }
+
+    def hydrate(self, state: Mapping[str, Any]) -> None:
+        """Restore only strictly validated state written by :meth:`export_state`."""
+
+        if not isinstance(state, Mapping) or state.get("risk_preset") != self.risk_preset:
+            raise ValueError("market confidence state risk preset does not match")
+
+        def optional_price(key: str) -> Decimal | None:
+            value = state.get(key)
+            return None if value is None else _price(value)
+
+        midpoint = optional_price("last_trusted_midpoint")
+        bid = optional_price("last_trusted_bid")
+        ask = optional_price("last_trusted_ask")
+        if (bid is None) != (ask is None):
+            raise ValueError("trusted restart range is incomplete")
+        if bid is not None and (bid > ask or midpoint is None or not bid <= midpoint <= ask):
+            raise ValueError("trusted restart range is invalid")
+        pending_midpoint = optional_price("pending_midpoint")
+        pending_refreshes = state.get("pending_refreshes")
+        if type(pending_refreshes) is not int or pending_refreshes < 0:
+            raise ValueError("pending refresh count is invalid")
+        if (pending_midpoint is None) != (pending_refreshes == 0):
+            raise ValueError("pending restart movement is incomplete")
+        prior_ids = state.get("prior_offer_ids")
+        if type(prior_ids) is not list or any(
+            type(value) is not str or not value for value in prior_ids
+        ):
+            raise ValueError("prior offer identities are invalid")
+        prior_observed = state.get("prior_observed_at")
+        if prior_observed is None:
+            observed_at = None
+        elif type(prior_observed) is str:
+            text = prior_observed[:-1] + "+00:00" if prior_observed.endswith("Z") else prior_observed
+            observed_at = _utc(datetime.fromisoformat(text))
+        else:
+            raise ValueError("prior observation time is invalid")
+        if bool(prior_ids) != (observed_at is not None):
+            raise ValueError("prior offer churn state is incomplete")
+
+        self._last_trusted_midpoint = midpoint
+        self._last_trusted_bid = bid
+        self._last_trusted_ask = ask
+        self._pending_midpoint = pending_midpoint
+        self._pending_refreshes = pending_refreshes
+        self._prior_offer_ids = frozenset(prior_ids)
+        self._prior_observed_at = observed_at
+
     def evaluate(
         self,
         *,
@@ -253,16 +323,31 @@ class MarketConfidenceEngine:
 
         bids = [offer for offer in offers if offer.side == "buy"]
         asks = [offer for offer in offers if offer.side == "sell"]
-        bid_depth = sum(offer.amount_mojos for offer in bids)
-        ask_depth = sum(offer.amount_mojos for offer in asks)
+        best_bid = max((offer.price for offer in bids), default=None)
+        best_ask = min((offer.price for offer in asks), default=None)
+        envelope = Decimal(self._thresholds["depth_price_envelope_bps"]) / Decimal(
+            10_000
+        )
+        executable_bids = (
+            [offer for offer in bids if offer.price >= best_bid * (Decimal(1) - envelope)]
+            if best_bid is not None
+            else []
+        )
+        executable_asks = (
+            [offer for offer in asks if offer.price <= best_ask * (Decimal(1) + envelope)]
+            if best_ask is not None
+            else []
+        )
+        bid_depth = sum(offer.amount_mojos for offer in executable_bids)
+        ask_depth = sum(offer.amount_mojos for offer in executable_asks)
+        if len(executable_bids) != len(bids) or len(executable_asks) != len(asks):
+            reasons.append("out_of_range_depth_excluded")
         required_depth = int(
             (
                 Decimal(configured_offer_size_mojos)
                 * Decimal(self._thresholds["depth_multiple"])
             ).to_integral_value(rounding=ROUND_CEILING)
         )
-        best_bid = max((offer.price for offer in bids), default=None)
-        best_ask = min((offer.price for offer in asks), default=None)
         proposed_midpoint = (
             (best_bid + best_ask) / Decimal(2)
             if best_bid is not None and best_ask is not None and best_bid <= best_ask

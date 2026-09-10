@@ -33,6 +33,7 @@ from typing import Dict, Optional
 
 from config import cfg
 from database import (
+    get_active_offer_market_identities,
     get_runtime_mutation_lease,
     log_event,
     get_stats,
@@ -421,6 +422,7 @@ class BotLoop:
         self._market_runtime_required = True
         self._market_runtime = None
         self._market_runtime_asset_id = ""
+        self._market_runtime_risk_preset = ""
         self._market_confidence_result = None
         self._market_degraded_decision = None
         self._market_refresh_now = datetime.now(timezone.utc)
@@ -1335,6 +1337,7 @@ class BotLoop:
                 value = str(row.get(key) or "").strip()
                 if value:
                     identities.add(value)
+        identities.update(get_active_offer_market_identities(asset_id))
         return frozenset(identities)
 
     @staticmethod
@@ -1374,9 +1377,13 @@ class BotLoop:
 
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
+        risk_preset = str(
+            getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced"
+        ).strip().lower()
         if (
             self._market_runtime is not None
             and self._market_runtime_asset_id == asset
+            and self._market_runtime_risk_preset == risk_preset
         ):
             return self._market_runtime
 
@@ -1385,13 +1392,15 @@ class BotLoop:
                 raise ValueError("Dexie confidence asset changed during refresh")
             self.market_intel.refresh_orderbook(force=True)
             snapshot = self.market_intel.get_attributable_orderbook()
-            return {"bids": snapshot["bids"], "asks": snapshot["asks"]}
+            return {
+                "bids": snapshot["bids"],
+                "asks": snapshot["asks"],
+                "source_time": snapshot["source_time"],
+            }
 
         self._market_runtime = OfferBookMarketRuntime(
             asset_id=asset,
-            risk_preset=str(
-                getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced"
-            ),
+            risk_preset=risk_preset,
             fetch_dexie_book=fetch_dexie,
             fetch_splash_offers=lambda requested_asset: (
                 self._get_fresh_splash_confidence_offers(
@@ -1401,6 +1410,7 @@ class BotLoop:
             fetch_splash_health=self._splash_confidence_health,
         )
         self._market_runtime_asset_id = asset
+        self._market_runtime_risk_preset = risk_preset
         return self._market_runtime
 
     def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
