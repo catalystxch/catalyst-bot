@@ -7937,7 +7937,9 @@ def guarded_reset_authoritative_state(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                     (table_name,),
                 ).fetchone():
-                    cursor = conn.execute(f"DELETE FROM {table_name}")
+                    # table_name comes only from the closed literal allowlist
+                    # above; no request or persisted value can reach this SQL.
+                    cursor = conn.execute(f"DELETE FROM {table_name}")  # nosec B608
                     summary["market_evidence_cleared"][summary_key] = int(
                         cursor.rowcount or 0
                     )
