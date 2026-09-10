@@ -586,9 +586,12 @@ def test_repost_queue_is_idempotent_while_exact_publication_is_in_flight(
     )
 
 
-@pytest.mark.parametrize("projection", ["missing", "mutated"])
+@pytest.mark.parametrize(
+    ("projection", "expected_state"),
+    [("missing", "queued"), ("mutated", "unresolved")],
+)
 def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
-    isolated_database, monkeypatch, projection
+    isolated_database, monkeypatch, projection, expected_state
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
     if projection == "mutated":
@@ -617,8 +620,12 @@ def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
     )[0]
     assert remote_calls == []
     assert result["requeued"] == 0
-    assert row["state"] == "unresolved"
-    assert row["last_error_sha256"] == _sha(row["last_error_json"])
+    assert row["state"] == expected_state
+    if expected_state == "queued":
+        assert row["last_error_json"] is None
+        assert row["last_error_sha256"] is None
+    else:
+        assert row["last_error_sha256"] == _sha(row["last_error_json"])
 
 
 def test_success_requires_current_claim_version_and_digest_binds_acknowledgement(
@@ -843,6 +850,88 @@ def _persist_offer_projection(db, trade_id, offer_text):
         tier="inner",
     )
     assert db.update_offer_bech32(trade_id, offer_text)
+
+
+def test_new_publication_waits_for_atomic_offer_projection(isolated_database):
+    """Publisher threads may observe intent commit before add_offer commits."""
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+
+    assert _claim(isolated_database) is None
+    queued = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert queued["state"] == "queued"
+    assert queued["attempt_count"] == 0
+    assert queued["last_error_json"] is None
+
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    claim = _claim(isolated_database)
+
+    assert claim["state"] == "claimed"
+    assert claim["trade_id"] == trade_id
+    assert claim["offer_bech32"] == _offer_text(intent["intent_id"])
+
+
+def test_slow_ladder_publication_remains_queued_until_offer_projection(
+    isolated_database,
+):
+    """A slow Sage ladder may delay the legacy offer projection for minutes."""
+    intent, _trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+
+    claim = isolated_database.claim_publication_outbox(
+        publisher="dexie",
+        owner_run_id="worker-a",
+        claim_token="claim-a",
+        claimed_at="2026-08-15T12:02:00.000000Z",
+        claim_expires_at="2026-08-15T12:02:30.000000Z",
+    )
+
+    assert claim is None
+    queued = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert queued["state"] == "queued"
+    assert queued["attempt_count"] == 0
+    assert queued["last_error_json"] is None
+
+
+def test_startup_requeues_preprojection_race_from_older_build(isolated_database):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    error = json.dumps(
+        {
+            "code": "PUBLICATION_OFFER_REFERENCE_MISSING",
+            "offer_ref": "[redacted]",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET state='unresolved', row_version=1, "
+        "last_error_json=?, last_error_sha256=? WHERE intent_id=?",
+        (error, _sha(error), intent["intent_id"]),
+    )
+    conn.commit()
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+
+    result = isolated_database.recover_preprojection_publications_at_startup(
+        recovered_at="2026-08-15T12:00:10.000000Z"
+    )
+
+    assert result == {"examined": 2, "recovered": 2, "remaining": 0}
+    rows = isolated_database.list_publication_outbox(intent_id=intent["intent_id"])
+    assert {row["state"] for row in rows} == {"queued"}
+    assert all(row["last_error_json"] is None for row in rows)
+    assert (
+        isolated_database.get_stability_startup_recovery_snapshot()[
+            "publication_issues"
+        ]
+        == []
+    )
 
 
 @pytest.mark.parametrize(

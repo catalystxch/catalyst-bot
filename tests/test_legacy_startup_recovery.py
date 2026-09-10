@@ -174,6 +174,10 @@ def test_many_legacy_candidates_share_bounded_wallet_history_reads():
 
     class Wallet:
         @staticmethod
+        def get_wallet_backend_authority():
+            return "sage"
+
+        @staticmethod
         def get_wallet_identity():
             wallet_calls["identity"] += 1
             return {"success": True}
@@ -226,6 +230,126 @@ def test_many_legacy_candidates_share_bounded_wallet_history_reads():
 
     assert result == {"examined": 72, "recovered": 0, "remaining": 72}
     assert wallet_calls == {"identity": 1, "offers": 1, "coins": 1}
+
+
+def test_prepared_creation_with_authoritatively_unlocked_input_is_failed_closed():
+    """A pre-effect crash must not strand every later desktop startup."""
+    import legacy_startup_recovery
+
+    coin_id = "8" * 64
+    intent_id = "9" * 64
+    operation_id = f"create:{intent_id}"
+    intent = {
+        "intent_id": intent_id,
+        "lifecycle_state": "prepared",
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "asset_id": ASSET_ID,
+        "side": "sell",
+        "tier": "outer",
+        "selected_coin_ids_json": json.dumps([coin_id], separators=(",", ":")),
+    }
+    blocker = {
+        "event_id": f"{operation_id}:prepared",
+        "operation_id": operation_id,
+        "operation_type": "CREATE",
+        "intent_id": intent_id,
+        "attempt": 1,
+        "phase": "PREPARED",
+        "outcome": "PREPARED",
+        "reason_code": "INTENT_PREPARED",
+        "blocks_mutation": 1,
+        "wallet_identity_json": json.dumps(
+            {
+                "snapshot": {
+                    "binding": {
+                        "fingerprint": 736588221,
+                        "network_id": "mainnet",
+                    }
+                }
+            }
+        ),
+    }
+    calls = []
+
+    def finalize_offer_intent(**kwargs):
+        calls.append(("finalize", kwargs))
+        intent["lifecycle_state"] = kwargs["lifecycle_state"]
+        return dict(intent)
+
+    def resolve_runtime_safety_latch(**kwargs):
+        calls.append(("resolve_latch", kwargs))
+        return {"resolved": True}
+
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [],
+        get_unresolved_offer_operation_blockers=lambda: [blocker],
+        get_offer_intent=lambda requested: intent if requested == intent_id else None,
+        validate_offer_operation_event=lambda event: dict(event),
+        finalize_offer_intent=finalize_offer_intent,
+        get_runtime_safety_latch=lambda: {
+            "generation": 3,
+            "state": "tripped",
+            "blocking_operation_ids_json": json.dumps([operation_id]),
+        },
+        resolve_runtime_safety_latch=resolve_runtime_safety_latch,
+    )
+
+    class Wallet:
+        @staticmethod
+        def get_wallet_backend_authority():
+            return "sage"
+
+        @staticmethod
+        def get_wallet_identity():
+            calls.append(("identity",))
+            return {
+                "success": True,
+                "fingerprint": 736588221,
+                "network_id": "mainnet",
+            }
+
+        @staticmethod
+        def get_coins_by_ids(coin_ids):
+            calls.append(("coins", tuple(coin_ids)))
+            return {
+                coin_id: {
+                    "amount": 42_051_809,
+                    "offer_id": None,
+                    "spent_height": None,
+                }
+            }
+
+    reconciliation = SimpleNamespace(
+        EXPIRED_PROVEN="EXPIRED_PROVEN",
+        CANCELLED_PROVEN="CANCELLED_PROVEN",
+        FILLED_PROVEN="FILLED_PROVEN",
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=Wallet(),
+        database_module=database,
+        reconciliation_module=reconciliation,
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 1, "recovered": 1, "remaining": 0}
+    assert [call[0] for call in calls] == [
+        "identity",
+        "coins",
+        "identity",
+        "finalize",
+        "resolve_latch",
+    ]
+    finalized = calls[-2][1]
+    assert finalized["lifecycle_state"] == "creation_failed"
+    assert finalized["outcome"] == "FAILED"
+    assert finalized["reason_code"] == "CREATE_PREPARED_INPUT_PROVEN_UNLOCKED"
+    assert finalized["finalize_selected_coin_reservations"] is True
+    assert calls[-1][1]["expected_generation"] == 3
+    assert calls[-1][1]["resolved_operation_ids"] == [operation_id]
 
 
 @pytest.mark.parametrize(

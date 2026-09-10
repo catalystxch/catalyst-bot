@@ -3119,6 +3119,91 @@ def test_submitted_legacy_runtime_absorb_can_be_adopted_with_exact_output_proof(
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
+def test_submitted_legacy_cat_consolidation_can_be_adopted_with_separate_fee_proof(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    """Recover the former unjournaled CAT combine without replaying it."""
+
+    import mutation_gate
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    sources = [
+        hashlib.sha256(b"legacy-cat-consolidate-a").hexdigest(),
+        hashlib.sha256(b"legacy-cat-consolidate-b").hexdigest(),
+    ]
+    fee_source = hashlib.sha256(b"legacy-cat-consolidate-fee").hexdigest()
+    combined = hashlib.sha256(b"legacy-cat-consolidate-output").hexdigest()
+    fee_change = hashlib.sha256(b"legacy-cat-consolidate-change").hexdigest()
+    for source in sources:
+        assert database.upsert_coin(source, "cat", 500, purpose="replacement")
+    assert database.upsert_coin(fee_source, "xch", 1000, purpose="fee_reserve")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.consolidate_cat_sage",
+        source_coin_ids=sources,
+        fee_coin_ids=[fee_source],
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=sources,
+        fee_coin_ids=[fee_source],
+    )
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=True, success=True
+        )
+    assert (
+        database.complete_wallet_effect_dispatch(dispatch, result=result) == "SUBMITTED"
+    )
+
+    identity = mutation_gate.wallet_identity_binding_payload(
+        runtime._wallet_identity_binding
+    )
+
+    def view(coins):
+        return {
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": identity,
+            "observed_at": "2026-08-20T12:00:00.000000Z",
+            "expires_at": "2026-08-20T12:00:15.000000Z",
+            "coins": coins,
+        }
+
+    fee_outputs = [
+        {"coin_id": fee_change, "amount_mojos": 987, "purpose": "fee_reserve"}
+    ]
+    adopted = database.adopt_legacy_submitted_topup_coin_prep_operation(
+        operation_kind="combine",
+        purpose="top_up",
+        source_coin_ids=sources,
+        target_contract={
+            "wallet_type": "cat",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 1000,
+                    "purpose": "top_up",
+                }
+            ],
+        },
+        wallet_identity_json=identity,
+        evidence_json={
+            "pre_view_coin_ids": sources,
+            "fee_reconciliation": {
+                "source_coin_ids": [fee_source],
+                "expected_outputs": fee_outputs,
+                "authoritative_view": view(fee_outputs),
+            },
+        },
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    assert adopted["operation"]["outcome"] == "SUBMITTED_UNKNOWN"
+
+
 def test_post_fill_claim_attestation_guard_recomputes_exact_canonical_binding(
     isolated_database,
 ):

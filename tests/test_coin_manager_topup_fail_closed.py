@@ -265,6 +265,41 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         )
         self.assertEqual(tx_ids, ["0xabc123", "0xdef456"])
 
+    def test_smart_topup_filters_protected_small_coins_before_consolidating(self):
+        manager = self._make_manager()
+        protected = [_record(f"0xprotected{i}", 100) for i in range(40)]
+        normal = _record("0xnormal", 100)
+        inventory = {
+            "reserve": [],
+            "small": [*protected, normal],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+        }
+
+        with (
+            patch.object(
+                manager,
+                "_filter_out_protected_coin_ids",
+                return_value=["0xnormal"],
+            ) as protected_filter,
+            patch.object(manager, "_consolidate_coins", return_value=False) as combine,
+            patch.object(coin_manager, "log_event"),
+        ):
+            result = manager._smart_topup_wallet(
+                "CAT-inner",
+                wallet_id=2,
+                inventory=inventory,
+                trading_size_mojos=1_000,
+                needed=2,
+                is_cat=True,
+            )
+
+        self.assertFalse(result)
+        protected_filter.assert_called_once()
+        combine.assert_not_called()
+
     def test_unadvised_unknown_deposit_is_not_a_topup_source(self):
         coin_id = "0x65119c25b5bc049c2496a5791349c552269ff51483ada6bcb2bc68ae51ed08be"
         records = [_record(coin_id, 193_886_291)]
@@ -943,6 +978,159 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         event_types = [call.args[1] for call in log_event.call_args_list]
         self.assertIn("topup_xch-sniper_osstep_confirmed", event_types)
         self.assertNotIn("topup_xch-sniper_osstep_timeout", event_types)
+
+    def test_submitted_topup_timeout_remains_pending(self):
+        """A known submitted transaction must not invite a second wallet mutation."""
+        manager = self._make_manager()
+        source = "0xsource"
+
+        with (
+            patch(
+                "wallet.sage_topup_split",
+                return_value={"transaction_id": "0xtx"},
+            ),
+            patch.object(
+                coin_manager,
+                "get_next_address",
+                return_value={"success": True, "address": "xch1testaddress"},
+            ),
+            patch.object(coin_manager.cfg, "TOPUP_SPLIT_DEBOUNCE_SECS", 0, create=True),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
+            patch.object(manager, "_fee_pool_enabled", return_value=False),
+            patch.object(
+                manager,
+                "_get_owned_coin_amount_map",
+                side_effect=[{source: 1_000}, {}, {}],
+            ),
+            patch.object(
+                manager,
+                "_get_strict_selectable_coin_id_set",
+                return_value=set(),
+            ),
+            patch.object(
+                manager,
+                "_get_transaction_confirmation_state",
+                return_value={"confirmed": False, "height": None},
+            ),
+            patch.object(manager, "_spacescan_self_send_confirmed", return_value=False),
+            patch.object(coin_manager, "log_event") as log_event,
+            patch.object(coin_manager.time, "sleep", return_value=None),
+            patch.object(coin_manager.time, "time", side_effect=[0, 0, 0, 0, 121, 121]),
+        ):
+            result = manager._sage_one_step_split(
+                name="CAT-extreme",
+                wallet_id=2,
+                source_coin_id=source,
+                num_to_create=1,
+                trading_size_mojos=100,
+                is_cat=True,
+            )
+
+        self.assertEqual(result, coin_manager._TOPUP_PENDING)
+        event_types = [call.args[1] for call in log_event.call_args_list]
+        self.assertIn("topup_cat-extreme_osstep_timeout", event_types)
+
+    def test_existing_runtime_topup_latch_skips_retry_after_debounce(self):
+        """An unresolved split stays read-only after its time debounce expires."""
+        manager = self._make_manager()
+        source = "0xsource"
+
+        with (
+            patch.object(
+                coin_manager,
+                "get_next_address",
+                return_value={"success": True, "address": "xch1testaddress"},
+            ),
+            patch.object(coin_manager.cfg, "TOPUP_SPLIT_DEBOUNCE_SECS", 0, create=True),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
+            patch.object(manager, "_fee_pool_enabled", return_value=False),
+            patch.object(
+                manager,
+                "_get_owned_coin_amount_map",
+                return_value={source: 1_000},
+            ),
+            patch.object(manager, "_coinset_topup_split_state", return_value=None),
+            patch.object(
+                coin_manager.mutation_gate,
+                "status",
+                return_value=types.SimpleNamespace(
+                    allowed=False,
+                    reason_code="COIN_PREP_EFFECT_UNKNOWN",
+                ),
+            ),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=AssertionError(
+                    "must not retry an unresolved wallet effect"
+                ),
+            ),
+            patch.object(coin_manager, "log_event") as log_event,
+        ):
+            result = manager._sage_one_step_split(
+                name="CAT-extreme",
+                wallet_id=2,
+                source_coin_id=source,
+                num_to_create=1,
+                trading_size_mojos=100,
+                is_cat=True,
+            )
+
+        self.assertEqual(result, coin_manager._TOPUP_PENDING)
+        event_types = [call.args[1] for call in log_event.call_args_list]
+        self.assertIn("topup_cat-extreme_osstep_recovery_wait", event_types)
+
+    def test_smart_topup_preserves_pending_split_result(self):
+        """The tier scheduler must see that a submitted split is unresolved."""
+        manager = self._make_manager()
+        reserve = _record("0xreserve", 1_000)
+        inventory = {
+            "reserve": [reserve],
+            "small": [],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+        }
+
+        with (
+            patch.object(
+                coin_manager,
+                "_get_free_coins_rpc",
+                return_value={"confirmed_records": [reserve]},
+            ),
+            patch.object(
+                coin_manager,
+                "_classify_coins",
+                return_value={"reserve": [reserve], "small": []},
+            ),
+            patch.object(
+                coin_manager,
+                "_filter_unallocated_deposit_sources",
+                side_effect=lambda records, **_kwargs: (records, 0),
+            ),
+            patch("database.get_all_coins_state", return_value={}),
+            patch.object(
+                manager,
+                "_filter_backed_off_topup_sources",
+                side_effect=lambda records, **_kwargs: records,
+            ),
+            patch.object(manager, "_max_coins_within_topup_budget", return_value=None),
+            patch.object(manager, "_check_topup_reserve_guards", return_value=True),
+            patch.object(manager, "_two_step_split", return_value="pending") as split,
+            patch.object(coin_manager, "log_event"),
+        ):
+            result = manager._smart_topup_wallet(
+                "CAT-extreme",
+                wallet_id=2,
+                inventory=inventory,
+                trading_size_mojos=100,
+                needed=1,
+                is_cat=True,
+            )
+
+        self.assertEqual(result, coin_manager._TOPUP_PENDING)
+        split.assert_called_once()
 
     def test_one_step_split_debounces_duplicate_pending_source(self):
         manager = self._make_manager()
@@ -2022,7 +2210,7 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 tier_is_empty=True,
             )
 
-        self.assertFalse(result)
+        self.assertEqual(result, coin_manager._TOPUP_PENDING)
         consolidate.assert_called_once()
         refund.assert_not_called()
         event_types = [call.args[1] for call in log_event.call_args_list]
@@ -2126,6 +2314,80 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertEqual(second, "pending")
         combine.assert_called_once()
+
+    def test_cat_consolidate_uses_exact_xch_fee_coin(self):
+        manager = self._make_manager()
+        source_ids = ["0x" + "11" * 32, "0x" + "22" * 32]
+        fee_coin_id = "0x" + "33" * 32
+        effect_calls = []
+
+        def run_effect(operation, callback, **kwargs):
+            effect_calls.append((operation, kwargs))
+            return coin_manager._PreparedWalletEffectReceipt(
+                result=callback(),
+                operation={"operation_id": "coin-prep:" + "4" * 64},
+                dispatch_outcome="SUBMITTED",
+            )
+
+        with (
+            patch.object(coin_manager, "get_wallet_type", return_value="sage"),
+            patch.object(manager, "_tx_fee_mojos", return_value=10),
+            patch.object(manager, "_fee_pool_enabled", return_value=True),
+            patch.object(manager.fee_pool, "reserve", return_value=fee_coin_id),
+            patch.object(
+                manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(
+                manager,
+                "_get_owned_coin_amount_map",
+                return_value={source_ids[0]: 40, source_ids[1]: 60},
+            ),
+            patch.object(manager, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager, "_run_claimed_wallet_effect", side_effect=run_effect
+            ),
+            patch.object(coin_manager.cfg, "CAT_ASSET_ID", "asset-id"),
+            patch(
+                "wallet.get_next_address",
+                return_value={"address": "xch1cat-self"},
+            ),
+            patch(
+                "wallet.create_transaction_rpc",
+                return_value={
+                    "success": True,
+                    "transaction_id": "0xcatcombine",
+                    "coin_spends": [{}, {}, {}],
+                },
+            ) as create_transaction,
+            patch("wallet.combine_coins") as native_combine,
+        ):
+            result = manager._consolidate_coins(
+                "CAT-inner",
+                2,
+                100,
+                True,
+                source_coin_ids=source_ids,
+            )
+
+        self.assertTrue(result)
+        native_combine.assert_not_called()
+        create_transaction.assert_called_once_with(
+            selected_coin_ids=[*source_ids, fee_coin_id],
+            actions=[
+                {
+                    "type": "send",
+                    "id": {"type": "existing", "asset_id": "asset-id"},
+                    "address": "xch1cat-self",
+                    "amount": "100",
+                    "memos": [],
+                },
+                {"type": "fee", "amount": "10"},
+            ],
+            auto_submit=True,
+        )
+        self.assertEqual(effect_calls[0][0], "coin_manager.consolidate_cat_sage")
+        self.assertEqual(effect_calls[0][1]["source_coin_ids"], source_ids)
+        self.assertEqual(effect_calls[0][1]["fee_coin_ids"], [fee_coin_id])
 
     def test_consolidate_coins_without_txid_and_no_pending_does_not_debounce_inputs(
         self,
