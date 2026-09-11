@@ -23836,7 +23836,14 @@
                     return `${name} ${String(provider.status || 'unavailable')}${timeLabel}${providerReasons}`;
                 })
                 .join(' · ');
-            setText('marketProviderHealth', providerText || 'providers unavailable');
+            const externalFill = ((data.fill_authority || {}).external_corroboration || {});
+            const fillAuthorityText = externalFill.can_confirm === true
+                ? 'Exact external fill proof ready'
+                : 'Exact external fill proof unavailable; Sage remains authoritative';
+            setText(
+                'marketProviderHealth',
+                `${providerText || 'providers unavailable'} · ${fillAuthorityText}`
+            );
             setText(
                 'offerDiscoveryState',
                 'Publication acknowledgement is provisional until exact rediscovery. Current sources: '

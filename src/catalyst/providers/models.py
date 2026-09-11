@@ -37,6 +37,7 @@ class Capability(str, Enum):
     DISCOVER_OFFER = "discover_offer"
     WALLET_AUTHORITY = "wallet_authority"
     CHAIN_EVIDENCE = "chain_evidence"
+    EXACT_FILL_AUTHORITY = "exact_fill_authority"
     PEER_HEALTH = "peer_health"
 
 

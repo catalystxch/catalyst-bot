@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -185,10 +186,19 @@ def test_sage_identity_is_authoritative_and_mismatch_is_invalid():
 
 
 def test_chain_adapters_preserve_exact_coin_and_height_evidence():
+    parent = "11" * 32
+    puzzle_hash = "22" * 32
+    coin_id = hashlib.sha256(
+        bytes.fromhex(parent) + bytes.fromhex(puzzle_hash) + b"\x0a"
+    ).hexdigest()
     coinset = CoinsetEvidenceProvider(
         SimpleNamespace(
             get_coin_by_name=lambda _coin: {
-                "coin_name": COIN_ID,
+                "coin": {
+                    "parent_coin_info": parent,
+                    "puzzle_hash": puzzle_hash,
+                    "amount": 10,
+                },
                 "spent": True,
                 "spent_block_index": 123456,
                 "confirmed_block_index": 123000,
@@ -198,20 +208,34 @@ def test_chain_adapters_preserve_exact_coin_and_height_evidence():
     spacescan = SpacescanEvidenceProvider(
         SimpleNamespace(
             is_coin_spent=lambda _coin: {
-                "coin_id": COIN_ID,
                 "spent": True,
-                "spent_block_height": 123456,
+                "spent_block": "123456",
+                "receiver_address": "xch1example",
             }
         )
     )
 
-    coinset_observation = coinset.observe_coin(COIN_ID, now=NOW)
+    coinset_observation = coinset.observe_coin(coin_id, now=NOW)
     spacescan_observation = spacescan.observe_coin(COIN_ID, now=NOW)
 
     assert coinset_observation.source_height == 123456
     assert spacescan_observation.source_height == 123456
     assert coinset_observation.quality is ObservationQuality.VALID
     assert spacescan_observation.quality is ObservationQuality.VALID
+
+
+def test_generic_chain_evidence_never_claims_exact_fill_authority():
+    coinset = CoinsetEvidenceProvider(
+        SimpleNamespace(get_coin_by_name=lambda _coin: None)
+    )
+    spacescan = SpacescanEvidenceProvider(
+        SimpleNamespace(is_coin_spent=lambda _coin: None)
+    )
+
+    assert coinset.capabilities.supports(Capability.CHAIN_EVIDENCE)
+    assert spacescan.capabilities.supports(Capability.CHAIN_EVIDENCE)
+    assert not coinset.capabilities.supports(Capability.EXACT_FILL_AUTHORITY)
+    assert not spacescan.capabilities.supports(Capability.EXACT_FILL_AUTHORITY)
 
 
 def test_chain_adapter_missing_result_is_degraded_not_unspent():

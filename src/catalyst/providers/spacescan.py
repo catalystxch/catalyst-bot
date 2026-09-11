@@ -44,15 +44,24 @@ class SpacescanEvidenceProvider:
                     quality=ObservationQuality.DEGRADED,
                     reason_codes=("provider_unavailable",),
                 )
-            if (
-                type(raw) is not dict
-                or str(raw.get("coin_id") or "").lower() != coin_id.lower()
-            ):
+            if type(raw) is not dict:
+                raise ValueError("Spacescan coin record is invalid")
+            supplied_id = str(raw.get("coin_id") or "").lower().removeprefix("0x")
+            expected_id = coin_id.lower().removeprefix("0x")
+            if supplied_id and supplied_id != expected_id:
                 raise ValueError("Spacescan coin identity mismatch")
             spent = raw.get("spent")
             if type(spent) is not bool:
                 raise ValueError("Spacescan spent state is invalid")
-            height = exact_nonnegative_height(raw.get("spent_block_height"))
+            raw_height = raw.get("spent_block_height", raw.get("spent_block"))
+            if type(raw_height) is str:
+                if raw_height == "":
+                    raw_height = None
+                elif raw_height.isdecimal():
+                    raw_height = int(raw_height)
+                else:
+                    raise ValueError("Spacescan spent height is invalid")
+            height = exact_nonnegative_height(raw_height)
             return observation(
                 provider_id="spacescan",
                 capability=Capability.CHAIN_EVIDENCE,

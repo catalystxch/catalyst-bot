@@ -678,6 +678,23 @@ def _post_tibet_provider_status(
     return providers
 
 
+def _fill_authority_capability_status() -> dict:
+    """Expose economic authority separately from generic chain observations."""
+
+    return {
+        "primary": "sage",
+        "external_corroboration": {
+            "status": "unavailable",
+            "can_confirm": False,
+            "required_providers": ["coinset", "spacescan"],
+            "reason_codes": [
+                "coinset_exact_flow_unavailable",
+                "spacescan_exact_flow_unavailable",
+            ],
+        },
+    }
+
+
 def _age_confidence_snapshot(
     confidence: dict, providers: dict, *, now: datetime | None = None
 ) -> dict:
@@ -811,6 +828,7 @@ def api_market_confidence():
                 "degraded": None,
                 "migration": None,
                 "providers": {"tibetswap": {"status": "retired", "capabilities": []}},
+                "fill_authority": _fill_authority_capability_status(),
                 "evidence": {
                     "derived_at": None,
                     "reason_codes": ["asset_not_selected"],
@@ -878,6 +896,7 @@ def api_market_confidence():
         "degraded": degraded,
         "migration": migration,
         "providers": providers,
+        "fill_authority": _fill_authority_capability_status(),
         "evidence": {
             "derived_at": confidence.get("derived_at"),
             "reason_codes": list(confidence.get("reason_codes") or []),

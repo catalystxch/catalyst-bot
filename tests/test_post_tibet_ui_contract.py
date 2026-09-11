@@ -112,6 +112,18 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
         "status": "retired",
         "capabilities": [],
     }
+    assert payload["fill_authority"] == {
+        "primary": "sage",
+        "external_corroboration": {
+            "status": "unavailable",
+            "can_confirm": False,
+            "required_providers": ["coinset", "spacescan"],
+            "reason_codes": [
+                "coinset_exact_flow_unavailable",
+                "spacescan_exact_flow_unavailable",
+            ],
+        },
+    }
     assert payload["can_increase_exposure"] is False
     assert payload["metrics"]["independent_bid_depth_xch"] == "2"
     assert payload["metrics"]["independent_ask_depth_xch"] == "3"
@@ -205,6 +217,21 @@ def test_market_confidence_exposes_exact_evidence_and_withdrawal_countdown(
         "recovery_refreshes_required": 3,
         "recovery_minimum_seconds": 60,
     }
+    assert payload["fill_authority"]["external_corroboration"]["can_confirm"] is False
+
+
+def test_market_confidence_without_asset_still_exposes_fill_authority_capability(
+    monkeypatch,
+):
+    monkeypatch.setitem(api_server._active_cat, "asset_id", "")
+
+    with api_server.app.test_request_context("/api/market/confidence"):
+        payload = market.api_market_confidence().get_json()
+
+    external = payload["fill_authority"]["external_corroboration"]
+    assert external["status"] == "unavailable"
+    assert external["can_confirm"] is False
+    assert external["required_providers"] == ["coinset", "spacescan"]
 
 
 def test_api_diagnostics_never_reads_retired_amm_monitor(monkeypatch):
@@ -633,6 +660,7 @@ def test_offers_ui_surfaces_publication_discovery_and_confirmed_fill_authority()
     assert "Discovery:" in html
     assert "fill_confidence" in html
     assert "Confirmed evidence" in html
+    assert "Exact external fill proof" in html
 
 
 def test_fills_endpoint_labels_only_authoritative_rows_as_confirmed(monkeypatch):

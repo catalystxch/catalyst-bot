@@ -415,6 +415,9 @@ class FillTrackerVerificationTests(unittest.TestCase):
 
         self.assertEqual(result["sell_fills"], [])
         self.assertEqual(self.recorded, [])
+        self.assertEqual(self.fills, [])
+        self.assertEqual(self.lifecycle_updates, [])
+        self.assertNotIn((trade_id, "filled"), self.status_updates)
         self.assertIn(trade_id, tracker._pending_reverify)
 
     def test_spacescan_disabled_does_not_record_fill(self):

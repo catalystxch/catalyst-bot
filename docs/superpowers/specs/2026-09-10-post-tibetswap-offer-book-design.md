@@ -278,6 +278,19 @@ If Sage later conflicts with external confirmation, CATalyst enters a durable
 amber safety state, preserves both evidence sets, and stops related mutations.
 Chain evidence wins over a conflicting Dexie status.
 
+### v1.4 exact-external-authority capability exception
+
+The 2026-09-11 implementation review established that the currently supported
+Coinset and Spacescan response contracts do not both expose the complete spent
+and created coin flow needed to distinguish a fill from a cancellation or other
+spend. CATalyst therefore advertises exact external fill authority as
+`unavailable` and keeps Coinset/Spacescan chain observations diagnostic. Generic
+`CHAIN_EVIDENCE` never implies economic authority. For v1.4, only exact Sage
+wallet reconciliation may produce `CONFIRMED`, affect accounting, or authorize a
+replacement. The dual-provider path remains fail-closed until both independent
+providers expose a verified exact-flow contract and the later-Sage-conflict latch
+has end-to-end coverage.
+
 ## Smart Settings and risk presets
 
 Smart Settings keeps Conservative, Balanced, and Aggressive presets, but derives
