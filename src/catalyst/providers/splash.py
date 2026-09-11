@@ -67,7 +67,7 @@ class SplashOfferProvider:
                     {
                         "offer_id": offer_id,
                         "side": side,
-                        "price": str(row.get("price")),
+                        "price": str(price),
                         "amount_mojos": amount,
                     }
                 )

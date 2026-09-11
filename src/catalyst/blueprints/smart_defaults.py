@@ -1454,7 +1454,6 @@ def _calculate_smart_defaults(
         return jsonify({"error": "Trusted market midpoint is not exact"}), 409
     mid_price_decimal = trusted_mid_price
     dexie_price = float(price_info["dexie_price"])
-    tibet_price = float(price_info["tibet_price"])
     mid_price = float(mid_price_decimal)
     arb_gap_bps = float(price_info["arb_gap_bps"])
     spacescan_gap_bps = float(price_info["spacescan_gap_bps"])

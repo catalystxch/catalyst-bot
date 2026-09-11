@@ -27,7 +27,12 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 import api_server
 from config import cfg
-from database import log_event, backup_database, get_stats
+from database import (
+    backup_database,
+    get_post_tibet_migration_report,
+    get_stats,
+    log_event,
+)
 from super_log import slog
 
 # Shared helper defined in the offers blueprint — used by /api/status.
@@ -52,11 +57,10 @@ def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     transport or schema failure must remain retryable and must never be
     mistaken for an empty authoritative offer set.
     """
-    import database
     from market_evidence import migrate_post_tibet_state
     from wallet import get_all_offers
 
-    existing = database.get_post_tibet_migration_report(asset_id)
+    existing = get_post_tibet_migration_report(asset_id)
     if existing is not None:
         return existing
 

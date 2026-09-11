@@ -285,7 +285,7 @@ def test_prepared_creation_with_authoritatively_unlocked_input_is_failed_closed(
         get_legacy_startup_reservation_candidates=lambda limit=128: [],
         get_unresolved_offer_operation_blockers=lambda: [blocker],
         get_offer_intent=lambda requested: intent if requested == intent_id else None,
-        validate_offer_operation_event=lambda event: dict(event),
+        validate_offer_operation_event=dict,
         finalize_offer_intent=finalize_offer_intent,
         get_runtime_safety_latch=lambda: {
             "generation": 3,
