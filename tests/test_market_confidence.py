@@ -175,6 +175,31 @@ def test_same_offer_seen_on_dexie_and_splash_is_counted_once():
     assert "single_provider_dependency" in result.reason_codes
 
 
+def test_churn_detection_window_tracks_configured_refresh_cadence():
+    engine = MarketConfidenceEngine(
+        risk_preset="balanced", refresh_cadence_seconds=90
+    )
+    engine.evaluate(
+        observations=(_dexie(ids=("old-db", "old-da")), _splash(ids=("old-sb", "old-sa"))),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    result = engine.evaluate(
+        observations=(
+            _dexie(at=NOW + timedelta(seconds=90), ids=("new-db", "new-da")),
+            _splash(at=NOW + timedelta(seconds=90), ids=("new-sb", "new-sa")),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(seconds=90),
+    )
+
+    assert result.manipulation_score == 100
+    assert "rapid_offer_churn" in result.reason_codes
+
+
 def test_depth_threshold_scales_with_offer_size_and_preset():
     conservative = MarketConfidenceEngine(risk_preset="conservative").evaluate(
         observations=(_dexie(amount=1_000), _splash(amount=1_000)),

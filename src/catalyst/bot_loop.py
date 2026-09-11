@@ -76,6 +76,7 @@ from boost_manager import BoostManager
 from market_intel import MarketIntel
 from market_toxicity import MarketToxicityGuard, ToxicityContext
 from market_runtime import OfferBookMarketRuntime
+from degraded_market import DegradedMarketController, DegradedMarketDecision
 from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
@@ -433,6 +434,7 @@ class BotLoop:
         self._market_runtime = None
         self._market_runtime_asset_id = ""
         self._market_runtime_risk_preset = ""
+        self._market_runtime_refresh_cadence = 0
         self._market_confidence_result = None
         self._market_degraded_decision = None
         self._market_refresh_now = datetime.now(timezone.utc)
@@ -1139,16 +1141,25 @@ class BotLoop:
     def _get_fresh_splash_confidence_offers(
         self, asset_id: str, *, now: datetime
     ) -> list[Dict]:
-        """Return only Splash offers received in the last 20 seconds."""
+        """Return recently advertised Splash offers for two market cycles.
+
+        Splash delivers an offer through its webhook once, while the default
+        confidence loop runs every 90 seconds.  A fixed 20-second cache made a
+        valid advertisement disappear before the next normal refresh.  Keep
+        it for a bounded two-cycle lease; a later advertisement refreshes the
+        lease, while silence still removes it promptly.
+        """
 
         current = now.astimezone(timezone.utc)
         target = str(asset_id or "").strip().lower()
+        loop_seconds = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
+        retention_seconds = max(20, loop_seconds * 2)
         result = []
         with self._splash_confidence_lock:
             stale = []
             for identity, row in self._splash_confidence_offers.items():
                 age = (current - row["observed_at"]).total_seconds()
-                if age > 20:
+                if age > retention_seconds:
                     stale.append(identity)
                     continue
                 if row["asset_id"] != target:
@@ -1387,6 +1398,7 @@ class BotLoop:
 
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
+        refresh_cadence = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
         risk_preset = (
             str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
             .strip()
@@ -1396,6 +1408,8 @@ class BotLoop:
             self._market_runtime is not None
             and self._market_runtime_asset_id == asset
             and self._market_runtime_risk_preset == risk_preset
+            and getattr(self, "_market_runtime_refresh_cadence", 0)
+            == refresh_cadence
         ):
             return self._market_runtime
 
@@ -1444,9 +1458,11 @@ class BotLoop:
                 )
             ),
             fetch_splash_health=self._splash_confidence_health,
+            refresh_cadence_seconds=refresh_cadence,
         )
         self._market_runtime_asset_id = asset
         self._market_runtime_risk_preset = risk_preset
+        self._market_runtime_refresh_cadence = refresh_cadence
         return self._market_runtime
 
     def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
@@ -1465,6 +1481,8 @@ class BotLoop:
         )
         self._market_confidence_result = result.confidence
         self._market_degraded_decision = result.degraded
+        self._market_refresh_failure_since = None
+        self._apply_market_withdrawal(result.degraded)
         dexie_snapshot = self.market_intel.get_attributable_orderbook()
         splash_snapshot = self._get_fresh_splash_confidence_offers(
             asset_id, now=observed_at
@@ -1474,8 +1492,6 @@ class BotLoop:
             splash_offers=splash_snapshot,
             now=observed_at,
         )
-        self._apply_market_withdrawal(result.degraded)
-
         self._set_state(
             market_confidence=result.confidence.state,
             market_confidence_reason_codes=list(result.confidence.reason_codes),
@@ -1497,6 +1513,96 @@ class BotLoop:
                 },
             )
         return result
+
+    def _enforce_market_refresh_failure(
+        self, *, now: datetime, error: BaseException
+    ) -> DegradedMarketDecision:
+        """Turn any confidence-refresh exception into progressive RED safety."""
+
+        current = now.astimezone(timezone.utc)
+        decision = None
+        controller = getattr(getattr(self, "_market_runtime", None), "_degraded", None)
+        if controller is None:
+            asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+            try:
+                controller = DegradedMarketController(asset_id=asset_id)
+            except Exception:
+                controller = None
+        if controller is not None:
+            try:
+                decision = controller.update(confidence_state="RED", now=current)
+            except Exception as persistence_error:
+                log_event(
+                    "critical",
+                    "market_degraded_state_unavailable",
+                    "Market refresh failed and durable degraded state could not be "
+                    f"updated; enforcing in-memory withdrawal: {persistence_error}",
+                )
+
+        if decision is None:
+            degraded_since = getattr(self, "_market_refresh_failure_since", None)
+            if type(degraded_since) is not datetime or degraded_since.tzinfo is None:
+                degraded_since = current
+            self._market_refresh_failure_since = degraded_since
+            elapsed = max(0, (current - degraded_since).total_seconds())
+            if elapsed >= 600:
+                stage = "ALL"
+                cancel_tiers = (
+                    "inner",
+                    "middle",
+                    "outer",
+                    "extreme",
+                    "opportunity",
+                )
+            elif elapsed >= 180:
+                stage = "MIDDLE"
+                cancel_tiers = ("inner", "middle")
+            else:
+                stage = "INNER"
+                cancel_tiers = ("inner",)
+            decision = DegradedMarketDecision(
+                confidence_state="RED",
+                can_create=False,
+                can_requote=False,
+                cancel_tiers=cancel_tiers,
+                paused=stage == "ALL",
+                recovering=False,
+                stage=stage,
+                degraded_since=degraded_since,
+                recovery_refreshes=0,
+                notify=True,
+                reason_code=f"MARKET_REFRESH_FAILED_{stage}",
+            )
+        else:
+            self._market_refresh_failure_since = decision.degraded_since
+
+        self._market_confidence_result = None
+        self._market_degraded_decision = decision
+        self._set_state(
+            market_confidence="RED",
+            market_confidence_reason_codes=["market_refresh_failed"],
+            market_withdrawal_stage=decision.stage,
+            market_confidence_snapshot_id=None,
+        )
+        try:
+            self._apply_market_withdrawal(decision)
+        except Exception as withdrawal_error:
+            log_event(
+                "critical",
+                "market_refresh_failure_withdrawal_failed",
+                "Market refresh failed and protective cancellation also failed: "
+                f"{withdrawal_error}",
+            )
+        log_event(
+            "error",
+            "market_confidence_refresh_failed",
+            f"Offer-book confidence refresh failed closed: {error}",
+            data={
+                "reason_code": decision.reason_code,
+                "withdrawal_stage": decision.stage,
+            },
+        )
+        return decision
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -8885,10 +8991,8 @@ class BotLoop:
             market_result = self._refresh_offer_book_market()
         except Exception as market_error:
             market_result = None
-            log_event(
-                "error",
-                "market_confidence_refresh_failed",
-                f"Offer-book confidence refresh failed closed: {market_error}",
+            self._enforce_market_refresh_failure(
+                now=datetime.now(timezone.utc), error=market_error
             )
         trusted_midpoint = (
             market_result.confidence.trusted_midpoint if market_result else None

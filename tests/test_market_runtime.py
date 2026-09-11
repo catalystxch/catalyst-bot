@@ -620,6 +620,44 @@ def test_bot_rebuilds_market_runtime_when_risk_preset_changes(isolated_db, monke
     assert aggressive._engine.risk_preset == "aggressive"
 
 
+def test_bot_rebuilds_market_runtime_when_refresh_cadence_changes(
+    isolated_db, monkeypatch
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    loop._market_runtime_asset_id = ""
+    loop._market_runtime_risk_preset = ""
+    loop._market_runtime_refresh_cadence = 0
+    loop._market_refresh_now = NOW
+    loop.market_intel = SimpleNamespace(
+        refresh_orderbook=lambda force=False: None,
+        get_attributable_orderbook=lambda: {
+            **_book(),
+            "source_time": NOW.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    loop.splash_node = SimpleNamespace(
+        get_status=lambda: {
+            "process_running": False,
+            "api_reachable": False,
+            "metrics": {"peers": 0},
+        }
+    )
+    loop._splash_confidence_offers = {}
+    loop._splash_confidence_lock = __import__("threading").Lock()
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 60, raising=False)
+
+    first = loop._ensure_market_runtime(ASSET_ID)
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
+    second = loop._ensure_market_runtime(ASSET_ID)
+
+    assert second is not first
+    assert second._engine.derived_thresholds["churn_window_seconds"] == 180
+
+
 def test_runtime_rebases_persisted_confidence_state_when_risk_preset_changes(
     isolated_db,
 ):
@@ -833,6 +871,41 @@ def test_bot_preserves_whole_number_splash_confidence_price():
     assert row["price"] == "10"
 
 
+def test_splash_confidence_offer_survives_one_default_market_cycle(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._splash_confidence_offers = {}
+    loop._splash_confidence_lock = __import__("threading").Lock()
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
+    classified = {
+        "relevant": True,
+        "side": "sell",
+        "summary": {
+            "offered": {ASSET_ID: 12_500_000},
+            "requested": {"xch": 1_000_000_000_000},
+        },
+    }
+
+    assert loop._remember_splash_confidence_offer(
+        fingerprint="splash-offer-one-cycle",
+        classified=classified,
+        observed_at=NOW,
+    )
+
+    rows = loop._get_fresh_splash_confidence_offers(
+        ASSET_ID, now=NOW + timedelta(seconds=90)
+    )
+
+    assert [row["offer_id"] for row in rows] == ["splash-offer-one-cycle"]
+    assert (
+        loop._get_fresh_splash_confidence_offers(
+            ASSET_ID, now=NOW + timedelta(seconds=181)
+        )
+        == []
+    )
+
+
 def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     import bot_loop
 
@@ -862,6 +935,74 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     )
 
     assert cancelled == ["inner", "mid"]
+
+
+def test_market_refresh_applies_withdrawal_before_publication_reconciliation(
+    monkeypatch,
+):
+    import bot_loop
+
+    decision = SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_RED")
+    confidence = SimpleNamespace(state="RED", reason_codes=("one_sided_book",))
+    result = SimpleNamespace(
+        confidence=confidence,
+        degraded=decision,
+        snapshot_id="snapshot-1",
+    )
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_refresh_now = NOW
+    loop._ensure_market_runtime = lambda _asset: SimpleNamespace(
+        refresh=lambda **_kwargs: result
+    )
+    loop._market_own_offer_identities = lambda _asset: frozenset()
+    loop._configured_market_offer_size_mojos = lambda: 1_000
+    loop.market_intel = SimpleNamespace(get_attributable_orderbook=lambda: _book())
+    loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
+    withdrawals = []
+    loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
+    loop._reconcile_offer_publication_discovery = lambda **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("reconciliation unavailable")
+    )
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+
+    with pytest.raises(RuntimeError, match="reconciliation unavailable"):
+        loop._refresh_offer_book_market(now=NOW)
+
+    assert withdrawals == [decision]
+
+
+def test_market_refresh_failure_enforces_red_withdrawal_when_persistence_fails(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = SimpleNamespace(
+        _degraded=SimpleNamespace(
+            update=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("degraded state unavailable")
+            )
+        )
+    )
+    loop._set_state = lambda **_kwargs: None
+    withdrawals = []
+    loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+
+    decision = loop._enforce_market_refresh_failure(
+        now=NOW,
+        error=RuntimeError("provider refresh failed"),
+    )
+
+    assert decision.confidence_state == "RED"
+    assert decision.stage == "INNER"
+    assert decision.cancel_tiers == ("inner",)
+    assert decision.can_create is False
+    assert decision.can_requote is False
+    assert withdrawals == [decision]
+    assert "_enforce_market_refresh_failure" in inspect.getsource(
+        bot_loop.BotLoop._run_one_cycle
+    )
 
 
 def test_trading_cycle_prices_mutations_from_offer_book_confidence_only():

@@ -138,13 +138,18 @@ class MarketConfidenceResult:
 class MarketConfidenceEngine:
     """Derive safe prices solely from current attributable offer evidence."""
 
-    def __init__(self, *, risk_preset: str) -> None:
+    def __init__(
+        self, *, risk_preset: str, refresh_cadence_seconds: int = 60
+    ) -> None:
         preset = str(risk_preset).strip().lower()
         if preset not in _PRESETS:
             raise ValueError(
                 "risk_preset must be conservative, balanced, or aggressive"
             )
         self.risk_preset = preset
+        if type(refresh_cadence_seconds) is not int or refresh_cadence_seconds <= 0:
+            raise ValueError("refresh_cadence_seconds must be a positive integer")
+        self._churn_window_seconds = max(60, refresh_cadence_seconds * 2)
         self._thresholds = _PRESETS[preset]
         self._last_trusted_midpoint: Decimal | None = None
         self._last_trusted_bid: Decimal | None = None
@@ -156,10 +161,12 @@ class MarketConfidenceEngine:
 
     @property
     def derived_thresholds(self) -> dict[str, int | str]:
-        return {
+        thresholds = {
             key: str(value) if type(value) is Decimal else int(value)
             for key, value in self._thresholds.items()
         }
+        thresholds["churn_window_seconds"] = self._churn_window_seconds
+        return thresholds
 
     def export_state(self) -> dict[str, Any]:
         """Return exact mutable policy state needed for fail-closed restart."""
@@ -595,7 +602,7 @@ class MarketConfidenceEngine:
         if not self._prior_offer_ids or self._prior_observed_at is None:
             return 0
         elapsed = (now - self._prior_observed_at).total_seconds()
-        if elapsed < 0 or elapsed > 60:
+        if elapsed < 0 or elapsed > self._churn_window_seconds:
             return 0
         changed = len(self._prior_offer_ids.symmetric_difference(offer_ids))
         denominator = max(len(self._prior_offer_ids), len(offer_ids), 1)
