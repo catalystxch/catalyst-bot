@@ -446,6 +446,78 @@ def test_dashboard_market_health_uses_authoritative_confidence_snapshot(page):
     )
 
 
+def test_dashboard_health_cannot_claim_healthy_when_authoritative_confidence_is_red(
+    page,
+):
+    """The legacy health card must not contradict the durable RED safety truth."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['market_evidence_expired'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: { withdrawal_stage: 'ALL' },
+                metrics: {},
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy — bot stopped',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthDot")).to_have_class(re.compile(r"cc-light-red"))
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Market blocked — offer-book confidence is RED"
+    )
+    expect(page.locator("#ccConditions")).to_contain_text("market evidence expired")
+
+
+def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
+    """Confidence arriving after dashboard data must immediately reconcile the card."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _dashboardData = {
+                market_health: {
+                    status: 'green',
+                    message: 'Market conditions healthy — bot stopped',
+                    conditions: [],
+                    metrics: {},
+                },
+            };
+            window.updateMarketHealth(_dashboardData.market_health);
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['market_evidence_expired'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: { withdrawal_stage: 'ALL' },
+                metrics: {},
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthDot")).to_have_class(re.compile(r"cc-light-red"))
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Market blocked — offer-book confidence is RED"
+    )
+
+
 def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
     """A running pair must not flash the misleading ``Select pair`` state."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

@@ -23874,6 +23874,14 @@
             setText('derivedChurnLimit', metrics.manipulation_score !== undefined
                 ? `${metrics.manipulation_score}/100 current`
                 : '—');
+
+            // Dashboard and confidence requests race during startup and tab
+            // changes. Reconcile an already-rendered legacy health summary as
+            // soon as the authoritative confidence snapshot arrives.
+            const renderedHealth = (_dashboardData || _lcDashboardData || {}).market_health;
+            if (renderedHealth && typeof updateMarketHealth === 'function') {
+                updateMarketHealth(renderedHealth);
+            }
         }
 
         async function fetchMarketConfidence() {
@@ -27174,6 +27182,19 @@
             // Update traffic light and market metrics from health data
             if (!h) return;
             const el = id => document.getElementById(id);
+            // The durable offer-book confidence snapshot is the authoritative
+            // exposure gate.  The legacy risk-health summary can still be green
+            // while the bot is stopped, so always render the stricter state and
+            // never tell the user the market is healthy when confidence blocks it.
+            const confidenceSnapshot = (_lastMarketConfidence || {}).confidence || {};
+            const confidenceState = String(confidenceSnapshot.state || '').toLowerCase();
+            const healthState = String(h.status || '').toLowerCase();
+            const severity = { green: 0, amber: 1, red: 2 };
+            const confidenceIsStricter = (severity[confidenceState] ?? -1) > (severity[healthState] ?? -1);
+            const effectiveStatus = confidenceIsStricter ? confidenceState : healthState;
+            const confidenceReasons = Array.isArray(confidenceSnapshot.reason_codes)
+                ? confidenceSnapshot.reason_codes.map(code => String(code).replaceAll('_', ' '))
+                : [];
 
             // Traffic light dot
             const dot = el('ccHealthDot');
@@ -27183,26 +27204,30 @@
                 dot.className = 'cc-light-dot';
                 dot.style.opacity = '1';
                 icon.style.fontSize = '';
-                if (h.status === 'green') {
+                if (effectiveStatus === 'green') {
                     dot.classList.add('cc-light-green');
                     icon.textContent = '';
                     msg.style.color = 'var(--status-success)';
-                } else if (h.status === 'amber') {
+                } else if (effectiveStatus === 'amber') {
                     dot.classList.add('cc-light-amber');
                     icon.textContent = '';
                     msg.style.color = 'var(--status-warning)';
-                } else if (h.status === 'red') {
+                } else if (effectiveStatus === 'red') {
                     dot.classList.add('cc-light-red');
                     icon.textContent = '';
                     msg.style.color = 'var(--status-danger)';
                 }
             }
-            const healthMessage = (
-                isRecoveryGuidanceActive()
-                && String(h.message || '') === 'Market healthy — bot operating normally'
-            )
-                ? 'Market healthy — bot rebuilding ladder'
-                : h.message;
+            const healthMessage = confidenceIsStricter
+                ? (confidenceState === 'red'
+                    ? 'Market blocked — offer-book confidence is RED'
+                    : 'Market restricted — offer-book confidence is AMBER')
+                : (
+                    isRecoveryGuidanceActive()
+                    && String(h.message || '') === 'Market healthy — bot operating normally'
+                )
+                    ? 'Market healthy — bot rebuilding ladder'
+                    : h.message;
             if (msg && healthMessage) msg.textContent = healthMessage;
 
             // Remove pre-start hint
@@ -27217,8 +27242,17 @@
 
             // Condition sub-messages
             const condEl = el('ccConditions');
-            if (condEl && h.conditions && h.conditions.length > 0) {
-                condEl.innerHTML = h.conditions.map(c => {
+            const healthConditions = Array.isArray(h.conditions) ? [...h.conditions] : [];
+            if (confidenceIsStricter) {
+                healthConditions.unshift({
+                    level: confidenceState,
+                    text: confidenceReasons.length
+                        ? `Offer-book confidence: ${confidenceReasons.join(' · ')}`
+                        : `Offer-book confidence is ${confidenceState.toUpperCase()}`,
+                });
+            }
+            if (condEl && healthConditions.length > 0) {
+                condEl.innerHTML = healthConditions.map(c => {
                     const color = c.level === 'red' ? 'var(--status-danger)' : (c.level === 'amber' ? 'var(--status-warning)' : 'var(--slate-400)');
                     const icon = c.level === 'red' ? '🔴 ' : (c.level === 'amber' ? '🟡 ' : 'ℹ️ ');
                     return '<div class="cc-condition-item" style="color:' + color + '; line-height: 1.45; margin-bottom: 4px;">' + icon + escapeHtml(normalizeMarketConditionText(c.text)) + '</div>';
