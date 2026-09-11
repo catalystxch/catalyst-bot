@@ -303,6 +303,79 @@ def test_material_move_requires_persistence_but_settled_trade_can_confirm():
     assert "settled_trade_confirmed_move" in accepted.reason_codes
 
 
+def test_material_move_persistence_allows_small_midpoint_jitter():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    first = engine.evaluate(
+        observations=(
+            _dexie(bid="0.11", ask="0.112", at=NOW + timedelta(seconds=20)),
+            _splash(bid="0.11", ask="0.112", at=NOW + timedelta(seconds=20)),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(seconds=20),
+    )
+    second = engine.evaluate(
+        observations=(
+            _dexie(bid="0.1101", ask="0.1121", at=NOW + timedelta(seconds=40)),
+            _splash(bid="0.1101", ask="0.1121", at=NOW + timedelta(seconds=40)),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(seconds=40),
+    )
+
+    assert first.state == "AMBER"
+    assert first.pending_movement_refreshes == 1
+    assert second.state == "GREEN"
+    assert second.trusted_midpoint == Decimal("0.1111")
+    assert second.pending_movement_refreshes == 0
+    assert "movement_persistence_satisfied" in second.reason_codes
+
+
+def test_material_move_persistence_jitter_does_not_ratchet_anchor():
+    engine = MarketConfidenceEngine(risk_preset="conservative")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    results = []
+    for offset, midpoint in enumerate(("0.111", "0.1119", "0.1128"), start=1):
+        half_spread = Decimal("0.001")
+        results.append(
+            engine.evaluate(
+                observations=(
+                    _dexie(
+                        bid=str(Decimal(midpoint) - half_spread),
+                        ask=str(Decimal(midpoint) + half_spread),
+                        at=NOW + timedelta(seconds=20 * offset),
+                    ),
+                    _splash(
+                        bid=str(Decimal(midpoint) - half_spread),
+                        ask=str(Decimal(midpoint) + half_spread),
+                        at=NOW + timedelta(seconds=20 * offset),
+                    ),
+                ),
+                own_offer_identities=frozenset(),
+                configured_offer_size_mojos=1_000,
+                now=NOW + timedelta(seconds=20 * offset),
+            )
+        )
+
+    assert [result.state for result in results] == ["AMBER", "AMBER", "AMBER"]
+    assert results[-1].trusted_midpoint == Decimal("0.1")
+    assert results[-1].pending_movement_refreshes == 1
+
+
 def test_hard_move_cap_rejects_even_settled_trade():
     engine = MarketConfidenceEngine(risk_preset="balanced")
     engine.evaluate(

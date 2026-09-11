@@ -225,7 +225,7 @@ def migrate_post_tibet_state(
     if type(ownership_proven) is not bool:
         raise TypeError("ownership_proven must be a boolean")
     existing = database.get_post_tibet_migration_report(asset)
-    if existing is not None:
+    if existing is not None and existing.get("can_start") is True:
         return existing
 
     local_open_ids = sorted(

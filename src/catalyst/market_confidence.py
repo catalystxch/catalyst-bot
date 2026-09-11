@@ -22,6 +22,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_red": 70,
         "source_conflict_bps": 250,
         "depth_price_envelope_bps": 250,
+        "persistence_jitter_bps": 100,
     },
     "balanced": {
         "depth_multiple": Decimal("2"),
@@ -32,6 +33,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_red": 80,
         "source_conflict_bps": 400,
         "depth_price_envelope_bps": 400,
+        "persistence_jitter_bps": 100,
     },
     "aggressive": {
         "depth_multiple": Decimal("1.5"),
@@ -42,6 +44,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "manipulation_red": 90,
         "source_conflict_bps": 600,
         "depth_price_envelope_bps": 600,
+        "persistence_jitter_bps": 100,
     },
 }
 
@@ -424,7 +427,12 @@ class MarketConfidenceEngine:
                     self._pending_midpoint = None
                     self._pending_refreshes = 0
                 else:
-                    if self._pending_midpoint == proposed_midpoint:
+                    pending_anchor_matches = (
+                        self._pending_midpoint is not None
+                        and _basis_points(proposed_midpoint, self._pending_midpoint)
+                        <= Decimal(self._thresholds["persistence_jitter_bps"])
+                    )
+                    if pending_anchor_matches:
                         self._pending_refreshes += 1
                     else:
                         self._pending_midpoint = proposed_midpoint

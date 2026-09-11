@@ -187,3 +187,36 @@ def test_bot_start_migration_fails_closed_when_sage_offer_read_is_unavailable(
     assert report["can_start"] is False
     assert report["reason_code"] == "POST_TIBET_SAGE_OFFERS_UNAVAILABLE"
     assert database.get_post_tibet_migration_report(ASSET_ID) is None
+
+
+def test_bot_start_retries_failed_migration_after_sage_reconciliation(
+    isolated_db, monkeypatch
+):
+    import api_server  # noqa: F401 - complete blueprint registration first
+    import blueprints.bot as bot_blueprint
+    import wallet
+
+    _add_offer("reconciled-offer")
+    snapshots = iter(
+        [
+            [],
+            [{"trade_id": "reconciled-offer"}],
+        ]
+    )
+    calls = []
+
+    def get_all_offers(**kwargs):
+        calls.append(kwargs)
+        return next(snapshots)
+
+    monkeypatch.setattr(wallet, "get_all_offers", get_all_offers)
+
+    blocked = bot_blueprint._enforce_post_tibet_start_migration(ASSET_ID)
+    recovered = bot_blueprint._enforce_post_tibet_start_migration(ASSET_ID)
+
+    assert blocked["can_start"] is False
+    assert blocked["reason_code"] == "POST_TIBET_UNSAFE_OPEN_OFFERS"
+    assert recovered["can_start"] is True
+    assert recovered["retained_offer_ids"] == ["reconciled-offer"]
+    assert len(calls) == 2
+    assert database.get_post_tibet_migration_report(ASSET_ID) == recovered

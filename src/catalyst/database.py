@@ -31822,15 +31822,19 @@ def count_legacy_tibet_price_rows(asset_id: str) -> int:
 def store_post_tibet_migration_report(
     asset_id: str, report: Dict[str, Any], completed_at: datetime
 ) -> Dict[str, Any]:
-    """Store the one-time migration result without overwriting prior authority."""
+    """Store migration authority, replacing only an earlier blocked result."""
 
     encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
     conn = get_connection()
     conn.execute(
         """
-        INSERT OR IGNORE INTO post_tibet_migration_reports (
+        INSERT INTO post_tibet_migration_reports (
             asset_id, migration_version, report_json, completed_at
         ) VALUES (?, 1, ?, ?)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            report_json=excluded.report_json,
+            completed_at=excluded.completed_at
+        WHERE json_extract(post_tibet_migration_reports.report_json, '$.can_start') = 0
         """,
         (asset_id, encoded, _market_evidence_timestamp(completed_at, "completed_at")),
     )

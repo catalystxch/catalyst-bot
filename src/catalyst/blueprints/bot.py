@@ -60,7 +60,7 @@ def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     from wallet import get_all_offers
 
     existing = get_post_tibet_migration_report(asset_id)
-    if existing is not None:
+    if existing is not None and existing.get("can_start") is True:
         return existing
 
     wallet_offers = get_all_offers(include_completed=False, start=0, end=500)
