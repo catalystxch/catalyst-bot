@@ -1096,9 +1096,15 @@ class RiskManager:
         if cfg.MAX_POSITION_XCH <= 0:
             return True
 
-        price = mid_price
+        try:
+            price = Decimal(str(mid_price or "0"))
+        except (ValueError, TypeError):
+            price = Decimal("0")
         if price <= 0 and self._price_engine:
-            price = self._price_engine.get_last_price()
+            try:
+                price = Decimal(str(self._price_engine.get_last_price() or "0"))
+            except (ValueError, TypeError):
+                price = Decimal("0")
         if price <= 0:
             return True
 
