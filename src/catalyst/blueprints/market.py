@@ -24,7 +24,6 @@ from flask import Blueprint, jsonify, request
 import api_server
 import database
 from config import cfg
-from database import log_event
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -420,7 +419,7 @@ def api_dbx_pending():
         )
         return jsonify(result)
     except Exception as e:
-        log_event("error", "dbx_claim", f"pending lookup failed: {e}")
+        database.log_event("error", "dbx_claim", f"pending lookup failed: {e}")
         return jsonify(
             {
                 "success": False,
@@ -446,9 +445,9 @@ def api_dbx_claim():
 
         result = claim_all(target_address=target)
     except Exception as e:
-        log_event("error", "dbx_claim", f"claim failed: {e}")
+        database.log_event("error", "dbx_claim", f"claim failed: {e}")
         return jsonify({"success": False, "error": "reward_claim_failed"})
-    log_event(
+    database.log_event(
         "success" if result.get("success") else "warning",
         "dbx_claim",
         f"claim attempt: submitted={result.get('claims_submitted', 0)} "
@@ -1338,7 +1337,7 @@ def api_debug_sage_single_offer_test():
             "cat_coin": cat_coin,
             "results": [xch_case, cat_case],
         }
-        log_event(
+        database.log_event(
             "info", "sage_single_offer_test", json.dumps(payload, default=str)[:1500]
         )
         return jsonify(payload)

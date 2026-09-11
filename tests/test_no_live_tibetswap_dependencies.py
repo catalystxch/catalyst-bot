@@ -9,7 +9,6 @@ import api_server
 import bot_loop
 import cat_resolver
 import market_data_collector
-import pytest
 import doctor
 from blueprints import bot as bot_routes
 from blueprints import boost as boost_routes

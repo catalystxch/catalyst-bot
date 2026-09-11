@@ -30,7 +30,6 @@ from config import cfg
 from database import (
     backup_database,
     get_post_tibet_migration_report,
-    get_stats,
     log_event,
 )
 from super_log import slog
