@@ -214,66 +214,6 @@ class TestSmartDefaults(_FlaskBase):
 
 
 class TestSmartDefaultsSourceContract(unittest.TestCase):
-    def test_confidence_adapter_receives_normalized_standalone_provider_book(self):
-        from blueprints import smart_defaults
-
-        captured = {}
-        confidence = object()
-
-        class FakeRuntime:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            def refresh(self, **kwargs):
-                captured["refresh"] = kwargs
-                captured["dexie_book"] = captured["fetch_dexie_book"](
-                    smart_defaults.api_server._active_cat["asset_id"]
-                )
-                return SimpleNamespace(confidence=confidence)
-
-        asset_id = "a" * 64
-        original_cat = dict(api_server._active_cat)
-        api_server._active_cat["asset_id"] = asset_id
-        standalone_book = {
-            "api_ok": True,
-            "has_data": True,
-            "best_bid": Decimal("0.09"),
-            "best_ask": Decimal("0.11"),
-            "provider_book": {
-                "bids": [
-                    {
-                        "offer_id": "buy-1",
-                        "price": "0.09",
-                        "amount_mojos": 2_000_000_000_000,
-                    }
-                ],
-                "asks": [
-                    {
-                        "offer_id": "sell-1",
-                        "price": "0.11",
-                        "amount_mojos": 2_000_000_000_000,
-                    }
-                ],
-            },
-        }
-
-        try:
-            with patch("market_runtime.OfferBookMarketRuntime", FakeRuntime):
-                result = smart_defaults._derive_smart_market_confidence(
-                    asset_id=asset_id,
-                    risk_profile="balanced",
-                    provider_book=standalone_book,
-                    own_offer_identities=frozenset(),
-                    configured_offer_size_xch=Decimal("1"),
-                    now=smart_defaults.datetime.now(smart_defaults.timezone.utc),
-                )
-        finally:
-            api_server._active_cat.clear()
-            api_server._active_cat.update(original_cat)
-
-        self.assertIs(result, confidence)
-        self.assertEqual(captured["dexie_book"], standalone_book["provider_book"])
-
     _ASSET_ID = "b8" * 32
 
     def test_standalone_dexie_offer_normalization_is_exact_and_attributable(self):

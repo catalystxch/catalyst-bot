@@ -55,6 +55,35 @@ def test_dexie_empty_book_is_degraded_not_zero_priced():
     assert "price" not in _payload(observation)
 
 
+def test_dexie_preserves_a_real_sized_public_book_as_valid_evidence():
+    provider = DexieOrderbookProvider(
+        fetch_book=lambda _asset: {
+            "bids": [
+                {
+                    "price": f"0.00002{index:02d}",
+                    "amount_mojos": 1_000_000_000_000,
+                    "offer_id": f"bid-{index}-" + "a" * 56,
+                }
+                for index in range(4, 0, -1)
+            ],
+            "asks": [
+                {
+                    "price": f"0.0001{index:04d}",
+                    "amount_mojos": 1_000_000_000_000,
+                    "offer_id": f"ask-{index}-" + "b" * 55,
+                }
+                for index in range(1, 33)
+            ],
+        }
+    )
+
+    observation = provider.observe_order_book(ASSET_ID, now=NOW)
+
+    assert observation.quality is ObservationQuality.VALID
+    assert len(_payload(observation)["bids"]) == 4
+    assert len(_payload(observation)["asks"]) == 32
+
+
 def test_dexie_rejects_float_price_and_redacts_failure_detail():
     provider = DexieOrderbookProvider(
         fetch_book=lambda _asset: {

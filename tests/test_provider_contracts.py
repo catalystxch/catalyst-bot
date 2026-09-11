@@ -107,8 +107,8 @@ def test_provider_observation_rejects_digest_mismatch_and_oversized_evidence():
     with pytest.raises(ValueError, match="digest"):
         ProviderObservation(**values)
 
-    with pytest.raises(ValueError, match="4096"):
-        canonical_evidence_json({"payload": "x" * 5000})
+    with pytest.raises(ValueError, match="65536"):
+        canonical_evidence_json({"payload": "x" * 70_000})
 
 
 def test_canonical_evidence_redacts_secret_fields_and_is_deterministic():

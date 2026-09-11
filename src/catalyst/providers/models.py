@@ -26,7 +26,7 @@ _REDACTED_KEYS = frozenset(
         "token",
     }
 )
-_MAX_EVIDENCE_BYTES = 4096
+_MAX_EVIDENCE_BYTES = 64 * 1024
 
 
 class Capability(str, Enum):
@@ -111,7 +111,7 @@ def canonical_evidence_json(value: Mapping[str, Any]) -> str:
         ensure_ascii=True,
     )
     if len(encoded.encode("utf-8")) > _MAX_EVIDENCE_BYTES:
-        raise ValueError("evidence exceeds the 4096-byte limit")
+        raise ValueError(f"evidence exceeds the {_MAX_EVIDENCE_BYTES}-byte limit")
     return encoded
 
 
@@ -198,7 +198,9 @@ class ProviderObservation:
         if type(self.raw_evidence_json) is not str:
             raise TypeError("raw_evidence_json must be text")
         if len(self.raw_evidence_json.encode("utf-8")) > _MAX_EVIDENCE_BYTES:
-            raise ValueError("raw evidence exceeds the 4096-byte limit")
+            raise ValueError(
+                f"raw evidence exceeds the {_MAX_EVIDENCE_BYTES}-byte limit"
+            )
         try:
             raw_evidence = json.loads(self.raw_evidence_json)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
