@@ -138,9 +138,7 @@ class MarketConfidenceResult:
 class MarketConfidenceEngine:
     """Derive safe prices solely from current attributable offer evidence."""
 
-    def __init__(
-        self, *, risk_preset: str, refresh_cadence_seconds: int = 60
-    ) -> None:
+    def __init__(self, *, risk_preset: str, refresh_cadence_seconds: int = 60) -> None:
         preset = str(risk_preset).strip().lower()
         if preset not in _PRESETS:
             raise ValueError(

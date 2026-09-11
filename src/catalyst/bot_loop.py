@@ -1408,8 +1408,7 @@ class BotLoop:
             self._market_runtime is not None
             and self._market_runtime_asset_id == asset
             and self._market_runtime_risk_preset == risk_preset
-            and getattr(self, "_market_runtime_refresh_cadence", 0)
-            == refresh_cadence
+            and getattr(self, "_market_runtime_refresh_cadence", 0) == refresh_cadence
         ):
             return self._market_runtime
 

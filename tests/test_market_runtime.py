@@ -960,9 +960,9 @@ def test_market_refresh_applies_withdrawal_before_publication_reconciliation(
     loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
     withdrawals = []
     loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
-    loop._reconcile_offer_publication_discovery = lambda **_kwargs: (_ for _ in ()).throw(
-        RuntimeError("reconciliation unavailable")
-    )
+    loop._reconcile_offer_publication_discovery = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("reconciliation unavailable"))
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
 
     with pytest.raises(RuntimeError, match="reconciliation unavailable"):

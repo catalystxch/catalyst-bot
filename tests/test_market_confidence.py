@@ -176,11 +176,12 @@ def test_same_offer_seen_on_dexie_and_splash_is_counted_once():
 
 
 def test_churn_detection_window_tracks_configured_refresh_cadence():
-    engine = MarketConfidenceEngine(
-        risk_preset="balanced", refresh_cadence_seconds=90
-    )
+    engine = MarketConfidenceEngine(risk_preset="balanced", refresh_cadence_seconds=90)
     engine.evaluate(
-        observations=(_dexie(ids=("old-db", "old-da")), _splash(ids=("old-sb", "old-sa"))),
+        observations=(
+            _dexie(ids=("old-db", "old-da")),
+            _splash(ids=("old-sb", "old-sa")),
+        ),
         own_offer_identities=frozenset(),
         configured_offer_size_mojos=1_000,
         now=NOW,
