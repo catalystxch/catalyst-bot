@@ -119,29 +119,6 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
         return dict(price)
 
 
-def _confirmed_tibetswap_outage(bot=None) -> dict:
-    """Return UI-safe context for a confirmed external TibetSwap outage."""
-    active_bot = bot if bot is not None else api_server.bot
-    startup_results = getattr(active_bot, "_startup_self_test_results", {}) or {}
-    tibet_health = (
-        startup_results.get("tibet", {}) if isinstance(startup_results, dict) else {}
-    )
-    if not isinstance(tibet_health, dict) or tibet_health.get("ok") is not False:
-        return {}
-
-    status_code = tibet_health.get("status_code")
-    status_label = f"HTTP {status_code}" if status_code else "service unavailable"
-    return {
-        "message": (
-            f"TibetSwap outage ({status_label}): pool depth and slippage are "
-            "unavailable. CATalyst is using Dexie-only pricing; AMM drift "
-            "protection is unavailable."
-        ),
-        "reason": "provider_outage",
-        "status_code": status_code,
-    }
-
-
 def _get_tibet_pairs_cached(base: str = None, timeout: int = 8) -> list:
     """One-release compatibility stub for the retired provider."""
 

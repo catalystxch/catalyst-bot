@@ -22733,7 +22733,7 @@
 
             if (midPrice <= 0 && maxSell > 0) {
                 showInputWarning(coinPrepWarn, 'critical',
-                    `⏳ <strong>Waiting for current market pricing...</strong> Cannot calculate token amounts for sell offers until a current price is available. Check your selected pair and market connection. During a TibetSwap outage, CATalyst can use valid Dexie pricing.`);
+                    `⏳ <strong>Waiting for current market pricing...</strong> Cannot calculate token amounts for sell offers until a current price is available. Check your selected pair and offer-book provider connection.`);
                 tradingSettingsImpossible = true;
                 return;
             }

@@ -13563,7 +13563,7 @@ class BotLoop:
                 f"Step hung: {step_name}",
                 f"Cycle step '{step_name}' has been running for {elapsed:.0f}s "
                 f"(SLA {self._step_sla_secs:.0f}s). Most likely a hung RPC. "
-                f"Check Sage/Coinset/Tibet connectivity.",
+                f"Check Sage and active market-data provider connectivity.",
             )
         except Exception:
             pass

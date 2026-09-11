@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import Mock
 
 import api_server
@@ -138,6 +139,27 @@ def test_live_health_paths_do_not_describe_retirement_as_an_outage():
         assert "Market degraded — TibetSwap" not in source
         assert "Dexie-only pricing" not in source
         assert '"pricing_mode"] = "offer_book_confidence"' in source
+
+
+def test_live_ui_does_not_offer_retired_tibet_outage_fallback():
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "During a TibetSwap outage" not in html
+
+
+def test_operational_alerts_do_not_treat_tibet_as_live_connectivity():
+    step_sla_source = inspect.getsource(bot_loop.BotLoop._check_step_sla)
+
+    assert "Sage/Coinset/Tibet connectivity" not in step_sla_source
+
+
+def test_market_module_does_not_keep_retired_outage_fallback_wording():
+    market_source = inspect.getsource(market)
+
+    assert "Dexie-only pricing" not in market_source
+    assert "AMM drift protection is unavailable" not in market_source
 
 
 def test_legacy_slippage_endpoint_is_explicitly_retired(monkeypatch):
