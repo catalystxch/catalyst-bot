@@ -81,6 +81,17 @@ def test_settings_save_handles_expired_session_before_reading_validation_errors(
     assert "validationResponse.status === 401" in guarded
 
 
+def test_successful_settings_save_refreshes_dashboard_before_coin_prep_handoff():
+    gui = GUI.read_text(encoding="utf-8")
+    body = _extract_function_body(gui, "async function saveConfig()")
+
+    reviewed = body.index("setSettingsReviewedState(true);")
+    dashboard_refresh = body.index("await fetchDashboard(currentCAT?.asset_id || '');")
+    coin_prep_handoff = body.index("checkIfCoinPrepNeeded(config);")
+
+    assert reviewed < dashboard_refresh < coin_prep_handoff
+
+
 def test_removed_max_mid_move_setting_is_not_visible_in_setup():
     gui = GUI.read_text(encoding="utf-8")
     setup_markup = _settings_setup_markup(gui)

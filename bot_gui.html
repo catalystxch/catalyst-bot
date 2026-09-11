@@ -34657,6 +34657,11 @@
                     }
                     closeConfig();
                     checkSettingsReviewed();
+                    // v4SwitchView starts a dashboard request without awaiting it.
+                    // Complete one authoritative refresh here so the Active
+                    // Settings panel cannot keep showing the pre-save config
+                    // while the coin-prep confirmation displays the new plan.
+                    await fetchDashboard(currentCAT?.asset_id || '');
                     updateCoinPrepPreview();
 
                     // If the bot already has active offers, skip coin prep entirely.
