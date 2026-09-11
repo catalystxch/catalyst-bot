@@ -219,8 +219,20 @@ def test_dexie_settled_trade_freshness_is_anchored_to_trade_time():
 def test_splash_normalizes_peer_health_and_exact_offer_set():
     provider = SplashOfferProvider(
         fetch_offers=lambda _asset: [
-            {"offer_id": "offer-2", "side": "sell", "price": "0.13", "amount_mojos": 3},
-            {"offer_id": "offer-1", "side": "buy", "price": "0.10", "amount_mojos": 2},
+            {
+                "offer_id": "offer-2",
+                "side": "sell",
+                "price": "0.13",
+                "amount_mojos": 3,
+                "observed_at": "2026-09-10T14:59:58Z",
+            },
+            {
+                "offer_id": "offer-1",
+                "side": "buy",
+                "price": "0.10",
+                "amount_mojos": 2,
+                "observed_at": "2026-09-10T14:59:59Z",
+            },
         ],
         get_health=lambda: {"running": True, "peers": 4, "api_reachable": True},
     )
@@ -229,10 +241,15 @@ def test_splash_normalizes_peer_health_and_exact_offer_set():
     health = provider.observe_peer_health(now=NOW)
 
     assert offers.quality is ObservationQuality.VALID
+    assert offers.source_time == NOW - timedelta(seconds=2)
+    assert offers.fresh_until == NOW + timedelta(seconds=18)
     assert [row["offer_id"] for row in _payload(offers)["offers"]] == [
         "offer-1",
         "offer-2",
     ]
+    assert _payload(offers)["offers"][0]["observed_at"] == (
+        "2026-09-10T14:59:59.000000Z"
+    )
     assert health.quality is ObservationQuality.VALID
     assert _payload(health)["peers"] == 4
 

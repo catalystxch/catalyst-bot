@@ -47,12 +47,14 @@ def _splash():
             "side": "buy",
             "price": "0.00009",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": NOW.isoformat().replace("+00:00", "Z"),
         },
         {
             "offer_id": "splash-sell",
             "side": "sell",
             "price": "0.00011",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": NOW.isoformat().replace("+00:00", "Z"),
         },
     ]
 
@@ -232,12 +234,18 @@ def test_restart_hydrates_trusted_price_and_rejects_a_hard_move(isolated_db):
                 "side": "buy",
                 "price": "0.00014",
                 "amount_mojos": 3_000_000_000_000,
+                "observed_at": (NOW + timedelta(seconds=20))
+                .isoformat()
+                .replace("+00:00", "Z"),
             },
             {
                 "offer_id": "s-moved-ask",
                 "side": "sell",
                 "price": "0.00016",
                 "amount_mojos": 3_000_000_000_000,
+                "observed_at": (NOW + timedelta(seconds=20))
+                .isoformat()
+                .replace("+00:00", "Z"),
             },
         ],
         fetch_splash_health=lambda: {
@@ -299,12 +307,18 @@ def test_restart_preserves_pending_movement_state(isolated_db):
             "side": "buy",
             "price": "0.000104",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
         {
             "offer_id": "splash-sell",
             "side": "sell",
             "price": "0.000116",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     ]
     first = runtime.refresh(
@@ -378,12 +392,18 @@ def test_fresh_dexie_settled_trade_confirms_material_move_and_is_persisted(isola
             "side": "buy",
             "price": "0.000104",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
         {
             "offer_id": "splash-sell",
             "side": "sell",
             "price": "0.000116",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     ]
     current_trades = [
@@ -455,12 +475,18 @@ def test_dust_dexie_trade_cannot_confirm_material_move(isolated_db):
             "side": "buy",
             "price": "0.000104",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
         {
             "offer_id": "splash-sell",
             "side": "sell",
             "price": "0.000116",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     ]
     current_trades = [
@@ -741,12 +767,18 @@ def test_first_large_move_after_risk_preset_rebase_still_hard_blocks(isolated_db
             "side": "buy",
             "price": "0.000139",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
         {
             "offer_id": "splash-moved-sell",
             "side": "sell",
             "price": "0.000141",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": (NOW + timedelta(seconds=20))
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     ]
 
@@ -903,6 +935,7 @@ def test_bot_records_exact_splash_offer_for_confidence():
         "side": "sell",
         "price": "0.00008",
         "amount_mojos": 1_000_000_000_000,
+        "observed_at": NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
     }
 
 
@@ -997,15 +1030,19 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     assert cancelled == ["inner", "mid"]
 
 
-def test_market_withdrawal_immediately_enters_durable_retry_for_typed_failure(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "outcome",
+    ["CANCEL_FAILED", "CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"],
+)
+def test_market_withdrawal_immediately_enters_durable_retry_for_unresolved_outcome(
+    monkeypatch, outcome
 ):
     import bot_loop
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
     loop.offer_manager = SimpleNamespace(
         cancel_offers=lambda ids, **kwargs: {
-            trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids
+            trade_id: {"outcome": outcome} for trade_id in ids
         }
     )
     retries = []

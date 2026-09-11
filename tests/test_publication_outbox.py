@@ -2035,6 +2035,48 @@ def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkey
     assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
 
 
+def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch):
+    import wallet
+
+    class RepostDexie:
+        def __init__(self):
+            self.queued = []
+            self.flushes = 0
+
+        def queue_post(self, _offer, trade_id, force=False):
+            self.queued.append((trade_id, force))
+
+        def flush_queue(self, flush_all=False):
+            self.flushes += int(flush_all)
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    gate_results = iter((True, False))
+    loop._enter_runtime_effect_phase = lambda phase: next(gate_results)
+    loop.dexie_manager = RepostDexie()
+    loop.splash_manager = object()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "slow-trade",
+                "offer_bech32": None,
+                "dexie_id": None,
+                "side": "buy",
+            }
+        ],
+    )
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda _trade_id: "offer1slow")
+
+    assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
+    assert loop.dexie_manager.queued == [("slow-trade", True)]
+    assert loop.dexie_manager.flushes == 0
+
+
 @pytest.mark.parametrize(
     ("column", "malformed_value"),
     [

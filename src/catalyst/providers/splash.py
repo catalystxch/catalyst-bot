@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
-from ._normalization import exact_price, failed_observation, observation, utc_now
+from ._normalization import (
+    exact_price,
+    failed_observation,
+    observation,
+    source_datetime,
+    utc_now,
+)
 from .models import (
     Capability,
     ObservationQuality,
@@ -44,6 +50,7 @@ class SplashOfferProvider:
             if type(rows) is not list:
                 raise TypeError("Splash offer set must be a list")
             normalized: list[dict[str, Any]] = []
+            source_times: list[datetime] = []
             seen: set[str] = set()
             duplicate = False
             for row in rows:
@@ -53,6 +60,7 @@ class SplashOfferProvider:
                 side = row.get("side")
                 amount = row.get("amount_mojos")
                 price = exact_price(row.get("price"))
+                source_time = source_datetime(row.get("observed_at"))
                 if type(offer_id) is not str or not offer_id:
                     raise ValueError("Splash offer identity is missing")
                 if offer_id in seen:
@@ -62,13 +70,19 @@ class SplashOfferProvider:
                     raise ValueError("Splash offer side is invalid")
                 if type(amount) is not int or amount <= 0:
                     raise ValueError("Splash offer amount is invalid")
+                if source_time is None:
+                    raise ValueError("Splash offer observation time is missing")
                 seen.add(offer_id)
+                source_times.append(source_time)
                 normalized.append(
                     {
                         "offer_id": offer_id,
                         "side": side,
                         "price": str(price),
                         "amount_mojos": amount,
+                        "observed_at": source_time.isoformat(
+                            timespec="microseconds"
+                        ).replace("+00:00", "Z"),
                     }
                 )
             normalized.sort(key=lambda row: row["offer_id"])
@@ -83,6 +97,7 @@ class SplashOfferProvider:
                 capability=Capability.ORDER_BOOK,
                 payload={"asset_id": asset_id.lower(), "offers": normalized},
                 observed_at=observed_at,
+                source_time=min(source_times) if source_times else None,
                 identity_keys=(asset_id.lower(), *sorted(seen)),
                 freshness_seconds=20,
                 quality=quality,

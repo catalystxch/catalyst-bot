@@ -67,19 +67,24 @@ def _independent_book():
     }
 
 
-def _independent_splash():
+def _independent_splash(observed_at: datetime):
+    observed_at_text = observed_at.isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
     return [
         {
             "offer_id": _sha("independent-splash-buy"),
             "side": "buy",
             "price": "0.00009",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": observed_at_text,
         },
         {
             "offer_id": _sha("independent-splash-sell"),
             "side": "sell",
             "price": "0.00011",
             "amount_mojos": 3_000_000_000_000,
+            "observed_at": observed_at_text,
         },
     ]
 
@@ -280,7 +285,7 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
     # over at least sixty seconds, including across the persisted controller.
     provider = {
         "dexie": _independent_book(),
-        "splash": _independent_splash(),
+        "splash": _independent_splash(NOW + timedelta(seconds=20)),
         "health": {"running": True, "api_reachable": True, "peers": 2},
     }
     runtime = OfferBookMarketRuntime(
@@ -326,15 +331,16 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
     assert mock_wallet.get_mock_stats()["total_offers_created"] == wallet_effects_before
 
     provider["dexie"] = _independent_book()
-    provider["splash"] = _independent_splash()
     provider["health"] = {"running": True, "api_reachable": True, "peers": 2}
     for offset in (11 * 60, 11 * 60 + 30):
+        provider["splash"] = _independent_splash(NOW + timedelta(seconds=offset))
         recovering = runtime.refresh(
             own_offer_identities=frozenset({offer_identity}),
             configured_offer_size_mojos=1_000_000_000_000,
             now=NOW + timedelta(seconds=offset),
         )
         assert recovering.degraded.can_create is False
+    provider["splash"] = _independent_splash(NOW + timedelta(minutes=12))
     recovered = runtime.refresh(
         own_offer_identities=frozenset({offer_identity}),
         configured_offer_size_mojos=1_000_000_000_000,
@@ -461,12 +467,14 @@ def test_source_conflict_stays_amber_and_never_authorizes_new_exposure(isolated_
                 "side": "buy",
                 "price": "0.00015",
                 "amount_mojos": 3_000_000_000_000,
+                "observed_at": AT,
             },
             {
                 "offer_id": _sha("conflict-sell"),
                 "side": "sell",
                 "price": "0.00016",
                 "amount_mojos": 3_000_000_000_000,
+                "observed_at": AT,
             },
         ],
         fetch_splash_health=lambda: {

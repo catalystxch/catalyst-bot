@@ -1187,6 +1187,9 @@ class BotLoop:
                         "side": row["side"],
                         "price": row["price"],
                         "amount_mojos": row["amount_mojos"],
+                        "observed_at": row["observed_at"]
+                        .isoformat(timespec="microseconds")
+                        .replace("+00:00", "Z"),
                     }
                 )
             for identity in stale:
@@ -1214,8 +1217,13 @@ class BotLoop:
             reason=str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
             force_storm=True,
         )
+        unresolved_outcomes = {
+            "CANCEL_FAILED",
+            "CANCEL_SUBMITTED_UNCONFIRMED",
+            "CANCEL_UNKNOWN",
+        }
         if any(
-            type(result) is dict and result.get("outcome") == "CANCEL_FAILED"
+            type(result) is dict and result.get("outcome") in unresolved_outcomes
             for result in (results or {}).values()
         ):
             self._run_cancel_retry_pass()
@@ -14862,6 +14870,15 @@ class BotLoop:
                         )
 
             if count > 0:
+                if not self._enter_runtime_effect_phase("publication"):
+                    log_event(
+                        "warning",
+                        "dexie_repost_market_blocked",
+                        "Skipped queued Dexie repost because market confidence "
+                        "expired before publication",
+                        data={"reason": reason, "stage": "dexie_flush"},
+                    )
+                    return False
                 self.dexie_manager.flush_queue(flush_all=True)
                 log_event(
                     "info",
@@ -14873,6 +14890,15 @@ class BotLoop:
                 )
                 # Also broadcast to Splash if enabled (V3)
                 if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+                    if not self._enter_runtime_effect_phase("publication"):
+                        log_event(
+                            "warning",
+                            "splash_repost_market_blocked",
+                            "Skipped queued Splash repost because market confidence "
+                            "expired before publication",
+                            data={"reason": reason, "stage": "splash_flush"},
+                        )
+                        return False
                     self.splash_manager.flush_queue(flush_all=True)
                     log_event(
                         "info",
@@ -14881,6 +14907,15 @@ class BotLoop:
                         + (" in the background" if background else ""),
                     )
             elif getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+                if not self._enter_runtime_effect_phase("publication"):
+                    log_event(
+                        "warning",
+                        "splash_repost_market_blocked",
+                        "Skipped queued Splash repost because market confidence "
+                        "expired before publication",
+                        data={"reason": reason, "stage": "splash_flush"},
+                    )
+                    return False
                 self.splash_manager.flush_queue(flush_all=True)
                 log_event(
                     "info",
