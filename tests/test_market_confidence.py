@@ -449,9 +449,7 @@ def test_rapid_offer_churn_raises_manipulation_and_never_improves_confidence():
         ("0.0985", "0.1015"),
     ],
 )
-def test_non_executable_dust_churn_cannot_force_red_confidence(
-    junk_bid, junk_ask
-):
+def test_non_executable_dust_churn_cannot_force_red_confidence(junk_bid, junk_ask):
     def splash_with_rotating_junk(suffix: str, at: datetime):
         offers = [
             {
