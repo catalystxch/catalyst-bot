@@ -518,6 +518,66 @@ def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(pag
     )
 
 
+def test_market_intel_refreshes_splash_node_after_supervisor_restart(
+    flask_server, page
+):
+    """A visible Market Intel tab must replace a dead Splash PID without reload."""
+    page.goto(flask_server, wait_until="domcontentloaded")
+    reveal_app_shell_for_nav(page)
+    page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+        }"""
+    )
+
+    page.route(
+        "**/api/market/intel",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "splash_node": {
+                        "process_running": True,
+                        "api_reachable": True,
+                        "binary_found": True,
+                        "pid": 14488,
+                        "uptime_seconds": 845,
+                        "restart_count": 0,
+                    }
+                }
+            ),
+        ),
+    )
+    page.route(
+        "**/api/splash/node",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "process_running": True,
+                    "api_reachable": True,
+                    "binary_found": True,
+                    "pid": 48156,
+                    "uptime_seconds": 20,
+                    "restart_count": 1,
+                }
+            ),
+        ),
+    )
+
+    page.locator('[data-view="intel"]').click()
+    expect(page.locator("#splashNodePid")).to_have_text("14488")
+    expect(page.locator("#splashNodePid")).to_have_text("48156", timeout=8_000)
+    expect(page.locator("#splashNodeStatus")).to_have_text("Running")
+
+
 def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
     """A running pair must not flash the misleading ``Select pair`` state."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

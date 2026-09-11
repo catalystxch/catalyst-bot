@@ -25903,6 +25903,20 @@
             fetchMarketConfidence();
         }
 
+        async function refreshVisibleSplashNodeStatus() {
+            if (_v4CurrentView !== 'intel') return;
+            try {
+                const response = await apiFetch(`${API_URL}/splash/node`);
+                if (!response.ok) return;
+                const node = await response.json();
+                renderSplashIntel({ splash_node: node });
+            } catch (_error) {
+                // The next lightweight poll will retry. Market confidence owns
+                // the separate fail-closed decision when provider evidence is
+                // unavailable.
+            }
+        }
+
         async function toggleSplashListening() {
             const btn = document.getElementById('splashListenToggle');
             if (!btn) return;
@@ -37376,6 +37390,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     startSystemLogBackfillPolling();
     // Refresh dashboard every 120 seconds as backup (SSE is primary)
     setInterval(() => { fetchDashboard(); }, 120000);
+
+    // Splash supervises and can restart its child process while the trading
+    // bot is stopped. /api/status intentionally has no Splash fields in that
+    // state, so keep the visible Market Intel process telemetry current via
+    // the dedicated lightweight endpoint instead of leaving a dead PID on
+    // screen until the user changes tabs or reloads the app.
+    setInterval(() => { refreshVisibleSplashNodeStatus(); }, 5000);
 
     // Start market summary polling (live bid/ask, volume, pool depth)
     setTimeout(() => { startMarketSummaryPolling(); }, 1500);
