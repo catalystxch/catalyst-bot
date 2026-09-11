@@ -26522,6 +26522,70 @@ def get_offer_intent_by_trade_id(sage_trade_id: str) -> Optional[Dict[str, Any]]
     return dict(row) if row is not None else None
 
 
+def get_offer_ui_authority_by_trade_ids(
+    sage_trade_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return one bounded, consistent provider-authority snapshot for the UI."""
+
+    if type(sage_trade_ids) is not list or len(sage_trade_ids) > 500:
+        raise ValueError("offer UI authority requires a list of at most 500 trade IDs")
+    normalized = []
+    seen = set()
+    for value in sage_trade_ids:
+        trade_id = _required_stability_text(value, "sage_trade_id")
+        if trade_id not in seen:
+            seen.add(trade_id)
+            normalized.append(trade_id)
+    if not normalized:
+        return {}
+
+    placeholders = ",".join("?" for _value in normalized)
+    conn = _stability_read_only_connection()
+    try:
+        intent_rows = conn.execute(
+            f"SELECT * FROM offer_intents WHERE sage_trade_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        snapshot = {
+            str(row["sage_trade_id"]): {
+                "intent": dict(row),
+                "discoveries": [],
+                "publications": [],
+            }
+            for row in intent_rows
+        }
+        intent_ids = [str(row["intent_id"]) for row in intent_rows]
+        if not intent_ids:
+            return snapshot
+
+        intent_placeholders = ",".join("?" for _value in intent_ids)
+        discoveries = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            f"WHERE intent_id IN ({intent_placeholders}) ORDER BY intent_id,provider",
+            intent_ids,
+        ).fetchall()
+        publications = conn.execute(
+            "SELECT * FROM publication_outbox "
+            f"WHERE intent_id IN ({intent_placeholders}) "
+            "ORDER BY intent_id,publisher,publication_epoch,publication_id",
+            intent_ids,
+        ).fetchall()
+        trade_id_by_intent = {
+            str(row["intent_id"]): str(row["sage_trade_id"]) for row in intent_rows
+        }
+        for row in discoveries:
+            trade_id = trade_id_by_intent.get(str(row["intent_id"]))
+            if trade_id:
+                snapshot[trade_id]["discoveries"].append(dict(row))
+        for row in publications:
+            trade_id = trade_id_by_intent.get(str(row["intent_id"]))
+            if trade_id:
+                snapshot[trade_id]["publications"].append(dict(row))
+        return snapshot
+    finally:
+        conn.close()
+
+
 def get_offer_intent_by_hash(offer_text_sha256: str) -> Optional[Dict[str, Any]]:
     row = (
         get_connection()

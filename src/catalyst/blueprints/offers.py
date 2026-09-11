@@ -225,14 +225,21 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
     """Attach bounded publication/discovery truth to wallet offer rows."""
 
     serialized = api_server._serialize_offers(wallet_offers)
+    if not serialized:
+        return []
+    trade_ids = [
+        str(item.get("trade_id") or "").strip()
+        for item in serialized
+        if str(item.get("trade_id") or "").strip()
+    ]
+    try:
+        authority_snapshot = database.get_offer_ui_authority_by_trade_ids(trade_ids)
+    except Exception:
+        authority_snapshot = {}
     for item in serialized:
         trade_id = str(item.get("trade_id") or "").strip()
-        intent = None
-        try:
-            if trade_id:
-                intent = database.get_offer_intent_by_trade_id(trade_id)
-        except Exception:
-            intent = None
+        snapshot = authority_snapshot.get(trade_id) or {}
+        intent = snapshot.get("intent")
         if not intent:
             item["authority"] = None
             item["discovery"] = {
@@ -254,10 +261,7 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
             "updated_at": intent.get("updated_at"),
         }
         discovery_providers = {}
-        try:
-            discovery_rows = database.get_offer_publication_discoveries(intent_id)
-        except Exception:
-            discovery_rows = []
+        discovery_rows = snapshot.get("discoveries") or []
         for row in discovery_rows:
             provider = str(row.get("provider") or "").strip().lower()
             if provider not in {"dexie", "splash"}:
@@ -275,10 +279,7 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
             "providers": discovery_providers,
         }
         provider_rows = {}
-        try:
-            publications = database.list_publication_outbox(intent_id=intent_id)
-        except Exception:
-            publications = []
+        publications = snapshot.get("publications") or []
         for row in publications:
             publisher = str(row.get("publisher") or "").strip().lower()
             if publisher not in {"dexie", "splash"}:

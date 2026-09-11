@@ -325,6 +325,33 @@ def test_confirmation_transactionally_enqueues_both_destinations_by_reference(
     assert intent["publication_identity"] == f"mainnet:{offer_fingerprint}:7"
 
 
+def test_offer_ui_authority_snapshot_batches_requested_trade_ids(isolated_database):
+    first, first_trade_id, _ = _prepare_and_confirm(
+        isolated_database, intent_id="intent-ui-first", generation=1
+    )
+    second, second_trade_id, _ = _prepare_and_confirm(
+        isolated_database, intent_id="intent-ui-second", generation=1
+    )
+    isolated_database.ensure_offer_publication_discoveries(first["intent_id"])
+    isolated_database.ensure_offer_publication_discoveries(second["intent_id"])
+
+    snapshot = isolated_database.get_offer_ui_authority_by_trade_ids(
+        [first_trade_id, "unknown-trade", second_trade_id, first_trade_id]
+    )
+
+    assert set(snapshot) == {first_trade_id, second_trade_id}
+    assert snapshot[first_trade_id]["intent"]["intent_id"] == first["intent_id"]
+    assert snapshot[second_trade_id]["intent"]["intent_id"] == second["intent_id"]
+    assert {row["provider"] for row in snapshot[first_trade_id]["discoveries"]} == {
+        "dexie",
+        "splash",
+    }
+    assert {row["publisher"] for row in snapshot[first_trade_id]["publications"]} == {
+        "dexie",
+        "splash",
+    }
+
+
 def test_finalize_rolls_back_confirmation_if_publication_insert_fails(
     isolated_database, monkeypatch
 ):

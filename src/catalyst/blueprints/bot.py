@@ -34,8 +34,11 @@ from database import (
 )
 from super_log import slog
 
-# Shared helper defined in the offers blueprint — used by /api/status.
-from blueprints.offers import _build_fill_history_for_gui
+# Shared helpers defined in the offers blueprint — used by /api/status.
+from blueprints.offers import (
+    _build_fill_history_for_gui,
+    _offers_with_durable_authority,
+)
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -1482,6 +1485,16 @@ def api_status():
 
         enriched_buy = [_enrich_offer(o) for o in offers_buy]
         enriched_sell = [_enrich_offer(o) for o in offers_sell]
+        # The Offers tab renders this five-second status payload, not the
+        # standalone /api/offers response. Attach the same durable provider
+        # authority here so an omitted field cannot be rendered as the false
+        # claims "not queued" or "not observed" after exact Dexie discovery.
+        buy_count = len(enriched_buy)
+        authoritative_offers = _offers_with_durable_authority(
+            enriched_buy + enriched_sell
+        )
+        enriched_buy = authoritative_offers[:buy_count]
+        enriched_sell = authoritative_offers[buy_count:]
 
         fills_data = raw.get("fills") or {}
         history_out = _build_fill_history_for_gui(

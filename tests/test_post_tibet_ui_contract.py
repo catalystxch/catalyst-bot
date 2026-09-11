@@ -556,67 +556,58 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
             )
         ),
     )
-    monkeypatch.setattr(
-        offers.database,
-        "get_offer_intent_by_trade_id",
-        Mock(
-            return_value={
-                "intent_id": "intent-1",
-                "lifecycle_state": "visible",
-                "generation": 2,
-                "publication_identity": "publication-identity",
-                "first_visible_at": "2026-09-10T12:00:00.000000Z",
-                "parent_intent_id": "intent-0",
-                "child_intent_id": None,
-                "updated_at": "2026-09-10T12:00:01.000000Z",
-            }
-        ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        offers.database,
-        "list_publication_outbox",
-        Mock(
-            return_value=[
-                {
-                    "publisher": "dexie",
-                    "state": "succeeded",
-                    "queued_at": "2026-09-10T11:59:59.000000Z",
-                    "updated_at": "2026-09-10T12:00:00.000000Z",
-                    "terminal_at": "2026-09-10T12:00:00.000000Z",
-                },
-                {
-                    "publisher": "splash",
-                    "state": "retryable",
-                    "queued_at": "2026-09-10T11:59:59.000000Z",
+    authority_snapshot = Mock(
+        return_value={
+            "trade-1": {
+                "intent": {
+                    "intent_id": "intent-1",
+                    "lifecycle_state": "visible",
+                    "generation": 2,
+                    "publication_identity": "publication-identity",
+                    "first_visible_at": "2026-09-10T12:00:00.000000Z",
+                    "parent_intent_id": "intent-0",
+                    "child_intent_id": None,
                     "updated_at": "2026-09-10T12:00:01.000000Z",
-                    "terminal_at": None,
                 },
-            ]
-        ),
-        raising=False,
+                "publications": [
+                    {
+                        "publisher": "dexie",
+                        "state": "succeeded",
+                        "queued_at": "2026-09-10T11:59:59.000000Z",
+                        "updated_at": "2026-09-10T12:00:00.000000Z",
+                        "terminal_at": "2026-09-10T12:00:00.000000Z",
+                    },
+                    {
+                        "publisher": "splash",
+                        "state": "retryable",
+                        "queued_at": "2026-09-10T11:59:59.000000Z",
+                        "updated_at": "2026-09-10T12:00:01.000000Z",
+                        "terminal_at": None,
+                    },
+                ],
+                "discoveries": [
+                    {
+                        "provider": "dexie",
+                        "state": "exact",
+                        "deadline_at": "2026-09-10T12:01:30.000000Z",
+                        "first_observed_at": "2026-09-10T12:00:00.000000Z",
+                        "observed_identity": "d" * 64,
+                    },
+                    {
+                        "provider": "splash",
+                        "state": "pending",
+                        "deadline_at": "2026-09-10T12:01:30.000000Z",
+                        "first_observed_at": None,
+                        "observed_identity": None,
+                    },
+                ],
+            }
+        }
     )
     monkeypatch.setattr(
         offers.database,
-        "get_offer_publication_discoveries",
-        Mock(
-            return_value=[
-                {
-                    "provider": "dexie",
-                    "state": "exact",
-                    "deadline_at": "2026-09-10T12:01:30.000000Z",
-                    "first_observed_at": "2026-09-10T12:00:00.000000Z",
-                    "observed_identity": "d" * 64,
-                },
-                {
-                    "provider": "splash",
-                    "state": "pending",
-                    "deadline_at": "2026-09-10T12:01:30.000000Z",
-                    "first_observed_at": None,
-                    "observed_identity": None,
-                },
-            ]
-        ),
+        "get_offer_ui_authority_by_trade_ids",
+        authority_snapshot,
         raising=False,
     )
 
@@ -649,6 +640,7 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
     assert row["publication"]["splash"]["state"] == "retryable"
     assert row["discovery"]["providers"]["dexie"]["state"] == "exact"
     assert row["discovery"]["providers"]["splash"]["state"] == "pending"
+    authority_snapshot.assert_called_once_with(["trade-1"])
 
 
 def test_offers_ui_surfaces_publication_discovery_and_confirmed_fill_authority():

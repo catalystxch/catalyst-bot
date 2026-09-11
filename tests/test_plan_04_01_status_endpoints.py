@@ -726,6 +726,71 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(offer["price"], "0.0000640000")
         self.assertEqual(offer["status"], "PENDING_ACCEPT")
 
+    def test_running_status_exposes_durable_offer_publication_authority(self):
+        """The live Offers UI must not invent negative provider states."""
+        asset_id = "ab" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        durable_buy = {
+            "trade_id": "live-buy-id",
+            "side": "buy",
+            "price_xch": "0.000064",
+            "size_xch": "1.25",
+            "size_cat": "19531.250",
+            "status": "open",
+        }
+
+        def durable_open_offers(*, side=None, cat_asset_id=None, **_kwargs):
+            return [durable_buy] if side == "buy" else []
+
+        def attach_authority(rows):
+            return [
+                {
+                    **row,
+                    "authority": {
+                        "intent_id": "intent-1",
+                        "lifecycle_state": "visible",
+                    },
+                    "publication": {"dexie": {"state": "succeeded"}},
+                    "discovery": {
+                        "state": "visible",
+                        "providers": {"dexie": {"state": "exact"}},
+                    },
+                }
+                for row in rows
+            ]
+
+        with (
+            patch.object(api_server, "bot", _fake_bot_running()),
+            patch("database.get_open_offers", side_effect=durable_open_offers),
+            patch(
+                "blueprints.bot._offers_with_durable_authority",
+                side_effect=attach_authority,
+                create=True,
+            ) as enrich_authority,
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        offer = resp.get_json()["offers"]["buy"][0]
+        self.assertEqual(offer["authority"]["intent_id"], "intent-1")
+        self.assertEqual(offer["publication"]["dexie"]["state"], "succeeded")
+        self.assertEqual(offer["discovery"]["providers"]["dexie"]["state"], "exact")
+        enrich_authority.assert_called_once()
+
     def test_stopped_bot_state_does_not_read_wallet_for_zero_db_snapshot(self):
         zero_bot = _fake_bot_stopped()
         zero_state = zero_bot.get_state()
