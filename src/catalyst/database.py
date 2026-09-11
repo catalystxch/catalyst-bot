@@ -30728,6 +30728,92 @@ def mark_publication_dispatch_started(
         conn.close()
 
 
+def defer_publication_dispatch_before_effect(
+    *,
+    publication_id: str,
+    owner_run_id: str,
+    claim_token: str,
+    claim_generation: int,
+    expected_row_version: int,
+    request_sha256: str,
+    evidence_json: Any,
+    deferred_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Release a marked claim when authority is withdrawn before transport.
+
+    Callers must invoke this only before the external transport function.  The
+    exact request digest and claim CAS prove which never-sent dispatch marker
+    is being cleared so the publication can be retried after fresh authority.
+    """
+
+    publication = _required_stability_text(publication_id, "publication_id")
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    token = _required_stability_text(claim_token, "claim_token")
+    generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
+    if (
+        type(request_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+    ):
+        raise ValueError("request_sha256 must be a canonical SHA-256 digest")
+    deferred = _stability_timestamp(deferred_at, "deferred_at")
+    evidence, evidence_sha256 = _bounded_publication_evidence(
+        evidence_json,
+        "publication deferral evidence",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE publication_outbox
+            SET state='retryable', claim_owner_run_id=NULL, claim_token=NULL,
+                claim_expires_at=NULL, next_attempt_at=?,
+                dispatch_started_at=NULL, request_sha256=NULL,
+                last_error_json=?, last_error_sha256=?, terminal_at=NULL,
+                row_version=row_version+1, updated_at=?
+            WHERE publication_id=? AND state='claimed'
+              AND claim_owner_run_id=? AND claim_token=?
+              AND claim_generation=? AND row_version=?
+              AND claim_expires_at>=?
+              AND dispatch_started_at IS NOT NULL AND request_sha256=?
+              AND recovery_generation=(
+                  SELECT generation FROM runtime_safety_latch
+                  WHERE singleton_id=1 AND state='resolved'
+              )
+            """,
+            (
+                deferred,
+                evidence,
+                evidence_sha256,
+                deferred,
+                publication,
+                owner,
+                token,
+                generation,
+                version,
+                deferred,
+                request_sha256,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        row = dict(
+            conn.execute(
+                "SELECT * FROM publication_outbox WHERE publication_id=?",
+                (publication,),
+            ).fetchone()
+        )
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def unresolve_publication_outbox(
     *,
     publication_id: str,

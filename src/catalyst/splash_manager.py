@@ -27,6 +27,7 @@ from config import cfg
 from database import (
     claim_publication_outbox,
     complete_publication_outbox,
+    defer_publication_dispatch_before_effect,
     enqueue_publication_for_trade,
     log_event,
     mark_publication_dispatch_started,
@@ -132,27 +133,6 @@ class SplashManager:
         authorization_blocked = False
         flush_started = time.monotonic()
         for index in range(max(1, limit)):
-            if self._durable_dispatch_authorizer is not None:
-                try:
-                    authorized = self._durable_dispatch_authorizer() is True
-                except Exception as exc:
-                    authorized = False
-                    log_event(
-                        "warning",
-                        "splash_publication_authority_error",
-                        "Splash publication stopped because dispatch authority "
-                        "could not be revalidated",
-                        data={"error_type": type(exc).__name__},
-                    )
-                if not authorized:
-                    authorization_blocked = True
-                    log_event(
-                        "warning",
-                        "splash_publication_authority_blocked",
-                        "Splash publication stopped before the next external post "
-                        "because current market confidence does not authorize it",
-                    )
-                    break
             if not flush_all and index > 0:
                 elapsed = time.monotonic() - flush_started
                 budget = max(1.0, float(self._durable_flush_budget_seconds))
@@ -208,6 +188,48 @@ class SplashManager:
             if dispatched is None:
                 failed += 1
                 continue
+            if self._durable_dispatch_authorizer is not None:
+                try:
+                    authorized = self._durable_dispatch_authorizer() is True
+                except Exception as exc:
+                    authorized = False
+                    log_event(
+                        "warning",
+                        "splash_publication_authority_error",
+                        "Splash publication stopped because dispatch authority "
+                        "could not be revalidated",
+                        data={"error_type": type(exc).__name__},
+                    )
+                if not authorized:
+                    authorization_blocked = True
+                    deferred_at = self._durable_now_provider()
+                    deferred = defer_publication_dispatch_before_effect(
+                        publication_id=dispatched["publication_id"],
+                        owner_run_id=dispatched["claim_owner_run_id"],
+                        claim_token=dispatched["claim_token"],
+                        claim_generation=dispatched["claim_generation"],
+                        expected_row_version=dispatched["row_version"],
+                        request_sha256=request_digest,
+                        evidence_json={
+                            "code": "MARKET_PUBLICATION_AUTHORITY_WITHDRAWN_BEFORE_EFFECT",
+                            "provider": "splash",
+                            "request_sha256": request_digest,
+                        },
+                        deferred_at=deferred_at,
+                    )
+                    if deferred is None:
+                        failed += 1
+                    else:
+                        skipped += 1
+                        requeued += 1
+                    log_event(
+                        "warning",
+                        "splash_publication_authority_blocked",
+                        "Splash publication stopped before the next external post "
+                        "because current market confidence does not authorize it",
+                        data={"publication_deferred": deferred is not None},
+                    )
+                    break
             result = self._post_single(
                 offer_bech32,
                 trade_id,

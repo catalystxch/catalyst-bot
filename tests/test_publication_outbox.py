@@ -2359,10 +2359,17 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
     monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
     authorizations = iter((True, False))
     authorization_calls = []
+    authorization_snapshots = []
     transport_calls = []
 
     def authorize():
         authorization_calls.append(True)
+        rows = isolated_database.list_publication_outbox(publisher=publisher)
+        claimed = [row for row in rows if row["state"] == "claimed"]
+        assert len(claimed) == 1
+        authorization_snapshots.append(claimed[0])
+        assert claimed[0]["dispatch_started_at"] is not None
+        assert claimed[0]["request_sha256"] is not None
         return next(authorizations)
 
     def accepted_post(url, **kwargs):
@@ -2389,11 +2396,15 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
     result = manager.flush_queue(flush_all=True)
 
     assert len(authorization_calls) == 2
+    assert len(authorization_snapshots) == 2
     assert len(transport_calls) == 1
     assert result["posted"] == 1
     assert result["authorization_blocked"] is True
     remaining = isolated_database.list_publication_outbox(publisher=publisher)
-    assert [row["state"] for row in remaining].count("queued") == 1
+    deferred = [row for row in remaining if row["state"] == "retryable"]
+    assert len(deferred) == 1
+    assert deferred[0]["dispatch_started_at"] is None
+    assert deferred[0]["request_sha256"] is None
 
 
 def test_stale_dispatched_claim_without_observation_contract_never_replays(
