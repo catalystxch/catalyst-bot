@@ -1031,6 +1031,7 @@ def _derive_smart_market_confidence(
         ),
         fetch_splash_offers=splash_offers,
         fetch_splash_health=splash_health,
+        minimum_provider_count=2 if getattr(cfg, "SPLASH_ENABLED", False) else 1,
     )
     return runtime.refresh(
         own_offer_identities=own_offer_identities,

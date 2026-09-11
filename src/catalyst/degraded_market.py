@@ -11,7 +11,15 @@ import database
 
 _ASSET_ID = re.compile(r"[0-9a-f]{64}")
 _STATES = frozenset({"GREEN", "AMBER", "RED"})
-_ALL_TIERS = ("inner", "middle", "outer", "extreme", "opportunity")
+_ALL_TIERS = (
+    "inner",
+    "middle",
+    "outer",
+    "extreme",
+    "opportunity",
+    "sniper",
+    "boost",
+)
 
 
 def _asset_id(value: str) -> str:

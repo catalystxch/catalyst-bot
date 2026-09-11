@@ -38,7 +38,15 @@ def test_red_freezes_mutations_and_progressively_withdraws(isolated_db):
     assert before_middle.cancel_tiers == ("inner",)
     assert middle.cancel_tiers == ("inner", "middle")
     assert middle.stage == "MIDDLE"
-    assert final.cancel_tiers == ("inner", "middle", "outer", "extreme", "opportunity")
+    assert final.cancel_tiers == (
+        "inner",
+        "middle",
+        "outer",
+        "extreme",
+        "opportunity",
+        "sniper",
+        "boost",
+    )
     assert final.stage == "ALL"
     assert final.paused is True
 

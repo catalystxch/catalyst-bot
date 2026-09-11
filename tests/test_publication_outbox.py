@@ -1969,6 +1969,7 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
 
     loop = object.__new__(bot_loop.BotLoop)
     loop._running = True
+    loop._enter_runtime_effect_phase = lambda phase: phase == "publication"
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     events = []
@@ -2010,6 +2011,28 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
     assert loop.dexie_manager.flushes == 1
     assert any(event == "dexie_repost_quarantined" for _, event, _, _ in events)
     assert not any(event == "dexie_repost_failed" for _, event, _, _ in events)
+
+
+def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkeypatch):
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: False
+    loop.dexie_manager = type(
+        "BlockedDexie",
+        (),
+        {
+            "queue_post": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("blocked startup must not queue public offers")
+            ),
+            "flush_queue": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("blocked startup must not flush public offers")
+            ),
+        },
+    )()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+
+    assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
 
 
 @pytest.mark.parametrize(

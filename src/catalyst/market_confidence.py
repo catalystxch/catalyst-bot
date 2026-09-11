@@ -138,7 +138,13 @@ class MarketConfidenceResult:
 class MarketConfidenceEngine:
     """Derive safe prices solely from current attributable offer evidence."""
 
-    def __init__(self, *, risk_preset: str, refresh_cadence_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        *,
+        risk_preset: str,
+        refresh_cadence_seconds: int = 60,
+        minimum_provider_count: int = 2,
+    ) -> None:
         preset = str(risk_preset).strip().lower()
         if preset not in _PRESETS:
             raise ValueError(
@@ -147,7 +153,13 @@ class MarketConfidenceEngine:
         self.risk_preset = preset
         if type(refresh_cadence_seconds) is not int or refresh_cadence_seconds <= 0:
             raise ValueError("refresh_cadence_seconds must be a positive integer")
+        if type(minimum_provider_count) is not int or minimum_provider_count not in {
+            1,
+            2,
+        }:
+            raise ValueError("minimum_provider_count must be 1 or 2")
         self._churn_window_seconds = max(60, refresh_cadence_seconds * 2)
+        self._minimum_provider_count = minimum_provider_count
         self._thresholds = _PRESETS[preset]
         self._last_trusted_midpoint: Decimal | None = None
         self._last_trusted_bid: Decimal | None = None
@@ -164,6 +176,7 @@ class MarketConfidenceEngine:
             for key, value in self._thresholds.items()
         }
         thresholds["churn_window_seconds"] = self._churn_window_seconds
+        thresholds["minimum_provider_count"] = self._minimum_provider_count
         return thresholds
 
     def export_state(self) -> dict[str, Any]:
@@ -543,11 +556,14 @@ class MarketConfidenceEngine:
         amber = bool(
             pending
             or selected_providers is not None
-            or usable_provider_count < 2
+            or usable_provider_count < self._minimum_provider_count
             or "stale_provider_data" in reasons
             or manipulation_score >= int(self._thresholds["manipulation_amber"])
         )
-        if usable_provider_count < 2 and proposed_midpoint is not None:
+        if (
+            usable_provider_count < self._minimum_provider_count
+            and proposed_midpoint is not None
+        ):
             reasons.append("single_provider_dependency")
         state = "RED" if fatal else ("AMBER" if amber else "GREEN")
 

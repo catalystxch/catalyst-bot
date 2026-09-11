@@ -435,6 +435,7 @@ class BotLoop:
         self._market_runtime_asset_id = ""
         self._market_runtime_risk_preset = ""
         self._market_runtime_refresh_cadence = 0
+        self._market_runtime_minimum_provider_count = 0
         self._market_confidence_result = None
         self._market_degraded_decision = None
         self._market_refresh_now = datetime.now(timezone.utc)
@@ -1074,6 +1075,22 @@ class BotLoop:
         decision = getattr(self, "_market_degraded_decision", None)
         if decision is None:
             return False
+        confidence = getattr(self, "_market_confidence_result", None)
+        derived_at = getattr(confidence, "derived_at", None)
+        current_time = datetime.now(timezone.utc)
+        if type(derived_at) is not datetime or derived_at.tzinfo is None:
+            return False
+        confidence_age = (
+            current_time - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if confidence_age < -2 or confidence_age > 20:
+            self._enforce_market_refresh_failure(
+                now=current_time,
+                error=RuntimeError(
+                    f"market confidence evidence expired before {phase_name} phase"
+                ),
+            )
+            return False
         if phase_name == "requote":
             return bool(getattr(decision, "can_requote", False))
         if phase_name in {"create", "publication"}:
@@ -1192,11 +1209,16 @@ class BotLoop:
         ]
         if not trade_ids or not self._enter_runtime_effect_phase("cancel"):
             return 0
-        self.offer_manager.cancel_offers(
+        results = self.offer_manager.cancel_offers(
             trade_ids,
             reason=str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
             force_storm=True,
         )
+        if any(
+            type(result) is dict and result.get("outcome") == "CANCEL_FAILED"
+            for result in (results or {}).values()
+        ):
+            self._run_cancel_retry_pass()
         log_event(
             "warning",
             "market_confidence_withdrawal",
@@ -1399,6 +1421,7 @@ class BotLoop:
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
         refresh_cadence = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
+        minimum_provider_count = 2 if getattr(cfg, "SPLASH_ENABLED", False) else 1
         risk_preset = (
             str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
             .strip()
@@ -1409,6 +1432,8 @@ class BotLoop:
             and self._market_runtime_asset_id == asset
             and self._market_runtime_risk_preset == risk_preset
             and getattr(self, "_market_runtime_refresh_cadence", 0) == refresh_cadence
+            and getattr(self, "_market_runtime_minimum_provider_count", 0)
+            == minimum_provider_count
         ):
             return self._market_runtime
 
@@ -1458,10 +1483,12 @@ class BotLoop:
             ),
             fetch_splash_health=self._splash_confidence_health,
             refresh_cadence_seconds=refresh_cadence,
+            minimum_provider_count=minimum_provider_count,
         )
         self._market_runtime_asset_id = asset
         self._market_runtime_risk_preset = risk_preset
         self._market_runtime_refresh_cadence = refresh_cadence
+        self._market_runtime_minimum_provider_count = minimum_provider_count
         return self._market_runtime
 
     def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
@@ -1552,6 +1579,8 @@ class BotLoop:
                     "outer",
                     "extreme",
                     "opportunity",
+                    "sniper",
+                    "boost",
                 )
             elif elapsed >= 180:
                 stage = "MIDDLE"
@@ -8559,6 +8588,9 @@ class BotLoop:
                         "mid_price was 0 — requoting will be disabled until offers are created",
                     )
             except Exception as e:
+                self._enforce_market_refresh_failure(
+                    now=datetime.now(timezone.utc), error=e
+                )
                 err_msg = f"[WARN] Could not set baseline price: {e}"
                 log_event("warning", "startup_baseline_failed", err_msg)
 
@@ -14694,6 +14726,15 @@ class BotLoop:
             return
         if not self._running:
             return
+        if not self._enter_runtime_effect_phase("publication"):
+            log_event(
+                "warning",
+                "dexie_repost_market_blocked",
+                "Skipped offer repost because current market confidence does not "
+                "authorize publication",
+                data={"reason": reason},
+            )
+            return False
 
         try:
             from database import PublicationSuppressedError, get_offers_for_repost

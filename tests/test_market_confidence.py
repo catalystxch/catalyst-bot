@@ -134,6 +134,21 @@ def test_confidence_table(observations, expected_state, reason):
     assert reason is None or reason in result.reason_codes
 
 
+def test_configured_dexie_only_mode_can_reach_green_with_deep_two_sided_book():
+    result = MarketConfidenceEngine(
+        risk_preset="balanced", minimum_provider_count=1
+    ).evaluate(
+        observations=(_dexie(),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "GREEN"
+    assert "single_provider_dependency" not in result.reason_codes
+    assert result.derived_thresholds["minimum_provider_count"] == 1
+
+
 def test_own_offers_are_excluded_before_price_and_depth():
     result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
         observations=(

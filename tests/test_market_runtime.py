@@ -813,6 +813,66 @@ def test_bot_runtime_phase_gate_fails_closed_before_first_confidence_refresh(
     assert loop._enter_runtime_effect_phase("cancel") is True
 
 
+@pytest.mark.parametrize(
+    ("splash_enabled", "expected_minimum"),
+    [(False, 1), (True, 2)],
+)
+def test_bot_market_runtime_matches_provider_requirement_to_splash_configuration(
+    monkeypatch, splash_enabled, expected_minimum
+):
+    import bot_loop
+
+    captured = {}
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    loop._market_runtime_asset_id = ""
+    loop._market_runtime_risk_preset = ""
+    loop._market_runtime_refresh_cadence = 0
+    loop._market_runtime_minimum_provider_count = 0
+    loop.market_intel = object()
+    loop.dexie_manager = object()
+    loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
+    loop._splash_confidence_health = lambda: {}
+    monkeypatch.setattr(bot_loop, "OfferBookMarketRuntime", Runtime)
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", splash_enabled, raising=False)
+
+    loop._ensure_market_runtime(ASSET_ID)
+
+    assert captured["minimum_provider_count"] == expected_minimum
+
+
+def test_bot_runtime_phase_gate_expires_green_confidence_before_mutation(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(
+        can_create=True,
+        can_requote=True,
+    )
+    loop._market_confidence_result = SimpleNamespace(
+        state="GREEN",
+        derived_at=datetime.now(timezone.utc) - timedelta(seconds=21),
+    )
+    monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
+    loop._runtime_recovery_monotonic = lambda: 1
+    loop._runtime_recovery_wall_clock = lambda: NOW
+    loop._runtime_recovery_gap_seconds = 10
+    loop._runtime_recovery_skew_seconds = 2
+    enforced = []
+    loop._enforce_market_refresh_failure = lambda **kwargs: enforced.append(kwargs)
+
+    assert loop._enter_runtime_effect_phase("publication") is False
+    assert enforced and "expired" in str(enforced[0]["error"])
+
+
 def test_bot_records_exact_splash_offer_for_confidence():
     import bot_loop
 
@@ -935,6 +995,34 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     )
 
     assert cancelled == ["inner", "mid"]
+
+
+def test_market_withdrawal_immediately_enters_durable_retry_for_typed_failure(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: {
+            trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids
+        }
+    )
+    retries = []
+    loop._run_cancel_retry_pass = lambda: retries.append(True) or True
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [{"trade_id": "inner", "tier": "inner"}],
+        raising=False,
+    )
+
+    loop._apply_market_withdrawal(
+        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_INNER")
+    )
+
+    assert retries == [True]
 
 
 def test_market_refresh_applies_withdrawal_before_publication_reconciliation(

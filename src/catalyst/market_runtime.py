@@ -45,6 +45,7 @@ class OfferBookMarketRuntime:
         fetch_splash_health: Callable[[], dict],
         fetch_dexie_settled_trades: Callable[[str], list[dict]] | None = None,
         refresh_cadence_seconds: int = 60,
+        minimum_provider_count: int = 2,
     ) -> None:
         self.asset_id = str(asset_id).strip().lower()
         self._fetch_splash_health = fetch_splash_health
@@ -60,6 +61,7 @@ class OfferBookMarketRuntime:
         self._engine = MarketConfidenceEngine(
             risk_preset=risk_preset,
             refresh_cadence_seconds=refresh_cadence_seconds,
+            minimum_provider_count=minimum_provider_count,
         )
         persisted_state = load_confidence_engine_state(self.asset_id)
         if persisted_state is not None:
