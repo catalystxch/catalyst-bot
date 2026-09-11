@@ -373,119 +373,18 @@ class BoostManager:
 
         Returns dict with results and any warnings.
         """
+        _ = (
+            mid_price,
+            arb_gap_bps,
+            main_spread_bps,
+            size_xch_override,
+            start_pct_override,
+        )
         return {
             "success": False,
             "status": "retired",
             "reason": "TIBETSWAP_SHUTDOWN",
             "replacement": "book_opportunity",
-        }
-
-        # One-release compatibility code remains below for downgrade
-        # archaeology, but v1.4 returns before any wallet effect can occur.
-        if self._active_boost_ids:
-            return {
-                "success": False,
-                "error": "Close the Gap already has protected offers",
-                "active_count": len(self._active_boost_ids),
-            }
-
-        if mid_price <= 0:
-            return {"success": False, "error": "No valid mid price available"}
-
-        # Circuit breaker check — refuse to create pair if either side blocked.
-        if self._cb_blocks_boost():
-            return {
-                "success": False,
-                "error": "Circuit breaker active — Close the Gap cannot create offers",
-            }
-
-        # Store user overrides
-        self._custom_size_xch = size_xch_override
-
-        # ===== INVERTED PROBE INITIALIZATION =====
-        # Each side starts at (tibet_fee + initial_past_fee_bps) past mid.
-        # That's the SHALLOWEST inverted depth where TibetSwap arb is barely
-        # profitable for a watcher. We push deeper each cycle if it survives,
-        # back off when it gets arbed.
-        tibet_fee = int(getattr(cfg, "TIBETSWAP_FEE_BPS", 70))
-        initial_past_fee = int(getattr(cfg, "GAP_PROBE_INITIAL_PAST_FEE_BPS", 10))
-        starting_offset = tibet_fee + initial_past_fee + int(arb_gap_bps)
-
-        self._buy_offset_bps = starting_offset
-        self._sell_offset_bps = starting_offset
-        self._buy_settled = False
-        self._sell_settled = False
-        self._buy_floor_bps = 0
-        self._sell_floor_bps = 0
-        self._buy_last_safe_offset_bps = 0
-        self._sell_last_safe_offset_bps = 0
-        self._buy_probe_tid = ""
-        self._sell_probe_tid = ""
-
-        # Compatibility: keep old fields populated for any external readers
-        self._gap_spread_bps = starting_offset * 2  # symmetric equivalent
-        self._start_spread_bps = self._gap_spread_bps
-        self._arb_floor_bps = tibet_fee + int(arb_gap_bps)
-        self._widen_ceiling_bps = self._gap_spread_bps
-
-        warnings = []
-
-        # Create initial inverted probe pair
-        created = self._create_inverted_probe_pair(mid_price)
-
-        if created:
-            self._boost_active = True
-            self._stable_since = time.time()
-            self._steps_taken = 0
-            self._arb_count = 0
-            self._last_step_time = time.time()
-            self._subprobe_attempted = False  # legacy field, unused in inverted mode
-            self._convergence_factor = Decimal("1.0")
-
-            log_event(
-                "info",
-                "gap_closer_activated",
-                f"📈 Close the Gap ON (inverted-probe mode) — "
-                f"{len(created)} offers at BUY+{_bps_to_pct(self._buy_offset_bps)}, "
-                f"SELL-{_bps_to_pct(self._sell_offset_bps)} past mid. "
-                f"Will push deeper until arbed, then back off to find each side's floor.",
-                data={
-                    "buy_offset_bps": self._buy_offset_bps,
-                    "sell_offset_bps": self._sell_offset_bps,
-                    "tibet_fee_bps": tibet_fee,
-                    "arb_gap_bps": int(arb_gap_bps),
-                    "steps_taken": 0,
-                },
-            )
-            print(
-                f"📈 Close the Gap ON (inverted): BUY +{_bps_to_pct(self._buy_offset_bps)}, "
-                f"SELL -{_bps_to_pct(self._sell_offset_bps)} past mid",
-                flush=True,
-            )
-
-        size_xch = self._effective_size_xch()
-        buy_price = mid_price * (
-            Decimal("1") + Decimal(self._buy_offset_bps) / Decimal("10000")
-        )
-        sell_price = mid_price * (
-            Decimal("1") - Decimal(self._sell_offset_bps) / Decimal("10000")
-        )
-
-        return {
-            "success": len(created) > 0,
-            "created": len(created),
-            "mode": "inverted",
-            "buy_price": str(buy_price),
-            "sell_price": str(sell_price),
-            "buy_offset_bps": self._buy_offset_bps,
-            "sell_offset_bps": self._sell_offset_bps,
-            "tibet_fee_bps": tibet_fee,
-            "arb_gap_bps": int(arb_gap_bps),
-            "spread_bps": self._buy_offset_bps
-            + self._sell_offset_bps,  # total inverted span
-            "main_spread_bps": main_spread_bps,
-            "size_xch": str(size_xch),
-            "warnings": warnings,
         }
 
     def _next_inverted_probe_side(self) -> Optional[str]:
