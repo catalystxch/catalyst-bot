@@ -985,6 +985,9 @@ def _derive_smart_market_confidence(
         raise ValueError("configured Smart Settings offer size is invalid")
 
     active_bot = getattr(api_server, "bot", None)
+    normalized_provider_book = provider_book.get("provider_book")
+    if type(normalized_provider_book) is not dict:
+        raise ValueError("Smart Settings Dexie provider book is unavailable")
 
     def splash_health():
         if active_bot is None or not hasattr(active_bot, "_splash_confidence_health"):
@@ -1002,7 +1005,7 @@ def _derive_smart_market_confidence(
         asset_id=asset_id,
         risk_preset=risk_profile,
         fetch_dexie_book=lambda requested_asset: (
-            provider_book
+            normalized_provider_book
             if requested_asset == asset_id
             else (_ for _ in ()).throw(ValueError("Smart Settings asset changed"))
         ),
