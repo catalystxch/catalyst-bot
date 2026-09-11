@@ -216,6 +216,18 @@ class TestSmartDefaults(_FlaskBase):
 class TestSmartDefaultsSourceContract(unittest.TestCase):
     _ASSET_ID = "b8" * 32
 
+    def test_dbx_decimal_competitor_spread_derives_requote_without_float_boundary(self):
+        from blueprints.smart_defaults import _derive_requote_bps
+
+        requote_bps = _derive_requote_bps(
+            base_spread_bps=625,
+            competitor_spread_bps=Decimal("224.7404687729391723110441558"),
+            regime="normal",
+            spread_step_mult=1.0,
+        )
+
+        self.assertEqual(requote_bps, Decimal("375.00"))
+
     def test_standalone_dexie_offer_normalization_is_exact_and_attributable(self):
         from blueprints.smart_defaults import _normalise_standalone_dexie_offer
 
@@ -923,7 +935,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             "api_ok": True,
             "num_buy_offers": 1,
             "num_sell_offers": 1,
-            "competitor_spread_bps": 100,
+            "competitor_spread_bps": Decimal("100"),
             "best_bid": 0.0001089,
             "best_ask": 0.0001100,
         }

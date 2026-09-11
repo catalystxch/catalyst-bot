@@ -90,6 +90,39 @@ def _smart_float(value, default: float = 0.0) -> float:
     return parsed
 
 
+def _derive_requote_bps(
+    *,
+    base_spread_bps,
+    competitor_spread_bps,
+    regime: str,
+    spread_step_mult,
+) -> Decimal:
+    """Derive the requote threshold without crossing a float boundary."""
+
+    base_spread = Decimal(str(base_spread_bps))
+    competitor_spread = Decimal(str(competitor_spread_bps or 0))
+    step_multiplier = Decimal(str(spread_step_mult))
+
+    typical_impact = (
+        competitor_spread / Decimal("2") if competitor_spread > 0 else Decimal("500")
+    )
+    requote = max(
+        base_spread * Decimal("0.60"),
+        typical_impact * Decimal("2"),
+    )
+    if regime in {"extreme", "volatile"}:
+        requote *= Decimal("1.15")
+
+    requote = max(
+        base_spread * Decimal("0.55"),
+        min(base_spread * Decimal("0.80"), requote),
+    )
+    requote = max(Decimal("150"), requote)
+    if step_multiplier != Decimal("1"):
+        requote = max(Decimal("150"), requote * step_multiplier)
+    return requote
+
+
 def _cat_units_for_xch_exact(xch_amount, mid_price: Decimal) -> Decimal:
     """Convert XCH value to CAT units without crossing a float boundary."""
 
@@ -1676,40 +1709,17 @@ def _calculate_smart_defaults(
     # ═══ REQUOTE ═══
     # Offer-book noise allowance: use the observed competitor spread when a
     # two-sided book exists, otherwise retain a conservative fixed baseline.
-    typical_impact_bps = comp_spread / 2 if comp_spread > 0 else 500
-
-    # Base: 60% of the full spread.
-    # An offer placed at ±(spread/2) from mid should survive until mid has moved
-    # well past the offer price — i.e., well past half_spread from the last quote.
-    # At 60% of spread, the offer is still ~10% inside the spread when we cancel,
-    # meaning it had a real chance to fill and we're not being trigger-happy.
-    # Simulation finding: 40% threshold caused 75-95% of fills to be missed.
-    spread_based = base_spread_bps * 0.60
-
-    # Also consider raw market-impact noise (scaled to trade size vs pool)
-    requote_bps = max(spread_based, typical_impact_bps * 2.0)
-
-    # Volatile / extreme: widen further — price oscillates, let offers ride
-    # through the noise rather than churning cancels on every wave
-    if regime in ("extreme", "volatile"):
-        requote_bps *= 1.15
-
-    # Clamp to spread-relative bounds (55%–80% of full spread)
-    # 55% lower: never cancel before the offer could realistically fill
-    # 80% upper: don't leave clearly stale offers (offer is past fair value)
-    min_requote = base_spread_bps * 0.55
-    max_requote = base_spread_bps * 0.80
-    requote_bps = max(min_requote, min(max_requote, requote_bps))
-
-    # Absolute floor regardless of spread size
-    requote_bps = max(150, requote_bps)
-
-    # ── RISK PROFILE: spread step ──────────────────────────────────────────
-    # Conservative widens requote (let offers ride longer, less churn).
-    # Aggressive narrows it (cancel sooner, stay tighter to mid).
-    # Re-apply absolute floor after adjustment.
-    if _rp["spread_step_mult"] != 1.0:
-        requote_bps = max(150, requote_bps * _rp["spread_step_mult"])
+    # Keep the complete derivation exact because live order-book spreads are
+    # Decimals and mixing them with float multipliers crashes on Windows.
+    requote_bps = _derive_requote_bps(
+        base_spread_bps=base_spread_bps,
+        competitor_spread_bps=comp_spread,
+        regime=regime,
+        spread_step_mult=_rp["spread_step_mult"],
+    )
+    typical_impact_bps = (
+        Decimal(str(comp_spread)) / Decimal("2") if comp_spread > 0 else Decimal("500")
+    )
 
     print(
         f"[SMART_DEFAULTS v2] Requote: {api_server._bps_to_pct(requote_bps)} "
@@ -4175,9 +4185,16 @@ def _calculate_smart_defaults(
         required_outer_bps = (inner_edge_bps * 3 + 1) // 2
         min_spread_bps = max(200, int(base_spread_bps * 0.6), required_outer_bps)
         max_spread_bps = max(min_spread_bps * 2, min(int(base_spread_bps * 2), 1500))
+        exact_policy_spread = Decimal(str(base_spread_bps))
         requote_bps = max(
-            150,
-            min(base_spread_bps * 0.80, max(base_spread_bps * 0.55, requote_bps)),
+            Decimal("150"),
+            min(
+                exact_policy_spread * Decimal("0.80"),
+                max(
+                    exact_policy_spread * Decimal("0.55"),
+                    Decimal(str(requote_bps)),
+                ),
+            ),
         )
 
     _toxicity_defaults = _smart_toxicity_defaults(
