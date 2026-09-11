@@ -67,6 +67,20 @@ def test_saved_setup_controls_are_tracked_for_dirty_state_preservation():
     assert missing == []
 
 
+def test_settings_save_handles_expired_session_before_reading_validation_errors():
+    gui = GUI.read_text(encoding="utf-8")
+    body = _extract_function_body(gui, "async function saveConfig()")
+
+    response_guard = body.index("if (!validationResponse.ok")
+    safe_error_read = body.index("validationErrors[0]")
+
+    assert response_guard < safe_error_read
+    assert "Array.isArray(validation.errors)" in body[response_guard:safe_error_read]
+    guarded = body[response_guard:safe_error_read]
+    assert "validationFailure = formatError(" in guarded
+    assert "validationResponse.status === 401" in guarded
+
+
 def test_removed_max_mid_move_setting_is_not_visible_in_setup():
     gui = GUI.read_text(encoding="utf-8")
     setup_markup = _settings_setup_markup(gui)

@@ -34478,12 +34478,32 @@
                     body: JSON.stringify(config)
                 });
                 const validation = await validationResponse.json();
-                
+
                 debugLog('[VALIDATION]', validation);
-                
+
+                const validationErrors = Array.isArray(validation?.errors)
+                    ? validation.errors : [];
+                const validationWarnings = Array.isArray(validation?.warnings)
+                    ? validation.warnings : [];
+                if (!validationResponse.ok
+                    || typeof validation?.valid !== 'boolean'
+                    || !Array.isArray(validation.errors)
+                    || !Array.isArray(validation.warnings)) {
+                    const validationFailure = formatError(
+                        validation,
+                        validationResponse.status === 401
+                            ? 'Your session has expired. Please reload CATalyst and try again.'
+                            : 'Settings validation failed. Reload CATalyst and try again.'
+                    );
+                    if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
+                    showToast(validationFailure, 'error');
+                    setSaveConfigButtonState(false);
+                    return;
+                }
+
                 if (!validation.valid) {
                     // Show first error message
-                    const errorMsg = validation.errors[0]?.message || validation.errors[0] || 'Invalid settings';
+                    const errorMsg = validationErrors[0]?.message || validationErrors[0] || 'Invalid settings';
                     if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                     showToast(errorMsg, 'error');
                     setSaveConfigButtonState(false);
@@ -34492,8 +34512,8 @@
                 
                 debugLog('[VALIDATION] ✅ Passed');
 
-                if (validation.warnings && validation.warnings.length > 0) {
-                    const warnItems = validation.warnings
+                if (validationWarnings.length > 0) {
+                    const warnItems = validationWarnings
                         .map(w => w.message || w)
                         .map(msg => `• ${escapeHtml(msg)}`)
                         .join('<br>');
