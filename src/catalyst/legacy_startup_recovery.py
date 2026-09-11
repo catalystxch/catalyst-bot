@@ -719,5 +719,7 @@ def recover_legacy_sage_reservations(
     try:
         _resolve_cleared_startup_latch(database_module)
     except Exception:
+        # Reconciliation results above remain authoritative; latch cleanup is
+        # best-effort and the next startup pass will retry it.
         pass
     return result

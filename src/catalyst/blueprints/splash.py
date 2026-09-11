@@ -268,6 +268,7 @@ def api_splash_incoming():
             try:
                 bot.splash_node.note_webhook_delivery()
             except Exception:
+                # Optional delivery telemetry must not reject a valid duplicate.
                 pass
         return jsonify({"ok": True, "new": False, "duplicate": True})
 
@@ -280,6 +281,7 @@ def api_splash_incoming():
                 try:
                     bot.splash_node.note_webhook_delivery()
                 except Exception:
+                    # Optional delivery telemetry must not reject a valid duplicate.
                     pass
             return jsonify({"ok": True, "new": False, "duplicate": True})
         return (

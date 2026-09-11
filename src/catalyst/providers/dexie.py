@@ -74,7 +74,7 @@ class DexieOrderbookProvider:
                         continue
                     if type(amount) is not int or amount <= 0:
                         raise ValueError("Dexie offer amount is invalid")
-                    price = exact_price(row.get("price"))
+                    exact_price(row.get("price"))
                     seen.add(offer_id)
                     normalized.append(
                         {

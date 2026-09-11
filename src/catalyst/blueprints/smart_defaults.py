@@ -1371,7 +1371,6 @@ def _calculate_smart_defaults(
     ticker = raw.get("dexie_ticker") or {}
     trades = raw.get("dexie_trades") or {}
     tibet = {"has_data": False, "status": "retired"}
-    tibet_quote = {"available": False, "status": "retired"}
     spacescan = raw.get("spacescan") or {}
     db_hist = raw.get("internal_db") or {}
 

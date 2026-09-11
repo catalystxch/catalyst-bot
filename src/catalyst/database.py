@@ -7413,6 +7413,7 @@ def add_offer(
                 if conn is not None:
                     conn.rollback()
             except Exception:
+                # Preserve the original lock error; rollback cleanup is best-effort.
                 pass
             conn = open_critical_write_connection()
             close_conn = True
@@ -7423,6 +7424,7 @@ def add_offer(
         try:
             conn.rollback()
         except Exception:
+            # Report the original integrity failure even if rollback also fails.
             pass
         err = str(e)
         if "UNIQUE constraint failed" in err:
@@ -7452,6 +7454,7 @@ def add_offer(
         try:
             conn.rollback()
         except Exception:
+            # Preserve the primary database failure for the operator log.
             pass
         print(f"  ❌ [DB] add_offer FAILED for {trade_id[:16]}...: {e}", flush=True)
         log_event("error", "db_error", f"Failed to add offer {trade_id}: {e}")
