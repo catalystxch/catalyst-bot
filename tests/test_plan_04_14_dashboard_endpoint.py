@@ -131,6 +131,12 @@ class TestDashboard(_FlaskBase):
         ):
             self.assertIn(key, body)
 
+    def test_active_features_omit_retired_amm_sniper(self):
+        resp = self._get_dashboard()
+
+        features = resp.get_json()["settings"]["features"]
+        self.assertNotIn("sniper", features)
+
     def test_response_has_fiat_price_summary(self):
         fake_stats = {
             "realised_pnl_xch": "0",

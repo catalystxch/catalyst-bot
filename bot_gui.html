@@ -26638,13 +26638,12 @@
                 // Features
                 if (s.features) {
                     const featureNames = {
-                        sniper: ['Sniper', 'Takes arb opportunities when price gaps appear between exchanges'],
                         competitor_aware: ['Competitor Aware', 'Monitors Dexie orderbook and adjusts spreads based on competitor pricing'],
                         splash: ['Splash P2P', 'Broadcasts offers via peer-to-peer network for direct settlement'],
                         auto_requote: ['Auto Requote', 'Automatically refreshes offers when price moves beyond threshold'],
                         coin_prep: ['Coin Prep', 'Pre-splits coins to optimal sizes for faster offer creation'],
                         runtime_coin_health: ['Runtime Coin Health', 'Monitors coin availability during trading and tops up when low'],
-                        dynamic_spread: ['Dynamic Spread', 'Adjusts spread based on volatility, inventory, fill rate, and pool depth'],
+                        dynamic_spread: ['Dynamic Spread', 'Adjusts spread based on trusted offer-book depth, volatility, churn, and fill rate'],
                         inventory_mgmt: ['Inventory Mgmt', 'Skews spreads to manage inventory position and reduce directional risk'],
                         tiered_orders: ['Tiered Orders', 'Places larger orders near mid-price and smaller orders further out']
                     };

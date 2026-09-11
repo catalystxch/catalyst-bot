@@ -271,7 +271,6 @@ def api_dashboard():
                 "dynamic_limit_pct": str(cfg.DYNAMIC_LIMIT_PCT),
             },
             "features": {
-                "sniper": getattr(cfg, "SNIPER_ENABLED", True),
                 "competitor_aware": cfg.COMPETITOR_AWARE_ENABLED,
                 "splash": cfg.SPLASH_ENABLED,
                 "auto_requote": cfg.AUTO_REQUOTE,
