@@ -433,6 +433,18 @@ def test_retired_amm_controls_are_not_user_visible():
     assert "confidenceData.confidence" in market_health
 
 
+def test_dashboard_labels_retired_sniper_coins_as_legacy_inventory():
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+    start = html.index("function formatTierGroupLabel")
+    end = html.index("function renderCoinTierGroups", start)
+    labels = html[start:end]
+
+    assert "Legacy sniper (reusable)" in labels
+    assert "sniper: 'Sniper'" not in labels
+
+
 def test_post_tibet_help_and_about_describe_provider_authority_truthfully():
     html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
         encoding="utf-8"
