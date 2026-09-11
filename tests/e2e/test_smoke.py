@@ -807,6 +807,79 @@ def test_reload_restores_completed_coin_prep_for_same_asset_only(page):
     }
 
 
+def test_manual_cat_refresh_preserves_selected_pair_and_setup_state(page):
+    """Refreshing the active wallet's CAT list must not discard its live selection."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const assetId = 'ab'.repeat(32);
+            const cat = {
+                asset_id: assetId,
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+                category: 'ready',
+                decimals: 3,
+            };
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `<option value="${assetId}" data-wallet="2" selected>MZ</option>`;
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            settingsReviewed = true;
+            coinPrepStatus = 'done';
+
+            apiFetch = async (path) => {
+                const url = String(path);
+                if (url.includes('/cat/refresh')) {
+                    return new Response(JSON.stringify({ success: true }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                if (url.endsWith('/cats')) {
+                    return new Response(JSON.stringify({ cats: [cat] }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                if (url.endsWith('/status')) {
+                    return new Response(JSON.stringify({
+                        running: false,
+                        current_cat: cat,
+                    }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                throw new Error(`Unexpected test request: ${url}`);
+            };
+            refreshBalances = async () => {};
+            fetchStatus = async () => {};
+            updateFingerprint = async () => {};
+
+            await refreshCATs(true);
+            return {
+                selectedAssetId: selector.value,
+                currentAssetId: currentCAT.asset_id || '',
+                pairSelectedByUser: _pairSelectedByUser,
+                settingsReviewed,
+                coinPrepStatus,
+            };
+        }"""
+    )
+
+    assert result == {
+        "selectedAssetId": "ab" * 32,
+        "currentAssetId": "ab" * 32,
+        "pairSelectedByUser": True,
+        "settingsReviewed": True,
+        "coinPrepStatus": "done",
+    }
+
+
 def test_final_startup_dismiss_keeps_start_disabled_without_verified_prep(page):
     """Completing the startup overlay must not bypass Coin Prep readiness."""
 

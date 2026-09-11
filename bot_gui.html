@@ -24180,7 +24180,10 @@
                 document.getElementById('catSelector').innerHTML = '<option>Refreshing...</option>';
                 const settingsSelector = document.getElementById('configCatSelector');
                 if (settingsSelector) settingsSelector.innerHTML = '<option>Refreshing...</option>';
-                resetPairSelectionState('Refreshing CATs for the active wallet...');
+                // This is a same-wallet data refresh, not a wallet or pair
+                // change. Keep the active pair and its reviewed/prepared
+                // setup while loadCATs() verifies it still exists; loadCATs()
+                // already clears the state if the token is genuinely absent.
                 await apiFetch(`${API_URL}/cat/refresh`, { method: 'POST' });
                 await loadCATs();
                 // Also refresh balances (user expects updated numbers after refresh)
