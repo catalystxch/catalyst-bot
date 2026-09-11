@@ -11,6 +11,12 @@ import inspect
 
 ASSET_ID = "b8" * 32
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+POST_TIBET_SCHEMA_KEY = "post-tibetswap-offer-book-schema"
+POST_TIBET_REQUIRED_TABLES = (
+    "fill_confidence_assessments",
+    "offer_book_competition_claims",
+    "offer_publication_discoveries",
+)
 
 
 @pytest.fixture
@@ -32,6 +38,61 @@ def _add_offer(trade_id: str):
         size_cat=Decimal("10"),
         cat_asset_id=ASSET_ID,
     )
+
+
+def _remove_post_tibet_schema_watermark(conn):
+    conn.execute("DROP TRIGGER stability_migration_watermarks_no_delete")
+    conn.execute(
+        "DELETE FROM stability_migration_watermarks WHERE migration_key=?",
+        (POST_TIBET_SCHEMA_KEY,),
+    )
+    conn.execute(
+        """CREATE TRIGGER stability_migration_watermarks_no_delete
+        BEFORE DELETE ON stability_migration_watermarks BEGIN
+            SELECT RAISE(ABORT, 'stability_migration_watermarks is append-only');
+        END"""
+    )
+
+
+def test_v13_watermark_allows_first_post_tibet_schema_install(isolated_db):
+    conn = database.get_connection()
+    _remove_post_tibet_schema_watermark(conn)
+    for table_name in POST_TIBET_REQUIRED_TABLES:
+        conn.execute(f"DROP TABLE {table_name}")
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    watermark = conn.execute(
+        "SELECT schema_version, policy_sha256 "
+        "FROM stability_migration_watermarks WHERE migration_key=?",
+        (POST_TIBET_SCHEMA_KEY,),
+    ).fetchone()
+    assert set(POST_TIBET_REQUIRED_TABLES) <= tables
+    assert watermark is not None
+    assert watermark["schema_version"] == 1
+    assert len(watermark["policy_sha256"]) == 64
+
+
+def test_post_tibet_watermark_rejects_missing_installed_schema(isolated_db):
+    conn = database.get_connection()
+    conn.execute("DROP TABLE offer_book_competition_claims")
+    conn.commit()
+    database.close_connection()
+
+    with pytest.raises(
+        RuntimeError,
+        match="post-TibetSwap schema watermark contradicts schema",
+    ):
+        database._migrate_stability_schema()
 
 
 def test_migration_retains_proven_owned_offer_and_legacy_tibet_history(isolated_db):

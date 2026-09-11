@@ -5473,6 +5473,19 @@ _STABILITY_BACKFILL_POLICY_SHA256 = hashlib.sha256(
     b"task9-authoritative-backfills:v1:sweep-boost-hook-proof"
 ).hexdigest()
 
+_POST_TIBET_SCHEMA_MIGRATION_KEY = "post-tibetswap-offer-book-schema"
+_POST_TIBET_SCHEMA_VERSION = 1
+_POST_TIBET_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"post-tibetswap-offer-book-schema:v1:publication-fill-competition"
+).hexdigest()
+_POST_TIBET_SCHEMA_TABLES = frozenset(
+    {
+        "fill_confidence_assessments",
+        "offer_book_competition_claims",
+        "offer_publication_discoveries",
+    }
+)
+
 
 def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
@@ -5489,6 +5502,24 @@ def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
         or row["policy_sha256"] != _STABILITY_BACKFILL_POLICY_SHA256
     ):
         raise RuntimeError("stability migration watermark contradicts schema policy")
+    return True
+
+
+def _post_tibet_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 "
+        "FROM stability_migration_watermarks WHERE migration_key=?",
+        (_POST_TIBET_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        type(row["schema_version"]) is not int
+        or row["schema_version"] != _POST_TIBET_SCHEMA_VERSION
+        or type(row["policy_sha256"]) is not str
+        or row["policy_sha256"] != _POST_TIBET_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("post-TibetSwap schema watermark contradicts schema policy")
     return True
 
 
@@ -6252,30 +6283,37 @@ def _migrate_stability_schema() -> None:
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
         backfills_completed = _stability_backfills_completed(conn)
-        legacy_missing_tables = missing_stability_tables - {
-            "offer_reconciliation_coin_outcomes",
-            "offer_reconciliation_coin_outcome_quarantine",
-            "authoritative_fill_receipts",
-            "authoritative_round_trip_receipts",
-            "offer_authority_migration_audit",
-            "offer_intent_economic_authority",
-            "wallet_effect_claims",
-            "wallet_effect_claim_coins",
-            "wallet_effect_claim_authorities",
-            "wallet_effect_dispatches",
-            "wallet_effect_claim_resolutions",
-            "offer_authority_revocations",
-            "offer_fill_hook_claim_attestations",
-            "offer_fill_sweep_delivery_claim_attestations",
-            "offer_refresh_lineage_commits",
-            "offer_refresh_lineage_blockers",
-            "runtime_recovery_epochs",
-            "runtime_recovery_takeovers",
-            "runtime_recovery_passes",
-            "runtime_recovery_promotions",
-            "runtime_quarantine_manifests",
-            "runtime_quarantine_resolutions",
-        }
+        post_tibet_schema_completed = _post_tibet_schema_completed(conn)
+        missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
+        if post_tibet_schema_completed and missing_post_tibet_tables:
+            raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
+        legacy_missing_tables = missing_stability_tables - (
+            {
+                "offer_reconciliation_coin_outcomes",
+                "offer_reconciliation_coin_outcome_quarantine",
+                "authoritative_fill_receipts",
+                "authoritative_round_trip_receipts",
+                "offer_authority_migration_audit",
+                "offer_intent_economic_authority",
+                "wallet_effect_claims",
+                "wallet_effect_claim_coins",
+                "wallet_effect_claim_authorities",
+                "wallet_effect_dispatches",
+                "wallet_effect_claim_resolutions",
+                "offer_authority_revocations",
+                "offer_fill_hook_claim_attestations",
+                "offer_fill_sweep_delivery_claim_attestations",
+                "offer_refresh_lineage_commits",
+                "offer_refresh_lineage_blockers",
+                "runtime_recovery_epochs",
+                "runtime_recovery_takeovers",
+                "runtime_recovery_passes",
+                "runtime_recovery_promotions",
+                "runtime_quarantine_manifests",
+                "runtime_quarantine_resolutions",
+            }
+            | _POST_TIBET_SCHEMA_TABLES
+        )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
         _backfill_authoritative_coin_outcomes(
@@ -6305,6 +6343,18 @@ def _migrate_stability_schema() -> None:
                     _STABILITY_BACKFILL_MIGRATION_KEY,
                     _STABILITY_BACKFILL_SCHEMA_VERSION,
                     _STABILITY_BACKFILL_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not post_tibet_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _POST_TIBET_SCHEMA_MIGRATION_KEY,
+                    _POST_TIBET_SCHEMA_VERSION,
+                    _POST_TIBET_SCHEMA_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
