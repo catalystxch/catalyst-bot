@@ -3017,6 +3017,7 @@ def api_logs_download():
             "SAGE_KEY_PATH",
             "FULL_NODE_CERT_PATH",
             "FULL_NODE_KEY_PATH",
+            "SAGE_FINGERPRINT",
             "SPACESCAN_API_KEY",
             "BOT_LOCAL_WRITE_TOKEN",
         )
