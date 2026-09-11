@@ -30775,12 +30775,7 @@ def defer_publication_dispatch_before_effect(
             WHERE publication_id=? AND state='claimed'
               AND claim_owner_run_id=? AND claim_token=?
               AND claim_generation=? AND row_version=?
-              AND claim_expires_at>=?
               AND dispatch_started_at IS NOT NULL AND request_sha256=?
-              AND recovery_generation=(
-                  SELECT generation FROM runtime_safety_latch
-                  WHERE singleton_id=1 AND state='resolved'
-              )
             """,
             (
                 deferred,
@@ -30792,7 +30787,6 @@ def defer_publication_dispatch_before_effect(
                 token,
                 generation,
                 version,
-                deferred,
                 request_sha256,
             ),
         )

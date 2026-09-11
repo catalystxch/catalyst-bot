@@ -2361,6 +2361,7 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
     authorization_calls = []
     authorization_snapshots = []
     transport_calls = []
+    clock = {"now": LATER}
 
     def authorize():
         authorization_calls.append(True)
@@ -2370,7 +2371,17 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
         authorization_snapshots.append(claimed[0])
         assert claimed[0]["dispatch_started_at"] is not None
         assert claimed[0]["request_sha256"] is not None
-        return next(authorizations)
+        authorized = next(authorizations)
+        if not authorized:
+            clock["now"] = AFTER_LEASE
+            isolated_database.trip_runtime_safety_latch(
+                reason_code="MARKET_AUTHORITY_WITHDRAWN",
+                blocking_operation_ids=[f"publication:{publisher}"],
+                wallet_fingerprint_hash=_sha("wallet"),
+                network="mainnet",
+                tripped_at=AFTER_LEASE,
+            )
+        return authorized
 
     def accepted_post(url, **kwargs):
         transport_calls.append((url, kwargs))
@@ -2388,7 +2399,7 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
     manager.enable_durable_outbox(
         owner_run_id=f"authority-worker-{publisher}",
         network="mainnet",
-        now_provider=lambda: LATER,
+        now_provider=lambda: clock["now"],
         lease_expires_provider=lambda _now: LEASE_END,
         dispatch_authorizer=authorize,
     )
