@@ -23,6 +23,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 250,
         "depth_price_envelope_bps": 250,
         "persistence_jitter_bps": 100,
+        "churn_minimum_ratio": Decimal("0.1"),
     },
     "balanced": {
         "depth_multiple": Decimal("2"),
@@ -34,6 +35,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 400,
         "depth_price_envelope_bps": 400,
         "persistence_jitter_bps": 100,
+        "churn_minimum_ratio": Decimal("0.1"),
     },
     "aggressive": {
         "depth_multiple": Decimal("1.5"),
@@ -45,6 +47,7 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 600,
         "depth_price_envelope_bps": 600,
         "persistence_jitter_bps": 100,
+        "churn_minimum_ratio": Decimal("0.1"),
     },
 }
 
@@ -402,7 +405,18 @@ class MarketConfidenceEngine:
         if ask_depth < required_depth:
             reasons.append("insufficient_ask_depth")
 
-        manipulation_score = self._churn_score(seen_ids, current_time)
+        churn_minimum_amount = int(
+            (
+                Decimal(configured_offer_size_mojos)
+                * Decimal(self._thresholds["churn_minimum_ratio"])
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        churn_ids = {
+            offer.offer_id
+            for offer in (*executable_bids, *executable_asks)
+            if offer.amount_mojos >= churn_minimum_amount
+        }
+        manipulation_score = self._churn_score(churn_ids, current_time)
         if manipulation_score:
             reasons.append("rapid_offer_churn")
 
@@ -488,8 +502,8 @@ class MarketConfidenceEngine:
         trusted_bid = self._last_trusted_bid
         trusted_ask = self._last_trusted_ask
 
-        self._prior_offer_ids = frozenset(seen_ids)
-        self._prior_observed_at = current_time if seen_ids else None
+        self._prior_offer_ids = frozenset(churn_ids)
+        self._prior_observed_at = current_time if churn_ids else None
         return MarketConfidenceResult(
             state=state,
             derived_at=current_time,

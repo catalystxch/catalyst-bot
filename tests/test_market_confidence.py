@@ -440,3 +440,73 @@ def test_rapid_offer_churn_raises_manipulation_and_never_improves_confidence():
     assert churned.manipulation_score > 0
     assert "rapid_offer_churn" in churned.reason_codes
     assert churned.derived_thresholds["manipulation_amber"] == 50
+
+
+@pytest.mark.parametrize(
+    ("junk_bid", "junk_ask"),
+    [
+        ("0.01", "1"),
+        ("0.0985", "0.1015"),
+    ],
+)
+def test_non_executable_dust_churn_cannot_force_red_confidence(
+    junk_bid, junk_ask
+):
+    def splash_with_rotating_junk(suffix: str, at: datetime):
+        offers = [
+            {
+                "offer_id": "stable-s-b",
+                "side": "buy",
+                "price": "0.099",
+                "amount_mojos": 3_000,
+            },
+            {
+                "offer_id": "stable-s-a",
+                "side": "sell",
+                "price": "0.101",
+                "amount_mojos": 3_000,
+            },
+        ]
+        offers.extend(
+            {
+                "offer_id": f"junk-{suffix}-b-{index}",
+                "side": "buy",
+                "price": junk_bid,
+                "amount_mojos": 1,
+            }
+            for index in range(10)
+        )
+        offers.extend(
+            {
+                "offer_id": f"junk-{suffix}-a-{index}",
+                "side": "sell",
+                "price": junk_ask,
+                "amount_mojos": 1,
+            }
+            for index in range(10)
+        )
+        return _observation("splash", {"offers": offers}, at=at)
+
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    baseline = engine.evaluate(
+        observations=(_dexie(), splash_with_rotating_junk("first", NOW)),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    rotated = engine.evaluate(
+        observations=(
+            _dexie(at=NOW + timedelta(seconds=5)),
+            splash_with_rotating_junk("second", NOW + timedelta(seconds=5)),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(seconds=5),
+    )
+
+    assert baseline.state == "GREEN"
+    assert rotated.state == "GREEN"
+    assert rotated.manipulation_score == 0
+    assert "rapid_offer_churn" not in rotated.reason_codes
+    if junk_bid == "0.01":
+        assert "out_of_range_depth_excluded" in rotated.reason_codes
