@@ -669,3 +669,29 @@ def test_prestart_status_does_not_warn_when_operator_has_not_selected_a_pair(
         not (call.args and call.args[0] in {"warning", "error"})
         for call in events.call_args_list
     )
+
+
+def test_live_settings_guidance_uses_offer_book_terms_only():
+    from blueprints import config_bp
+
+    with api_server.app.test_request_context(
+        "/api/settings/validate",
+        method="POST",
+        json={
+            "dynamic_spread_enabled": False,
+            "inventory_enabled": True,
+            "competitor_aware_enabled": True,
+        },
+    ):
+        payload = config_bp.api_settings_validate().get_json()
+
+    guidance = " ".join(payload["warnings"])
+    assert "offer-book confidence safeguards remain active" in guidance
+    assert "arb-gap" not in guidance
+    assert "pool-depth" not in guidance
+
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+    assert "pool-depth scaling" not in html
+    assert "arb-gap" not in html

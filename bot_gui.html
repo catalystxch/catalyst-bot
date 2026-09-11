@@ -15868,9 +15868,9 @@
                         title: 'Switching to fixed spread',
                         message: `Turning Dynamic Spreads OFF means the bot will use the <strong>fixed ` +
                                  `Spread</strong> value from your settings (not the Base Spread slider above). ` +
-                                 `<br><br>Volatility scaling, fill-rate scaling, and pool-depth scaling will ` +
-                                 `<strong>all stop</strong>. Existing offers stay live; new requotes will use ` +
-                                 `the fixed spread. ` +
+                                 `<br><br>Volatility and fill-rate scaling will <strong>stop</strong>. ` +
+                                 `Offer-book confidence safeguards remain active. Existing offers stay ` +
+                                 `live; eligible new requotes will use the fixed spread. ` +
                                  `<br><br>Continue?`,
                         confirmText: 'Yes, turn OFF',
                         cancelText: 'Keep ON',
@@ -16085,7 +16085,7 @@
             const invOn = document.getElementById('lcToggleInventory')?.classList.contains('on');
             const compOn = document.getElementById('lcToggleCompetitor')?.classList.contains('on');
             const extras = [];
-            if (dynOn) extras.push('volatility / fill-rate / pool-depth scaling');
+            if (dynOn) extras.push('volatility / fill-rate scaling');
             if (invOn) extras.push('inventory skew');
             if (compOn) extras.push('competitor nudges');
 
