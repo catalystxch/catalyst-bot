@@ -335,6 +335,83 @@ def test_restart_preserves_pending_movement_state(isolated_db):
     assert second.confidence.trusted_midpoint == Decimal("0.00011")
 
 
+def test_fresh_dexie_settled_trade_confirms_material_move_and_is_persisted(isolated_db):
+    current_book = _book()
+    current_splash = _splash()
+    current_trades = []
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: current_book,
+        fetch_dexie_settled_trades=lambda _asset: current_trades,
+        fetch_splash_offers=lambda _asset: current_splash,
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
+    )
+    runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    current_book = {
+        "bids": [
+            {
+                "offer_id": "buy-1",
+                "price": "0.000104",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "sell-1",
+                "price": "0.000116",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+    }
+    current_splash = [
+        {
+            "offer_id": "splash-buy",
+            "side": "buy",
+            "price": "0.000104",
+            "amount_mojos": 3_000_000_000_000,
+        },
+        {
+            "offer_id": "splash-sell",
+            "side": "sell",
+            "price": "0.000116",
+            "amount_mojos": 3_000_000_000_000,
+        },
+    ]
+    current_trades = [
+        {
+            "trade_id": "confirming-trade",
+            "price": "0.00011",
+            "base_volume": "1000",
+            "target_volume": "0.11",
+            "trade_timestamp": int((NOW + timedelta(seconds=19)).timestamp() * 1000),
+            "type": "buy",
+        }
+    ]
+
+    result = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert result.confidence.state == "GREEN"
+    assert result.confidence.trusted_midpoint == Decimal("0.00011")
+    assert "settled_trade_confirmed_move" in result.confidence.reason_codes
+    observations = database.get_market_provider_observations(ASSET_ID, limit=10)
+    settled = [row for row in observations if row["capability"] == "settled_trades"]
+    assert settled
+    assert settled[0]["payload_sha256"] in result.confidence.evidence_digests
+
+
 def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
     runtime = OfferBookMarketRuntime(
         asset_id=ASSET_ID,

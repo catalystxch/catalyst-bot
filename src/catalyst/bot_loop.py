@@ -1406,10 +1406,34 @@ class BotLoop:
                 "source_time": snapshot["source_time"],
             }
 
+        def fetch_dexie_settled_trades(_asset_id: str) -> list[Dict]:
+            if _asset_id != asset:
+                raise ValueError("Dexie settled-trade asset changed during refresh")
+            ticker_id = (
+                str(
+                    getattr(cfg, "CAT_TICKER_ID", "")
+                    or getattr(cfg, "CAT_NAME", "")
+                    or ""
+                )
+                .strip()
+                .upper()
+            )
+            if not ticker_id:
+                raise ValueError("Dexie settled-trade ticker is unavailable")
+            if "_" not in ticker_id:
+                ticker_id = f"{ticker_id}_XCH"
+            return (
+                self.dexie_manager.fetch_v3_historical_trades(
+                    ticker_id, limit=10, force=True
+                )
+                or []
+            )
+
         self._market_runtime = OfferBookMarketRuntime(
             asset_id=asset,
             risk_preset=risk_preset,
             fetch_dexie_book=fetch_dexie,
+            fetch_dexie_settled_trades=fetch_dexie_settled_trades,
             fetch_splash_offers=lambda requested_asset: (
                 self._get_fresh_splash_confidence_offers(
                     requested_asset, now=self._market_refresh_now

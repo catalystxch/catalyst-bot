@@ -248,6 +248,7 @@ class MarketConfidenceEngine:
         configured_offer_size_mojos: int,
         now: datetime,
         settled_trade_price: Decimal | None = None,
+        supporting_evidence_digests: tuple[str, ...] = (),
     ) -> MarketConfidenceResult:
         current_time = _utc(now)
         if type(own_offer_identities) is not frozenset or any(
@@ -262,6 +263,11 @@ class MarketConfidenceEngine:
             raise ValueError("configured_offer_size_mojos must be positive")
         if settled_trade_price is not None:
             settled_trade_price = _price(settled_trade_price)
+        if type(supporting_evidence_digests) is not tuple or any(
+            type(digest) is not str or len(digest) != 64
+            for digest in supporting_evidence_digests
+        ):
+            raise ValueError("supporting evidence digests are invalid")
 
         reasons: list[str] = []
         source_health: dict[str, str] = {}
@@ -308,6 +314,7 @@ class MarketConfidenceEngine:
                 provider_midpoints[observation.provider_id] = (
                     max(bids) + min(asks)
                 ) / Decimal(2)
+        evidence_digests.extend(supporting_evidence_digests)
 
         source_conflict = self._source_conflict(provider_midpoints)
         selected_providers: set[str] | None = None

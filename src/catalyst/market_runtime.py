@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
+import json
 from typing import Callable
 
 from degraded_market import DegradedMarketController, DegradedMarketDecision
@@ -41,10 +43,15 @@ class OfferBookMarketRuntime:
         fetch_dexie_book: Callable[[str], dict],
         fetch_splash_offers: Callable[[str], list[dict]],
         fetch_splash_health: Callable[[], dict],
+        fetch_dexie_settled_trades: Callable[[str], list[dict]] | None = None,
     ) -> None:
         self.asset_id = str(asset_id).strip().lower()
         self._fetch_splash_health = fetch_splash_health
-        self._dexie = DexieOrderbookProvider(fetch_book=fetch_dexie_book)
+        self._dexie = DexieOrderbookProvider(
+            fetch_book=fetch_dexie_book,
+            fetch_settled_trades=fetch_dexie_settled_trades,
+        )
+        self._has_dexie_settled_trades = fetch_dexie_settled_trades is not None
         self._splash = SplashOfferProvider(
             fetch_offers=fetch_splash_offers,
             get_health=fetch_splash_health,
@@ -76,11 +83,23 @@ class OfferBookMarketRuntime:
         for observation in (dexie, splash):
             persist_provider_observation(observation)
 
+        settled_trade_price = None
+        supporting_evidence_digests: tuple[str, ...] = ()
+        if self._has_dexie_settled_trades:
+            settled = self._dexie.observe_settled_trade(self.asset_id, now=now)
+            persist_provider_observation(settled)
+            if settled.quality.value == "valid" and settled.fresh_until >= now:
+                payload = json.loads(settled.raw_evidence_json)
+                settled_trade_price = Decimal(payload["trade"]["price"])
+                supporting_evidence_digests = (settled.payload_sha256,)
+
         confidence = self._engine.evaluate(
             observations=(dexie, splash),
             own_offer_identities=own_offer_identities,
             configured_offer_size_mojos=configured_offer_size_mojos,
             now=now,
+            settled_trade_price=settled_trade_price,
+            supporting_evidence_digests=supporting_evidence_digests,
         )
         degraded = self._degraded.update(
             confidence_state=confidence.state,

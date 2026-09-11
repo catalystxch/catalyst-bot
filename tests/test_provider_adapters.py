@@ -130,6 +130,92 @@ def test_dexie_cached_book_keeps_source_age_instead_of_becoming_fresh_again():
     assert observation.fresh_until == cached_at + timedelta(seconds=20)
 
 
+def test_dexie_normalizes_latest_settled_trade_with_exact_price_and_time():
+    provider = DexieOrderbookProvider(
+        fetch_book=lambda _asset: {"bids": [], "asks": []},
+        fetch_settled_trades=lambda _asset: [
+            {
+                "trade_id": "older-trade",
+                "price": "0.00010",
+                "base_volume": "1000",
+                "target_volume": "0.1",
+                "trade_timestamp": int(
+                    (NOW - timedelta(seconds=30)).timestamp() * 1000
+                ),
+                "type": "buy",
+            },
+            {
+                "trade_id": "latest-trade",
+                "price": "0.00011",
+                "base_volume": "2000",
+                "target_volume": "0.22",
+                "trade_timestamp": int((NOW - timedelta(seconds=5)).timestamp() * 1000),
+                "type": "sell",
+            },
+        ],
+    )
+
+    observation = provider.observe_settled_trade(ASSET_ID, now=NOW)
+
+    assert observation.capability is Capability.SETTLED_TRADES
+    assert observation.quality is ObservationQuality.VALID
+    assert observation.source_time == NOW - timedelta(seconds=5)
+    assert observation.fresh_until == NOW + timedelta(seconds=55)
+    assert observation.identity_keys == (ASSET_ID, "latest-trade")
+    assert _payload(observation)["trade"] == {
+        "base_volume": "2000",
+        "price": "0.00011",
+        "side": "sell",
+        "target_volume": "0.22",
+        "trade_id": "latest-trade",
+    }
+
+
+def test_dexie_rejects_inexact_settled_trade_price():
+    provider = DexieOrderbookProvider(
+        fetch_book=lambda _asset: {"bids": [], "asks": []},
+        fetch_settled_trades=lambda _asset: [
+            {
+                "trade_id": "bad-trade",
+                "price": 0.00011,
+                "base_volume": "2000",
+                "target_volume": "0.22",
+                "trade_timestamp": int(NOW.timestamp() * 1000),
+                "type": "sell",
+            }
+        ],
+    )
+
+    observation = provider.observe_settled_trade(ASSET_ID, now=NOW)
+
+    assert observation.quality is ObservationQuality.INVALID
+    assert observation.reason_codes == ("malformed_provider_response",)
+
+
+def test_dexie_settled_trade_freshness_is_anchored_to_trade_time():
+    trade_time = NOW - timedelta(minutes=5)
+    provider = DexieOrderbookProvider(
+        fetch_book=lambda _asset: {"bids": [], "asks": []},
+        fetch_settled_trades=lambda _asset: [
+            {
+                "trade_id": "stale-trade",
+                "price": "0.00011",
+                "base_volume": "2000",
+                "target_volume": "0.22",
+                "trade_timestamp": int(trade_time.timestamp() * 1000),
+                "type": "sell",
+            }
+        ],
+    )
+
+    observation = provider.observe_settled_trade(ASSET_ID, now=NOW)
+
+    assert observation.quality is ObservationQuality.VALID
+    assert observation.source_time == trade_time
+    assert observation.fresh_until == trade_time + timedelta(seconds=60)
+    assert observation.fresh_until < NOW
+
+
 def test_splash_normalizes_peer_health_and_exact_offer_set():
     provider = SplashOfferProvider(
         fetch_offers=lambda _asset: [
