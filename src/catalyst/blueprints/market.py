@@ -478,9 +478,7 @@ def api_market_price_history():
     limit = max(2, min(limit, 5000))
 
     try:
-        from database import get_recent_prices
-
-        rows = get_recent_prices(asset_id, hours=hours, limit=limit)
+        rows = database.get_recent_prices(asset_id, hours=hours, limit=limit)
         points = [
             {
                 "timestamp": row.get("timestamp"),
@@ -1160,9 +1158,7 @@ def api_debug_coinprep():
             result["coin_manager_error"] = str(e)
 
     try:
-        from database import get_recent_events
-
-        events = get_recent_events(limit=20)
+        events = database.get_recent_events(limit=20)
         prep_events = [e for e in events if "coin_prep" in str(e.get("event_type", ""))]
         result["recent_coin_prep_events"] = prep_events[:10]
     except Exception:
@@ -1242,8 +1238,6 @@ def api_debug_sage_single_offer_test():
         if get_wallet_type() != "sage":
             return jsonify({"ok": False, "error": "sage_only_debug_route"}), 400
 
-        from database import get_smallest_free_tier_spare
-
         def _extract_trade_id(result: dict) -> str:
             if not isinstance(result, dict):
                 return ""
@@ -1297,8 +1291,8 @@ def api_debug_sage_single_offer_test():
             result["cancel_result"] = cancel_res
             return result
 
-        xch_coin = get_smallest_free_tier_spare("xch")
-        cat_coin = get_smallest_free_tier_spare("cat")
+        xch_coin = database.get_smallest_free_tier_spare("xch")
+        cat_coin = database.get_smallest_free_tier_spare("cat")
         if not xch_coin or not cat_coin:
             return jsonify(
                 {
