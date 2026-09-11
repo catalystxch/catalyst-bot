@@ -254,6 +254,42 @@ def test_returning_to_logs_fetches_fresh_events_immediately(page):
     assert page.evaluate("window.__logsRequestCount") == 1
 
 
+def test_logs_backfill_includes_latest_non_debug_info_event(page):
+    """The Logs tab must not keep stale rows when the newest event is ordinary info."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    log_panel = page.locator("#logsContainer")
+    page.evaluate(
+        """() => {
+            window.apiFetch = async (path) => {
+                if (!String(path).includes('/logs?limit=2000')) {
+                    throw new Error(`Unexpected test request: ${path}`);
+                }
+                return new Response(JSON.stringify({
+                    logs: [{
+                        id: 3,
+                        timestamp: '2026-09-11 03:31:33',
+                        severity: 'info',
+                        event_type: 'cat_selected',
+                        message: 'Trading pair selected: Monkeyzoo Token (wallet 2)',
+                        data: null,
+                    }],
+                }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            document.getElementById('logsContainer').innerHTML = '<div>stale-startup-entry</div>';
+            window.v4SwitchView('dashboard');
+        }"""
+    )
+
+    page.evaluate("window.v4SwitchView('logs')")
+
+    expect(log_panel).to_contain_text("Trading pair selected", timeout=2_000)
+    expect(log_panel).not_to_contain_text("stale-startup-entry")
+
+
 def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
     """A resolved confidence snapshot must replace the warming placeholder."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

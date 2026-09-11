@@ -27712,6 +27712,16 @@
             return true;
         }
 
+        function shouldShowLogPanelEvent(severity) {
+            // The dedicated Logs view is an operator audit trail, not the
+            // compact Dashboard activity feed. Keep every current-session
+            // event except debug chatter so tab re-entry cannot leave a
+            // newer ordinary-info event hidden behind an older allowlisted
+            // row. shouldShowSystemLogEvent remains intentionally selective
+            // for the Dashboard feed.
+            return String(severity || 'info') !== 'debug';
+        }
+
         function formatSystemLogMessage(eventType, message) {
             const evt = String(eventType || '');
             const icon = SYSTEM_LOG_EVENT_ICONS[evt]
@@ -28206,8 +28216,9 @@
                     try { fetchPnLData(); } catch (e) {}
                 }
 
-                // System log: show warnings/errors always; info only for allowlisted events
-                if (!shouldShowSystemLogEvent(sev, evt)) return;
+                // Dedicated Logs view: show every non-debug current-session
+                // event. The Dashboard activity feed remains allowlisted.
+                if (!shouldShowLogPanelEvent(sev)) return;
                 addLogEntry(sev, formatSystemLogMessage(evt, msg), evt);
             }
 
@@ -30195,7 +30206,7 @@
 
                 const orderedEntries = orderSystemLogEntries(entries);
                 _sysLogBuffer = orderedEntries
-                    .filter((entry) => shouldShowSystemLogEvent(entry.severity, entry.event_type))
+                    .filter((entry) => shouldShowLogPanelEvent(entry.severity))
                     .map((entry) => {
                     const parsedTimestamp = parseSystemLogTimestamp(entry.timestamp);
                     const ts = Number.isFinite(parsedTimestamp) ? new Date(parsedTimestamp) : null;
