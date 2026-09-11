@@ -89,6 +89,28 @@ def _smart_float(value, default: float = 0.0) -> float:
     return parsed
 
 
+def _cat_units_for_xch_exact(xch_amount, mid_price: Decimal) -> Decimal:
+    """Convert XCH value to CAT units without crossing a float boundary."""
+
+    if type(mid_price) is not Decimal or not mid_price.is_finite() or mid_price <= 0:
+        raise ValueError("mid_price must be a finite positive Decimal")
+    amount = xch_amount if type(xch_amount) is Decimal else Decimal(str(xch_amount))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("xch_amount must be finite and nonnegative")
+    return amount / mid_price
+
+
+def _xch_value_for_cat_exact(cat_amount, mid_price: Decimal) -> Decimal:
+    """Convert CAT units to XCH value without crossing a float boundary."""
+
+    if type(mid_price) is not Decimal or not mid_price.is_finite() or mid_price <= 0:
+        raise ValueError("mid_price must be a finite positive Decimal")
+    amount = cat_amount if type(cat_amount) is Decimal else Decimal(str(cat_amount))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("cat_amount must be finite and nonnegative")
+    return amount * mid_price
+
+
 def _sell_ladder_cat_prep_total(
     *,
     mid_price,
@@ -1429,9 +1451,12 @@ def _calculate_smart_defaults(
         messages=messages,
     )
     trusted_mid_price = price_info["mid_price"]
+    if type(trusted_mid_price) is not Decimal:
+        return jsonify({"error": "Trusted market midpoint is not exact"}), 409
+    mid_price_decimal = trusted_mid_price
     dexie_price = float(price_info["dexie_price"])
     tibet_price = float(price_info["tibet_price"])
-    mid_price = float(trusted_mid_price)
+    mid_price = float(mid_price_decimal)
     arb_gap_bps = float(price_info["arb_gap_bps"])
     spacescan_gap_bps = float(price_info["spacescan_gap_bps"])
     has_both_prices = price_info["has_both_prices"]
@@ -2136,7 +2161,9 @@ def _calculate_smart_defaults(
     # of capital stranded in the topup buffer.
     _post_pools_xch = max(0.0, _avail_xch - _fee_pool_xch - _sniper_pool_xch)
     if mid_price and mid_price > 0 and _avail_cat > 0:
-        _cat_xch_equiv = round(_avail_cat * mid_price, 4)
+        _cat_xch_equiv = float(
+            round(_xch_value_for_cat_exact(_avail_cat, mid_price_decimal), 4)
+        )
         _bottleneck_xch = min(_post_pools_xch, _cat_xch_equiv)
         _cat_limited_trading = _cat_xch_equiv < _post_pools_xch
     else:
@@ -2390,7 +2417,10 @@ def _calculate_smart_defaults(
             _den = max(
                 1e-9, (n * _TIER_CAPITAL_FACTOR + _SPARE_OVERHEAD) * _CP_HEADROOM_MULT
             )
-            return (_avail_cat * mid_price) / _den
+            return float(
+                _xch_value_for_cat_exact(_avail_cat, mid_price_decimal)
+                / Decimal(str(_den))
+            )
 
         def _solve_base(n):
             return min(_solve_base_xch(n), _solve_base_cat(n))
@@ -2405,8 +2435,9 @@ def _calculate_smart_defaults(
                 (_xch_units - _BUY_SPARE_OVERHEAD) / max(1e-9, _BUY_TIER_FACTOR)
             )
             if mid_price and mid_price > 0 and _avail_cat > 0:
-                _cat_units = (_avail_cat * mid_price) / (
-                    _MIN_OFFER_XCH * _CP_HEADROOM_MULT
+                _cat_units = float(
+                    _xch_value_for_cat_exact(_avail_cat, mid_price_decimal)
+                    / Decimal(str(_MIN_OFFER_XCH * _CP_HEADROOM_MULT))
                 )
                 _n_cat = int(
                     (_cat_units - _SPARE_OVERHEAD) / max(1e-9, _TIER_CAPITAL_FACTOR)
@@ -2432,7 +2463,9 @@ def _calculate_smart_defaults(
         # CAT-backed sell capacity at the trial base size.
         _n_sell = _target_n
         if mid_price and mid_price > 0 and _avail_cat > 0 and _base_size > 0:
-            _cat_base = _base_size / mid_price
+            _cat_base = float(
+                _cat_units_for_xch_exact(_base_size, mid_price_decimal)
+            )
             if _cat_base > 0:
                 _cat_units_avail = _avail_cat / _cat_base
                 _n_sell = max(
@@ -2453,7 +2486,9 @@ def _calculate_smart_defaults(
 
         # Re-check CAT capacity against the definitive final base_size.
         if mid_price and mid_price > 0 and _base_size > 0:
-            _cat_per_offer_final = _base_size / mid_price
+            _cat_per_offer_final = float(
+                _cat_units_for_xch_exact(_base_size, mid_price_decimal)
+            )
             if _cat_per_offer_final > 0:
                 _cat_units_avail = _avail_cat / _cat_per_offer_final
                 _n_sell = max(
@@ -2694,7 +2729,7 @@ def _calculate_smart_defaults(
             # if the user clicks it the spare counts arrive here updated, so
             # the defensive max is never needed.
             _total_cat_prep = _sell_ladder_cat_prep_total(
-                mid_price=mid_price,
+                mid_price=mid_price_decimal,
                 spread_bps=base_spread_bps,
                 min_edge_bps=inner_edge_bps,
                 max_sell=_smart_max_sell,
@@ -2940,7 +2975,13 @@ def _calculate_smart_defaults(
         if _smart_trade_size > 0 and _smart_max_sell > 0 and mid_price > 0:
             _cp_headroom_mult = 1 + (coin_prep_headroom_pct / 100.0)
             _cp_cat_needed = (
-                (_smart_trade_size / mid_price) * _cp_headroom_mult * _smart_max_sell
+                float(
+                    _cat_units_for_xch_exact(
+                        _smart_trade_size, mid_price_decimal
+                    )
+                )
+                * _cp_headroom_mult
+                * _smart_max_sell
             )
 
         _cp_xch_mult = min(3.0, _avail_xch / _cp_xch_needed)
@@ -3617,7 +3658,9 @@ def _calculate_smart_defaults(
         _f64_cat_budget_tokens = max(
             0.0, _avail_cat * 0.98 - _sniper_cat_tokens - _topup_cat_tokens
         )
-        _f64_sell_budget_xch = _f64_cat_budget_tokens * mid_price
+        _f64_sell_budget_xch = float(
+            _xch_value_for_cat_exact(_f64_cat_budget_tokens, mid_price_decimal)
+        )
 
         if _f64_sell_budget_xch > 0:
             # ── Step 2: Derive the largest sell base that fits ──
@@ -3660,7 +3703,7 @@ def _calculate_smart_defaults(
                         else _smart_sell_extreme
                     )
                     total = _sell_ladder_cat_prep_total(
-                        mid_price=mid_price,
+                        mid_price=mid_price_decimal,
                         spread_bps=base_spread_bps,
                         min_edge_bps=inner_edge_bps,
                         max_sell=_smart_max_sell,
@@ -3725,7 +3768,14 @@ def _calculate_smart_defaults(
                         + _smart_n_outer * _smart_sell_outer
                         + _smart_n_extreme * _smart_sell_extreme
                     )
-                    _sell_cat_deployed = round(_sell_live_xch / mid_price, 0)
+                    _sell_cat_deployed = round(
+                        float(
+                            _cat_units_for_xch_exact(
+                                _sell_live_xch, mid_price_decimal
+                            )
+                        ),
+                        0,
+                    )
                     _sell_cat_pct = (
                         round(_sell_cat_deployed / _avail_cat * 100, 1)
                         if _avail_cat > 0
@@ -3793,7 +3843,7 @@ def _calculate_smart_defaults(
                         else _spare_extreme
                     )
                     cat = _sell_ladder_cat_prep_total(
-                        mid_price=mid_price,
+                        mid_price=mid_price_decimal,
                         spread_bps=base_spread_bps,
                         min_edge_bps=inner_edge_bps,
                         max_sell=n,
@@ -3910,7 +3960,7 @@ def _calculate_smart_defaults(
     if _avail_cat > 0 and mid_price and mid_price > 0 and _smart_sell_inner > 0:
         _f65_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
         _f65_tier_cat = _sell_ladder_cat_prep_total(
-            mid_price=mid_price,
+            mid_price=mid_price_decimal,
             spread_bps=base_spread_bps,
             min_edge_bps=inner_edge_bps,
             max_sell=_smart_max_sell,
@@ -3972,7 +4022,7 @@ def _calculate_smart_defaults(
 
             # Verify the scaled sizes actually fit now.
             _f65_new_tier = _sell_ladder_cat_prep_total(
-                mid_price=mid_price,
+                mid_price=mid_price_decimal,
                 spread_bps=base_spread_bps,
                 min_edge_bps=inner_edge_bps,
                 max_sell=_smart_max_sell,

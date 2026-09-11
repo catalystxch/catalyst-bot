@@ -348,6 +348,28 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(accepted["price_source"], "trusted_offer_book")
         self.assertEqual(rejected["mid_price"], Decimal("0"))
 
+    def test_smart_budget_price_math_preserves_decimal_precision(self):
+        import inspect
+        from blueprints.smart_defaults import (
+            _calculate_smart_defaults,
+            _cat_units_for_xch_exact,
+            _xch_value_for_cat_exact,
+        )
+
+        price = Decimal("0.1000000000000000001")
+        self.assertEqual(
+            _cat_units_for_xch_exact(Decimal("1"), price), Decimal("1") / price
+        )
+        self.assertEqual(
+            _xch_value_for_cat_exact(Decimal("10"), price),
+            Decimal("1.0000000000000000010"),
+        )
+
+        source = inspect.getsource(_calculate_smart_defaults)
+        self.assertNotIn("_avail_cat * mid_price", source)
+        self.assertNotIn("_base_size / mid_price", source)
+        self.assertIn("mid_price=mid_price_decimal", source)
+
     def test_calculation_has_no_live_tibet_decision_inputs(self):
         import inspect
         from blueprints.smart_defaults import _calculate_smart_defaults
