@@ -230,6 +230,72 @@ def test_far_away_junk_offers_cannot_satisfy_executable_depth():
     assert "insufficient_ask_depth" in result.reason_codes
 
 
+def test_crossing_dust_cannot_move_price_or_cross_meaningful_book():
+    splash = _observation(
+        "splash",
+        {
+            "offers": [
+                {
+                    "offer_id": "stable-s-b",
+                    "side": "buy",
+                    "price": "0.099",
+                    "amount_mojos": 3_000,
+                },
+                {
+                    "offer_id": "stable-s-a",
+                    "side": "sell",
+                    "price": "0.101",
+                    "amount_mojos": 3_000,
+                },
+                {
+                    "offer_id": "crossing-dust",
+                    "side": "buy",
+                    "price": "0.102",
+                    "amount_mojos": 1,
+                },
+            ]
+        },
+    )
+
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(_dexie(), splash),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "GREEN"
+    assert result.trusted_bid == Decimal("0.099")
+    assert result.trusted_ask == Decimal("0.101")
+    assert "crossed_book" not in result.reason_codes
+
+
+def test_one_sided_provider_does_not_supply_independent_corroboration():
+    one_sided_splash = _observation(
+        "splash",
+        {
+            "offers": [
+                {
+                    "offer_id": "splash-only-bid",
+                    "side": "buy",
+                    "price": "0.05",
+                    "amount_mojos": 3_000,
+                }
+            ]
+        },
+    )
+
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(_dexie(), one_sided_splash),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "AMBER"
+    assert "single_provider_dependency" in result.reason_codes
+
+
 def test_hydrate_normalizes_legacy_empty_offer_timestamp():
     engine = MarketConfidenceEngine(risk_preset="balanced")
 
@@ -398,6 +464,69 @@ def test_hard_move_cap_rejects_even_settled_trade():
     assert result.state == "RED"
     assert result.trusted_midpoint == Decimal("0.1")
     assert "hard_price_move_cap" in result.reason_codes
+
+
+def test_corroborated_hard_move_reanchors_after_extended_persistence():
+    engine = MarketConfidenceEngine(risk_preset="conservative")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    results = []
+    for refresh in range(1, 7):
+        observed_at = NOW + timedelta(seconds=20 * refresh)
+        results.append(
+            engine.evaluate(
+                observations=(
+                    _dexie(bid="0.119", ask="0.121", at=observed_at),
+                    _splash(bid="0.119", ask="0.121", at=observed_at),
+                ),
+                own_offer_identities=frozenset(),
+                configured_offer_size_mojos=1_000,
+                now=observed_at,
+            )
+        )
+
+    assert all(result.state == "RED" for result in results[:-1])
+    assert results[-1].state == "GREEN"
+    assert results[-1].trusted_midpoint == Decimal("0.12")
+    assert "hard_move_reanchor_persistence_satisfied" in results[-1].reason_codes
+
+
+def test_single_provider_hard_move_never_reanchors():
+    engine = MarketConfidenceEngine(risk_preset="conservative")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    results = []
+    for refresh in range(1, 8):
+        observed_at = NOW + timedelta(seconds=20 * refresh)
+        results.append(
+            engine.evaluate(
+                observations=(
+                    _dexie(
+                        bid="0.119",
+                        ask="0.121",
+                        amount=3_000,
+                        at=observed_at,
+                    ),
+                ),
+                own_offer_identities=frozenset(),
+                configured_offer_size_mojos=1_000,
+                now=observed_at,
+            )
+        )
+
+    assert all(result.state == "RED" for result in results)
+    assert results[-1].trusted_midpoint == Decimal("0.1")
+    assert "hard_price_move_cap" in results[-1].reason_codes
 
 
 def test_chain_evidence_overrides_provider_conflict_but_stays_amber():

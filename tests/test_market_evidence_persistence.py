@@ -91,6 +91,30 @@ def test_confidence_snapshot_survives_connection_restart(isolated_db):
     assert restored["source_health"] == {"dexie": "degraded", "splash": "valid"}
 
 
+def test_confidence_snapshot_preserves_whole_number_prices(isolated_db):
+    snapshot = MarketConfidenceSnapshot(
+        asset_id=ASSET_ID,
+        state="GREEN",
+        derived_at=NOW,
+        trusted_midpoint=Decimal("10"),
+        trusted_bid=Decimal("9"),
+        trusted_ask=Decimal("11"),
+        degraded_since=None,
+        withdrawal_stage="NONE",
+        recovery_refreshes=0,
+        reason_codes=(),
+        source_health={"dexie": "valid", "splash": "valid"},
+        evidence_digests=("ab" * 32,),
+    )
+
+    persist_confidence_snapshot(snapshot)
+    restored = database.get_latest_market_confidence_snapshot(ASSET_ID)
+
+    assert restored["trusted_midpoint"] == "10"
+    assert restored["trusted_bid"] == "9"
+    assert restored["trusted_ask"] == "11"
+
+
 def test_evidence_compaction_keeps_daily_non_sensitive_summary(isolated_db):
     old = NOW - timedelta(days=31)
     persist_provider_observation(_provider_observation(old))

@@ -49,8 +49,10 @@ def _decimal_text(value: Decimal | None, label: str) -> str | None:
         raise TypeError(f"{label} must be a Decimal")
     if not value.is_finite() or value <= 0:
         raise ValueError(f"{label} must be finite and positive")
-    text = format(value, "f").rstrip("0").rstrip(".")
-    return text or "0"
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:

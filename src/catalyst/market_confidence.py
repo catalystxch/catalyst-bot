@@ -23,7 +23,8 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 250,
         "depth_price_envelope_bps": 250,
         "persistence_jitter_bps": 100,
-        "churn_minimum_ratio": Decimal("0.1"),
+        "minimum_evidence_ratio": Decimal("0.1"),
+        "hard_move_reanchor_refreshes": 6,
     },
     "balanced": {
         "depth_multiple": Decimal("2"),
@@ -35,7 +36,8 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 400,
         "depth_price_envelope_bps": 400,
         "persistence_jitter_bps": 100,
-        "churn_minimum_ratio": Decimal("0.1"),
+        "minimum_evidence_ratio": Decimal("0.1"),
+        "hard_move_reanchor_refreshes": 5,
     },
     "aggressive": {
         "depth_multiple": Decimal("1.5"),
@@ -47,7 +49,8 @@ _PRESETS: dict[str, dict[str, Decimal | int]] = {
         "source_conflict_bps": 600,
         "depth_price_envelope_bps": 600,
         "persistence_jitter_bps": 100,
-        "churn_minimum_ratio": Decimal("0.1"),
+        "minimum_evidence_ratio": Decimal("0.1"),
+        "hard_move_reanchor_refreshes": 4,
     },
 }
 
@@ -275,12 +278,20 @@ class MarketConfidenceEngine:
         ):
             raise ValueError("supporting evidence digests are invalid")
 
+        minimum_offer_amount = int(
+            (
+                Decimal(configured_offer_size_mojos)
+                * Decimal(self._thresholds["minimum_evidence_ratio"])
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+
         reasons: list[str] = []
         source_health: dict[str, str] = {}
         evidence_digests: list[str] = []
         provider_offers: dict[str, list[_Offer]] = {}
         provider_midpoints: dict[str, Decimal] = {}
         excluded_own = 0
+        dust_offers: list[_Offer] = []
 
         ordered = sorted(
             tuple(observations),
@@ -311,6 +322,8 @@ class MarketConfidenceEngine:
             for offer in offers:
                 if offer.offer_id in own_offer_identities:
                     excluded_own += 1
+                elif offer.amount_mojos < minimum_offer_amount:
+                    dust_offers.append(offer)
                 else:
                     independent.append(offer)
             provider_offers[observation.provider_id] = independent
@@ -382,7 +395,24 @@ class MarketConfidenceEngine:
         )
         bid_depth = sum(offer.amount_mojos for offer in executable_bids)
         ask_depth = sum(offer.amount_mojos for offer in executable_asks)
-        if len(executable_bids) != len(bids) or len(executable_asks) != len(asks):
+        dust_out_of_range = any(
+            (
+                offer.side == "buy"
+                and best_bid is not None
+                and offer.price < best_bid * (Decimal(1) - envelope)
+            )
+            or (
+                offer.side == "sell"
+                and best_ask is not None
+                and offer.price > best_ask * (Decimal(1) + envelope)
+            )
+            for offer in dust_offers
+        )
+        if (
+            len(executable_bids) != len(bids)
+            or len(executable_asks) != len(asks)
+            or dust_out_of_range
+        ):
             reasons.append("out_of_range_depth_excluded")
         required_depth = int(
             (
@@ -405,17 +435,7 @@ class MarketConfidenceEngine:
         if ask_depth < required_depth:
             reasons.append("insufficient_ask_depth")
 
-        churn_minimum_amount = int(
-            (
-                Decimal(configured_offer_size_mojos)
-                * Decimal(self._thresholds["churn_minimum_ratio"])
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        churn_ids = {
-            offer.offer_id
-            for offer in (*executable_bids, *executable_asks)
-            if offer.amount_mojos >= churn_minimum_amount
-        }
+        churn_ids = {offer.offer_id for offer in (*executable_bids, *executable_asks)}
         manipulation_score = self._churn_score(churn_ids, current_time)
         if manipulation_score:
             reasons.append("rapid_offer_churn")
@@ -423,13 +443,40 @@ class MarketConfidenceEngine:
         hard_cap = False
         pending = False
         settled_confirmation = False
+        usable_provider_count = sum(
+            1
+            for provider in provider_midpoints
+            if selected_providers is None or provider in selected_providers
+        )
         if proposed_midpoint is not None and self._last_trusted_midpoint is not None:
             move_bps = _basis_points(proposed_midpoint, self._last_trusted_midpoint)
             hard_cap = move_bps > Decimal(self._thresholds["hard_move_cap_bps"])
             if hard_cap:
-                reasons.append("hard_price_move_cap")
-                self._pending_midpoint = None
-                self._pending_refreshes = 0
+                corroborated = not source_conflict and usable_provider_count >= 2
+                pending_anchor_matches = (
+                    self._pending_midpoint is not None
+                    and _basis_points(proposed_midpoint, self._pending_midpoint)
+                    <= Decimal(self._thresholds["persistence_jitter_bps"])
+                )
+                if not corroborated:
+                    reasons.append("hard_price_move_cap")
+                    self._pending_midpoint = None
+                    self._pending_refreshes = 0
+                else:
+                    if pending_anchor_matches:
+                        self._pending_refreshes += 1
+                    else:
+                        self._pending_midpoint = proposed_midpoint
+                        self._pending_refreshes = 1
+                    if self._pending_refreshes >= int(
+                        self._thresholds["hard_move_reanchor_refreshes"]
+                    ):
+                        hard_cap = False
+                        reasons.append("hard_move_reanchor_persistence_satisfied")
+                        self._pending_midpoint = None
+                        self._pending_refreshes = 0
+                    else:
+                        reasons.append("hard_price_move_cap")
             elif move_bps > Decimal(self._thresholds["material_move_bps"]):
                 settled_confirmation = (
                     settled_trade_price is not None
@@ -471,11 +518,6 @@ class MarketConfidenceEngine:
             or hard_cap
             or (source_conflict and "chain_override_source_conflict" not in reasons)
             or manipulation_score >= int(self._thresholds["manipulation_red"])
-        )
-        usable_provider_count = sum(
-            1
-            for provider, rows in provider_offers.items()
-            if rows and (selected_providers is None or provider in selected_providers)
         )
         amber = bool(
             pending
