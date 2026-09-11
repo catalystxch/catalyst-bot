@@ -157,7 +157,10 @@ def validate_config(cfg) -> ValidationReport:
             "EXPECTED_CANCEL_REQUOTES",
             "EXPECTED_CANCEL_REQUOTES cannot be negative",
         )
-    competition_cooldown = getattr(cfg, "COMPETITION_COOLDOWN_SECS", 0)
+    # Older Config-like callers may not expose the v1.4 competition setting.
+    # Absence retains the safe production default; an explicit zero remains
+    # invalid and is covered by the post-TibetSwap configuration tests.
+    competition_cooldown = getattr(cfg, "COMPETITION_COOLDOWN_SECS", 60)
     if competition_cooldown < 1:
         err(
             "COMPETITION_COOLDOWN_SECS",

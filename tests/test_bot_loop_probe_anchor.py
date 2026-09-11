@@ -82,6 +82,7 @@ fake_database.get_events_since = lambda *args, **kwargs: []
 fake_database.get_open_offers = lambda *args, **kwargs: []
 fake_database.get_stats = lambda: {}
 fake_database.get_offer = lambda tid, *args, **kwargs: {"dexie_id": f"dexie-{tid}"}
+fake_database.get_active_offer_market_identities = lambda *args, **kwargs: set()
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.backfill_verified_fills_from_offers = lambda *args, **kwargs: 0

@@ -254,181 +254,159 @@ def test_returning_to_logs_fetches_fresh_events_immediately(page):
     assert page.evaluate("window.__logsRequestCount") == 1
 
 
-def test_inactive_amm_monitor_is_not_shown_as_still_gathering(page):
-    """A resolved inactive monitor state must not look like an endless fetch."""
+def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
+    """A resolved confidence snapshot must replace the warming placeholder."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
         """() => {
-            window.updateAmmStatusBar({
-                available: false,
-                amm_price: null,
-                xch_reserve: null,
-                token_reserve: null,
-                fetched_at: 0,
-                pair_id: '',
-                total_polls: 0,
-                failed_polls: 0,
-                consecutive_failures: 0,
-                last_success_ago_secs: null,
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_attributable_depth'],
+                },
+                evidence: { source_ids: [] },
+                providers: {},
+                metrics: {},
             });
         }"""
     )
 
-    expect(page.locator("#ammPlaceholder")).to_contain_text(
-        "TibetSwap monitor inactive"
+    expect(page.locator("#marketConfidencePlaceholder")).to_be_hidden()
+    expect(page.locator("#marketConfidenceState")).to_have_text("RED")
+    expect(page.locator("#marketConfidenceReasons")).to_have_text(
+        "insufficient attributable depth"
     )
-    expect(
-        page.locator("#ammPlaceholder .v4-data-strip-placeholder-dots")
-    ).to_be_hidden()
 
 
-def test_market_intel_names_confirmed_tibetswap_outage(page):
-    """Market Intel must distinguish a TibetSwap outage from an absent pool."""
+def test_market_intel_explains_tibetswap_retirement(page):
+    """Market Intel must explain that TibetSwap is historical-only in v1.4."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    page.evaluate(
-        """() => {
-            window.renderTibetSlippageContext({
-                available: false,
-                error: 'TibetSwap quote unavailable',
-                message: 'TibetSwap outage (HTTP 502): pool depth and slippage are unavailable. CATalyst is using Dexie-only pricing; AMM drift protection is unavailable.',
-                provider: 'tibetswap',
-                reason: 'provider_outage',
-                status_code: 502,
-            });
-        }"""
-    )
 
     expect(page.locator("#intelTibetContext")).to_have_text(
-        "TibetSwap outage (HTTP 502): pool depth and slippage are unavailable. "
-        "CATalyst is using Dexie-only pricing; AMM drift protection is unavailable."
+        "TibetSwap shut down; historical TibetSwap data is retained as read-only "
+        "history and never drives a live decision."
     )
-    expect(page.locator("#intelSlippage")).to_have_text("Unavailable")
-    expect(page.locator("#intelPoolRatio")).to_have_text("Unavailable")
+    expect(page.locator("#intelSlippage")).to_be_hidden()
+    expect(page.locator("#intelPoolRatio")).to_be_hidden()
 
 
-def test_dashboard_diagnostics_do_not_render_false_tibet_values_during_outage(page):
-    """The TibetSwap outage must not look like a zero pool or zero arb gap."""
+def test_dashboard_confidence_does_not_invent_tradable_depth(page):
+    """Red confidence must not turn absent attributable depth into zero-valued safety."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
         """() => {
-            window.renderMarketSummaryVenueState({
-                has_data: true,
-                dexie_depth_xch: 420,
-                pool_xch: 0,
-                arb_gap_bps: 0,
-                tibet_available: false,
-                tibet_reason: 'provider_outage',
-                tibet_status_code: 502,
-            });
-            window.updateIntelDiagnostics({
-                pricing: { bid: 0.00006723, ask: 0.00006792 },
-                arb_gap_bps: 0,
-                chia_health: { status: 'healthy' },
-                diagnostics: { spacescan_enabled: true },
-            });
-        }"""
-    )
-
-    expect(page.locator("#mktTibetDepth")).to_have_text("Tibet: unavailable")
-    expect(page.locator("#mktArbGap")).to_have_text("Unavailable")
-    expect(page.locator("#mktArbSub")).to_have_text("TibetSwap outage — Dexie-only")
-    expect(page.locator("#coverageTibet")).to_have_text("outage")
-    expect(page.locator("#intelArbGapTrend")).to_have_text("Unavailable")
-    expect(page.locator("#intelArbGapTrendSub")).to_have_text(
-        "TibetSwap outage — Dexie-only"
-    )
-
-
-def test_dashboard_diagnostics_do_not_render_false_tibet_values_without_pool(page):
-    """A reachable TibetSwap API with no pool cannot supply depth or arb data."""
-    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
-    page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    rendered = page.evaluate(
-        """() => {
-            window.renderMarketSummaryVenueState({
-                has_data: true,
-                dexie_depth_xch: 128.35,
-                pool_xch: 0,
-                tibet_price: 0,
-                arb_gap_bps: 0,
-                tibet_available: true,
-                tibet_reason: 'no_pool',
-            });
-            window.updateMarketHealth({
-                status: 'green',
-                message: 'Market healthy — bot operating normally',
-                metrics: { arb_gap_bps: '0', pool_depth_ratio: '0' },
-            });
-            window.updateIntelDiagnostics({
-                pricing: { bid: 0.00007343, ask: 0.00007860 },
-                arb_gap_bps: 0,
-                chia_health: { status: 'healthy' },
-                diagnostics: { spacescan_enabled: true },
-            });
-            return {
-                depth: document.getElementById('mktTibetDepth').textContent,
-                gap: document.getElementById('mktArbGap').textContent,
-                sub: document.getElementById('mktArbSub').textContent,
-                healthGap: document.getElementById('ccArbGap').textContent,
-                healthPool: document.getElementById('ccPoolDepth').textContent,
-                intelCoverage: document.getElementById('coverageTibet').textContent,
-                intelGap: document.getElementById('intelArbGapTrend').textContent,
-                intelGapSub: document.getElementById('intelArbGapTrendSub').textContent,
-            };
-        }"""
-    )
-
-    assert rendered == {
-        "depth": "Tibet: no pool",
-        "gap": "Unavailable",
-        "sub": "No TibetSwap pool — Dexie-only",
-        "healthGap": "Unavailable",
-        "healthPool": "Unavailable",
-        "intelCoverage": "none",
-        "intelGap": "Unavailable",
-        "intelGapSub": "No TibetSwap pool — Dexie-only",
-    }
-
-
-def test_dashboard_market_health_marks_tibet_metrics_unavailable_during_outage(page):
-    """The TibetSwap outage must not render AMM-only health metrics as zero."""
-    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
-    page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    page.evaluate(
-        """() => {
-            window.updateMarketHealth({
-                status: 'amber',
-                message: 'Market degraded — TibetSwap unavailable; Dexie-only pricing active without AMM drift protection',
-                conditions: [{
-                    level: 'amber',
-                    text: 'TibetSwap API unavailable — Dexie-only pricing; AMM drift protection and reference price unavailable',
-                }],
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    trusted_bid: null,
+                    trusted_ask: null,
+                    reason_codes: ['stale_provider_evidence'],
+                },
                 metrics: {
-                    pricing_mode: 'dexie_only',
-                    tibetswap_available: false,
-                    tibetswap_status_code: 502,
-                    arb_gap_bps: '0',
-                    pool_depth_ratio: '0',
+                    independent_bid_depth_xch: 0,
+                    independent_ask_depth_xch: 0,
+                },
+                evidence: { source_ids: [] },
+                providers: {
+                    dexie: { status: 'stale', reason_codes: ['evidence_expired'] },
                 },
             });
         }"""
     )
 
-    expect(page.locator("#ccHealthMsg")).to_have_text(
-        "Market degraded — TibetSwap unavailable; Dexie-only pricing active without AMM drift protection"
+    expect(page.locator("#mktPoolDepth")).to_have_text("—")
+    expect(page.locator("#mktArbGap")).to_have_text("RED")
+    expect(page.locator("#mktArbSub")).to_have_text("stale provider evidence")
+    expect(page.locator("#marketTrustedRange")).to_have_text("No tradable range")
+    expect(page.locator("#marketProviderHealth")).to_contain_text(
+        "dexie stale (evidence expired)"
     )
-    expect(page.locator("#ccArbGap")).to_have_text("Unavailable")
-    expect(page.locator("#ccPoolDepth")).to_have_text("Unavailable")
+
+
+def test_dashboard_renders_attributable_confidence_depth(page):
+    """A coherent confidence snapshot drives trusted range and independent depth."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    rendered = page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'GREEN',
+                    trusted_bid: '0.00007343',
+                    trusted_ask: '0.00007860',
+                    reason_codes: [],
+                },
+                metrics: {
+                    independent_bid_depth_xch: 12.25,
+                    independent_ask_depth_xch: 9.75,
+                    required_depth_xch: 2,
+                },
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {
+                    dexie: { status: 'fresh', reason_codes: [] },
+                    splash: { status: 'fresh', reason_codes: [] },
+                },
+            });
+            return {
+                depth: document.getElementById('mktPoolDepth').textContent,
+                bidDepth: document.getElementById('mktDexieDepth').textContent,
+                askDepth: document.getElementById('mktAskDepth').textContent,
+                confidence: document.getElementById('mktArbGap').textContent,
+                range: document.getElementById('marketTrustedRange').textContent,
+            };
+        }"""
+    )
+
+    assert rendered == {
+        "depth": "22.00 XCH",
+        "bidDepth": "Bid: 12.25 XCH",
+        "askDepth": "Ask: 9.75 XCH",
+        "confidence": "GREEN",
+        "range": "0.00007343 – 0.00007860 XCH",
+    }
+
+
+def test_dashboard_market_health_uses_authoritative_confidence_snapshot(page):
+    """Health cards must use the durable confidence snapshot, not legacy AMM fields."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'AMBER',
+                    reason_codes: ['single_provider_evidence'],
+                },
+                metrics: { required_depth_xch: 1.25 },
+                evidence: { source_ids: ['dexie'] },
+                providers: { dexie: { status: 'fresh', reason_codes: [] } },
+            });
+            window.updateMarketHealth({
+                status: 'amber',
+                message: 'Market restricted — independent evidence is incomplete',
+                conditions: [{
+                    level: 'amber',
+                    text: 'Only one attributable provider currently confirms the book',
+                }],
+                metrics: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Market restricted — independent evidence is incomplete"
+    )
+    expect(page.locator("#ccArbGap")).to_have_text("AMBER")
+    expect(page.locator("#ccPoolDepth")).to_have_text("1.2500 XCH / side")
     expect(page.locator("#ccConditions")).to_contain_text(
-        "TibetSwap API unavailable — Dexie-only pricing"
+        "Only one attributable provider currently confirms the book"
     )
 
 
@@ -450,19 +428,30 @@ def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
                     decimals: 3,
                 },
             };
-            apiFetch = async () => new Response(JSON.stringify({
-                has_data: true,
-                best_bid: 0.0000672337521645723,
-                best_ask: 0.0000679213506120472,
-                volume_24h: 0.242291699794,
-                dexie_depth_xch: 420,
-                pool_xch: 0,
-                arb_gap_bps: 0,
-                mid_price: 0.0000675775515,
-                tibet_available: false,
-                tibet_reason: 'provider_outage',
-                tibet_status_code: 502,
-            }), { status: 200 });
+            apiFetch = async (url) => new Response(JSON.stringify(
+                String(url).includes('/market/confidence')
+                    ? {
+                        confidence: {
+                            state: 'GREEN',
+                            trusted_bid: '0.0000672337521645723',
+                            trusted_ask: '0.0000679213506120472',
+                            reason_codes: [],
+                        },
+                        metrics: {
+                            independent_bid_depth_xch: 8,
+                            independent_ask_depth_xch: 7,
+                        },
+                        evidence: { source_ids: ['dexie', 'splash'] },
+                        providers: {},
+                    }
+                    : {
+                        has_data: true,
+                        best_bid: 0.0000672337521645723,
+                        best_ask: 0.0000679213506120472,
+                        volume_24h: 0.242291699794,
+                        mid_price: 0.0000675775515,
+                    }
+            ), { status: 200 });
 
             await fetchMarketSummary();
         }"""
@@ -471,8 +460,8 @@ def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
     expect(page.locator("#mktBestBid")).to_have_text("0.00006723")
     expect(page.locator("#mktBestAsk")).to_have_text("0.00006792")
     expect(page.locator("#mktVolume24h")).to_have_text("0.242")
-    expect(page.locator("#mktTibetDepth")).to_have_text("Tibet: unavailable")
-    expect(page.locator("#mktArbGap")).to_have_text("Unavailable")
+    expect(page.locator("#mktPoolDepth")).to_have_text("15.00 XCH")
+    expect(page.locator("#mktArbGap")).to_have_text("GREEN")
 
 
 def test_pair_pnl_reset_allows_identical_fill_snapshot_to_render_again(page):

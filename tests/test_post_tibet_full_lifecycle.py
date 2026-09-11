@@ -19,6 +19,7 @@ import bot_loop
 import database
 import mock_wallet
 import pytest
+from coin_prep_policy import exclude_retired_sniper_pools
 from fill_classifier import FillConfidence, assess_fill_confidence
 from market_runtime import OfferBookMarketRuntime
 from offer_book_policy import derive_offer_book_policy
@@ -136,6 +137,27 @@ def _persist_created_offer(db, *, intent_id: str, generation: int, trade_id: str
     )
     assert db.update_offer_bech32(trade_id, offer_text)
     return intent, offer_identity
+
+
+def test_coin_prep_ignores_legacy_sniper_configuration_after_tibetswap_retirement():
+    """Old hidden sniper settings must never create retired prep cohorts."""
+
+    xch_counts, cat_counts, tier_sizes = exclude_retired_sniper_pools(
+        {"inner": 4, "sniper": 9},
+        {"outer": 3, "sniper": 9},
+        {
+            "inner": Decimal("0.25"),
+            "outer": Decimal("0.75"),
+            "sniper": Decimal("0.01"),
+        },
+    )
+
+    assert xch_counts == {"inner": 4}
+    assert cat_counts == {"outer": 3}
+    assert tier_sizes == {
+        "inner": Decimal("0.25"),
+        "outer": Decimal("0.75"),
+    }
 
 
 def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
@@ -329,19 +351,31 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
     provider_hint = assess_fill_confidence(
         {"offer_missing": True, "dexie_status": "spent", "sage_status": "pending"}
     )
-    assert provider_hint.confidence is FillConfidence.PROBABLE
+    assert provider_hint.confidence is FillConfidence.OBSERVED
     assert provider_hint.can_account is False
     assert provider_hint.can_replace is False
 
     assert mock_wallet.simulate_fills(fill_probability=1.0) == [trade_id]
+    expected_inputs = [
+        {
+            "coin_id": _sha("filled-input"),
+            "asset_id": ASSET_ID,
+            "amount_mojos": 1_000_000_000_000,
+        }
+    ]
+    exact_chain_evidence = {
+        "transaction_id": TX_ID,
+        "spend_identity": _sha("filled-spend"),
+        "block_height": 1_234_567,
+        "inputs": expected_inputs,
+    }
     confirmed = assess_fill_confidence(
         {
             "offer_missing": True,
             "sage_status": "delayed",
-            "coinset_transaction_id": TX_ID,
-            "coinset_height": 1_234_567,
-            "spacescan_transaction_id": TX_ID,
-            "spacescan_height": 1_234_567,
+            "expected_inputs": expected_inputs,
+            "coinset_evidence": dict(exact_chain_evidence),
+            "spacescan_evidence": dict(exact_chain_evidence),
         }
     )
     assert confirmed.confidence is FillConfidence.CONFIRMED

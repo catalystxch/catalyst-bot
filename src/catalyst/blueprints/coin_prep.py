@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
 
 import api_server
+from coin_prep_policy import exclude_retired_sniper_pools
 from config import cfg
 from database import (
     backup_database,
@@ -2329,23 +2330,19 @@ def _api_coin_prep_trigger_locked():
                     elif _liquidity_mode == "sell_only":
                         xch_tier_counts = {}
 
-                    # Sniper needs BOTH sides: buy snipers lock XCH coins, sell snipers
-                    # lock CAT coins. preferred_tier="sniper" strict on both sides, so a
-                    # missing CAT sniper pool silently kills sell-side probes and leaves
-                    # the ladder anchored to one-sided probe data only. Fees are XCH-only.
-                    sniper_count = int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0)
-                    sniper_size = Decimal(
-                        str(getattr(cfg, "SNIPER_SIZE_XCH", "0") or "0")
+                    # TibetSwap-backed sniping is retired in v1.4.  Apply a
+                    # server-side compatibility fence so stale hidden settings
+                    # from an upgraded installation cannot create obsolete
+                    # sniper cohorts or extra wallet transactions.
+                    (
+                        xch_tier_counts,
+                        cat_tier_counts,
+                        tier_sizes,
+                    ) = exclude_retired_sniper_pools(
+                        xch_tier_counts,
+                        cat_tier_counts,
+                        tier_sizes,
                     )
-                    if (
-                        _liquidity_mode == "two_sided"
-                        and getattr(cfg, "SNIPER_ENABLED", False)
-                        and sniper_count > 0
-                        and sniper_size > 0
-                    ):
-                        xch_tier_counts["sniper"] = sniper_count
-                        cat_tier_counts["sniper"] = sniper_count
-                        tier_sizes["sniper"] = sniper_size
 
                     fee_status = api_server.get_fee_settings_snapshot()
                     fee_count = int(fee_status.get("fee_prep_count", 0) or 0)

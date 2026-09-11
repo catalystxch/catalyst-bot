@@ -97,6 +97,7 @@ _mod(
     log_event=lambda *a, **kw: None,
     get_events_since=lambda *a, **kw: [],
     get_open_offers=lambda *a, **kw: [],
+    get_active_offer_market_identities=lambda *a, **kw: set(),
     get_stats=lambda: {},
     get_offer=lambda *a, **kw: None,
     get_offers_by_trade_ids=lambda *a, **kw: [],

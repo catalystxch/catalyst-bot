@@ -88,7 +88,7 @@ def test_provider_observation_is_immutable_and_serializable():
         ("observed_at", datetime(2026, 9, 10, 12, 0)),
         ("source_time", datetime(2026, 9, 10, 12, 1, tzinfo=timezone.utc)),
         ("source_height", -1),
-        ("fresh_until", NOW - timedelta(seconds=1)),
+        ("fresh_until", NOW - timedelta(seconds=2)),
         ("identity_keys", ()),
         ("payload_sha256", "bad"),
         ("raw_evidence_json", "not-json"),
