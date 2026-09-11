@@ -6666,7 +6666,8 @@
             box-shadow: var(--shadow-md);
             text-align: left;
             animation: toastSlideIn var(--transition-normal);
-            pointer-events: auto;  /* toast itself is interactive */
+            /* Keep sticky diagnostics visible without covering controls below. */
+            pointer-events: none;
             display: flex;
             align-items: flex-start;
             gap: var(--space-3);
@@ -6687,6 +6688,7 @@
             padding: 2px 6px;
             border-radius: var(--radius-sm);
             transition: background-color var(--transition-fast), color var(--transition-fast);
+            pointer-events: auto;
         }
         .toast .toast-close:hover {
             background: rgba(0, 0, 0, 0.25);
@@ -10717,7 +10719,7 @@
                                 <span id="xchReservePercent" style="min-width: 40px; text-align: right; font-weight: bold; color: var(--status-success);">25%</span>
                             </div>
                             <div style="display: flex; gap: 10px; align-items: center; margin-top: 6px;">
-                                <input type="number" step="0.001" id="configXchReserve" value="" placeholder="XCH amount" min="0" max="10" oninput="updateReserveFromInput('xch'); scheduleSettingsUpdate();" style="flex: 1;">
+                                <input type="number" step="any" id="configXchReserve" value="" placeholder="XCH amount" min="0" oninput="updateReserveFromInput('xch'); scheduleSettingsUpdate();" style="flex: 1;">
                                 <span style="font-size: 0.85em; opacity: 0.7;">XCH</span>
                             </div>
                             <div class="v4-settings-hint">Balance: <span id="xchReserveBalance" style="font-weight: bold;">--</span> XCH · Reserved: <span id="xchReserveAmount" style="font-weight: bold; color: var(--status-success);">--</span> XCH</div>
@@ -10845,7 +10847,7 @@
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="font-size: 0.85em;"><span id="topupPoolCatLabel">CAT</span> topup budget</label>
                             <div style="display: flex; gap: 10px; align-items: center;">
-                                <input type="number" id="configTopupPoolCat" value="" placeholder="Set by Smart Settings" min="0" oninput="scheduleSettingsUpdate();" style="flex: 1;">
+                                <input type="number" step="any" id="configTopupPoolCat" value="" placeholder="Set by Smart Settings" min="0" oninput="scheduleSettingsUpdate();" style="flex: 1;">
                                 <span id="topupPoolCatUnit" style="font-size: 0.85em; opacity: 0.7; min-width: 32px;">tokens</span>
                             </div>
                         </div>
@@ -10934,11 +10936,11 @@
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Min Price (Optional) <span class="cc-help">?<span class="cc-tooltip">Hard floor price. If the mid-price drops below this, the bot stops creating new buy offers. Leave blank for no limit.</span></span></label>
-                                <input type="number" step="0.00000001" id="configMinMid" value="" placeholder="Leave blank">
+                                <input type="number" step="any" id="configMinMid" value="" placeholder="Leave blank">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Max Price (Optional) <span class="cc-help">?<span class="cc-tooltip">Hard ceiling price. If the mid-price rises above this, the bot stops creating new sell offers. Leave blank for no limit.</span></span></label>
-                                <input type="number" step="0.00000001" id="configMaxMid" value="" placeholder="Leave blank">
+                                <input type="number" step="any" id="configMaxMid" value="" placeholder="Leave blank">
                             </div>
                         </div>
                     </div>
@@ -10968,7 +10970,7 @@
                             <div style="font-weight: bold; color: var(--accent-cyan); margin-bottom: 10px;">Offer Sizing (XCH per offer)</div>
                             <div class="form-group" style="margin-bottom: 10px;">
                                 <label>Base Trade Size (XCH) <span class="cc-help">?<span class="cc-tooltip">Default XCH amount per offer. With tiered sizing enabled, this is the 'mid' tier — inner is 2x, outer is 0.5x, extreme is 0.2x.</span></span></label>
-                                <input type="number" step="0.001" id="configTradeXch" value="" placeholder="e.g. 0.5" oninput="updateTierSizesFromBase(); handleTierSizeInputChange(); scheduleSettingsUpdate();">
+                                <input type="number" step="any" id="configTradeXch" value="" placeholder="e.g. 0.5" oninput="updateTierSizesFromBase(); handleTierSizeInputChange(); scheduleSettingsUpdate();">
                                 <div id="tradeSizeWarning" style="display: none; margin-top: 4px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em;"></div>
                             </div>
 
@@ -11005,19 +11007,19 @@
                                     <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Buy Inner</label>
-                                            <input type="number" id="configBuyInnerSizeXch" value="1.0" step="0.01" min="0.001" oninput="handleBuyTierSizeInputChange()">
+                                            <input type="number" id="configBuyInnerSizeXch" value="1.0" step="any" min="0.001" oninput="handleBuyTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Buy Mid</label>
-                                            <input type="number" id="configBuyMidSizeXch" value="0.5" step="0.01" min="0.001" oninput="handleBuyTierSizeInputChange()">
+                                            <input type="number" id="configBuyMidSizeXch" value="0.5" step="any" min="0.001" oninput="handleBuyTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Buy Outer</label>
-                                            <input type="number" id="configBuyOuterSizeXch" value="0.25" step="0.01" min="0.001" oninput="handleBuyTierSizeInputChange()">
+                                            <input type="number" id="configBuyOuterSizeXch" value="0.25" step="any" min="0.001" oninput="handleBuyTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Buy Extreme</label>
-                                            <input type="number" id="configBuyExtremeSizeXch" value="0.1" step="0.01" min="0.001" oninput="handleBuyTierSizeInputChange()">
+                                            <input type="number" id="configBuyExtremeSizeXch" value="0.1" step="any" min="0.001" oninput="handleBuyTierSizeInputChange()">
                                         </div>
                                     </div>
                                 </div>
@@ -11026,19 +11028,19 @@
                                     <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px;">
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Sell Inner</label>
-                                            <input type="number" id="configInnerSizeXch" value="1.0" step="0.01" min="0.001" oninput="handleTierSizeInputChange()">
+                                            <input type="number" id="configInnerSizeXch" value="1.0" step="any" min="0.001" oninput="handleTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Sell Mid</label>
-                                            <input type="number" id="configMidSizeXch" value="0.5" step="0.01" min="0.001" oninput="handleTierSizeInputChange()">
+                                            <input type="number" id="configMidSizeXch" value="0.5" step="any" min="0.001" oninput="handleTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Sell Outer</label>
-                                            <input type="number" id="configOuterSizeXch" value="0.25" step="0.01" min="0.001" oninput="handleTierSizeInputChange()">
+                                            <input type="number" id="configOuterSizeXch" value="0.25" step="any" min="0.001" oninput="handleTierSizeInputChange()">
                                         </div>
                                         <div class="form-group" style="margin-bottom: 0;">
                                             <label style="font-size: 0.85em;">Sell Extreme</label>
-                                            <input type="number" id="configExtremeSizeXch" value="0.1" step="0.01" min="0.001" oninput="handleTierSizeInputChange()">
+                                            <input type="number" id="configExtremeSizeXch" value="0.1" step="any" min="0.001" oninput="handleTierSizeInputChange()">
                                         </div>
                                     </div>
                                 </div>
@@ -11209,7 +11211,7 @@
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Base Spread (%) <span class="cc-help">?<span class="cc-tooltip">Starting point for the dynamic spread engine. Large changes materially shift quoting behaviour, so adjust this carefully.</span></span></label>
-                                    <input type="number" id="configBaseSpreadBps" value="5.0" step="0.5" min="1" max="20">
+                                    <input type="number" id="configBaseSpreadBps" value="5.0" step="0.1" min="0.1" max="50">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Volatility Window (hrs) <span class="cc-help">?<span class="cc-tooltip">How many hours of price history to use when calculating volatility. Shorter = more reactive, longer = more stable.</span></span></label>
@@ -11219,16 +11221,16 @@
                             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Inner Edge (%) <span class="cc-help">?<span class="cc-tooltip">Closest ladder distance from mid. The ladder starts here and widens outward, so this should stay comfortably below your min and base spread.</span></span></label>
-                                    <input type="number" id="configMinEdgeBps" value="3.0" step="0.5" min="0.5" max="15">
+                                    <input type="number" id="configMinEdgeBps" value="3.0" step="0.1" min="0" max="50">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Min Spread (%) <span class="cc-help">?<span class="cc-tooltip">Hard floor — the dynamic spread formula can never go below this value regardless of conditions.</span></span></label>
-                                    <input type="number" id="configMinSpreadBps" value="3.0" step="0.5" min="0.5" max="10" oninput="checkRiskWarnings()">
+                                    <input type="number" id="configMinSpreadBps" value="3.0" step="0.1" min="0.1" max="50" oninput="checkRiskWarnings()">
                                     <div id="minSpreadWarning" style="display: none; margin-top: 4px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em;"></div>
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Max Spread (%) <span class="cc-help">?<span class="cc-tooltip">Hard ceiling — the dynamic spread formula can never exceed this value regardless of conditions.</span></span></label>
-                                    <input type="number" id="configMaxSpreadBps" value="30.0" step="1" min="5" max="50">
+                                    <input type="number" id="configMaxSpreadBps" value="30.0" step="0.1" min="0.1" max="50">
                                 </div>
                             </div>
                         </div>
@@ -11315,11 +11317,11 @@
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Requote Threshold (%) <span class="cc-help">?<span class="cc-tooltip">How far the mid-price must move before triggering a requote. Lower = more responsive but more wallet operations.</span></span></label>
-                                <input type="number" id="configRequoteBps" value="1.5" min="0.5" max="5" step="0.1">
+                                <input type="number" id="configRequoteBps" value="1.5" min="0.1" max="50" step="0.1">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 0.85em;">Requote Cooldown (sec) <span class="cc-help">?<span class="cc-tooltip">Minimum seconds between requotes. Prevents excessive cancel/create cycles during high volatility.</span></span></label>
-                                <input type="number" id="configRequoteCooldown" value="60" min="30" max="600" step="10">
+                                <input type="number" id="configRequoteCooldown" value="60" min="10" max="600" step="1">
                             </div>
                         </div>
                         <div class="form-group" style="margin-bottom: 0; margin-top: 8px;">
@@ -11363,7 +11365,7 @@
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Sniper Size (XCH) <span class="cc-help">?<span class="cc-tooltip">Size of each discovery probe. Smart Settings derives this from wallet size, fill rate, visible orderbook depth, arb gap, and fee-coin size.</span></span></label>
-                                    <input type="number" id="configSniperSizeXch" value="0.001" step="0.0001" min="0.00000001" oninput="updateCoinPrepPreview()">
+                                    <input type="number" id="configSniperSizeXch" value="0.001" step="any" min="0" oninput="updateCoinPrepPreview()">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Sniper Prep Count <span class="cc-help">?<span class="cc-tooltip">How many dedicated sniper coins to prepare. These are reserved for probe offers so the main ladder does not borrow them.</span></span></label>
@@ -11405,7 +11407,7 @@
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Amount (XCH per transaction) <span class="cc-help">?<span class="cc-tooltip">Fee you want to use for each transaction.</span></span></label>
-                                    <input type="number" id="configTransactionFeeXch" value="0" step="0.00000001" min="0" oninput="updateFeeSettingsUi();">
+                                    <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Coin Size (XCH) <span class="cc-help">?<span class="cc-tooltip">The size of coin that the bot will prepare for fee coins.</span></span></label>
@@ -11472,7 +11474,7 @@
                         Save as preset
                         <span class="cc-help">?<span class="cc-tooltip">Tick this to also save the settings you're about to apply as a named preset, so you can recall them later from the Configuration Presets panel above. The preset is captured AFTER Save succeeds, so it reflects exactly what got applied.</span></span>
                     </label>
-                    <button class="btn btn-start btn-primary btn-save" id="saveConfigBtn" onclick="handleSaveClick()">Save &amp; Continue</button>
+                    <button type="button" class="btn btn-start btn-primary btn-save" id="saveConfigBtn" onclick="handleSaveClick()">Save &amp; Continue</button>
                 </div>
 
             </div><!-- /#v4View-settings -->
@@ -13630,7 +13632,7 @@
                             const fullerSide = Math.max(mb || 0, ms || 0);
                             const autoDist = getCoinPrepTierDistribution(fullerSide, null);
                             const matchesAuto = ['inner', 'mid', 'outer', 'extreme'].every((tier) => loadedTierCounts[tier] === autoDist[tier]);
-                            if (matchesAuto || mb !== loadedTierTotal || ms !== loadedTierTotal) {
+                            if (matchesAuto || fullerSide !== loadedTierTotal) {
                                 setTierCountMode('auto');
                                 autoFillTierCountsFromOffers(true, { preserveOfferLimits: true });
                             } else {

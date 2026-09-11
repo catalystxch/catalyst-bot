@@ -880,6 +880,47 @@ def test_bot_market_runtime_matches_provider_requirement_to_splash_configuration
     assert captured["minimum_provider_count"] == expected_minimum
 
 
+def test_bot_dexie_fetch_does_not_claim_local_refresh_time_as_provider_time(
+    monkeypatch,
+):
+    import bot_loop
+
+    captured = {}
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    loop._market_runtime_asset_id = ""
+    loop._market_runtime_risk_preset = ""
+    loop._market_runtime_refresh_cadence = 0
+    loop._market_runtime_minimum_provider_count = 0
+    loop.market_intel = SimpleNamespace(
+        refresh_orderbook=lambda force=False: None,
+        get_attributable_orderbook=lambda: {
+            **_book(),
+            # This is CATalyst's local fetch-completion time, not a timestamp
+            # authored by Dexie. It can be later than the cycle observation time.
+            "source_time": (NOW + timedelta(seconds=1)).isoformat(),
+        },
+    )
+    loop.dexie_manager = object()
+    loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
+    loop._splash_confidence_health = lambda: {}
+    monkeypatch.setattr(bot_loop, "OfferBookMarketRuntime", Runtime)
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False, raising=False)
+
+    loop._ensure_market_runtime(ASSET_ID)
+    dexie_book = captured["fetch_dexie_book"](ASSET_ID)
+
+    assert dexie_book == _book()
+    assert "source_time" not in dexie_book
+
+
 def test_bot_runtime_phase_gate_expires_green_confidence_before_mutation(monkeypatch):
     import bot_loop
 

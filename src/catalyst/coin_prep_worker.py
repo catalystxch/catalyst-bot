@@ -2479,6 +2479,7 @@ class CoinPrepWorker:
         constraints = BatchConstraints(
             reserve_floors={"xch": xch_reserve, "cat": cat_reserve},
             fee_mojos=self._tx_fee_mojos(),
+            allow_bounded_prerequisite=True,
         )
         with self.status_lock:
             self.status.execution_mode = "direct_final_batch_v2"
@@ -2488,7 +2489,10 @@ class CoinPrepWorker:
             self.status.batch_current = 0
             self.status.batch_confirmed = 0
         effects_confirmed = 0
-        for batch_number in range(1, 3):
+        # Compact wallets finish in one batch per asset. Fragmented XCH can
+        # require one or more bounded 50-input prerequisites first; keep this
+        # finite so malformed or non-progressing snapshots fail closed.
+        for batch_number in range(1, 9):
             snapshot = self._direct_batch_snapshot(targets)
             if snapshot is None:
                 if effects_confirmed:
@@ -2527,10 +2531,18 @@ class CoinPrepWorker:
             with self.status_lock:
                 self.status.batch_current = batch_number
                 self.status.planned_fee_mojos += plan.fee_mojos
+            prerequisite = bool(plan.outputs) and all(
+                output.ordinal < 0 and output.purpose in {"change", "fee_change"}
+                for output in plan.outputs
+            )
             self.update_status(
                 PrepPhase.SPLITTING,
-                0.30 + (batch_number - 1) * 0.30,
-                f"Building direct final-output batch {batch_number}/2...",
+                min(0.90, 0.30 + (batch_number - 1) * 0.15),
+                (
+                    f"Building bounded input prerequisite batch {batch_number}..."
+                    if prerequisite
+                    else f"Building direct final-output batch {batch_number}..."
+                ),
             )
             if not self._submit_direct_batch_plan(plan, address):
                 if (

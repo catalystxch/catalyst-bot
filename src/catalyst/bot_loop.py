@@ -438,6 +438,7 @@ class BotLoop:
         self._market_runtime_minimum_provider_count = 0
         self._market_confidence_result = None
         self._market_degraded_decision = None
+        self._publication_discovery_pending = 0
         self._market_refresh_now = datetime.now(timezone.utc)
         self._splash_confidence_offers: Dict[str, Dict] = {}
         self._splash_confidence_lock = threading.Lock()
@@ -1455,7 +1456,6 @@ class BotLoop:
             return {
                 "bids": snapshot["bids"],
                 "asks": snapshot["asks"],
-                "source_time": snapshot["source_time"],
             }
 
         def fetch_dexie_settled_trades(_asset_id: str) -> list[Dict]:
@@ -1523,10 +1523,13 @@ class BotLoop:
         splash_snapshot = self._get_fresh_splash_confidence_offers(
             asset_id, now=observed_at
         )
-        self._reconcile_offer_publication_discovery(
+        discovery = self._reconcile_offer_publication_discovery(
             dexie_book=dexie_snapshot,
             splash_offers=splash_snapshot,
             now=observed_at,
+        )
+        self._publication_discovery_pending = max(
+            0, int((discovery or {}).get("pending", 0) or 0)
         )
         self._set_state(
             market_confidence=result.confidence.state,
@@ -5555,11 +5558,15 @@ class BotLoop:
         )
         self._health_thread.start()
 
-        # Price watcher thread (V1 parity)
-        self._watcher_thread = threading.Thread(
-            target=self._price_watcher_thread, daemon=True, name="price-watcher"
+        # TibetSwap's reserve watcher is retired in the offer-book model.
+        # Do not create a thread whose intentional immediate exit would be
+        # misclassified by the liveness watchdog as a crash.
+        self._watcher_thread = None
+        log_event(
+            "info",
+            "tibetswap_price_watcher_retired",
+            "TibetSwap reserve watcher is retired in the offer-book market model",
         )
-        self._watcher_thread.start()
 
         # Mempool watcher — pre-emptive price intelligence
         # Polls Coinset mempool every 5s for pending Tibet pool spends,
@@ -7777,27 +7784,19 @@ class BotLoop:
                     f"Wallet address detection failed: {e}",
                 )
 
-            # ---- Auto-resolve CAT metadata (TIBET_PAIR_ID, CAT_TICKER_ID, CAT_NAME) ----
-            # Given only CAT_ASSET_ID, queries TibetSwap to fill any empty derived fields.
+            # ---- Resolve CAT metadata for the offer-book market ----
             # Only fills fields that are unset in .env — never overwrites explicit config.
             try:
                 from cat_resolver import resolve_and_apply as _resolve_cat
 
                 _cat_meta = _resolve_cat(cfg)
-                if _cat_meta.get("pair_id"):
-                    slog(
-                        "STARTUP",
-                        f"CAT metadata resolved — "
-                        f"pair_id={_cat_meta['pair_id'][:20]}... "
-                        f"ticker={_cat_meta.get('ticker_id')} "
-                        f"name={_cat_meta.get('name')}",
-                    )
-                else:
-                    slog(
-                        "STARTUP",
-                        "CAT metadata: token not found on TibetSwap "
-                        "(no pair/ticker auto-resolved — check CAT_TICKER_ID in .env)",
-                    )
+                slog(
+                    "STARTUP",
+                    "CAT metadata ready for offer-book market — "
+                    f"ticker={_cat_meta.get('ticker_id') or cfg.CAT_TICKER_ID or 'unresolved'} "
+                    f"name={_cat_meta.get('name') or cfg.CAT_NAME or 'unresolved'}; "
+                    "TibetSwap is retired",
+                )
             except Exception as e:
                 log_event(
                     "warning",
@@ -12230,6 +12229,19 @@ class BotLoop:
             )
             return
 
+        pending_discovery = max(
+            0, int(getattr(self, "_publication_discovery_pending", 0) or 0)
+        )
+        if pending_discovery:
+            log_event(
+                _skip_level(_any_under),
+                "create_skip_publication_discovery_pending",
+                f"Waiting for exact public rediscovery of {pending_discovery} "
+                "offer(s) before creating another staged batch",
+                data={"pending_discovery": pending_discovery},
+            )
+            return
+
         # Stale wallet data guard — applies outside recovery mode too.
         # After 3 consecutive stale cycles (~15s) we stop creating new offers
         # because the wallet's offer list may be outdated: we could double-post
@@ -12634,6 +12646,47 @@ class BotLoop:
                     action="view_position",
                     action_label="View Position",
                 )
+
+        # Durable publication is intentionally sequential and bounded by the
+        # bot-cycle SLA.  Creating an entire large ladder at once can therefore
+        # leave later offers unpublished when their fixed 90-second exact-
+        # discovery deadline arrives.  Stage at most ten offers per cycle and
+        # divide the budget fairly between active sides; the pending-discovery
+        # guard above prevents the next stage until this one is publicly proven.
+        publication_batch_limit = 10
+        requested_total = sum(max(0, int(item[1])) for item in work_items)
+        if requested_total > publication_batch_limit:
+            staged_counts = {side: 0 for side, _needed, _spread in work_items}
+            remaining = {
+                side: max(0, int(needed)) for side, needed, _spread in work_items
+            }
+            budget = publication_batch_limit
+            while budget > 0 and any(value > 0 for value in remaining.values()):
+                for side, _needed, _spread in work_items:
+                    if budget <= 0:
+                        break
+                    if remaining[side] <= 0:
+                        continue
+                    staged_counts[side] += 1
+                    remaining[side] -= 1
+                    budget -= 1
+            work_items = [
+                (side, staged_counts[side], spread)
+                for side, _needed, spread in work_items
+                if staged_counts[side] > 0
+            ]
+            log_event(
+                "info",
+                "publication_creation_batch_staged",
+                f"Staged {publication_batch_limit}/{requested_total} missing "
+                "offer(s) so durable publication can prove this batch before "
+                "the next one",
+                data={
+                    "requested_total": requested_total,
+                    "staged_total": publication_batch_limit,
+                    "staged_by_side": dict(staged_counts),
+                },
+            )
 
         if getattr(cfg, "LADDER_CREATE_GLOBAL_SERIAL", False) or recovery_active:
             if recovery_active:
@@ -13597,13 +13650,11 @@ class BotLoop:
 
         Threads checked:
           - health-monitor (Sage health watcher)
-          - price-watcher (fast Tibet poller)
           - coin-watcher (DB↔wallet coin diff)
           - splash-receive (Splash incoming offer poller)
         """
         critical_threads = [
             ("health-monitor", "_health_thread", self._start_health_monitor),
-            ("price-watcher", "_watcher_thread", self._start_price_watcher),
             ("coin-watcher", "_coin_watcher_thread", self._start_coin_watcher),
         ]
         # Splash incoming watcher classifies inbound P2P offers. Previously

@@ -1513,6 +1513,37 @@ class ProbeAnchorTests(unittest.TestCase):
             "sell creation must pause until pending cancels disappear from Sage",
         )
 
+    def test_create_offers_if_needed_stages_large_ladder_for_publication(self):
+        """Creation must not outrun durable Dexie publication and discovery.
+
+        A live 45/44 DBX ladder was created in one cycle, while the durable
+        publisher could acknowledge only 13-14 offers per cycle. The remaining
+        49 then hit the fixed 90-second exact-discovery deadline and were safely
+        cancelled. Stage a balanced maximum of ten new offers per cycle.
+        """
+        loop = bot_loop.BotLoop()
+
+        with (
+            patch.object(fake_config.cfg, "MAX_ACTIVE_BUY_OFFERS", 45),
+            patch.object(fake_config.cfg, "MAX_ACTIVE_SELL_OFFERS", 44),
+        ):
+            loop._create_offers_if_needed(Decimal("1.10"), 0, 0)
+
+        requested = {
+            side: call[2]["num_offers"]
+            for call in loop.offer_manager.create_calls
+            for side in [call[0]]
+        }
+        self.assertEqual(requested, {"buy": 5, "sell": 5})
+
+    def test_create_offers_if_needed_waits_for_exact_publication_discovery(self):
+        loop = bot_loop.BotLoop()
+        loop._publication_discovery_pending = 3
+
+        loop._create_offers_if_needed(Decimal("1.10"), 0, 0)
+
+        self.assertEqual(loop.offer_manager.create_calls, [])
+
     def test_wallet_active_pending_cancel_watchdog_queues_stale_retry(self):
         loop = bot_loop.BotLoop()
         loop.offer_manager._pending_cancel_retries = {}

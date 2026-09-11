@@ -53,6 +53,27 @@ def _save_config_input_ids(source: str) -> set[str]:
     }
 
 
+def _number_input_constraints(source: str, field_id: str) -> dict[str, str]:
+    match = re.search(rf'<input\b(?=[^>]*\bid="{re.escape(field_id)}")[^>]*>', source)
+    assert match is not None, f"Missing number input {field_id}"
+    markup = match.group(0)
+    assert 'type="number"' in markup
+    return dict(re.findall(r'\b(min|max|step)="([^"]+)"', markup))
+
+
+def _assert_browser_accepts_number(source: str, field_id: str, value: str) -> None:
+    constraints = _number_input_constraints(source, field_id)
+    number = Decimal(value)
+    if constraints.get("min"):
+        assert number >= Decimal(constraints["min"]), (field_id, constraints, value)
+    if constraints.get("max"):
+        assert number <= Decimal(constraints["max"]), (field_id, constraints, value)
+    step = constraints.get("step")
+    if step and step != "any":
+        base = Decimal(constraints.get("min", "0"))
+        assert (number - base) % Decimal(step) == 0, (field_id, constraints, value)
+
+
 def test_saved_setup_controls_are_tracked_for_dirty_state_preservation():
     gui = GUI.read_text(encoding="utf-8")
     setup_markup = _settings_setup_markup(gui)
@@ -90,6 +111,60 @@ def test_successful_settings_save_refreshes_dashboard_before_coin_prep_handoff()
     coin_prep_handoff = body.index("checkIfCoinPrepNeeded(config);")
 
     assert reviewed < dashboard_refresh < coin_prep_handoff
+
+
+def test_smart_settings_generated_dbx_values_are_valid_number_inputs():
+    """Browser constraints must accept the exact values Smart Settings emits.
+
+    DBX live testing exposed stale MZ-era limits and coarse steps that marked
+    the generated setup invalid before it could be saved reliably.
+    """
+    gui = GUI.read_text(encoding="utf-8")
+    generated_values = {
+        "configXchReserve": "14.592",
+        "configTopupPoolCat": "119.854",
+        "configMinMid": "0.0070246455",
+        "configMaxMid": "0.0162584515",
+        "configTradeXch": "1.3824",
+        "configBuyInnerSizeXch": "0.6283",
+        "configBuyMidSizeXch": "1.3824",
+        "configBuyOuterSizeXch": "2.5134",
+        "configBuyExtremeSizeXch": "4.5242",
+        "configInnerSizeXch": "0.115",
+        "configMidSizeXch": "0.0639",
+        "configOuterSizeXch": "0.0351",
+        "configExtremeSizeXch": "0.016",
+        "configBaseSpreadBps": "25.7",
+        "configMinEdgeBps": "10.3",
+        "configMinSpreadBps": "15.4",
+        "configMaxSpreadBps": "30.9",
+        "configRequoteBps": "14.2",
+        "configRequoteCooldown": "45",
+        "configSniperSizeXch": "0",
+        "configTransactionFeeXch": "0.0000130791",
+    }
+
+    for field_id, value in generated_values.items():
+        _assert_browser_accepts_number(gui, field_id, value)
+
+    save_markup = re.search(r'<button\b(?=[^>]*\bid="saveConfigBtn")[^>]*>', gui).group(
+        0
+    )
+    assert 'type="button"' in save_markup
+
+
+def test_saved_smart_tier_template_survives_asymmetric_offer_limits_on_reload():
+    """A fuller-side Smart template must not be replaced after app restart.
+
+    Live DBX Smart Settings produced 45 buy / 44 sell offers with one shared
+    45-slot template.  Treating the smaller side as a mismatch replaced the
+    saved market-adaptive counts and made Coin Prep exceed the XCH balance.
+    """
+    gui = GUI.read_text(encoding="utf-8")
+
+    assert "const fullerSide = Math.max(mb || 0, ms || 0);" in gui
+    assert "fullerSide !== loadedTierTotal" in gui
+    assert "mb !== loadedTierTotal || ms !== loadedTierTotal" not in gui
 
 
 def test_removed_max_mid_move_setting_is_not_visible_in_setup():
@@ -269,3 +344,16 @@ def test_sniper_live_toggle_uses_live_config_endpoint():
     ).group("body")
 
     assert "'SNIPER_ENABLED'" in quote_only
+
+
+def test_sticky_toast_message_cannot_block_setup_controls():
+    """Persistent errors stay readable without intercepting the page beneath them."""
+    gui = GUI.read_text(encoding="utf-8")
+
+    toast_rule = re.search(r"\.toast\s*\{(?P<body>.*?)\n\s*\}", gui, re.S)
+    close_rule = re.search(r"\.toast \.toast-close\s*\{(?P<body>.*?)\n\s*\}", gui, re.S)
+
+    assert toast_rule is not None
+    assert close_rule is not None
+    assert "pointer-events: none" in toast_rule.group("body")
+    assert "pointer-events: auto" in close_rule.group("body")

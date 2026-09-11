@@ -89,6 +89,13 @@ def test_bot_price_watcher_is_retired_and_cannot_poll_reserves():
     assert "retired" in source.lower()
 
 
+def test_startup_cat_metadata_message_uses_offer_book_model_not_tibetswap_lookup():
+    source = inspect.getsource(bot_loop.BotLoop._startup_sync)
+
+    assert "token not found on TibetSwap" not in source
+    assert "offer-book market" in source
+
+
 def test_startup_health_check_marks_tibetswap_retired_without_network_probe():
     source = inspect.getsource(bot_loop.BotLoop._run_startup_self_test)
 
