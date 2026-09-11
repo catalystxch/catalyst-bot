@@ -5688,6 +5688,8 @@
             align-items: center;
             gap: 8px;
         }
+        /* Author styles can otherwise override the browser's hidden rule. */
+        .lc-toggle-row[hidden] { display: none !important; }
         .lc-toggle-label {
             font-size: 0.78em;
             color: var(--overlay-w-70);
