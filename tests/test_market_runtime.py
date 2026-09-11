@@ -390,6 +390,49 @@ def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
     assert "rapid_offer_churn" in result.confidence.reason_codes
 
 
+def test_restart_tolerates_a_persisted_empty_offer_book(isolated_db):
+    unavailable = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: {"bids": [], "asks": []},
+        fetch_splash_offers=lambda _asset: [],
+        fetch_splash_health=lambda: {
+            "running": False,
+            "api_reachable": False,
+            "peers": 0,
+        },
+    )
+    first = unavailable.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+
+    persisted = database.get_market_confidence_engine_state(ASSET_ID)
+    assert first.confidence.state == "RED"
+    assert persisted["prior_offer_ids"] == []
+    assert persisted["prior_observed_at"] is None
+
+    restarted = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: _book(),
+        fetch_splash_offers=lambda _asset: _splash(),
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
+    )
+    recovered = restarted.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert recovered.confidence.state == "GREEN"
+
+
 def test_bot_rebuilds_market_runtime_when_risk_preset_changes(isolated_db, monkeypatch):
     import bot_loop
 

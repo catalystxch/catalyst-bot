@@ -227,7 +227,9 @@ class MarketConfidenceEngine:
             observed_at = _utc(datetime.fromisoformat(text))
         else:
             raise ValueError("prior observation time is invalid")
-        if bool(prior_ids) != (observed_at is not None):
+        if not prior_ids:
+            observed_at = None
+        elif observed_at is None:
             raise ValueError("prior offer churn state is incomplete")
 
         self._last_trusted_midpoint = midpoint
@@ -472,7 +474,7 @@ class MarketConfidenceEngine:
         trusted_ask = self._last_trusted_ask
 
         self._prior_offer_ids = frozenset(seen_ids)
-        self._prior_observed_at = current_time
+        self._prior_observed_at = current_time if seen_ids else None
         return MarketConfidenceResult(
             state=state,
             derived_at=current_time,

@@ -230,6 +230,25 @@ def test_far_away_junk_offers_cannot_satisfy_executable_depth():
     assert "insufficient_ask_depth" in result.reason_codes
 
 
+def test_hydrate_normalizes_legacy_empty_offer_timestamp():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+
+    engine.hydrate(
+        {
+            "risk_preset": "balanced",
+            "last_trusted_midpoint": None,
+            "last_trusted_bid": None,
+            "last_trusted_ask": None,
+            "pending_midpoint": None,
+            "pending_refreshes": 0,
+            "prior_offer_ids": [],
+            "prior_observed_at": NOW.isoformat().replace("+00:00", "Z"),
+        }
+    )
+
+    assert engine.export_state()["prior_observed_at"] is None
+
+
 def test_material_move_requires_persistence_but_settled_trade_can_confirm():
     engine = MarketConfidenceEngine(risk_preset="balanced")
     baseline = engine.evaluate(
