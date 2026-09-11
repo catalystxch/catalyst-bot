@@ -789,3 +789,20 @@ def test_live_settings_guidance_uses_offer_book_terms_only():
     )
     assert "pool-depth scaling" not in html
     assert "arb-gap" not in html
+
+
+def test_smart_settings_market_failure_precedes_rewards_prompt():
+    """A blocked SBX book must not ask how to optimize an unusable plan."""
+
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+    start = html.index("async function getSmartDefaults()")
+    end = html.index("function recalcCapitalBreakdown()", start)
+    smart_defaults = html[start:end]
+
+    error_guard = smart_defaults.index("if (data.error)")
+    rewards_prompt = smart_defaults.index(
+        "const _dbxInfo = await _fetchDbxIncentiveInfo"
+    )
+    assert error_guard < rewards_prompt

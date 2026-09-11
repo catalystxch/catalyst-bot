@@ -19784,37 +19784,6 @@
                 try { updateTokenIcons(currentCAT.asset_id); } catch (_) {}
             }
 
-            // ── DBX incentive pre-prompt ─────────────────────────────────
-            // If the chosen pair is in Dexie's liquidity-rewards program,
-            // ask the user upfront whether to cap the spread at the
-            // incentive threshold. Smart Settings's volatility-driven
-            // spread is often wider than the cap, so without this nudge
-            // most tiers fall outside the eligible range and earn nothing.
-            // The choice is passed to the backend via ?dbx_cap=true and
-            // applied to base_spread / max_spread / requote_bps.
-            let _dbxCapChoice = false;
-            try {
-                const _dbxInfo = await _fetchDbxIncentiveInfo(selectedCAT.asset_id);
-                if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0) {
-                    const capPct = (_dbxInfo.max_spread_bps / 100).toFixed(1);
-                    const aprPct = (_dbxInfo.estimated_apr * 100).toFixed(1);
-                    const rewardToken = _dbxInfo.reward_token || 'DBX';
-                    const choice = await showStyledConfirm({
-                        icon: '🏆',
-                        title: `${selectedCAT.name || 'Selected CAT'} earns ${rewardToken} rewards`,
-                        message: `Dexie pays ${rewardToken} on offers within <strong>${capPct}%</strong> of market price (estimated ${aprPct}% APR).<br><br>` +
-                                 `Cap your spread at ${capPct}% so all tiers stay reward-eligible? Otherwise Smart Settings will use the calculated spread for this pair's volatility.`,
-                        confirmText: `Maximize ${rewardToken} (cap at ${capPct}%)`,
-                        cancelText: 'Use calculated spread',
-                        style: 'success',
-                        allowHtml: true,
-                    });
-                    _dbxCapChoice = !!choice;
-                }
-            } catch (_dbxPromptErr) {
-                debugWarn('[SmartDefaults] DBX pre-prompt skipped:', _dbxPromptErr);
-            }
-
             const sdBtn = document.getElementById('smartDefaultsBtn');
             const sdProgress = document.getElementById('smartDefaultsProgress');
             const sdStatus = document.getElementById('smartDefaultsStatus');
@@ -19887,19 +19856,48 @@
                     liquidity_mode: (typeof getLiquidityMode === 'function')
                         ? getLiquidityMode() : 'two_sided',
                 });
-                // DBX-cap: when the user picked "stay within incentive
-                // threshold" in the pre-prompt, tell the backend to clamp
-                // the calculated spread + requote_bps so all tiers qualify.
-                if (_dbxCapChoice) {
-                    params.append('dbx_cap', 'true');
-                }
                 if (sdStatus) sdStatus.textContent = 'Analysing market data + calculating capital allocation...';
                 const resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
-                const data = await resp.json();
+                let data = await resp.json();
 
                 if (data.error) {
                     showToast('Smart Settings: ' + data.error, 'error');
                     return;
+                }
+
+                // Ask about Dexie incentive optimization only after the
+                // backend has produced a usable, GREEN-confidence plan. A
+                // blocked or failed plan must surface its real error instead
+                // of presenting a rewards choice that cannot be applied.
+                try {
+                    const _dbxInfo = await _fetchDbxIncentiveInfo(selectedCAT.asset_id);
+                    if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0) {
+                        const capPct = (_dbxInfo.max_spread_bps / 100).toFixed(1);
+                        const aprPct = (_dbxInfo.estimated_apr * 100).toFixed(1);
+                        const rewardToken = _dbxInfo.reward_token || 'DBX';
+                        const choice = await showStyledConfirm({
+                            icon: '🏆',
+                            title: `${selectedCAT.name || 'Selected CAT'} earns ${rewardToken} rewards`,
+                            message: `Dexie pays ${rewardToken} on offers within <strong>${capPct}%</strong> of market price (estimated ${aprPct}% APR).<br><br>` +
+                                     `Cap your spread at ${capPct}% so all tiers stay reward-eligible? Otherwise Smart Settings will use the calculated spread for this pair's volatility.`,
+                            confirmText: `Maximize ${rewardToken} (cap at ${capPct}%)`,
+                            cancelText: 'Use calculated spread',
+                            style: 'success',
+                            allowHtml: true,
+                        });
+                        if (choice) {
+                            params.set('dbx_cap', 'true');
+                            if (sdStatus) sdStatus.textContent = `Applying ${rewardToken} incentive cap...`;
+                            const cappedResp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
+                            data = await cappedResp.json();
+                            if (data.error) {
+                                showToast('Smart Settings: ' + data.error, 'error');
+                                return;
+                            }
+                        }
+                    }
+                } catch (_dbxPromptErr) {
+                    debugWarn('[SmartDefaults] DBX rewards prompt skipped:', _dbxPromptErr);
                 }
 
                 const src = data._data_sources || {};
