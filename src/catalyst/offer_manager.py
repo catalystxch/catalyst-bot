@@ -186,6 +186,55 @@ def assess_offer_book_candidate(
     }
 
 
+def book_opportunity_size_cap(
+    *, requested_size_xch: Decimal, confidence: Any
+) -> Optional[Decimal]:
+    """Return the exact maximum size for a current book-improvement order.
+
+    Opportunity orders are deliberately smaller than the normal tier size and
+    than the independently observed executable depth. Missing, stale, thin,
+    or high-churn evidence fails closed by returning ``None``.
+    """
+
+    if type(requested_size_xch) is not Decimal:
+        raise TypeError("requested_size_xch must be a Decimal")
+    if not requested_size_xch.is_finite() or requested_size_xch <= 0:
+        raise ValueError("requested_size_xch must be finite and positive")
+
+    def field(name: str) -> Any:
+        if isinstance(confidence, dict):
+            return confidence.get(name)
+        return getattr(confidence, name, None)
+
+    if field("state") != "GREEN":
+        return None
+    bid_depth = field("independent_bid_depth_mojos")
+    ask_depth = field("independent_ask_depth_mojos")
+    required_depth = field("required_depth_mojos")
+    manipulation_score = field("manipulation_score")
+    thresholds = field("derived_thresholds")
+    if (
+        type(bid_depth) is not int
+        or type(ask_depth) is not int
+        or type(required_depth) is not int
+        or min(bid_depth, ask_depth, required_depth) < 0
+        or bid_depth < required_depth
+        or ask_depth < required_depth
+        or type(manipulation_score) is not int
+        or not isinstance(thresholds, dict)
+    ):
+        return None
+    amber_threshold = thresholds.get("manipulation_amber")
+    if type(amber_threshold) is not int or manipulation_score >= amber_threshold:
+        return None
+
+    depth_xch = Decimal(min(bid_depth, ask_depth)) / Decimal("1000000000000")
+    bounded = min(
+        requested_size_xch * Decimal("0.5"), depth_xch * Decimal("0.02")
+    )
+    return bounded if bounded > 0 else None
+
+
 @dataclass(frozen=True, slots=True)
 class _CanonicalOfferCreationIntent:
     intent_id: str
@@ -4141,6 +4190,7 @@ class OfferManager:
                 }
 
             market_guard = None
+            purpose = "normal_lifecycle"
             if market_confidence is not None:
                 market_guard = assess_offer_book_candidate(
                     side=side,
@@ -4160,6 +4210,49 @@ class OfferManager:
                         f"{market_guard.get('reason_code', 'market_guard_failed')}",
                     )
                     continue
+                if market_guard.get("improves_book"):
+                    opportunity_cap = book_opportunity_size_cap(
+                        requested_size_xch=size_xch,
+                        confidence=market_confidence,
+                    )
+                    if opportunity_cap is None:
+                        log_event(
+                            "info",
+                            "book_opportunity_blocked",
+                            f"Skipping {side} slot {slot}: confirmed depth or "
+                            "churn policy does not permit a book-opportunity order",
+                        )
+                        continue
+                    size_xch = opportunity_cap
+                    cat_amount = size_xch / price
+                    cat_mojos = cat_to_mojos(cat_amount, decimals)
+                    cat_amount = mojos_to_cat(cat_mojos, decimals)
+                    xch_mojos = xch_to_mojos(size_xch)
+                    if int(cat_mojos) <= 0 or int(xch_mojos) <= 0:
+                        continue
+                    if side == "buy":
+                        offer_dict = {
+                            str(cfg.WALLET_ID_XCH): -int(xch_mojos),
+                            str(wallet_cat): int(cat_mojos),
+                        }
+                    else:
+                        offer_dict = {
+                            str(wallet_cat): -int(cat_mojos),
+                            str(cfg.WALLET_ID_XCH): int(xch_mojos),
+                        }
+                    market_guard = assess_offer_book_candidate(
+                        side=side,
+                        candidate_price=price,
+                        size_xch=size_xch,
+                        confidence=market_confidence,
+                        network_fee_xch=network_fee_xch,
+                        expected_cancel_requotes=expected_cancel_requotes,
+                        minimum_profit_xch=minimum_profit_xch,
+                        now=datetime.now(timezone.utc),
+                    )
+                    if not market_guard.get("eligible"):
+                        continue
+                    purpose = "book_opportunity"
 
             offer_specs.append(
                 {
@@ -4172,6 +4265,7 @@ class OfferManager:
                     "offer_dict": offer_dict,
                     "stagger": i,
                     "market_guard": market_guard,
+                    "purpose": purpose,
                 }
             )
 
@@ -4492,7 +4586,7 @@ class OfferManager:
                     "asset_id": asset_id,
                     "side": side,
                     "tier": spec["tier"],
-                    "purpose": "normal_lifecycle",
+                    "purpose": spec["purpose"],
                     "parent_intent_id": parent_intent_id,
                     "offer_size_uniqueness": {
                         "slot": spec["slot"],

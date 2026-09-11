@@ -9,7 +9,7 @@ import inspect
 import database
 import offer_manager
 import pytest
-from offer_manager import assess_offer_book_candidate
+from offer_manager import assess_offer_book_candidate, book_opportunity_size_cap
 
 
 ASSET_ID = "b8" * 32
@@ -36,6 +36,11 @@ def _confidence(**overrides):
         "trusted_ask": Decimal("0.103"),
         "evidence_digests": (DIGEST_A, DIGEST_B),
         "derived_at": NOW,
+        "independent_bid_depth_mojos": 10_000_000_000_000,
+        "independent_ask_depth_mojos": 10_000_000_000_000,
+        "required_depth_mojos": 2_000_000_000_000,
+        "manipulation_score": 0,
+        "derived_thresholds": {"manipulation_amber": 50},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -104,6 +109,32 @@ def test_profitable_candidate_only_competes_when_it_improves_trusted_book():
 
     assert result["eligible"] is True
     assert result["improves_book"] is False
+
+
+def test_book_opportunity_size_is_exactly_bounded_by_size_and_confirmed_depth():
+    confidence = _confidence(
+        independent_bid_depth_mojos=10_000_000_000_000,
+        independent_ask_depth_mojos=20_000_000_000_000,
+    )
+
+    assert book_opportunity_size_cap(
+        requested_size_xch=Decimal("1"), confidence=confidence
+    ) == Decimal("0.20")
+    assert (
+        book_opportunity_size_cap(
+            requested_size_xch=Decimal("1"),
+            confidence=_confidence(manipulation_score=50),
+        )
+        is None
+    )
+
+
+def test_ladder_labels_book_improvements_as_bounded_opportunities():
+    source = inspect.getsource(offer_manager.OfferManager.create_ladder)
+
+    assert 'purpose = "book_opportunity"' in source
+    assert '"purpose": spec["purpose"]' in source
+    assert "book_opportunity_size_cap(" in source
 
 
 def test_competition_claim_is_durable_per_asset_side_and_not_digest_bypassable(

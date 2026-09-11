@@ -21,7 +21,21 @@ bp = Blueprint("boost", __name__)
 
 @bp.route("/api/boost/activate", methods=["POST"])
 def api_boost_activate():
-    """Activate Close the Gap — adaptive spread probing for ranking."""
+    """Reject the retired TibetSwap-dependent Close-the-Gap workflow."""
+    return (
+        jsonify(
+            {
+                "success": False,
+                "status": "retired",
+                "reason": "TIBETSWAP_SHUTDOWN",
+                "replacement": "book_opportunity",
+            }
+        ),
+        410,
+    )
+
+    # One-release compatibility code remains below for downgrade archaeology,
+    # but the v1.4 route returns before any market read or mutation can occur.
     bot = api_server.bot
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500

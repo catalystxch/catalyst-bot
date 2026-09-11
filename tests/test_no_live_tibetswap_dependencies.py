@@ -12,7 +12,9 @@ import market_data_collector
 import pytest
 import doctor
 from blueprints import bot as bot_routes
+from blueprints import boost as boost_routes
 from blueprints import market
+from boost_manager import BoostManager
 from blueprints.smart_defaults import _fetch_price_standalone
 from price_engine import PriceEngine
 
@@ -160,6 +162,51 @@ def test_market_module_does_not_keep_retired_outage_fallback_wording():
 
     assert "Dexie-only pricing" not in market_source
     assert "AMM drift protection is unavailable" not in market_source
+
+
+def test_legacy_boost_activation_is_retired_without_starting_a_mutation(monkeypatch):
+    fake_manager = Mock()
+    fake_bot = Mock(boost_manager=fake_manager)
+    start_mutation = Mock(side_effect=AssertionError("mutation worker started"))
+    monkeypatch.setattr(api_server, "bot", fake_bot)
+    monkeypatch.setattr(api_server, "start_mutation_thread", start_mutation)
+
+    with api_server.app.test_request_context(
+        "/api/boost/activate", method="POST", json={}
+    ):
+        response, status = boost_routes.api_boost_activate()
+
+    assert status == 410
+    assert response.get_json() == {
+        "success": False,
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+        "replacement": "book_opportunity",
+    }
+    start_mutation.assert_not_called()
+    fake_manager.activate.assert_not_called()
+
+
+def test_legacy_boost_manager_cannot_create_new_offers():
+    offer_manager = Mock()
+    manager = BoostManager(offer_manager=offer_manager)
+
+    result = manager.activate(Decimal("1"))
+
+    assert result == {
+        "success": False,
+        "status": "retired",
+        "reason": "TIBETSWAP_SHUTDOWN",
+        "replacement": "book_opportunity",
+    }
+    offer_manager.create_ladder.assert_not_called()
+    offer_manager.create_offer_with_retry.assert_not_called()
+
+
+def test_production_cycle_fences_recovered_legacy_boost_mutations():
+    source = inspect.getsource(bot_loop.BotLoop._run_one_cycle)
+
+    assert "LEGACY_TIBET_BOOST_RUNTIME_ENABLED" in source
 
 
 def test_legacy_slippage_endpoint_is_explicitly_retired(monkeypatch):

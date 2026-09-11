@@ -95,6 +95,11 @@ DEXIE_STATUS_CANCELLED = 3
 DEXIE_STATUS_COMPLETED = 4
 DEXIE_STATUS_EXPIRED = 6
 
+# One-release compatibility keeps the old BoostManager available for
+# authoritative cancellation of recovered offers, never for creation or
+# repricing. Conservative opportunity orders now run through OfferManager.
+LEGACY_TIBET_BOOST_RUNTIME_ENABLED = False
+
 
 def _bps_to_pct(val):
     """Convert a BPS value (int, float, str, Decimal) to a formatted % string."""
@@ -10647,7 +10652,26 @@ class BotLoop:
                     f"{linger_remaining:.1f}s more before cleanup",
                 )
 
-        if self.boost_manager._boost_active and not recovery_active_now:
+        if (
+            self.boost_manager._boost_active
+            and not LEGACY_TIBET_BOOST_RUNTIME_ENABLED
+            and not recovery_active_now
+        ):
+            if self._enter_runtime_effect_phase("cancel"):
+                retired_result = self.boost_manager.deactivate()
+                log_event(
+                    "info",
+                    "legacy_boost_retirement_cleanup",
+                    "Retired TibetSwap-dependent boost offers were sent through "
+                    "authoritative cancellation cleanup",
+                    data=retired_result,
+                )
+
+        if (
+            LEGACY_TIBET_BOOST_RUNTIME_ENABLED
+            and self.boost_manager._boost_active
+            and not recovery_active_now
+        ):
             # 1. Keep offers alive and centred on price
             refreshed = self.boost_manager.refresh_if_needed(mid_price)
 

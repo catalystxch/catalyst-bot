@@ -362,7 +362,7 @@ class BoostManager:
         size_xch_override: Optional[Decimal] = None,
         start_pct_override: Optional[int] = None,
     ) -> Dict:
-        """Turn gap-closer ON — creates initial offers and begins probing.
+        """Reject the retired TibetSwap-dependent gap-closer workflow.
 
         Args:
             mid_price: Current mid price to centre offers around
@@ -373,6 +373,15 @@ class BoostManager:
 
         Returns dict with results and any warnings.
         """
+        return {
+            "success": False,
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+            "replacement": "book_opportunity",
+        }
+
+        # One-release compatibility code remains below for downgrade
+        # archaeology, but v1.4 returns before any wallet effect can occur.
         if self._active_boost_ids:
             return {
                 "success": False,
