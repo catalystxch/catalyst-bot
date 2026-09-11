@@ -28,7 +28,7 @@ price, then earning the spread as orders fill. Doing this well on Chia is hard:
   costs a transaction.
 - Wallet coins must be pre-split into the right denominations before offers can
   be created.
-- Fills can appear through Dexie, mempool, wallet, and on-chain signals at
+- Fills can appear through Dexie, Splash, wallet, and corroborating chain signals at
   different times.
 - Competitors move the book constantly, and arbitrageurs sweep gaps quickly.
 
@@ -48,12 +48,12 @@ and market shocks.
   competitor depth.
 - **Smart Settings.** One-click capital planning based on wallet balance and
   market conditions.
-- **Sniper probes.** Detects arbitrage gaps between Dexie and TibetSwap AMM and
-  fires targeted orders to capture them.
+- **Guarded book opportunities.** Places conservative, bounded opportunity
+  orders only inside the fresh attributable order-book envelope.
 - **Gap-close cascades.** Closes large market moves in staged steps instead of a
   single shock requote.
-- **Mempool watch.** Spots TibetSwap swaps before they confirm on chain and
-  preempts price moves.
+- **Confidence withdrawal.** Freezes new exposure immediately when attributable
+  evidence is weak, then withdraws the ladder progressively if degradation lasts.
 
 ### Execution and Safety
 
@@ -64,7 +64,7 @@ and market shocks.
   and per-cycle cancel/create caps.
 - **Adverse-selection guard.** Scores market toxicity separately for buy and
   sell flow, then widens or pauses only the side that is at risk when fills,
-  sweeps, public depth, or AMM/Dexie dislocations suggest adverse selection.
+  sweeps, public-depth changes, or provider conflicts suggest adverse selection.
 - **Dynamic price limits.** Tracks a live reference price and rejects quotes
   outside a configurable band.
 - **Risk disclosure.** On first run, the operator must accept an on-screen
@@ -84,8 +84,8 @@ and market shocks.
 ### Operations
 
 - **Native desktop app.** System tray, notifications, and background operation.
-- **Splash P2P.** Broadcasts offers directly to other Splash nodes for
-  private-mempool distribution.
+- **Splash P2P.** Broadcasts public signed offers directly to other Splash nodes
+  as an optional independent publication and discovery channel.
 - **Self-healing watchdog.** Detects stuck state, stale lifecycle flags, and
   budget drift; repairs them without restarts.
 - **Data management.** Separate resets for P&L history, offer history, or full
@@ -120,7 +120,8 @@ SVG and PNG assets.
 The trading loop runs on the configurable `LOOP_SECONDS` cadence, defaulting
 to 90 seconds:
 
-1. Fetch and blend TibetSwap and Dexie pricing, then update market intelligence.
+1. Build a trusted price range from fresh attributable Dexie and Splash offers,
+   with Sage and chain providers supplying independent state evidence.
 2. Check risk limits, circuit breakers, inventory skew, and live market depth.
 3. Sync live offers from the wallet and detect fills using wallet, Dexie, and
    Spacescan evidence.
@@ -129,9 +130,9 @@ to 90 seconds:
    Dexie and Splash.
 6. Reconcile coins, top up tier spares, and run runtime health checks.
 
-Between cycles, coin prep/topup reshapes the wallet coin set, AMM monitoring
-keeps TibetSwap reserves fresh, and the mempool watcher can wake the loop early
-when pending spends suggest a fill or price shock.
+Between cycles, coin prep/topup reshapes the wallet coin set and provider watchers
+refresh offer-book, wallet, and chain evidence. A watched offer-coin spend can wake
+the loop early so fill verification does not wait for the next normal cycle.
 
 ### Adverse-Selection Guard
 
@@ -148,8 +149,8 @@ same context the bot is already using:
   created.
 - One-sided fill clusters, same-block sweep-like fills, and recent sweep
   events.
-- Post-fill adverse price moves, Dexie/TibetSwap dislocations, and
-  TibetSwap/mempool shock signals.
+- Post-fill adverse price moves, attributable source disagreement, and rapid
+  order-book movement or churn.
 - Dexie public orderbook depth, large market-relative public offers, stale
   orderbook data, and truncated orderbook pages.
 - Current inventory and spendable XCH/CAT exposure relative to the configured
@@ -179,10 +180,10 @@ If live toxicity cancellation is enabled, `bot_loop.py` can also cancel already
 open offers on the throttled side instead of leaving them exposed on the book.
 
 Smart Settings chooses defensive, balanced, or gentle defaults from the current
-wallet balance and market depth, then saves the guard settings with the rest of
-the trading configuration. Coinset or local full-node mempool signals can wake
-the loop early when a watched offer coin or TibetSwap pool coin is spent, so the
-fill detector and toxicity guard can react before the next normal cycle.
+wallet balance and trusted market depth, then saves the guard settings with the
+rest of the trading configuration. Coinset or local full-node observations can
+wake the loop early when a watched offer coin is spent, so the fill detector and
+toxicity guard can react before the next normal cycle.
 
 ---
 
@@ -332,8 +333,9 @@ handles this automatically; custom scripts must supply the token themselves.
   access to third-party market data and offer-posting services.
 - Trading and market making can lose funds through market movement, bad
   configuration, wallet/API failures, or operator error.
-- Splash, Spacescan, Dexie, TibetSwap, and Coinset behavior can change outside
-  this repository.
+- Splash, Spacescan, Dexie, and Coinset behavior can change outside this
+  repository. TibetSwap is retired and is retained only in historical data and
+  compatibility fields; CATalyst makes no live trading request to it.
 - CATalyst refuses to auto-install a downloaded Splash binary if the release
   does not provide a SHA256 checksum sidecar. Developers can override this with
   `CATALYST_ALLOW_UNVERIFIED_SPLASH_DOWNLOAD=1`, but that should not be used for
@@ -376,7 +378,7 @@ fields afterwards.
 | `bot_gui.html` | Single-file dashboard UI. |
 | `offer_manager.py` | Offer creation, cancellation, and rolling requote. |
 | `fill_tracker.py` | Fill detection and multi-source verification. |
-| `price_engine.py` | Price oracle using TibetSwap and Dexie. |
+| `price_engine.py` | Offer-book price engine using attributable Dexie evidence. |
 | `risk_manager.py` | Circuit breakers, position limits, and spread calculation. |
 | `market_toxicity.py` | Side-aware adverse-selection scoring used by the dashboard and risk manager. |
 | `coin_manager.py` | UTXO tracking, tier classification, and topup. |
@@ -384,7 +386,7 @@ fields afterwards.
 | `wallet_sage.py` | Sage wallet RPC adapter. |
 | `dexie_manager.py` | Dexie API integration. |
 | `spacescan.py` | On-chain verification via Spacescan. |
-| `sniper.py` | Arbitrage gap probing. |
+| `sniper.py` | Retired legacy compatibility module; live opportunity logic is offer-book-only. |
 | `splash_manager.py` | Splash P2P node integration. |
 | `smart_defaults.py` | Capital-aware config generator. |
 | `bot_health.py` | Self-healing watchdog. |
@@ -401,7 +403,7 @@ fields afterwards.
 - SQLite WAL-mode local database
 - Vanilla HTML/CSS/JavaScript frontend
 - Sage wallet RPC integration
-- Dexie, TibetSwap, Spacescan, Coinset, and Splash integrations
+- Dexie, Spacescan, Coinset, and Splash integrations
 - PyInstaller desktop builds
 
 ---

@@ -289,3 +289,28 @@ def test_cycle_does_not_print_prices_or_requote_decisions_to_clear_text_console(
     assert "print(done_msg, flush=True)" not in source
     assert "Gap closer refreshed at {mid_price" not in source
     assert "[REQUOTE] {side} side ({reason})" not in source
+
+
+def test_current_operator_docs_do_not_advertise_retired_tibetswap_features():
+    root = Path(__file__).resolve().parents[1]
+    current_docs = "\n".join(
+        (root / path).read_text(encoding="utf-8")
+        for path in (
+            "README.md",
+            "docs/PRIVACY.md",
+            "docs/tutorial-master-settings-inventory.md",
+            "tests/manual_test_checklist.md",
+        )
+    )
+
+    for retired_claim in (
+        "Sniper probes.",
+        "TibetSwap AMM",
+        "Fetch and blend TibetSwap and Dexie pricing",
+        "keeps TibetSwap reserves fresh",
+        "TibetSwap pool coin",
+        "Price oracle using TibetSwap and Dexie",
+        "CATalyst queries TibetSwap for pool, reserve, price",
+        "lists all MZ_XCH and other CAT pools from TibetSwap",
+    ):
+        assert retired_claim not in current_docs
