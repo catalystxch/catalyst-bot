@@ -331,6 +331,13 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
                 history_by_trade_id[trade_id]["dexie_link"] = dexie_link
             return
 
+        authority = _confirmed_fill_authority(row.get("fill_id"))
+        if not authority:
+            # A historical offers.status='filled' row is not economic proof.
+            # Only an immutable authoritative fill receipt may enter the
+            # confirmed history and downstream P&L/accounting surfaces.
+            return
+
         filled_at = (
             row.get("filled_at") or row.get("timestamp") or row.get("created_at") or ""
         )
@@ -349,7 +356,7 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
             "filled_at": filled_at,
             "dexie_link": dexie_link,
             "fill_confidence": "Confirmed",
-            "fill_authority": _confirmed_fill_authority(row.get("fill_id")),
+            "fill_authority": authority,
             "_sort_key": str(filled_at),
         }
 

@@ -686,6 +686,40 @@ def test_fills_endpoint_labels_only_authoritative_rows_as_confirmed(monkeypatch)
     assert payload["activity"][0]["can_account"] is False
 
 
+def test_offers_history_does_not_confirm_legacy_filled_row_without_receipt(
+    monkeypatch,
+):
+    from blueprints import offers
+
+    legacy_row = {
+        "trade_id": "legacy-trade-without-receipt",
+        "side": "buy",
+        "price_xch": "0.0001",
+        "size_xch": "1",
+        "size_cat": "10000",
+        "tier": "base",
+        "coin_id": "coin-1",
+        "filled_at": "2026-09-10T12:00:00.000000Z",
+        "created_at": "2026-09-10T11:59:00.000000Z",
+        "dexie_id": "dexie-1",
+    }
+    cursor = SimpleNamespace(fetchall=lambda: [legacy_row])
+    connection = SimpleNamespace(execute=lambda *_args, **_kwargs: cursor)
+
+    monkeypatch.setattr(offers.database, "get_fills", Mock(return_value=[]))
+    monkeypatch.setattr(
+        offers.database,
+        "get_authoritative_fill_by_id",
+        Mock(return_value=None),
+    )
+    monkeypatch.setattr(offers, "get_connection", Mock(return_value=connection))
+    monkeypatch.setattr(api_server, "_get_run_history_cutoff", Mock(return_value=None))
+
+    history = offers._build_fill_history_for_gui(ASSET_ID)
+
+    assert history == []
+
+
 def test_prestart_status_does_not_warn_when_operator_has_not_selected_a_pair(
     monkeypatch,
 ):
