@@ -246,6 +246,25 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             },
         )
 
+    def test_standalone_dexie_offer_preserves_whole_number_price(self):
+        from blueprints.smart_defaults import _normalise_standalone_dexie_offer
+
+        row = _normalise_standalone_dexie_offer(
+            {
+                "id": "whole-number-price",
+                "offered": {"id": "xch", "code": "XCH", "amount": "10"},
+                "requested": {
+                    "id": self._ASSET_ID,
+                    "code": "MZ",
+                    "amount": "1",
+                },
+            },
+            expected_side="buy",
+            asset_id=self._ASSET_ID,
+        )
+
+        self.assertEqual(row["price"], "10")
+
     def test_standalone_dexie_offer_rejects_fractional_mojos(self):
         from blueprints.smart_defaults import _normalise_standalone_dexie_offer
 

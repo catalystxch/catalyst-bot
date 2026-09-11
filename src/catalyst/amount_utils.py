@@ -9,6 +9,16 @@ def _cat_scale(decimals: int) -> Decimal:
     return Decimal(10) ** Decimal(int(decimals))
 
 
+def format_decimal_plain(value: Decimal) -> str:
+    """Format an exact Decimal without exponent or insignificant fraction zeros."""
+    if type(value) is not Decimal:
+        raise TypeError("value must be a Decimal")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 def cat_display_amount_to_mojos_ceil(amount, decimals: int) -> int:
     """Convert a CAT display amount to mojos, rounding any dust up.
 
@@ -37,7 +47,9 @@ def format_cat_display_amount(amount, decimals: int) -> str:
     """Format CAT display amounts without hiding sub-1-CAT values as zero."""
     places = max(0, min(int(decimals), 12))
     value = Decimal(str(amount))
-    text = f"{value:,.{places}f}".rstrip("0").rstrip(".")
+    text = f"{value:,.{places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 

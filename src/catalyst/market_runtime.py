@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 import json
 from typing import Callable
 
@@ -90,8 +90,16 @@ class OfferBookMarketRuntime:
             persist_provider_observation(settled)
             if settled.quality.value == "valid" and settled.fresh_until >= now:
                 payload = json.loads(settled.raw_evidence_json)
-                settled_trade_price = Decimal(payload["trade"]["price"])
-                supporting_evidence_digests = (settled.payload_sha256,)
+                minimum_trade_mojos = (
+                    Decimal(configured_offer_size_mojos)
+                    * Decimal(self._engine.derived_thresholds["minimum_evidence_ratio"])
+                ).to_integral_value(rounding=ROUND_CEILING)
+                settled_trade_mojos = Decimal(
+                    payload["trade"]["target_volume"]
+                ) * Decimal("1000000000000")
+                if settled_trade_mojos >= minimum_trade_mojos:
+                    settled_trade_price = Decimal(payload["trade"]["price"])
+                    supporting_evidence_digests = (settled.payload_sha256,)
 
         confidence = self._engine.evaluate(
             observations=(dexie, splash),

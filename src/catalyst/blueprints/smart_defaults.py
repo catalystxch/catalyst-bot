@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from flask import Blueprint, jsonify, request
 
 import api_server
+from amount_utils import format_decimal_plain
 from config import cfg
 from database import log_event
 from ladder_sizing import prepared_sell_ladder_cat_total
@@ -563,7 +564,7 @@ def _normalise_standalone_dexie_offer(
     if not offer_identity:
         raise ValueError("Dexie offer identity is missing")
     price = xch_amount / cat_amount
-    price_text = format(price, "f").rstrip("0").rstrip(".") or "0"
+    price_text = format_decimal_plain(price)
     return {
         "offer_id": offer_identity,
         "provider_offer_id": provider_offer_id,

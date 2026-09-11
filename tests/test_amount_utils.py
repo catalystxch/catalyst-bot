@@ -17,6 +17,7 @@ def test_format_cat_display_amount_preserves_low_decimal_fraction():
     assert format_cat_display_amount(Decimal("0.002"), 3) == "0.002"
     assert format_cat_display_amount(Decimal("0.0020"), 3) == "0.002"
     assert format_cat_display_amount(Decimal("2.000"), 3) == "2"
+    assert format_cat_display_amount(Decimal("10"), 0) == "10"
 
 
 def test_format_signed_cat_display_amount_preserves_sign_and_fraction():

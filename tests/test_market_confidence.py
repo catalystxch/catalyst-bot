@@ -171,6 +171,8 @@ def test_same_offer_seen_on_dexie_and_splash_is_counted_once():
     assert result.independent_bid_depth_mojos == 2_000
     assert result.independent_ask_depth_mojos == 2_000
     assert result.deduplicated_offer_count == 2
+    assert result.state == "AMBER"
+    assert "single_provider_dependency" in result.reason_codes
 
 
 def test_depth_threshold_scales_with_offer_size_and_preset():
@@ -527,6 +529,83 @@ def test_single_provider_hard_move_never_reanchors():
     assert all(result.state == "RED" for result in results)
     assert results[-1].trusted_midpoint == Decimal("0.1")
     assert "hard_price_move_cap" in results[-1].reason_codes
+
+
+def test_fatal_low_depth_samples_do_not_advance_hard_move_reanchor():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    for refresh in range(1, 5):
+        observed_at = NOW + timedelta(seconds=20 * refresh)
+        result = engine.evaluate(
+            observations=(
+                _dexie(bid="0.139", ask="0.141", amount=100, at=observed_at),
+                _splash(bid="0.139", ask="0.141", amount=100, at=observed_at),
+            ),
+            own_offer_identities=frozenset(),
+            configured_offer_size_mojos=1_000,
+            now=observed_at,
+        )
+        assert result.state == "RED"
+        assert result.pending_movement_refreshes == 0
+
+    valid_at = NOW + timedelta(seconds=100)
+    valid = engine.evaluate(
+        observations=(
+            _dexie(bid="0.139", ask="0.141", at=valid_at),
+            _splash(bid="0.139", ask="0.141", at=valid_at),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=valid_at,
+    )
+
+    assert valid.state == "RED"
+    assert valid.trusted_midpoint == Decimal("0.1")
+    assert valid.pending_movement_refreshes == 1
+    assert "hard_price_move_cap" in valid.reason_codes
+
+
+def test_fatal_low_depth_sample_does_not_advance_material_move_persistence():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    low_depth_at = NOW + timedelta(seconds=20)
+    low_depth = engine.evaluate(
+        observations=(
+            _dexie(bid="0.109", ask="0.111", amount=100, at=low_depth_at),
+            _splash(bid="0.109", ask="0.111", amount=100, at=low_depth_at),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=low_depth_at,
+    )
+    valid_at = NOW + timedelta(seconds=40)
+    valid = engine.evaluate(
+        observations=(
+            _dexie(bid="0.109", ask="0.111", at=valid_at),
+            _splash(bid="0.109", ask="0.111", at=valid_at),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=valid_at,
+    )
+
+    assert low_depth.state == "RED"
+    assert low_depth.pending_movement_refreshes == 0
+    assert valid.state == "AMBER"
+    assert valid.trusted_midpoint == Decimal("0.1")
+    assert valid.pending_movement_refreshes == 1
 
 
 def test_chain_evidence_overrides_provider_conflict_but_stays_amber():

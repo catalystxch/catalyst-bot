@@ -80,7 +80,11 @@ from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
 from shock_protection import evaluate_tibet_shock
-from amount_utils import format_cat_display_amount, format_signed_cat_display_amount
+from amount_utils import (
+    format_cat_display_amount,
+    format_decimal_plain,
+    format_signed_cat_display_amount,
+)
 from wallet import get_all_offers, get_chia_health
 
 try:
@@ -1111,7 +1115,7 @@ class BotLoop:
                 / Decimal("1000000000000")
                 / (Decimal(cat_atoms) / cat_scale)
             )
-            price_text = format(price, "f").rstrip("0").rstrip(".")
+            price_text = format_decimal_plain(price)
             if not price_text:
                 return False
         except (KeyError, TypeError, ValueError, ArithmeticError):

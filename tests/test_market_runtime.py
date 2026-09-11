@@ -280,14 +280,14 @@ def test_restart_preserves_pending_movement_state(isolated_db):
     current_book = {
         "bids": [
             {
-                "offer_id": "move-bid",
+                "offer_id": "buy-1",
                 "price": "0.000104",
                 "amount_mojos": 3_000_000_000_000,
             }
         ],
         "asks": [
             {
-                "offer_id": "move-ask",
+                "offer_id": "sell-1",
                 "price": "0.000116",
                 "amount_mojos": 3_000_000_000_000,
             }
@@ -295,13 +295,13 @@ def test_restart_preserves_pending_movement_state(isolated_db):
     }
     current_splash = [
         {
-            "offer_id": "s-move-bid",
+            "offer_id": "splash-buy",
             "side": "buy",
             "price": "0.000104",
             "amount_mojos": 3_000_000_000_000,
         },
         {
-            "offer_id": "s-move-ask",
+            "offer_id": "splash-sell",
             "side": "sell",
             "price": "0.000116",
             "amount_mojos": 3_000_000_000_000,
@@ -410,6 +410,82 @@ def test_fresh_dexie_settled_trade_confirms_material_move_and_is_persisted(isola
     settled = [row for row in observations if row["capability"] == "settled_trades"]
     assert settled
     assert settled[0]["payload_sha256"] in result.confidence.evidence_digests
+
+
+def test_dust_dexie_trade_cannot_confirm_material_move(isolated_db):
+    current_book = _book()
+    current_splash = _splash()
+    current_trades = []
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: current_book,
+        fetch_dexie_settled_trades=lambda _asset: current_trades,
+        fetch_splash_offers=lambda _asset: current_splash,
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
+    )
+    runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    current_book = {
+        "bids": [
+            {
+                "offer_id": "buy-1",
+                "price": "0.000104",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "sell-1",
+                "price": "0.000116",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+    }
+    current_splash = [
+        {
+            "offer_id": "splash-buy",
+            "side": "buy",
+            "price": "0.000104",
+            "amount_mojos": 3_000_000_000_000,
+        },
+        {
+            "offer_id": "splash-sell",
+            "side": "sell",
+            "price": "0.000116",
+            "amount_mojos": 3_000_000_000_000,
+        },
+    ]
+    current_trades = [
+        {
+            "trade_id": "dust-confirmation",
+            "price": "0.00011",
+            "base_volume": "0.000001",
+            "target_volume": "0.000000000001",
+            "trade_timestamp": int((NOW + timedelta(seconds=19)).timestamp() * 1000),
+            "type": "buy",
+        }
+    ]
+
+    result = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert result.confidence.state == "AMBER"
+    assert result.confidence.trusted_midpoint == Decimal("0.0001")
+    assert "material_move_pending_confirmation" in result.confidence.reason_codes
+    assert "settled_trade_confirmed_move" not in result.confidence.reason_codes
+    observations = database.get_market_provider_observations(ASSET_ID, limit=10)
+    assert any(row["capability"] == "settled_trades" for row in observations)
 
 
 def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
@@ -730,6 +806,31 @@ def test_bot_records_exact_splash_offer_for_confidence():
         "price": "0.00008",
         "amount_mojos": 1_000_000_000_000,
     }
+
+
+def test_bot_preserves_whole_number_splash_confidence_price():
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._splash_confidence_offers = {}
+    loop._splash_confidence_lock = __import__("threading").Lock()
+    classified = {
+        "relevant": True,
+        "side": "sell",
+        "summary": {
+            "offered": {ASSET_ID: 1_000},
+            "requested": {"xch": 10_000_000_000_000},
+        },
+    }
+
+    assert loop._remember_splash_confidence_offer(
+        fingerprint="whole-number-splash-offer",
+        classified=classified,
+        observed_at=NOW,
+    )
+
+    row = loop._get_fresh_splash_confidence_offers(ASSET_ID, now=NOW)[0]
+    assert row["price"] == "10"
 
 
 def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):

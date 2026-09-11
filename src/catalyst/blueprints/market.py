@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from flask import Blueprint, jsonify, request
 
 import api_server
+from amount_utils import format_decimal_plain
 import database
 from config import cfg
 
@@ -741,7 +742,7 @@ def _runtime_confidence_metrics() -> dict:
 
     def _xch(mojos) -> str:
         value = Decimal(int(mojos or 0)) / Decimal("1000000000000")
-        return format(value, "f").rstrip("0").rstrip(".") or "0"
+        return format_decimal_plain(value)
 
     return {
         "independent_bid_depth_xch": _xch(

@@ -395,6 +395,9 @@ class MarketConfidenceEngine:
         )
         bid_depth = sum(offer.amount_mojos for offer in executable_bids)
         ask_depth = sum(offer.amount_mojos for offer in executable_asks)
+        executable_provider_ids = {
+            offer.provider_id for offer in (*executable_bids, *executable_asks)
+        }
         dust_out_of_range = any(
             (
                 offer.side == "buy"
@@ -446,13 +449,20 @@ class MarketConfidenceEngine:
         usable_provider_count = sum(
             1
             for provider in provider_midpoints
-            if selected_providers is None or provider in selected_providers
+            if provider in executable_provider_ids
+            and (selected_providers is None or provider in selected_providers)
+        )
+        movement_sample_safe = bool(
+            bid_depth >= required_depth
+            and ask_depth >= required_depth
+            and not source_conflict
+            and manipulation_score < int(self._thresholds["manipulation_red"])
         )
         if proposed_midpoint is not None and self._last_trusted_midpoint is not None:
             move_bps = _basis_points(proposed_midpoint, self._last_trusted_midpoint)
             hard_cap = move_bps > Decimal(self._thresholds["hard_move_cap_bps"])
             if hard_cap:
-                corroborated = not source_conflict and usable_provider_count >= 2
+                corroborated = movement_sample_safe and usable_provider_count >= 2
                 pending_anchor_matches = (
                     self._pending_midpoint is not None
                     and _basis_points(proposed_midpoint, self._pending_midpoint)
@@ -488,25 +498,31 @@ class MarketConfidenceEngine:
                     self._pending_midpoint = None
                     self._pending_refreshes = 0
                 else:
-                    pending_anchor_matches = (
-                        self._pending_midpoint is not None
-                        and _basis_points(proposed_midpoint, self._pending_midpoint)
-                        <= Decimal(self._thresholds["persistence_jitter_bps"])
-                    )
-                    if pending_anchor_matches:
-                        self._pending_refreshes += 1
-                    else:
-                        self._pending_midpoint = proposed_midpoint
-                        self._pending_refreshes = 1
-                    pending = self._pending_refreshes < int(
-                        self._thresholds["persistence_refreshes"]
-                    )
-                    if pending:
-                        reasons.append("material_move_pending_confirmation")
-                    else:
-                        reasons.append("movement_persistence_satisfied")
+                    if not movement_sample_safe:
                         self._pending_midpoint = None
                         self._pending_refreshes = 0
+                        pending = True
+                        reasons.append("material_move_pending_confirmation")
+                    else:
+                        pending_anchor_matches = (
+                            self._pending_midpoint is not None
+                            and _basis_points(proposed_midpoint, self._pending_midpoint)
+                            <= Decimal(self._thresholds["persistence_jitter_bps"])
+                        )
+                        if pending_anchor_matches:
+                            self._pending_refreshes += 1
+                        else:
+                            self._pending_midpoint = proposed_midpoint
+                            self._pending_refreshes = 1
+                        pending = self._pending_refreshes < int(
+                            self._thresholds["persistence_refreshes"]
+                        )
+                        if pending:
+                            reasons.append("material_move_pending_confirmation")
+                        else:
+                            reasons.append("movement_persistence_satisfied")
+                            self._pending_midpoint = None
+                            self._pending_refreshes = 0
             else:
                 self._pending_midpoint = None
                 self._pending_refreshes = 0
