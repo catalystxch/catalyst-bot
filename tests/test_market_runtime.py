@@ -956,7 +956,7 @@ def test_market_refresh_applies_withdrawal_before_publication_reconciliation(
     )
     loop._market_own_offer_identities = lambda _asset: frozenset()
     loop._configured_market_offer_size_mojos = lambda: 1_000
-    loop.market_intel = SimpleNamespace(get_attributable_orderbook=lambda: _book())
+    loop.market_intel = SimpleNamespace(get_attributable_orderbook=_book)
     loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
     withdrawals = []
     loop._apply_market_withdrawal = lambda value: withdrawals.append(value)
