@@ -961,12 +961,14 @@ class BotLoop:
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
+            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
         )
         self.splash_manager.enable_durable_outbox(
             owner_run_id=owner + ":splash",
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
+            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
         )
 
     def set_runtime_recovery_coordinator(self, coordinator) -> None:

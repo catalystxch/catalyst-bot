@@ -254,6 +254,34 @@ def test_splash_normalizes_peer_health_and_exact_offer_set():
     assert _payload(health)["peers"] == 4
 
 
+def test_splash_rejects_any_future_dated_offer_even_when_older_row_masks_minimum():
+    provider = SplashOfferProvider(
+        fetch_offers=lambda _asset: [
+            {
+                "offer_id": "offer-current",
+                "side": "buy",
+                "price": "0.10",
+                "amount_mojos": 2,
+                "observed_at": (NOW - timedelta(seconds=1)).isoformat(),
+            },
+            {
+                "offer_id": "offer-future",
+                "side": "sell",
+                "price": "0.13",
+                "amount_mojos": 3,
+                "observed_at": (NOW + timedelta(days=1)).isoformat(),
+            },
+        ],
+        get_health=lambda: {"running": True, "peers": 4, "api_reachable": True},
+    )
+
+    offers = provider.observe_offers(ASSET_ID, now=NOW)
+
+    assert offers.quality is ObservationQuality.INVALID
+    assert offers.reason_codes == ("malformed_provider_response",)
+    assert _payload(offers) == {"available": False, "error_type": "ValueError"}
+
+
 def test_splash_no_peers_is_degraded_and_not_fabricated_healthy():
     provider = SplashOfferProvider(
         fetch_offers=lambda _asset: [],

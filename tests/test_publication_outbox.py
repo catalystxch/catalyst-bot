@@ -2332,6 +2332,70 @@ def test_dispatched_ambiguous_response_is_unresolved_and_never_retried(
     assert row["state"] == "unresolved"
 
 
+@pytest.mark.parametrize(
+    ("manager_module", "manager_type", "publisher"),
+    [
+        (dexie_manager, dexie_manager.DexieManager, "dexie"),
+        (splash_manager, splash_manager.SplashManager, "splash"),
+    ],
+)
+def test_durable_bulk_flush_reauthorizes_before_each_external_post(
+    isolated_database,
+    monkeypatch,
+    manager_module,
+    manager_type,
+    publisher,
+):
+    for index in (1, 2):
+        intent_id = f"intent-authority-{publisher}-{index}"
+        _prepare_claimable(
+            isolated_database,
+            intent_id=intent_id,
+            generation=index,
+        )
+
+    manager = manager_type()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    authorizations = iter((True, False))
+    authorization_calls = []
+    transport_calls = []
+
+    def authorize():
+        authorization_calls.append(True)
+        return next(authorizations)
+
+    def accepted_post(url, **kwargs):
+        transport_calls.append((url, kwargs))
+        key = kwargs["headers"].get("idempotency-key")
+        payload = {"idempotency_key": key}
+        if publisher == "dexie":
+            payload["id"] = "dexie-authorized"
+            status_code = 201
+        else:
+            payload["success"] = True
+            status_code = 200
+        return _TransportResponse(status_code, payload)
+
+    monkeypatch.setattr(manager_module.requests, "post", accepted_post)
+    manager.enable_durable_outbox(
+        owner_run_id=f"authority-worker-{publisher}",
+        network="mainnet",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+        dispatch_authorizer=authorize,
+    )
+
+    result = manager.flush_queue(flush_all=True)
+
+    assert len(authorization_calls) == 2
+    assert len(transport_calls) == 1
+    assert result["posted"] == 1
+    assert result["authorization_blocked"] is True
+    remaining = isolated_database.list_publication_outbox(publisher=publisher)
+    assert [row["state"] for row in remaining].count("queued") == 1
+
+
 def test_stale_dispatched_claim_without_observation_contract_never_replays(
     isolated_database, monkeypatch
 ):
@@ -2679,6 +2743,35 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
         "startup_gate",
         "drain_outbox",
     ]
+
+
+def test_bot_binds_market_authority_to_each_durable_publication_dispatch(
+    monkeypatch,
+):
+    captured = []
+    phases = []
+
+    class Manager:
+        def enable_durable_outbox(self, **kwargs):
+            captured.append(kwargs)
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop.dexie_manager = Manager()
+    loop.splash_manager = Manager()
+    loop._enter_runtime_effect_phase = lambda phase: phases.append(phase) or True
+    monkeypatch.setattr(
+        bot_loop,
+        "get_runtime_mutation_lease",
+        lambda: {"network": "mainnet"},
+    )
+
+    loop._enable_durable_publication_outbox()
+
+    assert len(captured) == 2
+    assert all(callable(item["dispatch_authorizer"]) for item in captured)
+    assert captured[0]["dispatch_authorizer"]() is True
+    assert captured[1]["dispatch_authorizer"]() is True
+    assert phases == ["publication", "publication"]
 
 
 def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():

@@ -72,6 +72,8 @@ class SplashOfferProvider:
                     raise ValueError("Splash offer amount is invalid")
                 if source_time is None:
                     raise ValueError("Splash offer observation time is missing")
+                if source_time > observed_at:
+                    raise ValueError("Splash offer observation time is in the future")
                 seen.add(offer_id)
                 source_times.append(source_time)
                 normalized.append(
