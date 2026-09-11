@@ -493,6 +493,7 @@ class PriceEngine:
         fetched_at: float = None,
     ) -> bool:
         """Compatibility no-op; retired reserve evidence is never accepted."""
+        _ = fetched_at  # Retained for one-release keyword compatibility.
         return False
 
     def get_live_amm_price(self) -> Optional[Decimal]:

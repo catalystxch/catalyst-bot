@@ -49,9 +49,9 @@ def test_smart_settings_persists_selected_offer_book_risk_preset():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    backend = (root / "src" / "catalyst" / "blueprints" / "smart_defaults.py").read_text(
-        encoding="utf-8"
-    )
+    backend = (
+        root / "src" / "catalyst" / "blueprints" / "smart_defaults.py"
+    ).read_text(encoding="utf-8")
     html = (root / "bot_gui.html").read_text(encoding="utf-8")
 
     assert '"market_risk_preset": _risk_profile_name' in backend

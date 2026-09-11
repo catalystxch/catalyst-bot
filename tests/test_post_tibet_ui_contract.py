@@ -47,7 +47,9 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
         "tibet_live_features": "retired",
     }
     monkeypatch.setattr(
-        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=snapshot)
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(return_value=snapshot),
     )
     monkeypatch.setattr(
         market.database, "get_degraded_market_state", Mock(return_value=degraded)
@@ -166,7 +168,9 @@ def test_market_confidence_exposes_exact_evidence_and_withdrawal_countdown(
     monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
     monkeypatch.setattr(market, "_utc_now", lambda: now)
     monkeypatch.setattr(
-        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=snapshot)
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(return_value=snapshot),
     )
     monkeypatch.setattr(
         market.database, "get_degraded_market_state", Mock(return_value=degraded)
@@ -352,7 +356,9 @@ def test_market_confidence_rejects_newer_observation_not_bound_to_snapshot(
 def test_market_confidence_endpoint_fails_closed_while_evidence_is_warming(monkeypatch):
     monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
     monkeypatch.setattr(
-        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=None)
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(return_value=None),
     )
     monkeypatch.setattr(
         market.database, "get_degraded_market_state", Mock(return_value=None)
@@ -419,8 +425,10 @@ def test_retired_amm_controls_are_not_user_visible():
     assert "Confidence State" in html
     assert "Required Independent Depth" in html
     assert "Withdrawal Stage" in html
-    market_health = html[html.index("function updateMarketHealth"):]
-    market_health = market_health[: market_health.index("function mergeStatusRiskIntoDashboard")]
+    market_health = html[html.index("function updateMarketHealth") :]
+    market_health = market_health[
+        : market_health.index("function mergeStatusRiskIntoDashboard")
+    ]
     assert "tibetReferenceUnavailable" not in market_health
     assert "confidenceData.confidence" in market_health
 
@@ -642,7 +650,9 @@ def test_fills_endpoint_labels_only_authoritative_rows_as_confirmed(monkeypatch)
     assert payload["activity"][0]["can_account"] is False
 
 
-def test_prestart_status_does_not_warn_when_operator_has_not_selected_a_pair(monkeypatch):
+def test_prestart_status_does_not_warn_when_operator_has_not_selected_a_pair(
+    monkeypatch,
+):
     from blueprints import bot as bot_blueprint
 
     events = Mock()

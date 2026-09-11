@@ -31,15 +31,29 @@ def _book():
             {"offer_id": "buy-1", "price": "0.00009", "amount_mojos": 3_000_000_000_000}
         ],
         "asks": [
-            {"offer_id": "sell-1", "price": "0.00011", "amount_mojos": 3_000_000_000_000}
+            {
+                "offer_id": "sell-1",
+                "price": "0.00011",
+                "amount_mojos": 3_000_000_000_000,
+            }
         ],
     }
 
 
 def _splash():
     return [
-        {"offer_id": "splash-buy", "side": "buy", "price": "0.00009", "amount_mojos": 3_000_000_000_000},
-        {"offer_id": "splash-sell", "side": "sell", "price": "0.00011", "amount_mojos": 3_000_000_000_000},
+        {
+            "offer_id": "splash-buy",
+            "side": "buy",
+            "price": "0.00009",
+            "amount_mojos": 3_000_000_000_000,
+        },
+        {
+            "offer_id": "splash-sell",
+            "side": "sell",
+            "price": "0.00011",
+            "amount_mojos": 3_000_000_000_000,
+        },
     ]
 
 
@@ -49,7 +63,11 @@ def test_runtime_persists_one_coherent_green_decision(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda asset_id: _book(),
         fetch_splash_offers=lambda asset_id: _splash(),
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
 
     result = runtime.refresh(
@@ -75,7 +93,11 @@ def test_runtime_fails_closed_when_only_our_offers_remain(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda asset_id: _book(),
         fetch_splash_offers=lambda asset_id: [],
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 1},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 1,
+        },
     )
 
     result = runtime.refresh(
@@ -173,7 +195,11 @@ def test_restart_hydrates_trusted_price_and_rejects_a_hard_move(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: baseline,
         fetch_splash_offers=lambda _asset: _splash(),
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     original = runtime.refresh(
         own_offer_identities=frozenset(),
@@ -181,18 +207,44 @@ def test_restart_hydrates_trusted_price_and_rejects_a_hard_move(isolated_db):
         now=NOW,
     )
     moved = {
-        "bids": [{"offer_id": "moved-bid", "price": "0.00014", "amount_mojos": 3_000_000_000_000}],
-        "asks": [{"offer_id": "moved-ask", "price": "0.00016", "amount_mojos": 3_000_000_000_000}],
+        "bids": [
+            {
+                "offer_id": "moved-bid",
+                "price": "0.00014",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "moved-ask",
+                "price": "0.00016",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
     }
     restarted = OfferBookMarketRuntime(
         asset_id=ASSET_ID,
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: moved,
         fetch_splash_offers=lambda _asset: [
-            {"offer_id": "s-moved-bid", "side": "buy", "price": "0.00014", "amount_mojos": 3_000_000_000_000},
-            {"offer_id": "s-moved-ask", "side": "sell", "price": "0.00016", "amount_mojos": 3_000_000_000_000},
+            {
+                "offer_id": "s-moved-bid",
+                "side": "buy",
+                "price": "0.00014",
+                "amount_mojos": 3_000_000_000_000,
+            },
+            {
+                "offer_id": "s-moved-ask",
+                "side": "sell",
+                "price": "0.00016",
+                "amount_mojos": 3_000_000_000_000,
+            },
         ],
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
 
     result = restarted.refresh(
@@ -214,7 +266,11 @@ def test_restart_preserves_pending_movement_state(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: current_book,
         fetch_splash_offers=lambda _asset: current_splash,
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     runtime.refresh(
         own_offer_identities=frozenset(),
@@ -222,12 +278,34 @@ def test_restart_preserves_pending_movement_state(isolated_db):
         now=NOW,
     )
     current_book = {
-        "bids": [{"offer_id": "move-bid", "price": "0.000104", "amount_mojos": 3_000_000_000_000}],
-        "asks": [{"offer_id": "move-ask", "price": "0.000116", "amount_mojos": 3_000_000_000_000}],
+        "bids": [
+            {
+                "offer_id": "move-bid",
+                "price": "0.000104",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "move-ask",
+                "price": "0.000116",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
     }
     current_splash = [
-        {"offer_id": "s-move-bid", "side": "buy", "price": "0.000104", "amount_mojos": 3_000_000_000_000},
-        {"offer_id": "s-move-ask", "side": "sell", "price": "0.000116", "amount_mojos": 3_000_000_000_000},
+        {
+            "offer_id": "s-move-bid",
+            "side": "buy",
+            "price": "0.000104",
+            "amount_mojos": 3_000_000_000_000,
+        },
+        {
+            "offer_id": "s-move-ask",
+            "side": "sell",
+            "price": "0.000116",
+            "amount_mojos": 3_000_000_000_000,
+        },
     ]
     first = runtime.refresh(
         own_offer_identities=frozenset(),
@@ -241,7 +319,11 @@ def test_restart_preserves_pending_movement_state(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: current_book,
         fetch_splash_offers=lambda _asset: current_splash,
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     second = restarted.refresh(
         own_offer_identities=frozenset(),
@@ -259,7 +341,11 @@ def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: _book(),
         fetch_splash_offers=lambda _asset: _splash(),
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     runtime.refresh(
         own_offer_identities=frozenset(),
@@ -267,15 +353,31 @@ def test_restart_preserves_prior_offer_ids_for_churn_detection(isolated_db):
         now=NOW,
     )
     changed = {
-        "bids": [{"offer_id": "changed-bid", "price": "0.00009", "amount_mojos": 3_000_000_000_000}],
-        "asks": [{"offer_id": "changed-ask", "price": "0.00011", "amount_mojos": 3_000_000_000_000}],
+        "bids": [
+            {
+                "offer_id": "changed-bid",
+                "price": "0.00009",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
+        "asks": [
+            {
+                "offer_id": "changed-ask",
+                "price": "0.00011",
+                "amount_mojos": 3_000_000_000_000,
+            }
+        ],
     }
     restarted = OfferBookMarketRuntime(
         asset_id=ASSET_ID,
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: changed,
         fetch_splash_offers=lambda _asset: [],
-        fetch_splash_health=lambda: {"running": False, "api_reachable": False, "peers": 0},
+        fetch_splash_health=lambda: {
+            "running": False,
+            "api_reachable": False,
+            "peers": 0,
+        },
     )
 
     result = restarted.refresh(
@@ -330,7 +432,11 @@ def test_runtime_rebases_persisted_confidence_state_when_risk_preset_changes(
         risk_preset="balanced",
         fetch_dexie_book=lambda _asset: _book(),
         fetch_splash_offers=lambda _asset: _splash(),
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     balanced.refresh(
         own_offer_identities=frozenset(),
@@ -344,7 +450,11 @@ def test_runtime_rebases_persisted_confidence_state_when_risk_preset_changes(
         risk_preset="aggressive",
         fetch_dexie_book=lambda _asset: _book(),
         fetch_splash_offers=lambda _asset: _splash(),
-        fetch_splash_health=lambda: {"running": True, "api_reachable": True, "peers": 2},
+        fetch_splash_health=lambda: {
+            "running": True,
+            "api_reachable": True,
+            "peers": 2,
+        },
     )
     after = aggressive._engine.export_state()
 
@@ -451,7 +561,9 @@ def test_bot_runtime_phase_gate_blocks_exposure_but_never_safety_cancel(monkeypa
     assert loop._enter_runtime_effect_phase("trim") is True
 
 
-def test_bot_runtime_phase_gate_fails_closed_before_first_confidence_refresh(monkeypatch):
+def test_bot_runtime_phase_gate_fails_closed_before_first_confidence_refresh(
+    monkeypatch,
+):
     import bot_loop
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
@@ -482,11 +594,14 @@ def test_bot_records_exact_splash_offer_for_confidence():
         },
     }
 
-    assert loop._remember_splash_confidence_offer(
-        fingerprint="splash-offer-1",
-        classified=classified,
-        observed_at=NOW,
-    ) is True
+    assert (
+        loop._remember_splash_confidence_offer(
+            fingerprint="splash-offer-1",
+            classified=classified,
+            observed_at=NOW,
+        )
+        is True
+    )
 
     row = loop._get_fresh_splash_confidence_offers(ASSET_ID, now=NOW)[0]
     assert row == {
@@ -505,7 +620,9 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     loop.offer_manager = SimpleNamespace(
         cancel_offers=lambda ids, **kwargs: cancelled.extend(ids) or {}
     )
-    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: phase == "cancel")
+    monkeypatch.setattr(
+        loop, "_enter_runtime_effect_phase", lambda phase: phase == "cancel"
+    )
     monkeypatch.setattr(
         bot_loop,
         "get_open_offers",
@@ -518,7 +635,9 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     )
 
     loop._apply_market_withdrawal(
-        SimpleNamespace(cancel_tiers=("inner", "middle"), reason_code="MARKET_DEGRADED_MIDDLE")
+        SimpleNamespace(
+            cancel_tiers=("inner", "middle"), reason_code="MARKET_DEGRADED_MIDDLE"
+        )
     )
 
     assert cancelled == ["inner", "mid"]

@@ -729,7 +729,10 @@ def _age_confidence_snapshot(
             reasons.append("confidence_snapshot_expired")
     if fresh_books == 0:
         aged["state"] = "RED"
-        if aged.get("derived_at") is not None and "market_evidence_expired" not in reasons:
+        if (
+            aged.get("derived_at") is not None
+            and "market_evidence_expired" not in reasons
+        ):
             reasons.append("market_evidence_expired")
     elif fresh_books == 1 and str(aged.get("state") or "RED").upper() == "GREEN":
         aged["state"] = "AMBER"
@@ -763,15 +766,9 @@ def _runtime_confidence_metrics() -> dict:
         "pending_movement_refreshes": int(
             getattr(result, "pending_movement_refreshes", 0)
         ),
-        "excluded_own_offer_count": int(
-            getattr(result, "excluded_own_offer_count", 0)
-        ),
-        "deduplicated_offer_count": int(
-            getattr(result, "deduplicated_offer_count", 0)
-        ),
-        "derived_thresholds": dict(
-            getattr(result, "derived_thresholds", {}) or {}
-        ),
+        "excluded_own_offer_count": int(getattr(result, "excluded_own_offer_count", 0)),
+        "deduplicated_offer_count": int(getattr(result, "deduplicated_offer_count", 0)),
+        "derived_thresholds": dict(getattr(result, "derived_thresholds", {}) or {}),
     }
 
 
@@ -811,11 +808,16 @@ def _degraded_timeline(degraded: dict | None, *, now: datetime) -> dict | None:
 def api_market_confidence():
     """Expose the single durable market/safety truth used by every UI tab."""
 
-    asset_id = str(
-        api_server._active_cat.get("asset_id")
-        or getattr(api_server.cfg, "CAT_ASSET_ID", "")
-        or ""
-    ).strip().lower().removeprefix("0x")
+    asset_id = (
+        str(
+            api_server._active_cat.get("asset_id")
+            or getattr(api_server.cfg, "CAT_ASSET_ID", "")
+            or ""
+        )
+        .strip()
+        .lower()
+        .removeprefix("0x")
+    )
     if not asset_id:
         generated_at = _utc_now().isoformat()
         return jsonify(
@@ -888,9 +890,7 @@ def api_market_confidence():
         timeline = _degraded_timeline(degraded, now=current_time)
         if timeline is not None:
             degraded["timeline"] = timeline
-    degraded_active = bool(
-        degraded and degraded.get("degraded_since")
-    )
+    degraded_active = bool(degraded and degraded.get("degraded_since"))
     can_create = state == "GREEN" and not degraded_active
     can_requote = state == "GREEN" and not degraded_active
     payload = {

@@ -218,9 +218,7 @@ def _exact_chain_inputs(value) -> tuple[tuple[str, str, int], ...] | None:
         ):
             return None
         normalized.append((coin_id, asset_id, amount))
-    if len({coin_id for coin_id, _asset_id, _amount in normalized}) != len(
-        normalized
-    ):
+    if len({coin_id for coin_id, _asset_id, _amount in normalized}) != len(normalized):
         return None
     return tuple(sorted(normalized))
 

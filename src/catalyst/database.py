@@ -8005,9 +8005,7 @@ def guarded_reset_authoritative_state(
         # entirely ensures no future FK topology can turn reset into data loss.
         if clear_fills and fill_assessment_count:
             cursor = conn.execute("DELETE FROM fill_confidence_assessments")
-            summary["fill_confidence_assessments_cleared"] = int(
-                cursor.rowcount or 0
-            )
+            summary["fill_confidence_assessments_cleared"] = int(cursor.rowcount or 0)
         if (
             clear_round_trips
             and conn.execute(
@@ -25403,7 +25401,9 @@ def ensure_offer_publication_discoveries(
                 current["offer_identity"] != identity
                 or current["deadline_at"] != deadline_at
             ):
-                raise ValueError("offer discovery replay conflicts with durable authority")
+                raise ValueError(
+                    "offer discovery replay conflicts with durable authority"
+                )
         conn.commit()
         return [dict(row) for row in rows]
     except Exception:
@@ -25456,9 +25456,7 @@ def record_offer_publication_discovery(
         if row is None:
             raise RuntimeError("offer discovery obligation is missing")
         current = dict(row)
-        next_state = (
-            "exact" if observed == current["offer_identity"] else "mismatch"
-        )
+        next_state = "exact" if observed == current["offer_identity"] else "mismatch"
         if current["state"] == "exact":
             conn.commit()
             return current
@@ -31366,13 +31364,17 @@ def get_market_provider_observations(
 ) -> List[Dict[str, Any]]:
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM market_provider_observations
         WHERE asset_id=? ORDER BY observed_at DESC, observation_id DESC LIMIT ?
         """,
-        (asset_id, limit),
-    ).fetchall()
+            (asset_id, limit),
+        )
+        .fetchall()
+    )
     result = []
     for row in rows:
         item = dict(row)
@@ -31498,14 +31500,18 @@ def get_fill_confidence_assessments(
     safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
     if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 500:
         raise ValueError("limit must be an integer between 1 and 500")
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM fill_confidence_assessments
         WHERE asset_id=?
         ORDER BY observed_at DESC, assessment_id DESC LIMIT ?
         """,
-        (safe_asset, limit),
-    ).fetchall()
+            (safe_asset, limit),
+        )
+        .fetchall()
+    )
     result = []
     for row in rows:
         item = dict(row)
@@ -31584,10 +31590,14 @@ def record_market_confidence_snapshot(
 
 
 def get_market_confidence_engine_state(asset_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT state_json FROM market_confidence_engine_state WHERE asset_id=?",
-        (str(asset_id).strip().lower(),),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT state_json FROM market_confidence_engine_state WHERE asset_id=?",
+            (str(asset_id).strip().lower(),),
+        )
+        .fetchone()
+    )
     if row is None:
         return None
     value = json.loads(row["state_json"])
@@ -31599,13 +31609,17 @@ def get_market_confidence_engine_state(asset_id: str) -> Optional[Dict[str, Any]
 def get_latest_market_confidence_snapshot(
     asset_id: str,
 ) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        """
+    row = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM market_confidence_snapshots
         WHERE asset_id=? ORDER BY derived_at DESC, snapshot_id DESC LIMIT 1
         """,
-        (asset_id,),
-    ).fetchone()
+            (asset_id,),
+        )
+        .fetchone()
+    )
     if row is None:
         return None
     result = dict(row)
@@ -31723,24 +31737,32 @@ def get_market_evidence_summaries(
 ) -> List[Dict[str, Any]]:
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM market_evidence_summaries
         WHERE asset_id=? ORDER BY summary_day DESC, provider_id LIMIT ?
         """,
-        (asset_id, limit),
-    ).fetchall()
+            (asset_id, limit),
+        )
+        .fetchall()
+    )
     return [dict(row) for row in rows]
 
 
 def count_legacy_tibet_price_rows(asset_id: str) -> int:
-    row = get_connection().execute(
-        """
+    row = (
+        get_connection()
+        .execute(
+            """
         SELECT COUNT(*) AS row_count FROM price_history
         WHERE cat_asset_id=? AND tibet_price IS NOT NULL
         """,
-        (asset_id,),
-    ).fetchone()
+            (asset_id,),
+        )
+        .fetchone()
+    )
     return int(row["row_count"])
 
 
@@ -31764,17 +31786,23 @@ def store_post_tibet_migration_report(
 
 
 def get_post_tibet_migration_report(asset_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT report_json FROM post_tibet_migration_reports WHERE asset_id=?",
-        (asset_id,),
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute(
+            "SELECT report_json FROM post_tibet_migration_reports WHERE asset_id=?",
+            (asset_id,),
+        )
+        .fetchone()
+    )
     return json.loads(row["report_json"]) if row is not None else None
 
 
 def get_degraded_market_state(asset_id: str) -> Optional[Dict[str, Any]]:
-    row = get_connection().execute(
-        "SELECT * FROM degraded_market_state WHERE asset_id=?", (asset_id,)
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT * FROM degraded_market_state WHERE asset_id=?", (asset_id,))
+        .fetchone()
+    )
     return dict(row) if row is not None else None
 
 

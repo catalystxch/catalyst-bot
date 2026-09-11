@@ -182,11 +182,14 @@ def test_retired_pool_and_quote_methods_do_not_use_network(monkeypatch):
     assert engine._fetch_tibet_price(ASSET_ID) is None
     assert engine._find_tibet_pair(ASSET_ID) is None
     assert engine._get_tibet_pairs() == []
-    assert engine.inject_tibet_reserves(
-        asset_id=ASSET_ID,
-        xch_reserve=1,
-        token_reserve=1,
-    ) is False
+    assert (
+        engine.inject_tibet_reserves(
+            asset_id=ASSET_ID,
+            xch_reserve=1,
+            token_reserve=1,
+        )
+        is False
+    )
     assert engine.get_tibet_pool_info(ASSET_ID)["status"] == "retired"
     assert engine.get_tibet_quote(Decimal("1"), "buy")["status"] == "retired"
     engine._session.get.assert_not_called()
@@ -204,4 +207,16 @@ def test_legacy_tibet_mempool_and_sniper_paths_are_runtime_fenced():
     assert '"tibetswap_mempool_watcher_retired"' in mempool_source
     assert "return False" in coin_prep_source
     assert "_sniper_on = False" in cycle_source
-    assert "if False and self.amm_monitor.is_available()" in cycle_source
+    assert "self.amm_monitor.is_available()" not in cycle_source
+
+
+def test_cycle_does_not_print_prices_or_requote_decisions_to_clear_text_console():
+    """Structured logs must replace terminal output that CodeQL treats as sensitive."""
+    source = inspect.getsource(bot_loop.BotLoop._run_one_cycle)
+
+    assert "print(baseline_msg" not in source
+    assert "Tibet: {tibet_p}" not in source
+    assert "print(msg, flush=True)" not in source
+    assert "print(done_msg, flush=True)" not in source
+    assert "Gap closer refreshed at {mid_price" not in source
+    assert "[REQUOTE] {side} side ({reason})" not in source

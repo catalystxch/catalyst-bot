@@ -289,7 +289,9 @@ class TestPricingStrategySelection(unittest.TestCase):
 
     def test_retired_tibet_price_is_never_blended(self):
         eng = self._eng_with_prices("1.00", "1.20")
-        eng._fetch_tibet_price = Mock(side_effect=AssertionError("retired provider called"))
+        eng._fetch_tibet_price = Mock(
+            side_effect=AssertionError("retired provider called")
+        )
         with patch("database.record_price"):
             result = eng.get_price()
         self.assertEqual(result["mid_price"], Decimal("1.00"))

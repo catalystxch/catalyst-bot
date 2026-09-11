@@ -198,9 +198,13 @@ class MarketConfidenceEngine:
         ask = optional_price("last_trusted_ask")
         if (bid is None) != (ask is None):
             raise ValueError("trusted restart range is incomplete")
-        if bid is not None and (bid > ask or midpoint is None or not bid <= midpoint <= ask):
+        if bid is not None and (
+            bid > ask or midpoint is None or not bid <= midpoint <= ask
+        ):
             raise ValueError("trusted restart range is invalid")
-        pending_midpoint = None if preset_changed else optional_price("pending_midpoint")
+        pending_midpoint = (
+            None if preset_changed else optional_price("pending_midpoint")
+        )
         pending_refreshes = 0 if preset_changed else state.get("pending_refreshes")
         if type(pending_refreshes) is not int or pending_refreshes < 0:
             raise ValueError("pending refresh count is invalid")
@@ -215,7 +219,11 @@ class MarketConfidenceEngine:
         if prior_observed is None:
             observed_at = None
         elif type(prior_observed) is str:
-            text = prior_observed[:-1] + "+00:00" if prior_observed.endswith("Z") else prior_observed
+            text = (
+                prior_observed[:-1] + "+00:00"
+                if prior_observed.endswith("Z")
+                else prior_observed
+            )
             observed_at = _utc(datetime.fromisoformat(text))
         else:
             raise ValueError("prior observation time is invalid")
@@ -340,12 +348,20 @@ class MarketConfidenceEngine:
             10_000
         )
         executable_bids = (
-            [offer for offer in bids if offer.price >= best_bid * (Decimal(1) - envelope)]
+            [
+                offer
+                for offer in bids
+                if offer.price >= best_bid * (Decimal(1) - envelope)
+            ]
             if best_bid is not None
             else []
         )
         executable_asks = (
-            [offer for offer in asks if offer.price <= best_ask * (Decimal(1) + envelope)]
+            [
+                offer
+                for offer in asks
+                if offer.price <= best_ask * (Decimal(1) + envelope)
+            ]
             if best_ask is not None
             else []
         )

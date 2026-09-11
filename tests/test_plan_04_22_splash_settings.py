@@ -368,6 +368,7 @@ class TestSplashIncoming(_FlaskBase):
         self.assertFalse(second_persist_started.is_set())
         self.assertEqual(call_count, 1)
         self.assertTrue(all(response.status_code == 200 for response in responses))
+
     def test_recent_duplicate_bypasses_rate_limit_and_second_db_write(self):
         """A repeated network offer must not consume scarce webhook capacity."""
         bot = _make_bot()

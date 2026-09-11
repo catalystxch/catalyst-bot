@@ -302,10 +302,14 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
                 own_offer_identities=frozenset({own_identity}),
             )
 
-        self.assertEqual(get.call_args_list[0].kwargs["params"]["offered"], self._ASSET_ID)
+        self.assertEqual(
+            get.call_args_list[0].kwargs["params"]["offered"], self._ASSET_ID
+        )
         self.assertEqual(get.call_args_list[0].kwargs["params"]["requested"], "xch")
         self.assertEqual(get.call_args_list[1].kwargs["params"]["offered"], "xch")
-        self.assertEqual(get.call_args_list[1].kwargs["params"]["requested"], self._ASSET_ID)
+        self.assertEqual(
+            get.call_args_list[1].kwargs["params"]["requested"], self._ASSET_ID
+        )
         self.assertEqual(result["num_sell_offers"], 0)
         self.assertEqual(result["sell_depth_xch"], Decimal("0"))
         self.assertEqual(result["best_bid"], Decimal("0.09"))
@@ -340,9 +344,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             messages=[],
         )
 
-        self.assertEqual(
-            accepted["mid_price"], Decimal("0.1000000000000000001")
-        )
+        self.assertEqual(accepted["mid_price"], Decimal("0.1000000000000000001"))
         self.assertEqual(accepted["price_source"], "trusted_offer_book")
         self.assertEqual(rejected["mid_price"], Decimal("0"))
 
@@ -456,13 +458,9 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         ).read_text(encoding="utf-8")
         result_block = src.split(
             '    result = {\n        "market_model": "offer_book"', 1
-        )[1].split(
-            'print(f"[SMART_DEFAULTS v2]', 1
-        )[0]
+        )[1].split('print(f"[SMART_DEFAULTS v2]', 1)[0]
 
-        self.assertIn(
-            'result = {\n        "market_model": "offer_book"', src
-        )
+        self.assertIn('result = {\n        "market_model": "offer_book"', src)
         self.assertIn('"offer_book_policy"', result_block)
         self.assertIn('"tibet_status": "retired"', result_block)
         self.assertIn('"market_toxicity_enabled"', result_block)

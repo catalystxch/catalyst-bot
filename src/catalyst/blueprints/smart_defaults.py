@@ -808,7 +808,9 @@ def _fetch_dexie_orderbook_standalone(
     dexie_base = getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")
     our_tag = str(getattr(cfg, "BOT_TAG", "") or "").strip()
     own_identities = frozenset(
-        str(value or "").strip() for value in own_offer_identities if str(value or "").strip()
+        str(value or "").strip()
+        for value in own_offer_identities
+        if str(value or "").strip()
     )
     page_size = max(20, int(getattr(cfg, "DEXIE_ORDERBOOK_PAGE_SIZE", 200) or 200))
 
@@ -916,9 +918,7 @@ def _fetch_dexie_orderbook_standalone(
             mid = (result["best_bid"] + result["best_ask"]) / Decimal("2")
             if mid > 0:
                 result["competitor_spread_bps"] = (
-                    (result["best_ask"] - result["best_bid"])
-                    / mid
-                    * Decimal("10000")
+                    (result["best_ask"] - result["best_bid"]) / mid * Decimal("10000")
                 )
 
         # has_data means "API succeeded AND competitors were found".
@@ -996,9 +996,7 @@ def _derive_smart_market_confidence(
             active_bot, "_get_fresh_splash_confidence_offers"
         ):
             return []
-        return active_bot._get_fresh_splash_confidence_offers(
-            requested_asset, now=now
-        )
+        return active_bot._get_fresh_splash_confidence_offers(requested_asset, now=now)
 
     runtime = OfferBookMarketRuntime(
         asset_id=asset_id,
@@ -4108,9 +4106,7 @@ def _calculate_smart_defaults(
         volatility_bps=Decimal(str(max(0.0, max_move * 100))),
         churn_score=int(market_confidence.manipulation_score),
         network_fee_xch=Decimal(str(max(0.0, _smart_fee_xch))),
-        expected_cancel_requotes=int(
-            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0
-        ),
+        expected_cancel_requotes=int(getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0),
         minimum_profit_xch=Decimal(
             str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
         ),
@@ -4136,9 +4132,7 @@ def _calculate_smart_defaults(
         inner_edge_bps = max(100, int(base_spread_bps * 0.4))
         required_outer_bps = (inner_edge_bps * 3 + 1) // 2
         min_spread_bps = max(200, int(base_spread_bps * 0.6), required_outer_bps)
-        max_spread_bps = max(
-            min_spread_bps * 2, min(int(base_spread_bps * 2), 1500)
-        )
+        max_spread_bps = max(min_spread_bps * 2, min(int(base_spread_bps * 2), 1500))
         requote_bps = max(
             150,
             min(base_spread_bps * 0.80, max(base_spread_bps * 0.55, requote_bps)),

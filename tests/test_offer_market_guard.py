@@ -143,9 +143,13 @@ def test_competition_claim_is_durable_per_asset_side_and_not_digest_bypassable(
 def test_unprofitable_ladder_is_rejected_before_coin_inventory_rpc():
     manager = offer_manager.OfferManager()
     with (
-        patch.object(offer_manager.cfg, "MINIMUM_PROFIT_XCH", Decimal("0.01"), create=True),
+        patch.object(
+            offer_manager.cfg, "MINIMUM_PROFIT_XCH", Decimal("0.01"), create=True
+        ),
         patch.object(offer_manager.cfg, "EXPECTED_CANCEL_REQUOTES", 2, create=True),
-        patch.object(offer_manager, "get_effective_transaction_fee_mojos", return_value=1),
+        patch.object(
+            offer_manager, "get_effective_transaction_fee_mojos", return_value=1
+        ),
         patch.object(
             offer_manager,
             "get_exact_spendable_coins_rpc",

@@ -1183,9 +1183,7 @@ class BotLoop:
             f"Market confidence withdrawal submitted for {len(trade_ids)} "
             f"{','.join(sorted(requested))} offer(s)",
             data={
-                "reason_code": str(
-                    getattr(decision, "reason_code", "MARKET_DEGRADED")
-                ),
+                "reason_code": str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
                 "trade_ids": trade_ids,
             },
         )
@@ -1276,7 +1274,9 @@ class BotLoop:
                 )
 
             discoveries = expire_offer_publication_discoveries(intent_id, now=now)
-            exact = sorted(row["provider"] for row in discoveries if row["state"] == "exact")
+            exact = sorted(
+                row["provider"] for row in discoveries if row["state"] == "exact"
+            )
             if exact:
                 provider = exact[0]
                 record_offer_intent_visibility(
@@ -1378,9 +1378,11 @@ class BotLoop:
 
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
-        risk_preset = str(
-            getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced"
-        ).strip().lower()
+        risk_preset = (
+            str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
+            .strip()
+            .lower()
+        )
         if (
             self._market_runtime is not None
             and self._market_runtime_asset_id == asset
@@ -8411,13 +8413,8 @@ class BotLoop:
                         f"📌 Requote baseline set: {startup_mid:.8f} XCH "
                         f"(enables requoting + emergency requote)"
                     )
-                    print(baseline_msg, flush=True)
                     log_event("info", "startup_baseline_price", baseline_msg)
                 else:
-                    print(
-                        "[WARN] Could not set requote baseline -- mid_price is 0!",
-                        flush=True,
-                    )
                     log_event(
                         "warning",
                         "startup_baseline_zero",
@@ -8425,7 +8422,6 @@ class BotLoop:
                     )
             except Exception as e:
                 err_msg = f"[WARN] Could not set baseline price: {e}"
-                print(err_msg, flush=True)
                 log_event("warning", "startup_baseline_failed", err_msg)
 
             # ---- V3: Initialize Coinset puzzle hash cache ----
@@ -8977,29 +8973,12 @@ class BotLoop:
             },
         )
 
-        # Terminal heartbeat — every loop (terminal is dev-only, GUI is for users)
-        dexie_p = price_data.get("dexie_price", "")
-        tibet_p = price_data.get("tibet_price", "")
-        print(f"\n{'=' * 70}", flush=True)
-        print(
-            f"💓 Loop {self._loop_count} | mid: {mid_price:.8f} | "
-            f"arb gap: {_bps_to_pct(arb_gap)} | "
-            f"spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
-            flush=True,
-        )
-
-        # Console heartbeat — user-visible cycle start
+        # Structured cycle heartbeat for the GUI and durable diagnostics.
         log_event(
             "info",
             "cycle_start",
             f"Cycle #{self._loop_count} — mid price: {mid_price:.8f} XCH, "
             f"arb gap: {_bps_to_pct(arb_gap)}, spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
-        )
-        baseline_val = self._last_quoted_price.get("sell", Decimal("0"))
-        baseline_str = f"{baseline_val:.8f}" if baseline_val > 0 else "pending requote"
-        print(
-            f"   Dexie: {dexie_p} | Tibet: {tibet_p} | baseline: {baseline_str}",
-            flush=True,
         )
 
         # ---- Step 1b: Refresh market intelligence (NEW — ecosystem) ----
@@ -9534,121 +9513,6 @@ class BotLoop:
         if not buy_fills and not sell_fills:
             print(" none", flush=True)
             pass  # No fills — nothing to log
-
-        # ---- AMM drift check — force requote if AMM price has moved ----
-        # If AMMMonitor has data, check whether the current AMM price has
-        # drifted far enough from our last quoted prices to make our offers
-        # arb targets. If so, flag both sides for requote immediately.
-        #
-        # Fix 4: cooldown gate. The AMM drift trigger used to bypass
-        # REQUOTE_COOLDOWN_SECS, which combined with a stale baseline
-        # (which Fix 4's baseline-on-attempt advance also addresses) caused
-        # a feedback loop where every cycle re-fired the same drift,
-        # generating a requote storm. We now refuse to re-trigger drift
-        # requote within REQUOTE_COOLDOWN_SECS of the last AMM-drift force.
-        try:
-            # One-release compatibility body only. The literal False is a
-            # non-configurable fence: neither an upgraded .env nor a mocked
-            # legacy monitor can reactivate TibetSwap-derived requotes.
-            if False and self.amm_monitor.is_available() and self._loop_count > 5:
-                amm_drift_bps = self.amm_monitor.get_drift_bps()
-                if amm_drift_bps is not None:
-                    _drift_threshold = Decimal(
-                        str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "80"))
-                    )
-                    if amm_drift_bps >= _drift_threshold:
-                        _now = time.time()
-                        _cooldown = float(
-                            getattr(cfg, "REQUOTE_COOLDOWN_SECS", 60) or 60
-                        )
-
-                        # Per-side AMM-drift cooldown. Previously one shared
-                        # scalar gated both sides, so a buy-side force set
-                        # at t=0 blocked a sell-side force at t=30 even
-                        # though the opposite-direction move had just
-                        # exposed the sell ladder. Track buy and sell
-                        # independently; fall back to the legacy scalar
-                        # once on upgrade so operators mid-session don't
-                        # get an immediate double-fire.
-                        if not isinstance(
-                            getattr(self, "_last_amm_drift_force_at", None), dict
-                        ):
-                            _legacy = float(
-                                getattr(self, "_last_amm_drift_force_at", 0) or 0
-                            )
-                            self._last_amm_drift_force_at = {
-                                "buy": _legacy,
-                                "sell": _legacy,
-                            }
-
-                            # Determine which side is vulnerable based on price direction
-                        try:
-                            _amm_state = self.amm_monitor._state or {}
-                            _amm_price = Decimal(
-                                str(_amm_state.get("amm_price", 0) or 0)
-                            )
-                            if _amm_price > 0 and self._current_mid_price > 0:
-                                _target_sides = (
-                                    ["buy"]
-                                    if _amm_price < self._current_mid_price
-                                    else ["sell"]
-                                )
-                                _direction_note = (
-                                    "price DOWN"
-                                    if _amm_price < self._current_mid_price
-                                    else "price UP"
-                                )
-                            else:
-                                _target_sides = ["buy", "sell"]
-                                _direction_note = "direction unknown"
-                        except Exception:
-                            _target_sides = ["buy", "sell"]
-                            _direction_note = "direction error"
-
-                        for _target_side in _target_sides:
-                            _backoff_remaining = self._requote_backoff_remaining(
-                                _target_side
-                            )
-                            if _backoff_remaining > 0:
-                                log_event(
-                                    "info",
-                                    "amm_drift_requote_backoff",
-                                    f"AMM drift would force {_target_side} requote, "
-                                    f"but that side is in requote failure backoff "
-                                    f"for {_backoff_remaining:.0f}s",
-                                    data={
-                                        "side": _target_side,
-                                        "remaining_secs": round(_backoff_remaining, 1),
-                                    },
-                                )
-                                continue
-                            _last_force = float(
-                                self._last_amm_drift_force_at.get(_target_side, 0) or 0
-                            )
-                            if (_now - _last_force) < _cooldown:
-                                continue  # per-side cooldown active
-                            if not self._force_requote.get(_target_side):
-                                log_event(
-                                    "info",
-                                    "amm_drift_requote_triggered",
-                                    f"AMM drift {_bps_to_pct(amm_drift_bps)} "
-                                    f"({_direction_note}) — forcing "
-                                    f"{_target_side} requote",
-                                    data={
-                                        "drift_bps": str(
-                                            amm_drift_bps.quantize(Decimal("0.1"))
-                                        ),
-                                        "side": _target_side,
-                                    },
-                                )
-                            self._force_requote[_target_side] = True
-                            self._last_amm_drift_force_at[_target_side] = _now
-        except Exception as _amm_drift_err:
-            log_event(
-                "debug",
-                "amm_drift_check_error",
-                f"AMM drift check error (non-critical): {_amm_drift_err}",
-            )
 
         fills_hour = None
         try:
@@ -10522,7 +10386,6 @@ class BotLoop:
                         f"({last_q:.8f} -> {mid_price:.8f}, "
                         f"arb gap: {_bps_to_pct(arb_gap)})"
                     )
-                    print(msg, flush=True)  # Terminal-visible
                     log_event("warning", "emergency_requote", msg)
 
                     spread = self.risk_manager.get_adjusted_spread(eq_side)
@@ -10625,7 +10488,6 @@ class BotLoop:
                             f"[OK] Emergency requote {eq_side}: "
                             f"{len(new_offers)} new offers at {requote_mid:.8f}"
                         )
-                        print(done_msg, flush=True)  # Terminal-visible
                         log_event("info", "emergency_requote_done", done_msg)
                     else:
                         if waiting_for_cancel_settle:
@@ -10826,7 +10688,6 @@ class BotLoop:
 
             if refreshed:
                 self._emit("boost", state)
-                print(f"   [8d] Gap closer refreshed at {mid_price:.8f}", flush=True)
 
             if stepped:
                 # Gap-closer tightened — let CASCADE handle main book tightening.
@@ -11427,7 +11288,9 @@ class BotLoop:
         if force_buy or force_sell:
             try:
                 confidence = getattr(self, "_market_confidence_result", None)
-                fresh_mid = Decimal(str(getattr(confidence, "trusted_midpoint", 0) or 0))
+                fresh_mid = Decimal(
+                    str(getattr(confidence, "trusted_midpoint", 0) or 0)
+                )
                 if fresh_mid > 0 and fresh_mid != mid_price:
                     old_mid = mid_price
                     mid_price = fresh_mid
@@ -11725,7 +11588,6 @@ class BotLoop:
                     if forced
                     else f"price moved {last_price:.8f} -> {compare_mid:.8f} [{severity.value}]"
                 )
-                print(f"\n   [REQUOTE] {side} side ({reason})", flush=True)
                 log_event(
                     "info",
                     "requoting",

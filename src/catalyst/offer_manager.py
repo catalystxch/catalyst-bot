@@ -4007,9 +4007,7 @@ class OfferManager:
         network_fee_xch = Decimal(get_effective_transaction_fee_mojos()) / Decimal(
             "1000000000000"
         )
-        expected_cancel_requotes = int(
-            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0
-        )
+        expected_cancel_requotes = int(getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0)
         minimum_profit_xch = Decimal(
             str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
         )
@@ -4449,9 +4447,7 @@ class OfferManager:
                 if not market_guard.get("eligible"):
                     return spec["i"], {
                         "success": False,
-                        "error": market_guard.get(
-                            "reason_code", "market_guard_failed"
-                        ),
+                        "error": market_guard.get("reason_code", "market_guard_failed"),
                     }
             if market_guard.get("improves_book"):
                 try:

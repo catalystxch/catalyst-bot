@@ -10,8 +10,10 @@ from types import SimpleNamespace
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
 AT = NOW.isoformat(timespec="microseconds").replace("+00:00", "Z")
-CONFIRMED = (NOW + timedelta(seconds=5)).isoformat(timespec="microseconds").replace(
-    "+00:00", "Z"
+CONFIRMED = (
+    (NOW + timedelta(seconds=5))
+    .isoformat(timespec="microseconds")
+    .replace("+00:00", "Z")
 )
 
 
@@ -163,7 +165,9 @@ def test_bot_cancels_via_authoritative_manager_after_discovery_deadline(
         cancel_offers=lambda ids, **kwargs: cancelled.extend(ids) or {}
     )
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", intent["asset_id"], raising=False)
-    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: phase == "cancel")
+    monkeypatch.setattr(
+        loop, "_enter_runtime_effect_phase", lambda phase: phase == "cancel"
+    )
 
     result = loop._reconcile_offer_publication_discovery(
         dexie_book={"bids": [], "asks": []},
@@ -173,6 +177,7 @@ def test_bot_cancels_via_authoritative_manager_after_discovery_deadline(
 
     assert result == {"visible": 0, "pending": 0, "cancel_requested": 1}
     assert cancelled == [trade_id]
-    assert isolated_database.get_offer_intent(intent["intent_id"])[
-        "lifecycle_state"
-    ] == "created"
+    assert (
+        isolated_database.get_offer_intent(intent["intent_id"])["lifecycle_state"]
+        == "created"
+    )

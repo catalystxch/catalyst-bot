@@ -30,4 +30,6 @@ def test_sse_market_health_treats_tibetswap_as_retired_compatibility_only():
     assert augmented["metrics"]["tibetswap_retired"] is True
     assert augmented["metrics"]["tibetswap_reason"] == "TIBETSWAP_SHUTDOWN"
     assert augmented["metrics"]["pricing_mode"] == "offer_book_confidence"
-    assert not any("TibetSwap" in item.get("text", "") for item in augmented["conditions"])
+    assert not any(
+        "TibetSwap" in item.get("text", "") for item in augmented["conditions"]
+    )

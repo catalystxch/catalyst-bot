@@ -184,10 +184,7 @@ _MISSING_MODULE = object()
 
 
 def _capture_guarded_modules() -> dict[str, object]:
-    return {
-        name: sys.modules.get(name, _MISSING_MODULE)
-        for name in _ISOLATION_GUARDED
-    }
+    return {name: sys.modules.get(name, _MISSING_MODULE) for name in _ISOLATION_GUARDED}
 
 
 def _restore_guarded_modules(saved: dict[str, object]) -> None:

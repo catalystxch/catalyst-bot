@@ -409,9 +409,7 @@ def api_bot_start():
                 "reason_code": "POST_TIBET_MIGRATION_FAILED",
             }
         if migration.get("can_start") is not True:
-            reason = str(
-                migration.get("reason_code") or "POST_TIBET_MIGRATION_FAILED"
-            )
+            reason = str(migration.get("reason_code") or "POST_TIBET_MIGRATION_FAILED")
             error = "Post-TibetSwap offer ownership reconciliation blocked bot start"
             return jsonify(
                 {
@@ -2081,9 +2079,7 @@ def api_diagnostics_api_stats():
         )
         try:
             payload["dexie"]["orderbook_refreshes"] = int(
-                (getattr(bot, "_bot_state", {}) or {}).get(
-                    "orderbook_refreshes", 0
-                )
+                (getattr(bot, "_bot_state", {}) or {}).get("orderbook_refreshes", 0)
                 or 0
             )
         except (AttributeError, TypeError, ValueError):
@@ -2126,106 +2122,13 @@ def api_diagnostics_api_stats():
     except Exception as e:
         payload["splash"] = {"available": False, "error": str(e)}
 
-    # --- TibetSwap / AMM Monitor --------------------------------------
-    try:
-        if False and bot is not None and getattr(bot, "amm_monitor", None):
-            amm_stats = bot.amm_monitor.get_stats() or {}
-            # Also grab price engine stats
-            _pe = getattr(bot, "price_engine", None)
-            _tibet_cache_age = None
-            _pe_tibet_fetches = 0
-            _pe_dexie_fetches = 0
-            if _pe:
-                with getattr(
-                    _pe,
-                    "_price_lock",
-                    type(
-                        "_", (), {"__enter__": lambda s: s, "__exit__": lambda *a: None}
-                    )(),
-                ):
-                    _last_tibet_ts = getattr(_pe, "_last_tibet_price_time", 0) or 0
-                    if _last_tibet_ts > 0:
-                        _tibet_cache_age = round(time.time() - _last_tibet_ts, 1)
-                _pe_tibet_fetches = getattr(_pe, "_tibet_price_fetches", 0)
-                _pe_dexie_fetches = getattr(_pe, "_dexie_price_fetches", 0)
-            # Orderbook refresh count from bot loop
-            _ob_refreshes = 0
-            try:
-                _ob_refreshes = int(bot._bot_state.get("orderbook_refreshes", 0) or 0)
-            except Exception:
-                pass
-            payload["tibetswap"] = {
-                "available": bool(amm_stats.get("available", False)),
-                "amm_price": amm_stats.get("amm_price"),
-                "drift_bps": amm_stats.get("drift_bps"),
-                "arb_pressure": amm_stats.get("arb_pressure", 0),
-                "arb_pressure_label": amm_stats.get("arb_pressure_label", "unknown"),
-                "total_polls": int(amm_stats.get("total_polls", 0) or 0),
-                "failed_polls": int(amm_stats.get("failed_polls", 0) or 0),
-                "consecutive_failures": int(
-                    amm_stats.get("consecutive_failures", 0) or 0
-                ),
-                "last_success_ago_secs": amm_stats.get("last_success_ago_secs"),
-                "price_cache_age_secs": _tibet_cache_age,
-                "pair_id": amm_stats.get("pair_id", ""),
-                "price_fetches": _pe_tibet_fetches,
-            }
-            # Add mempool watcher's Tibet API calls
-            try:
-                import mempool_watcher as _mw2
-
-                _watcher2 = getattr(_mw2, "_watcher_instance", None)
-                if _watcher2:
-                    _mw_tibet2 = getattr(_watcher2, "_tibet_api_calls", 0)
-                    payload["tibetswap"]["mempool_watcher_calls"] = _mw_tibet2
-                    payload["tibetswap"]["price_fetches"] = (
-                        _pe_tibet_fetches + _mw_tibet2
-                    )
-            except Exception:
-                pass
-            # Add Dexie read counters to the Dexie section
-            if payload["dexie"].get("available"):
-                payload["dexie"]["price_fetches"] = _pe_dexie_fetches
-                payload["dexie"]["orderbook_refreshes"] = _ob_refreshes
-            # Dynamic buffer stats if available
-            dyn = amm_stats.get("dynamic_buffer", {})
-            if dyn:
-                payload["tibetswap"]["sweep_count_in_window"] = dyn.get(
-                    "sweep_count_in_window", 0
-                )
-                payload["tibetswap"]["buffer_widened"] = (
-                    dyn.get("current_buffer_bps") is not None
-                )
-        else:
-            payload["tibetswap"] = {
-                "available": False,
-                "status": "retired",
-                "capabilities": [],
-            }
-    except Exception as e:
-        payload["tibetswap"] = {"available": False, "error": str(e)}
-
-    # Merge "direct" TibetSwap calls (token discovery, /pairs lookups
-    # from cat_resolver, smart_defaults, market intel, etc.) — these
-    # bypass amm_monitor so they're invisible to its stats. Always
-    # surface the counter; if amm_monitor isn't running we still want
-    # the direct counts to show up.
-    # Historical counters are intentionally not promoted into live provider
-    # health. TibetSwap is permanently retired in v1.4.
-    _tibet_direct = 0
-    if _tibet_direct:
-        if not isinstance(payload.get("tibetswap"), dict):
-            payload["tibetswap"] = {"available": False}
-        # Even when amm_monitor is offline (available=False), expose
-        # the direct calls so the modal can render *something*.
-        payload["tibetswap"]["direct_calls"] = _tibet_direct
-        payload["tibetswap"]["direct_calls_by_endpoint"] = _tracker_endpoints(
-            "tibetswap"
-        )
-        # Promote to "available" if at least one direct call landed —
-        # the panel becomes meaningful even without the AMM monitor.
-        if not payload["tibetswap"].get("available"):
-            payload["tibetswap"]["available_via_direct"] = True
+    # One-release compatibility marker. TibetSwap has shut down permanently;
+    # historical counters are not promoted into live provider health.
+    payload["tibetswap"] = {
+        "available": False,
+        "status": "retired",
+        "capabilities": [],
+    }
 
     # --- CoinGecko (XCH/USD price) ------------------------------------
     # Used by Smart Settings to display USD-denominated values and to

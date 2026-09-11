@@ -84,7 +84,9 @@ def _independent_splash():
     ]
 
 
-def _persist_created_offer(db, *, intent_id: str, generation: int, trade_id: str, offer_text: str):
+def _persist_created_offer(
+    db, *, intent_id: str, generation: int, trade_id: str, offer_text: str
+):
     offer_identity = _sha(offer_text)
     selected_coin_id = _sha(f"coin:{intent_id}")
     db.prepare_offer_intent(
@@ -206,14 +208,10 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
         is_cat=True,
     )["success"]
     unspent_xch = [
-        coin
-        for coin in mock_wallet.state.xch_coins
-        if coin["spent_block_index"] == 0
+        coin for coin in mock_wallet.state.xch_coins if coin["spent_block_index"] == 0
     ]
     unspent_cat = [
-        coin
-        for coin in mock_wallet.state.cat_coins
-        if coin["spent_block_index"] == 0
+        coin for coin in mock_wallet.state.cat_coins if coin["spent_block_index"] == 0
     ]
     assert sum(c["coin"]["amount"] == 1_000_000_000 for c in unspent_xch) == fee_count
     assert sum(c["coin"]["amount"] == 250_000 for c in unspent_cat) == 4
@@ -383,24 +381,33 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
     assert confirmed.can_replace is True
 
     terminal_at = NOW + timedelta(minutes=13)
-    assert tracker.replacement_decision(
-        authoritative_terminal=False,
-        terminal_at=None,
-        attempt=2,
-        now=terminal_at,
-    ).action == "BLOCK_REPLACEMENT"
-    assert tracker.replacement_decision(
-        authoritative_terminal=True,
-        terminal_at=terminal_at,
-        attempt=2,
-        now=terminal_at + timedelta(seconds=19),
-    ).action == "WAIT_REPLACEMENT_BACKOFF"
-    assert tracker.replacement_decision(
-        authoritative_terminal=True,
-        terminal_at=terminal_at,
-        attempt=2,
-        now=terminal_at + timedelta(seconds=20),
-    ).action == "ALLOW_REPLACEMENT"
+    assert (
+        tracker.replacement_decision(
+            authoritative_terminal=False,
+            terminal_at=None,
+            attempt=2,
+            now=terminal_at,
+        ).action
+        == "BLOCK_REPLACEMENT"
+    )
+    assert (
+        tracker.replacement_decision(
+            authoritative_terminal=True,
+            terminal_at=terminal_at,
+            attempt=2,
+            now=terminal_at + timedelta(seconds=19),
+        ).action
+        == "WAIT_REPLACEMENT_BACKOFF"
+    )
+    assert (
+        tracker.replacement_decision(
+            authoritative_terminal=True,
+            terminal_at=terminal_at,
+            attempt=2,
+            now=terminal_at + timedelta(seconds=20),
+        ).action
+        == "ALLOW_REPLACEMENT"
+    )
 
     replacement = mock_wallet.create_offer(
         {"1": -1_000_000_000_000, "2": 10_000_000},
@@ -431,8 +438,12 @@ def test_full_mock_wallet_lifecycle_survives_outage_fill_cancel_and_restart(
         for row in restored_discovery
     )
 
-    html = Path(__file__).resolve().parents[1].joinpath("bot_gui.html").read_text(
-        encoding="utf-8"
+    html = (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("bot_gui.html")
+        .read_text(encoding="utf-8")
     )
     assert "Previous live book is ready to resume" in html
     assert "Resume Bot Now" in html

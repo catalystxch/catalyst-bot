@@ -114,10 +114,13 @@ def test_bot_housekeeping_compacts_provider_evidence_after_thirty_days(monkeypat
     monkeypatch.setattr(
         database,
         "compact_market_provider_evidence",
-        lambda **kwargs: calls.append(kwargs) or {
-            "deleted": 0,
-            "summaries_written": 0,
-        },
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or {
+                "deleted": 0,
+                "summaries_written": 0,
+            }
+        ),
     )
 
     result = BotLoop._compact_market_evidence(now=NOW)

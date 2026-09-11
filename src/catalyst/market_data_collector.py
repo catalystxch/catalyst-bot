@@ -30,7 +30,6 @@ from database import (
     get_market_analysis_cache,
     set_market_analysis_cache,
     get_pool_snapshots,
-    record_pool_snapshot,
 )
 
 

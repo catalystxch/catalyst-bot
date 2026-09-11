@@ -51,6 +51,7 @@ def resolve_cat_metadata(
 
     This is safe to call at startup — failures return empty dict, never raise.
     """
+    _ = tibet_api_base  # Retained for one-release keyword compatibility.
     result = {
         "pair_id": None,
         "ticker_id": None,

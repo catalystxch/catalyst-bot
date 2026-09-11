@@ -572,9 +572,7 @@ def _splash_incoming_claim_delivery(fingerprint: str) -> tuple[bool, threading.E
         return True, event
 
 
-def _splash_incoming_finish_delivery(
-    fingerprint: str, event: threading.Event
-) -> None:
+def _splash_incoming_finish_delivery(fingerprint: str, event: threading.Event) -> None:
     """Release followers after the elected persistence attempt finishes."""
 
     cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"

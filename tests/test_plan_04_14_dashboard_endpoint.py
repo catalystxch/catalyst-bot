@@ -445,7 +445,10 @@ class TestDashboard(_FlaskBase):
             market_health["message"], "Market healthy — bot operating normally"
         )
         self.assertFalse(
-            any("TibetSwap" in condition.get("text", "") for condition in market_health["conditions"])
+            any(
+                "TibetSwap" in condition.get("text", "")
+                for condition in market_health["conditions"]
+            )
         )
 
     def test_wallet_has_balance_keys(self):

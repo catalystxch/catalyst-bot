@@ -269,9 +269,7 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
                 "observed_identity": row.get("observed_identity"),
             }
         item["discovery"] = {
-            "state": (
-                "visible" if intent.get("first_visible_at") else "pending"
-            ),
+            "state": ("visible" if intent.get("first_visible_at") else "pending"),
             "provider_identity": intent.get("publication_identity"),
             "first_visible_at": intent.get("first_visible_at"),
             "providers": discovery_providers,

@@ -22,9 +22,7 @@ def _exact_external_fill_evidence():
         "transaction_id": TX_ID,
         "spend_identity": SPEND_ID,
         "block_height": 456,
-        "inputs": [
-            {"coin_id": INPUT_ID, "asset_id": ASSET_ID, "amount_mojos": 123000}
-        ],
+        "inputs": [{"coin_id": INPUT_ID, "asset_id": ASSET_ID, "amount_mojos": 123000}],
     }
     return {
         "expected_inputs": [
@@ -161,9 +159,7 @@ def test_external_confirmation_requires_exact_input_asset_and_amount_agreement()
     external = _exact_external_fill_evidence()
     external["spacescan_evidence"] = {
         **external["spacescan_evidence"],
-        "inputs": [
-            {"coin_id": INPUT_ID, "asset_id": ASSET_ID, "amount_mojos": 122999}
-        ],
+        "inputs": [{"coin_id": INPUT_ID, "asset_id": ASSET_ID, "amount_mojos": 122999}],
     }
 
     decision = assess_fill_confidence(

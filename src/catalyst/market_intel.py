@@ -918,7 +918,9 @@ class MarketIntel:
                     continue
                 try:
                     amount_mojos = int(
-                        (Decimal(xch_amount) * Decimal("1000000000000")).to_integral_exact()
+                        (
+                            Decimal(xch_amount) * Decimal("1000000000000")
+                        ).to_integral_exact()
                     )
                 except Exception:
                     continue
@@ -942,9 +944,9 @@ class MarketIntel:
             "bids": rows(buys),
             "asks": rows(sells),
             "observed_at_unix": observed_at,
-            "source_time": datetime.fromtimestamp(
-                observed_at, tz=timezone.utc
-            ).isoformat().replace("+00:00", "Z"),
+            "source_time": datetime.fromtimestamp(observed_at, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
             "source": "dexie_v1_offers",
         }
 

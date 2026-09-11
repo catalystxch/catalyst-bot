@@ -801,9 +801,7 @@ def test_trim_advances_visible_lineage_without_cancelling_its_child(
     database.record_offer_intent_visibility(
         "a-child", publication_identity="registry:child"
     )
-    _prepare(
-        "ordinary", slot_key=f"ladder:{_sha('asset-a')}:buy:2"
-    )
+    _prepare("ordinary", slot_key=f"ladder:{_sha('asset-a')}:buy:2")
     _confirm("ordinary")
 
     from offer_manager import OfferManager
