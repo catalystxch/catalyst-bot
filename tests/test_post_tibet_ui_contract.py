@@ -455,6 +455,19 @@ def test_live_ui_does_not_poll_retired_tibetswap_endpoints():
     assert "`${API_URL}/market/slippage`" not in html
 
 
+def test_sage_fingerprint_start_tolerates_slow_busy_wallet_rpc():
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+    start = html.index("async function startupSelectFingerprint")
+    end = html.index("function startupShowRpcDisabled", start)
+    selection = html[start:end]
+
+    assert "AbortSignal.timeout(60000)" in selection
+    assert "isWalletStartupTimeout(err)" in selection
+    assert "startupPollUntilReady();" in selection
+
+
 def test_native_bridge_exposes_same_market_confidence_snapshot(monkeypatch):
     import app_bridge
 

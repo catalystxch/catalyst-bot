@@ -36926,6 +36926,12 @@ async function startupShowFingerprints() {
 
 async function startupSelectFingerprint(fingerprint, cardEl) {
     debugLog('[STARTUP] Selected fingerprint:', fingerprint);
+    const isWalletStartupTimeout = (error) => {
+        const name = String(error?.name || '').toLowerCase();
+        const message = String(error?.message || '').toLowerCase();
+        return name === 'aborterror' || name === 'timeouterror' ||
+            message.includes('timed out') || message.includes('timeout');
+    };
 
     // Highlight selected card, disable all
     document.querySelectorAll('.fp-card').forEach(c => c.classList.add('disabled'));
@@ -36948,7 +36954,9 @@ async function startupSelectFingerprint(fingerprint, cardEl) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ fingerprint: fingerprint }),
-            signal: AbortSignal.timeout(10000)
+            // Sage can briefly serialize RPC work while a large wallet/CAT list
+            // is warming.  Keep this longer than ordinary read-only UI calls.
+            signal: AbortSignal.timeout(60000)
         });
         const result = await resp.json();
 
@@ -36967,6 +36975,16 @@ async function startupSelectFingerprint(fingerprint, cardEl) {
             startupShowError('Failed to start ' + _startupWalletLabel + ': ' + (result.error || 'Unknown error'));
         }
     } catch (err) {
+        if (isWalletStartupTimeout(err)) {
+            // A fetch deadline does not prove that the local server rejected or
+            // stopped the request.  Continue through the authoritative startup
+            // status instead of presenting a false start failure.
+            debugWarn('[STARTUP] Wallet selection is still completing:', err);
+            document.getElementById('startupStartingText').textContent =
+                _startupWalletLabel + ' is still responding — checking startup status...';
+            startupPollUntilReady();
+            return;
+        }
         debugError('[STARTUP] Start error:', err);
         startupShowError('Could not send start command: ' + (err.message || ''));
     }
