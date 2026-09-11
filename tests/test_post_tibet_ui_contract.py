@@ -451,9 +451,13 @@ def test_live_settings_keeps_retired_sniper_control_out_of_accessibility_tree():
     )
 
     assert ".lc-toggle-row[hidden]" in html
-    assert "display: none !important" in html[
-        html.index(".lc-toggle-row[hidden]") : html.index(".lc-toggle-row[hidden]") + 120
-    ]
+    assert (
+        "display: none !important"
+        in html[
+            html.index(".lc-toggle-row[hidden]") : html.index(".lc-toggle-row[hidden]")
+            + 120
+        ]
+    )
 
 
 def test_post_tibet_help_and_about_describe_provider_authority_truthfully():

@@ -2463,9 +2463,7 @@ def _calculate_smart_defaults(
         # CAT-backed sell capacity at the trial base size.
         _n_sell = _target_n
         if mid_price and mid_price > 0 and _avail_cat > 0 and _base_size > 0:
-            _cat_base = float(
-                _cat_units_for_xch_exact(_base_size, mid_price_decimal)
-            )
+            _cat_base = float(_cat_units_for_xch_exact(_base_size, mid_price_decimal))
             if _cat_base > 0:
                 _cat_units_avail = _avail_cat / _cat_base
                 _n_sell = max(
@@ -2975,11 +2973,7 @@ def _calculate_smart_defaults(
         if _smart_trade_size > 0 and _smart_max_sell > 0 and mid_price > 0:
             _cp_headroom_mult = 1 + (coin_prep_headroom_pct / 100.0)
             _cp_cat_needed = (
-                float(
-                    _cat_units_for_xch_exact(
-                        _smart_trade_size, mid_price_decimal
-                    )
-                )
+                float(_cat_units_for_xch_exact(_smart_trade_size, mid_price_decimal))
                 * _cp_headroom_mult
                 * _smart_max_sell
             )
@@ -3770,9 +3764,7 @@ def _calculate_smart_defaults(
                     )
                     _sell_cat_deployed = round(
                         float(
-                            _cat_units_for_xch_exact(
-                                _sell_live_xch, mid_price_decimal
-                            )
+                            _cat_units_for_xch_exact(_sell_live_xch, mid_price_decimal)
                         ),
                         0,
                     )

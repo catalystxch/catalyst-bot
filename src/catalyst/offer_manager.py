@@ -229,9 +229,7 @@ def book_opportunity_size_cap(
         return None
 
     depth_xch = Decimal(min(bid_depth, ask_depth)) / Decimal("1000000000000")
-    bounded = min(
-        requested_size_xch * Decimal("0.5"), depth_xch * Decimal("0.02")
-    )
+    bounded = min(requested_size_xch * Decimal("0.5"), depth_xch * Decimal("0.02"))
     return bounded if bounded > 0 else None
 
 
