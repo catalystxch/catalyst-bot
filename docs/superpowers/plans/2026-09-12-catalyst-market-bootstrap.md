@@ -332,7 +332,7 @@ git commit -m "feat: separate market validity from redundancy"
 - Consumes: persisted `BootstrapCampaign`, current `BootstrapDecision`, verified balances, and existing fee/profit configuration.
 - Produces: `derive_bootstrap_plan(campaign, decision, balances) -> dict` with exactly three price/size levels per funded side and exact Coin Prep requirements.
 
-- [ ] **Step 1: Write failing budget, corridor, one-sided, and subsidy tests**
+- [x] **Step 1: Write failing budget, corridor, one-sided, and subsidy tests**
 
 Add exact-sum assertions that initial offered amounts never exceed 10% of either
 funded budget; all three monotonic levels stay inside `[0.5 * anchor, 2 * anchor]`;
@@ -340,17 +340,17 @@ a buy-only plan produces no CAT Coin Prep output; subsidy affects a below-floor
 quote only when the exact shortfall fits its remaining separate budget; and no
 creation plan consumes the final 20% cancellation fee reserve.
 
-- [ ] **Step 2: Run tests and observe missing Bootstrap planning behavior**
+- [x] **Step 2: Run tests and observe missing Bootstrap planning behavior**
 
 Run: `python -m pytest tests/test_bootstrap_smart_settings.py tests/test_bootstrap_offer_policy.py -q`
 
 Expected: FAIL because follow-only Smart Settings rejects the campaign anchor.
 
-- [ ] **Step 3: Implement exact ladder and inventory-skew policy**
+- [x] **Step 3: Implement exact ladder and inventory-skew policy**
 
 Generate three monotonic levels per funded side around the current capped anchor. Sum of offered XCH/CAT must not exceed the stage fraction of its fixed budget. Apply existing fee and minimum-profit floors unless the exact projected shortfall is within the remaining separate subsidy budget. Skew remaining quotes toward rebalancing and pause a depleted side; never cross the current trusted range or hard campaign corridor.
 
-- [ ] **Step 4: Integrate purpose-separated Coin Prep requirements**
+- [x] **Step 4: Integrate purpose-separated Coin Prep requirements**
 
 Coin Prep receives only the exact staged XCH/CAT offer sizes and dedicated fee coins. It excludes campaign-protected, cancellation-reserve, unrelated wallet, unresolved-effect, and existing-offer coins under the existing selection rules.
 

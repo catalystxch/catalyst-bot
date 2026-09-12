@@ -57,6 +57,34 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def bootstrap_coin_prep_requirements(plan: dict) -> dict:
+    """Return only purpose-separated outputs from an authorized Bootstrap plan."""
+
+    if type(plan) is not dict or plan.get("authorized") is not True:
+        raise ValueError("authorized Bootstrap plan is required")
+    prep = plan.get("coin_prep")
+    if type(prep) is not dict:
+        raise ValueError("Bootstrap Coin Prep requirements are missing")
+    required = {
+        "campaign_asset_id",
+        "xch_offer_coins",
+        "cat_offer_coins",
+        "fee_coins",
+        "excluded_xch",
+        "excluded_purposes",
+    }
+    if set(prep) != required:
+        raise ValueError("Bootstrap Coin Prep requirements are not purpose-separated")
+    return {
+        "campaign_asset_id": prep["campaign_asset_id"],
+        "xch_offer_coins": list(prep["xch_offer_coins"]),
+        "cat_offer_coins": list(prep["cat_offer_coins"]),
+        "fee_coins": list(prep["fee_coins"]),
+        "excluded_xch": dict(prep["excluded_xch"]),
+        "excluded_purposes": tuple(prep["excluded_purposes"]),
+    }
+
+
 def _wallet_open_offer_snapshot_before_prep() -> dict:
     """Return one complete, read-only view of every live wallet offer.
 

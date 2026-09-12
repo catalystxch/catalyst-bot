@@ -21,7 +21,7 @@ from amount_utils import format_decimal_plain
 from config import cfg
 from database import log_event
 from ladder_sizing import prepared_sell_ladder_cat_total
-from offer_book_policy import derive_offer_book_policy
+from offer_book_policy import derive_bootstrap_plan, derive_offer_book_policy
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -32,6 +32,17 @@ except Exception:
 
 
 bp = Blueprint("smart_defaults", __name__)
+
+
+def derive_bootstrap_smart_settings(*, campaign, decision, balances) -> dict:
+    """Return the exact Bootstrap plan without consulting Follow capacity."""
+
+    plan = derive_bootstrap_plan(campaign, decision, balances)
+    return {
+        **plan,
+        "market_mode": "bootstrap",
+        "follow_capacity_fraction": Decimal("0"),
+    }
 
 
 def _smart_tibet_shock_trigger_pct(min_edge_bps) -> float:

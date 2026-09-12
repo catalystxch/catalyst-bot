@@ -87,6 +87,44 @@ def offer_is_profitable(
     return expected_gross_xch >= required
 
 
+def bootstrap_offer_specs(plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Flatten one authorized Bootstrap plan into exact offer specifications."""
+
+    if type(plan) is not dict or plan.get("authorized") is not True:
+        raise ValueError("authorized Bootstrap plan is required")
+    sides = plan.get("sides")
+    if type(sides) is not dict or set(sides) != {"buy", "sell"}:
+        raise ValueError("Bootstrap side plan is invalid")
+
+    specs: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        side_plan = sides[side]
+        if type(side_plan) is not dict:
+            raise ValueError("Bootstrap side plan is invalid")
+        levels = side_plan.get("levels")
+        if type(levels) is not list:
+            raise ValueError("Bootstrap levels are invalid")
+        if levels and len(levels) != 3:
+            raise ValueError("Bootstrap requires exactly three levels per active side")
+        for level in levels:
+            if type(level) is not dict or level.get("side") != side:
+                raise ValueError("Bootstrap level is invalid")
+            specs.append(
+                {
+                    "purpose": "bootstrap_market",
+                    "side": side,
+                    "level": level["level"],
+                    "price": level["price"],
+                    "xch_amount": level["xch_amount"],
+                    "cat_amount": level["cat_amount"],
+                    "subsidy_xch": level["subsidy_xch"],
+                }
+            )
+    if not specs:
+        raise ValueError("Bootstrap plan has no active offer levels")
+    return tuple(specs)
+
+
 def assess_offer_book_candidate(
     *,
     side: str,
