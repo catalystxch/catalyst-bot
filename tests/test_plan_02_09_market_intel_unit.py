@@ -398,6 +398,26 @@ class TestAnalyseOrderbook(_MI):
         self.assertEqual(summary["orderbook_source"], "dexie_v3_orderbook")
         self.assertTrue(any("ticker_id" in params for params in calls))
 
+    def test_refresh_requests_best_bid_page_from_reciprocal_dexie_sort(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"success": True, "offers": [], "orderbook": {}}
+
+        calls = []
+
+        def fake_get(_url, params=None, timeout=None):
+            calls.append(dict(params or {}))
+            return FakeResponse()
+
+        self._mi._session.get = fake_get
+
+        self._mi.refresh_orderbook(force=True)
+
+        buy_request = next(params for params in calls if params.get("offered") == "xch")
+        self.assertEqual(buy_request["sort"], "price_asc")
+
 
 # ===========================================================================
 # State query methods

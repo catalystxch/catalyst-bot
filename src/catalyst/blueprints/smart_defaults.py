@@ -888,7 +888,8 @@ def _fetch_dexie_orderbook_standalone(
         sell_ok = sell_resp.status_code == 200
         sell_offers = sell_resp.json().get("offers", []) if sell_ok else []
 
-        # Buy side: XCH offered for CAT (descending = highest first = best bid)
+        # Buy side: XCH offered for CAT. Dexie sorts this direction as CAT per
+        # XCH, so ascending returns the highest XCH-per-CAT bids first.
         _record_api_call("dexie", "/v1/offers")
         buy_resp = _req.get(
             f"{dexie_base}/v1/offers",
@@ -897,7 +898,7 @@ def _fetch_dexie_orderbook_standalone(
                 "requested": asset_id,
                 "status": 0,
                 "page_size": page_size,
-                "sort": "price_desc",
+                "sort": "price_asc",
             },
             timeout=8,
         )

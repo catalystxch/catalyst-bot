@@ -341,6 +341,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(
             get.call_args_list[1].kwargs["params"]["requested"], self._ASSET_ID
         )
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["sort"], "price_asc")
         self.assertEqual(result["num_sell_offers"], 0)
         self.assertEqual(result["sell_depth_xch"], Decimal("0"))
         self.assertEqual(result["best_bid"], Decimal("0.09"))

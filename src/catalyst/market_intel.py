@@ -186,7 +186,9 @@ class MarketIntel:
                 "requested": cfg.CAT_ASSET_ID,
                 "status": 0,
                 "page_size": self._orderbook_page_size,
-                "sort": "price_desc",
+                # Dexie exposes reciprocal CAT-per-XCH prices for this
+                # direction; ascending yields the best XCH-per-CAT bids.
+                "sort": "price_asc",
             }
 
             buy_resp = self._session.get(url, params=buy_params, timeout=10)
