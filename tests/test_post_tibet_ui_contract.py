@@ -634,6 +634,7 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
             "trade-1": {
                 "intent": {
                     "intent_id": "intent-1",
+                    "selected_coin_ids_json": '["' + "c" * 64 + '"]',
                     "lifecycle_state": "visible",
                     "generation": 2,
                     "publication_identity": "publication-identity",
@@ -688,6 +689,8 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
         payload = offers.api_offers().get_json()
 
     row = payload["buys"][0]
+    assert row["coin_id"] == "c" * 64
+    assert row["coin_id_short"] == "c" * 18 + "..."
     assert row["authority"]["intent_id"] == "intent-1"
     assert row["authority"]["generation"] == 2
     assert row["discovery"] == {

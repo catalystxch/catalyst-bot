@@ -11,6 +11,7 @@ can still inspect it.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -253,6 +254,22 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
             continue
 
         intent_id = str(intent.get("intent_id") or "")
+        if not str(item.get("coin_id") or "").strip():
+            try:
+                selected_coin_ids = json.loads(
+                    str(intent.get("selected_coin_ids_json") or "[]")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                selected_coin_ids = []
+            if len(selected_coin_ids) == 1:
+                coin_id = str(selected_coin_ids[0]).strip()
+                if (
+                    len(coin_id) == 64
+                    and coin_id == coin_id.lower()
+                    and all(character in "0123456789abcdef" for character in coin_id)
+                ):
+                    item["coin_id"] = coin_id
+                    item["coin_id_short"] = coin_id[:18] + "..."
         item["authority"] = {
             "intent_id": intent_id,
             "lifecycle_state": intent.get("lifecycle_state"),
