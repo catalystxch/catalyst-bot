@@ -39,6 +39,12 @@ class Capability(str, Enum):
     CHAIN_EVIDENCE = "chain_evidence"
     EXACT_FILL_AUTHORITY = "exact_fill_authority"
     PEER_HEALTH = "peer_health"
+    PARTIAL_CREATE = "partial_create"
+    PARTIAL_CANCEL = "partial_cancel"
+    PARTIAL_STATE = "partial_state"
+    PARTIAL_LINEAGE = "partial_lineage"
+    PARTIAL_FILL = "partial_fill"
+    PARTIAL_DISCOVERY = "partial_discovery"
 
 
 class ObservationQuality(str, Enum):

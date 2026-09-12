@@ -10715,7 +10715,7 @@
                             </label>
                             <label style="display:flex; align-items:center; gap:9px; margin-top:10px; font-size:0.82em; color:var(--text-tertiary);">
                                 <input id="bootstrapPartialOffers" type="checkbox" disabled style="width:auto;">
-                                <span>Partial offers — unavailable (<code>PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN</code>; <code>disabled_until_capability_proven</code>)</span>
+                                <span id="bootstrapPartialOffersReason">Partial offers — unavailable (<code>PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN</code>; <code>disabled_until_capability_proven</code>)</span>
                             </label>
                             <div id="bootstrapStatusPanel" role="status" aria-live="polite"
                                  style="margin-top:12px; padding:10px 12px; min-height:42px; border-radius:8px; background:rgba(15,23,42,0.42); border:1px solid rgba(148,163,184,0.18); color:var(--text-secondary); font-size:0.82em; line-height:1.55;">
@@ -38554,10 +38554,20 @@ async function bootstrapRefreshPartialCapability() {
         const response = await apiFetch('/api/bootstrap/partial-capability', { cache: 'no-store' });
         const payload = await response.json();
         const control = document.getElementById('bootstrapPartialOffers');
+        const reason = document.getElementById('bootstrapPartialOffersReason');
         if (control) {
             control.checked = payload?.enabled === true;
             control.disabled = true;
             control.dataset.reasonCode = payload?.reason_code || 'PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN';
+        }
+        if (reason) {
+            const reasonCodes = Array.isArray(payload?.reason_codes) && payload.reason_codes.length
+                ? payload.reason_codes.join(', ')
+                : (payload?.reason_code || 'PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN');
+            const policy = payload?.policy || 'disabled_until_capability_proven';
+            reason.textContent = payload?.enabled === true
+                ? 'Partial offers — capability proven (experimental option remains locked for this release)'
+                : `Partial offers — unavailable (${reasonCodes}; ${policy})`;
         }
     } catch (_) {}
 }

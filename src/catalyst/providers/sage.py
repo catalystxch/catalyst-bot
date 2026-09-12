@@ -17,6 +17,9 @@ from .models import (
 class SageAuthorityProvider:
     def __init__(self, wallet_facade: Any) -> None:
         self._wallet = wallet_facade
+        # Sage currently proves standard-offer wallet authority only.  Do not
+        # advertise partial create/cancel/state/lineage/fill until its exact RPC
+        # response contracts are implemented and covered end to end.
         self.capabilities = ProviderCapabilities(
             "sage",
             frozenset(

@@ -520,30 +520,30 @@ git commit -m "feat: export bootstrap participation proofs"
 - Adds provider capabilities `PARTIAL_CREATE`, `PARTIAL_CANCEL`, `PARTIAL_STATE`, `PARTIAL_LINEAGE`, `PARTIAL_FILL`, and `PARTIAL_DISCOVERY`.
 - Produces: `evaluate_partial_offer_capability(registry) -> PartialOfferCapabilityDecision(enabled, reason_codes, providers)`.
 
-- [ ] **Step 1: Write the failing all-capabilities-required test matrix**
+- [x] **Step 1: Write the failing all-capabilities-required test matrix**
 
 Parameterize every required partial capability and assert removing each one sets
 `enabled=False` with that exact missing-capability reason. Also assert the current
 Sage/distribution registry is disabled without invoking adapters, and inspect the
 config/API contracts to prove no force-enable setting or request parameter exists.
 
-- [ ] **Step 2: Run tests and observe missing capability enum/policy failures**
+- [x] **Step 2: Run tests and observe missing capability enum/policy failures**
 
 Run: `python -m pytest tests/test_partial_offer_capability.py -q`
 
 Expected: FAIL before the capability values and evaluator exist.
 
-- [ ] **Step 3: Implement detection only, with no live partial creation path**
+- [x] **Step 3: Implement detection only, with no live partial creation path**
 
 Current adapters advertise only capabilities proven by their actual response contracts. The current Sage and public-discovery combination therefore returns disabled with exact reason codes. Do not add permissive wallet stubs to the live offer manager; ordinary standard offers remain unchanged.
 
-- [ ] **Step 4: Run provider and standard-offer regression suites**
+- [x] **Step 4: Run provider and standard-offer regression suites**
 
 Run: `python -m pytest tests/test_partial_offer_capability.py tests/test_provider_contracts.py tests/test_provider_adapters.py tests/test_offer_creation_wallet_gate.py -q`
 
 Expected: PASS with standard behavior unchanged.
 
-- [ ] **Step 5: Commit capability gating**
+- [x] **Step 5: Commit capability gating**
 
 ```powershell
 git add src/catalyst/providers/models.py src/catalyst/providers/sage.py src/catalyst/providers/dexie.py src/catalyst/providers/splash.py src/catalyst/partial_offer_capability.py tests/test_partial_offer_capability.py

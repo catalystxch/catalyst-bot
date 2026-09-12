@@ -33,6 +33,8 @@ class DexieOrderbookProvider:
         self._fetch_book = fetch_book
         self._fetch_settled_trades = fetch_settled_trades
         self._fetch_metadata = fetch_metadata
+        # These are standard-offer capabilities.  Public partial discovery is
+        # intentionally absent until Dexie exposes a proven CHIP-0052 contract.
         self.capabilities = ProviderCapabilities(
             "dexie",
             frozenset(

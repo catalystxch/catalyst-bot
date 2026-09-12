@@ -31,6 +31,11 @@ from bootstrap_proof import build_participation_report, participation_report_id
 from config import cfg
 import database
 from offer_book_policy import derive_bootstrap_plan
+from partial_offer_capability import evaluate_partial_offer_capability
+from providers.dexie import DexieOrderbookProvider
+from providers.registry import ProviderRegistry
+from providers.sage import SageAuthorityProvider
+from providers.splash import SplashOfferProvider
 from super_log import slog
 
 
@@ -242,9 +247,7 @@ def _campaign_inputs(
                 balances_raw[optional], optional, allow_zero=False
             )
     if (
-        fields["xch_budget"]
-        + fields["fee_budget_xch"]
-        + fields["subsidy_budget_xch"]
+        fields["xch_budget"] + fields["fee_budget_xch"] + fields["subsidy_budget_xch"]
         > balances["xch_available"]
     ):
         raise BootstrapApiError("bootstrap_xch_budget_exceeds_available")
@@ -295,9 +298,7 @@ def _derive_preview(body: dict[str, Any], identity: dict[str, Any]) -> dict[str,
         created_at=now,
         expires_at=now + timedelta(seconds=reviewed["expires_in_seconds"]),
     )
-    decision = evaluate_bootstrap_campaign(
-        campaign, BootstrapEvidence(), now=now
-    )
+    decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=now)
     plan = derive_bootstrap_plan(campaign, decision, balances)
     return {
         "reviewed": reviewed,
@@ -384,9 +385,7 @@ def api_bootstrap_preview():
 @bp.post("/api/bootstrap/start")
 def api_bootstrap_start():
     try:
-        created = _create_reviewed_campaign(
-            _request_body(), _read_bootstrap_identity()
-        )
+        created = _create_reviewed_campaign(_request_body(), _read_bootstrap_identity())
         return jsonify(
             _json_safe(
                 {
@@ -453,8 +452,7 @@ def api_bootstrap_stop():
         if any(
             (
                 campaign["network"] != identity["network"],
-                campaign["wallet_fingerprint"]
-                != identity["wallet_fingerprint"],
+                campaign["wallet_fingerprint"] != identity["wallet_fingerprint"],
                 campaign["wallet_id"] != identity["wallet_id"],
                 campaign["asset_id"] != identity["asset_id"],
             )
@@ -713,11 +711,31 @@ def api_bootstrap_participation_export():
 @bp.get("/api/bootstrap/capabilities/partial-offers")
 @bp.get("/api/bootstrap/partial-capability")
 def api_bootstrap_partial_offer_capability():
+    def unavailable(*_args, **_kwargs):
+        raise AssertionError("partial capability detection must not invoke adapters")
+
+    registry = ProviderRegistry()
+    registry.register(SageAuthorityProvider(None))
+    registry.register(
+        DexieOrderbookProvider(
+            fetch_book=unavailable,
+            fetch_settled_trades=unavailable,
+            fetch_metadata=unavailable,
+        )
+    )
+    registry.register(
+        SplashOfferProvider(fetch_offers=unavailable, get_health=unavailable)
+    )
+    decision = evaluate_partial_offer_capability(registry)
     return jsonify(
         {
             "success": True,
-            "enabled": False,
-            "reason_code": "PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN",
+            "enabled": decision.enabled,
+            "reason_code": (
+                None if decision.enabled else "PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN"
+            ),
+            "reason_codes": list(decision.reason_codes),
+            "providers": list(decision.providers),
             "policy": "disabled_until_capability_proven",
         }
     )

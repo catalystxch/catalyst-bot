@@ -22,6 +22,7 @@ def test_bootstrap_wizard_exposes_reviewed_campaign_controls():
         "bootstrapManifestImportInput",
         "bootstrapParticipationExportBtn",
         "bootstrapPartialOffers",
+        "bootstrapPartialOffersReason",
         "bootstrapStatusPanel",
         "bootstrapDashboardStatus",
     ):
@@ -48,8 +49,10 @@ def test_bootstrap_ui_calls_every_campaign_route_and_walletconnect_signing():
 
 def test_partial_offers_are_visibly_disabled_with_stable_reason():
     assert 'id="bootstrapPartialOffers"' in GUI
+    assert 'id="bootstrapPartialOffersReason"' in GUI
     assert "disabled_until_capability_proven" in GUI
     assert "PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN" in GUI
+    assert "payload?.reason_codes" in GUI
 
 
 def test_bootstrap_status_is_visible_across_the_main_workflow():

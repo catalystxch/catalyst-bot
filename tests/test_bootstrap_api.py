@@ -108,9 +108,9 @@ def test_start_requires_exact_asset_warning_and_persists_before_coin_prep(
 
     assert rejected.status_code == 400
     assert rejected.get_json()["code"] == "exact_asset_confirmation_required"
-    assert database.get_active_bootstrap_campaign(
-        ASSET_ID, 736588221, "mainnet"
-    ) is None
+    assert (
+        database.get_active_bootstrap_campaign(ASSET_ID, 736588221, "mainnet") is None
+    )
 
     accepted = client.post(
         "/api/bootstrap/start",
@@ -125,9 +125,7 @@ def test_start_requires_exact_asset_warning_and_persists_before_coin_prep(
     assert payload["success"] is True
     assert payload["coin_prep_required"] is True
     assert payload["financial_action_started"] is False
-    active = database.get_active_bootstrap_campaign(
-        ASSET_ID, 736588221, "mainnet"
-    )
+    active = database.get_active_bootstrap_campaign(ASSET_ID, 736588221, "mainnet")
     assert active["campaign_id"] == payload["campaign_id"]
 
 
@@ -290,6 +288,15 @@ def test_partial_offer_capability_is_explicitly_disabled(bootstrap_api):
         "success": True,
         "enabled": False,
         "reason_code": "PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN",
+        "reason_codes": [
+            "MISSING_PARTIAL_CREATE",
+            "MISSING_PARTIAL_CANCEL",
+            "MISSING_PARTIAL_STATE",
+            "MISSING_PARTIAL_LINEAGE",
+            "MISSING_PARTIAL_FILL",
+            "MISSING_PARTIAL_DISCOVERY",
+        ],
+        "providers": ["dexie", "sage", "splash"],
         "policy": "disabled_until_capability_proven",
     }
 
@@ -332,8 +339,10 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
     monkeypatch.setattr(
         bootstrap,
         "_cancel_campaign_offers",
-        lambda trade_ids: cancelled.extend(trade_ids)
-        or {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids},
+        lambda trade_ids: (
+            cancelled.extend(trade_ids)
+            or {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids}
+        ),
     )
     stopped = client.post(
         "/api/bootstrap/stop",

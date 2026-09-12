@@ -29,6 +29,8 @@ class SplashOfferProvider:
     ) -> None:
         self._fetch_offers = fetch_offers
         self._get_health = get_health
+        # Splash currently observes and relays complete standard offers only;
+        # it must not satisfy the independent partial-discovery gate.
         self.capabilities = ProviderCapabilities(
             "splash",
             frozenset(
