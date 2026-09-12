@@ -66,6 +66,301 @@ from cancel_outcomes import (
 )
 
 
+def offer_is_profitable(
+    *,
+    expected_gross_xch: Decimal,
+    network_fee_xch: Decimal,
+    expected_cancel_requotes: int,
+    minimum_profit_xch: Decimal,
+) -> bool:
+    """Require gross edge to cover every expected lifecycle cost."""
+
+    values = (expected_gross_xch, network_fee_xch, minimum_profit_xch)
+    if any(type(value) is not Decimal or not value.is_finite() for value in values):
+        raise TypeError("profitability values must be finite Decimal values")
+    if any(value < 0 for value in values):
+        raise ValueError("profitability values must be nonnegative")
+    if type(expected_cancel_requotes) is not int or expected_cancel_requotes < 0:
+        raise ValueError("expected_cancel_requotes must be nonnegative")
+    required = network_fee_xch * Decimal(1 + expected_cancel_requotes)
+    required += minimum_profit_xch
+    return expected_gross_xch >= required
+
+
+def bootstrap_offer_specs(
+    plan: dict[str, Any],
+    *,
+    campaign_authority: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], ...]:
+    """Flatten one authorized Bootstrap plan into exact offer specifications."""
+
+    if type(plan) is not dict or plan.get("authorized") is not True:
+        raise ValueError("authorized Bootstrap plan is required")
+    sides = plan.get("sides")
+    if type(sides) is not dict or set(sides) != {"buy", "sell"}:
+        raise ValueError("Bootstrap side plan is invalid")
+
+    campaign_fields: dict[str, Any] = {}
+    if campaign_authority is not None:
+        if type(campaign_authority) is not dict:
+            raise ValueError("Bootstrap campaign authority is invalid")
+        campaign_id = campaign_authority.get("campaign_id")
+        revision = campaign_authority.get("revision")
+        if (
+            type(campaign_id) is not str
+            or len(campaign_id) != 64
+            or any(character not in "0123456789abcdef" for character in campaign_id)
+            or type(revision) is not int
+            or revision < 0
+            or campaign_authority.get("status") != "active"
+        ):
+            raise ValueError("Bootstrap campaign authority is invalid")
+        campaign_fields = {
+            "campaign_id": campaign_id,
+            "campaign_revision": revision,
+            "purpose": f"bootstrap:{campaign_id}:revision:{revision}",
+        }
+
+    specs: list[dict[str, Any]] = []
+    for side in ("buy", "sell"):
+        side_plan = sides[side]
+        if type(side_plan) is not dict:
+            raise ValueError("Bootstrap side plan is invalid")
+        levels = side_plan.get("levels")
+        if type(levels) is not list:
+            raise ValueError("Bootstrap levels are invalid")
+        if levels and len(levels) != 3:
+            raise ValueError("Bootstrap requires exactly three levels per active side")
+        for level in levels:
+            if type(level) is not dict or level.get("side") != side:
+                raise ValueError("Bootstrap level is invalid")
+            specs.append(
+                {
+                    "purpose": "bootstrap_market",
+                    "side": side,
+                    "level": level["level"],
+                    "price": level["price"],
+                    "xch_amount": level["xch_amount"],
+                    "cat_amount": level["cat_amount"],
+                    "subsidy_xch": level["subsidy_xch"],
+                    **campaign_fields,
+                }
+            )
+    if not specs:
+        raise ValueError("Bootstrap plan has no active offer levels")
+    return tuple(specs)
+
+
+def require_active_bootstrap_intent_authority(
+    *,
+    purpose: str,
+    asset_id: str,
+    now: Optional[datetime] = None,
+) -> Optional[dict[str, Any]]:
+    """Re-read the exact campaign revision encoded in a Bootstrap intent."""
+
+    if type(purpose) is not str:
+        raise ValueError("offer purpose must be canonical text")
+    if not purpose.startswith("bootstrap:"):
+        return None
+    parts = purpose.split(":")
+    if len(parts) != 4 or parts[0] != "bootstrap" or parts[2] != "revision":
+        raise ValueError("Bootstrap offer purpose is malformed")
+    campaign_id = parts[1]
+    try:
+        revision = int(parts[3])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bootstrap offer revision is malformed") from exc
+    if (
+        len(campaign_id) != 64
+        or any(character not in "0123456789abcdef" for character in campaign_id)
+        or revision < 0
+        or parts[3] != str(revision)
+    ):
+        raise ValueError("Bootstrap offer authority is malformed")
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    if type(campaign) is not dict or campaign.get("status") != "active":
+        raise ValueError("Bootstrap campaign is not active")
+    if campaign.get("revision") != revision:
+        raise ValueError("Bootstrap campaign revision is no longer active")
+    if campaign.get("asset_id") != asset_id:
+        raise ValueError("Bootstrap campaign asset identity changed")
+    observed_at = now or datetime.now(timezone.utc)
+    if type(observed_at) is not datetime or observed_at.tzinfo is None:
+        raise ValueError("Bootstrap authority time is invalid")
+    expiry = campaign.get("expires_at")
+    try:
+        if type(expiry) is not str or not expiry.endswith("Z"):
+            raise ValueError("noncanonical expiry")
+        expires_at = datetime.fromisoformat(expiry[:-1] + "+00:00")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bootstrap campaign expiry is malformed") from exc
+    if observed_at.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc):
+        raise ValueError("Bootstrap campaign has expired")
+    return {
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+        "status": "active",
+    }
+
+
+def _bootstrap_level_tier(level: str) -> str:
+    tiers = {"near": "inner", "middle": "mid", "far": "outer"}
+    try:
+        return tiers[level]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Bootstrap offer level is invalid") from exc
+
+
+def assess_offer_book_candidate(
+    *,
+    side: str,
+    candidate_price: Decimal,
+    size_xch: Decimal,
+    confidence: Any,
+    network_fee_xch: Decimal,
+    expected_cancel_requotes: int,
+    minimum_profit_xch: Decimal,
+    now: Optional[datetime] = None,
+    max_confidence_age_seconds: int = 20,
+) -> Dict[str, Any]:
+    """Validate one exact candidate against attributable, valid book evidence."""
+
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if type(candidate_price) is not Decimal or type(size_xch) is not Decimal:
+        raise TypeError("candidate price and size must be Decimal")
+    if not candidate_price.is_finite() or candidate_price <= 0:
+        raise ValueError("candidate price must be finite and positive")
+    if not size_xch.is_finite() or size_xch <= 0:
+        raise ValueError("candidate size must be finite and positive")
+
+    def field(name: str) -> Any:
+        if isinstance(confidence, dict):
+            return confidence.get(name)
+        return getattr(confidence, name, None)
+
+    data_valid = field("data_valid")
+    if data_valid is None:
+        data_valid = field("state") == "GREEN"
+    if data_valid is not True:
+        return {"eligible": False, "reason_code": "market_data_invalid"}
+    if now is not None:
+        derived_at = field("derived_at")
+        if (
+            type(now) is not datetime
+            or now.tzinfo is None
+            or type(derived_at) is not datetime
+            or derived_at.tzinfo is None
+            or type(max_confidence_age_seconds) is not int
+            or max_confidence_age_seconds < 1
+        ):
+            return {"eligible": False, "reason_code": "confidence_time_invalid"}
+        age = (
+            now.astimezone(timezone.utc) - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if age < -2 or age > max_confidence_age_seconds:
+            return {"eligible": False, "reason_code": "market_confidence_stale"}
+    midpoint = field("trusted_midpoint")
+    bid = field("trusted_bid")
+    ask = field("trusted_ask")
+    if any(type(value) is not Decimal for value in (midpoint, bid, ask)):
+        return {"eligible": False, "reason_code": "trusted_range_missing"}
+    if not (bid > 0 and bid <= midpoint <= ask):
+        return {"eligible": False, "reason_code": "trusted_range_invalid"}
+    digests = tuple(field("evidence_digests") or ())
+    if not digests or any(
+        type(value) is not str
+        or len(value) != 64
+        or value.lower() != value
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in digests
+    ):
+        return {"eligible": False, "reason_code": "snapshot_evidence_missing"}
+
+    if normalized_side == "buy":
+        edge_per_cat = midpoint - candidate_price
+        improves_book = candidate_price > bid
+    else:
+        edge_per_cat = candidate_price - midpoint
+        improves_book = candidate_price < ask
+    if edge_per_cat <= 0:
+        return {
+            "eligible": False,
+            "reason_code": "candidate_outside_profitable_side",
+        }
+    cat_amount = size_xch / candidate_price
+    gross = edge_per_cat * cat_amount
+    required = network_fee_xch * Decimal(1 + expected_cancel_requotes)
+    required += minimum_profit_xch
+    evidence_digest = hashlib.sha256(
+        "|".join(sorted(digests)).encode("ascii")
+    ).hexdigest()
+    return {
+        "eligible": offer_is_profitable(
+            expected_gross_xch=gross,
+            network_fee_xch=network_fee_xch,
+            expected_cancel_requotes=expected_cancel_requotes,
+            minimum_profit_xch=minimum_profit_xch,
+        ),
+        "reason_code": (
+            "candidate_profitable" if gross >= required else "profit_floor_not_met"
+        ),
+        "expected_gross_xch": gross,
+        "required_xch": required,
+        "improves_book": improves_book,
+        "evidence_digest": evidence_digest,
+    }
+
+
+def book_opportunity_size_cap(
+    *, requested_size_xch: Decimal, confidence: Any
+) -> Optional[Decimal]:
+    """Return the exact maximum size for a current book-improvement order.
+
+    Opportunity orders are deliberately smaller than the normal tier size and
+    than the independently observed executable depth. Missing, stale, thin,
+    or high-churn evidence fails closed by returning ``None``.
+    """
+
+    if type(requested_size_xch) is not Decimal:
+        raise TypeError("requested_size_xch must be a Decimal")
+    if not requested_size_xch.is_finite() or requested_size_xch <= 0:
+        raise ValueError("requested_size_xch must be finite and positive")
+
+    def field(name: str) -> Any:
+        if isinstance(confidence, dict):
+            return confidence.get(name)
+        return getattr(confidence, name, None)
+
+    if field("state") != "GREEN":
+        return None
+    bid_depth = field("independent_bid_depth_mojos")
+    ask_depth = field("independent_ask_depth_mojos")
+    required_depth = field("required_depth_mojos")
+    manipulation_score = field("manipulation_score")
+    thresholds = field("derived_thresholds")
+    if (
+        type(bid_depth) is not int
+        or type(ask_depth) is not int
+        or type(required_depth) is not int
+        or min(bid_depth, ask_depth, required_depth) < 0
+        or bid_depth < required_depth
+        or ask_depth < required_depth
+        or type(manipulation_score) is not int
+        or not isinstance(thresholds, dict)
+    ):
+        return None
+    amber_threshold = thresholds.get("manipulation_amber")
+    if type(amber_threshold) is not int or manipulation_score >= amber_threshold:
+        return None
+
+    depth_xch = Decimal(min(bid_depth, ask_depth)) / Decimal("1000000000000")
+    bounded = min(requested_size_xch * Decimal("0.5"), depth_xch * Decimal("0.02"))
+    return bounded if bounded > 0 else None
+
+
 @dataclass(frozen=True, slots=True)
 class _CanonicalOfferCreationIntent:
     intent_id: str
@@ -416,8 +711,10 @@ class OfferManager:
         # Phase two begins only after the whole selected/open cohort passed
         # exact identity, state, and slot validation.  Task 8 remains the
         # only cancellation authority and owns its wallet effect.
+        action_priority = {"commit": 0, "cancel": 1, "wait": 2}
         for action, parent, pause in sorted(
-            resume_actions, key=lambda item: item[1]["intent_id"]
+            resume_actions,
+            key=lambda item: (action_priority[item[0]], item[1]["intent_id"]),
         ):
             if action == "wait":
                 return {}, pause
@@ -461,6 +758,53 @@ class OfferManager:
             )
             return {}, "awaiting_task8_task9"
         return candidates, None
+
+    def _advance_pending_refresh_lineage(
+        self, open_offers: List[Dict[str, Any]], side: str
+    ) -> Optional[str]:
+        """Advance durable child-first replacement work before quote selection.
+
+        Price reversion, graduated tier filtering, and per-cycle budgets must not
+        hide a parent once its replacement child is durable.  Likewise, generic
+        cap trimming must not cancel that child while the parent still owns the
+        incomplete lineage edge.
+        """
+
+        try:
+            pending_parent_ids = database.get_pending_refresh_lineage_parent_ids(
+                asset_id=cfg.CAT_ASSET_ID, side=side, limit=128
+            )
+        except Exception as exc:
+            log_event(
+                "warning",
+                "refresh_lineage_query_failed",
+                f"Refresh lineage {side}: durable query failed closed: {exc}",
+            )
+            return "lineage_query_failed"
+        if not pending_parent_ids:
+            return None
+        completion_pause = self._resume_pending_refresh_lineage_completions(side)
+        if completion_pause is not None:
+            return completion_pause
+        _parents, cohort_pause = self._collect_staged_refresh_parents(open_offers, side)
+        return cohort_pause or "awaiting_refresh_lineage"
+
+    def resume_pending_refresh_lineages(
+        self,
+        open_buys: List[Dict[str, Any]],
+        open_sells: List[Dict[str, Any]],
+    ) -> Dict[str, Optional[str]]:
+        """Advance crash-safe replacement lineages on every fresh wallet cycle.
+
+        This explicit recovery seam keeps progression independent of price drift,
+        requote eligibility, tier selection, and offer-cap trimming.  Callers must
+        establish the runtime cancellation effect phase before invoking it.
+        """
+
+        return {
+            "buy": self._advance_pending_refresh_lineage(open_buys, "buy"),
+            "sell": self._advance_pending_refresh_lineage(open_sells, "sell"),
+        }
 
     def __init__(self):
         # Track which offers the bot cancelled (vs externally filled).
@@ -1973,6 +2317,10 @@ class OfferManager:
         ):
             if type(value) is not str or not value or value != value.strip():
                 raise ValueError(f"creation {label} must be canonical text")
+        require_active_bootstrap_intent_authority(
+            purpose=purpose,
+            asset_id=asset_id,
+        )
         if parent_intent_id is not None and (
             type(parent_intent_id) is not str
             or not parent_intent_id
@@ -2576,6 +2924,10 @@ class OfferManager:
         wallet_hash = ""
         network = ""
         try:
+            require_active_bootstrap_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+            )
             continuation = wallet.begin_offer_creation_continuation(
                 operation_id=intent.operation_id,
                 intent_id=intent.intent_id,
@@ -2675,6 +3027,10 @@ class OfferManager:
                     "_catalyst_intent_id": intent.intent_id,
                 }
             self._offer_creation_crash_boundary("before_wallet_call", intent)
+            require_active_bootstrap_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+            )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),
@@ -2888,6 +3244,240 @@ class OfferManager:
                     # Cleanup is best-effort and must never replace the stable
                     # durable result (or the original pre-prepare exception).
                     pass
+
+    def create_bootstrap_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        campaign_authority: dict[str, Any],
+        xch_wallet_id: int,
+        cat_wallet_id: int,
+        cat_decimals: int,
+        coin_ids_enabled: bool,
+        existing_levels: frozenset[tuple[str, str]] = frozenset(),
+    ) -> list[dict[str, Any]]:
+        """Create only the exact standard offers authorized by a Bootstrap plan.
+
+        This deliberately bypasses ordinary ladder interpolation, adaptive
+        targets, and Follow-market repricing.  Each wallet mutation is still
+        journalled by ``create_offer_with_retry`` and rechecks the exact active
+        campaign revision at that final boundary.
+        """
+
+        if type(xch_wallet_id) is not int or xch_wallet_id <= 0:
+            raise ValueError("Bootstrap XCH wallet ID is invalid")
+        if type(cat_wallet_id) is not int or cat_wallet_id <= 0:
+            raise ValueError("Bootstrap CAT wallet ID is invalid")
+        if xch_wallet_id == cat_wallet_id:
+            raise ValueError("Bootstrap wallet IDs must be distinct")
+        if type(cat_decimals) is not int or not 0 <= cat_decimals <= 12:
+            raise ValueError("Bootstrap CAT decimals are invalid")
+        if type(coin_ids_enabled) is not bool:
+            raise TypeError("Bootstrap coin selection flag must be a bool")
+        if type(existing_levels) is not frozenset or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] not in {"buy", "sell"}
+            or item[1] not in {"near", "middle", "far"}
+            for item in existing_levels
+        ):
+            raise ValueError("Bootstrap existing levels are invalid")
+
+        specs = bootstrap_offer_specs(
+            plan,
+            campaign_authority=campaign_authority,
+        )
+        campaign_id = campaign_authority["campaign_id"]
+        revision = campaign_authority["revision"]
+        asset_id = str(plan.get("coin_prep", {}).get("campaign_asset_id") or "")
+        created: list[dict[str, Any]] = []
+        used_coin_ids: set[str] = set()
+        for index, spec in enumerate(specs):
+            if (spec["side"], spec["level"]) in existing_levels:
+                continue
+            if getattr(self, "_stop_requested", False):
+                break
+            xch_mojos = xch_to_mojos(spec["xch_amount"])
+            cat_mojos = cat_to_mojos(spec["cat_amount"], cat_decimals)
+            if xch_mojos <= 0 or cat_mojos <= 0:
+                raise ValueError("Bootstrap offer amount rounds to zero")
+            if spec["side"] == "buy":
+                offer_dict = {
+                    str(xch_wallet_id): -xch_mojos,
+                    str(cat_wallet_id): cat_mojos,
+                }
+            else:
+                offer_dict = {
+                    str(cat_wallet_id): -cat_mojos,
+                    str(xch_wallet_id): xch_mojos,
+                }
+            tier = _bootstrap_level_tier(spec["level"])
+            result = self.create_offer_with_retry(
+                offer_dict,
+                expiry_offset=index,
+                used_coins=used_coin_ids,
+                coin_ids_enabled=coin_ids_enabled,
+                preferred_tier=tier,
+                creation_context={
+                    "slot_key": (
+                        f"bootstrap:{campaign_id}:{revision}:"
+                        f"{spec['side']}:{spec['level']}"
+                    ),
+                    "select_next_generation": True,
+                    "asset_id": asset_id,
+                    "side": spec["side"],
+                    "tier": tier,
+                    "purpose": spec["purpose"],
+                    "offer_size_uniqueness": {
+                        "campaign_id": campaign_id,
+                        "campaign_revision": revision,
+                        "side": spec["side"],
+                        "level": spec["level"],
+                        "requested_amount_atomic": str(
+                            next(amount for amount in offer_dict.values() if amount > 0)
+                        ),
+                    },
+                },
+            )
+            if result and result.get("success"):
+                trade_record = result.get("trade_record") or {}
+                trade_id = result.get("trade_id") or trade_record.get("trade_id") or ""
+                if not trade_id:
+                    log_event(
+                        "error",
+                        "bootstrap_offer_projection_failed",
+                        "Confirmed Bootstrap offer did not return a Sage trade ID",
+                    )
+                    continue
+                locked_coin_id = result.get("locked_coin_id")
+                verification = result.get("_catalyst_locked_input_verification") or {}
+                verified_locked_coin_ids = (
+                    list(verification.get("locked_coin_ids") or [])
+                    if verification.get("verified") is True
+                    else []
+                )
+                normalized_locked_coin_id = self._normalize_coin_ref(locked_coin_id)
+                normalized_verified = {
+                    self._normalize_coin_ref(coin_id)
+                    for coin_id in verified_locked_coin_ids
+                }
+                if (
+                    normalized_locked_coin_id
+                    and normalized_locked_coin_id in normalized_verified
+                ):
+                    db_coin_id = locked_coin_id
+                elif verified_locked_coin_ids:
+                    db_coin_id = verified_locked_coin_ids[0]
+                else:
+                    db_coin_id = locked_coin_id
+
+                offer_max_time = result.get("offer_max_time", 0)
+                expires_at = (
+                    datetime.fromtimestamp(
+                        int(offer_max_time), tz=timezone.utc
+                    ).isoformat()
+                    if offer_max_time and int(offer_max_time) > 0
+                    else None
+                )
+                existing = database.get_offer(trade_id)
+                if existing is None:
+                    projected = add_offer(
+                        trade_id=trade_id,
+                        side=spec["side"],
+                        price_xch=spec["price"],
+                        size_xch=spec["xch_amount"],
+                        size_cat=spec["cat_amount"],
+                        cat_asset_id=asset_id,
+                        tier=tier,
+                        expires_at=expires_at,
+                        coin_id=db_coin_id,
+                    )
+                else:
+                    try:
+                        projected = (
+                            existing.get("status") == "open"
+                            and existing.get("side") == spec["side"]
+                            and str(existing.get("cat_asset_id") or "").lower()
+                            == asset_id
+                            and Decimal(str(existing.get("price_xch")))
+                            == Decimal(str(spec["price"]))
+                            and Decimal(str(existing.get("size_xch")))
+                            == Decimal(str(spec["xch_amount"]))
+                            and Decimal(str(existing.get("size_cat")))
+                            == Decimal(str(spec["cat_amount"]))
+                            and existing.get("tier") == tier
+                            and self._normalize_coin_ref(existing.get("coin_id"))
+                            == self._normalize_coin_ref(db_coin_id)
+                        )
+                    except (ArithmeticError, TypeError, ValueError):
+                        projected = False
+
+                offer_bech32 = (
+                    result.get("offer")
+                    or result.get("offer_bech32")
+                    or get_offer_bech32(trade_id)
+                    or ""
+                )
+                cached = (
+                    projected
+                    and bool(offer_bech32)
+                    and update_offer_bech32(trade_id, offer_bech32)
+                )
+                if not projected or not cached:
+                    log_event(
+                        "error",
+                        "bootstrap_offer_projection_failed",
+                        f"Bootstrap offer {trade_id[:16]}... could not be made "
+                        "claimable by the durable publication outbox; cancelling it",
+                    )
+                    try:
+                        self.cancel_offers(
+                            [trade_id], reason="bootstrap_projection_failed"
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                lock_targets = verified_locked_coin_ids or (
+                    [locked_coin_id] if locked_coin_id else []
+                )
+                for coin_id in lock_targets:
+                    used_coin_ids.add(coin_id)
+                    self._cycle_used_coin_ids.add(coin_id)
+                    try:
+                        lock_coin(coin_id, trade_id)
+                    except Exception as exc:
+                        log_event(
+                            "warning",
+                            "coin_lock_failed",
+                            f"DB coin lock failed for Bootstrap coin "
+                            f"{coin_id[:16]}... (offer {trade_id[:16]}...): {exc}",
+                        )
+
+                offer_detail = {
+                    **result,
+                    "trade_id": trade_id,
+                    "side": spec["side"],
+                    "level": spec["level"],
+                    "price": spec["price"],
+                    "size_xch": spec["xch_amount"],
+                    "size_cat": spec["cat_amount"],
+                    "tier": tier,
+                    "coin_id": db_coin_id,
+                    "offer_bech32": offer_bech32,
+                    "campaign_id": campaign_id,
+                    "campaign_revision": revision,
+                }
+                if verified_locked_coin_ids:
+                    offer_detail["locked_coin_ids"] = verified_locked_coin_ids
+                offer_cache = getattr(self, "_offer_details_cache", None)
+                if isinstance(offer_cache, dict):
+                    offer_cache[trade_id] = offer_detail
+                recently_created = getattr(self, "_recently_created", None)
+                if isinstance(recently_created, dict):
+                    recently_created[trade_id] = time.time()
+                created.append(offer_detail)
+        return created
 
     def create_offer_with_retry(
         self,
@@ -3524,6 +4114,7 @@ class OfferManager:
         price_floor: Decimal = None,
         interpolate_refill_prices: bool = True,
         refresh_parent_ids: Dict[int, str] = None,
+        market_confidence: Any = None,
     ) -> List[Dict]:
         """Create a ladder of offers on one side (buy or sell).
 
@@ -3552,6 +4143,8 @@ class OfferManager:
             refresh_parent_ids: Exact durable parent intent keyed by ladder
                 slot.  When supplied, creation is a Task 11 child and is
                 bound only after its confirmed Sage identity is durable.
+            market_confidence: Exact current offer-book decision authorizing
+                price, profitability, and any public-book improvement.
 
         Returns list of created offer details (trade_id, price, size, etc.)
         """
@@ -3832,6 +4425,13 @@ class OfferManager:
         # ── Phase 1: Pre-compute all offer specs ──────────────────────────
         # Calculate prices, sizes, tiers, and offer dicts for all slots upfront.
         # This is pure math — no RPC calls, instant.
+        network_fee_xch = Decimal(get_effective_transaction_fee_mojos()) / Decimal(
+            "1000000000000"
+        )
+        expected_cancel_requotes = int(getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 2) or 0)
+        minimum_profit_xch = Decimal(
+            str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
+        )
         offer_specs = []
         for i in range(num):
             if self._stop_requested:
@@ -3961,6 +4561,71 @@ class OfferManager:
                     str(cfg.WALLET_ID_XCH): int(xch_mojos),
                 }
 
+            market_guard = None
+            purpose = "normal_lifecycle"
+            if market_confidence is not None:
+                market_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=price,
+                    size_xch=size_xch,
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                if not market_guard.get("eligible"):
+                    log_event(
+                        "info",
+                        "offer_profitability_blocked",
+                        f"Skipping {side} slot {slot}: "
+                        f"{market_guard.get('reason_code', 'market_guard_failed')}",
+                    )
+                    continue
+                if market_guard.get("improves_book"):
+                    opportunity_cap = book_opportunity_size_cap(
+                        requested_size_xch=size_xch,
+                        confidence=market_confidence,
+                    )
+                    if opportunity_cap is None:
+                        log_event(
+                            "info",
+                            "book_opportunity_blocked",
+                            f"Skipping {side} slot {slot}: confirmed depth or "
+                            "churn policy does not permit a book-opportunity order",
+                        )
+                        continue
+                    size_xch = opportunity_cap
+                    cat_amount = size_xch / price
+                    cat_mojos = cat_to_mojos(cat_amount, decimals)
+                    cat_amount = mojos_to_cat(cat_mojos, decimals)
+                    xch_mojos = xch_to_mojos(size_xch)
+                    if int(cat_mojos) <= 0 or int(xch_mojos) <= 0:
+                        continue
+                    if side == "buy":
+                        offer_dict = {
+                            str(cfg.WALLET_ID_XCH): -int(xch_mojos),
+                            str(wallet_cat): int(cat_mojos),
+                        }
+                    else:
+                        offer_dict = {
+                            str(wallet_cat): -int(cat_mojos),
+                            str(cfg.WALLET_ID_XCH): int(xch_mojos),
+                        }
+                    market_guard = assess_offer_book_candidate(
+                        side=side,
+                        candidate_price=price,
+                        size_xch=size_xch,
+                        confidence=market_confidence,
+                        network_fee_xch=network_fee_xch,
+                        expected_cancel_requotes=expected_cancel_requotes,
+                        minimum_profit_xch=minimum_profit_xch,
+                        now=datetime.now(timezone.utc),
+                    )
+                    if not market_guard.get("eligible"):
+                        continue
+                    purpose = "book_opportunity"
+
             offer_specs.append(
                 {
                     "i": i,
@@ -3971,6 +4636,8 @@ class OfferManager:
                     "cat_amount": cat_amount,
                     "offer_dict": offer_dict,
                     "stagger": i,
+                    "market_guard": market_guard,
+                    "purpose": purpose,
                 }
             )
 
@@ -4159,6 +4826,25 @@ class OfferManager:
                         str(cfg.WALLET_ID_XCH): int(unique_requested_xch_mojos),
                     }
 
+        # Exact-tier alignment can change the final size and requested amount.
+        # Re-evaluate the resulting price/size immediately before the wallet
+        # effect so clamping or atomic rounding cannot evade the profit floor.
+        if market_confidence is not None:
+            for spec in offer_specs:
+                final_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=spec["price"],
+                    size_xch=spec["size_xch"],
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                spec["market_guard"] = final_guard
+                if not final_guard.get("eligible"):
+                    spec["market_blocked"] = True
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading as _threading
 
@@ -4180,6 +4866,13 @@ class OfferManager:
 
         def _create_one(spec):
             """Create a single offer (runs in thread pool)."""
+            if spec.get("market_blocked"):
+                return spec["i"], {
+                    "success": False,
+                    "error": spec.get("market_guard", {}).get(
+                        "reason_code", "market_guard_failed"
+                    ),
+                }
             if coin_ids_enabled and not spec.get("coin_id"):
                 # Pre-selection returned no coin. In exact tier mode, never
                 # let Sage auto-select a fallback coin: it can pick a reserve
@@ -4205,6 +4898,48 @@ class OfferManager:
                     f"— serial mode, letting Sage pick from wallet",
                 )
 
+            market_guard = spec.get("market_guard") or {}
+            if market_confidence is not None:
+                market_guard = assess_offer_book_candidate(
+                    side=side,
+                    candidate_price=spec["price"],
+                    size_xch=spec["size_xch"],
+                    confidence=market_confidence,
+                    network_fee_xch=network_fee_xch,
+                    expected_cancel_requotes=expected_cancel_requotes,
+                    minimum_profit_xch=minimum_profit_xch,
+                    now=datetime.now(timezone.utc),
+                )
+                if not market_guard.get("eligible"):
+                    return spec["i"], {
+                        "success": False,
+                        "error": market_guard.get("reason_code", "market_guard_failed"),
+                    }
+            if market_guard.get("improves_book"):
+                try:
+                    improvement_allowed = database.claim_offer_book_improvement(
+                        asset_id=asset_id,
+                        side=side,
+                        evidence_digest=market_guard["evidence_digest"],
+                        cooldown_seconds=int(
+                            getattr(cfg, "COMPETITION_COOLDOWN_SECS", 30) or 30
+                        ),
+                        now=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:
+                    log_event(
+                        "warning",
+                        "competition_claim_failed",
+                        f"Skipping {side} slot {spec['slot']}: durable "
+                        f"competition claim failed closed: {exc}",
+                    )
+                    improvement_allowed = False
+                if not improvement_allowed:
+                    return spec["i"], {
+                        "success": False,
+                        "error": "competition_cooldown_active",
+                    }
+
             parent_intent_id = (
                 refresh_parent_ids.get(int(spec["slot"]))
                 if refresh_parent_ids is not None
@@ -4223,7 +4958,7 @@ class OfferManager:
                     "asset_id": asset_id,
                     "side": side,
                     "tier": spec["tier"],
-                    "purpose": "normal_lifecycle",
+                    "purpose": spec["purpose"],
                     "parent_intent_id": parent_intent_id,
                     "offer_size_uniqueness": {
                         "slot": spec["slot"],
@@ -4402,8 +5137,6 @@ class OfferManager:
             # DB: record offer
             _omt = res.get("offer_max_time", 0)
             if _omt and int(_omt) > 0:
-                from datetime import datetime, timezone
-
                 expires_at = datetime.fromtimestamp(
                     int(_omt), tz=timezone.utc
                 ).isoformat()
@@ -4890,6 +5623,7 @@ class OfferManager:
         max_offers: int = 0,
         allowed_tiers: set = None,
         force_cancel_storm: bool = False,
+        market_confidence: Any = None,
     ) -> List[Dict]:
         """Single-pass requote: cancel old offers, then create replacements.
 
@@ -4918,6 +5652,25 @@ class OfferManager:
         # ── Gather open offers to replace ──
         all_open = get_open_offers(side=side, cat_asset_id=cfg.CAT_ASSET_ID)
         open_offers = [o for o in all_open if o.get("tier") not in ("boost", "sniper")]
+        pending_lineage_pause = self._advance_pending_refresh_lineage(open_offers, side)
+        if pending_lineage_pause is not None:
+            log_event(
+                "info",
+                "requote_pending_lineage_paused",
+                f"Requote {side}: {pending_lineage_pause}; holding new children",
+            )
+            pending_count = len(open_offers)
+            return {
+                "offers": [],
+                "fully_replaced": False,
+                "replaced_count": 0,
+                "target_count": pending_count,
+                "original_target_count": pending_count,
+                "pending_cancel_count": 0,
+                "failed_cancel_count": 0,
+                "tier_filter_drained": False,
+                "refresh_paused": True,
+            }
         # Wallet omission is diagnostic only.  Durable nonterminal rows remain
         # capacity-owning until Task 9 commits exact terminal proof.
         # Sort most-at-risk first so cancels prioritise the stale-est offers.
@@ -5041,6 +5794,7 @@ class OfferManager:
                 coin_ids_enabled=cfg.COIN_IDS_ENABLED,
                 price_cap=price_cap,
                 price_floor=price_floor,
+                market_confidence=market_confidence,
             )
             if dexie_manager and fresh:
                 for offer in fresh:
@@ -5063,25 +5817,6 @@ class OfferManager:
                 "target_count": 0,
                 "original_target_count": 0,
                 "tier_filter_drained": False,
-            }
-
-        pending_lineage_pause = self._resume_pending_refresh_lineage_completions(side)
-        if pending_lineage_pause is not None:
-            log_event(
-                "info",
-                "requote_pending_lineage_paused",
-                f"Requote {side}: {pending_lineage_pause}; holding new children",
-            )
-            return {
-                "offers": [],
-                "fully_replaced": False,
-                "replaced_count": 0,
-                "target_count": target_count,
-                "original_target_count": original_target_count,
-                "pending_cancel_count": 0,
-                "failed_cancel_count": 0,
-                "tier_filter_drained": False,
-                "refresh_paused": True,
             }
 
         # Pending children normally consume the overlap coin that makes the
@@ -5219,6 +5954,7 @@ class OfferManager:
             price_cap=price_cap,
             price_floor=price_floor,
             refresh_parent_ids=refresh_parent_ids,
+            market_confidence=market_confidence,
         )
         if dexie_manager:
             for offer in new_offers:
@@ -7668,6 +8404,17 @@ class OfferManager:
                 }
             except Exception:
                 _excluded_ids = set()
+                _db_open = []
+            pending_lineage_pause = self._advance_pending_refresh_lineage(
+                list(_db_open), side
+            )
+            if pending_lineage_pause is not None:
+                log_event(
+                    "info",
+                    "trim_pending_lineage_paused",
+                    f"Trim {side}: {pending_lineage_pause}; preserving staged child",
+                )
+                continue
             open_offers = [
                 o
                 for o in open_offers_all
@@ -7784,10 +8531,27 @@ class OfferManager:
                 return None
             manifest = database.get_offer_cancel_cohort_manifest(cohort_ids.pop())
             manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+            prepared = database.get_offer_cancel_cohort_prepared_events(
+                manifest["cohort_id"]
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         manifest_ids = {member["operation_id"] for member in manifest["members"]}
-        if manifest["member_count"] < 2 or not set(blocker_ids).issubset(manifest_ids):
+        if (
+            manifest["member_count"] < 2
+            or not set(blocker_ids).issubset(manifest_ids)
+            or type(prepared) is not list
+            or len(prepared) != manifest["member_count"]
+        ):
+            return None
+        try:
+            protocols = {
+                json.loads(event["evidence_json"])["wallet_effect"]["batch"]["protocol"]
+                for event in prepared
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if protocols != {"sage_native_cancel_offers_zero_plus_fee_v1"}:
             return None
         return manifest
 
@@ -8002,6 +8766,21 @@ class OfferManager:
                     database_module=database,
                     observed_at=observed_at,
                 )
+                if cancel_context is None:
+                    try:
+                        blocker_evidence = json.loads(blockers[0]["evidence_json"])
+                        cohort_id = blocker_evidence.get("cohort_id")
+                        manifest = database.get_offer_cancel_cohort_manifest(cohort_id)
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        manifest = None
+                    if manifest is not None:
+                        cancel_context = offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
+                            manifest,
+                            blocker_ids,
+                            evidence,
+                            database_module=database,
+                            observed_at=observed_at,
+                        )
                 classification = offer_reconciliation.classify_terminal_evidence(
                     intent_row,
                     evidence,
@@ -8018,14 +8797,63 @@ class OfferManager:
                     terminal_classification != offer_reconciliation.CANCELLED_PROVEN
                     or cancel_context is not None
                 ):
-                    reconciled = offer_reconciliation.reconcile_offer(
-                        intent.intent_id,
-                        evidence=evidence,
-                        cancel_context=cancel_context,
-                        now=observed_at,
-                    )
+                    reconcile_rows = [intent_row]
                     if (
-                        reconciled.get("classification") == terminal_classification
+                        terminal_classification == offer_reconciliation.CANCELLED_PROVEN
+                        and type(cancel_context) is dict
+                        and len(cancel_context.get("members", [])) > 1
+                    ):
+                        reconcile_rows = []
+                        for member in cancel_context["members"]:
+                            member_intent = database.get_offer_intent(
+                                member["intent_id"]
+                            )
+                            if (
+                                type(member_intent) is not dict
+                                or member_intent.get("sage_trade_id")
+                                != member["trade_id"]
+                            ):
+                                raise ValueError(
+                                    "external cohort recovery intent binding changed"
+                                )
+                            if member_intent["intent_id"] != intent.intent_id:
+                                reconcile_rows.append(member_intent)
+                        # Commit the sole blocking member last so every aborted
+                        # peer is terminal before the durable latch can clear.
+                        reconcile_rows.append(intent_row)
+                    reconciled = None
+                    for reconcile_row in reconcile_rows:
+                        member_classification = (
+                            offer_reconciliation.classify_terminal_evidence(
+                                reconcile_row,
+                                evidence,
+                                cancel_context=cancel_context,
+                                now=observed_at,
+                            )
+                        )
+                        if (
+                            member_classification.get("classification")
+                            != terminal_classification
+                        ):
+                            raise ValueError(
+                                "external cohort recovery proof is incomplete"
+                            )
+                        reconciled = offer_reconciliation.reconcile_offer(
+                            reconcile_row["intent_id"],
+                            evidence=evidence,
+                            cancel_context=cancel_context,
+                            now=observed_at,
+                        )
+                        if (
+                            reconciled.get("classification") != terminal_classification
+                            or reconciled.get("applied") is not True
+                        ):
+                            raise ValueError(
+                                "external cohort recovery was not committed"
+                            )
+                    if (
+                        type(reconciled) is dict
+                        and reconciled.get("classification") == terminal_classification
                         and reconciled.get("applied") is True
                     ):
                         runtime = mutation_gate.current_runtime()
@@ -8164,12 +8992,14 @@ class OfferManager:
             )
         return False
 
-    def retry_failed_cancels(self) -> int:
-        """Retry exact durable failures; memory is only a health-reporting cache."""
-        # A batch deliberately aborts later members after one cancellation
-        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
-        # blocker before reading or retrying failed peers; otherwise the retry
-        # attempts a second wallet mutation behind a closed safety gate.
+    def reconcile_submitted_cancels_only(self) -> int:
+        """Settle submitted cancel blockers without initiating a wallet effect.
+
+        This proof-only path is safe to expose while the mutation gate is
+        latched.  It may read Sage evidence and commit an authoritative Task 9
+        terminal result, but it never retries or submits a cancellation.
+        """
+
         try:
             blockers = database.get_unresolved_offer_operation_blockers()
         except Exception as exc:
@@ -8210,6 +9040,16 @@ class OfferManager:
                         return -1
                 finally:
                     self._end_cancel_settlement(intent.operation_id)
+        return 0
+
+    def retry_failed_cancels(self) -> int:
+        """Retry exact durable failures; memory is only a health-reporting cache."""
+        # A batch deliberately aborts later members after one cancellation
+        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
+        # blocker before reading or retrying failed peers; otherwise the retry
+        # attempts a second wallet mutation behind a closed safety gate.
+        if self.reconcile_submitted_cancels_only() != 0:
+            return -1
 
         try:
             candidates = database.get_retryable_failed_offer_cancels()

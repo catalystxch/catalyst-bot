@@ -9,7 +9,7 @@ No existing tests. Covers:
 
 import unittest
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     import risk_manager as _rm_mod
@@ -212,6 +212,14 @@ class TestShouldEnableSide(unittest.TestCase):
             rm = _make_rm()
             rm._net_position_cat = Decimal("200")  # Way over limit
             self.assertTrue(rm.should_enable_side("buy", Decimal("1.00")))
+
+    def test_missing_price_engine_value_does_not_raise(self):
+        """RED/no-price startup must not make the health watcher error-loop."""
+
+        rm = _make_rm(price_engine=Mock(get_last_price=Mock(return_value=None)))
+
+        self.assertTrue(rm.should_enable_side("buy", Decimal("0")))
+        self.assertTrue(rm.should_enable_side("sell", Decimal("0")))
 
 
 @unittest.skipIf(_SKIP is not None, f"risk_manager unavailable: {_SKIP}")

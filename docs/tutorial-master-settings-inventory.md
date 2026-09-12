@@ -1,6 +1,8 @@
 # CATalyst Tutorial Master Settings Inventory
 
-Generated from the 2026-05-24 settings deep-dive UI audit.
+Generated from the 2026-05-24 settings deep-dive UI audit and updated for the
+post-TibetSwap v1.4 operator model. TibetSwap, legacy sniper probes, and Close
+the Gap are retired compatibility concepts, not live controls.
 
 Use this as the source checklist for tutorial videos and prompt generation. It combines:
 
@@ -44,8 +46,8 @@ Items not fully captured in the final screenshot folder:
 |---|---|---:|---|
 | Sidebar | Dashboard | Captured | Opens the main command center and bot status view. |
 | Sidebar | Offers | Captured | Opens active offers and fill history. |
-| Sidebar | P&L | Captured | Opens profit/loss, inventory position, spread, and sniper stats. |
-| Sidebar | Market Intel | Captured | Opens price history, orderbook, pool, Spacescan, DBX, and Splash intelligence. |
+| Sidebar | P&L | Captured | Opens confirmed profit/loss, inventory position, spread, and fill-evidence status. |
+| Sidebar | Market Intel | Captured | Opens price history, attributable orderbook, confidence, Spacescan, DBX, and Splash intelligence. |
 | Sidebar | Settings | Captured | Opens Live and Setup configuration views. |
 | Sidebar | Logs | Captured | Opens live diagnostics and debug tools. |
 | Sidebar | Data Reset | Captured | Opens reset actions for P&L, offer history, and runtime stats. |
@@ -101,7 +103,7 @@ Items not fully captured in the final screenshot folder:
 | Full chart link | Captured | Opens Market Intel. |
 | View full logs link | Captured | Opens Logs. |
 | Dexie Orderbook link | Captured | Opens current pair on Dexie. |
-| TibetSwap Pool link | Captured | Opens current pair pool. |
+| Offer-book confidence card | Captured | Shows attributable sources, evidence age, trusted range, withdrawal stage, and reason codes. |
 | Spacescan link | Captured | Opens token/address data. |
 | Refresh balances | Captured | Refreshes wallet balances. |
 
@@ -124,7 +126,6 @@ These hot-reload on the next bot loop and are safe to change while running.
 |---|---|---:|---|
 | Dynamic Spreads toggle | `DYNAMIC_SPREAD_ENABLED` | Captured | Turns dynamic spread engine on/off. |
 | Inventory Mgmt toggle | `INVENTORY_ENABLED` | Captured | Turns inventory skew on/off. |
-| Sniper toggle | `SNIPER_ENABLED` | Captured | Turns sniper/probe behavior on/off. |
 | Competitor Aware toggle | `COMPETITOR_AWARE_ENABLED` | Captured | Turns Dexie competitor nudges on/off. |
 | Dynamic Base Spread slider | `BASE_SPREAD_BPS` | Captured | Changes dynamic spread starting point. |
 | Base Spread Apply | `BASE_SPREAD_BPS` | Captured | Saves live spread slider value. |
@@ -132,10 +133,7 @@ These hot-reload on the next bot loop and are safe to change while running.
 | Skew Sensitivity slider | `SKEW_INTENSITY` | Captured | Changes how strongly inventory affects spreads. |
 | Skew Apply | `SKEW_INTENSITY` | Captured | Saves live skew slider value. |
 | Skew Cancel Move | `SKEW_INTENSITY` | Captured | Reverts pending live skew slider move. |
-| Close the Gap | Boost manager state | Captured/Conditional | Opens manual probe strategy confirmation. |
-| Close the Gap starting aggression | Gap strategy | Conditional | Starts near floor/default, balanced, cautious, or very cautious. |
-| Close the Gap sniper probe size | Gap strategy / `SNIPER_SIZE_XCH` | Conditional | Sets each manual probe size. |
-| Close the Gap Start | Gap strategy | Conditional | Starts manual tightening probe ladder. |
+| Book opportunities | Derived market-confidence state | Captured/Conditional | Reports conservative bounded opportunities; no manual legacy activation remains. |
 
 ### Settings - Setup
 
@@ -196,8 +194,7 @@ Setup settings are persisted. When the bot is running, most apply on restart rat
 | Enable Sell Side | `ENABLE_SELL` | Captured | Allows sell offer creation. Also derived from liquidity mode. |
 | Dynamic Band | `DYNAMIC_LIMIT_PCT` | Captured | Price band around reference price for quote sanity. |
 | Step-Change Guard | `MAX_STEP_CHANGE_FRACTION` | Captured | Prevents large mid-price jumps from immediately moving quotes too far. |
-| Tibet Shock Cancel | `TIBET_SHOCK_CANCEL_TRIGGER_PCT` | Captured | Cancels defensively when TibetSwap moves sharply. |
-| Arb Alert Threshold | `ARB_ALERT_THRESHOLD_BPS` | Captured | Gap threshold for arb warnings/sniper logic. |
+| Offer-book confidence thresholds | Derived from risk preset | Captured | Read-only depth, persistence, churn, manipulation, and profitability limits. |
 | Min Price | `MIN_MID` | Captured | Optional hard lower price bound. |
 | Max Price | `MAX_MID` | Captured | Optional hard upper price bound. |
 
@@ -261,11 +258,6 @@ Setup settings are persisted. When the bot is running, most apply on restart rat
 
 | Control | Config key | Coverage | What it does |
 |---|---|---:|---|
-| Sniper | `SNIPER_ENABLED` | Captured | Enables small discovery/probe offers. |
-| Sniper Size | `SNIPER_SIZE_XCH` | Captured | XCH size of each sniper probe. |
-| Sniper Prep Count | `SNIPER_PREP_COUNT` | Captured | Dedicated sniper coins to prepare. |
-| Re-arm Price Move | `SNIPER_REARM_PRICE_MOVE_BPS` | Captured | Price move required before sniper re-arms. |
-| Re-arm Arb Gap Move | `SNIPER_REARM_GAP_MOVE_BPS` | Captured | Arb gap move required before sniper re-arms. |
 | Transaction Fees | `TRANSACTION_FEE_XCH` enabled/nonzero | Captured | Adds fee to on-chain wallet transactions. Offer creation remains fee-free. |
 | Fee Amount | `TRANSACTION_FEE_XCH` | Captured | Fee per on-chain transaction. |
 | Fee Coin Size | `FEE_COIN_SIZE_XCH` | Captured | Prepared fee coin size. |
@@ -313,7 +305,7 @@ P&L metrics to explain:
 - Fees spent, total volume, average fill prices.
 - Round trips and win rate.
 - Position drift chart and current inventory position.
-- Current spreads and sniper stats.
+- Current spreads and confirmed-versus-pending fill evidence.
 
 ### Market Intel Tab
 
@@ -330,10 +322,10 @@ P&L metrics to explain:
 Market Intel metrics to explain:
 
 - Mid price chart.
-- Market diagnostics for Dexie, TibetSwap, Spacescan.
+- Market diagnostics for Dexie, Splash, Sage, Spacescan, and Coinset capabilities.
 - Spacescan token context: holders, market cap, supply, rank where available.
-- Dexie orderbook depth and arb gap.
-- TibetSwap pool ratio and estimated slippage.
+- Dexie/Splash attributable orderbook depth and trusted price range.
+- Confidence state, evidence age, manipulation signals, and withdrawal/recovery stage.
 - Dexie liquidity rewards eligibility.
 - Splash local submit, failures, skipped, API status, incoming listener, received/relevant counts, peers, queue.
 
@@ -360,7 +352,7 @@ Market Intel metrics to explain:
 | Control | Coverage | What it does |
 |---|---:|---|
 | Help modal | Captured/Partial | User education center. |
-| Help tabs: Overview, Getting Started, Dashboard, Offers & Fills, Spreads & Pricing, Inventory & PnL, Coin Management, Market Intel, Sniper, Close the Gap, Sage Wallet, Config Guide, Troubleshooting | Conditional | Need individual screenshots/video sections. |
+| Help tabs: Overview, Getting Started, Dashboard, Offers & Fills, Spreads & Pricing, Inventory & PnL, Coin Management, Market Intel, Book Opportunities, Confidence Recovery, Sage Wallet, Config Guide, Troubleshooting | Conditional | Need individual screenshots/video sections. |
 | About close | Captured | Closes about modal. |
 | About links: Report a bug, Send feedback, Latest release | Captured | Opens external support/release links. |
 
@@ -374,7 +366,6 @@ Market Intel metrics to explain:
 | Deposit Advisor | Conditional | Allocates newly detected deposits to trading pool, reserve, or split. |
 | Cancel All confirmation | Conditional | Confirms cancelling every active offer. |
 | Cancel All progress | Conditional | Shows cancel batch progress and failures. |
-| Close the Gap confirmation | Conditional | Explains and starts manual probe ladder. |
 | Shutdown confirmation | Conditional | Stops app, optionally cancels offers first. |
 | Shutdown progress | Conditional | Shows shutdown/cancel progress. |
 | Wallet picker | Conditional | Switches active Sage fingerprint. |
@@ -393,23 +384,23 @@ These are the backend systems that tutorial videos should explain even when they
 | Desktop/app shell | `desktop_app.py`, `api_server.py`, `app_bridge.py` | Starts Flask, desktop window, tray/app lifecycle, local API bridge. |
 | Config persistence | `config.py`, `.env`, API settings routes | Loads typed settings, validates updates, persists allowed keys only. |
 | Wallet integration | `wallet.py`, `wallet_sage.py` | Talks to Sage RPC, manages fingerprints, balances, coins, offers, change address, cert path. |
-| CAT discovery | `cat_resolver.py`, API startup discovery | Resolves CAT metadata, wallet IDs, Tibet pair IDs, token names, ticker IDs. |
-| Price engine | `price_engine.py`, `amm_monitor.py` | Pulls TibetSwap, Dexie, Spacescan/market context, mid price, arb gap, volatility, drift. |
+| CAT discovery | `cat_resolver.py`, API startup discovery | Resolves CAT metadata, wallet IDs, Dexie pair/ticker IDs, and token names. |
+| Price engine | `price_engine.py`, `market_confidence.py` | Derives a trusted range and midpoint from attributable offer-book evidence and provider health. |
 | Trading loop | `bot_loop.py` | Runs each cycle: refresh state, price, risk checks, create/cancel/requote/top-up/fill tracking. |
-| Dynamic spread engine | `risk_manager.py`, `bot_loop.py` | Adjusts spreads using volatility, fill rate, pool depth, arb gap, inventory, competitors, and toxicity. |
+| Dynamic spread engine | `risk_manager.py`, `bot_loop.py` | Adjusts spreads using volatility, verified fill rate, trusted depth, inventory, competitors, and toxicity. |
 | Toxicity/adverse selection guard | `risk_manager.py`, `bot_loop.py` | Scores one-sided/large public offers, fills, and order-flow signals; widens, pauses, or cancels if needed. |
 | Inventory management | `risk_manager.py`, `bot_loop.py` | Tracks CAT/XCH position and skews buy/sell spreads to return toward neutral. |
 | Offer lifecycle | `offer_manager.py`, `fill_tracker.py`, `database.py` | Creates offers, tracks Dexie/Splash posting, detects fills, handles cancels, stores history. |
 | Dexie posting | `offer_manager.py`, API helpers | Publishes offers to Dexie and records posting state/link. |
 | Splash P2P | `splash_*`, `bot_loop.py`, API Splash routes | Starts/checks Splash, broadcasts offers, receives inbound P2P offers, tracks relevant/received counts. |
-| Coin classification | `coin_manager.py`, `coin_classifier.py` | Sorts coins into tier, spare, sniper, fee, dust, reserve, and top-up groups. |
-| Coin prep worker | `coin_prep_worker.py` | Splits/composes coins for offer tiers, sniper probes, and fees. |
+| Coin classification | `coin_manager.py`, `coin_classifier.py` | Sorts coins into tier, spare, reusable legacy, fee, dust, reserve, and top-up groups. |
+| Coin prep worker | `coin_prep_worker.py` | Splits/composes coins for offer tiers, reusable compatibility inventory, and fees. |
 | Runtime coin health | `bot_health.py`, `bot_loop.py` | Watches coin shortages and top-up budgets, repairs depleted tiers while running. |
 | Deposit advisor | `bot_health.py`, API config update | Detects new large coins and asks whether to allocate them to trading pool or reserve. |
-| Sniper probes | `bot_loop.py`, `boost_manager.py` | Places tiny edge-discovery offers and re-arms only after meaningful market movement. |
-| Close the Gap | `boost_manager.py`, Live Controls | Manual strategy to tighten probes toward the safest arb floor. |
+| Book opportunities | `bot_loop.py`, `offer_manager.py` | Allows bounded opportunity orders only inside a fresh trusted book and configured risk limits. |
+| Legacy Boost/Close the Gap | `boost_manager.py`, compatibility routes | Retired; returns an explicit shutdown/replacement response and cannot create offers. |
 | Requote system | `bot_loop.py`, `offer_manager.py` | Cancels/recreates stale offers by drift, cooldown, and batch size. |
-| Pre-confirmation/mempool guards | `bot_loop.py`, wallet/offer lifecycle | Reacts quickly when watched spends/offers indicate fills or pool movement. |
+| Pre-confirmation/chain guards | `bot_loop.py`, wallet/offer lifecycle | Reacts quickly when watched spends or offer state indicate fills or cancellation. |
 | Circuit breakers | `risk_manager.py`, `bot_loop.py` | Protects against price shocks, stale wallets, bad mappings, excessive drift, and unsafe state. |
 | P&L accounting | `database.py`, `fill_tracker.py`, API P&L endpoints | Tracks fills, realized/unrealized P&L, round trips, volume, fees, inventory drift. |
 | Logs and debug bundle | `super_log.py`, API diagnostics routes | Streams logs, creates debug bundles, API stats, doctor checks. |

@@ -71,6 +71,14 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "success": True,
             "transactions": [],
         }
+        fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
+        fake_wallet.validate_unsigned_transaction_effect = lambda *args, **kwargs: {
+            "_catalyst_validated_unsigned": True,
+            "constructed_outputs": [],
+        }
+        fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
+            "success": True
+        }
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
         fake_wallet.wallet_mutation_succeeded = lambda result: (

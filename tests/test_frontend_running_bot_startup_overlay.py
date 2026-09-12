@@ -41,3 +41,14 @@ def test_restored_live_book_can_resume_without_repeating_coin_prep_review():
     assert "hasResumedLiveBook()" in checklist
     assert "Existing live offers are already using prepared coins" in checklist
     assert "coinPrepStatus === 'none' && !hasResumedLiveBook()" in start_bot
+
+
+def test_startup_initializers_do_not_depend_on_external_stylesheets():
+    """Offline font CDNs must not hold DOMContentLoaded and the safety overlay."""
+    gui = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    head = gui.split("</head>", 1)[0]
+
+    assert "fonts.googleapis.com" not in head
+    assert "fonts.gstatic.com" not in head
+    assert '<script defer src="/assets/walletconnect-signing.js"></script>' in head

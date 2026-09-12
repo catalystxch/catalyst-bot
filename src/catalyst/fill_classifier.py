@@ -20,8 +20,14 @@ classifier bug or missing upstream data.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Dict, List, Optional, Set
+
+from providers.models import canonical_evidence_json, evidence_digest
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +41,273 @@ class FillType:
     ARB_SWEEP_SELL = "arb_sweep_sell"
     DEXIE_COMBINED = "dexie_combined"
     UNKNOWN = "unknown"
+
+
+class FillConfidence(str, Enum):
+    """Evidence maturity for economic accounting and replacement authority."""
+
+    OBSERVED = "Observed"
+    PROBABLE = "Probable"
+    CONFIRMED = "Confirmed"
+
+
+@dataclass(frozen=True, slots=True)
+class FillAuthorityDecision:
+    confidence: FillConfidence
+    outcome: str
+    authority_source: str
+    reason_codes: tuple[str, ...]
+    market_confidence_impact: str | None = None
+
+    @property
+    def can_account(self) -> bool:
+        return self.confidence is FillConfidence.CONFIRMED and self.outcome == "FILL"
+
+    @property
+    def can_replace(self) -> bool:
+        return self.can_account
+
+
+def assess_fill_confidence(evidence: Dict) -> FillAuthorityDecision:
+    """Classify untrusted fill hints without authorizing premature accounting.
+
+    Sage remains authoritative.  When Sage is delayed, exact Coinset and
+    Spacescan transaction/height agreement is sufficient corroborated chain
+    proof.  Marketplace statuses alone can reach only ``Probable``.
+    """
+
+    if type(evidence) is not dict:
+        raise TypeError("fill evidence must be a dict")
+    sage_status = str(evidence.get("sage_status") or "").strip().lower()
+    dexie_status = str(evidence.get("dexie_status") or "").strip().lower()
+    splash_status = str(evidence.get("splash_status") or "").strip().lower()
+    spacescan_status = str(evidence.get("spacescan_status") or "").strip().lower()
+    provider_statuses = (dexie_status, splash_status, spacescan_status)
+    provider_hint_count = sum(
+        status in {"spent", "taken", "filled", "completed"}
+        for status in provider_statuses
+    )
+    provider_hint = provider_hint_count > 0
+    chain_state = _external_chain_evidence_state(evidence)
+
+    if evidence.get("reorg") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "CONFLICT",
+            "CHAIN",
+            ("chain_reorg_observed",),
+            "AMBER",
+        )
+    if evidence.get("self_spend") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "SAGE",
+            ("self_spend_rejected",),
+        )
+    if evidence.get("external_cancel") is True:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "CHAIN",
+            ("external_cancellation_proven",),
+        )
+    if sage_status in {"cancelled", "canceled", "expired"}:
+        if chain_state == "confirmed":
+            return FillAuthorityDecision(
+                FillConfidence.OBSERVED,
+                "CONFLICT",
+                "SAGE_AND_CORROBORATED_CHAIN",
+                ("sage_chain_evidence_conflict",),
+                "AMBER",
+            )
+        reasons = ["sage_terminal_non_fill"]
+        if provider_hint:
+            reasons.append("sage_cancel_overrides_provider_hint")
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "NOT_FILL",
+            "SAGE",
+            tuple(reasons),
+            "AMBER" if provider_hint else None,
+        )
+
+    sage_height = evidence.get("sage_confirmed_height")
+    if sage_status in {"confirmed", "completed", "filled"} and (
+        type(sage_height) is int and sage_height > 0
+    ):
+        return FillAuthorityDecision(
+            FillConfidence.CONFIRMED,
+            "FILL",
+            "SAGE",
+            ("sage_confirmed_fill",),
+        )
+
+    if chain_state == "confirmed":
+        reasons = ["exact_chain_evidence_agreement"]
+        if sage_status in {"", "pending", "delayed", "unknown"}:
+            reasons.append("sage_delayed_chain_confirmation")
+        return FillAuthorityDecision(
+            FillConfidence.CONFIRMED,
+            "FILL",
+            "CORROBORATED_CHAIN",
+            tuple(reasons),
+        )
+    if chain_state == "conflict":
+        return FillAuthorityDecision(
+            FillConfidence.PROBABLE,
+            "LIKELY_FILL",
+            "CONFLICTED_CHAIN",
+            ("chain_evidence_conflict",),
+            "AMBER",
+        )
+
+    if provider_hint_count >= 2:
+        return FillAuthorityDecision(
+            FillConfidence.PROBABLE,
+            "LIKELY_FILL",
+            "CORROBORATED_MARKETPLACE_HINTS",
+            ("multiple_third_party_fill_hints",),
+        )
+    if provider_hint:
+        return FillAuthorityDecision(
+            FillConfidence.OBSERVED,
+            "POSSIBLE_FILL",
+            "MARKETPLACE_HINT",
+            ("third_party_fill_hint",),
+        )
+    return FillAuthorityDecision(
+        FillConfidence.OBSERVED,
+        "POSSIBLE_FILL",
+        "LOCAL_OBSERVATION",
+        ("offer_disappearance_observed",),
+    )
+
+
+def _exact_hex_id(value) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        return None
+    return normalized
+
+
+def _exact_chain_inputs(value) -> tuple[tuple[str, str, int], ...] | None:
+    if type(value) is not list or not value or len(value) > 64:
+        return None
+    normalized = []
+    for row in value:
+        if type(row) is not dict or set(row) != {
+            "coin_id",
+            "asset_id",
+            "amount_mojos",
+        }:
+            return None
+        coin_id = _exact_hex_id(row.get("coin_id"))
+        asset_id = str(row.get("asset_id") or "").strip().lower()
+        amount = row.get("amount_mojos")
+        if (
+            coin_id is None
+            or (asset_id != "xch" and _exact_hex_id(asset_id) is None)
+            or type(amount) is not int
+            or isinstance(amount, bool)
+            or amount <= 0
+        ):
+            return None
+        normalized.append((coin_id, asset_id, amount))
+    if len({coin_id for coin_id, _asset_id, _amount in normalized}) != len(normalized):
+        return None
+    return tuple(sorted(normalized))
+
+
+def _exact_external_chain_evidence(value) -> tuple | None:
+    if type(value) is not dict or set(value) != {
+        "transaction_id",
+        "spend_identity",
+        "block_height",
+        "inputs",
+    }:
+        return None
+    transaction_id = _exact_hex_id(value.get("transaction_id"))
+    spend_identity = _exact_hex_id(value.get("spend_identity"))
+    height = value.get("block_height")
+    inputs = _exact_chain_inputs(value.get("inputs"))
+    if (
+        transaction_id is None
+        or spend_identity is None
+        or type(height) is not int
+        or isinstance(height, bool)
+        or height <= 0
+        or inputs is None
+    ):
+        return None
+    return transaction_id, spend_identity, height, inputs
+
+
+def _external_chain_evidence_state(evidence: Dict) -> str:
+    """Return confirmed/conflict/incomplete for optional dual chain proof."""
+
+    coinset_raw = evidence.get("coinset_evidence")
+    spacescan_raw = evidence.get("spacescan_evidence")
+    expected_raw = evidence.get("expected_inputs")
+    if coinset_raw is None and spacescan_raw is None:
+        return "incomplete"
+    coinset = _exact_external_chain_evidence(coinset_raw)
+    spacescan = _exact_external_chain_evidence(spacescan_raw)
+    expected = _exact_chain_inputs(expected_raw)
+    if coinset is None or spacescan is None or expected is None:
+        return "incomplete"
+    if coinset != spacescan or coinset[3] != expected:
+        return "conflict"
+    return "confirmed"
+
+
+def build_fill_confidence_record(
+    *,
+    trade_id: str,
+    asset_id: str,
+    decision: FillAuthorityDecision,
+    evidence: Dict,
+    observed_at: datetime,
+) -> Dict:
+    """Build one immutable, redacted assessment for durable UI/audit state."""
+
+    safe_trade_id = _exact_hex_id(trade_id)
+    safe_asset_id = _exact_hex_id(asset_id)
+    if safe_trade_id is None or safe_asset_id is None:
+        raise ValueError("trade_id and asset_id must be exact lowercase hex identities")
+    if type(decision) is not FillAuthorityDecision:
+        raise TypeError("decision must be a FillAuthorityDecision")
+    if type(observed_at) is not datetime or observed_at.tzinfo is None:
+        raise TypeError("observed_at must be timezone-aware")
+    if type(evidence) is not dict:
+        raise TypeError("evidence must be a dict")
+    evidence_json = canonical_evidence_json(evidence)
+    observed_text = observed_at.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    record = {
+        "trade_id": safe_trade_id,
+        "asset_id": safe_asset_id,
+        "confidence": decision.confidence.name,
+        "outcome": decision.outcome,
+        "authority_source": decision.authority_source,
+        "reason_codes": list(decision.reason_codes),
+        "market_confidence_impact": decision.market_confidence_impact,
+        "can_account": decision.can_account,
+        "can_replace": decision.can_replace,
+        "evidence_json": evidence_json,
+        "evidence_sha256": evidence_digest(evidence_json),
+        "observed_at": observed_text,
+    }
+    identity_json = json.dumps(
+        record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    record["assessment_id"] = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    return record
 
 
 @dataclass

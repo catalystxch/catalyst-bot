@@ -10,6 +10,7 @@
 user_secrets.json
 secrets.json
 .venv/
+node_modules/
 
 # --- SSL / TLS certs and keys (Sage wallet mTLS) ---
 sage_client_ssl/

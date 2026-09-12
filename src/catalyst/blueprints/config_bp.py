@@ -1073,8 +1073,9 @@ def api_settings_validate():
 
     if dynamic_enabled is False and (inventory_enabled or competitor_enabled):
         warnings.append(
-            "Dynamic spreads off only disables volatility, fill-rate, arb-gap, and pool-depth scaling; "
-            "inventory skew and competitor nudges still apply if those features stay enabled"
+            "Dynamic spreads off disables volatility and fill-rate scaling; "
+            "inventory skew and competitor nudges still apply if those features "
+            "stay enabled, and offer-book confidence safeguards remain active"
         )
 
     return jsonify(

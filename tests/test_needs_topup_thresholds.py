@@ -262,6 +262,18 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         mgr._last_drip_time = time.time()  # block drip path too
         self.assertFalse(mgr.needs_topup(), "cooldown should block topup")
 
+    def test_submitted_action_blocks_both_topup_paths_until_confirmation_window(self):
+        """A pending topup spend must not be followed by another path next cycle."""
+        mgr = self._manager(cat_overrides={"inner": 0})
+        mgr._last_topup_time = 0  # emergency clock would otherwise be ready
+        mgr._last_drip_time = 0  # drip clock would otherwise be ready
+        mgr._last_topup_action_time = time.time()
+
+        self.assertFalse(
+            mgr.needs_topup(),
+            "a submitted wallet mutation needs the advertised confirmation window",
+        )
+
     def test_drip_ready_does_not_bypass_emergency_cooldown(self):
         """A ready drip timer must not re-run emergency topup while it cools down."""
         mgr = self._manager(xch_overrides={"inner": 3})
@@ -293,8 +305,8 @@ class NeedsTopupThresholdTests(unittest.TestCase):
         self.assertTrue(mgr.needs_topup())
         self.assertTrue(mgr._topup_is_drip)
 
-    def test_sniper_drip_waits_when_cat_pool_has_no_source(self):
-        """Do not start noisy drip topups for optional CAT sniper gaps with no pool."""
+    def test_retired_sniper_pool_never_triggers_drip_topup(self):
+        """Upgraded configs cannot reactivate the retired TibetSwap sniper pool."""
         self._ns.SNIPER_ENABLED = True
         self._ns.SNIPER_PREP_COUNT = 25
         self._ns.SNIPER_SIZE_XCH = "0.001"
@@ -320,7 +332,7 @@ class NeedsTopupThresholdTests(unittest.TestCase):
             self.assertFalse(mgr.needs_topup())
 
         event_types = [call.args[1] for call in log_event.call_args_list]
-        self.assertIn("drip_source_unavailable", event_types)
+        self.assertNotIn("drip_source_unavailable", event_types)
         self.assertNotIn("drip_trigger", event_types)
 
     def test_drip_source_unavailable_notice_is_hourly(self):
@@ -590,6 +602,263 @@ class TestReversed(NeedsTopupThresholdTests):
             mgr._topup_worker(active_buy=12, active_sell=12)
 
         self.assertEqual(calls[:1], ["XCH-extreme"])
+
+    def test_pending_xch_split_stops_tier_scheduler_before_cat_mutation(self):
+        """An unresolved XCH spend must block every later wallet action."""
+        mgr = self._manager()
+        empty_tiers = {
+            "reserve": [{}],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+            "small": [],
+        }
+        xch_inv = {key: list(value) for key, value in empty_tiers.items()}
+        cat_inv = {key: list(value) for key, value in empty_tiers.items()}
+        active_counts = {"inner": 2, "mid": 3, "outer": 5, "extreme": 10}
+        prepared_counts = {"inner": 4, "mid": 6, "outer": 10, "extreme": 20}
+        calls = []
+
+        def pending_smart_topup(name, *_args, **_kwargs):
+            calls.append(name)
+            return self.cm._TOPUP_PENDING
+
+        with (
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(
+                mgr, "_classify_coins_by_designation", side_effect=[xch_inv, cat_inv]
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 3_500_000_000_000,
+                    "mid": 1_750_000_000_000,
+                    "outer": 875_000_000_000,
+                    "extreme": 350_000_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("3.5"),
+                    "mid": Decimal("1.75"),
+                    "outer": Decimal("0.875"),
+                    "extreme": Decimal("0.35"),
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(mgr, "_smart_topup_wallet", side_effect=pending_smart_topup),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(
+                self.cm,
+                "_get_free_coins_rpc",
+                return_value={"confirmed_records": [{}]},
+            ),
+            patch.object(self.cm, "get_tier_distribution", return_value=active_counts),
+            patch.object(
+                self.cm, "get_weighted_tier_prep_counts", return_value=prepared_counts
+            ),
+        ):
+            mgr._topup_worker(active_buy=12, active_sell=12)
+
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith("XCH-"), calls)
+
+    def test_topup_worker_prioritizes_missing_cat_extreme_over_inner_spares(self):
+        """A real missing sell slot outranks another tier's spare-buffer gap."""
+
+        mgr = self._manager()
+        xch_inv = {
+            "reserve": [{}],
+            "inner": [{}] * 30,
+            "mid": [{}] * 30,
+            "outer": [{}] * 30,
+            "extreme": [{}] * 30,
+            "small": [],
+        }
+        cat_inv = {
+            "reserve": [{}],
+            "inner": [{}] * 5,
+            "mid": [{}],
+            "outer": [],
+            "extreme": [],
+            "small": [],
+        }
+        xch_slots = {"inner": 5, "mid": 9, "outer": 11, "extreme": 11}
+        cat_slots = {"inner": 11, "mid": 11, "outer": 9, "extreme": 5}
+        xch_prepared = {"inner": 8, "mid": 15, "outer": 16, "extreme": 18}
+        cat_prepared = {"inner": 18, "mid": 17, "outer": 14, "extreme": 8}
+        calls = []
+        events = []
+
+        with (
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(
+                mgr, "_classify_coins_by_designation", side_effect=[xch_inv, cat_inv]
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 53_002_390,
+                    "mid": 42_051_809,
+                    "outer": 31_841_410,
+                    "extreme": 14_632_872,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("3.9518"),
+                    "mid": Decimal("3.2932"),
+                    "outer": Decimal("2.4699"),
+                    "extreme": Decimal("1.3173"),
+                },
+            ),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 1},
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(
+                mgr,
+                "_smart_topup_wallet",
+                side_effect=lambda name, *_a, **_k: calls.append(name) or True,
+            ),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(
+                self.cm,
+                "log_event",
+                side_effect=lambda *args, **kwargs: events.append((args, kwargs)),
+            ),
+            patch.object(
+                self.cm,
+                "_get_free_coins_rpc",
+                return_value={"confirmed_records": [{}]},
+            ),
+            patch.object(
+                self.cm,
+                "get_tier_distribution",
+                side_effect=[xch_slots, cat_slots, xch_slots, cat_slots],
+            ),
+            patch.object(
+                self.cm,
+                "get_weighted_tier_prep_counts",
+                side_effect=[
+                    xch_prepared,
+                    cat_prepared,
+                    xch_prepared,
+                    cat_prepared,
+                ],
+            ),
+        ):
+            mgr._topup_worker(active_buy=36, active_sell=35)
+
+        self.assertEqual(calls[:1], ["CAT-extreme"], events)
+
+    def test_topup_worker_does_not_reshape_other_tiers_when_missing_offer_has_coin(
+        self,
+    ):
+        """A book gap with a usable coin must not spend on unrelated spare buffers."""
+
+        mgr = self._manager()
+        xch_inv = {
+            "reserve": [{}],
+            "inner": [{}] * 30,
+            "mid": [{}] * 30,
+            "outer": [{}] * 30,
+            "extreme": [{}] * 30,
+            "small": [],
+        }
+        cat_inv = {
+            "reserve": [{}],
+            "inner": [{}] * 5,
+            "mid": [{}] * 3,
+            "outer": [],
+            "extreme": [{}] * 8,
+            "small": [],
+        }
+        xch_slots = {"inner": 5, "mid": 9, "outer": 11, "extreme": 11}
+        cat_slots = {"inner": 11, "mid": 11, "outer": 9, "extreme": 5}
+        xch_prepared = {"inner": 8, "mid": 15, "outer": 16, "extreme": 18}
+        cat_prepared = {"inner": 18, "mid": 17, "outer": 14, "extreme": 8}
+        calls = []
+
+        with (
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(
+                mgr, "_classify_coins_by_designation", side_effect=[xch_inv, cat_inv]
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 53_002_390,
+                    "mid": 44_169_105,
+                    "outer": 35_421_963,
+                    "extreme": 18_667_492,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("3.9518"),
+                    "mid": Decimal("3.2932"),
+                    "outer": Decimal("2.4699"),
+                    "extreme": Decimal("1.3173"),
+                },
+            ),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 1},
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(
+                mgr,
+                "_smart_topup_wallet",
+                side_effect=lambda name, *_a, **_k: calls.append(name) or True,
+            ),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(
+                self.cm,
+                "_get_free_coins_rpc",
+                return_value={"confirmed_records": [{}]},
+            ),
+            patch.object(
+                self.cm,
+                "get_tier_distribution",
+                side_effect=[xch_slots, cat_slots, xch_slots, cat_slots],
+            ),
+            patch.object(
+                self.cm,
+                "get_weighted_tier_prep_counts",
+                side_effect=[
+                    xch_prepared,
+                    cat_prepared,
+                    xch_prepared,
+                    cat_prepared,
+                ],
+            ),
+        ):
+            mgr._topup_worker(active_buy=36, active_sell=35)
+
+        self.assertEqual(calls, [])
 
     def test_drip_worker_refills_partial_spare_buffer_gap(self):
         """A drip topup should split even when only one spare is missing."""
@@ -986,6 +1255,95 @@ class TestReversed(NeedsTopupThresholdTests):
             mgr._topup_worker(active_buy=3, active_sell=12)
 
         self.assertNotIn("XCH-extreme", calls)
+
+    def test_topup_worker_refills_when_only_matching_coin_lacks_policy_purpose(self):
+        """Legacy tier labels must not satisfy a missing offer rebuild.
+
+        The offer selector rejects coins whose durable DB row has no policy
+        purpose.  The top-up worker must use the same eligibility rule or it
+        will incorrectly wait forever with an incomplete live ladder.
+        """
+        mgr = self._manager()
+        policy_coin = {"_catalyst_policy_purpose": "replacement"}
+        legacy_coin = {"_catalyst_policy_purpose": None}
+        xch_inv = {
+            "reserve": [{}],
+            "inner": [policy_coin] * 4,
+            "mid": [policy_coin] * 4,
+            "outer": [policy_coin] * 4,
+            "extreme": [policy_coin] * 4,
+            "small": [],
+        }
+        cat_inv = {
+            "reserve": [{}],
+            "inner": [policy_coin] * 4,
+            "mid": [policy_coin] * 4,
+            "outer": [policy_coin] * 4,
+            "extreme": [legacy_coin],
+            "small": [],
+        }
+        active_counts = {"inner": 1, "mid": 1, "outer": 1, "extreme": 1}
+        prepared_counts = dict(active_counts)
+        calls = []
+
+        def fake_smart_topup(name, *_args, **_kwargs):
+            calls.append(name)
+            return True
+
+        with (
+            patch.object(mgr, "_absorb_misfits_to_reserve", return_value=False),
+            patch.object(
+                mgr, "_classify_coins_by_designation", side_effect=[xch_inv, cat_inv]
+            ),
+            patch.object(
+                mgr,
+                "_get_tier_sizes_mojos",
+                return_value={
+                    "inner": 4_000_000,
+                    "mid": 3_000_000,
+                    "outer": 2_000_000,
+                    "extreme": 1_000_000,
+                },
+            ),
+            patch.object(
+                mgr,
+                "_configured_tier_sizes_xch",
+                return_value={
+                    "inner": Decimal("4"),
+                    "mid": Decimal("3"),
+                    "outer": Decimal("2"),
+                    "extreme": Decimal("1"),
+                },
+            ),
+            patch.object(
+                mgr,
+                "_topup_offer_deficits_by_tier",
+                return_value={
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 0, "mid": 0, "outer": 0, "extreme": 1},
+                },
+            ),
+            patch.object(mgr, "get_trading_pace", return_value="normal"),
+            patch.object(mgr, "_smart_topup_wallet", side_effect=fake_smart_topup),
+            patch.object(mgr, "_sniper_pool_enabled", return_value=False),
+            patch.object(mgr, "_fee_pool_enabled", return_value=False),
+            patch.object(mgr, "update_coin_counts"),
+            patch.object(mgr, "log_inventory"),
+            patch.object(
+                self.cm,
+                "_get_free_coins_rpc",
+                return_value={
+                    "confirmed_records": [{"coin": {"amount": 1, "name": "dummy"}}]
+                },
+            ),
+            patch.object(self.cm, "get_tier_distribution", return_value=active_counts),
+            patch.object(
+                self.cm, "get_weighted_tier_prep_counts", return_value=prepared_counts
+            ),
+        ):
+            mgr._topup_worker(active_buy=4, active_sell=3)
+
+        self.assertIn("CAT-extreme", calls)
 
     def test_topup_worker_labels_missing_offer_refill_separately_from_low_spares(self):
         """Missing-offer recovery should not be logged as a low-tier warning."""

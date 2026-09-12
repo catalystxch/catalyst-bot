@@ -226,6 +226,9 @@ _MUTATING_API_ENDPOINTS = {
     "api_update_relaunch_intent",
     "boost.api_boost_activate",
     "boost.api_boost_deactivate",
+    "bootstrap.api_bootstrap_renew",
+    "bootstrap.api_bootstrap_start",
+    "bootstrap.api_bootstrap_stop",
     "bot.api_bot_start",
     "cat.api_cat_refresh",
     "cat.api_cat_select",
@@ -243,7 +246,6 @@ _MUTATING_API_ENDPOINTS = {
     "market.api_dbx_claim",
     "market.api_debug_sage_single_offer_test",
     "market.api_dexie_repost",
-    "offers.api_cancel_all",
     "offers.api_cancel_offer",
     "offers.api_cleanup_orphans",
     "offers.api_pnl_reset",
@@ -269,6 +271,17 @@ _MUTATING_API_ENDPOINTS = {
 }
 
 _READ_ONLY_WRITE_API_ENDPOINTS = {
+    # WalletConnect signs only canonical Bootstrap messages. The browser
+    # namespace deliberately contains no offer, spend, send, or cancel method.
+    "api_bootstrap_manifest_sign_begin",
+    "api_bootstrap_manifest_sign_complete",
+    "api_bootstrap_manifest_sign_fail",
+    "api_bootstrap_participation_sign_begin",
+    "api_bootstrap_participation_sign_complete",
+    "bootstrap.api_bootstrap_manifest_export",
+    "bootstrap.api_bootstrap_manifest_import",
+    "bootstrap.api_bootstrap_participation_export",
+    "bootstrap.api_bootstrap_preview",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
     # remain available while a wallet effect is being reconciled and must not
@@ -290,6 +303,10 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     "bot.api_bot_stop",
     "bot.api_shutdown",
     "coin_prep.api_coin_prep_cancel",
+    # Cancel All performs proof-only reconciliation while an earlier cancel
+    # is unresolved.  The route acquires a normal mutation permit before it
+    # can start any fresh wallet effect.
+    "offers.api_cancel_all",
     "system.api_console_toggle",
     "watchdog.api_watchdog_shape_fix_abort",
 }
@@ -459,7 +476,27 @@ def _write_endpoint_requires_mutation(endpoint: str) -> bool:
 
 # Dedicated limiter/backlog guard for /api/splash/incoming so an unbounded
 # webhook flood cannot amplify into runaway DB writes.
-_SPLASH_RATE_LIMIT = {"window_s": 1.0, "hits": [], "lock": threading.Lock()}
+_SPLASH_RATE_LIMIT = {
+    "window_s": 1.0,
+    "hits": [],
+    "rejected_total": 0,
+    "lock": threading.Lock(),
+}
+_SPLASH_RECENT_DELIVERIES = {
+    # Only successfully persisted/acknowledged fingerprints enter this cache.
+    # That lets Splash retry transient failures while repeated network gossip is
+    # acknowledged without consuming the small DB-write allowance.
+    "fingerprints": {},
+    "duplicate_total": 0,
+    "lock": threading.Lock(),
+}
+_SPLASH_RECENT_DELIVERY_TTL_S = 300.0
+_SPLASH_RECENT_DELIVERY_MAX = 5000
+_SPLASH_INFLIGHT_DELIVERIES = {
+    "events": {},
+    "lock": threading.Lock(),
+}
+_SPLASH_INFLIGHT_WAIT_S = 5.0
 _SPLASH_BACKLOG_CACHE = {
     "checked_at": 0.0,
     "new_count": 0,
@@ -495,9 +532,100 @@ def _splash_incoming_rate_limited() -> bool:
         while hits and hits[0] < cutoff:
             hits.pop(0)
         if len(hits) >= _splash_incoming_max_per_sec():
+            _SPLASH_RATE_LIMIT["rejected_total"] = (
+                int(_SPLASH_RATE_LIMIT.get("rejected_total") or 0) + 1
+            )
             return True
         hits.append(now)
         return False
+
+
+def _splash_incoming_recent_duplicate(fingerprint: str) -> bool:
+    """Return True for a recently acknowledged Splash offer fingerprint."""
+
+    now = time.time()
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        fingerprints = _SPLASH_RECENT_DELIVERIES["fingerprints"]
+        seen_at = float(fingerprints.get(cache_key) or 0.0)
+        if seen_at and now - seen_at <= _SPLASH_RECENT_DELIVERY_TTL_S:
+            # Refresh insertion order so a frequently repeated offer remains
+            # cheap to acknowledge without growing the bounded cache.
+            fingerprints.pop(cache_key, None)
+            fingerprints[cache_key] = now
+            _SPLASH_RECENT_DELIVERIES["duplicate_total"] = (
+                int(_SPLASH_RECENT_DELIVERIES.get("duplicate_total") or 0) + 1
+            )
+            return True
+        if seen_at:
+            fingerprints.pop(cache_key, None)
+        return False
+
+
+def _splash_incoming_note_delivery(fingerprint: str) -> None:
+    """Remember a successfully acknowledged offer without retaining its body."""
+
+    now = time.time()
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        fingerprints = _SPLASH_RECENT_DELIVERIES["fingerprints"]
+        fingerprints.pop(cache_key, None)
+        fingerprints[cache_key] = now
+        while len(fingerprints) > _SPLASH_RECENT_DELIVERY_MAX:
+            oldest = next(iter(fingerprints))
+            fingerprints.pop(oldest, None)
+
+
+def _splash_incoming_claim_delivery(fingerprint: str) -> tuple[bool, threading.Event]:
+    """Elect one persistence owner for concurrent delivery of one offer."""
+
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_INFLIGHT_DELIVERIES["lock"]:
+        existing = _SPLASH_INFLIGHT_DELIVERIES["events"].get(cache_key)
+        if existing is not None:
+            return False, existing
+        event = threading.Event()
+        _SPLASH_INFLIGHT_DELIVERIES["events"][cache_key] = event
+        return True, event
+
+
+def _splash_incoming_finish_delivery(fingerprint: str, event: threading.Event) -> None:
+    """Release followers after the elected persistence attempt finishes."""
+
+    cache_key = f"{os.path.abspath(database.DB_PATH)}:{fingerprint}"
+    with _SPLASH_INFLIGHT_DELIVERIES["lock"]:
+        if _SPLASH_INFLIGHT_DELIVERIES["events"].get(cache_key) is event:
+            _SPLASH_INFLIGHT_DELIVERIES["events"].pop(cache_key, None)
+    event.set()
+
+
+def _splash_incoming_clear_recent_deliveries() -> None:
+    """Clear ephemeral acknowledgements when their backing DB rows are reset."""
+
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        _SPLASH_RECENT_DELIVERIES["fingerprints"].clear()
+    with _SPLASH_INFLIGHT_DELIVERIES["lock"]:
+        inflight = list(_SPLASH_INFLIGHT_DELIVERIES["events"].values())
+        _SPLASH_INFLIGHT_DELIVERIES["events"].clear()
+    for event in inflight:
+        event.set()
+
+
+def _splash_incoming_backpressure_stats() -> Dict[str, int]:
+    """Return bounded, non-sensitive counters for Splash webhook diagnostics."""
+
+    with _SPLASH_RATE_LIMIT["lock"]:
+        rate_limited_total = int(_SPLASH_RATE_LIMIT.get("rejected_total") or 0)
+    with _SPLASH_RECENT_DELIVERIES["lock"]:
+        duplicate_bypassed_total = int(
+            _SPLASH_RECENT_DELIVERIES.get("duplicate_total") or 0
+        )
+        recent_fingerprints = len(_SPLASH_RECENT_DELIVERIES["fingerprints"])
+    return {
+        "rate_limited_total": rate_limited_total,
+        "duplicate_bypassed_total": duplicate_bypassed_total,
+        "recent_fingerprints": recent_fingerprints,
+    }
 
 
 def _splash_incoming_backlog_full() -> bool:
@@ -3633,6 +3761,7 @@ def promote_wallet_setup_bootstrap() -> dict:
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
+        "TASK8_BINDING_CONFLICT",
     }
     if (
         authorization.get("allowed") is not True
@@ -3718,7 +3847,8 @@ def add_no_cache_headers(response):
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' data: https://icons.dexie.space https://*.spacescan.io https://cdn.spacescan.io https://assets.spacescan.io; "
-            "connect-src 'self'; "
+            "connect-src 'self' https://*.walletconnect.com "
+            "wss://*.walletconnect.com https://*.reown.com wss://*.reown.com; "
             "base-uri 'none'; "
             "object-src 'none'; "
             "form-action 'self'; "
@@ -4358,6 +4488,7 @@ def serve_brand_asset(filename: str):
         "monkeyzoo-logo-1.gif": "monkeyzoo-logo-1.gif",
         "spacescan-logo-192.webp": "spacescan-logo-192.webp",
         "sage_rpc_advanced.png": "sage_rpc_advanced.png",
+        "walletconnect-signing.js": "walletconnect-signing.js",
     }
     safe_name = allowed.get(filename)
     if safe_name is None:
@@ -4435,6 +4566,7 @@ def _reset_runtime_session_stats() -> Dict:
         from database import clear_splash_incoming
 
         reset_summary["splash_incoming_cleared"] = int(clear_splash_incoming() or 0)
+        _splash_incoming_clear_recent_deliveries()
     except Exception:
         reset_summary["splash_incoming_cleared"] = 0
 
@@ -4676,6 +4808,7 @@ def _reset_fresh_run_session(
             from database import clear_splash_incoming
 
             summary["splash_incoming_cleared"] = int(clear_splash_incoming() or 0)
+            _splash_incoming_clear_recent_deliveries()
         except Exception:
             summary["splash_incoming_cleared"] = 0
 
@@ -4887,6 +5020,186 @@ def api_crash_log():
             "mtime": st.st_mtime,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Market Bootstrap — non-financial Sage WalletConnect message signing
+# ---------------------------------------------------------------------------
+
+_walletconnect_signing_service = None
+_walletconnect_signing_project_id = None
+
+
+def _read_walletconnect_identity():
+    """Read the current Sage identity and receive address without mutation."""
+
+    from wallet import get_next_address, get_wallet_identity
+    from walletconnect_signing import SigningError, WalletIdentity
+
+    snapshot = get_wallet_identity()
+    if type(snapshot) is not dict or snapshot.get("success") is not True:
+        raise SigningError("wallet_identity_unavailable")
+    if str(snapshot.get("backend") or "").strip().lower() != "sage":
+        raise SigningError("sage_wallet_required")
+    if snapshot.get("has_secrets") is not True:
+        raise SigningError("sage_signing_key_required")
+    fingerprint = snapshot.get("fingerprint")
+    if type(fingerprint) is not int or fingerprint <= 0:
+        raise SigningError("invalid_wallet_fingerprint")
+    raw_network = str(snapshot.get("network_id") or "").strip().lower()
+    if raw_network == "mainnet":
+        network = "mainnet"
+    elif raw_network.startswith("testnet"):
+        network = "testnet"
+    else:
+        raise SigningError("invalid_wallet_network")
+    address_result = get_next_address(
+        int(getattr(cfg, "WALLET_ID_XCH", 1)), new_address=False
+    )
+    if type(address_result) is not dict or address_result.get("success") is not True:
+        raise SigningError("signing_address_unavailable")
+    return WalletIdentity(
+        wallet_type="sage",
+        fingerprint=fingerprint,
+        network=network,
+        signing_address=str(address_result.get("address") or "").strip(),
+    )
+
+
+def _get_walletconnect_signing_service():
+    """Return one process-local one-time request authority for the current ID."""
+
+    global _walletconnect_signing_project_id, _walletconnect_signing_service
+    from walletconnect_signing import WalletConnectSigningService
+
+    project_id = str(getattr(cfg, "WALLETCONNECT_PROJECT_ID", "") or "").strip()
+    if (
+        _walletconnect_signing_service is None
+        or _walletconnect_signing_project_id != project_id
+    ):
+        _walletconnect_signing_service = WalletConnectSigningService(
+            project_id=project_id,
+            identity_reader=_read_walletconnect_identity,
+        )
+        _walletconnect_signing_project_id = project_id
+    return _walletconnect_signing_service
+
+
+def _walletconnect_signing_error(exc):
+    code = str(getattr(exc, "code", "walletconnect_signing_failed") or "")
+    return jsonify({"success": False, "code": code, "error": code}), 400
+
+
+@app.route("/api/bootstrap/walletconnect/config", methods=["GET"])
+def api_bootstrap_walletconnect_config():
+    project_id = str(getattr(cfg, "WALLETCONNECT_PROJECT_ID", "") or "").strip()
+    return jsonify(
+        {
+            "success": True,
+            "enabled": bool(project_id),
+            "project_id": project_id,
+            "allowed_method": "chia_signMessageByAddress",
+            "financial_authority": False,
+        }
+    )
+
+
+@app.route("/api/bootstrap/manifest/sign/begin", methods=["POST"])
+def api_bootstrap_manifest_sign_begin():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"manifest"}:
+            raise SigningError("invalid_signing_begin_request")
+        identity = _read_walletconnect_identity()
+        signing_request = _get_walletconnect_signing_service().begin_manifest_signature(
+            body["manifest"], identity
+        )
+        return jsonify(
+            {"success": True, "signing_request": signing_request.to_public_dict()}
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/manifest/sign/complete", methods=["POST"])
+def api_bootstrap_manifest_sign_complete():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "response"}:
+            raise SigningError("invalid_signing_complete_request")
+        if type(body["request_id"]) is not str or type(body["response"]) is not dict:
+            raise SigningError("invalid_signing_complete_request")
+        identity = _read_walletconnect_identity()
+        signed_manifest = (
+            _get_walletconnect_signing_service().complete_manifest_signature(
+                body["request_id"], body["response"], identity
+            )
+        )
+        return jsonify({"success": True, "signed_manifest": signed_manifest})
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/manifest/sign/fail", methods=["POST"])
+def api_bootstrap_manifest_sign_fail():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "reason"}:
+            raise SigningError("invalid_signing_failure_request")
+        _get_walletconnect_signing_service().fail_request(
+            body["request_id"], body["reason"]
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+    return jsonify({"success": True})
+
+
+@app.route("/api/bootstrap/participation/sign/begin", methods=["POST"])
+def api_bootstrap_participation_sign_begin():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"report"}:
+            raise SigningError("invalid_signing_begin_request")
+        identity = _read_walletconnect_identity()
+        signing_request = (
+            _get_walletconnect_signing_service().begin_participation_signature(
+                body["report"], identity
+            )
+        )
+        return jsonify(
+            {"success": True, "signing_request": signing_request.to_public_dict()}
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/participation/sign/complete", methods=["POST"])
+def api_bootstrap_participation_sign_complete():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "response"}:
+            raise SigningError("invalid_signing_complete_request")
+        if type(body["request_id"]) is not str or type(body["response"]) is not dict:
+            raise SigningError("invalid_signing_complete_request")
+        identity = _read_walletconnect_identity()
+        signed_report = (
+            _get_walletconnect_signing_service().complete_participation_signature(
+                body["request_id"], body["response"], identity
+            )
+        )
+        return jsonify({"success": True, "signed_report": signed_report})
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -5912,6 +6225,7 @@ from blueprints.market import (
     api_coinset_stats,
     api_price,
     api_market_summary,
+    api_market_confidence,
     api_tibet_price,
     api_amm_price,
     api_debug_coinprep,
@@ -6015,6 +6329,18 @@ from blueprints.bot import (
     api_diagnostics_api_stats,
     api_bot_price,
 )
+from blueprints.bootstrap import (
+    bp as _bootstrap_bp,
+    api_bootstrap_manifest_export,
+    api_bootstrap_manifest_import,
+    api_bootstrap_partial_offer_capability,
+    api_bootstrap_participation_export,
+    api_bootstrap_preview,
+    api_bootstrap_renew,
+    api_bootstrap_start,
+    api_bootstrap_status,
+    api_bootstrap_stop,
+)
 
 app.register_blueprint(_splash_bp)
 app.register_blueprint(_diagnostics_bp)
@@ -6033,6 +6359,7 @@ app.register_blueprint(_offers_bp)
 app.register_blueprint(_dashboard_bp)
 app.register_blueprint(_smart_defaults_bp)
 app.register_blueprint(_bot_bp)
+app.register_blueprint(_bootstrap_bp)
 
 
 def _validate_write_route_classification() -> None:
@@ -6267,6 +6594,7 @@ if __name__ == "__main__":
         from database import clear_splash_incoming
 
         clear_splash_incoming()
+        _splash_incoming_clear_recent_deliveries()
     except Exception:
         pass
 

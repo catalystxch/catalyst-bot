@@ -97,6 +97,7 @@ _mod(
     log_event=lambda *a, **kw: None,
     get_events_since=lambda *a, **kw: [],
     get_open_offers=lambda *a, **kw: [],
+    get_active_offer_market_identities=lambda *a, **kw: set(),
     get_stats=lambda: {},
     get_offer=lambda *a, **kw: None,
     get_offers_by_trade_ids=lambda *a, **kw: [],
@@ -789,6 +790,32 @@ class TestTierSizeDriftTopup(_PatchedCfg):
 
 
 class TestCoinTopupPriority(_PatchedCfg):
+    def test_proactive_topup_does_not_defer_for_spares_in_wrong_tiers(self):
+        loop = _make_loop()
+
+        class TierAwareCoinManager:
+            _tier_spares = {
+                "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                "cat": {"inner": 0, "mid": 5, "outer": 7, "extreme": 0},
+            }
+
+            def _topup_offer_deficits_by_tier(self):
+                return {
+                    "xch": {"inner": 0, "mid": 0, "outer": 0, "extreme": 0},
+                    "cat": {"inner": 3, "mid": 0, "outer": 0, "extreme": 2},
+                }
+
+        loop.coin_manager = TierAwareCoinManager()
+        loop._current_mid_price = Decimal("1")
+        loop._get_expected_offer_targets = lambda _mid: {"buy": 36, "sell": 36}
+
+        deferred = loop._defer_drip_topup_for_offer_rebuild(
+            active_buy_count=36,
+            active_sell_count=31,
+        )
+
+        self.assertFalse(deferred)
+
     def test_proactive_topup_waits_when_missing_offers_have_spares(self):
         loop = _make_loop()
         loop._loop_count = 11

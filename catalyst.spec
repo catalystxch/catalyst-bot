@@ -76,6 +76,11 @@ _image_files = [
               'spacescan-logo-192.webp', 'sage_rpc_advanced.png')
     if os.path.isfile(os.path.join(_assets_dir, f))
 ]
+_image_files += [
+    (os.path.join(_assets_dir, 'walletconnect-signing.js'), 'assets')
+    for _ in (0,)
+    if os.path.isfile(os.path.join(_assets_dir, 'walletconnect-signing.js'))
+]
 # Also check root for backward compat
 _image_files += [
     (os.path.join(_HERE, f), '.')
@@ -104,6 +109,8 @@ _license_files = [
     (os.path.join(_HERE, 'THIRD_PARTY_NOTICES.md'), '.'),
     (os.path.join(_license_dir, 'Pieter-Wuille-bech32-MIT.txt'), 'licenses'),
     (os.path.join(_license_dir, 'Chia-Network-chia-blockchain-Apache-2.0.txt'), 'licenses'),
+    (os.path.join(_license_dir, 'Reown-WalletConnect-Community-License.txt'), 'licenses'),
+    (os.path.join(_license_dir, 'QRCode-MIT.txt'), 'licenses'),
 ]
 
 # requests resolves its default TLS trust store through certifi at runtime.
@@ -219,6 +226,8 @@ _hiddenimports = [
     'wallet_chia',
     'wallet_sage',
     'coin_prep_worker',
+    'bootstrap_manifest',
+    'walletconnect_signing',
     'super_log',
     'super_log_hooks',
     'chia_node',

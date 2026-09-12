@@ -189,6 +189,23 @@ def test_reselecting_persisted_pair_loads_saved_config_for_explicit_review():
     assert "setFreshStartTemplateState(!reselectingPersistedPair);" in resume_block
 
 
+def test_no_resume_startup_path_does_not_request_authoritative_fresh_reset():
+    """An ordinary zero-offer startup is read-only, even with durable fills."""
+    html = GUI.read_text(encoding="utf-8", errors="replace")
+
+    resume_start = html.index("async function checkForResume()")
+    resume_end = html.index("async function resumeSession()", resume_start)
+    resume_block = html[resume_start:resume_end]
+    no_resume_start = resume_block.index("if (!data.can_resume)")
+    no_resume_end = resume_block.index(
+        "setResumeSessionSummary(data);", no_resume_start
+    )
+    no_resume_block = resume_block[no_resume_start:no_resume_end]
+
+    assert "session/fresh-start" not in no_resume_block
+    assert "setFreshStartTemplateState(!reselectingPersistedPair);" in no_resume_block
+
+
 def test_resume_session_revalidates_live_summary_after_status_refresh():
     """A concurrent idle-status refresh must not blank the post-load summary."""
     html = GUI.read_text(encoding="utf-8", errors="replace")
@@ -324,12 +341,16 @@ def test_dry_run_is_not_user_facing_setting():
     assert "dry_run:" not in html
 
 
-def test_market_diagnostics_uses_live_amm_and_summary_sources():
+def test_market_diagnostics_uses_offer_book_confidence_and_provider_health():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    assert "_lastAmmPriceData" in html
+    assert "_lastAmmPriceData" not in html
     assert "_lastMarketSummary" in html
-    assert "summaryTibetXch" in html
+    assert "_lastMarketConfidence" in html
+    assert "marketProviderHealth" in html
+    assert "independent_bid_depth_xch" in html
+    assert "independent_ask_depth_xch" in html
+    assert "summaryTibetXch" not in html
 
 
 def test_close_gap_recommendation_has_confidence_gate():

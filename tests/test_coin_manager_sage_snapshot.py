@@ -16,7 +16,7 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
         self._saved_wallet_type = os.environ.get("WALLET_TYPE")
         os.environ["WALLET_TYPE"] = "sage"
         self._saved_modules = {name: sys.modules.get(name) for name in _MODS_TO_RESTORE}
-        self.calls = {"detailed": 0, "upserts": []}
+        self.calls = {"detailed": 0, "upserts": [], "batches": []}
 
         fake_config = types.ModuleType("config")
         fake_config.cfg = types.SimpleNamespace(
@@ -76,6 +76,15 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
                 "upserts"
             ].append((coin_id, wallet_type, amount))
         )
+
+        def _batch_upsert(coins, wallet_type="xch"):
+            snapshot = [
+                (coin["coin_id"], wallet_type, coin["amount_mojos"]) for coin in coins
+            ]
+            self.calls["batches"].append(snapshot)
+            return len(snapshot)
+
+        fake_database.batch_upsert_coins = _batch_upsert
         fake_database.get_free_coins = lambda wallet_type: []
         fake_database.mark_coins_gone = lambda coin_ids: 0
         fake_database.get_coin_summary = lambda: {}
@@ -145,13 +154,28 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
         self.assertEqual(
             {
                 (coin_id, wallet_type, amount)
-                for coin_id, wallet_type, amount in self.calls["upserts"]
+                for batch in self.calls["batches"]
+                for coin_id, wallet_type, amount in batch
             },
             {
                 ("0x" + "11" * 32, "xch", 111),
                 ("0x" + "21" * 32, "cat", 333),
             },
         )
+
+    def test_update_coin_counts_batches_snapshot_persistence(self):
+        """Large wallet snapshots must leave a writer window for the lease heartbeat."""
+        xch_count, cat_count = self.manager.update_coin_counts()
+
+        self.assertEqual((xch_count, cat_count), (1, 1))
+        self.assertEqual(
+            self.calls["batches"],
+            [
+                [("0x" + "11" * 32, "xch", 111)],
+                [("0x" + "21" * 32, "cat", 333)],
+            ],
+        )
+        self.assertEqual(self.calls["upserts"], [])
 
 
 if __name__ == "__main__":

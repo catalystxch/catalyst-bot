@@ -8,7 +8,7 @@ No existing tests. Covers:
 
 import unittest
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     import price_engine as _pe_mod
@@ -287,21 +287,25 @@ class TestPricingStrategySelection(unittest.TestCase):
         with patch("database.record_price", return_value=None):
             return eng
 
-    def test_weighted_strategy_blends_prices(self):
+    def test_retired_tibet_price_is_never_blended(self):
         eng = self._eng_with_prices("1.00", "1.20")
+        eng._fetch_tibet_price = Mock(
+            side_effect=AssertionError("retired provider called")
+        )
         with patch("database.record_price"):
             result = eng.get_price()
-        expected = Decimal("1.00") * Decimal("0.15") + Decimal("1.20") * Decimal("0.85")
-        self.assertAlmostEqual(float(result["mid_price"]), float(expected), places=6)
+        self.assertEqual(result["mid_price"], Decimal("1.00"))
+        self.assertEqual(result["strategy_used"], "dexie_offer_book")
+        eng._fetch_tibet_price.assert_not_called()
 
     def test_dexie_only_when_tibet_unavailable(self):
         eng = self._eng_with_prices("1.05", None)
         with patch("database.record_price"):
             result = eng.get_price()
-        self.assertEqual(result["strategy_used"], "dexie_only")
+        self.assertEqual(result["strategy_used"], "dexie_offer_book")
         self.assertEqual(result["mid_price"], Decimal("1.05"))
 
-    def test_tibet_only_when_dexie_unavailable(self):
+    def test_retired_tibet_cannot_be_a_fallback(self):
         cfg_patch = _CfgPatch()
         cfg_patch.PRICE_STRATEGY = "tibet_only"
         eng = _make_engine()
@@ -311,7 +315,7 @@ class TestPricingStrategySelection(unittest.TestCase):
         eng._update_reference_price = lambda p: None
         with patch.object(_pe_mod, "cfg", cfg_patch), patch("database.record_price"):
             result = eng.get_price()
-        self.assertEqual(result["strategy_used"], "tibet_only")
+        self.assertIsNone(result)
 
     def test_both_unavailable_returns_none(self):
         eng = _make_engine()
@@ -322,16 +326,12 @@ class TestPricingStrategySelection(unittest.TestCase):
             result = eng.get_price()
         self.assertIsNone(result)
 
-    def test_arb_gap_calculated_in_bps(self):
+    def test_retired_tibet_never_creates_an_arb_gap(self):
         eng = self._eng_with_prices("1.00", "1.05")
         with patch("database.record_price"):
             result = eng.get_price()
-        expected_gap = (
-            abs(Decimal("1.00") - Decimal("1.05")) / Decimal("1.00") * Decimal("10000")
-        )
-        self.assertAlmostEqual(
-            float(result["arb_gap_bps"]), float(expected_gap), places=4
-        )
+        self.assertEqual(result["arb_gap_bps"], Decimal("0"))
+        self.assertIsNone(result["arb_opportunity"])
 
     def test_no_arb_when_prices_equal(self):
         eng = self._eng_with_prices("1.00", "1.00")
@@ -448,7 +448,7 @@ class TestDexieTickerFreshness(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
 class TestTibetCacheInjection(unittest.TestCase):
-    """Fresh reserve signals can update the Tibet cache without waiting for /pairs."""
+    """Retired reserve signals cannot revive the legacy Tibet cache."""
 
     def setUp(self):
         self._p = patch.object(_pe_mod, "cfg", _CfgPatch())
@@ -466,7 +466,7 @@ class TestTibetCacheInjection(unittest.TestCase):
             _pe_mod._tibet_cache["cache_ttl"] = self._old_cache["cache_ttl"]
         self._p.stop()
 
-    def test_inject_tibet_reserves_updates_matching_cached_pair(self):
+    def test_inject_tibet_reserves_ignores_matching_cached_pair(self):
         with _pe_mod._tibet_lock:
             _pe_mod._tibet_cache["pairs"] = [
                 {
@@ -486,14 +486,14 @@ class TestTibetCacheInjection(unittest.TestCase):
             fetched_at=123,
         )
 
-        self.assertTrue(injected)
+        self.assertFalse(injected)
         with _pe_mod._tibet_lock:
             pair = _pe_mod._tibet_cache["pairs"][0]
-            self.assertEqual(pair["xch_reserve"], 3000)
-            self.assertEqual(pair["token_reserve"], 4000)
-            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 123)
+            self.assertEqual(pair["xch_reserve"], 1000)
+            self.assertEqual(pair["token_reserve"], 2000)
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 10)
 
-    def test_inject_tibet_reserves_invalidates_cache_when_pair_missing(self):
+    def test_inject_tibet_reserves_is_noop_when_pair_missing(self):
         with _pe_mod._tibet_lock:
             _pe_mod._tibet_cache["pairs"] = [
                 {
@@ -515,7 +515,7 @@ class TestTibetCacheInjection(unittest.TestCase):
 
         self.assertFalse(injected)
         with _pe_mod._tibet_lock:
-            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 0)
+            self.assertEqual(_pe_mod._tibet_cache["fetched_at"], 10)
 
 
 @unittest.skipIf(_SKIP is not None, f"price_engine unavailable: {_SKIP}")
@@ -591,11 +591,11 @@ class TestPoolDepthRatio(unittest.TestCase):
     def tearDown(self):
         self._p.stop()
 
-    def test_ratio_is_trade_over_depth(self):
+    def test_retired_pool_depth_is_neutral(self):
         eng = _make_engine()
         eng.get_tibet_pool_info = lambda: {"xch_reserve": Decimal("1000")}
         ratio = eng.get_pool_depth_ratio(Decimal("10"))
-        self.assertAlmostEqual(float(ratio), 0.01, places=6)
+        self.assertEqual(ratio, Decimal("0"))
 
     def test_no_pool_returns_zero(self):
         eng = _make_engine()
@@ -613,13 +613,14 @@ class TestPoolDepthRatio(unittest.TestCase):
 
         pool = eng.get_tibet_pool_info("asset-id")
 
-        self.assertIsNone(pool)
+        self.assertEqual(pool["status"], "retired")
+        self.assertFalse(pool["available"])
 
-    def test_zero_depth_returns_one(self):
+    def test_zero_depth_compatibility_path_is_neutral(self):
         eng = _make_engine()
         eng.get_tibet_pool_info = lambda: {"xch_reserve": Decimal("0")}
         ratio = eng.get_pool_depth_ratio(Decimal("10"))
-        self.assertEqual(ratio, Decimal("1"))
+        self.assertEqual(ratio, Decimal("0"))
 
 
 if __name__ == "__main__":

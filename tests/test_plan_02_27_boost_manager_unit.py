@@ -254,7 +254,7 @@ class TestFindStaleOffers(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, _SKIP_MSG)
 class TestFlexibleProbeSize(unittest.TestCase):
-    def test_activate_creates_only_one_inverted_probe_side(self):
+    def test_activate_is_retired_without_creating_an_inverted_probe(self):
         class OfferManager:
             def __init__(self):
                 self.created_sides = []
@@ -305,12 +305,12 @@ class TestFlexibleProbeSize(unittest.TestCase):
         ):
             result = mgr.activate(Decimal("0.0001"))
 
-        self.assertTrue(result["success"])
-        self.assertEqual(result["created"], 1)
-        self.assertEqual(offer_manager.created_sides, ["buy"])
-        self.assertEqual(len(dexie.posted), 1)
-        self.assertEqual(mgr._buy_probe_tid, "tid-buy-1")
-        self.assertEqual(mgr._sell_probe_tid, "")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "retired")
+        self.assertEqual(result["reason"], "TIBETSWAP_SHUTDOWN")
+        self.assertEqual(result["replacement"], "book_opportunity")
+        self.assertEqual(offer_manager.created_sides, [])
+        self.assertEqual(dexie.posted, [])
 
     def test_step_creates_missing_alternating_inverted_probe_side(self):
         class OfferManager:

@@ -184,6 +184,11 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
 
     with (
         api_mutations_permitted(api_server),
+        patch.object(
+            bot_routes,
+            "_enforce_post_tibet_start_migration",
+            return_value={"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
+        ),
         patch(
             "wallet.get_wallet_sync_status",
             side_effect=RuntimeError("secret wallet traceback"),

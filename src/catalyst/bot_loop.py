@@ -1,9 +1,10 @@
 """Central trading-loop orchestrator that wires all bot subsystems together
 
 The `BotLoop` class owns instances of `PriceEngine`, `OfferManager`, `FillTracker`,
-`DexieManager`, `SplashManager`, `CoinManager`, `RiskManager`, `Sniper`,
-`BoostManager`, `MarketIntel`, `RuntimeMonitor`, `AMMMonitor`, and `MempoolWatcher`,
-then completes cross-module wiring via attribute injection after construction.
+`DexieManager`, `SplashManager`, `CoinManager`, `RiskManager`, `BoostManager`,
+`MarketIntel`, and `RuntimeMonitor`, then completes cross-module wiring via
+attribute injection after construction. Legacy AMM/sniper objects remain inert
+for one upgrade cycle; v1.4 never starts their network or trading paths.
 The main entry point `_run_one_cycle()` runs on a background thread every
 `cfg.LOOP_SECONDS` and drives the per-cycle pipeline: price fetch, risk checks,
 fill detection, round-trip matching, requote, new-offer creation, Dexie posting,
@@ -25,18 +26,21 @@ import time
 import threading
 import traceback
 import requests
+import database
 import mutation_gate
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Dict, Optional
 
 from config import cfg
 from database import (
+    get_active_offer_market_identities,
     get_runtime_mutation_lease,
     log_event,
     get_stats,
     get_offer,
+    get_open_offers,
 )
 
 try:
@@ -72,12 +76,26 @@ from sniper import Sniper
 from boost_manager import BoostManager
 from market_intel import MarketIntel
 from market_toxicity import MarketToxicityGuard, ToxicityContext
+from market_runtime import OfferBookMarketRuntime
+from degraded_market import DegradedMarketController, DegradedMarketDecision
 from runtime_monitor import RuntimeMonitor
 from amm_monitor import AMMMonitor
 from splash_receive import classify_offer_for_asset
 from shock_protection import evaluate_tibet_shock
-from amount_utils import format_cat_display_amount, format_signed_cat_display_amount
+from amount_utils import (
+    format_cat_display_amount,
+    format_decimal_plain,
+    format_signed_cat_display_amount,
+)
 from wallet import get_all_offers, get_chia_health
+from bootstrap_runtime import (
+    active_bootstrap_levels,
+    derive_bootstrap_authoritative_evidence,
+    derive_bootstrap_runtime,
+    plan_bootstrap_state_update,
+    plan_bootstrap_runtime_transition,
+    superseded_bootstrap_trade_ids,
+)
 
 try:
     import mempool_watcher as _mempool_watcher_mod
@@ -90,6 +108,33 @@ DEXIE_STATUS_PENDING = 1
 DEXIE_STATUS_CANCELLED = 3
 DEXIE_STATUS_COMPLETED = 4
 DEXIE_STATUS_EXPIRED = 6
+
+# One-release compatibility keeps the old BoostManager available for
+# authoritative cancellation of recovered offers, never for creation or
+# repricing. Conservative opportunity orders now run through OfferManager.
+LEGACY_TIBET_BOOST_RUNTIME_ENABLED = False
+
+
+def plan_bootstrap_cycle_mutations(*, bootstrap_active: bool) -> dict[str, bool]:
+    """Separate Bootstrap-authorized effects from ordinary Follow churn."""
+
+    follow_allowed = not bool(bootstrap_active)
+    return {
+        "toxicity_cancel": follow_allowed,
+        "expiry_refresh": follow_allowed,
+        "emergency_requote": follow_allowed,
+        "sniper_cleanup": follow_allowed,
+        "boost_mutation": follow_allowed,
+        "follow_requote": follow_allowed,
+        "follow_trim": follow_allowed,
+        "follow_recovery_evaluation": follow_allowed,
+        "legacy_coin_topup": follow_allowed,
+        "safety_cancel": True,
+        "cancel_retry": True,
+        "bootstrap_create": True,
+        "publication_reconcile": True,
+        "fill_reconcile": True,
+    }
 
 
 def _bps_to_pct(val):
@@ -116,6 +161,25 @@ def _format_sage_cleanup_skip_summary(total: int, new: int, repeated: int) -> st
 _RUNTIME_EFFECT_PHASES = frozenset(
     {"cancel", "create", "publication", "coin_prep", "requote", "trim"}
 )
+
+
+def market_follow_offer_target(configured_target: int, confidence) -> int:
+    """Apply the exact provider-redundancy capacity cap to one Follow target."""
+
+    target = max(0, int(configured_target or 0))
+    if confidence is None:
+        return target
+    data_valid = getattr(confidence, "data_valid", None)
+    if data_valid is None:
+        data_valid = getattr(confidence, "state", None) == "GREEN"
+    if data_valid is not True:
+        return 0
+    fraction = getattr(confidence, "follow_capacity_fraction", Decimal("1"))
+    if type(fraction) is not Decimal or not fraction.is_finite() or fraction <= 0:
+        return 0
+    if fraction >= Decimal("1"):
+        return target
+    return max(1, int(Decimal(target) * fraction)) if target else 0
 
 
 def _normalize_coin_id_value(coin_id: object) -> str:
@@ -416,6 +480,20 @@ class BotLoop:
         self.splash_node = SplashNode()
         self.coinset_client = CoinsetClient()
         self.market_toxicity_guard = MarketToxicityGuard()
+        self._market_runtime_required = True
+        self._market_runtime = None
+        self._market_runtime_asset_id = ""
+        self._market_runtime_risk_preset = ""
+        self._market_runtime_refresh_cadence = 0
+        self._market_runtime_minimum_provider_count = 0
+        self._market_confidence_result = None
+        self._market_degraded_decision = None
+        self._market_confidence_valid_until = None
+        self._market_refresh_lock = threading.RLock()
+        self._publication_discovery_pending = 0
+        self._market_refresh_now = datetime.now(timezone.utc)
+        self._splash_confidence_offers: Dict[str, Dict] = {}
+        self._splash_confidence_lock = threading.Lock()
         # F34 (2026-04-08): wire coinset_client into offer_manager so
         # fill_tracker can reach it for the Coinset fill verification
         # fallback when Spacescan is unavailable.
@@ -936,12 +1014,14 @@ class BotLoop:
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
+            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
         )
         self.splash_manager.enable_durable_outbox(
             owner_run_id=owner + ":splash",
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
+            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
         )
 
     def set_runtime_recovery_coordinator(self, coordinator) -> None:
@@ -1041,7 +1121,673 @@ class BotLoop:
             # Keep isolated off-cycle utility calls compatible, but a partial
             # object that claims to be in a running cycle must fail closed.
             return not bool(getattr(self, "_cycle_started_running", False))
-        return self._runtime_recovery_cycle_boundary()
+        if not self._runtime_recovery_cycle_boundary():
+            return False
+        if not bool(getattr(self, "_market_runtime_required", False)):
+            return True
+        if phase_name in {"cancel", "trim", "coin_prep"}:
+            return True
+        decision = getattr(self, "_market_degraded_decision", None)
+        if decision is None:
+            return False
+        confidence = getattr(self, "_market_confidence_result", None)
+        derived_at = getattr(confidence, "derived_at", None)
+        current_time = datetime.now(timezone.utc)
+        if type(derived_at) is not datetime or derived_at.tzinfo is None:
+            return False
+        valid_until = getattr(self, "_market_confidence_valid_until", None)
+        if type(valid_until) is not datetime or valid_until.tzinfo is None:
+            valid_until = derived_at.astimezone(timezone.utc) + timedelta(seconds=30)
+
+        # External evidence is refreshed approximately every five seconds while
+        # offers are live. Refresh once more at a mutation boundary when the
+        # current permit is close to expiry, so a normally long wallet-sync
+        # phase cannot publish or create against an aging book.
+        seconds_remaining = (
+            valid_until.astimezone(timezone.utc) - current_time
+        ).total_seconds()
+        if 0 < seconds_remaining <= 5:
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(now=current_time, error=exc)
+                return False
+            decision = getattr(self, "_market_degraded_decision", None)
+            confidence = getattr(self, "_market_confidence_result", None)
+            derived_at = getattr(confidence, "derived_at", None)
+            valid_until = getattr(self, "_market_confidence_valid_until", None)
+            current_time = datetime.now(timezone.utc)
+            if type(derived_at) is not datetime or derived_at.tzinfo is None:
+                return False
+            if type(valid_until) is not datetime or valid_until.tzinfo is None:
+                valid_until = derived_at.astimezone(timezone.utc) + timedelta(
+                    seconds=30
+                )
+
+        confidence_age = (
+            current_time - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if confidence_age < -2 or current_time > valid_until.astimezone(timezone.utc):
+            self._enforce_market_refresh_failure(
+                now=current_time,
+                error=RuntimeError(
+                    f"market confidence evidence expired before {phase_name} phase"
+                ),
+            )
+            return False
+        if phase_name == "requote":
+            return bool(getattr(decision, "can_requote", False))
+        if phase_name in {"create", "publication"}:
+            return bool(getattr(decision, "can_create", False))
+        return False
+
+    def _background_publication_snapshot_ready(
+        self, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Read-only preflight for asynchronous visibility work.
+
+        Background reposts race the first live cycle during startup.  They must
+        never turn an already-stale snapshot into a new global failure (and
+        thereby withdraw an otherwise valid ladder) before the cycle has had a
+        chance to refresh the market.  The normal mutation phase gate remains
+        authoritative once a fresh, publication-capable snapshot exists.
+        """
+
+        if not bool(getattr(self, "_market_runtime_required", False)):
+            return True
+        decision = getattr(self, "_market_degraded_decision", None)
+        if decision is None or not bool(getattr(decision, "can_create", False)):
+            return False
+        confidence = getattr(self, "_market_confidence_result", None)
+        derived_at = getattr(confidence, "derived_at", None)
+        if type(derived_at) is not datetime or derived_at.tzinfo is None:
+            return False
+        current_time = now or datetime.now(timezone.utc)
+        valid_until = getattr(self, "_market_confidence_valid_until", None)
+        if type(valid_until) is not datetime or valid_until.tzinfo is None:
+            valid_until = derived_at.astimezone(timezone.utc) + timedelta(seconds=30)
+        confidence_age = (
+            current_time - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        return confidence_age >= -2 and current_time <= valid_until.astimezone(
+            timezone.utc
+        )
+
+    def _remember_splash_confidence_offer(
+        self,
+        *,
+        fingerprint: str,
+        classified: Dict,
+        observed_at: datetime,
+    ) -> bool:
+        """Cache one parsed Splash offer without changing its evidence time."""
+
+        identity = str(fingerprint or "").strip()
+        side = str((classified or {}).get("side") or "").strip().lower()
+        summary = (classified or {}).get("summary") or {}
+        offered = summary.get("offered") or {}
+        requested = summary.get("requested") or {}
+        if not identity or side not in {"buy", "sell"}:
+            return False
+        if type(observed_at) is not datetime or observed_at.tzinfo is None:
+            return False
+        asset_ids = sorted((set(offered) | set(requested)) - {"xch"})
+        if len(asset_ids) != 1:
+            return False
+        asset_id = str(asset_ids[0]).strip().lower()
+        try:
+            if side == "buy":
+                xch_mojos = abs(int(offered["xch"]))
+                cat_atoms = abs(int(requested[asset_id]))
+            else:
+                xch_mojos = abs(int(requested["xch"]))
+                cat_atoms = abs(int(offered[asset_id]))
+            if xch_mojos <= 0 or cat_atoms <= 0:
+                return False
+            cat_scale = Decimal(10) ** Decimal(str(getattr(cfg, "CAT_DECIMALS", 3)))
+            price = (
+                Decimal(xch_mojos)
+                / Decimal("1000000000000")
+                / (Decimal(cat_atoms) / cat_scale)
+            )
+            price_text = format_decimal_plain(price)
+            if not price_text:
+                return False
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
+
+        lock = getattr(self, "_splash_confidence_lock", None)
+        cache = getattr(self, "_splash_confidence_offers", None)
+        if lock is None or cache is None:
+            return False
+        with lock:
+            cache[identity] = {
+                "asset_id": asset_id,
+                "offer_id": identity,
+                "side": side,
+                "price": price_text,
+                "amount_mojos": xch_mojos,
+                "observed_at": observed_at.astimezone(timezone.utc),
+            }
+        return True
+
+    def _get_fresh_splash_confidence_offers(
+        self, asset_id: str, *, now: datetime
+    ) -> list[Dict]:
+        """Return recently advertised Splash offers for two market cycles.
+
+        Splash delivers an offer through its webhook once, while the default
+        confidence loop runs every 90 seconds.  A fixed 20-second cache made a
+        valid advertisement disappear before the next normal refresh.  Keep
+        it for a bounded two-cycle lease; a later advertisement refreshes the
+        lease, while silence still removes it promptly.
+        """
+
+        current = now.astimezone(timezone.utc)
+        target = str(asset_id or "").strip().lower()
+        loop_seconds = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
+        retention_seconds = max(20, loop_seconds * 2)
+        result = []
+        with self._splash_confidence_lock:
+            stale = []
+            for identity, row in self._splash_confidence_offers.items():
+                age = (current - row["observed_at"]).total_seconds()
+                if age > retention_seconds:
+                    stale.append(identity)
+                    continue
+                if row["asset_id"] != target:
+                    continue
+                result.append(
+                    {
+                        "offer_id": row["offer_id"],
+                        "side": row["side"],
+                        "price": row["price"],
+                        "amount_mojos": row["amount_mojos"],
+                        "observed_at": row["observed_at"]
+                        .isoformat(timespec="microseconds")
+                        .replace("+00:00", "Z"),
+                    }
+                )
+            for identity in stale:
+                self._splash_confidence_offers.pop(identity, None)
+        return sorted(result, key=lambda row: row["offer_id"])
+
+    def _apply_market_withdrawal(self, decision) -> int:
+        """Submit authoritative cancellation for the current withdrawal tiers."""
+
+        requested = set(getattr(decision, "cancel_tiers", ()) or ())
+        if not requested:
+            return 0
+        requested = {"mid" if tier == "middle" else tier for tier in requested}
+        rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        trade_ids = [
+            str(row.get("trade_id") or "").strip()
+            for row in rows
+            if str(row.get("tier") or "").strip().lower() in requested
+            and str(row.get("trade_id") or "").strip()
+        ]
+        if not trade_ids or not self._enter_runtime_effect_phase("cancel"):
+            return 0
+        results = self.offer_manager.cancel_offers(
+            trade_ids,
+            reason=str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
+            force_storm=True,
+        )
+        unresolved_outcomes = {
+            "CANCEL_FAILED",
+            "CANCEL_SUBMITTED_UNCONFIRMED",
+            "CANCEL_UNKNOWN",
+        }
+        if any(
+            type(result) is dict and result.get("outcome") in unresolved_outcomes
+            for result in (results or {}).values()
+        ):
+            self._run_cancel_retry_pass()
+        log_event(
+            "warning",
+            "market_confidence_withdrawal",
+            f"Market confidence withdrawal submitted for {len(trade_ids)} "
+            f"{','.join(sorted(requested))} offer(s)",
+            data={
+                "reason_code": str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
+                "trade_ids": trade_ids,
+            },
+        )
+        return len(trade_ids)
+
+    def _reconcile_offer_publication_discovery(
+        self,
+        *,
+        dexie_book: Dict,
+        splash_offers: list[Dict],
+        now: datetime,
+    ) -> Dict[str, int]:
+        """Prove exact rediscovery or cancel an unproven offer at 90 seconds."""
+
+        from database import (
+            ensure_offer_publication_discoveries,
+            expire_offer_publication_discoveries,
+            get_offer_intents_for_registry,
+            record_offer_intent_visibility,
+            record_offer_publication_discovery,
+        )
+
+        def canonical_identity(value) -> str:
+            text = str(value or "").strip().lower()
+            if len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
+                return ""
+            return text
+
+        dexie_identities: set[str] = set()
+        dexie_by_trade: Dict[str, str] = {}
+        for row in list((dexie_book or {}).get("bids") or []) + list(
+            (dexie_book or {}).get("asks") or []
+        ):
+            if type(row) is not dict:
+                continue
+            identity = canonical_identity(
+                row.get("offer_identity") or row.get("offer_id")
+            )
+            trade_id = canonical_identity(row.get("trade_id"))
+            if identity:
+                dexie_identities.add(identity)
+                if trade_id:
+                    dexie_by_trade[trade_id] = identity
+
+        splash_identities = {
+            identity
+            for identity in (
+                canonical_identity((row or {}).get("offer_id"))
+                for row in (splash_offers or [])
+                if type(row) is dict
+            )
+            if identity
+        }
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        result = {"visible": 0, "pending": 0, "cancel_requested": 0}
+        cancel_trade_ids: list[str] = []
+
+        for intent in get_offer_intents_for_registry():
+            if (
+                intent.get("lifecycle_state") != "created"
+                or str(intent.get("asset_id") or "").strip().lower() != asset_id
+            ):
+                continue
+            intent_id = str(intent.get("intent_id") or "")
+            trade_id = canonical_identity(intent.get("sage_trade_id"))
+            identity = canonical_identity(intent.get("offer_text_sha256"))
+            if not intent_id or not trade_id or not identity:
+                result["pending"] += 1
+                continue
+
+            ensure_offer_publication_discoveries(intent_id)
+            observed_dexie = dexie_by_trade.get(trade_id)
+            if identity in dexie_identities:
+                observed_dexie = identity
+            if observed_dexie:
+                record_offer_publication_discovery(
+                    intent_id,
+                    provider="dexie",
+                    observed_offer_identity=observed_dexie,
+                    observed_at=now,
+                )
+            if identity in splash_identities:
+                record_offer_publication_discovery(
+                    intent_id,
+                    provider="splash",
+                    observed_offer_identity=identity,
+                    observed_at=now,
+                )
+
+            discoveries = expire_offer_publication_discoveries(intent_id, now=now)
+            exact = sorted(
+                row["provider"] for row in discoveries if row["state"] == "exact"
+            )
+            if exact:
+                provider = exact[0]
+                record_offer_intent_visibility(
+                    intent_id,
+                    publication_identity=f"{provider}:{identity}",
+                    visible_at=now,
+                )
+                result["visible"] += 1
+                log_event(
+                    "info",
+                    "offer_publication_discovered",
+                    f"Exact offer rediscovered by {','.join(exact)}",
+                    data={
+                        "intent_id": intent_id,
+                        "trade_id": trade_id,
+                        "providers": exact,
+                        "offer_identity": identity,
+                    },
+                )
+            elif discoveries and all(
+                row["state"] == "deadline_expired" for row in discoveries
+            ):
+                cancel_trade_ids.append(trade_id)
+            else:
+                result["pending"] += 1
+
+        if cancel_trade_ids and self._enter_runtime_effect_phase("cancel"):
+            unique_trade_ids = sorted(set(cancel_trade_ids))
+            self.offer_manager.cancel_offers(
+                unique_trade_ids,
+                reason="PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
+                force_storm=True,
+            )
+            result["cancel_requested"] = len(unique_trade_ids)
+            log_event(
+                "warning",
+                "offer_publication_discovery_expired",
+                f"Sage cancellation submitted for {len(unique_trade_ids)} "
+                "offer(s) not rediscovered within 90 seconds",
+                data={
+                    "reason_code": "PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
+                    "trade_ids": unique_trade_ids,
+                },
+            )
+        else:
+            result["pending"] += len(cancel_trade_ids)
+        return result
+
+    def _market_own_offer_identities(self, asset_id: str) -> frozenset[str]:
+        identities: set[str] = set()
+        for row in get_open_offers(cat_asset_id=asset_id):
+            for key in (
+                "trade_id",
+                "dexie_id",
+                "offer_hash",
+                "publication_identity",
+                "coin_id",
+            ):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    identities.add(value)
+        identities.update(get_active_offer_market_identities(asset_id))
+        return frozenset(identities)
+
+    @staticmethod
+    def _configured_market_offer_size_mojos() -> int:
+        from config import get_tier_sizes_for_side
+
+        sizes = []
+        for side in ("buy", "sell"):
+            sizes.extend(
+                Decimal(str(value or 0))
+                for value in get_tier_sizes_for_side(side).values()
+            )
+        sizes.append(Decimal(str(getattr(cfg, "XCH_COIN_SIZE", 0) or 0)))
+        positive = [value for value in sizes if value > 0]
+        size_xch = max(positive, default=Decimal("0.001"))
+        return max(
+            1,
+            int(
+                (size_xch * Decimal("1000000000000")).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+
+    def _splash_confidence_health(self) -> Dict:
+        try:
+            status = self.splash_node.get_status() or {}
+            metrics = status.get("metrics") or {}
+            return {
+                "running": status.get("process_running") is True,
+                "api_reachable": status.get("api_reachable") is True
+                and metrics.get("reachable") is not False,
+                "peers": max(0, int(metrics.get("peers", 0) or 0)),
+            }
+        except Exception:
+            return {"running": False, "api_reachable": False, "peers": 0}
+
+    def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
+        asset = str(asset_id or "").strip().lower()
+        refresh_cadence = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
+        minimum_provider_count = 2
+        risk_preset = (
+            str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
+            .strip()
+            .lower()
+        )
+        if (
+            self._market_runtime is not None
+            and self._market_runtime_asset_id == asset
+            and self._market_runtime_risk_preset == risk_preset
+            and getattr(self, "_market_runtime_refresh_cadence", 0) == refresh_cadence
+            and getattr(self, "_market_runtime_minimum_provider_count", 0)
+            == minimum_provider_count
+        ):
+            return self._market_runtime
+
+        def fetch_dexie(_asset_id: str) -> Dict:
+            if _asset_id != asset:
+                raise ValueError("Dexie confidence asset changed during refresh")
+            previous = self.market_intel.get_attributable_orderbook()
+            previous_observed_at = float(previous.get("observed_at_unix", 0) or 0)
+            self.market_intel.refresh_orderbook(force=True)
+            snapshot = self.market_intel.get_attributable_orderbook()
+            observed_at = float(snapshot.get("observed_at_unix", 0) or 0)
+            if observed_at <= 0 or observed_at <= previous_observed_at:
+                raise RuntimeError(
+                    "forced refresh did not produce fresh Dexie evidence"
+                )
+            return {
+                "bids": snapshot["bids"],
+                "asks": snapshot["asks"],
+            }
+
+        def fetch_dexie_settled_trades(_asset_id: str) -> list[Dict]:
+            if _asset_id != asset:
+                raise ValueError("Dexie settled-trade asset changed during refresh")
+            ticker_id = (
+                str(
+                    getattr(cfg, "CAT_TICKER_ID", "")
+                    or getattr(cfg, "CAT_NAME", "")
+                    or ""
+                )
+                .strip()
+                .upper()
+            )
+            if not ticker_id:
+                raise ValueError("Dexie settled-trade ticker is unavailable")
+            if "_" not in ticker_id:
+                ticker_id = f"{ticker_id}_XCH"
+            return (
+                self.dexie_manager.fetch_v3_historical_trades(
+                    ticker_id, limit=10, force=True
+                )
+                or []
+            )
+
+        self._market_runtime = OfferBookMarketRuntime(
+            asset_id=asset,
+            risk_preset=risk_preset,
+            fetch_dexie_book=fetch_dexie,
+            fetch_dexie_settled_trades=fetch_dexie_settled_trades,
+            fetch_splash_offers=lambda requested_asset: (
+                self._get_fresh_splash_confidence_offers(
+                    requested_asset, now=self._market_refresh_now
+                )
+            ),
+            fetch_splash_health=self._splash_confidence_health,
+            refresh_cadence_seconds=refresh_cadence,
+            minimum_provider_count=minimum_provider_count,
+        )
+        self._market_runtime_asset_id = asset
+        self._market_runtime_risk_preset = risk_preset
+        self._market_runtime_refresh_cadence = refresh_cadence
+        self._market_runtime_minimum_provider_count = minimum_provider_count
+        return self._market_runtime
+
+    def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
+        """Serialize confidence-engine refreshes across runtime callers."""
+
+        lock = getattr(self, "_market_refresh_lock", None)
+        if lock is None:
+            return self._refresh_offer_book_market_core(now=now)
+        with lock:
+            return self._refresh_offer_book_market_core(now=now)
+
+    def _refresh_offer_book_market_core(self, *, now: Optional[datetime] = None):
+        """Refresh, persist, expose, and enforce one confidence decision."""
+
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) != 64:
+            return None
+        observed_at = now or datetime.now(timezone.utc)
+        self._market_refresh_now = observed_at
+        runtime = self._ensure_market_runtime(asset_id)
+        result = runtime.refresh(
+            own_offer_identities=self._market_own_offer_identities(asset_id),
+            configured_offer_size_mojos=self._configured_market_offer_size_mojos(),
+            now=observed_at,
+        )
+        self._market_confidence_result = result.confidence
+        self._market_degraded_decision = result.degraded
+        confidence_derived_at = getattr(result.confidence, "derived_at", observed_at)
+        self._market_confidence_valid_until = getattr(result, "valid_until", None)
+        if (
+            type(self._market_confidence_valid_until) is not datetime
+            or self._market_confidence_valid_until.tzinfo is None
+        ):
+            self._market_confidence_valid_until = confidence_derived_at.astimezone(
+                timezone.utc
+            ) + timedelta(seconds=30)
+        self._market_refresh_failure_since = None
+        self._apply_market_withdrawal(result.degraded)
+        dexie_snapshot = self.market_intel.get_attributable_orderbook()
+        splash_snapshot = self._get_fresh_splash_confidence_offers(
+            asset_id, now=observed_at
+        )
+        discovery = self._reconcile_offer_publication_discovery(
+            dexie_book=dexie_snapshot,
+            splash_offers=splash_snapshot,
+            now=observed_at,
+        )
+        self._publication_discovery_pending = max(
+            0, int((discovery or {}).get("pending", 0) or 0)
+        )
+        self._set_state(
+            market_confidence=result.confidence.state,
+            market_data_valid=result.confidence.data_valid,
+            market_provider_redundancy=result.confidence.provider_redundancy,
+            market_follow_capacity_fraction=str(
+                result.confidence.follow_capacity_fraction
+            ),
+            market_stage=result.confidence.market_stage,
+            market_confidence_reason_codes=list(result.confidence.reason_codes),
+            market_withdrawal_stage=result.degraded.stage,
+            market_confidence_snapshot_id=result.snapshot_id,
+        )
+        if result.degraded.notify:
+            level = "error" if result.confidence.state == "RED" else "info"
+            log_event(
+                level,
+                "market_confidence_transition",
+                f"Market confidence is {result.confidence.state}: "
+                f"{result.degraded.reason_code}",
+                data={
+                    "reason_code": result.degraded.reason_code,
+                    "confidence_reasons": list(result.confidence.reason_codes),
+                    "withdrawal_stage": result.degraded.stage,
+                    "snapshot_id": result.snapshot_id,
+                },
+            )
+        return result
+
+    def _enforce_market_refresh_failure(
+        self, *, now: datetime, error: BaseException
+    ) -> DegradedMarketDecision:
+        """Turn any confidence-refresh exception into progressive RED safety."""
+
+        current = now.astimezone(timezone.utc)
+        decision = None
+        controller = getattr(getattr(self, "_market_runtime", None), "_degraded", None)
+        if controller is None:
+            asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+            try:
+                controller = DegradedMarketController(asset_id=asset_id)
+            except Exception:
+                controller = None
+        if controller is not None:
+            try:
+                decision = controller.update(confidence_state="RED", now=current)
+            except Exception as persistence_error:
+                log_event(
+                    "critical",
+                    "market_degraded_state_unavailable",
+                    "Market refresh failed and durable degraded state could not be "
+                    f"updated; enforcing in-memory withdrawal: {persistence_error}",
+                )
+
+        if decision is None:
+            degraded_since = getattr(self, "_market_refresh_failure_since", None)
+            if type(degraded_since) is not datetime or degraded_since.tzinfo is None:
+                degraded_since = current
+            self._market_refresh_failure_since = degraded_since
+            elapsed = max(0, (current - degraded_since).total_seconds())
+            if elapsed >= 600:
+                stage = "ALL"
+                cancel_tiers = (
+                    "inner",
+                    "middle",
+                    "outer",
+                    "extreme",
+                    "opportunity",
+                    "sniper",
+                    "boost",
+                )
+            elif elapsed >= 180:
+                stage = "MIDDLE"
+                cancel_tiers = ("inner", "middle")
+            else:
+                stage = "INNER"
+                cancel_tiers = ("inner",)
+            decision = DegradedMarketDecision(
+                confidence_state="RED",
+                can_create=False,
+                can_requote=False,
+                cancel_tiers=cancel_tiers,
+                paused=stage == "ALL",
+                recovering=False,
+                stage=stage,
+                degraded_since=degraded_since,
+                recovery_refreshes=0,
+                notify=True,
+                reason_code=f"MARKET_REFRESH_FAILED_{stage}",
+            )
+        else:
+            self._market_refresh_failure_since = decision.degraded_since
+
+        self._market_confidence_result = None
+        self._market_degraded_decision = decision
+        self._set_state(
+            market_confidence="RED",
+            market_confidence_reason_codes=["market_refresh_failed"],
+            market_withdrawal_stage=decision.stage,
+            market_confidence_snapshot_id=None,
+        )
+        try:
+            self._apply_market_withdrawal(decision)
+        except Exception as withdrawal_error:
+            log_event(
+                "critical",
+                "market_refresh_failure_withdrawal_failed",
+                "Market refresh failed and protective cancellation also failed: "
+                f"{withdrawal_error}",
+            )
+        log_event(
+            "error",
+            "market_confidence_refresh_failed",
+            f"Offer-book confidence refresh failed closed: {error}",
+            data={
+                "reason_code": decision.reason_code,
+                "withdrawal_stage": decision.stage,
+            },
+        )
+        return decision
 
     def _requote_backoff_remaining(self, side: str) -> float:
         try:
@@ -1278,32 +2024,11 @@ class BotLoop:
     def _augment_health_with_provider_context(self, health_data: dict) -> dict:
         """Add external-provider state required by live dashboard SSE updates."""
         health_data = self._augment_health_with_spacescan(health_data)
-        startup_results = getattr(self, "_startup_self_test_results", {}) or {}
-        tibet_health = startup_results.get("tibet") or {}
-        if tibet_health.get("ok") is not False:
-            return health_data
-
-        outage_text = (
-            "TibetSwap API unavailable — Dexie-only pricing; "
-            "AMM drift protection and reference price unavailable"
-        )
-        conditions = health_data.setdefault("conditions", [])
-        if not any(
-            isinstance(condition, dict) and condition.get("text") == outage_text
-            for condition in conditions
-        ):
-            conditions.append({"level": "amber", "text": outage_text})
-
         metrics = health_data.setdefault("metrics", {})
         metrics["tibetswap_available"] = False
-        metrics["tibetswap_status_code"] = tibet_health.get("status_code")
-        metrics["pricing_mode"] = "dexie_only"
-        if health_data.get("status") == "green":
-            health_data["status"] = "amber"
-            health_data["message"] = (
-                "Market degraded — TibetSwap unavailable; Dexie-only pricing "
-                "active without AMM drift protection"
-            )
+        metrics["tibetswap_retired"] = True
+        metrics["tibetswap_reason"] = "TIBETSWAP_SHUTDOWN"
+        metrics["pricing_mode"] = "offer_book_confidence"
         return health_data
 
     def _emit_alert(
@@ -1459,8 +2184,8 @@ class BotLoop:
     def _wallet_type_for_offer_side(self, side: str) -> str:
         return "xch" if str(side or "").lower() == "buy" else "cat"
 
-    def _available_tier_spares_for_side(self, side: str) -> Optional[int]:
-        """Return free tier-spare count for the asset that funds a side."""
+    def _tier_spares_for_side(self, side: str) -> Optional[Dict[str, int]]:
+        """Return free tier-spare counts for the asset that funds a side."""
         wallet_type = self._wallet_type_for_offer_side(side)
         tier_names = ("inner", "mid", "outer", "extreme")
         spares = {}
@@ -1484,7 +2209,14 @@ class BotLoop:
                 spares = {}
         if not known:
             return None
-        return sum(max(0, int(spares.get(tier, 0) or 0)) for tier in tier_names)
+        return {tier: max(0, int(spares.get(tier, 0) or 0)) for tier in tier_names}
+
+    def _available_tier_spares_for_side(self, side: str) -> Optional[int]:
+        """Return total free tier-spare count for the asset that funds a side."""
+        spares = self._tier_spares_for_side(side)
+        if spares is None:
+            return None
+        return sum(spares.values())
 
     def _position_guard_pauses(self) -> Dict[str, Dict]:
         getter = getattr(self.offer_manager, "get_position_guard_pause", None)
@@ -1562,8 +2294,40 @@ class BotLoop:
     ) -> bool:
         """Let missing offer creation run before non-critical spare refills."""
         deficits = self._offer_rebuild_deficits(active_buy_count, active_sell_count)
+        tier_deficits = None
+        tier_deficit_getter = getattr(
+            self.coin_manager, "_topup_offer_deficits_by_tier", None
+        )
+        if callable(tier_deficit_getter):
+            try:
+                tier_deficits = tier_deficit_getter()
+            except Exception:
+                tier_deficits = None
+
         for side, info in deficits.items():
             deficit = int(info.get("deficit", 0) or 0)
+            wallet_type = self._wallet_type_for_offer_side(side)
+            by_tier = (
+                dict((tier_deficits or {}).get(wallet_type, {}) or {})
+                if isinstance(tier_deficits, dict)
+                else None
+            )
+            spares_by_tier = self._tier_spares_for_side(side)
+            if by_tier is not None and spares_by_tier is not None:
+                tier_deficit_total = sum(
+                    max(0, int(by_tier.get(tier, 0) or 0))
+                    for tier in ("inner", "mid", "outer", "extreme")
+                )
+                if tier_deficit_total < deficit:
+                    return False
+                if any(
+                    int(spares_by_tier.get(tier, 0) or 0)
+                    < int(by_tier.get(tier, 0) or 0)
+                    for tier in ("inner", "mid", "outer", "extreme")
+                ):
+                    return False
+                info["spares"] = sum(spares_by_tier.values())
+                continue
             spare_count = self._available_tier_spares_for_side(side)
             if spare_count is None or int(spare_count) < deficit:
                 return False
@@ -3923,65 +4687,16 @@ class BotLoop:
             )
 
     def _try_start_mempool_watcher(self, *, log_skip: bool = False) -> bool:
-        """F78 (2026-04-17): attempt to start the mempool watcher.
+        """Keep the TibetSwap-pair mempool watcher retired in v1.4."""
 
-        Split out from :meth:`start` so the main loop can call it each
-        cycle when the initial attempt at boot failed (usually because
-        the TibetSwap pair_id hadn't been resolved yet).
-
-        Returns True on successful start or when already running;
-        False when it couldn't start (caller should retry next cycle).
-        """
-        if not (
-            _mempool_watcher_mod
-            and getattr(cfg, "COINSET_ENABLED", True)
-            and cfg.CAT_ASSET_ID
-        ):
-            return False
-        # Already running?
-        try:
-            if getattr(_mempool_watcher_mod, "_watcher_instance", None) is not None:
-                return True
-        except Exception:
-            pass
-
-        try:
-            pair_id = getattr(cfg, "_cached_tibet_pair_id", "") or ""
-            if not pair_id:
-                from price_engine import PriceEngine as _PE
-
-                _tmp_pe = _PE()
-                _tmp_pair = _tmp_pe._find_tibet_pair(cfg.CAT_ASSET_ID) or {}
-                pair_id = _tmp_pair.get("pair_id", "")
-            if not pair_id:
-                if log_skip:
-                    log_event(
-                        "info",
-                        "mempool_watcher_deferred",
-                        "Mempool watcher deferred — TibetSwap pair_id "
-                        "not resolved yet; will retry on next cycle",
-                    )
-                return False
-            _mempool_watcher_mod.start_watcher(
-                pair_id=pair_id,
-                asset_id=cfg.CAT_ASSET_ID,
-                cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3) or 3),
-                wake_callback=self._watcher_event.set,
-            )
+        if log_skip:
             log_event(
                 "info",
-                "mempool_watcher_init",
-                f"Mempool watcher started (pair {pair_id[:16]}...)",
+                "tibetswap_mempool_watcher_retired",
+                "Legacy pair-specific mempool watching is retired; "
+                "offer-book and exact chain evidence remain active",
             )
-            return True
-        except Exception as _mw_err:
-            if log_skip:
-                log_event(
-                    "warning",
-                    "mempool_watcher_skip",
-                    f"Mempool watcher could not start: {_mw_err}",
-                )
-            return False
+        return False
 
     def _run_ladder_watchdog(self) -> None:
         """F72: Periodic ladder + coin-accounting integrity audit.
@@ -4987,11 +5702,15 @@ class BotLoop:
         )
         self._health_thread.start()
 
-        # Price watcher thread (V1 parity)
-        self._watcher_thread = threading.Thread(
-            target=self._price_watcher_thread, daemon=True, name="price-watcher"
+        # TibetSwap's reserve watcher is retired in the offer-book model.
+        # Do not create a thread whose intentional immediate exit would be
+        # misclassified by the liveness watchdog as a crash.
+        self._watcher_thread = None
+        log_event(
+            "info",
+            "tibetswap_price_watcher_retired",
+            "TibetSwap reserve watcher is retired in the offer-book market model",
         )
-        self._watcher_thread.start()
 
         # Mempool watcher — pre-emptive price intelligence
         # Polls Coinset mempool every 5s for pending Tibet pool spends,
@@ -5003,14 +5722,11 @@ class BotLoop:
         # self._mempool_watcher_needs_start. Previously this block
         # failed silently and the watcher never started for the session.
         self._mempool_watcher_needs_start = False
-        if (
-            _mempool_watcher_mod
-            and getattr(cfg, "COINSET_ENABLED", True)
-            and cfg.CAT_ASSET_ID
-        ):
-            started = self._try_start_mempool_watcher(log_skip=True)
-            if not started:
-                self._mempool_watcher_needs_start = True
+        log_event(
+            "info",
+            "tibetswap_mempool_watcher_retired",
+            "TibetSwap reserve-spend watcher retired after the service shutdown",
+        )
 
         # Coin watcher thread (lifecycle tracking)
         self._coin_watcher_thread = threading.Thread(
@@ -5056,16 +5772,12 @@ class BotLoop:
                     f"Failed to auto-start Splash node: {e}",
                 )
 
-        # AMM monitor — starts background polling thread for live reserve data
-        if getattr(cfg, "TIBET_PAIR_ID", "").strip():
-            try:
-                self.amm_monitor.start()
-            except Exception as _amm_err:
-                log_event(
-                    "warning",
-                    "amm_monitor_start_failed",
-                    f"AMM Monitor could not start: {_amm_err}",
-                )
+        # The AMM monitor is intentionally not started in the post-TibetSwap model.
+        log_event(
+            "info",
+            "tibetswap_amm_monitor_retired",
+            "TibetSwap AMM monitoring is retired; offer-book evidence is active",
+        )
 
         # Runtime monitor — tracks fill activity, conditions, diagnostics
         try:
@@ -5080,7 +5792,7 @@ class BotLoop:
         log_event(
             "info",
             "bot_started",
-            "Bot loop started (with health, price, coin, AMM, and runtime monitors)",
+            "Bot loop started (with health, offer-book, coin, and runtime monitors)",
         )
         return True
 
@@ -5189,6 +5901,25 @@ class BotLoop:
                     f"Splash node stop raised during shutdown: {e}",
                 )
 
+        if self._thread and self._thread.is_alive():
+            self._set_state(running=False, status="stopping")
+            log_event(
+                "warning",
+                "bot_loop_stop_waiting",
+                "Bot stop is still waiting for the active cycle to finish; "
+                "the app will not report stopped prematurely",
+            )
+            if not (
+                self._stop_finalize_thread and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+            return False
+
         self._set_state(status="stopped")
 
         # Clear all operational alerts so they don't linger on the GUI after stop
@@ -5244,6 +5975,18 @@ class BotLoop:
                 and self._thread is not threading.current_thread()
             ):
                 self._thread.join(timeout=30)
+                if self._thread.is_alive():
+                    self._set_state(running=False, status="stopping")
+                    log_event(
+                        "warning",
+                        "bot_loop_stop_waiting",
+                        "Bot stop is still waiting for the active cycle to finish; "
+                        "the app will not report stopped prematurely",
+                    )
+                    # This runs only on the asynchronous stop-finalizer daemon.
+                    # Remain truthful until an in-flight wallet/RPC operation
+                    # returns and the trading thread has actually terminated.
+                    self._thread.join()
 
             if self._splash_receive_thread and self._splash_receive_thread.is_alive():
                 self._splash_receive_thread.join(timeout=5)
@@ -5484,6 +6227,11 @@ class BotLoop:
             pair_hint = classified.get("pair_hint") or "unknown"
 
             if classified.get("relevant"):
+                self._remember_splash_confidence_offer(
+                    fingerprint=str(offer.get("fingerprint") or f"splash:{offer_id}"),
+                    classified=classified,
+                    observed_at=datetime.now(timezone.utc),
+                )
                 update_splash_incoming_status(
                     offer_id, "processed", pair_hint=pair_hint
                 )
@@ -5556,6 +6304,43 @@ class BotLoop:
     # Main loop
     # -------------------------------------------------------------------
 
+    def _market_evidence_poll_interval_seconds(self) -> int:
+        """Poll quickly while capital or unresolved publication is exposed."""
+
+        state = dict(getattr(self, "_bot_state", {}) or {})
+        has_live_offers = (
+            int(state.get("open_buys", 0) or 0) > 0
+            or int(state.get("open_sells", 0) or 0) > 0
+        )
+        pending_publication = (
+            int(getattr(self, "_publication_discovery_pending", 0) or 0) > 0
+        )
+        pending_cancels = bool(self._pending_cancel_settle_counts())
+        return 5 if has_live_offers or pending_publication or pending_cancels else 25
+
+    def _wait_for_watcher_with_market_refresh(self, sleep_seconds: float) -> bool:
+        """Wait for the next cycle while keeping offer-book evidence current."""
+
+        deadline = time.monotonic() + max(0.0, float(sleep_seconds or 0))
+        while self._running:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            wait_seconds = min(
+                remaining, float(self._market_evidence_poll_interval_seconds())
+            )
+            if self._watcher_event.wait(timeout=wait_seconds):
+                return True
+            if not self._running or time.monotonic() >= deadline:
+                return False
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(
+                    now=datetime.now(timezone.utc), error=exc
+                )
+        return False
+
     def _run_loop(self):
         """The main trading loop — runs forever until stopped."""
         log_event("info", "bot_loop_init", "Initialising bot loop...")
@@ -5575,9 +6360,18 @@ class BotLoop:
         )
         self._startup_complete.set()  # Ungate background threads
 
-        # Drain restart-surviving publication work only after read-only startup
-        # recovery has completed and every outbound adapter is claim-backed.
-        self._flush_public_offer_queues()
+        # Drain restart-surviving publication work only when startup recovered a
+        # still-fresh, publication-capable confidence snapshot.  A normal cycle
+        # refreshes market evidence before its own queue drain, so deferring here
+        # avoids turning harmless startup age into a global market failure.
+        if self._background_publication_snapshot_ready():
+            self._flush_public_offer_queues()
+        else:
+            log_event(
+                "info",
+                "publication_outbox_startup_drain_deferred",
+                "Deferred durable publication queue drain until the first fresh market cycle",
+            )
 
         self._set_state(status="running")
 
@@ -5611,7 +6405,7 @@ class BotLoop:
 
             # Sleep until next cycle — OR wake early if price watcher detects a swap
             sleep_time = max(1, cfg.LOOP_SECONDS - self._last_loop_duration)
-            watcher_triggered = self._watcher_event.wait(timeout=sleep_time)
+            watcher_triggered = self._wait_for_watcher_with_market_refresh(sleep_time)
             self._watcher_event.clear()
 
             if watcher_triggered and self._running:
@@ -6497,37 +7291,42 @@ class BotLoop:
     def _refresh_price_if_mempool_move_pending(
         self, mid_price: Decimal, arb_gap: Decimal
     ):
-        """Refresh the current cycle's price after an in-cycle reserve move."""
+        """Refresh the cycle from attributable offer-book evidence only."""
         if not getattr(self, "_mempool_price_refresh_needed", False):
             return mid_price, arb_gap, None
 
         self._mempool_price_refresh_needed = False
         try:
-            fresh_price = self.price_engine.get_price(
-                cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+            market_result = self._refresh_offer_book_market()
+            fresh_mid = (
+                market_result.confidence.trusted_midpoint
+                if market_result is not None
+                else None
             )
-            if not fresh_price:
+            if fresh_mid is None or fresh_mid <= 0:
                 return mid_price, arb_gap, None
-
-            fresh_mid = Decimal(str(fresh_price.get("mid_price", 0) or 0))
-            if fresh_mid <= 0:
-                return mid_price, arb_gap, fresh_price
-
-            fresh_arb = Decimal(str(fresh_price.get("arb_gap_bps", arb_gap) or 0))
+            fresh_arb = Decimal("0")
+            fresh_price = {
+                "mid_price": str(fresh_mid),
+                "dexie_price": str(fresh_mid),
+                "tibet_price": "",
+                "arb_gap_bps": "0",
+                "source": "attributable_offer_book",
+            }
             old_mid = mid_price
             self._current_mid_price = fresh_mid
             self._set_state(mid_price=str(fresh_mid), arb_gap_bps=str(fresh_arb))
             self.risk_manager.update_arb_gap(fresh_arb)
             log_event(
                 "info",
-                "mempool_reprice_applied",
-                f"Applied confirmed reserve price before trading decisions: "
+                "offer_book_reprice_applied",
+                f"Applied refreshed offer-book price before trading decisions: "
                 f"{old_mid:.8f} -> {fresh_mid:.8f}",
                 data={
                     "old_mid": str(old_mid),
                     "new_mid": str(fresh_mid),
                     "arb_gap_bps": str(fresh_arb),
-                    "tibet_price": str(fresh_price.get("tibet_price", "")),
+                    "market_confidence": market_result.confidence.state,
                 },
             )
             self._emit(
@@ -6535,7 +7334,7 @@ class BotLoop:
                 {
                     "mid_price": str(fresh_mid),
                     "dexie_price": str(fresh_price.get("dexie_price", "")),
-                    "tibet_price": str(fresh_price.get("tibet_price", "")),
+                    "tibet_price": "",
                     "arb_gap_bps": str(fresh_arb),
                     "spread_bps": self._bot_state.get("spread_bps", "0"),
                 },
@@ -6544,8 +7343,8 @@ class BotLoop:
         except Exception as e:
             log_event(
                 "warning",
-                "mempool_reprice_failed",
-                f"Could not refresh price after confirmed reserve move: {e}",
+                "offer_book_reprice_failed",
+                f"Could not refresh attributable offer-book price: {e}",
             )
             return mid_price, arb_gap, None
 
@@ -7206,27 +8005,19 @@ class BotLoop:
                     f"Wallet address detection failed: {e}",
                 )
 
-            # ---- Auto-resolve CAT metadata (TIBET_PAIR_ID, CAT_TICKER_ID, CAT_NAME) ----
-            # Given only CAT_ASSET_ID, queries TibetSwap to fill any empty derived fields.
+            # ---- Resolve CAT metadata for the offer-book market ----
             # Only fills fields that are unset in .env — never overwrites explicit config.
             try:
                 from cat_resolver import resolve_and_apply as _resolve_cat
 
                 _cat_meta = _resolve_cat(cfg)
-                if _cat_meta.get("pair_id"):
-                    slog(
-                        "STARTUP",
-                        f"CAT metadata resolved — "
-                        f"pair_id={_cat_meta['pair_id'][:20]}... "
-                        f"ticker={_cat_meta.get('ticker_id')} "
-                        f"name={_cat_meta.get('name')}",
-                    )
-                else:
-                    slog(
-                        "STARTUP",
-                        "CAT metadata: token not found on TibetSwap "
-                        "(no pair/ticker auto-resolved — check CAT_TICKER_ID in .env)",
-                    )
+                slog(
+                    "STARTUP",
+                    "CAT metadata ready for offer-book market — "
+                    f"ticker={_cat_meta.get('ticker_id') or cfg.CAT_TICKER_ID or 'unresolved'} "
+                    f"name={_cat_meta.get('name') or cfg.CAT_NAME or 'unresolved'}; "
+                    "TibetSwap is retired",
+                )
             except Exception as e:
                 log_event(
                     "warning",
@@ -7485,9 +8276,9 @@ class BotLoop:
 
             # Coin readiness report — shows per-tier availability vs requirements
             # so we know exactly what's available before creating offers
-            readiness = self.coin_manager.coin_readiness_report()
+            readiness = self._startup_coin_readiness_report()
             resumed_live_book = len(wallet_open_ids) > 0
-            if not readiness.get("overall_ready", True):
+            if readiness is not None and not readiness.get("overall_ready", True):
                 status = readiness.get("overall_status", "UNKNOWN")
                 if status == "CRITICAL":
                     # Suppress the warning if coin prep is running or about
@@ -7533,7 +8324,7 @@ class BotLoop:
             # visible rather than silently deferring to "topup when needed."
             try:
                 _tier_low_msgs = []
-                for _tn, _ti in readiness.get("tiers", {}).items():
+                for _tn, _ti in (readiness or {}).get("tiers", {}).items():
                     _xch_rem = _ti.get("xch_spare_remaining", 0)
                     _cat_rem = _ti.get("cat_spare_remaining", 0)
                     _xch_status = _ti.get("xch_status", "READY")
@@ -7996,19 +8787,18 @@ class BotLoop:
             # and ALL requoting (normal + emergency) is disabled because the
             # "if last_price <= 0: continue" check skips both sides.
             try:
-                startup_price = self.price_engine.get_price(
-                    cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+                startup_market = self._refresh_offer_book_market()
+                startup_mid = (
+                    startup_market.confidence.trusted_midpoint
+                    if startup_market is not None
+                    else None
                 )
-                startup_mid = Decimal(str(startup_price.get("mid_price", 0)))
-                startup_arb_gap = Decimal(str(startup_price.get("arb_gap_bps", 0) or 0))
-                startup_tibet = Decimal(str(startup_price.get("tibet_price", 0) or 0))
-                if startup_mid > 0:
+                if startup_mid is not None and startup_mid > 0:
                     self._last_quoted_price["buy"] = startup_mid
                     self._last_quoted_price["sell"] = startup_mid
                     # F67: plain mid == startup mid at this point (no probe yet)
                     self._last_quoted_plain_mid["buy"] = startup_mid
                     self._last_quoted_plain_mid["sell"] = startup_mid
-                    self.amm_monitor.notify_quoted_price(startup_mid, startup_mid)
                     self._current_mid_price = startup_mid
                     with self._probe_lock:
                         if self._probe_state.get("confirmed_price") in (
@@ -8016,31 +8806,22 @@ class BotLoop:
                             Decimal("0"),
                         ):
                             self._probe_state["confirmed_price"] = startup_mid
-                    self._remember_probe_market_snapshot(
-                        startup_mid,
-                        startup_arb_gap,
-                        startup_tibet,
-                        "startup_baseline",
-                    )
                     baseline_msg = (
                         f"📌 Requote baseline set: {startup_mid:.8f} XCH "
                         f"(enables requoting + emergency requote)"
                     )
-                    print(baseline_msg, flush=True)
                     log_event("info", "startup_baseline_price", baseline_msg)
                 else:
-                    print(
-                        "[WARN] Could not set requote baseline -- mid_price is 0!",
-                        flush=True,
-                    )
                     log_event(
                         "warning",
                         "startup_baseline_zero",
                         "mid_price was 0 — requoting will be disabled until offers are created",
                     )
             except Exception as e:
+                self._enforce_market_refresh_failure(
+                    now=datetime.now(timezone.utc), error=e
+                )
                 err_msg = f"[WARN] Could not set baseline price: {e}"
-                print(err_msg, flush=True)
                 log_event("warning", "startup_baseline_failed", err_msg)
 
             # ---- V3: Initialize Coinset puzzle hash cache ----
@@ -8465,164 +9246,46 @@ class BotLoop:
         except Exception:
             pass  # Sweep coordinator is additive — never block main cycle
 
-        # ---- Step 1: Fetch prices ----
+        # ---- Step 1: Derive price from attributable offer-book evidence ----
         self._set_cycle_step("step1_price_fetch")
-        price_data = self.price_engine.get_price(
-            cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+        try:
+            market_result = self._refresh_offer_book_market()
+        except Exception as market_error:
+            market_result = None
+            self._enforce_market_refresh_failure(
+                now=datetime.now(timezone.utc), error=market_error
+            )
+        trusted_midpoint = (
+            market_result.confidence.trusted_midpoint if market_result else None
+        )
+        price_data = (
+            {
+                "mid_price": str(trusted_midpoint),
+                "dexie_price": str(trusted_midpoint),
+                "tibet_price": "",
+                "arb_gap_bps": "0",
+                "source": "attributable_offer_book",
+            }
+            if trusted_midpoint is not None
+            else None
         )
 
         if price_data is None:
-            # get_price() returns None for two different failure modes:
-            #   (a) a safety-guard rail breach (handled below via CB), or
-            #   (b) both oracles (Dexie + TibetSwap) failed to produce a
-            #       usable number. Case (b) is an oracle OUTAGE — if we
-            #       don't track how long it has lasted, stale offers sit
-            #       on the book at the old mid while the market may have
-            #       moved. The stale-age counter below escalates the
-            #       response from soft warn (>60s) to hard pause (>120s)
-            #       so the book cannot stay exposed indefinitely.
-            now_outage = time.time()
-            prev_success = float(self._last_pricing_success_ts or 0)
-            outage_age = (now_outage - prev_success) if prev_success > 0 else 0.0
-            stale_threshold = int(getattr(cfg, "PRICE_STALE_ALERT_SECS", 60))
-            hard_pause_threshold = int(getattr(cfg, "PRICE_HARD_PAUSE_SECS", 120))
-
-            rail_dir = getattr(self.price_engine, "_last_rail_breach", None)
-            rail_kind = getattr(self.price_engine, "_last_rail_breach_kind", None)
-            rail_price = getattr(self.price_engine, "_last_rail_breach_price", None)
-            if rail_dir in ("above", "below"):
-                _direction_note = {
-                    "above": "rail breach ABOVE — price spike past upper rail",
-                    "below": "rail breach BELOW — price drop past lower rail",
-                }.get(rail_dir, f"rail breach ({rail_dir})")
-                _kind_note = f" [{rail_kind}]" if rail_kind else ""
-                _price_note = f" at {rail_price}" if rail_price is not None else ""
-                _reason = f"{_direction_note}{_kind_note}{_price_note}"
-                try:
-                    self.risk_manager.trip_price_rail_breach(_reason)
-                    self._set_state(status="circuit_breaker")
-                    self._emit_alert(
-                        "circuit_breaker",
-                        "error",
-                        "Price Rail Breach",
-                        _reason,
-                        action="stop_bot",
-                        action_label="Stop Bot",
-                    )
-                    log_event(
-                        "critical",
-                        "rail_breach",
-                        f"Price rail breach detected — tripping price CB and "
-                        f"cancelling stale offers ({_reason})",
-                        data={
-                            "direction": rail_dir,
-                            "kind": rail_kind,
-                            "rejected_price": str(rail_price)
-                            if rail_price is not None
-                            else None,
-                        },
-                    )
-                    # _safeguard cancels ALL offers for a price CB. Without
-                    # this call, stale offers stay on the book at the old
-                    # mid until the CB clears or the operator intervenes.
-                    self._safeguard_offers_for_circuit_breaker()
-                except Exception as _e:
-                    log_event(
-                        "error",
-                        "rail_breach_safeguard_failed",
-                        f"Rail breach safeguard failed: {_e}",
-                    )
-            # Oracle outage escalation (runs regardless of rail-breach path).
-            # Only escalate once we have a prior success timestamp to measure
-            # against — the first post-startup failure is not yet an outage.
-            if prev_success > 0 and rail_dir not in ("above", "below"):
-                if outage_age >= hard_pause_threshold:
-                    log_event(
-                        "critical",
-                        "price_outage_hard_pause",
-                        f"Oracle outage has lasted {outage_age:.0f}s "
-                        f"(>= {hard_pause_threshold}s hard-pause threshold). "
-                        f"Cancelling all offers and tripping the price CB "
-                        f"so the book does not stay exposed on a stale mid.",
-                        data={
-                            "outage_age_secs": outage_age,
-                            "hard_pause_threshold": hard_pause_threshold,
-                        },
-                    )
-                    try:
-                        self.risk_manager.trip_price_rail_breach(
-                            f"oracle outage >= {hard_pause_threshold}s"
-                        )
-                        self._set_state(status="circuit_breaker")
-                        self._emit_alert(
-                            "circuit_breaker",
-                            "error",
-                            "Oracle Outage — Hard Pause",
-                            f"Price oracle has been unavailable for "
-                            f"{outage_age:.0f}s. All offers cancelled.",
-                            action="stop_bot",
-                            action_label="Stop Bot",
-                        )
-                        self._safeguard_offers_for_circuit_breaker()
-                    except Exception as _e:
-                        log_event(
-                            "error",
-                            "price_outage_safeguard_failed",
-                            f"Oracle-outage safeguard failed: {_e}",
-                        )
-                elif outage_age >= stale_threshold:
-                    log_event(
-                        "warning",
-                        "price_outage_stale",
-                        f"Oracle stale for {outage_age:.0f}s "
-                        f"(alert threshold {stale_threshold}s; hard pause "
-                        f"at {hard_pause_threshold}s). Offers still live "
-                        f"on last-known mid.",
-                        data={
-                            "outage_age_secs": outage_age,
-                            "stale_threshold": stale_threshold,
-                        },
-                    )
-                    try:
-                        self._emit_alert(
-                            "price_stale",
-                            "warning",
-                            "Oracle Stale",
-                            f"Price sources have not responded for "
-                            f"{outage_age:.0f}s — offers still live. If this "
-                            f"reaches {hard_pause_threshold}s the bot will "
-                            f"hard-pause automatically.",
-                        )
-                    except Exception as _alert_err:
-                        log_event(
-                            "debug",
-                            "price_outage_alert_failed",
-                            f"Price-stale alert emit failed: {_alert_err}",
-                        )
-
-            # Run self-heal / reconcile passes even when we can't trade.
-            # These are read/repair-only and do not create or requote offers,
-            # so they are safe during an oracle outage and — critically —
-            # prevent stuck pending-cancel rows, orphan coin locks, and
-            # phantom fills from piling up while pricing is unavailable.
-            # Each check has its own internal throttle (see bot_health.py)
-            # so calling it here does not create extra load.
             try:
-                from bot_health import run_runtime_checks as _no_price_health
+                from bot_health import run_runtime_checks as _no_market_health
 
-                _no_price_health(auto_repair=True)
-            except Exception as _hc_err:
+                _no_market_health(auto_repair=True)
+            except Exception as health_error:
                 log_event(
                     "debug",
-                    "no_price_self_heal_failed",
-                    f"Self-heal during oracle outage failed: {_hc_err}",
+                    "no_market_self_heal_failed",
+                    f"Self-heal during market confidence loss failed: {health_error}",
                 )
-
             log_event(
                 "warning",
-                "no_price",
-                "Price rejected by safety guard — skipping cycle. "
-                "Check HARD_MAX_PRICE_XCH / HARD_MIN_PRICE_XCH or dynamic band settings.",
+                "market_confidence_no_trusted_price",
+                "No attributable trusted offer-book price is available; "
+                "new exposure and requotes remain blocked",
             )
             return
 
@@ -8708,29 +9371,12 @@ class BotLoop:
             },
         )
 
-        # Terminal heartbeat — every loop (terminal is dev-only, GUI is for users)
-        dexie_p = price_data.get("dexie_price", "")
-        tibet_p = price_data.get("tibet_price", "")
-        print(f"\n{'=' * 70}", flush=True)
-        print(
-            f"💓 Loop {self._loop_count} | mid: {mid_price:.8f} | "
-            f"arb gap: {_bps_to_pct(arb_gap)} | "
-            f"spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
-            flush=True,
-        )
-
-        # Console heartbeat — user-visible cycle start
+        # Structured cycle heartbeat for the GUI and durable diagnostics.
         log_event(
             "info",
             "cycle_start",
             f"Cycle #{self._loop_count} — mid price: {mid_price:.8f} XCH, "
             f"arb gap: {_bps_to_pct(arb_gap)}, spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
-        )
-        baseline_val = self._last_quoted_price.get("sell", Decimal("0"))
-        baseline_str = f"{baseline_val:.8f}" if baseline_val > 0 else "pending requote"
-        print(
-            f"   Dexie: {dexie_p} | Tibet: {tibet_p} | baseline: {baseline_str}",
-            flush=True,
         )
 
         # ---- Step 1b: Refresh market intelligence (NEW — ecosystem) ----
@@ -9149,6 +9795,25 @@ class BotLoop:
             self._clear_alert("wallet_offer_sync")
             self._wallet_sync_was_stale = False
 
+            # Resume durable child-first refresh work on every fresh wallet
+            # cycle.  Recovery must not depend on a later price move, requote
+            # budget, tier filter, or cap trim happening to select the parent.
+            if not self._enter_runtime_effect_phase("cancel"):
+                return
+            lineage_state = self.offer_manager.resume_pending_refresh_lineages(
+                _db_buy_all, _db_sell_all
+            )
+            pending_lineages = {
+                side: reason for side, reason in lineage_state.items() if reason
+            }
+            if pending_lineages:
+                log_event(
+                    "info",
+                    "refresh_lineage_cycle_resume",
+                    "Durable offer refresh lineage recovery advanced before fill detection",
+                    data=pending_lineages,
+                )
+
         if self._cycle_stop_requested("post_wallet_sync"):
             return
 
@@ -9224,11 +9889,16 @@ class BotLoop:
             buy_fills=buy_fills,
             sell_fills=sell_fills,
         )
-        toxicity_cancelled = self._cancel_toxicity_throttled_offers(
-            toxicity_snapshot,
-            current_buy_ids=current_buy_ids,
-            current_sell_ids=current_sell_ids,
+        _bootstrap_cycle_policy = plan_bootstrap_cycle_mutations(
+            bootstrap_active=self._bootstrap_campaign_blocks_follow_mutations()
         )
+        toxicity_cancelled = {"buy": set(), "sell": set()}
+        if _bootstrap_cycle_policy["toxicity_cancel"]:
+            toxicity_cancelled = self._cancel_toxicity_throttled_offers(
+                toxicity_snapshot,
+                current_buy_ids=current_buy_ids,
+                current_sell_ids=current_sell_ids,
+            )
         if toxicity_cancelled["buy"] or toxicity_cancelled["sell"]:
             current_buy_ids -= toxicity_cancelled["buy"]
             current_sell_ids -= toxicity_cancelled["sell"]
@@ -9246,118 +9916,6 @@ class BotLoop:
         if not buy_fills and not sell_fills:
             print(" none", flush=True)
             pass  # No fills — nothing to log
-
-        # ---- AMM drift check — force requote if AMM price has moved ----
-        # If AMMMonitor has data, check whether the current AMM price has
-        # drifted far enough from our last quoted prices to make our offers
-        # arb targets. If so, flag both sides for requote immediately.
-        #
-        # Fix 4: cooldown gate. The AMM drift trigger used to bypass
-        # REQUOTE_COOLDOWN_SECS, which combined with a stale baseline
-        # (which Fix 4's baseline-on-attempt advance also addresses) caused
-        # a feedback loop where every cycle re-fired the same drift,
-        # generating a requote storm. We now refuse to re-trigger drift
-        # requote within REQUOTE_COOLDOWN_SECS of the last AMM-drift force.
-        try:
-            if self.amm_monitor.is_available() and self._loop_count > 5:
-                amm_drift_bps = self.amm_monitor.get_drift_bps()
-                if amm_drift_bps is not None:
-                    _drift_threshold = Decimal(
-                        str(getattr(cfg, "AMM_DRIFT_REQUOTE_BPS", "80"))
-                    )
-                    if amm_drift_bps >= _drift_threshold:
-                        _now = time.time()
-                        _cooldown = float(
-                            getattr(cfg, "REQUOTE_COOLDOWN_SECS", 60) or 60
-                        )
-
-                        # Per-side AMM-drift cooldown. Previously one shared
-                        # scalar gated both sides, so a buy-side force set
-                        # at t=0 blocked a sell-side force at t=30 even
-                        # though the opposite-direction move had just
-                        # exposed the sell ladder. Track buy and sell
-                        # independently; fall back to the legacy scalar
-                        # once on upgrade so operators mid-session don't
-                        # get an immediate double-fire.
-                        if not isinstance(
-                            getattr(self, "_last_amm_drift_force_at", None), dict
-                        ):
-                            _legacy = float(
-                                getattr(self, "_last_amm_drift_force_at", 0) or 0
-                            )
-                            self._last_amm_drift_force_at = {
-                                "buy": _legacy,
-                                "sell": _legacy,
-                            }
-
-                            # Determine which side is vulnerable based on price direction
-                        try:
-                            _amm_state = self.amm_monitor._state or {}
-                            _amm_price = Decimal(
-                                str(_amm_state.get("amm_price", 0) or 0)
-                            )
-                            if _amm_price > 0 and self._current_mid_price > 0:
-                                _target_sides = (
-                                    ["buy"]
-                                    if _amm_price < self._current_mid_price
-                                    else ["sell"]
-                                )
-                                _direction_note = (
-                                    "price DOWN"
-                                    if _amm_price < self._current_mid_price
-                                    else "price UP"
-                                )
-                            else:
-                                _target_sides = ["buy", "sell"]
-                                _direction_note = "direction unknown"
-                        except Exception:
-                            _target_sides = ["buy", "sell"]
-                            _direction_note = "direction error"
-
-                        for _target_side in _target_sides:
-                            _backoff_remaining = self._requote_backoff_remaining(
-                                _target_side
-                            )
-                            if _backoff_remaining > 0:
-                                log_event(
-                                    "info",
-                                    "amm_drift_requote_backoff",
-                                    f"AMM drift would force {_target_side} requote, "
-                                    f"but that side is in requote failure backoff "
-                                    f"for {_backoff_remaining:.0f}s",
-                                    data={
-                                        "side": _target_side,
-                                        "remaining_secs": round(_backoff_remaining, 1),
-                                    },
-                                )
-                                continue
-                            _last_force = float(
-                                self._last_amm_drift_force_at.get(_target_side, 0) or 0
-                            )
-                            if (_now - _last_force) < _cooldown:
-                                continue  # per-side cooldown active
-                            if not self._force_requote.get(_target_side):
-                                log_event(
-                                    "info",
-                                    "amm_drift_requote_triggered",
-                                    f"AMM drift {_bps_to_pct(amm_drift_bps)} "
-                                    f"({_direction_note}) — forcing "
-                                    f"{_target_side} requote",
-                                    data={
-                                        "drift_bps": str(
-                                            amm_drift_bps.quantize(Decimal("0.1"))
-                                        ),
-                                        "side": _target_side,
-                                    },
-                                )
-                            self._force_requote[_target_side] = True
-                            self._last_amm_drift_force_at[_target_side] = _now
-        except Exception as _amm_drift_err:
-            log_event(
-                "debug",
-                "amm_drift_check_error",
-                f"AMM drift check error (non-critical): {_amm_drift_err}",
-            )
 
         fills_hour = None
         try:
@@ -9418,7 +9976,8 @@ class BotLoop:
         # with zero gap in market presence.
         expired = 0
         if (
-            cfg.OFFER_EXPIRY_SECS > 0
+            _bootstrap_cycle_policy["expiry_refresh"]
+            and cfg.OFFER_EXPIRY_SECS > 0
             and not getattr(self, "_graceful_in_progress", False)
             and not self._recovery_is_active()
         ):
@@ -9571,7 +10130,9 @@ class BotLoop:
         #   5. If both taken → widen both → retry
         #   6. Only after probe confirms do main offers deploy
         sniper_fired = False
-        _sniper_on = getattr(cfg, "SNIPER_ENABLED", True)
+        # v1.4: legacy AMM sniper/probe execution is permanently fenced even
+        # when an upgraded .env still contains SNIPER_ENABLED=true.
+        _sniper_on = False
         recovery_active_now = self._recovery_is_active()
         launch_reason = self._get_sniper_launch_reason(
             mid_price,
@@ -10148,47 +10709,18 @@ class BotLoop:
                 f"(startup or material market shift) — keeping sniper idle",
             )
 
-        # ---- Step 8b: Re-evaluate prices after sniper ----
-        # If the sniper just fired, the market has moved. Fetch fresh prices
-        # so the main offer batch (Step 10) uses post-snipe pricing.
+        # ---- Step 8b: Legacy sniper compatibility fence ----
+        # v1.4 never derives a second intra-cycle price from the retired AMM
+        # path. If an upgraded configuration somehow fires legacy sniper code,
+        # keep the coherent snapshot and prevent a follow-on ladder expansion.
         if sniper_fired:
             log_event(
-                "info",
-                "post_snipe_reprice",
-                "Sniper fired — re-fetching prices before creating main offer batch",
+                "error",
+                "legacy_sniper_runtime_blocked",
+                "Legacy sniper activity was detected after retirement; "
+                "skipping the remainder of this cycle",
             )
-            fresh_price = self.price_engine.get_price(
-                cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
-            )
-            fresh_mid = Decimal(str(fresh_price.get("mid_price", 0)))
-            if fresh_mid > 0:
-                old_mid = mid_price
-                mid_price = fresh_mid
-                self._current_mid_price = mid_price
-                self._set_state(mid_price=str(mid_price))
-
-                # Update arb gap with fresh data
-                arb_gap = Decimal(str(fresh_price.get("arb_gap_bps", 0)))
-                self.risk_manager.update_arb_gap(arb_gap)
-
-                log_event(
-                    "info",
-                    "post_snipe_price",
-                    f"Post-snipe price: {old_mid:.8f} → {fresh_mid:.8f} "
-                    f"(arb gap now {_bps_to_pct(arb_gap)})",
-                )
-
-                # Push updated price to GUI
-                self._emit(
-                    "price_update",
-                    {
-                        "mid_price": str(mid_price),
-                        "dexie_price": str(fresh_price.get("dexie_price", "")),
-                        "tibet_price": str(fresh_price.get("tibet_price", "")),
-                        "arb_gap_bps": str(arb_gap),
-                        "spread_bps": self._bot_state.get("spread_bps", "0"),
-                    },
-                )
+            return
 
         # ---- Step 8b2: Emergency requote of stale offers on price shock ----
         # When a TibetSwap swap causes a large arb gap, old offers on the
@@ -10203,7 +10735,11 @@ class BotLoop:
         emergency_requote_triggered = (
             recent_swap and arb_gap > cfg.ARB_ALERT_THRESHOLD_BPS and mid_price > 0
         )
-        if emergency_requote_triggered and not recovery_active_now:
+        if (
+            _bootstrap_cycle_policy["emergency_requote"]
+            and emergency_requote_triggered
+            and not recovery_active_now
+        ):
             for eq_side in ["sell", "buy"]:
                 if not self._config_enables_side(eq_side):
                     self._force_requote[eq_side] = False
@@ -10258,7 +10794,6 @@ class BotLoop:
                         f"({last_q:.8f} -> {mid_price:.8f}, "
                         f"arb gap: {_bps_to_pct(arb_gap)})"
                     )
-                    print(msg, flush=True)  # Terminal-visible
                     log_event("warning", "emergency_requote", msg)
 
                     spread = self.risk_manager.get_adjusted_spread(eq_side)
@@ -10295,6 +10830,7 @@ class BotLoop:
                         price_floor=price_floor,
                         live_offer_ids=_live_ids,
                         force_cancel_storm=True,
+                        market_confidence=self._market_confidence_result,
                     )
                     # Note: do NOT add to _requoted_this_cycle until we
                     # know progress was made. Previously we stamped this
@@ -10360,7 +10896,6 @@ class BotLoop:
                             f"[OK] Emergency requote {eq_side}: "
                             f"{len(new_offers)} new offers at {requote_mid:.8f}"
                         )
-                        print(done_msg, flush=True)  # Terminal-visible
                         log_event("info", "emergency_requote_done", done_msg)
                     else:
                         if waiting_for_cancel_settle:
@@ -10401,7 +10936,8 @@ class BotLoop:
             self._probe_state.get("buy_tid") or self._probe_state.get("sell_tid")
         )
         if (
-            not recovery_active_now
+            _bootstrap_cycle_policy["sniper_cleanup"]
+            and not recovery_active_now
             and not self._probe_state.get("active", False)
             and self._probe_state.get("confirmed_price")
             and _has_probe_tid
@@ -10520,7 +11056,27 @@ class BotLoop:
                     f"{linger_remaining:.1f}s more before cleanup",
                 )
 
-        if self.boost_manager._boost_active and not recovery_active_now:
+        if (
+            self.boost_manager._boost_active
+            and not LEGACY_TIBET_BOOST_RUNTIME_ENABLED
+            and not recovery_active_now
+        ):
+            if self._enter_runtime_effect_phase("cancel"):
+                retired_result = self.boost_manager.deactivate()
+                log_event(
+                    "info",
+                    "legacy_boost_retirement_cleanup",
+                    "Retired TibetSwap-dependent boost offers were sent through "
+                    "authoritative cancellation cleanup",
+                    data=retired_result,
+                )
+
+        if (
+            LEGACY_TIBET_BOOST_RUNTIME_ENABLED
+            and _bootstrap_cycle_policy["boost_mutation"]
+            and self.boost_manager._boost_active
+            and not recovery_active_now
+        ):
             # 1. Keep offers alive and centred on price
             refreshed = self.boost_manager.refresh_if_needed(mid_price)
 
@@ -10561,7 +11117,6 @@ class BotLoop:
 
             if refreshed:
                 self._emit("boost", state)
-                print(f"   [8d] Gap closer refreshed at {mid_price:.8f}", flush=True)
 
             if stepped:
                 # Gap-closer tightened — let CASCADE handle main book tightening.
@@ -10633,7 +11188,8 @@ class BotLoop:
         force_tag = " FORCED!" if (force_buy or force_sell) else ""
         print(f"   [9] Requote check...{force_tag}", end="", flush=True)
         # step9 detail log removed — the actual requoting info log fires when needed
-        self._handle_requoting(mid_price, current_buy_ids, current_sell_ids)
+        if _bootstrap_cycle_policy["follow_requote"]:
+            self._handle_requoting(mid_price, current_buy_ids, current_sell_ids)
         print(" done", flush=True)
         # step9_done removed
 
@@ -10859,7 +11415,11 @@ class BotLoop:
 
         # ---- Step 12: Coin management ----
         print("   [12] Coin health...", end="", flush=True)
-        self._handle_coins(len(current_buy_ids), len(current_sell_ids))
+        self._handle_coins(
+            len(current_buy_ids),
+            len(current_sell_ids),
+            allow_legacy_topup=_bootstrap_cycle_policy["legacy_coin_topup"],
+        )
         print(" done", flush=True)
         # step12 log removed
 
@@ -10870,75 +11430,70 @@ class BotLoop:
         # the furthest-from-mid offers back down to cap. With Fix 1 in
         # place this should rarely fire — but when it does, it stops the
         # overshoot from accumulating across cycles.
-        try:
-            # Filter out zombie wallet offers (cancelled in DB but still active in
-            # Sage) before passing to trim so the trim doesn't count those against
-            # the cap and cancel freshly-created real offers.
-            _db_filtered_buys = [
-                o for o in open_buys if o.get("trade_id") in _db_open_buy_ids
-            ]
-            _db_filtered_sells = [
-                o for o in open_sells if o.get("trade_id") in _db_open_sell_ids
-            ]
-            if not self._enter_runtime_effect_phase("trim"):
-                return False
-            trimmed = self.offer_manager.trim_excess_offers(
-                mid_price,
-                wallet_buys=_db_filtered_buys,
-                wallet_sells=_db_filtered_sells,
-            )
-            if trimmed > 0:
-                log_event(
-                    "info",
-                    "trim_excess_done",
-                    f"Trim pass cancelled {trimmed} excess offer(s)",
+        if _bootstrap_cycle_policy["follow_trim"]:
+            try:
+                # Filter out zombie wallet offers (cancelled in DB but still active
+                # in Sage) before passing to trim so the trim doesn't count those
+                # against the cap and cancel freshly-created real offers.
+                _db_filtered_buys = [
+                    o for o in open_buys if o.get("trade_id") in _db_open_buy_ids
+                ]
+                _db_filtered_sells = [
+                    o for o in open_sells if o.get("trade_id") in _db_open_sell_ids
+                ]
+                if not self._enter_runtime_effect_phase("trim"):
+                    return False
+                trimmed = self.offer_manager.trim_excess_offers(
+                    mid_price,
+                    wallet_buys=_db_filtered_buys,
+                    wallet_sells=_db_filtered_sells,
                 )
-                # F14 fix (2026-04-08): track trim activity. Repeated trim
-                # firing means create-first requote is leaving offers
-                # behind faster than they can be cancelled — likely a
-                # wallet sync issue or aggressive requote schedule. Alert
-                # if we trim >5 cycles in a row.
-                self._trim_streak = getattr(self, "_trim_streak", 0) + 1
-                if self._trim_streak >= 5:
+                if trimmed > 0:
                     log_event(
-                        "warning",
-                        "trim_excess_sustained",
-                        f"Trim pass has fired for {self._trim_streak} "
-                        f"consecutive cycles — create-first requote may "
-                        f"be leaking offers. Investigate cancel latency "
-                        f"or pause requotes.",
+                        "info",
+                        "trim_excess_done",
+                        f"Trim pass cancelled {trimmed} excess offer(s)",
                     )
-                    self._emit_alert(
-                        "trim_sustained",
-                        "warning",
-                        "Offer Cleanup Lag",
-                        f"The create-first requote dance has been over-creating "
-                        f"offers for {self._trim_streak} cycles in a row. The "
-                        f"trim pass is cleaning up but cancel latency seems high.",
-                    )
-            else:
-                # Reset streak when a clean cycle happens
-                if getattr(self, "_trim_streak", 0) > 0:
+                    self._trim_streak = getattr(self, "_trim_streak", 0) + 1
+                    if self._trim_streak >= 5:
+                        log_event(
+                            "warning",
+                            "trim_excess_sustained",
+                            f"Trim pass has fired for {self._trim_streak} "
+                            f"consecutive cycles — create-first requote may "
+                            f"be leaking offers. Investigate cancel latency "
+                            f"or pause requotes.",
+                        )
+                        self._emit_alert(
+                            "trim_sustained",
+                            "warning",
+                            "Offer Cleanup Lag",
+                            f"The create-first requote dance has been over-creating "
+                            f"offers for {self._trim_streak} cycles in a row. The "
+                            f"trim pass is cleaning up but cancel latency seems high.",
+                        )
+                elif getattr(self, "_trim_streak", 0) > 0:
                     self._trim_streak = 0
                     self._clear_alert("trim_sustained")
-        except Exception as e:
-            log_event(
-                "warning",
-                "trim_excess_error",
-                f"Trim excess pass failed (non-fatal): {e}",
-            )
+            except Exception as e:
+                log_event(
+                    "warning",
+                    "trim_excess_error",
+                    f"Trim excess pass failed (non-fatal): {e}",
+                )
 
         # ---- Step 12b: Recovery mode evaluation ----
         # Subtract any confirmed probe slots so the probe offer doesn't inflate
         # the apparent buy count and mask a genuine under-target condition.
-        _probe_offsets = self._confirmed_probe_slot_offsets(
-            current_buy_ids, current_sell_ids
-        )
-        self._evaluate_recovery_mode(
-            mid_price,
-            max(0, len(current_buy_ids) - _probe_offsets["buy"]),
-            max(0, len(current_sell_ids) - _probe_offsets["sell"]),
-        )
+        if _bootstrap_cycle_policy["follow_recovery_evaluation"]:
+            _probe_offsets = self._confirmed_probe_slot_offsets(
+                current_buy_ids, current_sell_ids
+            )
+            self._evaluate_recovery_mode(
+                mid_price,
+                max(0, len(current_buy_ids) - _probe_offsets["buy"]),
+                max(0, len(current_sell_ids) - _probe_offsets["sell"]),
+            )
 
         # ---- Step 13: Housekeeping ----
         print("   [13-15] Housekeeping + inventory + GUI push...", end="", flush=True)
@@ -11129,6 +11684,15 @@ class BotLoop:
         if not cfg.AUTO_REQUOTE:
             return
 
+        if self._bootstrap_campaign_blocks_follow_mutations():
+            log_event(
+                "debug",
+                "bootstrap_follow_requote_blocked",
+                "Active Market Bootstrap campaign owns repricing; ordinary Follow "
+                "requote is disabled",
+            )
+            return
+
         if self._recovery_is_active():
             log_event(
                 "debug",
@@ -11153,44 +11717,30 @@ class BotLoop:
             log_event("debug", "requote_skip", "Coin manager busy — skipping requote")
             return
 
-        # ---- Fresh price for forced requotes ----
-        # When AMM drift forces a requote, the mid_price from Step 1 (cycle
-        # start) may already be stale — the AMM monitor may have detected a
-        # move AFTER get_price() ran but BEFORE we reach this point. The old
-        # mid_price would make us requote at the SAME price, wasting coins.
-        # Re-fetch now so the new offers are at the correct price.
+        # ---- Coherent price for forced requotes ----
+        # The cycle's persisted confidence snapshot is the sole mutation
+        # authority. Never replace it mid-cycle with an anonymous ticker or
+        # aggregate level because that would split the decision evidence.
         force_buy = self._force_requote.get("buy", False)
         force_sell = self._force_requote.get("sell", False)
         if force_buy or force_sell:
             try:
-                fresh_price = self.price_engine.get_price(
-                    cfg.CAT_ASSET_ID, cfg.CAT_DECIMALS, cfg.CAT_TICKER_ID
+                confidence = getattr(self, "_market_confidence_result", None)
+                fresh_mid = Decimal(
+                    str(getattr(confidence, "trusted_midpoint", 0) or 0)
                 )
-                if fresh_price:
-                    fresh_mid = Decimal(str(fresh_price.get("mid_price", 0)))
-                    if fresh_mid > 0 and fresh_mid != mid_price:
-                        old_mid = mid_price
-                        mid_price = fresh_mid
-                        self._current_mid_price = mid_price
-                        self._set_state(mid_price=str(mid_price))
-                        log_event(
-                            "info",
-                            "requote_price_refresh",
-                            f"Refreshed mid_price before forced requote: "
-                            f"{old_mid:.8f} -> {mid_price:.8f}",
-                            data={"old_mid": str(old_mid), "new_mid": str(mid_price)},
-                        )
-                        # Push updated price to GUI
-                        self._emit(
-                            "price_update",
-                            {
-                                "mid_price": str(mid_price),
-                                "dexie_price": str(fresh_price.get("dexie_price", "")),
-                                "tibet_price": str(fresh_price.get("tibet_price", "")),
-                                "arb_gap_bps": str(fresh_price.get("arb_gap_bps", "0")),
-                                "spread_bps": self._bot_state.get("spread_bps", "0"),
-                            },
-                        )
+                if fresh_mid > 0 and fresh_mid != mid_price:
+                    old_mid = mid_price
+                    mid_price = fresh_mid
+                    self._current_mid_price = mid_price
+                    self._set_state(mid_price=str(mid_price))
+                    log_event(
+                        "info",
+                        "requote_price_refresh",
+                        f"Applied coherent confidence midpoint before forced requote: "
+                        f"{old_mid:.8f} -> {mid_price:.8f}",
+                        data={"old_mid": str(old_mid), "new_mid": str(mid_price)},
+                    )
             except Exception as _e:
                 log_event(
                     "warning",
@@ -11476,7 +12026,6 @@ class BotLoop:
                     if forced
                     else f"price moved {last_price:.8f} -> {compare_mid:.8f} [{severity.value}]"
                 )
-                print(f"\n   [REQUOTE] {side} side ({reason})", flush=True)
                 log_event(
                     "info",
                     "requoting",
@@ -11576,6 +12125,7 @@ class BotLoop:
                         RequoteSeverity.FULL,
                         RequoteSeverity.EMERGENCY,
                     ),
+                    market_confidence=self._market_confidence_result,
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force
@@ -11763,6 +12313,469 @@ class BotLoop:
     # Offer creation
     # -------------------------------------------------------------------
 
+    def _bootstrap_campaign_context(self) -> dict:
+        """Resolve local Bootstrap ownership before any Follow mutation."""
+
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) != 64:
+            return {"active": False}
+        try:
+            campaigns = database.list_active_bootstrap_campaigns_for_asset(asset_id)
+        except Exception as exc:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_authority_read_failed",
+                "detail": str(exc),
+            }
+        if not campaigns:
+            return {"active": False}
+        if len(campaigns) != 1:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_authority_ambiguous",
+            }
+        try:
+            from wallet import get_wallet_identity
+
+            snapshot = get_wallet_identity()
+        except Exception as exc:
+            snapshot = {"success": False, "error": str(exc)}
+        if type(snapshot) is not dict or snapshot.get("success") is not True:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_wallet_identity_unavailable",
+            }
+        network_id = str(snapshot.get("network_id") or "").strip().lower()
+        network = (
+            "mainnet"
+            if network_id == "mainnet"
+            else "testnet"
+            if network_id.startswith("testnet")
+            else ""
+        )
+        identity = {
+            "network": network,
+            "wallet_type": str(snapshot.get("backend") or "").strip().lower(),
+            "wallet_fingerprint": snapshot.get("fingerprint"),
+            "wallet_id": getattr(cfg, "CAT_WALLET_ID", None),
+            "asset_id": asset_id,
+        }
+        campaign = campaigns[0]
+        if any(campaign.get(key) != identity.get(key) for key in identity):
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_identity_mismatch",
+                "campaign": campaign,
+            }
+        if snapshot.get("has_secrets") is not True:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_wallet_not_signing",
+                "campaign": campaign,
+            }
+        return {
+            "active": True,
+            "blocked": False,
+            "campaign": campaign,
+            "identity": identity,
+        }
+
+    def _bootstrap_campaign_blocks_follow_mutations(self) -> bool:
+        """Fail closed whenever any active local Bootstrap authority exists."""
+
+        return bool(self._bootstrap_campaign_context().get("active"))
+
+    def _startup_coin_readiness_report(self):
+        """Use legacy tier readiness only when no exact Bootstrap plan owns startup."""
+
+        context = self._bootstrap_campaign_context()
+        if context.get("active") is True:
+            campaign = context.get("campaign") or {}
+            log_event(
+                "info",
+                "bootstrap_exact_coin_readiness",
+                "Market Bootstrap uses its exact campaign Coin Prep plan; "
+                "legacy tier targets do not apply",
+                data={
+                    "campaign_id": campaign.get("campaign_id"),
+                    "revision": campaign.get("revision"),
+                },
+            )
+            return None
+        return self.coin_manager.coin_readiness_report()
+
+    def _refresh_bootstrap_campaign_evidence(
+        self,
+        *,
+        campaign: dict,
+        intents: list,
+        identity: dict,
+        balances: dict,
+        now: datetime,
+    ) -> dict:
+        """Materialize exact fill/depth evidence before deriving a live plan."""
+
+        confidence = getattr(self, "_market_confidence_result", None)
+        if confidence is None:
+            return {
+                "campaign": campaign,
+                "runtime": derive_bootstrap_runtime(
+                    campaign_record=campaign,
+                    identity=identity,
+                    balances=balances,
+                    now=now,
+                ),
+                "changed": False,
+            }
+
+        try:
+            from wallet import get_wallet_puzzle_hashes
+
+            own_clusters = frozenset(
+                str(value).strip().lower().removeprefix("0x")
+                for value in get_wallet_puzzle_hashes()
+                if str(value).strip()
+            )
+        except Exception as exc:
+            own_clusters = frozenset()
+            log_event(
+                "warning",
+                "bootstrap_participant_identity_unavailable",
+                "Market Bootstrap retained its persisted stage because Sage "
+                f"participant identities could not be read: {exc}",
+            )
+        if not own_clusters:
+            log_event(
+                "warning",
+                "bootstrap_participant_identity_unproven",
+                "Market Bootstrap retained its persisted stage because Sage "
+                "did not prove any owned puzzle hashes",
+            )
+            if campaign.get("stage") != "bootstrap":
+                return {
+                    "campaign": campaign,
+                    "runtime": None,
+                    "changed": False,
+                    "blocked": True,
+                }
+            return {
+                "campaign": campaign,
+                "runtime": derive_bootstrap_runtime(
+                    campaign_record=campaign,
+                    identity=identity,
+                    balances=balances,
+                    now=now,
+                ),
+                "changed": False,
+                "blocked": False,
+            }
+
+        fills = database.get_fills(
+            cat_asset_id=campaign["asset_id"],
+            since=campaign["created_at"],
+            limit=10000,
+        )
+        evidence = derive_bootstrap_authoritative_evidence(
+            campaign_record=campaign,
+            authoritative_fills=fills,
+            intents=intents,
+            market_confidence=confidence,
+            now=now,
+            own_participant_clusters=own_clusters,
+            linked_participant_clusters=frozenset(),
+            include_anchor_proposal=False,
+        )
+        runtime = derive_bootstrap_runtime(
+            campaign_record=campaign,
+            identity=identity,
+            balances=balances,
+            now=now,
+            evidence=evidence,
+        )
+        state_update = plan_bootstrap_state_update(
+            campaign_record=campaign,
+            evidence=evidence,
+            decision=runtime["decision"],
+            now=now,
+        )
+        if state_update is None:
+            return {"campaign": campaign, "runtime": runtime, "changed": False}
+
+        revision = database.update_bootstrap_campaign_state(
+            campaign["campaign_id"],
+            expected_revision=campaign["revision"],
+            record=state_update,
+        )
+        occurred_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        database.append_bootstrap_campaign_event(
+            {
+                "campaign_id": campaign["campaign_id"],
+                "event_type": "authoritative_evidence_materialized",
+                "occurred_at": occurred_at,
+                "data": {
+                    "revision": revision,
+                    "stage": state_update["stage"],
+                    "deployment_fraction": state_update["deployment_fraction"],
+                    "confirmed_fills": state_update["confirmed_fills"],
+                    "settlement_clusters": state_update["settlement_clusters"],
+                    "independent_depth_sides": state_update["independent_depth_sides"],
+                    "anchor_moved": False,
+                },
+            }
+        )
+        refreshed = database.get_bootstrap_campaign(campaign["campaign_id"])
+        if type(refreshed) is not dict or refreshed.get("revision") != revision:
+            raise RuntimeError("Bootstrap evidence update could not be reloaded")
+        log_event(
+            "info",
+            "bootstrap_authoritative_evidence_materialized",
+            f"Market Bootstrap advanced to {refreshed['stage']} at revision {revision}",
+            data={
+                "campaign_id": campaign["campaign_id"],
+                "confirmed_fills": refreshed["confirmed_fills"],
+                "settlement_clusters": refreshed["settlement_clusters"],
+                "anchor_moved": False,
+            },
+        )
+        return {"campaign": refreshed, "runtime": None, "changed": True}
+
+    def _route_bootstrap_creation_if_active(
+        self,
+        *,
+        current_buy_ids: set,
+        current_sell_ids: set,
+    ):
+        """Create only missing exact campaign levels, or return None for Follow."""
+
+        context = self._bootstrap_campaign_context()
+        if context.get("active") is not True:
+            return None
+        empty = {"buy": set(), "sell": set()}
+        if context.get("blocked") is True:
+            log_event(
+                "error",
+                "bootstrap_runtime_blocked",
+                "Market Bootstrap blocked before wallet mutation: "
+                f"{context.get('reason')}",
+            )
+            return empty
+        if self.coin_manager.is_busy():
+            log_event(
+                "info",
+                "bootstrap_create_wait_coin_manager",
+                "Market Bootstrap waiting for Coin Prep or coin maintenance",
+            )
+            return empty
+        if int(getattr(self, "_publication_discovery_pending", 0) or 0) > 0:
+            log_event(
+                "info",
+                "bootstrap_create_wait_discovery",
+                "Market Bootstrap waiting for exact public rediscovery before "
+                "creating another level",
+            )
+            return empty
+
+        from tx_fees import get_effective_transaction_fee_mojos
+        from wallet import get_wallet_balance
+
+        try:
+            xch = _extract_wallet_balance_or_defer(
+                get_wallet_balance(int(getattr(cfg, "WALLET_ID_XCH", 1)))
+            )
+            cat = _extract_wallet_balance_or_defer(
+                get_wallet_balance(int(getattr(cfg, "CAT_WALLET_ID", 0)))
+            )
+            # Campaign capacity is bound to its fixed budget and the wallet's
+            # total confirmed inventory.  Existing campaign offers temporarily
+            # reduce spendable balance; using that view here would shrink the
+            # deterministic plan and mis-size replacement levels after a fill.
+            xch_atomic = xch["confirmed_wallet_balance"]
+            cat_atomic = cat["confirmed_wallet_balance"]
+            xch_available = Decimal(str(xch_atomic)) / Decimal("1000000000000")
+            cat_available = Decimal(str(cat_atomic)) / (
+                Decimal(10) ** int(getattr(cfg, "CAT_DECIMALS", 3))
+            )
+        except (KeyError, TypeError, ValueError, _ReserveCheckDeferred) as exc:
+            log_event(
+                "warning",
+                "bootstrap_balance_unavailable",
+                f"Market Bootstrap balance proof unavailable: {exc}",
+            )
+            return empty
+
+        campaign = context["campaign"]
+        balances = {
+            "xch_available": xch_available,
+            "cat_available": cat_available,
+            "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
+            "subsidy_spent_xch": Decimal("0"),
+            "network_fee_xch": Decimal(get_effective_transaction_fee_mojos())
+            / Decimal("1000000000000"),
+            "minimum_profit_xch": Decimal(
+                str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0")))
+            ),
+            "fee_coin_size_xch": Decimal(
+                str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0")))
+            ),
+            "expected_cancel_requotes": int(
+                getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
+            ),
+        }
+        confidence = getattr(self, "_market_confidence_result", None)
+        if confidence is not None and getattr(confidence, "data_valid", False) is True:
+            trusted_bid = getattr(confidence, "trusted_bid", None)
+            trusted_ask = getattr(confidence, "trusted_ask", None)
+            if type(trusted_bid) is Decimal:
+                balances["trusted_bid"] = trusted_bid
+            if type(trusted_ask) is Decimal:
+                balances["trusted_ask"] = trusted_ask
+        intents = database.get_offer_intents_for_registry()
+        now = datetime.now(timezone.utc)
+        try:
+            refreshed = self._refresh_bootstrap_campaign_evidence(
+                campaign=campaign,
+                intents=intents,
+                identity=context["identity"],
+                balances=balances,
+                now=now,
+            )
+            if refreshed.get("blocked") is True:
+                return empty
+            if refreshed["changed"] is True:
+                return empty
+            campaign = refreshed["campaign"]
+            runtime = refreshed["runtime"]
+        except Exception as exc:
+            log_event(
+                "error",
+                "bootstrap_runtime_derivation_failed",
+                f"Market Bootstrap runtime derivation failed closed: {exc}",
+            )
+            return empty
+        superseded = superseded_bootstrap_trade_ids(
+            intents,
+            campaign_id=campaign["campaign_id"],
+            revision=campaign["revision"],
+            live_trade_ids=current_buy_ids | current_sell_ids,
+        )
+        if superseded:
+            self.offer_manager.cancel_offers(
+                list(superseded),
+                reason="bootstrap_revision_superseded",
+                force_storm=True,
+            )
+            log_event(
+                "info",
+                "bootstrap_revision_fence",
+                f"Market Bootstrap is clearing {len(superseded)} offer(s) from "
+                "an older campaign revision before replacement",
+                data={
+                    "campaign_id": campaign["campaign_id"],
+                    "revision": campaign["revision"],
+                    "trade_ids": list(superseded),
+                },
+            )
+            return empty
+        if runtime["transition"]["cancel_required"]:
+            prefix = f"bootstrap:{campaign['campaign_id']}:revision:"
+            trade_ids = sorted(
+                {
+                    str(intent.get("sage_trade_id") or "")
+                    for intent in database.get_offer_intents_for_registry()
+                    if str(intent.get("purpose") or "").startswith(prefix)
+                    and str(intent.get("sage_trade_id") or "")
+                    in (current_buy_ids | current_sell_ids)
+                }
+            )
+            if trade_ids:
+                self.offer_manager.cancel_offers(
+                    trade_ids,
+                    reason=runtime["transition"]["cancel_reason"],
+                    force_storm=True,
+                )
+            else:
+                stop_reason = getattr(runtime.get("decision"), "stop_reason", None)
+                stop_reason_value = getattr(stop_reason, "value", None)
+                if type(stop_reason_value) is str and stop_reason_value:
+                    stopped = database.stop_bootstrap_campaign(
+                        campaign["campaign_id"], stop_reason_value, now
+                    )
+                    if stopped:
+                        occurred_at = now.astimezone(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%S.%fZ"
+                        )
+                        database.append_bootstrap_campaign_event(
+                            {
+                                "campaign_id": campaign["campaign_id"],
+                                "event_type": "campaign_stopped",
+                                "occurred_at": occurred_at,
+                                "data": {
+                                    "reason": stop_reason_value,
+                                    "cancel_targets": [],
+                                    "automatic": True,
+                                },
+                            }
+                        )
+                        log_event(
+                            "warning",
+                            "bootstrap_campaign_stopped_automatically",
+                            "Market Bootstrap stopped after authoritative offer "
+                            f"clearance: {stop_reason_value}",
+                            data={
+                                "campaign_id": campaign["campaign_id"],
+                                "reason": stop_reason_value,
+                            },
+                        )
+            return empty
+        if runtime["plan"].get("authorized") is not True:
+            log_event(
+                "warning",
+                "bootstrap_plan_not_authorized",
+                "Market Bootstrap has no currently authorized levels",
+                data={"reason_codes": list(runtime["plan"].get("reason_codes", ()))},
+            )
+            return empty
+
+        existing = active_bootstrap_levels(
+            intents,
+            campaign_id=campaign["campaign_id"],
+            revision=campaign["revision"],
+        )
+        if len(existing) >= sum(
+            len(runtime["plan"]["sides"][side]["levels"]) for side in ("buy", "sell")
+        ):
+            return empty
+        created = self.offer_manager.create_bootstrap_plan(
+            runtime["plan"],
+            campaign_authority=campaign,
+            xch_wallet_id=int(getattr(cfg, "WALLET_ID_XCH", 1)),
+            cat_wallet_id=int(getattr(cfg, "CAT_WALLET_ID", 0)),
+            cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+            coin_ids_enabled=bool(getattr(cfg, "COIN_IDS_ENABLED", False)),
+            existing_levels=existing,
+        )
+        created_ids = {"buy": set(), "sell": set()}
+        for offer in created:
+            side = offer.get("side")
+            trade_id = str(offer.get("trade_id") or "")
+            bech32 = str(offer.get("offer_bech32") or "")
+            if side in created_ids and trade_id:
+                created_ids[side].add(trade_id)
+            if bech32 and trade_id:
+                self.dexie_manager.queue_post(bech32, trade_id)
+                if getattr(cfg, "SPLASH_ENABLED", False):
+                    self.splash_manager.queue_post(bech32, trade_id)
+        if created:
+            self.coin_manager.snapshot_coins("bootstrap_offer_created")
+            self._emit_coin_update("bootstrap_offer_created")
+            self._last_bulk_create_time = time.time()
+        return created_ids
+
     def _log_create_disabled_under_target(
         self,
         side: str,
@@ -11826,6 +12839,12 @@ class BotLoop:
         """Create new offers if we're below target count."""
         if not self._enter_runtime_effect_phase("create"):
             return False
+        bootstrap_result = self._route_bootstrap_creation_if_active(
+            current_buy_ids=set(current_buy_ids or set()),
+            current_sell_ids=set(current_sell_ids or set()),
+        )
+        if bootstrap_result is not None:
+            return bootstrap_result
         recovery_active = self._recovery_is_active()
 
         # Fix F: check if suspended slots can be unsuspended (coins available)
@@ -11921,6 +12940,19 @@ class BotLoop:
             )
             return
 
+        pending_discovery = max(
+            0, int(getattr(self, "_publication_discovery_pending", 0) or 0)
+        )
+        if pending_discovery:
+            log_event(
+                _skip_level(_any_under),
+                "create_skip_publication_discovery_pending",
+                f"Waiting for exact public rediscovery of {pending_discovery} "
+                "offer(s) before creating another staged batch",
+                data={"pending_discovery": pending_discovery},
+            )
+            return
+
         # Stale wallet data guard — applies outside recovery mode too.
         # After 3 consecutive stale cycles (~15s) we stop creating new offers
         # because the wallet's offer list may be outdated: we could double-post
@@ -11961,6 +12993,9 @@ class BotLoop:
                 self._clear_alert(f"{_side}_position_paused")
         buy_target = int(adaptive_targets.get("buy", 0) or 0)
         sell_target = int(adaptive_targets.get("sell", 0) or 0)
+        confidence = getattr(self, "_market_confidence_result", None)
+        buy_target = market_follow_offer_target(buy_target, confidence)
+        sell_target = market_follow_offer_target(sell_target, confidence)
         _buy_under = bool(
             cfg.ENABLE_BUY and not skip_buy and effective_buy_count < buy_target
         )
@@ -12273,6 +13308,7 @@ class BotLoop:
                 price_floor=price_floor,
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
+                market_confidence=self._market_confidence_result,
             )
             _parallel_results[side] = offers or []
 
@@ -12324,6 +13360,47 @@ class BotLoop:
                     action="view_position",
                     action_label="View Position",
                 )
+
+        # Durable publication is intentionally sequential and bounded by the
+        # bot-cycle SLA.  Creating an entire large ladder at once can therefore
+        # leave later offers unpublished when their fixed 90-second exact-
+        # discovery deadline arrives.  Stage at most ten offers per cycle and
+        # divide the budget fairly between active sides; the pending-discovery
+        # guard above prevents the next stage until this one is publicly proven.
+        publication_batch_limit = 10
+        requested_total = sum(max(0, int(item[1])) for item in work_items)
+        if requested_total > publication_batch_limit:
+            staged_counts = {side: 0 for side, _needed, _spread in work_items}
+            remaining = {
+                side: max(0, int(needed)) for side, needed, _spread in work_items
+            }
+            budget = publication_batch_limit
+            while budget > 0 and any(value > 0 for value in remaining.values()):
+                for side, _needed, _spread in work_items:
+                    if budget <= 0:
+                        break
+                    if remaining[side] <= 0:
+                        continue
+                    staged_counts[side] += 1
+                    remaining[side] -= 1
+                    budget -= 1
+            work_items = [
+                (side, staged_counts[side], spread)
+                for side, _needed, spread in work_items
+                if staged_counts[side] > 0
+            ]
+            log_event(
+                "info",
+                "publication_creation_batch_staged",
+                f"Staged {publication_batch_limit}/{requested_total} missing "
+                "offer(s) so durable publication can prove this batch before "
+                "the next one",
+                data={
+                    "requested_total": requested_total,
+                    "staged_total": publication_batch_limit,
+                    "staged_by_side": dict(staged_counts),
+                },
+            )
 
         if getattr(cfg, "LADDER_CREATE_GLOBAL_SERIAL", False) or recovery_active:
             if recovery_active:
@@ -12494,9 +13571,13 @@ class BotLoop:
             # requote baseline pinned to the price we actually deployed.
             # Using the post-create market mid here can include our own fresh
             # book and trigger needless "replace what we just posted" churn.
-            fresh = self.price_engine.get_price()
-            if fresh and fresh.get("mid_price"):
-                fresh_mid = fresh["mid_price"]
+            fresh_market = self._refresh_offer_book_market()
+            fresh_mid = (
+                fresh_market.confidence.trusted_midpoint
+                if fresh_market is not None
+                else None
+            )
+            if fresh_mid is not None and fresh_mid > 0:
                 self._current_mid_price = fresh_mid
                 self._set_state(mid_price=str(fresh_mid))
                 log_event(
@@ -12673,7 +13754,13 @@ class BotLoop:
             )
             return False
 
-    def _handle_coins(self, active_buy_count: int, active_sell_count: int):
+    def _handle_coins(
+        self,
+        active_buy_count: int,
+        active_sell_count: int,
+        *,
+        allow_legacy_topup: bool = True,
+    ):
         """Handle coin counting, topup, and prep.
 
         Three-tier checking (V1 parity):
@@ -12681,6 +13768,13 @@ class BotLoop:
         2. needs_topup() — FREE coins low → lightweight split
         3. check_runtime_health() — every 5 loops, independent free coin check
         """
+        if not allow_legacy_topup:
+            status = self.coin_manager.check_coin_prep_status()
+            if status.get("cancelled_ids"):
+                for tid in status["cancelled_ids"]:
+                    self.offer_manager._bot_cancelled_ids.add(tid)
+            return
+
         if not self._enter_runtime_effect_phase("coin_prep"):
             return False
         if self._reclaim_oversized_locked_offers():
@@ -12998,6 +14092,20 @@ class BotLoop:
     # Housekeeping
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _compact_market_evidence(*, now: datetime | None = None) -> dict:
+        """Retain detailed provider evidence for 30 days, then summarize it."""
+
+        from database import compact_market_provider_evidence
+
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError("market evidence compaction time must be timezone-aware")
+        current = current.astimezone(timezone.utc)
+        return compact_market_provider_evidence(
+            before=current - timedelta(days=30), summarized_at=current
+        )
+
     def _handle_housekeeping(self):
         """Periodic cleanup tasks (every 5 minutes)."""
         now = time.time()
@@ -13222,6 +14330,15 @@ class BotLoop:
         except Exception:
             pass
 
+        try:
+            self._compact_market_evidence()
+        except Exception as evidence_error:
+            log_event(
+                "warning",
+                "market_evidence_compaction_failed",
+                f"Market evidence compaction failed: {evidence_error}",
+            )
+
         # ---- Proof-safe coin/offer drift diagnostics ----
         try:
             from database import get_orphan_coin_locks
@@ -13260,13 +14377,11 @@ class BotLoop:
 
         Threads checked:
           - health-monitor (Sage health watcher)
-          - price-watcher (fast Tibet poller)
           - coin-watcher (DB↔wallet coin diff)
           - splash-receive (Splash incoming offer poller)
         """
         critical_threads = [
             ("health-monitor", "_health_thread", self._start_health_monitor),
-            ("price-watcher", "_watcher_thread", self._start_price_watcher),
             ("coin-watcher", "_coin_watcher_thread", self._start_coin_watcher),
         ]
         # Splash incoming watcher classifies inbound P2P offers. Previously
@@ -13423,7 +14538,7 @@ class BotLoop:
                 f"Step hung: {step_name}",
                 f"Cycle step '{step_name}' has been running for {elapsed:.0f}s "
                 f"(SLA {self._step_sla_secs:.0f}s). Most likely a hung RPC. "
-                f"Check Sage/Coinset/Tibet connectivity.",
+                f"Check Sage and active market-data provider connectivity.",
             )
         except Exception:
             pass
@@ -13473,7 +14588,7 @@ class BotLoop:
         Services tested:
           - Sage RPC (critical — required for everything)
           - Coinset API (degrades fast fill detection if down)
-          - TibetSwap API (degrades pricing if down)
+          - TibetSwap compatibility state (retired; never probed)
           - Dexie API (degrades offer posting + competitor intel)
           - Spacescan API (degrades fill verification + token context)
           - SQLite DB write (critical — bot can't track state without it)
@@ -13567,20 +14682,17 @@ class BotLoop:
                 "error": f"check failed: {e}",
             }
 
-        # 2. TibetSwap API — pricing source
-        # F32 fix: use the real /pairs endpoint that price_engine actually
-        # consumes (was /router which doesn't exist on tibetswap.io v2).
-        tibet_url = str(
-            getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io")
-            or "https://api.v2.tibetswap.io"
-        )
-        r = _check_http("TibetSwap API", f"{tibet_url}/pairs?skip=0&limit=1")
-        r["missing_if_down"] = (
-            "Real-time price feed. Bot will fall back to Dexie-only pricing "
-            "(less accurate) and AMM drift detection will not work."
-        )
-        r["critical"] = False
-        results["tibet"] = r
+        # 2. One-release compatibility marker. TibetSwap shut down and must
+        # never be contacted by startup health checks or trading paths.
+        results["tibet"] = {
+            "name": "TibetSwap (retired)",
+            "ok": True,
+            "skipped": True,
+            "status": "retired",
+            "reason": "TIBETSWAP_SHUTDOWN",
+            "missing_if_down": "n/a (provider permanently retired)",
+            "critical": False,
+        }
 
         # 3. Dexie API — offer posting + competitor orderbook
         # F32 fix: use the real /v1/offers endpoint that dexie_manager and
@@ -14402,6 +15514,24 @@ class BotLoop:
             return
         if not self._running:
             return
+        if background and not self._background_publication_snapshot_ready():
+            log_event(
+                "info",
+                "dexie_repost_market_deferred",
+                "Deferred background offer visibility check until a fresh market "
+                "confidence snapshot authorizes publication",
+                data={"reason": reason, "total_offers": int(total_offers or 0)},
+            )
+            return False
+        if not self._enter_runtime_effect_phase("publication"):
+            log_event(
+                "warning",
+                "dexie_repost_market_blocked",
+                "Skipped offer repost because current market confidence does not "
+                "authorize publication",
+                data={"reason": reason},
+            )
+            return False
 
         try:
             from database import PublicationSuppressedError, get_offers_for_repost
@@ -14529,6 +15659,15 @@ class BotLoop:
                         )
 
             if count > 0:
+                if not self._enter_runtime_effect_phase("publication"):
+                    log_event(
+                        "warning",
+                        "dexie_repost_market_blocked",
+                        "Skipped queued Dexie repost because market confidence "
+                        "expired before publication",
+                        data={"reason": reason, "stage": "dexie_flush"},
+                    )
+                    return False
                 self.dexie_manager.flush_queue(flush_all=True)
                 log_event(
                     "info",
@@ -14540,6 +15679,15 @@ class BotLoop:
                 )
                 # Also broadcast to Splash if enabled (V3)
                 if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+                    if not self._enter_runtime_effect_phase("publication"):
+                        log_event(
+                            "warning",
+                            "splash_repost_market_blocked",
+                            "Skipped queued Splash repost because market confidence "
+                            "expired before publication",
+                            data={"reason": reason, "stage": "splash_flush"},
+                        )
+                        return False
                     self.splash_manager.flush_queue(flush_all=True)
                     log_event(
                         "info",
@@ -14548,6 +15696,15 @@ class BotLoop:
                         + (" in the background" if background else ""),
                     )
             elif getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+                if not self._enter_runtime_effect_phase("publication"):
+                    log_event(
+                        "warning",
+                        "splash_repost_market_blocked",
+                        "Skipped queued Splash repost because market confidence "
+                        "expired before publication",
+                        data={"reason": reason, "stage": "splash_flush"},
+                    )
+                    return False
                 self.splash_manager.flush_queue(flush_all=True)
                 log_event(
                     "info",
@@ -14977,43 +16134,17 @@ class BotLoop:
         log_event("info", "watcher_exit", "Price watcher stopped")
 
     def _fetch_tibet_reserves(self, session: requests.Session):
-        """Fetch TibetSwap reserves directly (lightweight).
-
-        Returns (xch_reserve, token_reserve) or (None, None) on failure.
-        """
-        try:
-            pair_info = self.price_engine.get_tibet_pool_info(cfg.CAT_ASSET_ID)
-            if pair_info:
-                xch_res = float(pair_info.get("xch_reserve", 0))
-                token_res = float(pair_info.get("token_reserve", 0))
-                if xch_res > 0 and token_res > 0:
-                    return xch_res, token_res
-        except Exception:
-            pass
-
-        # Fallback: direct API call
-        try:
-            url = f"{cfg.TIBET_API_BASE}/pairs"
-            resp = session.get(url, params={"skip": 0, "limit": 100}, timeout=5)
-            if resp.status_code == 200:
-                pairs = resp.json()
-                normalized = cfg.CAT_ASSET_ID.lower().strip()
-                cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
-                cat_scale = 10**cat_decimals
-                for pair in pairs:
-                    pair_asset = str(pair.get("short_name", "")).lower().strip()
-                    pair_asset_id = str(pair.get("asset_id", "")).lower().strip()
-                    # Exact match only — avoid zero-appending false matches.
-                    if normalized in (pair_asset, pair_asset_id):
-                        # API returns mojos — divide to match price_engine units
-                        xch_res = float(pair.get("xch_reserve", 0)) / 1e12
-                        token_res = float(pair.get("token_reserve", 0)) / cat_scale
-                        if xch_res > 0 and token_res > 0:
-                            return xch_res, token_res
-        except Exception:
-            pass
-
+        """Retired compatibility stub; never contacts TibetSwap."""
         return None, None
+
+    def _price_watcher_thread(self):
+        """Retired: TibetSwap reserve polling must never perform live I/O."""
+
+        log_event(
+            "info",
+            "tibetswap_price_watcher_retired",
+            "TibetSwap reserve watcher is retired in the offer-book market model",
+        )
 
     # -------------------------------------------------------------------
     # Coin Watcher Thread (lifecycle tracking)
@@ -15535,9 +16666,11 @@ class BotLoop:
             # ── Step 3: Sort by distance from mid price, keep 2 tightest per side ──
             mid_price = self._current_mid_price
             if mid_price <= 0:
-                price_data = self.price_engine.get_price()
-                if price_data:
-                    mid_price = Decimal(str(price_data.get("mid_price", 0)))
+                market_result = self._refresh_offer_book_market()
+                if market_result is not None:
+                    trusted_midpoint = market_result.confidence.trusted_midpoint
+                    if trusted_midpoint is not None:
+                        mid_price = trusted_midpoint
 
             if mid_price <= 0:
                 self._graceful_in_progress = False

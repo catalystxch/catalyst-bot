@@ -164,6 +164,91 @@ def test_direct_batch_never_falls_back_after_a_confirmed_effect(monkeypatch):
         worker._run_direct_batch_prep()
 
 
+def test_submitted_batch_wait_persists_live_confirmation_elapsed(monkeypatch):
+    worker = _worker()
+    clock = {"now": 0.0}
+    persisted = []
+
+    monkeypatch.setattr(coin_prep_worker.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        coin_prep_worker.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    worker._observe_coin_prep_post_effect = lambda _operation: (
+        {"confirmed": True} if clock["now"] >= 15 else None
+    )
+    worker.update_status = lambda **_kwargs: persisted.append(
+        worker.status.confirmation_elapsed_seconds
+    )
+
+    result = worker._wait_for_coin_prep_post_effect(
+        {"operation_id": "coin-prep:" + "1" * 64},
+        timeout_s=30,
+        poll_interval_s=5,
+    )
+
+    assert result == {"confirmed": True}
+    assert persisted == [5, 10, 15]
+    assert worker.status.confirmation_elapsed_seconds == 15
+
+
+def test_direct_batch_uses_bounded_xch_prerequisite_after_cat_is_prepared(
+    monkeypatch,
+):
+    """A DBX-shaped fragmented XCH wallet must finish without replaying CAT.
+
+    The live DBX run had 54 XCH inputs needed for the final batch while the
+    conservative input cap is 50.  CAT outputs had already confirmed, so
+    falling back was no longer safe.  A bounded prerequisite must consolidate
+    only 50 eligible XCH inputs, then the refreshed final batch can complete.
+    """
+    worker = _worker()
+    monkeypatch.setenv("XCH_RESERVE", "0")
+    monkeypatch.setattr(
+        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
+    )
+    prepared_cat = tuple(
+        _coin("cat", f"{index + 10_000:064x}", 10, "replacement") for index in range(76)
+    )
+    fragmented_xch = tuple(
+        _coin("xch", f"{index + 20_000:064x}", 20) for index in range(80)
+    )
+    after_prerequisite = (
+        prepared_cat
+        + (_coin("xch", f"{30_000:064x}", 990),)
+        + tuple(_coin("xch", f"{index + 20_050:064x}", 20) for index in range(30))
+    )
+    after_final = (
+        prepared_cat
+        + tuple(
+            _coin("xch", f"{index + 40_000:064x}", 10, "replacement")
+            for index in range(126)
+        )
+        + (_coin("xch", f"{50_000:064x}", 320),)
+    )
+    snapshots = iter(
+        (
+            CoinSnapshot(prepared_cat + fragmented_xch),
+            CoinSnapshot(after_prerequisite),
+            CoinSnapshot(after_final),
+        )
+    )
+    worker._direct_batch_snapshot = lambda _targets: next(snapshots)
+    submitted = []
+    worker._submit_direct_batch_plan = lambda plan, _address: (
+        submitted.append(plan) or True
+    )
+
+    assert worker._run_direct_batch_prep() is True
+    assert [plan.asset for plan in submitted] == ["xch", "xch"]
+    assert [len(plan.source_coin_ids) for plan in submitted] == [50, 15]
+    assert len(submitted[0].outputs) == 1
+    assert submitted[0].outputs[0].purpose == "change"
+    assert worker.status.batch_confirmed == 2
+    assert worker.status.paid_fee_mojos == 20
+
+
 def test_unsigned_output_binding_is_persisted_before_direct_batch_submit(monkeypatch):
     worker = _worker()
     monkeypatch.setenv("CAT_ASSET_ID", "a" * 64)

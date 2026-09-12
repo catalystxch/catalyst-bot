@@ -76,6 +76,7 @@ def _preload_real_package(package: str) -> None:
 
 _preload_real_package("dotenv")
 _preload_real_package("urllib3")
+_preload_real_package("requests")
 
 # ---------------------------------------------------------------------------
 # Exclude standalone integration scripts from collection.
@@ -87,6 +88,10 @@ collect_ignore = [
     "test_spacescan.py",
     "test_api_data_sources.py",
     "test_all_apis.py",
+    "test_coin_prep.py",
+    "test_coin_prep_v2.py",
+    "test_hidden_coins.py",
+    "test_offer_create.py",
 ]
 
 # ---------------------------------------------------------------------------
@@ -142,62 +147,76 @@ if sys.platform == "win32":
 # later files to re-import fresh copies of those modules which then broke
 # `patch(...)` calls that assume sys.modules still holds the original.
 #
-# This autouse fixture snapshots `sys.modules` before each test module is
-# loaded and restores the snapshot after, so file-level leaks can't reach
-# the next file even if individual teardowns are sloppy.
+# Pytest imports every test module during collection before it runs module
+# fixtures.  Isolation therefore has two phases: a collection hook records
+# the module environment each file deliberately constructed and restores the
+# clean baseline before collecting the next file; the fixture reinstates that
+# recorded environment while the file's tests execute.
 # ---------------------------------------------------------------------------
 import pytest
 
 
-# Snapshot these at first conftest load — these are the real modules the
-# bot ships, and the ones tests most commonly stub.
-_ISOLATION_GUARDED = (
-    "api_server",
-    "database",
-    "wallet",
-    "wallet_sage",
-    "wallet_chia",
-    "coin_manager",
-    "coin_prep_worker",
-    "bot_health",
-    "bot_loop",
-    "fill_tracker",
-    "offer_manager",
-    "price_engine",
-    "dexie_manager",
-    "spacescan",
-    "amm_monitor",
-    "tx_fees",
-    "config",
-)
+def _project_module_names() -> set[str]:
+    names: set[str] = set()
+    for root, _dirs, files in os.walk(_SRC_DIR):
+        relative_root = os.path.relpath(root, _SRC_DIR)
+        prefix = "" if relative_root == "." else relative_root.replace(os.sep, ".")
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+            stem = filename[:-3]
+            if stem == "__init__":
+                if prefix:
+                    names.add(prefix)
+                continue
+            names.add(f"{prefix}.{stem}" if prefix else stem)
+    return names
+
+
+_ISOLATION_GUARDED = _project_module_names() | {
+    "requests",
+    "requests.adapters",
+    "dotenv",
+    "urllib3",
+}
+_COLLECTION_MODULE_STATES: dict[str, dict[str, object]] = {}
+_MISSING_MODULE = object()
+
+
+def _capture_guarded_modules() -> dict[str, object]:
+    return {name: sys.modules.get(name, _MISSING_MODULE) for name in _ISOLATION_GUARDED}
+
+
+def _restore_guarded_modules(saved: dict[str, object]) -> None:
+    for name in _ISOLATION_GUARDED:
+        original = saved.get(name, _MISSING_MODULE)
+        if original is _MISSING_MODULE:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    """Prevent import-time stubs from leaking into the next test module."""
+
+    if not isinstance(collector, pytest.Module):
+        yield
+        return
+
+    baseline = _capture_guarded_modules()
+    yield
+    _COLLECTION_MODULE_STATES[collector.nodeid] = _capture_guarded_modules()
+    _restore_guarded_modules(baseline)
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _restore_isolation_guarded_modules():
-    """Restore stubbed bot modules between test files.
+def _restore_isolation_guarded_modules(request):
+    """Run each test file with the imports it established at collection."""
 
-    If a test file replaces `sys.modules["database"]` with a stub and
-    forgets to restore it, this fixture catches the damage at the end
-    of the module so the next file starts clean.
-    """
-    blueprint_modules = {
-        name
-        for name in sys.modules
-        if name == "blueprints" or name.startswith("blueprints.")
-    }
-    guarded = set(_ISOLATION_GUARDED) | blueprint_modules
-    saved = {name: sys.modules.get(name) for name in guarded}
+    saved = _capture_guarded_modules()
+    collected = _COLLECTION_MODULE_STATES.get(request.node.nodeid)
+    if collected is not None:
+        _restore_guarded_modules(collected)
     yield
-    current_blueprints = {
-        name
-        for name in sys.modules
-        if name == "blueprints" or name.startswith("blueprints.")
-    }
-    for name in guarded | current_blueprints:
-        original = saved.get(name)
-        current = sys.modules.get(name)
-        if original is None:
-            # Wasn't loaded before this file; drop any stub installed.
-            sys.modules.pop(name, None)
-        elif current is not original:
-            sys.modules[name] = original
+    _restore_guarded_modules(saved)

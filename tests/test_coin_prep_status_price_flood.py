@@ -8,6 +8,7 @@ import coin_manager
 import config
 import database
 import wallet
+from blueprints import bot as bot_blueprint
 from blueprints import coin_prep as coin_prep_blueprint
 
 
@@ -261,6 +262,11 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
     )
     monkeypatch.setattr(api_server, "_reset_runtime_session_stats", lambda: None)
     monkeypatch.setattr(api_server, "_fresh_start_clear", lambda: None)
+    monkeypatch.setattr(
+        bot_blueprint,
+        "_enforce_post_tibet_start_migration",
+        lambda _asset_id: {"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
+    )
 
     client = api_server.app.test_client()
     response = client.post(

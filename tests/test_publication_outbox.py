@@ -5,7 +5,9 @@ import json
 import os
 import socket
 import sys
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -325,6 +327,33 @@ def test_confirmation_transactionally_enqueues_both_destinations_by_reference(
     assert intent["publication_identity"] == f"mainnet:{offer_fingerprint}:7"
 
 
+def test_offer_ui_authority_snapshot_batches_requested_trade_ids(isolated_database):
+    first, first_trade_id, _ = _prepare_and_confirm(
+        isolated_database, intent_id="intent-ui-first", generation=1
+    )
+    second, second_trade_id, _ = _prepare_and_confirm(
+        isolated_database, intent_id="intent-ui-second", generation=1
+    )
+    isolated_database.ensure_offer_publication_discoveries(first["intent_id"])
+    isolated_database.ensure_offer_publication_discoveries(second["intent_id"])
+
+    snapshot = isolated_database.get_offer_ui_authority_by_trade_ids(
+        [first_trade_id, "unknown-trade", second_trade_id, first_trade_id]
+    )
+
+    assert set(snapshot) == {first_trade_id, second_trade_id}
+    assert snapshot[first_trade_id]["intent"]["intent_id"] == first["intent_id"]
+    assert snapshot[second_trade_id]["intent"]["intent_id"] == second["intent_id"]
+    assert {row["provider"] for row in snapshot[first_trade_id]["discoveries"]} == {
+        "dexie",
+        "splash",
+    }
+    assert {row["publisher"] for row in snapshot[first_trade_id]["publications"]} == {
+        "dexie",
+        "splash",
+    }
+
+
 def test_finalize_rolls_back_confirmation_if_publication_insert_fails(
     isolated_database, monkeypatch
 ):
@@ -586,9 +615,12 @@ def test_repost_queue_is_idempotent_while_exact_publication_is_in_flight(
     )
 
 
-@pytest.mark.parametrize("projection", ["missing", "mutated"])
+@pytest.mark.parametrize(
+    ("projection", "expected_state"),
+    [("missing", "queued"), ("mutated", "unresolved")],
+)
 def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
-    isolated_database, monkeypatch, projection
+    isolated_database, monkeypatch, projection, expected_state
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
     if projection == "mutated":
@@ -617,8 +649,12 @@ def test_claim_fails_closed_before_remote_when_offer_bytes_are_not_immutable(
     )[0]
     assert remote_calls == []
     assert result["requeued"] == 0
-    assert row["state"] == "unresolved"
-    assert row["last_error_sha256"] == _sha(row["last_error_json"])
+    assert row["state"] == expected_state
+    if expected_state == "queued":
+        assert row["last_error_json"] is None
+        assert row["last_error_sha256"] is None
+    else:
+        assert row["last_error_sha256"] == _sha(row["last_error_json"])
 
 
 def test_success_requires_current_claim_version_and_digest_binds_acknowledgement(
@@ -843,6 +879,88 @@ def _persist_offer_projection(db, trade_id, offer_text):
         tier="inner",
     )
     assert db.update_offer_bech32(trade_id, offer_text)
+
+
+def test_new_publication_waits_for_atomic_offer_projection(isolated_database):
+    """Publisher threads may observe intent commit before add_offer commits."""
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+
+    assert _claim(isolated_database) is None
+    queued = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert queued["state"] == "queued"
+    assert queued["attempt_count"] == 0
+    assert queued["last_error_json"] is None
+
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    claim = _claim(isolated_database)
+
+    assert claim["state"] == "claimed"
+    assert claim["trade_id"] == trade_id
+    assert claim["offer_bech32"] == _offer_text(intent["intent_id"])
+
+
+def test_slow_ladder_publication_remains_queued_until_offer_projection(
+    isolated_database,
+):
+    """A slow Sage ladder may delay the legacy offer projection for minutes."""
+    intent, _trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+
+    claim = isolated_database.claim_publication_outbox(
+        publisher="dexie",
+        owner_run_id="worker-a",
+        claim_token="claim-a",
+        claimed_at="2026-08-15T12:02:00.000000Z",
+        claim_expires_at="2026-08-15T12:02:30.000000Z",
+    )
+
+    assert claim is None
+    queued = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="dexie"
+    )[0]
+    assert queued["state"] == "queued"
+    assert queued["attempt_count"] == 0
+    assert queued["last_error_json"] is None
+
+
+def test_startup_requeues_preprojection_race_from_older_build(isolated_database):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    error = json.dumps(
+        {
+            "code": "PUBLICATION_OFFER_REFERENCE_MISSING",
+            "offer_ref": "[redacted]",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn = isolated_database.get_connection()
+    conn.execute(
+        "UPDATE publication_outbox SET state='unresolved', row_version=1, "
+        "last_error_json=?, last_error_sha256=? WHERE intent_id=?",
+        (error, _sha(error), intent["intent_id"]),
+    )
+    conn.commit()
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+
+    result = isolated_database.recover_preprojection_publications_at_startup(
+        recovered_at="2026-08-15T12:00:10.000000Z"
+    )
+
+    assert result == {"examined": 2, "recovered": 2, "remaining": 0}
+    rows = isolated_database.list_publication_outbox(intent_id=intent["intent_id"])
+    assert {row["state"] for row in rows} == {"queued"}
+    assert all(row["last_error_json"] is None for row in rows)
+    assert (
+        isolated_database.get_stability_startup_recovery_snapshot()[
+            "publication_issues"
+        ]
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -1880,6 +1998,7 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
 
     loop = object.__new__(bot_loop.BotLoop)
     loop._running = True
+    loop._enter_runtime_effect_phase = lambda phase: phase == "publication"
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     events = []
@@ -1921,6 +2040,104 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
     assert loop.dexie_manager.flushes == 1
     assert any(event == "dexie_repost_quarantined" for _, event, _, _ in events)
     assert not any(event == "dexie_repost_failed" for _, event, _, _ in events)
+
+
+def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkeypatch):
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: False
+    loop.dexie_manager = type(
+        "BlockedDexie",
+        (),
+        {
+            "queue_post": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("blocked startup must not queue public offers")
+            ),
+            "flush_queue": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("blocked startup must not flush public offers")
+            ),
+        },
+    )()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+
+    assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
+
+
+def test_background_startup_repost_defers_stale_confidence_without_global_failure(
+    monkeypatch,
+):
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(can_create=True)
+    loop._market_confidence_result = SimpleNamespace(
+        derived_at=datetime.now(timezone.utc) - timedelta(seconds=31)
+    )
+    loop._enter_runtime_effect_phase = lambda _phase: (_ for _ in ()).throw(
+        AssertionError(
+            "a stale background startup repost must defer before the global phase gate"
+        )
+    )
+    events = []
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event, message, data=None: events.append(
+            (level, event, message, data)
+        ),
+    )
+
+    assert (
+        loop._repost_active_offers_to_dexie(
+            reason="startup_resume", background=True, total_offers=4
+        )
+        is False
+    )
+    assert any(event == "dexie_repost_market_deferred" for _, event, _, _ in events)
+
+
+def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch):
+    import wallet
+
+    class RepostDexie:
+        def __init__(self):
+            self.queued = []
+            self.flushes = 0
+
+        def queue_post(self, _offer, trade_id, force=False):
+            self.queued.append((trade_id, force))
+
+        def flush_queue(self, flush_all=False):
+            self.flushes += int(flush_all)
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    gate_results = iter((True, False))
+    loop._enter_runtime_effect_phase = lambda phase: next(gate_results)
+    loop.dexie_manager = RepostDexie()
+    loop.splash_manager = object()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "slow-trade",
+                "offer_bech32": None,
+                "dexie_id": None,
+                "side": "buy",
+            }
+        ],
+    )
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda _trade_id: "offer1slow")
+
+    assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
+    assert loop.dexie_manager.queued == [("slow-trade", True)]
+    assert loop.dexie_manager.flushes == 0
 
 
 @pytest.mark.parametrize(
@@ -2176,6 +2393,92 @@ def test_dispatched_ambiguous_response_is_unresolved_and_never_retried(
     assert len(calls) == 1
     assert result["requeued"] == 0
     assert row["state"] == "unresolved"
+
+
+@pytest.mark.parametrize(
+    ("manager_module", "manager_type", "publisher"),
+    [
+        (dexie_manager, dexie_manager.DexieManager, "dexie"),
+        (splash_manager, splash_manager.SplashManager, "splash"),
+    ],
+)
+def test_durable_bulk_flush_reauthorizes_before_each_external_post(
+    isolated_database,
+    monkeypatch,
+    manager_module,
+    manager_type,
+    publisher,
+):
+    for index in (1, 2):
+        intent_id = f"intent-authority-{publisher}-{index}"
+        _prepare_claimable(
+            isolated_database,
+            intent_id=intent_id,
+            generation=index,
+        )
+
+    manager = manager_type()
+    monkeypatch.setattr(dexie_manager.cfg, "DEXIE_POST_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    authorizations = iter((True, False))
+    authorization_calls = []
+    authorization_snapshots = []
+    transport_calls = []
+    clock = {"now": LATER}
+
+    def authorize():
+        authorization_calls.append(True)
+        rows = isolated_database.list_publication_outbox(publisher=publisher)
+        claimed = [row for row in rows if row["state"] == "claimed"]
+        assert len(claimed) == 1
+        authorization_snapshots.append(claimed[0])
+        assert claimed[0]["dispatch_started_at"] is not None
+        assert claimed[0]["request_sha256"] is not None
+        authorized = next(authorizations)
+        if not authorized:
+            clock["now"] = AFTER_LEASE
+            isolated_database.trip_runtime_safety_latch(
+                reason_code="MARKET_AUTHORITY_WITHDRAWN",
+                blocking_operation_ids=[f"publication:{publisher}"],
+                wallet_fingerprint_hash=_sha("wallet"),
+                network="mainnet",
+                tripped_at=AFTER_LEASE,
+            )
+        return authorized
+
+    def accepted_post(url, **kwargs):
+        transport_calls.append((url, kwargs))
+        key = kwargs["headers"].get("idempotency-key")
+        payload = {"idempotency_key": key}
+        if publisher == "dexie":
+            payload["id"] = "dexie-authorized"
+            status_code = 201
+        else:
+            payload["success"] = True
+            status_code = 200
+        return _TransportResponse(status_code, payload)
+
+    monkeypatch.setattr(manager_module.requests, "post", accepted_post)
+    manager.enable_durable_outbox(
+        owner_run_id=f"authority-worker-{publisher}",
+        network="mainnet",
+        now_provider=lambda: clock["now"],
+        lease_expires_provider=lambda _now: LEASE_END,
+        dispatch_authorizer=authorize,
+    )
+
+    result = manager.flush_queue(flush_all=True)
+
+    assert len(authorization_calls) == 2
+    assert len(authorization_snapshots) == 2
+    assert len(transport_calls) == 1
+    assert result["posted"] == 1
+    assert result["authorization_blocked"] is True
+    remaining = isolated_database.list_publication_outbox(publisher=publisher)
+    deferred = [row for row in remaining if row["state"] == "retryable"]
+    assert len(deferred) == 1
+    assert deferred[0]["dispatch_started_at"] is None
+    assert deferred[0]["request_sha256"] is None
 
 
 def test_stale_dispatched_claim_without_observation_contract_never_replays(
@@ -2514,6 +2817,7 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: events.append("startup_recovery")
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
     loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
     loop._set_state = lambda **kwargs: None
 
@@ -2525,6 +2829,73 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
         "startup_gate",
         "drain_outbox",
     ]
+
+
+def test_startup_defers_durable_publication_drain_until_fresh_cycle():
+    events = []
+
+    class Gate:
+        def set(self):
+            events.append("startup_gate")
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._startup_complete = Gate()
+    loop._startup_sync = lambda: events.append("startup_recovery")
+    loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: False
+    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._run_one_cycle = lambda: (
+        events.append("cycle"),
+        setattr(loop, "_running", False),
+    )
+    loop._set_state = lambda **kwargs: None
+    loop._watcher_event = type(
+        "WatcherEvent",
+        (),
+        {"wait": lambda self, timeout: False, "clear": lambda self: None},
+    )()
+    loop._drain_mempool_signals = lambda **kwargs: None
+    loop._last_loop_duration = 0
+    loop._loop_count = 0
+
+    loop._run_loop()
+
+    assert events == [
+        "startup_recovery",
+        "enable_outbox",
+        "startup_gate",
+        "cycle",
+    ]
+
+
+def test_bot_binds_market_authority_to_each_durable_publication_dispatch(
+    monkeypatch,
+):
+    captured = []
+    phases = []
+
+    class Manager:
+        def enable_durable_outbox(self, **kwargs):
+            captured.append(kwargs)
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop.dexie_manager = Manager()
+    loop.splash_manager = Manager()
+    loop._enter_runtime_effect_phase = lambda phase: phases.append(phase) or True
+    monkeypatch.setattr(
+        bot_loop,
+        "get_runtime_mutation_lease",
+        lambda: {"network": "mainnet"},
+    )
+
+    loop._enable_durable_publication_outbox()
+
+    assert len(captured) == 2
+    assert all(callable(item["dispatch_authorizer"]) for item in captured)
+    assert captured[0]["dispatch_authorizer"]() is True
+    assert captured[1]["dispatch_authorizer"]() is True
+    assert phases == ["publication", "publication"]
 
 
 def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():

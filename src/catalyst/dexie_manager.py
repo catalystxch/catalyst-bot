@@ -27,6 +27,7 @@ from config import cfg
 from database import (
     claim_publication_outbox,
     complete_publication_outbox,
+    defer_publication_dispatch_before_effect,
     enqueue_publication_for_trade,
     log_event,
     mark_publication_dispatch_started,
@@ -212,6 +213,7 @@ class DexieManager:
         self._durable_outbox_owner: Optional[str] = None
         self._durable_now_provider = None
         self._durable_lease_expires_provider = None
+        self._durable_dispatch_authorizer = None
         self._durable_network: Optional[str] = None
         # Keep synchronous publication work below the bot-cycle SLA.  A slow
         # Dexie endpoint must not hold the whole trading loop for one timeout
@@ -251,6 +253,7 @@ class DexieManager:
         owner_run_id: str,
         now_provider,
         lease_expires_provider,
+        dispatch_authorizer=None,
         network: Optional[str] = None,
     ) -> None:
         """Route subsequent flushes through committed publication claims."""
@@ -259,11 +262,14 @@ class DexieManager:
             raise ValueError("owner_run_id must be exact non-empty text")
         if not callable(now_provider) or not callable(lease_expires_provider):
             raise TypeError("durable outbox timestamp providers must be callable")
+        if dispatch_authorizer is not None and not callable(dispatch_authorizer):
+            raise TypeError("durable outbox dispatch authorizer must be callable")
         if network is not None and (type(network) is not str or not network):
             raise ValueError("network must be exact non-empty text")
         self._durable_outbox_owner = owner_run_id.strip()
         self._durable_now_provider = now_provider
         self._durable_lease_expires_provider = lease_expires_provider
+        self._durable_dispatch_authorizer = dispatch_authorizer
         self._durable_network = network
         with self._lock:
             pending = list(self._queue)
@@ -282,6 +288,7 @@ class DexieManager:
         limit = 500 if flush_all else int(cfg.MAX_POSTS_PER_LOOP)
         posted = failed = skipped = requeued = 0
         budget_exhausted = False
+        authorization_blocked = False
         flush_started = time.monotonic()
         for index in range(max(1, limit)):
             if not flush_all and index > 0:
@@ -340,6 +347,48 @@ class DexieManager:
             if dispatched is None:
                 failed += 1
                 continue
+            if self._durable_dispatch_authorizer is not None:
+                try:
+                    authorized = self._durable_dispatch_authorizer() is True
+                except Exception as exc:
+                    authorized = False
+                    log_event(
+                        "warning",
+                        "dexie_publication_authority_error",
+                        "Dexie publication stopped because dispatch authority "
+                        "could not be revalidated",
+                        data={"error_type": type(exc).__name__},
+                    )
+                if not authorized:
+                    authorization_blocked = True
+                    deferred_at = self._durable_now_provider()
+                    deferred = defer_publication_dispatch_before_effect(
+                        publication_id=dispatched["publication_id"],
+                        owner_run_id=dispatched["claim_owner_run_id"],
+                        claim_token=dispatched["claim_token"],
+                        claim_generation=dispatched["claim_generation"],
+                        expected_row_version=dispatched["row_version"],
+                        request_sha256=request_digest,
+                        evidence_json={
+                            "code": "MARKET_PUBLICATION_AUTHORITY_WITHDRAWN_BEFORE_EFFECT",
+                            "provider": "dexie",
+                            "request_sha256": request_digest,
+                        },
+                        deferred_at=deferred_at,
+                    )
+                    if deferred is None:
+                        failed += 1
+                    else:
+                        skipped += 1
+                        requeued += 1
+                    log_event(
+                        "warning",
+                        "dexie_publication_authority_blocked",
+                        "Dexie publication stopped before the next external post "
+                        "because current market confidence does not authorize it",
+                        data={"publication_deferred": deferred is not None},
+                    )
+                    break
             result = self._post_single(
                 offer_bech32,
                 trade_id,
@@ -416,6 +465,7 @@ class DexieManager:
             "skipped": skipped,
             "requeued": requeued,
             "budget_exhausted": budget_exhausted,
+            "authorization_blocked": authorization_blocked,
         }
 
     def queue_post(self, offer_bech32: str, trade_id: str = None, force: bool = False):

@@ -178,3 +178,27 @@ def test_tibetswap_outage_does_not_make_coin_prep_warning_require_tibet(page):
         "TibetSwap is reachable"
     )
     assert page.evaluate("tradingSettingsImpossible") is True
+
+
+def test_sage_fingerprint_timeout_keeps_polling_instead_of_claiming_start_failed(page):
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
+    page.goto(GUI.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let polls = 0;
+            let errors = 0;
+            apiFetch = async () => {
+                const error = new Error('signal timed out');
+                error.name = 'TimeoutError';
+                throw error;
+            };
+            startupPollUntilReady = () => { polls += 1; };
+            startupShowError = () => { errors += 1; };
+            await startupSelectFingerprint('736588221', null);
+            return {polls, errors};
+        }"""
+    )
+
+    assert result == {"polls": 1, "errors": 0}

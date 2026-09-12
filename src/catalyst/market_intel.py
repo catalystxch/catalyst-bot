@@ -15,6 +15,7 @@ Key responsibilities:
     - Flag whether current placement qualifies for DBX rewards
 """
 
+import hashlib
 import time
 import requests
 import threading
@@ -56,6 +57,11 @@ class MarketIntel:
         self._orderbook: Dict = {
             "buy_offers": [],  # Sorted best (highest) to worst
             "sell_offers": [],  # Sorted best (lowest) to worst
+            # Exact v1 offers are retained separately because the display-only
+            # v3 aggregate fallback is anonymous and must never authorize a
+            # trading mutation.
+            "exact_buy_offers": [],
+            "exact_sell_offers": [],
             "last_refresh": 0,
             "refresh_count": 0,
             "errors": 0,
@@ -164,12 +170,19 @@ class MarketIntel:
 
             resp = self._session.get(url, params=params, timeout=10)
 
-            # Bail early on 429 — don't burn through the buy request too
-            if resp.status_code == 429:
+            # A forced confidence refresh must never make an old cached book
+            # look newly observed.  Treat every non-success response as a
+            # failed refresh and retain the last attributable snapshot.
+            if resp.status_code != 200:
                 log_event(
-                    "warning",
-                    "dexie_rate_limited",
-                    "Dexie orderbook API returned 429 — skipping refresh",
+                    "warning" if resp.status_code == 429 else "debug",
+                    (
+                        "dexie_rate_limited"
+                        if resp.status_code == 429
+                        else "orderbook_http_error"
+                    ),
+                    f"Dexie orderbook API returned HTTP {resp.status_code} — "
+                    "retaining the previous snapshot without refreshing its age",
                 )
                 self._orderbook["errors"] = self._orderbook.get("errors", 0) + 1
                 return self._competitors
@@ -180,17 +193,23 @@ class MarketIntel:
                 "requested": cfg.CAT_ASSET_ID,
                 "status": 0,
                 "page_size": self._orderbook_page_size,
-                "sort": "price_desc",
+                # Dexie exposes reciprocal CAT-per-XCH prices for this
+                # direction; ascending yields the best XCH-per-CAT bids.
+                "sort": "price_asc",
             }
 
             buy_resp = self._session.get(url, params=buy_params, timeout=10)
 
-            # Check buy side for 429 too
-            if buy_resp.status_code == 429:
+            if buy_resp.status_code != 200:
                 log_event(
-                    "warning",
-                    "dexie_rate_limited",
-                    "Dexie orderbook buy API returned 429 — skipping refresh",
+                    "warning" if buy_resp.status_code == 429 else "debug",
+                    (
+                        "dexie_rate_limited"
+                        if buy_resp.status_code == 429
+                        else "orderbook_http_error"
+                    ),
+                    f"Dexie orderbook buy API returned HTTP {buy_resp.status_code} — "
+                    "retaining the previous snapshot without refreshing its age",
                 )
                 self._orderbook["errors"] = self._orderbook.get("errors", 0) + 1
                 return self._competitors
@@ -199,22 +218,20 @@ class MarketIntel:
             buy_offers = []
 
             # Parse sell side (others selling CAT for XCH)
-            if resp.status_code == 200:
-                data = resp.json()
-                offers = data.get("offers", [])
-                for offer in offers:
-                    parsed = self._parse_dexie_offer(offer, "sell")
-                    if parsed:
-                        sell_offers.append(parsed)
+            data = resp.json()
+            offers = data.get("offers", [])
+            for offer in offers:
+                parsed = self._parse_dexie_offer(offer, "sell")
+                if parsed:
+                    sell_offers.append(parsed)
 
             # Parse buy side (others buying CAT with XCH)
-            if buy_resp.status_code == 200:
-                data = buy_resp.json()
-                offers = data.get("offers", [])
-                for offer in offers:
-                    parsed = self._parse_dexie_offer(offer, "buy")
-                    if parsed:
-                        buy_offers.append(parsed)
+            data = buy_resp.json()
+            offers = data.get("offers", [])
+            for offer in offers:
+                parsed = self._parse_dexie_offer(offer, "buy")
+                if parsed:
+                    buy_offers.append(parsed)
 
             # Sort: buys by price descending (best bid first),
             #        sells by price ascending (best ask first)
@@ -224,6 +241,8 @@ class MarketIntel:
             with self._lock:
                 self._orderbook["buy_offers"] = buy_offers
                 self._orderbook["sell_offers"] = sell_offers
+                self._orderbook["exact_buy_offers"] = list(buy_offers)
+                self._orderbook["exact_sell_offers"] = list(sell_offers)
                 self._orderbook["last_refresh"] = now
                 self._orderbook["refresh_count"] += 1
 
@@ -361,6 +380,15 @@ class MarketIntel:
         """
         try:
             offer_id = offer.get("id", "")
+            offer_text = str(offer.get("offer") or "").strip()
+            offer_identity = (
+                hashlib.sha256(offer_text.encode("utf-8")).hexdigest()
+                if offer_text
+                else ""
+            )
+            trade_id = str(offer.get("trade_id") or "").strip().lower()
+            if trade_id.startswith("0x"):
+                trade_id = trade_id[2:]
             offered = offer.get("offered", [])
             requested = offer.get("requested", [])
 
@@ -415,6 +443,9 @@ class MarketIntel:
 
             return {
                 "offer_id": offer_id,
+                "provider_offer_id": offer_id,
+                "offer_identity": offer_identity,
+                "trade_id": trade_id,
                 "side": expected_side,
                 "price": price,
                 "xch_amount": xch_amount,
@@ -871,6 +902,63 @@ class MarketIntel:
             "source": source,
             "our_best_bid": str(our_best_bid),
             "our_best_ask": str(our_best_ask),
+        }
+
+    def get_attributable_orderbook(self) -> Dict:
+        """Return exact Dexie v1 rows suitable for confidence decisions.
+
+        Anonymous v3 aggregate levels intentionally never appear here. Amounts
+        are normalized to XCH mojos so depth can be compared directly with the
+        configured per-offer XCH size without float conversion.
+        """
+
+        with self._lock:
+            buys = list(self._orderbook.get("exact_buy_offers", []))
+            sells = list(self._orderbook.get("exact_sell_offers", []))
+            observed_at = float(self._orderbook.get("last_refresh", 0) or 0)
+
+        def rows(values):
+            normalized = []
+            for row in values:
+                offer_id = str(
+                    row.get("offer_identity") or row.get("offer_id") or ""
+                ).strip()
+                price = row.get("price")
+                xch_amount = row.get("xch_amount")
+                if not offer_id or type(price) is not Decimal:
+                    continue
+                try:
+                    amount_mojos = int(
+                        (
+                            Decimal(xch_amount) * Decimal("1000000000000")
+                        ).to_integral_exact()
+                    )
+                except Exception:
+                    continue
+                if price <= 0 or amount_mojos <= 0:
+                    continue
+                normalized.append(
+                    {
+                        "offer_id": offer_id,
+                        "provider_offer_id": str(
+                            row.get("provider_offer_id") or row.get("offer_id") or ""
+                        ).strip(),
+                        "offer_identity": str(row.get("offer_identity") or "").strip(),
+                        "trade_id": str(row.get("trade_id") or "").strip(),
+                        "price": str(price),
+                        "amount_mojos": amount_mojos,
+                    }
+                )
+            return normalized
+
+        return {
+            "bids": rows(buys),
+            "asks": rows(sells),
+            "observed_at_unix": observed_at,
+            "source_time": datetime.fromtimestamp(observed_at, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "source": "dexie_v1_offers",
         }
 
     def get_stats(self) -> Dict:

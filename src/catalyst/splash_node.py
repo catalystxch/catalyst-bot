@@ -660,7 +660,17 @@ class SplashNode:
                         )
                         if now - last_logged >= 60.0:
                             self._last_hook_failure_log_time = now
-                            severity = "debug" if _since_start < 30 else "warning"
+                            delivery_is_live = (
+                                now - float(self._last_webhook_delivery_time or 0.0)
+                                <= 30.0
+                            )
+                            severity = (
+                                "debug"
+                                if _since_start < 30
+                                else "info"
+                                if delivery_is_live
+                                else "warning"
+                            )
                             if _is_hook_refused and _since_start < 30:
                                 prefix = "Splash webhook waiting for Flask"
                             elif (

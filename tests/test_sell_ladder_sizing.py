@@ -1,7 +1,11 @@
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _sbx_counts():
@@ -221,8 +225,7 @@ def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
 
 
 def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():
-    with open("bot_gui.html", encoding="utf-8") as f:
-        html = f.read()
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
 
     assert "function buildSellLadderCatPlan" in html
     assert "sellLadderCatPlan" in html
@@ -231,8 +234,9 @@ def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():
 
 
 def test_smart_defaults_dbx_cap_runs_before_cat_budget_validation():
-    with open("src/catalyst/blueprints/smart_defaults.py", encoding="utf-8") as f:
-        source = f.read()
+    source = (ROOT / "src" / "catalyst" / "blueprints" / "smart_defaults.py").read_text(
+        encoding="utf-8"
+    )
 
     assert source.index("DBX cap clamp") < source.index(
         "F65 FINAL SELL-SIDE CAT VERIFICATION"

@@ -729,6 +729,114 @@ def test_requote_resumes_eligible_lineage_before_zero_spare_capacity_gate(
     assert result["refresh_paused"] is True
 
 
+def test_requote_resumes_visible_lineage_before_tier_and_budget_filtering(
+    isolated_database, monkeypatch
+):
+    """Catches price/tier selection hiding the parent of a visible child."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    _prepare("z-parent")
+    _confirm("z-parent")
+    _prepare("a-child", parent_intent_id="z-parent", generation=1)
+    _confirm("a-child")
+    database.bind_refresh_lineage("z-parent", "a-child")
+    database.record_offer_intent_visibility(
+        "a-child", publication_identity="registry:child"
+    )
+
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    parent_trade = _sha("trade:z-parent")
+    child_trade = _sha("trade:a-child")
+    monkeypatch.setattr(
+        "offer_manager.get_open_offers",
+        lambda **_kwargs: [
+            {"trade_id": child_trade, "tier": "inner", "price_xch": "1.01"},
+            {"trade_id": parent_trade, "tier": "outer", "price_xch": "0.90"},
+        ],
+    )
+    manager = OfferManager.__new__(OfferManager)
+    manager._sort_open_offers_for_requote = lambda offers, *_args, **_kwargs: offers
+    cancelled = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids) or {}
+
+    result = manager.requote_side(
+        "buy", Decimal("1"), allowed_tiers={"inner"}, max_offers=1
+    )
+
+    assert cancelled == [parent_trade]
+    assert result["refresh_paused"] is True
+
+
+def test_trim_advances_visible_lineage_without_cancelling_its_child(
+    isolated_database, monkeypatch
+):
+    """Catches cap trimming a staged child before its parent is retired."""
+
+    database.init_database()
+    database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    _prepare("z-parent")
+    _confirm("z-parent")
+    _prepare("a-child", parent_intent_id="z-parent", generation=1)
+    _confirm("a-child")
+    database.bind_refresh_lineage("z-parent", "a-child")
+    database.record_offer_intent_visibility(
+        "a-child", publication_identity="registry:child"
+    )
+    _prepare("ordinary", slot_key=f"ladder:{_sha('asset-a')}:buy:2")
+    _confirm("ordinary")
+
+    from offer_manager import OfferManager
+
+    monkeypatch.setattr("offer_manager.cfg.CAT_ASSET_ID", _sha("asset-a"))
+    for name in (
+        "BUY_INNER_TIER_COUNT",
+        "BUY_MID_TIER_COUNT",
+        "BUY_OUTER_TIER_COUNT",
+        "BUY_EXTREME_TIER_COUNT",
+    ):
+        monkeypatch.setattr(f"offer_manager.cfg.{name}", 0)
+    monkeypatch.setattr("offer_manager.cfg.BUY_INNER_TIER_COUNT", 1)
+    parent_trade = _sha("trade:z-parent")
+    child_trade = _sha("trade:a-child")
+    ordinary_trade = _sha("trade:ordinary")
+    db_rows = [
+        {"trade_id": child_trade, "tier": "inner", "price_xch": "100"},
+        {"trade_id": parent_trade, "tier": "outer", "price_xch": "1"},
+        {"trade_id": ordinary_trade, "tier": "inner", "price_xch": "2"},
+    ]
+    monkeypatch.setattr("offer_manager.get_open_offers", lambda **_kwargs: db_rows)
+    manager = OfferManager.__new__(OfferManager)
+    manager._bot_cancelled_ids = set()
+    cancelled = []
+    manager.cancel_offers = lambda ids, **_kwargs: cancelled.extend(ids) or {}
+
+    trimmed = manager.trim_excess_offers(
+        Decimal("1"), wallet_buys=list(db_rows), wallet_sells=[]
+    )
+
+    assert trimmed == 0
+    assert cancelled == [parent_trade]
+
+
 def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
     isolated_database, monkeypatch
 ):
@@ -844,6 +952,39 @@ def test_parent_absent_completion_resume_replays_before_and_after_commit(
         == "awaiting_terminal_projection"
     )
     assert commits == ["absent-parent", "absent-parent", "absent-parent"]
+
+
+def test_cycle_resume_checks_both_sides_before_normal_offer_maintenance(monkeypatch):
+    """Every fresh wallet cycle must advance durable refresh work without drift."""
+
+    from offer_manager import OfferManager
+
+    manager = OfferManager.__new__(OfferManager)
+    calls = []
+    monkeypatch.setattr(
+        manager,
+        "_advance_pending_refresh_lineage",
+        lambda offers, side: calls.append((side, offers)) or None,
+    )
+    buys = [{"trade_id": _sha("cycle-buy")}]
+    sells = [{"trade_id": _sha("cycle-sell")}]
+
+    result = manager.resume_pending_refresh_lineages(buys, sells)
+
+    assert result == {"buy": None, "sell": None}
+    assert calls == [("buy", buys), ("sell", sells)]
+
+
+def test_bot_cycle_resumes_refresh_lineages_before_fill_detection():
+    """Crash recovery cannot depend on price drift, requote, or excess trimming."""
+
+    import inspect
+    from bot_loop import BotLoop
+
+    source = inspect.getsource(BotLoop._run_one_cycle)
+    assert source.index("resume_pending_refresh_lineages(") < source.index(
+        "self.fill_tracker.detect_fills("
+    )
 
 
 def test_refresh_blocker_incidents_are_exact_cohort_scoped_and_replayable(

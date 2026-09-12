@@ -97,6 +97,14 @@ _WORKER_DELEGATION_ENV_NAMES = (
 _worker_delegation_environment = None
 
 
+def tier_requires_split(count: int) -> bool:
+    """Return whether a prepared pool output needs a second split transaction."""
+
+    if type(count) is not int or count < 1:
+        raise ValueError("coin tier count must be a positive integer")
+    return count > 1
+
+
 def _coin_prep_status_file() -> str:
     """Return the shared user-data sidecar read by the parent app."""
 
@@ -801,6 +809,7 @@ class CoinPrepWorker:
         # prep uses sell sizes. Enables asymmetric ladders.
         buy_tier_sizes_str = os.getenv("_CLI_BUY_TIER_SIZES")
         sell_tier_sizes_str = os.getenv("_CLI_SELL_TIER_SIZES")
+        exact_cat_tier_sizes_str = os.getenv("_CLI_CAT_TIER_SIZES")
         tier_counts_str = os.getenv("_CLI_TIER_COUNTS")  # legacy: applies to BOTH sides
         tier_counts_xch_str = os.getenv(
             "_CLI_TIER_COUNTS_XCH"
@@ -914,7 +923,10 @@ class CoinPrepWorker:
                 for tn in all_tier_names
             }
 
-            # Derive CAT sizes per tier from XCH sizes / price × headroom
+            # Bootstrap passes exact CAT amounts because there may be no
+            # external market price yet.  Ordinary Follow prep still derives
+            # CAT sizes from the live sell ladder.
+            self.exact_tier_cat_sizes = _parse_sizes(exact_cat_tier_sizes_str)
             self.tier_cat_sizes = self._derive_tier_cat_sizes()
             # Drop any CAT counts for tiers that have no CAT size (e.g. fees,
             # which is XCH-only). Avoids accidentally trying to multi-send CAT
@@ -1880,7 +1892,9 @@ class CoinPrepWorker:
         # their target size.
         #
         # For XCH, allow a minimum of 10M mojos plus one full configured
-        # transaction-fee delta:
+        # transaction-fee delta.  Only fee-tier outputs may match below their
+        # target: an offer coin even one mojo below its exact spend is unusable
+        # and must be replaced rather than reported as prepared.
         # Sage can spread the fee across the smallest fee-tier outputs, which
         # made two 0.00115 XCH fee coins land as 0.0011369209 XCH.
         fee_abs_tol = 0
@@ -1924,6 +1938,8 @@ class CoinPrepWorker:
             best_diff = None
             for plan_amount, tier_name, _exp in plan_entries:
                 if slots_remaining.get((plan_amount, tier_name), 0) <= 0:
+                    continue
+                if tier_name != get_fee_tier_name() and coin_amount < plan_amount:
                     continue
                 if not _within_tolerance(coin_amount, plan_amount):
                     continue
@@ -2479,6 +2495,7 @@ class CoinPrepWorker:
         constraints = BatchConstraints(
             reserve_floors={"xch": xch_reserve, "cat": cat_reserve},
             fee_mojos=self._tx_fee_mojos(),
+            allow_bounded_prerequisite=True,
         )
         with self.status_lock:
             self.status.execution_mode = "direct_final_batch_v2"
@@ -2488,7 +2505,10 @@ class CoinPrepWorker:
             self.status.batch_current = 0
             self.status.batch_confirmed = 0
         effects_confirmed = 0
-        for batch_number in range(1, 3):
+        # Compact wallets finish in one batch per asset. Fragmented XCH can
+        # require one or more bounded 50-input prerequisites first; keep this
+        # finite so malformed or non-progressing snapshots fail closed.
+        for batch_number in range(1, 9):
             snapshot = self._direct_batch_snapshot(targets)
             if snapshot is None:
                 if effects_confirmed:
@@ -2527,10 +2547,18 @@ class CoinPrepWorker:
             with self.status_lock:
                 self.status.batch_current = batch_number
                 self.status.planned_fee_mojos += plan.fee_mojos
+            prerequisite = bool(plan.outputs) and all(
+                output.ordinal < 0 and output.purpose in {"change", "fee_change"}
+                for output in plan.outputs
+            )
             self.update_status(
                 PrepPhase.SPLITTING,
-                0.30 + (batch_number - 1) * 0.30,
-                f"Building direct final-output batch {batch_number}/2...",
+                min(0.90, 0.30 + (batch_number - 1) * 0.15),
+                (
+                    f"Building bounded input prerequisite batch {batch_number}..."
+                    if prerequisite
+                    else f"Building direct final-output batch {batch_number}..."
+                ),
             )
             if not self._submit_direct_batch_plan(plan, address):
                 if (
@@ -3048,6 +3076,11 @@ class CoinPrepWorker:
 
         Falls back to uniform CAT_COIN_SIZE if price fetch fails.
         """
+        exact = getattr(self, "exact_tier_cat_sizes", None) or {}
+        if exact:
+            self.log("   Tier CAT sizes supplied by exact Bootstrap campaign plan")
+            return dict(exact)
+
         result = {}
         price = self._get_live_price()
 
@@ -3127,9 +3160,15 @@ class CoinPrepWorker:
         return result
 
     def _apply_prep_headroom_xch(self, live_size_xch: Decimal) -> Decimal:
-        """Inflate a live offer size into the prepared coin size."""
+        """Inflate a live offer size without discarding spendable mojos.
+
+        XCH has twelve decimal places.  Quantizing prepared coins to eight
+        places made repeating Bootstrap allocations (for example one third of
+        a stage budget) a few thousand mojos smaller than the exact offer
+        spend, so Sage correctly refused to select them.
+        """
         return (live_size_xch * self.coin_prep_headroom_multiplier).quantize(
-            Decimal("0.00000001")
+            Decimal("0.000000000001")
         )
 
     def _get_fingerprint(self) -> str:
@@ -5623,12 +5662,6 @@ class CoinPrepWorker:
                 cat_size,
             ) in tier_info_for_side:
                 pool_mojos = cat_mojos if is_cat else xch_mojos
-                if count <= 1:
-                    self.log(
-                        f"   ⏭️ {side_label} {tier_name}: only 1 coin — skip (reserve IS the coin)"
-                    )
-                    step_done += 2
-                    continue
                 payments.append({"address": address, "amount": pool_mojos})
                 tier_details.append((tier_name, count, pool_mojos))
 
@@ -7341,6 +7374,13 @@ class CoinPrepWorker:
         total_split_submits = len(xch_tier_details_ordered) + len(cat_tier_details)
         split_submit_idx = 0
         for tier_name, count, pool_mojos in xch_tier_details_ordered:
+            if not tier_requires_split(count):
+                self.log(
+                    f"   ✅ XCH {tier_name}: exact single pool output is the prepared coin"
+                )
+                step_done += 1
+                split_submit_idx += 1
+                continue
             split_submit = None
             for _split_attempt in range(3):
                 split_submit = _submit_split(
@@ -7410,25 +7450,35 @@ class CoinPrepWorker:
                 )
 
         cat_fee_coin_ids = []
-        if cat_tier_details and self._tx_fee_mojos() > 0:
+        cat_split_details = [
+            item for item in cat_tier_details if tier_requires_split(item[1])
+        ]
+        if cat_split_details and self._tx_fee_mojos() > 0:
             base_cat_fee_input_mojos = 0
             for fee_tier_name, fee_count, fee_pool_mojos in xch_tier_details_ordered:
                 if fee_tier_name == "fees" and fee_count > 0:
                     base_cat_fee_input_mojos = fee_pool_mojos // fee_count
                     break
             cat_fee_coin_ids = _prepare_cat_split_fee_coins(
-                len(cat_tier_details),
+                len(cat_split_details),
                 base_cat_fee_input_mojos,
             )
-            if len(cat_fee_coin_ids) < len(cat_tier_details):
+            if len(cat_fee_coin_ids) < len(cat_split_details):
                 self.log(
                     f"   Dedicated CAT fee inputs unavailable "
-                    f"({len(cat_fee_coin_ids)}/{len(cat_tier_details)}); "
+                    f"({len(cat_fee_coin_ids)}/{len(cat_split_details)}); "
                     "remaining CAT splits will use serialized fee-input waits"
                 )
 
         cat_fee_coin_idx = 0
         for tier_name, count, pool_mojos in cat_tier_details:
+            if not tier_requires_split(count):
+                self.log(
+                    f"   ✅ CAT {tier_name}: exact single pool output is the prepared coin"
+                )
+                step_done += 1
+                split_submit_idx += 1
+                continue
             split_submit = None
             fee_coin_id = None
             if cat_fee_coin_idx < len(cat_fee_coin_ids):
@@ -9389,10 +9439,16 @@ class CoinPrepWorker:
         next_progress_log_s = 30
         while time.monotonic() - started_at < timeout_s:
             time.sleep(poll_interval_s)
+            elapsed_s = int(time.monotonic() - started_at)
+            with self.status_lock:
+                self.status.confirmation_elapsed_seconds = elapsed_s
+            # Persist on every confirmation poll so the GUI proves continued
+            # progress during a slow Sage/network confirmation instead of
+            # appearing frozen at the first observed value.
+            self.update_status()
             observation = self._observe_coin_prep_post_effect(operation)
             if type(observation) is dict:
                 return observation
-            elapsed_s = int(time.monotonic() - started_at)
             if elapsed_s >= next_progress_log_s:
                 self.log(
                     "      Waiting for authoritative confirmation of submitted "
@@ -10971,6 +11027,12 @@ def parse_arguments():
         help="Per-side CAT (sell, in XCH-equiv) tier sizes: inner=1.2,mid=0.7,outer=0.36,extreme=0.16[,sniper=0.01]",
     )
     parser.add_argument(
+        "--cat-tier-sizes",
+        type=str,
+        default=None,
+        help="Exact CAT display amounts per tier for an authorized Bootstrap plan",
+    )
+    parser.add_argument(
         "--tier-counts",
         type=str,
         default=None,
@@ -11190,6 +11252,9 @@ def main():
     if args.sell_tier_sizes is not None:
         os.environ["_CLI_SELL_TIER_SIZES"] = args.sell_tier_sizes
         overrides.append(f"SELL_TIER_SIZES={args.sell_tier_sizes}")
+    if args.cat_tier_sizes is not None:
+        os.environ["_CLI_CAT_TIER_SIZES"] = args.cat_tier_sizes
+        overrides.append(f"CAT_TIER_SIZES={args.cat_tier_sizes}")
     if args.tier_counts is not None:
         os.environ["_CLI_TIER_COUNTS"] = args.tier_counts
         overrides.append(f"TIER_COUNTS={args.tier_counts}")

@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -48,6 +49,30 @@ def _decimal_or_none(value) -> Decimal | None:
 
 _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
+
+
+def _confirmed_fill_authority(fill_id) -> dict:
+    """Expose the immutable receipt behind an economically visible fill."""
+
+    try:
+        receipt = database.get_authoritative_fill_by_id(int(fill_id))
+    except (TypeError, ValueError):
+        receipt = None
+    except Exception as exc:
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load confirmed fill authority for UI",
+            {"fill_id": fill_id, "error": type(exc).__name__},
+            level="warning",
+        )
+        receipt = None
+    if not receipt:
+        return {}
+    return {
+        "spent_block_height": receipt.get("spent_block_height"),
+        "transaction_id": receipt.get("transaction_id"),
+        "evidence_sha256": receipt.get("evidence_sha256"),
+    }
 
 
 def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
@@ -197,6 +222,79 @@ def _calculate_pnl_breakdown(
     return realised, unrealised, total
 
 
+def _offers_with_durable_authority(wallet_offers: list) -> list:
+    """Attach bounded publication/discovery truth to wallet offer rows."""
+
+    serialized = api_server._serialize_offers(wallet_offers)
+    if not serialized:
+        return []
+    trade_ids = [
+        str(item.get("trade_id") or "").strip()
+        for item in serialized
+        if str(item.get("trade_id") or "").strip()
+    ]
+    try:
+        authority_snapshot = database.get_offer_ui_authority_by_trade_ids(trade_ids)
+    except Exception:
+        authority_snapshot = {}
+    for item in serialized:
+        trade_id = str(item.get("trade_id") or "").strip()
+        snapshot = authority_snapshot.get(trade_id) or {}
+        intent = snapshot.get("intent")
+        if not intent:
+            item["authority"] = None
+            item["discovery"] = {
+                "state": "untracked",
+                "provider_identity": None,
+                "first_visible_at": None,
+                "providers": {},
+            }
+            item["publication"] = {}
+            continue
+
+        intent_id = str(intent.get("intent_id") or "")
+        item["authority"] = {
+            "intent_id": intent_id,
+            "lifecycle_state": intent.get("lifecycle_state"),
+            "generation": intent.get("generation"),
+            "parent_intent_id": intent.get("parent_intent_id"),
+            "child_intent_id": intent.get("child_intent_id"),
+            "updated_at": intent.get("updated_at"),
+        }
+        discovery_providers = {}
+        discovery_rows = snapshot.get("discoveries") or []
+        for row in discovery_rows:
+            provider = str(row.get("provider") or "").strip().lower()
+            if provider not in {"dexie", "splash"}:
+                continue
+            discovery_providers[provider] = {
+                "state": row.get("state"),
+                "deadline_at": row.get("deadline_at"),
+                "first_observed_at": row.get("first_observed_at"),
+                "observed_identity": row.get("observed_identity"),
+            }
+        item["discovery"] = {
+            "state": ("visible" if intent.get("first_visible_at") else "pending"),
+            "provider_identity": intent.get("publication_identity"),
+            "first_visible_at": intent.get("first_visible_at"),
+            "providers": discovery_providers,
+        }
+        provider_rows = {}
+        publications = snapshot.get("publications") or []
+        for row in publications:
+            publisher = str(row.get("publisher") or "").strip().lower()
+            if publisher not in {"dexie", "splash"}:
+                continue
+            provider_rows[publisher] = {
+                "state": row.get("state"),
+                "queued_at": row.get("queued_at"),
+                "updated_at": row.get("updated_at"),
+                "terminal_at": row.get("terminal_at"),
+            }
+        item["publication"] = provider_rows
+    return serialized
+
+
 def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
     """Return DB-backed fill history in the shape the Offers history tab expects."""
     if not asset_id:
@@ -235,6 +333,13 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
                 history_by_trade_id[trade_id]["dexie_link"] = dexie_link
             return
 
+        authority = _confirmed_fill_authority(row.get("fill_id"))
+        if not authority:
+            # A historical offers.status='filled' row is not economic proof.
+            # Only an immutable authoritative fill receipt may enter the
+            # confirmed history and downstream P&L/accounting surfaces.
+            return
+
         filled_at = (
             row.get("filled_at") or row.get("timestamp") or row.get("created_at") or ""
         )
@@ -252,6 +357,8 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
             "age": api_server._history_age_label(filled_at),
             "filled_at": filled_at,
             "dexie_link": dexie_link,
+            "fill_confidence": "Confirmed",
+            "fill_authority": authority,
             "_sort_key": str(filled_at),
         }
 
@@ -296,8 +403,8 @@ def api_offers():
 
     return jsonify(
         {
-            "buys": api_server._serialize_offers(open_buys),
-            "sells": api_server._serialize_offers(open_sells),
+            "buys": _offers_with_durable_authority(open_buys),
+            "sells": _offers_with_durable_authority(open_sells),
             "buy_count": len(open_buys),
             "sell_count": len(open_sells),
         }
@@ -352,6 +459,138 @@ def api_cancel_all():
                 "requires_stop": True,
             }
         ), 409
+
+    gate_status = api_server.mutation_gate.read_only_status()
+    if getattr(gate_status, "allowed", False) is not True:
+        reason = str(getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED")
+        durable_manager = (
+            getattr(bot, "offer_manager", None) if bot is not None else None
+        )
+        if reason != "UNRESOLVED_OPERATIONS" or durable_manager is None:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": reason,
+                    }
+                ),
+                423,
+            )
+
+        state = _get_cancel_all_state()
+        if state.get("running"):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Cancel reconciliation is already in progress.",
+                        "reason": reason,
+                        "reconciliation_only": True,
+                    }
+                ),
+                409,
+            )
+
+        blocker_ids = tuple(getattr(gate_status, "blocking_operation_ids", ()) or ())
+        _reset_cancel_all_state(
+            running=True,
+            complete=False,
+            error=None,
+            phase="reconciling",
+            total=len(blocker_ids),
+            pending=len(blocker_ids),
+            message=(
+                "An earlier cancellation is awaiting authoritative Sage proof. "
+                "Checking it now without submitting another transaction..."
+            ),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+        )
+
+        def _reconcile_existing_cancel():
+            result = durable_manager.reconcile_submitted_cancels_only()
+            refreshed = api_server.mutation_gate.read_only_status()
+            allowed = getattr(refreshed, "allowed", False) is True
+            refreshed_reason = str(
+                getattr(refreshed, "reason_code", "")
+                or ("" if allowed else "UNRESOLVED_OPERATIONS")
+            )
+            if result == 0 and allowed:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=True,
+                    error=None,
+                    phase="reconciled",
+                    pending=0,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message=(
+                        "The earlier cancellation is authoritatively resolved. "
+                        "Cancel All can now be run again for any remaining offers."
+                    ),
+                )
+                return
+            _set_cancel_all_state(
+                running=False,
+                complete=False,
+                error="awaiting_authoritative_cancel_proof",
+                phase="awaiting_authoritative_proof",
+                pending=len(blocker_ids),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=(
+                    "No second cancellation was submitted. The earlier request "
+                    "is still awaiting authoritative Sage confirmation."
+                ),
+            )
+            log_event(
+                "warning",
+                "cancel_all_awaiting_authoritative_proof",
+                "Cancel All remains blocked while the earlier Sage cancellation "
+                "awaits authoritative proof",
+                data={"reason_code": refreshed_reason},
+            )
+
+        recovery_thread = threading.Thread(
+            target=_reconcile_existing_cancel,
+            name="cancel-all-proof-reconciliation",
+            daemon=True,
+        )
+        recovery_thread.start()
+        api_server._cancel_all_thread = recovery_thread
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "async": True,
+                    "reason": reason,
+                    "reconciliation_only": True,
+                    "message": (
+                        "Checking the earlier cancellation for authoritative "
+                        "Sage confirmation; no new transaction was submitted."
+                    ),
+                }
+            ),
+            202,
+        )
+
+    try:
+        mutation_permit = api_server.mutation_gate.enter_mutation(
+            "api:offers.api_cancel_all"
+        )
+    except api_server.mutation_gate.MutationBlocked as exc:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                }
+            ),
+            423,
+        )
+    from flask import g
+
+    g._mutation_permit = mutation_permit
 
     state = _get_cancel_all_state()
     if state.get("running"):
@@ -878,7 +1117,28 @@ def api_fills():
         limit=limit,
         since=api_server._get_run_history_cutoff(),
     )
-    return jsonify({"fills": api_server._serialize_list(fills)})
+    for fill in fills:
+        fill["fill_confidence"] = "Confirmed"
+        fill["fill_authority"] = _confirmed_fill_authority(fill.get("fill_id"))
+    try:
+        activity = database.get_fill_confidence_assessments(
+            cfg.CAT_ASSET_ID,
+            limit=min(max(limit * 3, 20), 200),
+        )
+    except Exception as exc:
+        activity = []
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load fill confidence activity for UI",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+    return jsonify(
+        {
+            "fills": api_server._serialize_list(fills),
+            "activity": api_server._serialize_list(activity),
+        }
+    )
 
 
 @bp.route("/api/fills/classified")

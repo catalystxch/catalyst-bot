@@ -310,6 +310,68 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body["xch_coins"], 3)
         self.assertEqual(body["cat_coins"], 1)
 
+    def test_completed_tier_prep_does_not_rehydrate_undersized_offer_coin(self):
+        """A restart must not call an offer coin ready when it cannot fund the spend."""
+
+        xch_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 333_333_330_000}}],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 833_333}}],
+        }
+        last_prep = {
+            "tier_enabled": True,
+            "tier_counts_xch": {"inner": 1},
+            "tier_counts_cat": {"inner": 1},
+            "tier_sizes_xch": {"inner": "0.33333333"},
+            "offer_tier_sizes_xch": {"inner": "0.333333333333"},
+            "tier_sizes_cat": {"inner": "833.333"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            last_path = os.path.join(temp_dir, "coin_prep_last.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"phase": "complete", "run_id": "old-run"}, handle)
+            with open(last_path, "w", encoding="utf-8") as handle:
+                json.dump(last_prep, handle)
+
+            def spendable(wallet_id):
+                return xch_records if int(wallet_id) == 1 else cat_records
+
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_last_file",
+                    return_value=last_path,
+                ),
+                patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(
+                    api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}
+                ),
+                patch("database.get_coin_summary", return_value={}),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_tier_size_drift_findings",
+                    return_value=[],
+                ),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertFalse(body["complete"])
+        self.assertFalse(body.get("previously_complete", False))
+
 
 # ---------------------------------------------------------------------------
 # 2. GET /api/coin-prep/verify
@@ -338,6 +400,134 @@ class TestCoinPrepVerify(_FlaskBase):
             "live_size_mojos": 100000,
         }
     ]
+
+    def test_wallet_snapshot_queries_independent_sage_views_concurrently(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def slow_result(wallet_id):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return {"wallet_id": wallet_id}
+
+        snapshot = coin_prep_blueprint._coin_prep_wallet_snapshot(
+            slow_result,
+            slow_result,
+            1,
+            2,
+        )
+
+        self.assertGreaterEqual(max_active, 2)
+        self.assertEqual(snapshot[0]["wallet_id"], 1)
+        self.assertEqual(snapshot[1]["wallet_id"], 2)
+        self.assertEqual(snapshot[2]["wallet_id"], 1)
+        self.assertEqual(snapshot[3]["wallet_id"], 2)
+
+    def test_bootstrap_verify_uses_exact_campaign_outputs_not_legacy_query(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 5,
+                "cat_target": 3,
+                "buy_tier_sizes": "inner=0.4,mid=0.3,outer=0.3,fees=0.001",
+                "cat_tier_sizes": "inner=400,mid=300,outer=300",
+                "tier_counts_xch": "inner=1,mid=1,outer=1,fees=2",
+                "tier_counts_cat": "inner=1,mid=1,outer=1",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 2_000_000_000_000,
+            "cat_balance_mojos": 2_000_000,
+            "cat_decimals": 3,
+        }
+        empty = {"success": True, "records": []}
+
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch("wallet.get_spendable_coins_rpc", return_value=empty),
+            patch("wallet.get_wallet_balance") as legacy_balance,
+            patch("wallet.WALLET_ID_XCH", 1),
+            patch.object(
+                coin_prep_blueprint,
+                "_tier_size_drift_findings",
+            ) as legacy_drift,
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4"
+                "&inner_xch=999&inner_cat=999999&inner_count=50",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["bootstrap_campaign_id"], "campaign-1")
+        self.assertEqual(body["bootstrap_campaign_revision"], 4)
+        self.assertEqual(body["xch_needed_mojos"], 1_002_000_000_000)
+        self.assertEqual(body["cat_needed_mojos"], 1_000_000)
+        self.assertEqual(body["tiers"]["fees"]["needed"], 2)
+        legacy_balance.assert_not_called()
+        legacy_drift.assert_not_called()
+
+    def test_bootstrap_verify_rejects_offer_coins_below_exact_spend(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 2,
+                "cat_target": 1,
+                "buy_tier_sizes": "inner=0.333333333333,fees=0.001",
+                "cat_tier_sizes": "inner=833.333",
+                "tier_counts_xch": "inner=1,fees=1",
+                "tier_counts_cat": "inner=1",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 1_000_000_000_000,
+            "cat_balance_mojos": 2_000_000,
+            "cat_decimals": 3,
+        }
+        xch_records = {
+            "success": True,
+            "records": [
+                {"coin": {"amount": 333_333_330_000}},
+                {"coin": {"amount": 1_000_000_000}},
+            ],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 833_333}}],
+        }
+
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch(
+                "wallet.get_spendable_coins_rpc",
+                side_effect=[xch_records, cat_records],
+            ),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertFalse(body["all_sufficient"])
+        self.assertTrue(body["needs_coin_prep"])
+        self.assertEqual(body["tiers"]["inner"]["xch_have"], 0)
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 1)
 
     def test_returns_200_flat_mode(self):
         with (

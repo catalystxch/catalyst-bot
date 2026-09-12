@@ -132,7 +132,7 @@ cd src/catalyst && python -c "from config import cfg; print({k:getattr(cfg,k,Non
 | 1.1 | Status badge shows "◯ Stopped" in the titlebar area when bot not running | yes |
 | 1.2 | Wallet balance card populates with XCH total + CAT total | ≤ 10 s after Sage connect |
 | 1.3 | Coin inventory card shows `xch_total_coins`, `cat_total_coins` | non-zero after wallet sync |
-| 1.4 | Trading Pair selector lists all MZ_XCH and other CAT pools from TibetSwap | refresh button works |
+| 1.4 | Trading Pair selector lists MZ_XCH and other wallet CATs matched to Dexie trading pairs | refresh button works; no live TibetSwap request |
 | 1.5 | After picking a pair, Mid Price chart starts filling | ~5 s per sample, 240-point history |
 | 1.6 | Start Bot button enabled when: wallet synced + trading pair picked + settings saved + coins prepped | red disabled states with tooltips when not |
 | 1.7 | **Spacescan tier** — Activity Level / On-Chain Risk show "Free tier" (dimmed) when no API key; "Disabled" when SPACESCAN_ENABLED=false; actual value when Pro key set | (shipped 2026-04-25) |
@@ -168,7 +168,7 @@ Located at the top of Settings, just under Trading Pair.
 | 3.4 | After clicking **Buy Only**: Max Sell, Sell ladder sizes, CAT count row, CAT spare row, Sell prep column all hide | body class `liquidity-mode-buy-only` is set |
 | 3.5 | After clicking **Sell Only**: Max Buy, Buy ladder sizes, XCH count row, XCH spare row, Buy prep column, Reverse Buy Ladder toggle all hide | body class `liquidity-mode-sell-only` |
 | 3.6 | Inventory Management section hides in both single-sided modes | skew is meaningless one-sided |
-| 3.7 | Sniper config (size / prep count / re-arm fields + hint) hides and is replaced by "🎯 Sniper unavailable in single-sided mode" banner | banner has grey background |
+| 3.7 | Book-opportunity status follows the selected side and never exposes legacy sniper controls | single-sided mode cannot create opportunity orders on the disabled side |
 | 3.8 | Auto-Fill title switches: `Auto-Fill Settings` → `Auto-Fill — Accumulation Plan` / `— Distribution Plan` | subtitle also mode-specific |
 | 3.9 | **Coin Prep Summary** Buy/Sell columns collapse to single column in single-sided mode | only active side's counts+sizes shown |
 | 3.10 | Wallet-aware hint appears when wallet is ≥92% one asset | "Apply suggestion" button auto-switches mode |
@@ -182,8 +182,8 @@ Located at the top of Settings, just under Trading Pair.
 | 4.2 | Set XCH reserve to 5 → click Smart Settings → no error toast | completes in ~3-8 s |
 | 4.3 | Form populates: Max Buy, Max Sell, tier sizes (buy + sell rows), tier counts, spare counts, topup pools | all fields filled |
 | 4.4 | Capital plan message shows strategy string | e.g. "standard 4-tier ladder · 24B/23S offers · 87.40 XCH trading (85%)" |
-| 4.5 | **Liquidity Mode: Buy Only** + Smart Settings → `max_active_sell=0`, all `sell_*_size_xch=null`, `sniper_enabled=false`, `topup_pool_cat=0` | verify via: `fetch('/api/smart-defaults?liquidity_mode=buy_only&...').then(r=>r.json())` |
-| 4.6 | **Liquidity Mode: Sell Only** + Smart Settings → `max_active_buy=0`, all `buy_*_size_xch=null`, `sniper_enabled=false`, `topup_pool_xch=0`, `buy_ladder_reversed=false` | similar |
+| 4.5 | **Liquidity Mode: Buy Only** + Smart Settings → `max_active_sell=0`, all `sell_*_size_xch=null`, `topup_pool_cat=0` | verify via: `fetch('/api/smart-defaults?liquidity_mode=buy_only&...').then(r=>r.json())` |
+| 4.6 | **Liquidity Mode: Sell Only** + Smart Settings → `max_active_buy=0`, all `buy_*_size_xch=null`, `topup_pool_xch=0`, `buy_ladder_reversed=false` | similar |
 | 4.7 | Under Reverse Buy Ladder + Two-Sided, tier sizes follow the reverse orientation (inner smaller than extreme) | (per 2026-04-19 ea0d1b5 fix) |
 | 4.8 | Clicking Smart Settings twice in a row with same inputs → same output | idempotent |
 | 4.9 | **Reserve % matrix** — Smart Settings adjusts trade size + slot count inversely with reserve %: 25%→1.40 XCH × 24 slots, 50%→0.73 XCH × 36 slots (verified 2026-04-25) | bigger reserve = smaller trades, more slots |
@@ -219,7 +219,7 @@ Located at the top of Settings, just under Trading Pair.
 | 6.6 | **Single-sided mode banner** at top of PnL tab when mode ≠ two_sided | shows avg price + notional vs mid |
 | 6.7 | **Reset Position** button: confirm → `/api/fills/purge` → clears fills | (existing legacy behaviour) |
 | 6.8 | **⚠ Reset All Stats** button: confirm modal with full scope detail → `/api/pnl/reset` with `{confirm:"RESET"}` | full wipe (including runtime stats) |
-| 6.9 | Current Spreads card + Sniper Stats card both update | buy/sell spread % live |
+| 6.9 | Current Spreads card + fill-evidence status both update | buy/sell spread % and confirmed/pending counts are live |
 
 <a id="offers"></a>
 ## 7. Offers tab
@@ -302,7 +302,7 @@ curl -s http://127.0.0.1:5000/api/config | jq '.LIQUIDITY_MODE, .ENABLE_BUY, .EN
 for m in two_sided buy_only sell_only; do
   echo "=== $m ==="
   curl -s "http://127.0.0.1:5000/api/smart-defaults?xch_reserve=5&cat_reserve=10000&risk_profile=balanced&liquidity_mode=$m" | \
-    jq '{liquidity_mode, max_active_buy, max_active_sell, sniper_enabled, buy_ladder_reversed}'
+    jq '{liquidity_mode, max_active_buy, max_active_sell, buy_ladder_reversed}'
 done
 
 # PnL preview — what Reset All Stats would clear

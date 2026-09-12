@@ -3519,6 +3519,249 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
     recorded_at                TEXT NOT NULL,
     resolved_at                TEXT
 );
+
+-- v1.4 provider evidence. Raw evidence is bounded and redacted before this
+-- database boundary; exact digests make retries idempotent.
+CREATE TABLE IF NOT EXISTS market_provider_observations (
+    observation_id            TEXT PRIMARY KEY,
+    asset_id                  TEXT NOT NULL,
+    provider_id               TEXT NOT NULL,
+    capability                TEXT NOT NULL,
+    observed_at               TEXT NOT NULL,
+    source_time               TEXT,
+    source_height             INTEGER CHECK(source_height IS NULL OR source_height >= 0),
+    fresh_until               TEXT NOT NULL,
+    identity_keys_json        TEXT NOT NULL,
+    payload_sha256            TEXT NOT NULL,
+    quality                   TEXT NOT NULL CHECK(quality IN ('valid','degraded','invalid')),
+    reason_codes_json         TEXT NOT NULL,
+    raw_evidence_json         TEXT NOT NULL,
+    created_at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_provider_observations_asset_time
+    ON market_provider_observations(asset_id, observed_at DESC);
+
+-- Immutable fill-candidate evidence.  Observed/Probable rows are diagnostic
+-- only; database checks make it impossible to mark them as economic authority.
+CREATE TABLE IF NOT EXISTS fill_confidence_assessments (
+    assessment_id             TEXT PRIMARY KEY,
+    trade_id                  TEXT NOT NULL,
+    asset_id                  TEXT NOT NULL,
+    confidence                TEXT NOT NULL
+                              CHECK(confidence IN ('OBSERVED','PROBABLE','CONFIRMED')),
+    outcome                   TEXT NOT NULL,
+    authority_source          TEXT NOT NULL,
+    reason_codes_json         TEXT NOT NULL CHECK(json_valid(reason_codes_json)),
+    market_confidence_impact  TEXT CHECK(market_confidence_impact IS NULL OR
+                                         market_confidence_impact='AMBER'),
+    can_account               INTEGER NOT NULL CHECK(can_account IN (0,1)),
+    can_replace               INTEGER NOT NULL CHECK(can_replace IN (0,1)),
+    evidence_json             TEXT NOT NULL CHECK(json_valid(evidence_json)),
+    evidence_sha256           TEXT NOT NULL,
+    observed_at               TEXT NOT NULL,
+    CHECK((confidence='CONFIRMED' AND outcome='FILL' AND
+           can_account=1 AND can_replace=1) OR
+          (NOT (confidence='CONFIRMED' AND outcome='FILL') AND
+           can_account=0 AND can_replace=0))
+);
+CREATE INDEX IF NOT EXISTS idx_fill_confidence_asset_time
+    ON fill_confidence_assessments(asset_id, observed_at DESC, assessment_id DESC);
+CREATE INDEX IF NOT EXISTS idx_fill_confidence_trade_time
+    ON fill_confidence_assessments(trade_id, observed_at DESC, assessment_id DESC);
+CREATE TRIGGER IF NOT EXISTS fill_confidence_assessments_no_update
+BEFORE UPDATE ON fill_confidence_assessments
+BEGIN
+    SELECT RAISE(ABORT, 'fill_confidence_assessments is append-only');
+END;
+-- Deletion is allowed only through guarded_reset_authoritative_state after it
+-- proves that no unresolved wallet effect exists. Remove the early-development
+-- trigger as part of migration so that guarded evidence reset remains possible.
+DROP TRIGGER IF EXISTS fill_confidence_assessments_no_delete;
+
+CREATE TABLE IF NOT EXISTS market_evidence_summaries (
+    asset_id                  TEXT NOT NULL,
+    summary_day               TEXT NOT NULL,
+    provider_id               TEXT NOT NULL,
+    capability                TEXT NOT NULL,
+    quality                   TEXT NOT NULL,
+    observation_count         INTEGER NOT NULL CHECK(observation_count > 0),
+    summarized_at             TEXT NOT NULL,
+    PRIMARY KEY(asset_id, summary_day, provider_id, capability, quality)
+);
+
+CREATE TABLE IF NOT EXISTS market_confidence_snapshots (
+    snapshot_id               TEXT PRIMARY KEY,
+    asset_id                  TEXT NOT NULL,
+    state                     TEXT NOT NULL CHECK(state IN ('GREEN','AMBER','RED')),
+    derived_at                TEXT NOT NULL,
+    trusted_midpoint          TEXT,
+    trusted_bid               TEXT,
+    trusted_ask               TEXT,
+    degraded_since            TEXT,
+    withdrawal_stage          TEXT NOT NULL,
+    recovery_refreshes        INTEGER NOT NULL CHECK(recovery_refreshes >= 0),
+    reason_codes_json         TEXT NOT NULL,
+    source_health_json        TEXT NOT NULL,
+    evidence_digests_json     TEXT NOT NULL,
+    material                  INTEGER NOT NULL DEFAULT 1 CHECK(material IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_market_confidence_asset_time
+    ON market_confidence_snapshots(asset_id, derived_at DESC);
+
+-- Restart-safe price-war limiter. A changing book digest cannot bypass the
+-- per-asset/per-side cooldown; the digest records the decision input.
+CREATE TABLE IF NOT EXISTS offer_book_competition_claims (
+    asset_id                  TEXT NOT NULL,
+    side                      TEXT NOT NULL CHECK(side IN ('buy','sell')),
+    evidence_digest           TEXT NOT NULL,
+    claimed_at                TEXT NOT NULL,
+    PRIMARY KEY(asset_id, side)
+);
+
+CREATE TABLE IF NOT EXISTS market_confidence_engine_state (
+    asset_id                  TEXT PRIMARY KEY,
+    risk_preset               TEXT NOT NULL,
+    state_json                TEXT NOT NULL CHECK(json_valid(state_json)),
+    snapshot_id               TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    FOREIGN KEY(snapshot_id) REFERENCES market_confidence_snapshots(snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS post_tibet_migration_reports (
+    asset_id                  TEXT PRIMARY KEY,
+    migration_version        INTEGER NOT NULL CHECK(migration_version = 1),
+    report_json               TEXT NOT NULL,
+    completed_at              TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS degraded_market_state (
+    asset_id                  TEXT PRIMARY KEY,
+    degraded_since            TEXT,
+    recovery_started_at       TEXT,
+    recovery_refreshes        INTEGER NOT NULL DEFAULT 0
+                              CHECK(recovery_refreshes >= 0),
+    last_confidence_state     TEXT NOT NULL
+                              CHECK(last_confidence_state IN ('GREEN','AMBER','RED')),
+    withdrawal_stage          TEXT NOT NULL
+                              CHECK(withdrawal_stage IN ('NONE','INNER','MIDDLE','ALL')),
+    updated_at                TEXT NOT NULL
+);
+
+-- Exact public rediscovery is distinct from a provider's submission ACK.
+-- Rows are created for both destinations after Sage confirms creation.  An
+-- exact observation is irreversible; deadline expiry remains nonterminal so
+-- the offer continues to own its slot until Sage cancellation is proven.
+CREATE TABLE IF NOT EXISTS offer_publication_discoveries (
+    intent_id                 TEXT NOT NULL,
+    provider                  TEXT NOT NULL CHECK(provider IN ('dexie','splash')),
+    offer_identity            TEXT NOT NULL,
+    state                     TEXT NOT NULL
+                              CHECK(state IN ('pending','mismatch','exact','deadline_expired')),
+    observed_identity         TEXT,
+    deadline_at               TEXT NOT NULL,
+    first_observed_at         TEXT,
+    updated_at                TEXT NOT NULL,
+    PRIMARY KEY(intent_id, provider),
+    FOREIGN KEY(intent_id) REFERENCES offer_intents(intent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offer_publication_discovery_deadline
+    ON offer_publication_discoveries(state, deadline_at);
+
+-- Explicit, fixed-budget authority for post-TibetSwap Market Bootstrap.
+-- Decimal values are stored as canonical text so no float conversion can
+-- enlarge a campaign after restart.
+CREATE TABLE IF NOT EXISTS bootstrap_campaigns (
+    campaign_id                    TEXT PRIMARY KEY,
+    network                        TEXT NOT NULL CHECK(network IN ('mainnet','testnet')),
+    wallet_type                    TEXT NOT NULL CHECK(wallet_type='sage'),
+    wallet_fingerprint             INTEGER NOT NULL CHECK(wallet_fingerprint > 0),
+    wallet_id                      INTEGER NOT NULL CHECK(wallet_id > 0),
+    asset_id                       TEXT NOT NULL,
+    anchor_price                   TEXT NOT NULL,
+    minimum_price                  TEXT NOT NULL,
+    maximum_price                  TEXT NOT NULL,
+    xch_budget                     TEXT NOT NULL,
+    cat_budget                     TEXT NOT NULL,
+    fee_budget_xch                 TEXT NOT NULL,
+    subsidy_budget_xch             TEXT NOT NULL,
+    created_at                     TEXT NOT NULL,
+    expires_at                     TEXT NOT NULL,
+    status                         TEXT NOT NULL DEFAULT 'active'
+                                   CHECK(status IN ('active','stopped')),
+    stage                          TEXT NOT NULL DEFAULT 'bootstrap'
+                                   CHECK(stage IN ('bootstrap','discovery_25',
+                                                   'discovery_50','established',
+                                                   'unsafe','stopped')),
+    deployment_fraction            TEXT NOT NULL DEFAULT '0.1',
+    current_anchor_price            TEXT NOT NULL,
+    stable_since                   TEXT,
+    confirmed_fills                INTEGER NOT NULL DEFAULT 0
+                                   CHECK(confirmed_fills >= 0),
+    settlement_clusters            INTEGER NOT NULL DEFAULT 0
+                                   CHECK(settlement_clusters >= 0 AND
+                                         settlement_clusters <= confirmed_fills),
+    independent_depth_sides_json   TEXT NOT NULL DEFAULT '[]'
+                                   CHECK(json_valid(independent_depth_sides_json)),
+    suspected_linked_activity      INTEGER NOT NULL DEFAULT 0
+                                   CHECK(suspected_linked_activity IN (0,1)),
+    adverse_fill_times_json        TEXT NOT NULL DEFAULT '[]'
+                                   CHECK(json_valid(adverse_fill_times_json)),
+    fee_spent_xch                  TEXT NOT NULL DEFAULT '0',
+    realized_loss_xch              TEXT NOT NULL DEFAULT '0',
+    marked_inventory_loss_xch      TEXT NOT NULL DEFAULT '0',
+    revision                       INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    stop_reason                    TEXT,
+    stopped_at                     TEXT,
+    updated_at                     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_campaigns_one_active
+    ON bootstrap_campaigns(network, wallet_fingerprint, asset_id)
+    WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_bootstrap_campaigns_asset_status
+    ON bootstrap_campaigns(asset_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS bootstrap_campaign_events (
+    event_id                       TEXT PRIMARY KEY,
+    campaign_id                    TEXT NOT NULL,
+    event_type                     TEXT NOT NULL,
+    occurred_at                    TEXT NOT NULL,
+    data_json                      TEXT NOT NULL CHECK(json_valid(data_json)),
+    FOREIGN KEY(campaign_id) REFERENCES bootstrap_campaigns(campaign_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_campaign_events_campaign_time
+    ON bootstrap_campaign_events(campaign_id, occurred_at, event_id);
+CREATE TRIGGER IF NOT EXISTS bootstrap_campaign_events_no_update
+BEFORE UPDATE ON bootstrap_campaign_events
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_campaign_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS bootstrap_campaign_events_no_delete
+BEFORE DELETE ON bootstrap_campaign_events
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_campaign_events is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS bootstrap_participation (
+    participation_id              TEXT PRIMARY KEY,
+    campaign_id                   TEXT NOT NULL,
+    report_id                     TEXT NOT NULL,
+    recorded_at                   TEXT NOT NULL,
+    data_json                     TEXT NOT NULL CHECK(json_valid(data_json)),
+    UNIQUE(campaign_id, report_id),
+    FOREIGN KEY(campaign_id) REFERENCES bootstrap_campaigns(campaign_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_participation_campaign_time
+    ON bootstrap_participation(campaign_id, recorded_at, participation_id);
+CREATE TRIGGER IF NOT EXISTS bootstrap_participation_no_update
+BEFORE UPDATE ON bootstrap_participation
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_participation is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS bootstrap_participation_no_delete
+BEFORE DELETE ON bootstrap_participation
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_participation is append-only');
+END;
 """
 
 
@@ -3551,6 +3794,37 @@ _STABILITY_REQUIRED_COLUMNS = {
         "first_visible_at",
         "terminal_at",
         "updated_at",
+    },
+    "offer_publication_discoveries": {
+        "intent_id",
+        "provider",
+        "offer_identity",
+        "state",
+        "observed_identity",
+        "deadline_at",
+        "first_observed_at",
+        "updated_at",
+    },
+    "offer_book_competition_claims": {
+        "asset_id",
+        "side",
+        "evidence_digest",
+        "claimed_at",
+    },
+    "fill_confidence_assessments": {
+        "assessment_id",
+        "trade_id",
+        "asset_id",
+        "confidence",
+        "outcome",
+        "authority_source",
+        "reason_codes_json",
+        "market_confidence_impact",
+        "can_account",
+        "can_replace",
+        "evidence_json",
+        "evidence_sha256",
+        "observed_at",
     },
     "offer_operation_journal": {
         "sequence",
@@ -4056,6 +4330,54 @@ _STABILITY_REQUIRED_COLUMNS = {
         "recorded_at",
         "resolved_at",
     },
+    "bootstrap_campaigns": {
+        "campaign_id",
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "asset_id",
+        "anchor_price",
+        "minimum_price",
+        "maximum_price",
+        "xch_budget",
+        "cat_budget",
+        "fee_budget_xch",
+        "subsidy_budget_xch",
+        "created_at",
+        "expires_at",
+        "status",
+        "stage",
+        "deployment_fraction",
+        "current_anchor_price",
+        "stable_since",
+        "confirmed_fills",
+        "settlement_clusters",
+        "independent_depth_sides_json",
+        "suspected_linked_activity",
+        "adverse_fill_times_json",
+        "fee_spent_xch",
+        "realized_loss_xch",
+        "marked_inventory_loss_xch",
+        "revision",
+        "stop_reason",
+        "stopped_at",
+        "updated_at",
+    },
+    "bootstrap_campaign_events": {
+        "event_id",
+        "campaign_id",
+        "event_type",
+        "occurred_at",
+        "data_json",
+    },
+    "bootstrap_participation": {
+        "participation_id",
+        "campaign_id",
+        "report_id",
+        "recorded_at",
+        "data_json",
+    },
 }
 
 _STABILITY_INDEXES = {
@@ -4282,6 +4604,41 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("intent_id", "state"),
+        None,
+    ),
+    "idx_offer_publication_discovery_deadline": (
+        "offer_publication_discoveries",
+        False,
+        False,
+        ("state", "deadline_at"),
+        None,
+    ),
+    "idx_bootstrap_campaigns_one_active": (
+        "bootstrap_campaigns",
+        True,
+        True,
+        ("network", "wallet_fingerprint", "asset_id"),
+        "status='active'",
+    ),
+    "idx_bootstrap_campaigns_asset_status": (
+        "bootstrap_campaigns",
+        False,
+        False,
+        ("asset_id", "status", "updated_at"),
+        None,
+    ),
+    "idx_bootstrap_campaign_events_campaign_time": (
+        "bootstrap_campaign_events",
+        False,
+        False,
+        ("campaign_id", "occurred_at", "event_id"),
+        None,
+    ),
+    "idx_bootstrap_participation_campaign_time": (
+        "bootstrap_participation",
+        False,
+        False,
+        ("campaign_id", "recorded_at", "participation_id"),
         None,
     ),
 }
@@ -4799,6 +5156,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("child_intent_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
+    _require_unique_key(conn, "bootstrap_participation", ("campaign_id", "report_id"))
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -5288,6 +5646,26 @@ _STABILITY_BACKFILL_POLICY_SHA256 = hashlib.sha256(
     b"task9-authoritative-backfills:v1:sweep-boost-hook-proof"
 ).hexdigest()
 
+_POST_TIBET_SCHEMA_MIGRATION_KEY = "post-tibetswap-offer-book-schema"
+_POST_TIBET_SCHEMA_VERSION = 1
+_POST_TIBET_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"post-tibetswap-offer-book-schema:v1:publication-fill-competition"
+).hexdigest()
+_POST_TIBET_SCHEMA_TABLES = frozenset(
+    {
+        "fill_confidence_assessments",
+        "offer_book_competition_claims",
+        "offer_publication_discoveries",
+    }
+)
+_BOOTSTRAP_SCHEMA_TABLES = frozenset(
+    {
+        "bootstrap_campaigns",
+        "bootstrap_campaign_events",
+        "bootstrap_participation",
+    }
+)
+
 
 def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
@@ -5304,6 +5682,24 @@ def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
         or row["policy_sha256"] != _STABILITY_BACKFILL_POLICY_SHA256
     ):
         raise RuntimeError("stability migration watermark contradicts schema policy")
+    return True
+
+
+def _post_tibet_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 "
+        "FROM stability_migration_watermarks WHERE migration_key=?",
+        (_POST_TIBET_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        type(row["schema_version"]) is not int
+        or row["schema_version"] != _POST_TIBET_SCHEMA_VERSION
+        or type(row["policy_sha256"]) is not str
+        or row["policy_sha256"] != _POST_TIBET_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("post-TibetSwap schema watermark contradicts schema policy")
     return True
 
 
@@ -6067,30 +6463,38 @@ def _migrate_stability_schema() -> None:
         _validate_stability_schema(conn)
         _normalize_existing_stability_timestamps(conn)
         backfills_completed = _stability_backfills_completed(conn)
-        legacy_missing_tables = missing_stability_tables - {
-            "offer_reconciliation_coin_outcomes",
-            "offer_reconciliation_coin_outcome_quarantine",
-            "authoritative_fill_receipts",
-            "authoritative_round_trip_receipts",
-            "offer_authority_migration_audit",
-            "offer_intent_economic_authority",
-            "wallet_effect_claims",
-            "wallet_effect_claim_coins",
-            "wallet_effect_claim_authorities",
-            "wallet_effect_dispatches",
-            "wallet_effect_claim_resolutions",
-            "offer_authority_revocations",
-            "offer_fill_hook_claim_attestations",
-            "offer_fill_sweep_delivery_claim_attestations",
-            "offer_refresh_lineage_commits",
-            "offer_refresh_lineage_blockers",
-            "runtime_recovery_epochs",
-            "runtime_recovery_takeovers",
-            "runtime_recovery_passes",
-            "runtime_recovery_promotions",
-            "runtime_quarantine_manifests",
-            "runtime_quarantine_resolutions",
-        }
+        post_tibet_schema_completed = _post_tibet_schema_completed(conn)
+        missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
+        if post_tibet_schema_completed and missing_post_tibet_tables:
+            raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
+        legacy_missing_tables = missing_stability_tables - (
+            {
+                "offer_reconciliation_coin_outcomes",
+                "offer_reconciliation_coin_outcome_quarantine",
+                "authoritative_fill_receipts",
+                "authoritative_round_trip_receipts",
+                "offer_authority_migration_audit",
+                "offer_intent_economic_authority",
+                "wallet_effect_claims",
+                "wallet_effect_claim_coins",
+                "wallet_effect_claim_authorities",
+                "wallet_effect_dispatches",
+                "wallet_effect_claim_resolutions",
+                "offer_authority_revocations",
+                "offer_fill_hook_claim_attestations",
+                "offer_fill_sweep_delivery_claim_attestations",
+                "offer_refresh_lineage_commits",
+                "offer_refresh_lineage_blockers",
+                "runtime_recovery_epochs",
+                "runtime_recovery_takeovers",
+                "runtime_recovery_passes",
+                "runtime_recovery_promotions",
+                "runtime_quarantine_manifests",
+                "runtime_quarantine_resolutions",
+            }
+            | _POST_TIBET_SCHEMA_TABLES
+            | _BOOTSTRAP_SCHEMA_TABLES
+        )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
         _backfill_authoritative_coin_outcomes(
@@ -6120,6 +6524,18 @@ def _migrate_stability_schema() -> None:
                     _STABILITY_BACKFILL_MIGRATION_KEY,
                     _STABILITY_BACKFILL_SCHEMA_VERSION,
                     _STABILITY_BACKFILL_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not post_tibet_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _POST_TIBET_SCHEMA_MIGRATION_KEY,
+                    _POST_TIBET_SCHEMA_VERSION,
+                    _POST_TIBET_SCHEMA_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
@@ -7145,29 +7561,52 @@ def add_offer(
     Returns:
         True if inserted successfully, False on error
     """
+    conn = None
+    close_conn = False
     try:
-        conn = get_connection()
-        conn.execute(
-            """INSERT INTO offers (trade_id, side, price_xch, size_xch, size_cat,
+        sql = """INSERT INTO offers (trade_id, side, price_xch, size_xch, size_cat,
                tier, status, cat_asset_id, created_at, expires_at, coin_id, fee_mojos_xch)
-               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
-            (
-                trade_id,
-                side,
-                str(price_xch),
-                str(size_xch),
-                str(size_cat),
-                tier,
-                cat_asset_id,
-                _now(),
-                expires_at,
-                coin_id,
-                int(fee_mojos_xch),
-            ),
+               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)"""
+        values = (
+            trade_id,
+            side,
+            str(price_xch),
+            str(size_xch),
+            str(size_cat),
+            tier,
+            cat_asset_id,
+            _now(),
+            expires_at,
+            coin_id,
+            int(fee_mojos_xch),
         )
+
+        try:
+            conn = get_connection()
+            conn.execute(sql, values)
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            # Sage has already created the wallet offer. If a worker's cached
+            # connection is contended, retry on a fresh bounded connection so
+            # we do not cancel an otherwise-valid on-chain offer.
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                # Preserve the original lock error; rollback cleanup is best-effort.
+                pass
+            conn = open_critical_write_connection()
+            close_conn = True
+            conn.execute(sql, values)
         conn.commit()
         return True
     except sqlite3.IntegrityError as e:
+        try:
+            conn.rollback()
+        except Exception:
+            # Report the original integrity failure even if rollback also fails.
+            pass
         err = str(e)
         if "UNIQUE constraint failed" in err:
             # trade_id already exists — this is fine on restart/resume
@@ -7193,9 +7632,17 @@ def add_offer(
         )
         return False
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            # Preserve the primary database failure for the operator log.
+            pass
         print(f"  ❌ [DB] add_offer FAILED for {trade_id[:16]}...: {e}", flush=True)
         log_event("error", "db_error", f"Failed to add offer {trade_id}: {e}")
         return False
+    finally:
+        if close_conn and conn is not None:
+            conn.close()
 
 
 def recover_unknown_offers(wallet_offers: list, cat_asset_id: str) -> dict:
@@ -7703,6 +8150,22 @@ def guarded_reset_authoritative_state(
             return int(conn.execute(sql, params).fetchone()[0])
 
         fill_count = count("SELECT COUNT(*) FROM fills")
+        fill_assessment_count = count(
+            "SELECT COUNT(*) FROM fill_confidence_assessments"
+        )
+        unresolved_fill_evidence_count = count(
+            "SELECT COUNT(*) FROM fill_confidence_assessments AS candidate "
+            "WHERE candidate.confidence <> 'CONFIRMED' "
+            "AND candidate.outcome IN ('POSSIBLE_FILL','LIKELY_FILL','CONFLICT') "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM fill_confidence_assessments AS newer "
+            "  WHERE newer.trade_id=candidate.trade_id AND ("
+            "    newer.observed_at > candidate.observed_at OR "
+            "    (newer.observed_at=candidate.observed_at "
+            "     AND newer.assessment_id > candidate.assessment_id)"
+            "  )"
+            ")"
+        )
         intent_count = count("SELECT COUNT(*) FROM offer_intents")
         journal_count = count("SELECT COUNT(*) FROM offer_operation_journal")
         open_offer_count = count("SELECT COUNT(*) FROM offers WHERE status='open'")
@@ -7725,6 +8188,8 @@ def guarded_reset_authoritative_state(
             or protected_coin_count
         ):
             conflicts.append("authoritative_session_state")
+        if clear_fills and unresolved_fill_evidence_count:
+            conflicts.append("unresolved_fill_evidence")
         if clear_coins and (
             intent_count or journal_count or open_offer_count or protected_coin_count
         ):
@@ -7740,26 +8205,41 @@ def guarded_reset_authoritative_state(
                 "error": "authoritative_state_conflict",
                 "conflicts": sorted(set(conflicts)),
                 "fills_cleared": 0,
+                "fill_confidence_assessments_cleared": 0,
                 "round_trips_cleared": 0,
                 "coins_cleared": 0,
                 "open_offers_cancelled": 0,
                 "offers_deleted": 0,
                 "price_history_cleared": False,
+                "market_evidence_cleared": {
+                    "provider_observations": 0,
+                    "confidence_snapshots": 0,
+                    "summaries": 0,
+                },
                 "inventory_cleared": False,
             }
 
         summary: Dict[str, Any] = {
             "success": True,
             "fills_cleared": 0,
+            "fill_confidence_assessments_cleared": 0,
             "round_trips_cleared": 0,
             "coins_cleared": 0,
             "open_offers_cancelled": 0,
             "offers_deleted": 0,
             "price_history_cleared": False,
+            "market_evidence_cleared": {
+                "provider_observations": 0,
+                "confidence_snapshots": 0,
+                "summaries": 0,
+            },
             "inventory_cleared": False,
         }
         # A positive fill count is refused above.  Keeping the statement out
         # entirely ensures no future FK topology can turn reset into data loss.
+        if clear_fills and fill_assessment_count:
+            cursor = conn.execute("DELETE FROM fill_confidence_assessments")
+            summary["fill_confidence_assessments_cleared"] = int(cursor.rowcount or 0)
         if (
             clear_round_trips
             and conn.execute(
@@ -7781,6 +8261,22 @@ def guarded_reset_authoritative_state(
             summary["offers_deleted"] = int(cursor.rowcount or 0)
         if clear_price_history:
             conn.execute("DELETE FROM price_history")
+            evidence_tables = {
+                "provider_observations": "market_provider_observations",
+                "confidence_snapshots": "market_confidence_snapshots",
+                "summaries": "market_evidence_summaries",
+            }
+            for summary_key, table_name in evidence_tables.items():
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table_name,),
+                ).fetchone():
+                    # table_name comes only from the closed literal allowlist
+                    # above; no request or persisted value can reach this SQL.
+                    cursor = conn.execute(f"DELETE FROM {table_name}")  # nosec B608
+                    summary["market_evidence_cleared"][summary_key] = int(
+                        cursor.rowcount or 0
+                    )
             summary["price_history_cleared"] = True
         if (
             clear_inventory
@@ -8513,7 +9009,18 @@ def upsert_coin(
         # Normalize coin_id before any DB operation — ensures consistency
         # with reconcile_coins_with_wallet() which also normalizes.
         coin_id = norm_coin_id(coin_id)
-        if _coin_terminal_mutation_is_protected(conn, coin_id):
+        protection_snapshot = kwargs.get("_protection_snapshot")
+        if (
+            protection_snapshot is not None
+            and type(protection_snapshot) is not frozenset
+        ):
+            raise TypeError("coin protection snapshot must be an exact frozenset")
+        protected = (
+            coin_id in protection_snapshot
+            if protection_snapshot is not None
+            else _coin_terminal_mutation_is_protected(conn, coin_id)
+        )
+        if protected:
             if started_transaction:
                 conn.rollback()
             return False
@@ -8629,21 +9136,31 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
 
     Returns number of coins successfully upserted.
     """
+    if type(coins) is not list or not coins:
+        return 0
     count = 0
     failures = 0
     first_error: Optional[str] = None
     conn = get_connection()
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
+    protection_snapshot = frozenset(
+        _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
+    )
     for c in coins:
         try:
-            upsert_coin(
+            inserted = upsert_coin(
                 c["coin_id"],
                 wallet_type,
                 c["amount_mojos"],
                 tier=c.get("tier", "unknown"),
                 purpose=c.get("purpose"),
                 _skip_commit=True,
+                _protection_snapshot=protection_snapshot,
             )
-            count += 1
+            if inserted:
+                count += 1
         except Exception as e:
             failures += 1
             if first_error is None:
@@ -8689,7 +9206,7 @@ def lock_coin(coin_id: str, trade_id: str) -> bool:
     conn = None
     try:
         normalized = norm_coin_id(coin_id)
-        conn = _stability_connection()
+        conn = open_critical_write_connection()
         conn.execute("BEGIN IMMEDIATE")
         # Get coin details before locking (for logging)
         row = conn.execute(
@@ -10776,6 +11293,47 @@ def _coin_terminal_mutation_is_protected(
         "SELECT status FROM offers WHERE trade_id=?", (row["trade_id"],)
     ).fetchone()
     return bool(offer is not None and offer["status"] == "open")
+
+
+def _batch_coin_terminal_mutation_protection(
+    conn: sqlite3.Connection, coin_ids: list[str]
+) -> set[str]:
+    """Snapshot every mutation fence once for a wallet coin batch.
+
+    The single-coin guard intentionally revalidates all durable authorities on
+    every call. A Sage wallet snapshot contains hundreds of coins, so repeating
+    those global scans for each row can hold SQLite's writer lock longer than
+    the runtime lease. This helper preserves the same fences while evaluating
+    the global sets once per snapshot transaction.
+    """
+
+    requested = {norm_coin_id(coin_id) for coin_id in coin_ids}
+    protected = _active_wallet_effect_coin_ids(conn) | _nonterminal_registry_coin_ids(
+        conn
+    )
+
+    outcome_candidates = {
+        norm_coin_id(row["coin_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT coin_id FROM offer_reconciliation_coin_outcomes"
+        ).fetchall()
+        if row["coin_id"]
+    }
+    for coin_id in requested & outcome_candidates:
+        if _authoritative_coin_outcome(conn, coin_id) is not None:
+            protected.add(coin_id)
+
+    protected.update(
+        norm_coin_id(row["coin_id"])
+        for row in conn.execute(
+            """SELECT c.coin_id
+                 FROM coins AS c
+                 JOIN offers AS o ON o.trade_id=c.trade_id
+                WHERE o.status='open' AND c.coin_id IS NOT NULL"""
+        ).fetchall()
+        if row["coin_id"]
+    )
+    return protected & requested
 
 
 def _coin_has_authoritative_permanent_spend(
@@ -19313,24 +19871,42 @@ def clear_market_analysis_cache(
 # ---------------------------------------------------------------------------
 
 
-def _stability_connection() -> sqlite3.Connection:
-    """Return a short-lived autocommit connection for stability CAS writes."""
+def open_critical_write_connection(
+    timeout_seconds: float = 30.0,
+) -> sqlite3.Connection:
+    """Open a fresh autocommit connection for post-wallet integrity writes.
 
-    conn = _sqlite_connect(DB_PATH, timeout=10, isolation_level=None)
+    These writes record or release state after an external wallet effect. A
+    longer busy timeout is preferable to losing the durable record and having
+    to compensate on chain.
+    """
+
+    timeout_seconds = max(1.0, float(timeout_seconds))
+    conn = _sqlite_connect(
+        DB_PATH,
+        timeout=timeout_seconds,
+        isolation_level=None,
+    )
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
         try:
             from super_log import trace_connection
 
-            trace_connection(conn, f"stability-{threading.current_thread().name}")
+            trace_connection(conn, f"critical-{threading.current_thread().name}")
         except ImportError:
             pass
         return conn
     except BaseException:
         conn.close()
         raise
+
+
+def _stability_connection() -> sqlite3.Connection:
+    """Return a short-lived autocommit connection for stability CAS writes."""
+
+    return open_critical_write_connection(timeout_seconds=5.0)
 
 
 def _stability_read_only_connection() -> sqlite3.Connection:
@@ -21593,10 +22169,10 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
     """Attach one pre-Task-12 runtime top-up claim to exact recovery evidence.
 
     This narrow migration never replays a wallet effect. It accepts only a
-    historical runtime split or reserve-absorption operation after its adapter
-    outcome is durably SUBMITTED/UNKNOWN, and requires separate authoritative
-    proof for every pinned XCH fee input before the resulting prep operation can
-    resolve the safety latch.
+    historical runtime split, reserve absorption, or CAT consolidation after its
+    adapter outcome is durably SUBMITTED/UNKNOWN, and requires separate
+    authoritative proof for every pinned XCH fee input before the resulting prep
+    operation can resolve the safety latch.
     """
 
     from replacement_capacity import (
@@ -21652,16 +22228,24 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
             norm_coin_id(coin_id) for coin_id in contract["source_coin_ids"]
         )
         claim_operation = str(claim["operation_id"] or "") if claim is not None else ""
-        exact_operation_shape = (
-            claim_operation == "coin_manager.topup_split_sage"
-            and contract["operation_kind"] == "split"
-        ) or (
-            claim_operation == "coin_manager.absorb_sage"
-            and contract["operation_kind"] == "combine"
+        exact_combine_shape = (
+            contract["operation_kind"] == "combine"
             and contract["purpose"] == "top_up"
             and len(contract["source_coin_ids"]) >= 2
             and len(contract["target_contract"]["outputs"]) == 1
             and contract["target_contract"]["outputs"][0]["purpose"] == "top_up"
+        )
+        exact_operation_shape = (
+            claim_operation == "coin_manager.topup_split_sage"
+            and contract["operation_kind"] == "split"
+        ) or (
+            claim_operation
+            in {
+                "coin_manager.absorb_sage",
+                "coin_manager.absorb_cat_sage",
+                "coin_manager.consolidate_cat_sage",
+            }
+            and exact_combine_shape
         )
         if (
             claim is None
@@ -23233,6 +23817,8 @@ def _validate_reconciliation_cancel_context(
     latest_events: dict[str, Dict[str, Any]] = {}
     exact_members: list[Dict[str, Any]] = []
     native_batch_claims: list[Dict[str, Any]] = []
+    external_recovery_blockers: list[str] = []
+    external_recovery_aborted: list[tuple[str, str]] = []
     auxiliary_bare = sorted(
         _reconciliation_coin_identity(value, "Task 8 auxiliary coin")[0]
         for value in context["auxiliary_coin_ids"]
@@ -23430,15 +24016,64 @@ def _validate_reconciliation_cancel_context(
             if latest["phase"] == "FINALIZED"
             else None
         )
+        recovery_origin = latest
+        recovery_origin_evidence = latest_evidence
+        if latest["phase"] == "RECONCILED":
+            recovery_origin_row = conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? AND attempt=? AND phase='FINALIZED'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (f"cancel:{member_trade}", prepared["attempt"]),
+            ).fetchone()
+            if recovery_origin_row is not None:
+                recovery_origin = validate_offer_operation_event(
+                    dict(recovery_origin_row)
+                )
+                recovery_origin_evidence = json.loads(recovery_origin["evidence_json"])
         journaled_unknown_effect = bool(
-            latest["phase"] == "FINALIZED"
-            and latest["outcome"] in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
-            and latest["blocks_mutation"] == 1
-            and type(latest_evidence) is dict
-            and latest_evidence.get("effect_attempted") is True
-            and latest_evidence.get("trade_id") == member_trade
-            and latest_evidence.get("cohort_id") == context["cohort_id"]
-            and latest_evidence.get("member_id") == member_id
+            recovery_origin["phase"] == "FINALIZED"
+            and recovery_origin["outcome"]
+            in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+            and recovery_origin["blocks_mutation"] == 1
+            and type(recovery_origin_evidence) is dict
+            and recovery_origin_evidence.get("effect_attempted") is True
+            and recovery_origin_evidence.get("trade_id") == member_trade
+            and recovery_origin_evidence.get("cohort_id") == context["cohort_id"]
+            and recovery_origin_evidence.get("member_id") == member_id
+        )
+        serial_external_recovery_member = bool(
+            len(context["members"]) > 1
+            and not auxiliary_bare
+            and native_batch_for_member is None
+            and type(prepared_evidence) is dict
+            and prepared_evidence.get("cohort_id") == context["cohort_id"]
+            and prepared_evidence.get("cohort_size") == len(context["members"])
+            and prepared_evidence.get("member_id") == member_id
+            and prepared_evidence.get("effect_claim_protocol")
+            == "durable_cohort_claim_v1"
+            and type(prepared_evidence.get("wallet_effect")) is dict
+            and set(prepared_evidence["wallet_effect"])
+            == {"secure", "timeout", "fee_mojos"}
+            and prepared_evidence["wallet_effect"].get("secure") is True
+            and prepared_evidence["wallet_effect"].get("timeout") == 60
+            and prepared_evidence["wallet_effect"].get("fee_mojos") is None
+        )
+        external_recovery_aborted_member = bool(
+            serial_external_recovery_member
+            and recovery_origin["phase"] == "FINALIZED"
+            and recovery_origin["outcome"] == "CANCEL_FAILED"
+            and recovery_origin["blocks_mutation"] == 0
+            and type(recovery_origin_evidence) is dict
+            and recovery_origin_evidence.get("effect_attempted") is False
+            and type(recovery_origin_evidence.get("aborted_by_operation_id")) is str
+            and type(recovery_origin_evidence.get("cancel_result")) is dict
+            and recovery_origin_evidence["cancel_result"].get("method")
+            == "batch_abort_ambiguous"
+            and recovery_origin_evidence.get("cohort_id") == context["cohort_id"]
+            and recovery_origin_evidence.get("member_id") == member_id
+            and recovery_origin_evidence.get("trade_id") == member_trade
         )
         effect_claim_row = conn.execute(
             """
@@ -23470,7 +24105,7 @@ def _validate_reconciliation_cancel_context(
                 <= latest["request_timestamp"]
                 <= transaction_timestamp
             )
-            if not legacy_single_effect:
+            if not legacy_single_effect and not external_recovery_aborted_member:
                 raise ValueError("Task 8 effect claim is missing")
         else:
             try:
@@ -23511,9 +24146,27 @@ def _validate_reconciliation_cancel_context(
                 raise ValueError("Task 8 cancellation attempt state is invalid")
         elif latest["phase"] == "FINALIZED":
             if latest["outcome"] == "CANCEL_FAILED":
-                raise ValueError(
-                    "Task 8 cancellation proof contradicts a no-effect result"
+                if not external_recovery_aborted_member:
+                    raise ValueError(
+                        "Task 8 cancellation proof contradicts a no-effect result"
+                    )
+                external_recovery_aborted.append(
+                    (
+                        member_trade,
+                        recovery_origin_evidence["aborted_by_operation_id"],
+                    )
                 )
+                prepared_events[member_trade] = prepared
+                latest_events[member_trade] = latest
+                exact_members.append(
+                    {
+                        "intent_id": member_intent,
+                        "trade_id": member_trade,
+                        "member_id": member_id,
+                        "prepared_event_id": prepared_event_id,
+                    }
+                )
+                continue
             if (
                 latest["outcome"]
                 not in {
@@ -23550,12 +24203,24 @@ def _validate_reconciliation_cancel_context(
                 and type(latest_evidence) is dict
                 and latest_evidence.get("effect_attempted") is True
             )
+            externally_recovered_after_serial_submission = bool(
+                serial_external_recovery_member
+                and journaled_unknown_effect
+                and effect_claim_row is not None
+                and (
+                    member_transaction_id is not None
+                    or member_spend_identity is not None
+                )
+            )
             if (
                 not identity_matches
                 and not discovered_after_ambiguous_effect
                 and not submitted_txid_confirmed_as_spend_identity
+                and not externally_recovered_after_serial_submission
             ):
                 raise ValueError("Task 8 cancellation result identity is not exact")
+            if externally_recovered_after_serial_submission:
+                external_recovery_blockers.append(member_trade)
             latest_auxiliary = latest_evidence.get("auxiliary_coin_ids")
             if (
                 latest_auxiliary is None
@@ -23686,6 +24351,13 @@ def _validate_reconciliation_cancel_context(
                 or latest["spend_identity"] != member_spend_identity
             ):
                 raise ValueError("Task 8 cancellation confirmation identity differs")
+            if external_recovery_aborted_member:
+                external_recovery_aborted.append(
+                    (
+                        member_trade,
+                        recovery_origin_evidence["aborted_by_operation_id"],
+                    )
+                )
         else:
             raise ValueError("Task 8 cancellation attempt phase is invalid")
         prepared_events[member_trade] = prepared
@@ -23698,6 +24370,19 @@ def _validate_reconciliation_cancel_context(
                 "prepared_event_id": prepared_event_id,
             }
         )
+    external_recovery = bool(
+        len(external_recovery_blockers) == 1
+        and len(external_recovery_aborted) == len(exact_members) - 1
+        and all(
+            aborted_by == f"cancel:{external_recovery_blockers[0]}"
+            for _, aborted_by in external_recovery_aborted
+        )
+    )
+    if external_recovery_blockers or external_recovery_aborted:
+        if not external_recovery:
+            raise ValueError("Task 8 external cohort recovery is not exact")
+        if fee_mojos != 0 or auxiliary_bare:
+            raise ValueError("Task 8 external cohort recovery must be zero-fee")
     if native_batch_claims:
         if len(native_batch_claims) != len(exact_members) or any(
             claim != native_batch_claims[0] for claim in native_batch_claims[1:]
@@ -23780,7 +24465,11 @@ def _validate_reconciliation_cancel_context(
             )
             for member in exact_members
         }
-        if not contextual or not contextual.issubset(manifested):
+        if (
+            not contextual
+            or (external_recovery and contextual != manifested)
+            or (not external_recovery and not contextual.issubset(manifested))
+        ):
             raise ValueError("Task 8 cohort members are not manifest-bound")
         for member in manifest["members"]:
             member_trade = member["trade_id"]
@@ -23823,6 +24512,7 @@ def _validate_reconciliation_cancel_context(
     return {
         "target": target,
         "latest": latest_events[trade_id],
+        "external_recovery": external_recovery,
         "latest_sequences": {
             f"cancel:{member_trade}": event["sequence"]
             for member_trade, event in latest_events.items()
@@ -24370,7 +25060,12 @@ def commit_offer_reconciliation(
                     )
             latest_event = task8["latest"]
             cancel_operation_id = f"cancel:{trade_hint}"
-            if latest_event["blocks_mutation"] == 1:
+            if latest_event["blocks_mutation"] == 1 or (
+                task8["external_recovery"] is True
+                and latest_event["phase"] == "FINALIZED"
+                and latest_event["outcome"] == "CANCEL_FAILED"
+                and latest_event["blocks_mutation"] == 0
+            ):
                 cancel_resolution = {
                     "observed_sequence": latest_event["sequence"],
                     "operation_id": cancel_operation_id,
@@ -24980,6 +25675,199 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+_OFFER_DISCOVERY_PROVIDERS = ("dexie", "splash")
+
+
+def _offer_discovery_identity(value: Any, label: str) -> str:
+    identity = _required_stability_text(value, label)
+    if (
+        len(identity) != 64
+        or identity.lower() != identity
+        or any(character not in "0123456789abcdef" for character in identity)
+    ):
+        raise ValueError(f"{label} must be canonical lowercase 32-byte hex")
+    return identity
+
+
+def ensure_offer_publication_discoveries(
+    intent_id: str, *, deadline_seconds: int = 90
+) -> List[Dict[str, Any]]:
+    """Create and return the durable per-provider discovery obligations."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    if type(deadline_seconds) is not int or deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be a positive integer")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (safe_intent_id,)
+        ).fetchone()
+        if intent_row is None:
+            raise ValueError("offer intent does not exist")
+        intent = dict(intent_row)
+        if intent["lifecycle_state"] not in {"created", "visible"}:
+            raise ValueError("discovery requires a confirmed created offer")
+        identity = _offer_discovery_identity(
+            intent.get("offer_text_sha256"), "offer_text_sha256"
+        )
+        confirmed_at = _canonical_stored_stability_timestamp(
+            intent.get("confirmed_at") or intent.get("prepared_at")
+        )
+        confirmed_dt = _parse_iso_timestamp(
+            confirmed_at, "confirmed_at", require_timezone=True
+        )
+        deadline_at = _stability_timestamp(
+            confirmed_dt + timedelta(seconds=deadline_seconds), "discovery deadline"
+        )
+        updated_at = _stability_wall_clock()
+        for provider in _OFFER_DISCOVERY_PROVIDERS:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO offer_publication_discoveries (
+                    intent_id, provider, offer_identity, state,
+                    observed_identity, deadline_at, first_observed_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', NULL, ?, NULL, ?)
+                """,
+                (safe_intent_id, provider, identity, deadline_at, updated_at),
+            )
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        if len(rows) != len(_OFFER_DISCOVERY_PROVIDERS):
+            raise RuntimeError("offer discovery obligations are incomplete")
+        for row in rows:
+            current = dict(row)
+            if (
+                current["offer_identity"] != identity
+                or current["deadline_at"] != deadline_at
+            ):
+                raise ValueError(
+                    "offer discovery replay conflicts with durable authority"
+                )
+        conn.commit()
+        return [dict(row) for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_offer_publication_discoveries(intent_id: str) -> List[Dict[str, Any]]:
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_offer_publication_discovery(
+    intent_id: str,
+    *,
+    provider: str,
+    observed_offer_identity: str,
+    observed_at: Any = None,
+) -> Dict[str, Any]:
+    """Persist exact or mismatched public evidence without downgrading exact proof."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    safe_provider = _required_stability_text(provider, "provider").lower()
+    if safe_provider not in _OFFER_DISCOVERY_PROVIDERS:
+        raise ValueError("provider must be dexie or splash")
+    observed = _offer_discovery_identity(
+        observed_offer_identity, "observed_offer_identity"
+    )
+    when = _stability_timestamp_or_now(observed_at, "observed_at")
+    ensure_offer_publication_discoveries(safe_intent_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? AND provider=?",
+            (safe_intent_id, safe_provider),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("offer discovery obligation is missing")
+        current = dict(row)
+        next_state = "exact" if observed == current["offer_identity"] else "mismatch"
+        if current["state"] == "exact":
+            conn.commit()
+            return current
+        first_observed_at = current.get("first_observed_at") or when
+        conn.execute(
+            """
+            UPDATE offer_publication_discoveries
+            SET state=?, observed_identity=?, first_observed_at=?, updated_at=?
+            WHERE intent_id=? AND provider=?
+            """,
+            (
+                next_state,
+                observed,
+                first_observed_at,
+                when,
+                safe_intent_id,
+                safe_provider,
+            ),
+        )
+        updated = dict(
+            conn.execute(
+                "SELECT * FROM offer_publication_discoveries "
+                "WHERE intent_id=? AND provider=?",
+                (safe_intent_id, safe_provider),
+            ).fetchone()
+        )
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def expire_offer_publication_discoveries(
+    intent_id: str, *, now: Any = None
+) -> List[Dict[str, Any]]:
+    """Record a missed deadline while retaining the intent's slot authority."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    when = _stability_timestamp_or_now(now, "discovery expiry time")
+    ensure_offer_publication_discoveries(safe_intent_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE offer_publication_discoveries
+            SET state='deadline_expired', updated_at=?
+            WHERE intent_id=? AND state IN ('pending','mismatch') AND deadline_at<=?
+            """,
+            (when, safe_intent_id, when),
+        )
+        rows = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            "WHERE intent_id=? ORDER BY provider",
+            (safe_intent_id,),
+        ).fetchall()
+        conn.commit()
+        return [dict(row) for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 _REFRESH_CHILD_CREATED_STATES = frozenset({"created", "visible"})
@@ -25724,6 +26612,55 @@ def get_offer_intents_for_registry() -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_active_offer_market_identities(asset_id: str) -> frozenset[str]:
+    """Return every public identity owned by a nonterminal offer intent.
+
+    Dexie identifies exact offers by the offer-text SHA-256 while legacy offer
+    rows usually expose only Sage and Dexie trade IDs.  Confidence policy must
+    exclude both identity spaces before deriving price or depth.
+    """
+
+    safe_asset_id = _required_stability_text(asset_id, "asset_id").lower()
+    active_states = (
+        "prepared",
+        "submitted_unconfirmed",
+        "creation_unknown",
+        "created",
+        "visible",
+        "unknown",
+        "conflicted",
+    )
+    placeholders = ",".join("?" for _ in active_states)
+    rows = (
+        get_connection()
+        .execute(
+            f"""
+            SELECT sage_trade_id, offer_text_sha256, publication_identity,
+                   selected_coin_ids_json
+            FROM offer_intents
+            WHERE asset_id=? AND lifecycle_state IN ({placeholders})
+            """,
+            (safe_asset_id, *active_states),
+        )
+        .fetchall()
+    )
+    identities: set[str] = set()
+    for row in rows:
+        for key in ("sage_trade_id", "offer_text_sha256", "publication_identity"):
+            value = str(row[key] or "").strip()
+            if value:
+                identities.add(value)
+        try:
+            coin_ids = json.loads(row["selected_coin_ids_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            coin_ids = []
+        for coin_id in coin_ids if isinstance(coin_ids, list) else []:
+            value = str(coin_id or "").strip()
+            if value:
+                identities.add(value)
+    return frozenset(identities)
+
+
 def get_active_offer_slot_keys(*, asset_id: str, side: str) -> List[str]:
     """Return exact durable slot keys that still block new offer creation."""
 
@@ -25875,6 +26812,70 @@ def get_offer_intent_by_trade_id(sage_trade_id: str) -> Optional[Dict[str, Any]]
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+def get_offer_ui_authority_by_trade_ids(
+    sage_trade_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return one bounded, consistent provider-authority snapshot for the UI."""
+
+    if type(sage_trade_ids) is not list or len(sage_trade_ids) > 500:
+        raise ValueError("offer UI authority requires a list of at most 500 trade IDs")
+    normalized = []
+    seen = set()
+    for value in sage_trade_ids:
+        trade_id = _required_stability_text(value, "sage_trade_id")
+        if trade_id not in seen:
+            seen.add(trade_id)
+            normalized.append(trade_id)
+    if not normalized:
+        return {}
+
+    placeholders = ",".join("?" for _value in normalized)
+    conn = _stability_read_only_connection()
+    try:
+        intent_rows = conn.execute(
+            f"SELECT * FROM offer_intents WHERE sage_trade_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        snapshot = {
+            str(row["sage_trade_id"]): {
+                "intent": dict(row),
+                "discoveries": [],
+                "publications": [],
+            }
+            for row in intent_rows
+        }
+        intent_ids = [str(row["intent_id"]) for row in intent_rows]
+        if not intent_ids:
+            return snapshot
+
+        intent_placeholders = ",".join("?" for _value in intent_ids)
+        discoveries = conn.execute(
+            "SELECT * FROM offer_publication_discoveries "
+            f"WHERE intent_id IN ({intent_placeholders}) ORDER BY intent_id,provider",
+            intent_ids,
+        ).fetchall()
+        publications = conn.execute(
+            "SELECT * FROM publication_outbox "
+            f"WHERE intent_id IN ({intent_placeholders}) "
+            "ORDER BY intent_id,publisher,publication_epoch,publication_id",
+            intent_ids,
+        ).fetchall()
+        trade_id_by_intent = {
+            str(row["intent_id"]): str(row["sage_trade_id"]) for row in intent_rows
+        }
+        for row in discoveries:
+            trade_id = trade_id_by_intent.get(str(row["intent_id"]))
+            if trade_id:
+                snapshot[trade_id]["discoveries"].append(dict(row))
+        for row in publications:
+            trade_id = trade_id_by_intent.get(str(row["intent_id"]))
+            if trade_id:
+                snapshot[trade_id]["publications"].append(dict(row))
+        return snapshot
+    finally:
+        conn.close()
 
 
 def get_offer_intent_by_hash(offer_text_sha256: str) -> Optional[Dict[str, Any]]:
@@ -29307,6 +30308,154 @@ def recover_undispatched_publication_claims_at_startup(
         conn.close()
 
 
+def recover_preprojection_publications_at_startup(
+    *, recovered_at: Any = None
+) -> Dict[str, int]:
+    """Requeue the exact pre-projection publication race from older builds."""
+
+    from publication_outbox import canonical_publication_identity
+
+    recovered = _stability_timestamp_or_now(recovered_at, "recovered_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch = conn.execute(
+            "SELECT generation,state FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if (
+            latch is None
+            or latch["state"] != "resolved"
+            or lease is None
+            or bool(lease["active"])
+        ):
+            remaining = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM publication_outbox "
+                    "WHERE state IN ('claimed','unresolved')"
+                ).fetchone()[0]
+            )
+            conn.commit()
+            return {"examined": 0, "recovered": 0, "remaining": remaining}
+        rows = conn.execute(
+            "SELECT * FROM publication_outbox WHERE state='unresolved' "
+            "AND attempt_count=0 AND claim_generation=0 "
+            "AND claim_owner_run_id IS NULL AND claim_token IS NULL "
+            "AND claim_expires_at IS NULL AND dispatch_started_at IS NULL "
+            "AND request_sha256 IS NULL ORDER BY queued_at,publication_id LIMIT ?",
+            (_MAX_STARTUP_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > _MAX_STARTUP_RECOVERY_ROWS:
+            raise RuntimeError("startup pre-projection recovery limit exceeded")
+        expected_error = {
+            "code": "PUBLICATION_OFFER_REFERENCE_MISSING",
+            "offer_ref": "[redacted]",
+        }
+        latch_generation = _exact_integer(
+            latch["generation"], "runtime safety generation", minimum=0
+        )
+        recovered_count = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            try:
+                error_text = _canonical_json_text(
+                    row.get("last_error_json"),
+                    "publication error evidence",
+                    expected_type=dict,
+                    max_bytes=16384,
+                )
+                if json.loads(error_text) != expected_error or hashlib.sha256(
+                    error_text.encode("utf-8")
+                ).hexdigest() != row.get("last_error_sha256"):
+                    continue
+                payload_text = _canonical_json_text(
+                    row.get("payload_json"),
+                    "publication payload",
+                    expected_type=dict,
+                    max_bytes=4096,
+                )
+                payload = json.loads(payload_text)
+                if (
+                    set(payload) != {"offer_ref"}
+                    or type(payload["offer_ref"]) is not str
+                    or not payload["offer_ref"]
+                    or hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                    != row.get("payload_sha256")
+                ):
+                    continue
+                identity = canonical_publication_identity(
+                    row.get("network"),
+                    row.get("offer_fingerprint"),
+                    row.get("publication_epoch"),
+                )
+                if row.get("idempotency_key") != identity.idempotency_key:
+                    continue
+                if row.get("publisher") not in {"dexie", "splash"}:
+                    continue
+                intent = conn.execute(
+                    "SELECT lifecycle_state,sage_trade_id,offer_text_sha256,"
+                    "confirmed_at FROM offer_intents WHERE intent_id=?",
+                    (row.get("intent_id"),),
+                ).fetchone()
+                offer = conn.execute(
+                    "SELECT status,offer_bech32 FROM offers WHERE trade_id=?",
+                    (payload["offer_ref"],),
+                ).fetchone()
+                if (
+                    intent is None
+                    or intent["lifecycle_state"] not in {"created", "visible"}
+                    or intent["sage_trade_id"] != payload["offer_ref"]
+                    or intent["offer_text_sha256"] != identity.offer_fingerprint
+                    or intent["confirmed_at"] != row.get("queued_at")
+                    or offer is None
+                    or offer["status"] != "open"
+                    or type(offer["offer_bech32"]) is not str
+                    or not offer["offer_bech32"]
+                    or hashlib.sha256(offer["offer_bech32"].encode("utf-8")).hexdigest()
+                    != identity.offer_fingerprint
+                ):
+                    continue
+                row_version = _exact_integer(
+                    row.get("row_version"), "row_version", minimum=1
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            cursor = conn.execute(
+                "UPDATE publication_outbox SET state='queued', "
+                "last_error_json=NULL,last_error_sha256=NULL,next_attempt_at=NULL,"
+                "row_version=row_version+1,updated_at=?,recovery_generation=? "
+                "WHERE publication_id=? AND row_version=? AND state='unresolved' "
+                "AND attempt_count=0 AND dispatch_started_at IS NULL "
+                "AND request_sha256 IS NULL",
+                (
+                    recovered,
+                    latch_generation,
+                    row["publication_id"],
+                    row_version,
+                ),
+            )
+            recovered_count += int(cursor.rowcount)
+        remaining = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM publication_outbox "
+                "WHERE state IN ('claimed','unresolved')"
+            ).fetchone()[0]
+        )
+        conn.commit()
+        return {
+            "examined": len(rows),
+            "recovered": recovered_count,
+            "remaining": remaining,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def suppress_orphaned_dispatched_publications_at_startup(
     *, recovered_at: Any = None
 ) -> Dict[str, int]:
@@ -29740,6 +30889,53 @@ def claim_publication_outbox(
             "SELECT offer_bech32,status FROM offers WHERE trade_id=?",
             (offer_ref,),
         ).fetchone()
+        projection_pending = False
+        try:
+            projection_wait_seconds = (
+                at_dt
+                - _parse_iso_timestamp(
+                    current["queued_at"], "queued_at", require_timezone=True
+                )
+            ).total_seconds()
+        except (TypeError, ValueError):
+            projection_wait_seconds = -1
+        if (
+            current["state"] == "queued"
+            and current["attempt_count"] == 0
+            and current["claim_generation"] == 0
+            and current["row_version"] == 0
+            and current.get("claim_owner_run_id") is None
+            and current.get("claim_token") is None
+            and current.get("claim_expires_at") is None
+            and current.get("dispatch_started_at") is None
+            and current.get("request_sha256") is None
+            and projection_wait_seconds >= 0
+            and (
+                offer_row is None
+                or (offer_row["status"] == "open" and not offer_row["offer_bech32"])
+            )
+        ):
+            intent_row = conn.execute(
+                "SELECT lifecycle_state,sage_trade_id,offer_text_sha256,"
+                "confirmed_at FROM offer_intents WHERE intent_id=?",
+                (current.get("intent_id"),),
+            ).fetchone()
+            projection_pending = bool(
+                intent_row is not None
+                and intent_row["lifecycle_state"] == "created"
+                and intent_row["sage_trade_id"] == offer_ref
+                and intent_row["offer_text_sha256"] == current["offer_fingerprint"]
+                and intent_row["confirmed_at"] == current["queued_at"]
+            )
+        if projection_pending:
+            # finalize_offer_intent() atomically queues publication before the
+            # legacy offers projection and bech32 cache are committed. Slow
+            # Sage ladder batches can hold that projection for minutes while
+            # completed futures wait for the remaining wallet calls. Leave an
+            # exact pristine row queued for the whole hand-off; startup
+            # recovery handles a process exit before the projection commits.
+            conn.commit()
+            return None
         if (
             offer_row is None
             or offer_row["status"] != "open"
@@ -29868,6 +31064,86 @@ def mark_publication_dispatch_started(
                 generation,
                 version,
                 dispatched,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        row = dict(
+            conn.execute(
+                "SELECT * FROM publication_outbox WHERE publication_id=?",
+                (publication,),
+            ).fetchone()
+        )
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def defer_publication_dispatch_before_effect(
+    *,
+    publication_id: str,
+    owner_run_id: str,
+    claim_token: str,
+    claim_generation: int,
+    expected_row_version: int,
+    request_sha256: str,
+    evidence_json: Any,
+    deferred_at: Any,
+) -> Optional[Dict[str, Any]]:
+    """Release a marked claim when authority is withdrawn before transport.
+
+    Callers must invoke this only before the external transport function.  The
+    exact request digest and claim CAS prove which never-sent dispatch marker
+    is being cleared so the publication can be retried after fresh authority.
+    """
+
+    publication = _required_stability_text(publication_id, "publication_id")
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    token = _required_stability_text(claim_token, "claim_token")
+    generation = _exact_integer(claim_generation, "claim_generation", minimum=1)
+    version = _exact_integer(expected_row_version, "expected_row_version", minimum=1)
+    if (
+        type(request_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+    ):
+        raise ValueError("request_sha256 must be a canonical SHA-256 digest")
+    deferred = _stability_timestamp(deferred_at, "deferred_at")
+    evidence, evidence_sha256 = _bounded_publication_evidence(
+        evidence_json,
+        "publication deferral evidence",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE publication_outbox
+            SET state='retryable', claim_owner_run_id=NULL, claim_token=NULL,
+                claim_expires_at=NULL, next_attempt_at=?,
+                dispatch_started_at=NULL, request_sha256=NULL,
+                last_error_json=?, last_error_sha256=?, terminal_at=NULL,
+                row_version=row_version+1, updated_at=?
+            WHERE publication_id=? AND state='claimed'
+              AND claim_owner_run_id=? AND claim_token=?
+              AND claim_generation=? AND row_version=?
+              AND dispatch_started_at IS NOT NULL AND request_sha256=?
+            """,
+            (
+                deferred,
+                evidence,
+                evidence_sha256,
+                deferred,
+                publication,
+                owner,
+                token,
+                generation,
+                version,
+                request_sha256,
             ),
         )
         if cursor.rowcount != 1:
@@ -30525,3 +31801,1188 @@ def _suppress_publication_outbox_rows(
         (proof, proof_sha256, at, at, safe_intent),
     )
     return int(cursor.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# v1.4 market-provider evidence and post-TibetSwap migration state
+# ---------------------------------------------------------------------------
+
+
+def _market_evidence_timestamp(value: datetime, label: str) -> str:
+    if type(value) is not datetime or value.tzinfo is None:
+        raise TypeError(f"{label} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def record_market_provider_observation(record: Dict[str, Any]) -> str:
+    """Persist one immutable provider observation idempotently."""
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO market_provider_observations (
+            observation_id, asset_id, provider_id, capability, observed_at,
+            source_time, source_height, fresh_until, identity_keys_json,
+            payload_sha256, quality, reason_codes_json, raw_evidence_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["observation_id"],
+            record["asset_id"],
+            record["provider_id"],
+            record["capability"],
+            record["observed_at"],
+            record.get("source_time"),
+            record.get("source_height"),
+            record["fresh_until"],
+            json.dumps(record["identity_keys"], separators=(",", ":")),
+            record["payload_sha256"],
+            record["quality"],
+            json.dumps(record["reason_codes"], separators=(",", ":")),
+            record["raw_evidence_json"],
+            record["created_at"],
+        ),
+    )
+    conn.commit()
+    return str(record["observation_id"])
+
+
+def get_market_provider_observations(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM market_provider_observations
+        WHERE asset_id=? ORDER BY observed_at DESC, observation_id DESC LIMIT ?
+        """,
+            (asset_id, limit),
+        )
+        .fetchall()
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["identity_keys"] = json.loads(item.pop("identity_keys_json"))
+        item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
+        item["raw_evidence"] = json.loads(item.pop("raw_evidence_json"))
+        result.append(item)
+    return result
+
+
+def record_fill_confidence_assessment(record: Dict[str, Any]) -> str:
+    """Persist one immutable fill-confidence decision idempotently."""
+
+    if type(record) is not dict:
+        raise TypeError("fill confidence assessment must be a dict")
+    required = {
+        "assessment_id",
+        "trade_id",
+        "asset_id",
+        "confidence",
+        "outcome",
+        "authority_source",
+        "reason_codes",
+        "market_confidence_impact",
+        "can_account",
+        "can_replace",
+        "evidence_json",
+        "evidence_sha256",
+        "observed_at",
+    }
+    if set(record) != required:
+        raise ValueError("fill confidence assessment fields are invalid")
+    assessment_id = _reconciliation_coin_identity(
+        record["assessment_id"], "assessment_id"
+    )[0]
+    trade_id = _reconciliation_coin_identity(record["trade_id"], "trade_id")[0]
+    asset_id = _reconciliation_coin_identity(record["asset_id"], "asset_id")[0]
+    confidence = str(record["confidence"] or "").strip().upper()
+    outcome = _required_stability_text(record["outcome"], "outcome")
+    authority_source = _required_stability_text(
+        record["authority_source"], "authority_source"
+    )
+    if confidence not in {"OBSERVED", "PROBABLE", "CONFIRMED"}:
+        raise ValueError("fill confidence is invalid")
+    reason_codes = record["reason_codes"]
+    if (
+        type(reason_codes) is not list
+        or not reason_codes
+        or any(type(code) is not str or not code for code in reason_codes)
+    ):
+        raise ValueError("fill confidence reason codes are invalid")
+    reason_codes_json = json.dumps(reason_codes, separators=(",", ":"))
+    evidence_json = _canonical_json_text(
+        record["evidence_json"],
+        "fill confidence evidence",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    evidence_sha256 = _reconciliation_coin_identity(
+        record["evidence_sha256"], "evidence_sha256"
+    )[0]
+    if hashlib.sha256(evidence_json.encode("utf-8")).hexdigest() != evidence_sha256:
+        raise ValueError("fill confidence evidence digest mismatch")
+    observed_at = _stability_timestamp(record["observed_at"], "observed_at")
+    impact = record["market_confidence_impact"]
+    if impact not in {None, "AMBER"}:
+        raise ValueError("market confidence impact is invalid")
+    can_account = record["can_account"]
+    can_replace = record["can_replace"]
+    if type(can_account) is not bool or type(can_replace) is not bool:
+        raise TypeError("fill authority flags must be bool")
+    should_authorize = confidence == "CONFIRMED" and outcome == "FILL"
+    if can_account is not should_authorize or can_replace is not should_authorize:
+        raise ValueError("fill authority flags conflict with confidence")
+
+    values = (
+        assessment_id,
+        trade_id,
+        asset_id,
+        confidence,
+        outcome,
+        authority_source,
+        reason_codes_json,
+        impact,
+        int(can_account),
+        int(can_replace),
+        evidence_json,
+        evidence_sha256,
+        observed_at,
+    )
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO fill_confidence_assessments (
+                assessment_id, trade_id, asset_id, confidence, outcome,
+                authority_source, reason_codes_json, market_confidence_impact,
+                can_account, can_replace, evidence_json, evidence_sha256,
+                observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        stored = conn.execute(
+            "SELECT * FROM fill_confidence_assessments WHERE assessment_id=?",
+            (assessment_id,),
+        ).fetchone()
+        if stored is None or tuple(stored[key] for key in stored.keys()) != values:
+            raise RuntimeError("fill confidence assessment identity collision")
+        conn.commit()
+        return assessment_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_fill_confidence_assessments(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    """Return recent candidate/confirmed fill decisions for one asset."""
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 500:
+        raise ValueError("limit must be an integer between 1 and 500")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM fill_confidence_assessments
+        WHERE asset_id=?
+        ORDER BY observed_at DESC, assessment_id DESC LIMIT ?
+        """,
+            (safe_asset, limit),
+        )
+        .fetchall()
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["reason_codes"] = json.loads(item.pop("reason_codes_json"))
+        item["evidence"] = json.loads(item.pop("evidence_json"))
+        item["can_account"] = bool(item["can_account"])
+        item["can_replace"] = bool(item["can_replace"])
+        result.append(item)
+    return result
+
+
+def record_market_confidence_snapshot(
+    record: Dict[str, Any], engine_state: Optional[Dict[str, Any]] = None
+) -> str:
+    """Persist one snapshot and its restart state in a single transaction."""
+
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO market_confidence_snapshots (
+                snapshot_id, asset_id, state, derived_at, trusted_midpoint,
+                trusted_bid, trusted_ask, degraded_since, withdrawal_stage,
+                recovery_refreshes, reason_codes_json, source_health_json,
+                evidence_digests_json, material
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["snapshot_id"],
+                record["asset_id"],
+                record["state"],
+                record["derived_at"],
+                record.get("trusted_midpoint"),
+                record.get("trusted_bid"),
+                record.get("trusted_ask"),
+                record.get("degraded_since"),
+                record["withdrawal_stage"],
+                record["recovery_refreshes"],
+                json.dumps(record["reason_codes"], separators=(",", ":")),
+                json.dumps(
+                    record["source_health"], sort_keys=True, separators=(",", ":")
+                ),
+                json.dumps(record["evidence_digests"], separators=(",", ":")),
+                int(bool(record.get("material", True))),
+            ),
+        )
+        if engine_state is not None:
+            state_json = json.dumps(
+                engine_state, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+            conn.execute(
+                """
+                INSERT INTO market_confidence_engine_state (
+                    asset_id, risk_preset, state_json, snapshot_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    risk_preset=excluded.risk_preset,
+                    state_json=excluded.state_json,
+                    snapshot_id=excluded.snapshot_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    record["asset_id"],
+                    str(engine_state["risk_preset"]),
+                    state_json,
+                    record["snapshot_id"],
+                    record["derived_at"],
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return str(record["snapshot_id"])
+
+
+def get_market_confidence_engine_state(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = (
+        get_connection()
+        .execute(
+            "SELECT state_json FROM market_confidence_engine_state WHERE asset_id=?",
+            (str(asset_id).strip().lower(),),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    value = json.loads(row["state_json"])
+    if not isinstance(value, dict):
+        raise RuntimeError("market confidence engine state is malformed")
+    return value
+
+
+def get_latest_market_confidence_snapshot(
+    asset_id: str,
+) -> Optional[Dict[str, Any]]:
+    row = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM market_confidence_snapshots
+        WHERE asset_id=? ORDER BY derived_at DESC, snapshot_id DESC LIMIT 1
+        """,
+            (asset_id,),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    result = dict(row)
+    result["reason_codes"] = json.loads(result.pop("reason_codes_json"))
+    result["source_health"] = json.loads(result.pop("source_health_json"))
+    result["evidence_digests"] = json.loads(result.pop("evidence_digests_json"))
+    result["material"] = bool(result["material"])
+    return result
+
+
+def claim_offer_book_improvement(
+    *,
+    asset_id: str,
+    side: str,
+    evidence_digest: str,
+    cooldown_seconds: int,
+    now: datetime,
+) -> bool:
+    """Atomically claim one public-book improvement after its side cooldown."""
+
+    safe_asset = str(asset_id or "").strip().lower()
+    safe_side = str(side or "").strip().lower()
+    safe_digest = str(evidence_digest or "").strip().lower()
+    if not safe_asset:
+        raise ValueError("asset_id is required")
+    if safe_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if len(safe_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in safe_digest
+    ):
+        raise ValueError("evidence_digest must be lowercase sha256")
+    if type(cooldown_seconds) is not int or cooldown_seconds < 1:
+        raise ValueError("cooldown_seconds must be a positive integer")
+    claimed_at = _market_evidence_timestamp(now, "now")
+    cutoff_at = _market_evidence_timestamp(
+        now - timedelta(seconds=cooldown_seconds), "cooldown cutoff"
+    )
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            INSERT INTO offer_book_competition_claims (
+                asset_id, side, evidence_digest, claimed_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(asset_id, side) DO UPDATE SET
+                evidence_digest=excluded.evidence_digest,
+                claimed_at=excluded.claimed_at
+            WHERE offer_book_competition_claims.claimed_at <= ?
+            """,
+            (safe_asset, safe_side, safe_digest, claimed_at, cutoff_at),
+        )
+        accepted = cursor.rowcount == 1
+        conn.commit()
+        return accepted
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def compact_market_provider_evidence(
+    *, before: datetime, summarized_at: datetime
+) -> Dict[str, int]:
+    """Replace detailed old evidence with non-sensitive daily counts."""
+
+    cutoff = _market_evidence_timestamp(before, "before")
+    summarized = _market_evidence_timestamp(summarized_at, "summarized_at")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        groups = conn.execute(
+            """
+            SELECT asset_id, substr(observed_at, 1, 10) AS summary_day,
+                   provider_id, capability, quality, COUNT(*) AS observation_count
+            FROM market_provider_observations
+            WHERE observed_at < ?
+            GROUP BY asset_id, summary_day, provider_id, capability, quality
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in groups:
+            conn.execute(
+                """
+                INSERT INTO market_evidence_summaries (
+                    asset_id, summary_day, provider_id, capability, quality,
+                    observation_count, summarized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id, summary_day, provider_id, capability, quality)
+                DO UPDATE SET
+                    observation_count=observation_count + excluded.observation_count,
+                    summarized_at=excluded.summarized_at
+                """,
+                (
+                    row["asset_id"],
+                    row["summary_day"],
+                    row["provider_id"],
+                    row["capability"],
+                    row["quality"],
+                    row["observation_count"],
+                    summarized,
+                ),
+            )
+        deleted = conn.execute(
+            "DELETE FROM market_provider_observations WHERE observed_at < ?", (cutoff,)
+        ).rowcount
+        conn.commit()
+        return {"deleted": int(deleted), "summaries_written": len(groups)}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_market_evidence_summaries(
+    asset_id: str, limit: int = 100
+) -> List[Dict[str, Any]]:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM market_evidence_summaries
+        WHERE asset_id=? ORDER BY summary_day DESC, provider_id LIMIT ?
+        """,
+            (asset_id, limit),
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
+def count_legacy_tibet_price_rows(asset_id: str) -> int:
+    row = (
+        get_connection()
+        .execute(
+            """
+        SELECT COUNT(*) AS row_count FROM price_history
+        WHERE cat_asset_id=? AND tibet_price IS NOT NULL
+        """,
+            (asset_id,),
+        )
+        .fetchone()
+    )
+    return int(row["row_count"])
+
+
+def store_post_tibet_migration_report(
+    asset_id: str, report: Dict[str, Any], completed_at: datetime
+) -> Dict[str, Any]:
+    """Store migration authority, replacing only an earlier blocked result."""
+
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO post_tibet_migration_reports (
+            asset_id, migration_version, report_json, completed_at
+        ) VALUES (?, 1, ?, ?)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            report_json=excluded.report_json,
+            completed_at=excluded.completed_at
+        WHERE json_extract(post_tibet_migration_reports.report_json, '$.can_start') = 0
+        """,
+        (asset_id, encoded, _market_evidence_timestamp(completed_at, "completed_at")),
+    )
+    conn.commit()
+    return get_post_tibet_migration_report(asset_id)
+
+
+def get_post_tibet_migration_report(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = (
+        get_connection()
+        .execute(
+            "SELECT report_json FROM post_tibet_migration_reports WHERE asset_id=?",
+            (asset_id,),
+        )
+        .fetchone()
+    )
+    return json.loads(row["report_json"]) if row is not None else None
+
+
+def get_degraded_market_state(asset_id: str) -> Optional[Dict[str, Any]]:
+    row = (
+        get_connection()
+        .execute("SELECT * FROM degraded_market_state WHERE asset_id=?", (asset_id,))
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def save_degraded_market_state(record: Dict[str, Any]) -> None:
+    """Atomically persist the restart-safe degraded-market controller state."""
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO degraded_market_state (
+            asset_id, degraded_since, recovery_started_at, recovery_refreshes,
+            last_confidence_state, withdrawal_stage, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            degraded_since=excluded.degraded_since,
+            recovery_started_at=excluded.recovery_started_at,
+            recovery_refreshes=excluded.recovery_refreshes,
+            last_confidence_state=excluded.last_confidence_state,
+            withdrawal_stage=excluded.withdrawal_stage,
+            updated_at=excluded.updated_at
+        """,
+        (
+            record["asset_id"],
+            record.get("degraded_since"),
+            record.get("recovery_started_at"),
+            record["recovery_refreshes"],
+            record["last_confidence_state"],
+            record["withdrawal_stage"],
+            record["updated_at"],
+        ),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# v1.4 Market Bootstrap campaign authority
+# ---------------------------------------------------------------------------
+
+
+_BOOTSTRAP_CAMPAIGN_FIELDS = {
+    "network",
+    "wallet_type",
+    "wallet_fingerprint",
+    "wallet_id",
+    "asset_id",
+    "anchor_price",
+    "minimum_price",
+    "maximum_price",
+    "xch_budget",
+    "cat_budget",
+    "fee_budget_xch",
+    "subsidy_budget_xch",
+    "created_at",
+    "expires_at",
+}
+_BOOTSTRAP_STATE_FIELDS = {
+    "stage",
+    "deployment_fraction",
+    "current_anchor_price",
+    "stable_since",
+    "confirmed_fills",
+    "settlement_clusters",
+    "independent_depth_sides",
+    "suspected_linked_activity",
+    "adverse_fill_times",
+    "fee_spent_xch",
+    "realized_loss_xch",
+    "marked_inventory_loss_xch",
+    "updated_at",
+}
+_BOOTSTRAP_STAGES = {
+    "bootstrap",
+    "discovery_25",
+    "discovery_50",
+    "established",
+    "unsafe",
+    "stopped",
+}
+_BOOTSTRAP_STOP_REASONS = {
+    "expired",
+    "loss_limit",
+    "fee_reserve",
+    "manual",
+    "identity_mismatch",
+    "unsafe",
+}
+
+
+def _bootstrap_identity(value: Any, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be lowercase sha256 text")
+    text = value.strip().lower()
+    if len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
+        raise ValueError(f"{label} must be lowercase sha256 text")
+    return text
+
+
+def _bootstrap_decimal_text(
+    value: Any,
+    label: str,
+    *,
+    allow_zero: bool,
+) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be canonical decimal text")
+    try:
+        number = Decimal(value)
+    except Exception as exc:
+        raise ValueError(f"{label} must be canonical decimal text") from exc
+    if (
+        not number.is_finite()
+        or number < 0
+        or (not allow_zero and number == 0)
+        or _canonical_decimal_text(number) != value
+    ):
+        raise ValueError(f"{label} must be canonical decimal text")
+    return value
+
+
+def _bootstrap_campaign_material(record: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    if type(record) is not dict or set(record) != _BOOTSTRAP_CAMPAIGN_FIELDS:
+        raise ValueError("Bootstrap campaign fields are invalid")
+    network = _required_stability_text(record["network"], "network").lower()
+    if network not in {"mainnet", "testnet"}:
+        raise ValueError("Bootstrap campaign network is invalid")
+    wallet_type = _required_stability_text(record["wallet_type"], "wallet_type").lower()
+    if wallet_type != "sage":
+        raise ValueError("Bootstrap campaign wallet type must be sage")
+    fingerprint = _exact_integer(
+        record["wallet_fingerprint"], "wallet_fingerprint", minimum=1
+    )
+    wallet_id = _exact_integer(record["wallet_id"], "wallet_id", minimum=1)
+    asset_id = _bootstrap_identity(record["asset_id"], "asset_id")
+    normalized = {
+        "network": network,
+        "wallet_type": wallet_type,
+        "wallet_fingerprint": fingerprint,
+        "wallet_id": wallet_id,
+        "asset_id": asset_id,
+        "anchor_price": _bootstrap_decimal_text(
+            record["anchor_price"], "anchor_price", allow_zero=False
+        ),
+        "minimum_price": _bootstrap_decimal_text(
+            record["minimum_price"], "minimum_price", allow_zero=False
+        ),
+        "maximum_price": _bootstrap_decimal_text(
+            record["maximum_price"], "maximum_price", allow_zero=False
+        ),
+        "xch_budget": _bootstrap_decimal_text(
+            record["xch_budget"], "xch_budget", allow_zero=True
+        ),
+        "cat_budget": _bootstrap_decimal_text(
+            record["cat_budget"], "cat_budget", allow_zero=True
+        ),
+        "fee_budget_xch": _bootstrap_decimal_text(
+            record["fee_budget_xch"], "fee_budget_xch", allow_zero=True
+        ),
+        "subsidy_budget_xch": _bootstrap_decimal_text(
+            record["subsidy_budget_xch"],
+            "subsidy_budget_xch",
+            allow_zero=True,
+        ),
+        "created_at": _stability_timestamp(record["created_at"], "created_at"),
+        "expires_at": _stability_timestamp(record["expires_at"], "expires_at"),
+    }
+    anchor = Decimal(normalized["anchor_price"])
+    if (
+        not Decimal(normalized["minimum_price"])
+        <= anchor
+        <= Decimal(normalized["maximum_price"])
+    ):
+        raise ValueError("Bootstrap campaign corridor must contain anchor")
+    if (
+        Decimal(normalized["xch_budget"]) == 0
+        and Decimal(normalized["cat_budget"]) == 0
+    ):
+        raise ValueError("Bootstrap campaign must have a funded side")
+    created = _parse_iso_timestamp(
+        normalized["created_at"], "created_at", require_timezone=True
+    )
+    expires = _parse_iso_timestamp(
+        normalized["expires_at"], "expires_at", require_timezone=True
+    )
+    if expires <= created or expires - created > timedelta(days=7):
+        raise ValueError("Bootstrap campaign expiry is invalid")
+    canonical = _canonical_json_text(
+        normalized,
+        "Bootstrap campaign authority",
+        expected_type=dict,
+        max_bytes=8192,
+    )
+    campaign_id = hashlib.sha256(
+        b"catalyst-bootstrap-campaign-v1\x00" + canonical.encode("utf-8")
+    ).hexdigest()
+    return normalized, campaign_id
+
+
+def _decode_bootstrap_campaign(row: sqlite3.Row) -> Dict[str, Any]:
+    result = dict(row)
+    result["independent_depth_sides"] = json.loads(
+        result.pop("independent_depth_sides_json")
+    )
+    result["adverse_fill_times"] = json.loads(result.pop("adverse_fill_times_json"))
+    result["suspected_linked_activity"] = bool(result["suspected_linked_activity"])
+    return result
+
+
+def create_bootstrap_campaign(record: Dict[str, Any]) -> str:
+    """Persist fixed campaign authority before any wallet effect."""
+
+    authority, campaign_id = _bootstrap_campaign_material(record)
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT campaign_id FROM bootstrap_campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return campaign_id
+        active = conn.execute(
+            """
+            SELECT campaign_id FROM bootstrap_campaigns
+            WHERE network=? AND wallet_fingerprint=? AND asset_id=?
+              AND status='active'
+            """,
+            (
+                authority["network"],
+                authority["wallet_fingerprint"],
+                authority["asset_id"],
+            ),
+        ).fetchone()
+        if active is not None:
+            raise ValueError(
+                "an active Bootstrap campaign already exists for this wallet and asset"
+            )
+        conn.execute(
+            """
+            INSERT INTO bootstrap_campaigns (
+                campaign_id, network, wallet_type, wallet_fingerprint, wallet_id,
+                asset_id, anchor_price, minimum_price, maximum_price, xch_budget,
+                cat_budget, fee_budget_xch, subsidy_budget_xch, created_at,
+                expires_at, current_anchor_price, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                campaign_id,
+                authority["network"],
+                authority["wallet_type"],
+                authority["wallet_fingerprint"],
+                authority["wallet_id"],
+                authority["asset_id"],
+                authority["anchor_price"],
+                authority["minimum_price"],
+                authority["maximum_price"],
+                authority["xch_budget"],
+                authority["cat_budget"],
+                authority["fee_budget_xch"],
+                authority["subsidy_budget_xch"],
+                authority["created_at"],
+                authority["expires_at"],
+                authority["anchor_price"],
+                authority["created_at"],
+            ),
+        )
+        conn.commit()
+        return campaign_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    row = (
+        get_connection()
+        .execute("SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_id,))
+        .fetchone()
+    )
+    return _decode_bootstrap_campaign(row) if row is not None else None
+
+
+def get_active_bootstrap_campaign(
+    asset_id: str,
+    fingerprint: int,
+    network: str,
+) -> Optional[Dict[str, Any]]:
+    safe_asset = _bootstrap_identity(asset_id, "asset_id")
+    safe_fingerprint = _exact_integer(fingerprint, "fingerprint", minimum=1)
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("network is invalid")
+    row = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM bootstrap_campaigns
+        WHERE asset_id=? AND wallet_fingerprint=? AND network=? AND status='active'
+        """,
+            (safe_asset, safe_fingerprint, safe_network),
+        )
+        .fetchone()
+    )
+    return _decode_bootstrap_campaign(row) if row is not None else None
+
+
+def list_active_bootstrap_campaigns_for_asset(asset_id: str) -> List[Dict[str, Any]]:
+    """Return every active local authority for one exact CAT asset."""
+
+    safe_asset = _bootstrap_identity(asset_id, "asset_id")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM bootstrap_campaigns
+        WHERE asset_id=? AND status='active'
+        ORDER BY created_at, campaign_id
+        """,
+            (safe_asset,),
+        )
+        .fetchall()
+    )
+    return [_decode_bootstrap_campaign(row) for row in rows]
+
+
+def _bootstrap_state_material(
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    if type(record) is not dict or set(record) != _BOOTSTRAP_STATE_FIELDS:
+        raise ValueError("Bootstrap state fields are invalid")
+    stage = _required_stability_text(record["stage"], "stage").lower()
+    if stage not in _BOOTSTRAP_STAGES:
+        raise ValueError("Bootstrap stage is invalid")
+    deployment = _bootstrap_decimal_text(
+        record["deployment_fraction"],
+        "deployment_fraction",
+        allow_zero=True,
+    )
+    if deployment not in {"0", "0.1", "0.25", "0.5", "1"}:
+        raise ValueError("Bootstrap deployment fraction is invalid")
+    current_anchor = _bootstrap_decimal_text(
+        record["current_anchor_price"],
+        "current_anchor_price",
+        allow_zero=False,
+    )
+    stable_since = (
+        None
+        if record["stable_since"] is None
+        else _stability_timestamp(record["stable_since"], "stable_since")
+    )
+    confirmed_fills = _exact_integer(
+        record["confirmed_fills"], "confirmed_fills", minimum=0
+    )
+    settlement_clusters = _exact_integer(
+        record["settlement_clusters"], "settlement_clusters", minimum=0
+    )
+    if settlement_clusters > confirmed_fills:
+        raise ValueError("settlement clusters cannot exceed confirmed fills")
+    sides = record["independent_depth_sides"]
+    if (
+        type(sides) is not list
+        or sides != sorted(set(sides))
+        or any(side not in {"buy", "sell"} for side in sides)
+    ):
+        raise ValueError("independent depth sides are invalid")
+    sides_json = _canonical_json_text(
+        sides,
+        "independent depth sides",
+        expected_type=list,
+        max_bytes=64,
+    )
+    linked = record["suspected_linked_activity"]
+    if type(linked) is not bool:
+        raise TypeError("suspected_linked_activity must be bool")
+    adverse = record["adverse_fill_times"]
+    if type(adverse) is not list:
+        raise ValueError("adverse fill times must be a list")
+    normalized_adverse = []
+    for item in adverse:
+        if type(item) is not dict or set(item) != {"side", "occurred_at"}:
+            raise ValueError("adverse fill record is invalid")
+        side = _required_stability_text(item["side"], "adverse fill side").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("adverse fill side is invalid")
+        normalized_adverse.append(
+            {
+                "side": side,
+                "occurred_at": _stability_timestamp(
+                    item["occurred_at"], "adverse fill occurred_at"
+                ),
+            }
+        )
+    normalized_adverse.sort(key=lambda item: (item["occurred_at"], item["side"]))
+    adverse_json = _canonical_json_text(
+        normalized_adverse,
+        "adverse fill times",
+        expected_type=list,
+        max_bytes=8192,
+    )
+    return {
+        "stage": stage,
+        "deployment_fraction": deployment,
+        "current_anchor_price": current_anchor,
+        "stable_since": stable_since,
+        "confirmed_fills": confirmed_fills,
+        "settlement_clusters": settlement_clusters,
+        "independent_depth_sides_json": sides_json,
+        "suspected_linked_activity": int(linked),
+        "adverse_fill_times_json": adverse_json,
+        "fee_spent_xch": _bootstrap_decimal_text(
+            record["fee_spent_xch"], "fee_spent_xch", allow_zero=True
+        ),
+        "realized_loss_xch": _bootstrap_decimal_text(
+            record["realized_loss_xch"], "realized_loss_xch", allow_zero=True
+        ),
+        "marked_inventory_loss_xch": _bootstrap_decimal_text(
+            record["marked_inventory_loss_xch"],
+            "marked_inventory_loss_xch",
+            allow_zero=True,
+        ),
+        "updated_at": _stability_timestamp(record["updated_at"], "updated_at"),
+    }
+
+
+def update_bootstrap_campaign_state(
+    campaign_id: str,
+    *,
+    expected_revision: int,
+    record: Dict[str, Any],
+) -> int:
+    """Replace materialized policy state only at the expected revision."""
+
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    revision = _exact_integer(expected_revision, "expected_revision", minimum=0)
+    state = _bootstrap_state_material(record)
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign = conn.execute(
+            """
+            SELECT minimum_price, maximum_price FROM bootstrap_campaigns
+            WHERE campaign_id=? AND status='active'
+            """,
+            (safe_id,),
+        ).fetchone()
+        if campaign is None:
+            raise RuntimeError("Bootstrap campaign is not active")
+        anchor = Decimal(state["current_anchor_price"])
+        if (
+            not Decimal(campaign["minimum_price"])
+            <= anchor
+            <= Decimal(campaign["maximum_price"])
+        ):
+            raise ValueError("current anchor is outside the campaign corridor")
+        cursor = conn.execute(
+            """
+            UPDATE bootstrap_campaigns SET
+                stage=?, deployment_fraction=?, current_anchor_price=?,
+                stable_since=?, confirmed_fills=?, settlement_clusters=?,
+                independent_depth_sides_json=?, suspected_linked_activity=?,
+                adverse_fill_times_json=?, fee_spent_xch=?, realized_loss_xch=?,
+                marked_inventory_loss_xch=?, revision=revision+1, updated_at=?
+            WHERE campaign_id=? AND status='active' AND revision=?
+            """,
+            (
+                state["stage"],
+                state["deployment_fraction"],
+                state["current_anchor_price"],
+                state["stable_since"],
+                state["confirmed_fills"],
+                state["settlement_clusters"],
+                state["independent_depth_sides_json"],
+                state["suspected_linked_activity"],
+                state["adverse_fill_times_json"],
+                state["fee_spent_xch"],
+                state["realized_loss_xch"],
+                state["marked_inventory_loss_xch"],
+                state["updated_at"],
+                safe_id,
+                revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Bootstrap state compare-and-set failed")
+        conn.commit()
+        return revision + 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def stop_bootstrap_campaign(
+    campaign_id: str,
+    reason: str,
+    stopped_at: Any,
+) -> bool:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_reason = _required_stability_text(reason, "stop reason").lower()
+    if safe_reason not in _BOOTSTRAP_STOP_REASONS:
+        raise ValueError("Bootstrap stop reason is invalid")
+    stopped = _stability_timestamp(stopped_at, "stopped_at")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM bootstrap_campaigns WHERE campaign_id=?",
+            (safe_id,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return False
+        if row["status"] == "stopped":
+            conn.commit()
+            return True
+        cursor = conn.execute(
+            """
+            UPDATE bootstrap_campaigns
+            SET status='stopped', stage='stopped', deployment_fraction='0',
+                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1
+            WHERE campaign_id=? AND status='active'
+            """,
+            (safe_reason, stopped, stopped, safe_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def append_bootstrap_campaign_event(record: Dict[str, Any]) -> str:
+    required = {"campaign_id", "event_type", "occurred_at", "data"}
+    if type(record) is not dict or set(record) != required:
+        raise ValueError("Bootstrap event fields are invalid")
+    campaign_id = _bootstrap_identity(record["campaign_id"], "campaign_id")
+    event_type = _required_stability_text(record["event_type"], "event_type")
+    occurred_at = _stability_timestamp(record["occurred_at"], "occurred_at")
+    data_json = _canonical_json_text(
+        record["data"],
+        "Bootstrap event data",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    identity_json = _canonical_json_text(
+        {
+            "campaign_id": campaign_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at,
+            "data": json.loads(data_json),
+        },
+        "Bootstrap event identity",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    event_id = hashlib.sha256(
+        b"catalyst-bootstrap-event-v1\x00" + identity_json.encode("utf-8")
+    ).hexdigest()
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bootstrap_campaign_events (
+                event_id, campaign_id, event_type, occurred_at, data_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, campaign_id, event_type, occurred_at, data_json),
+        )
+        row = conn.execute(
+            "SELECT * FROM bootstrap_campaign_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if row is None or (
+            row["campaign_id"],
+            row["event_type"],
+            row["occurred_at"],
+            row["data_json"],
+        ) != (campaign_id, event_type, occurred_at, data_json):
+            raise RuntimeError("Bootstrap event identity collision")
+        conn.commit()
+        return event_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_bootstrap_campaign_events(
+    campaign_id: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM bootstrap_campaign_events
+        WHERE campaign_id=? ORDER BY occurred_at, event_id LIMIT ?
+        """,
+            (safe_id, safe_limit),
+        )
+        .fetchall()
+    )
+    return [
+        {
+            "event_id": row["event_id"],
+            "campaign_id": row["campaign_id"],
+            "event_type": row["event_type"],
+            "occurred_at": row["occurred_at"],
+            "data": json.loads(row["data_json"]),
+        }
+        for row in rows
+    ]
+
+
+def record_bootstrap_participation(record: Dict[str, Any]) -> str:
+    required = {"campaign_id", "report_id", "recorded_at", "data"}
+    if type(record) is not dict or set(record) != required:
+        raise ValueError("Bootstrap participation fields are invalid")
+    campaign_id = _bootstrap_identity(record["campaign_id"], "campaign_id")
+    report_id = _bootstrap_identity(record["report_id"], "report_id")
+    recorded_at = _stability_timestamp(record["recorded_at"], "recorded_at")
+    data_json = _canonical_json_text(
+        record["data"],
+        "Bootstrap participation data",
+        expected_type=dict,
+        max_bytes=262144,
+    )
+    participation_id = hashlib.sha256(
+        b"catalyst-bootstrap-participation-v1\x00"
+        + campaign_id.encode("ascii")
+        + b"\x00"
+        + report_id.encode("ascii")
+    ).hexdigest()
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bootstrap_participation (
+                participation_id, campaign_id, report_id, recorded_at, data_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (participation_id, campaign_id, report_id, recorded_at, data_json),
+        )
+        row = conn.execute(
+            "SELECT * FROM bootstrap_participation WHERE participation_id=?",
+            (participation_id,),
+        ).fetchone()
+        if row is None or (
+            row["campaign_id"],
+            row["report_id"],
+            row["recorded_at"],
+            row["data_json"],
+        ) != (campaign_id, report_id, recorded_at, data_json):
+            raise RuntimeError("Bootstrap participation identity collision")
+        conn.commit()
+        return participation_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_bootstrap_participation(
+    campaign_id: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM bootstrap_participation
+        WHERE campaign_id=? ORDER BY recorded_at, participation_id LIMIT ?
+        """,
+            (safe_id, safe_limit),
+        )
+        .fetchall()
+    )
+    return [
+        {
+            "participation_id": row["participation_id"],
+            "campaign_id": row["campaign_id"],
+            "report_id": row["report_id"],
+            "recorded_at": row["recorded_at"],
+            "data": json.loads(row["data_json"]),
+        }
+        for row in rows
+    ]

@@ -34,7 +34,11 @@ When the operator enables Splash, CATalyst can start the separately distributed 
 
 ### TibetSwap
 
-CATalyst queries TibetSwap for pool, reserve, price, and swap-related market information and can monitor public Chia mempool activity associated with configured pools. Requests identify the selected public CAT/pair. CATalyst does not submit a TibetSwap swap unless the operator separately uses a feature that explicitly does so.
+TibetSwap has shut down and CATalyst no longer contacts it for live trading,
+pricing, pool, reserve, quote, or mempool information. Existing TibetSwap fields
+and historical observations may remain in local databases, logs, exports, and
+compatibility API responses so upgrades do not destroy prior records. That local
+historical data never authorizes a live trading decision.
 
 ### Spacescan and Coinset
 

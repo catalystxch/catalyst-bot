@@ -305,6 +305,9 @@ class Config:
         # (line 416). Kept in cfg for to_dict() exclusion list completeness.
         self.SAGE_FINGERPRINT = _str("SAGE_FINGERPRINT")  # Auto-login fingerprint
         self.SAGE_SET_CHANGE_ADDRESS = _bool("SAGE_SET_CHANGE_ADDRESS", False)
+        # Public Reown identifier used only for interactive, non-financial
+        # Bootstrap manifest/proof signatures through Sage WalletConnect.
+        self.WALLETCONNECT_PROJECT_ID = _str("WALLETCONNECT_PROJECT_ID")
 
         # ----- Wallet Address (for Spacescan self-spend detection) -----
         # Populated dynamically at startup from wallet RPC (get_next_address).
@@ -354,6 +357,14 @@ class Config:
         self.MIN_TRADE_XCH = _decimal("MIN_TRADE_XCH", "0.005")
         self.MAX_TRADE_XCH = _decimal("MAX_TRADE_XCH", "0.050")
         self.DEFAULT_TRADE_XCH = _decimal("DEFAULT_TRADE_XCH", "0.0275")
+
+        _market_risk_preset = _str("MARKET_RISK_PRESET", "balanced").strip().lower()
+        if _market_risk_preset not in ("conservative", "balanced", "aggressive"):
+            _market_risk_preset = "balanced"
+        self.MARKET_RISK_PRESET = _market_risk_preset
+        self.MINIMUM_PROFIT_XCH = _decimal("MINIMUM_PROFIT_XCH", "0.0001")
+        self.EXPECTED_CANCEL_REQUOTES = _int("EXPECTED_CANCEL_REQUOTES", 2)
+        self.COMPETITION_COOLDOWN_SECS = _int("COMPETITION_COOLDOWN_SECS", 30)
 
         # ----- Spread & Pricing -----
         self.SPREAD_BPS = _decimal("SPREAD_BPS", "800")
@@ -836,7 +847,9 @@ class Config:
         self.RECONCILE_EVERY_N_LOOPS = _int("RECONCILE_EVERY_N_LOOPS", 2)
 
         # ----- Sniper (V2) -----
-        self.SNIPER_ENABLED = _bool("SNIPER_ENABLED", True)
+        # One-release compatibility key. Runtime remains fenced even when an
+        # upgraded .env explicitly contains True.
+        self.SNIPER_ENABLED = _bool("SNIPER_ENABLED", False)
         self.SNIPER_SIZE_XCH = _decimal("SNIPER_SIZE_XCH", "0.001")
         self.SNIPER_PREP_COUNT = _int("SNIPER_PREP_COUNT", 20)
         self.SNIPER_EXPIRY_SECS = _int(
@@ -1052,6 +1065,10 @@ class Config:
         "MIN_TRADE_XCH",
         "MAX_TRADE_XCH",
         "DEFAULT_TRADE_XCH",
+        "MARKET_RISK_PRESET",
+        "MINIMUM_PROFIT_XCH",
+        "EXPECTED_CANCEL_REQUOTES",
+        "COMPETITION_COOLDOWN_SECS",
         # Spread & pricing
         "SPREAD_BPS",
         "MIN_EDGE_BPS",
@@ -1664,6 +1681,16 @@ class Config:
                 f"REQUOTE_BPS={requote} is very high (>2000 bps) — requotes will only "
                 f"fire after a 20%+ price move; stale offers may fill at bad prices"
             )
+
+        minimum_profit = getattr(self, "MINIMUM_PROFIT_XCH", Decimal("0"))
+        if minimum_profit < 0:
+            errors.append("MINIMUM_PROFIT_XCH cannot be negative")
+        expected_requotes = getattr(self, "EXPECTED_CANCEL_REQUOTES", 0)
+        if expected_requotes < 0:
+            errors.append("EXPECTED_CANCEL_REQUOTES cannot be negative")
+        competition_cooldown = getattr(self, "COMPETITION_COOLDOWN_SECS", 0)
+        if competition_cooldown < 1:
+            errors.append("COMPETITION_COOLDOWN_SECS must be at least 1")
 
         shock_trigger = getattr(self, "TIBET_SHOCK_CANCEL_TRIGGER_PCT", Decimal("0"))
         if shock_trigger < Decimal("0"):

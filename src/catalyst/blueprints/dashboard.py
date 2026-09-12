@@ -271,7 +271,6 @@ def api_dashboard():
                 "dynamic_limit_pct": str(cfg.DYNAMIC_LIMIT_PCT),
             },
             "features": {
-                "sniper": getattr(cfg, "SNIPER_ENABLED", True),
                 "competitor_aware": cfg.COMPETITOR_AWARE_ENABLED,
                 "splash": cfg.SPLASH_ENABLED,
                 "auto_requote": cfg.AUTO_REQUOTE,
@@ -336,29 +335,11 @@ def api_dashboard():
             if bot_running is False:
                 market_health["message"] = "Market conditions healthy — bot stopped"
         if bot:
-            startup_results = getattr(bot, "_startup_self_test_results", {}) or {}
-            tibet_health = startup_results.get("tibet") or {}
-            if tibet_health.get("ok") is False:
-                conditions = market_health.setdefault("conditions", [])
-                conditions.append(
-                    {
-                        "level": "amber",
-                        "text": (
-                            "TibetSwap API unavailable — Dexie-only pricing; "
-                            "AMM drift protection and reference price unavailable"
-                        ),
-                    }
-                )
-                metrics = market_health.setdefault("metrics", {})
-                metrics["tibetswap_available"] = False
-                metrics["tibetswap_status_code"] = tibet_health.get("status_code")
-                metrics["pricing_mode"] = "dexie_only"
-                if market_health.get("status") == "green":
-                    market_health["status"] = "amber"
-                    market_health["message"] = (
-                        "Market degraded — TibetSwap unavailable; Dexie-only "
-                        "pricing active without AMM drift protection"
-                    )
+            metrics = market_health.setdefault("metrics", {})
+            metrics["tibetswap_available"] = False
+            metrics["tibetswap_retired"] = True
+            metrics["tibetswap_reason"] = "TIBETSWAP_SHUTDOWN"
+            metrics["pricing_mode"] = "offer_book_confidence"
         if bot:
             try:
                 metrics = market_health.setdefault("metrics", {})

@@ -22,7 +22,7 @@ def _live_status(**overrides):
             "expires_at": "2026-08-21T12:00:30.000000Z",
             "owned_by_this_run": False,
             "owner_run_id": "owner-secret-<script>alert(1)</script>",
-            "owner_pid": 4455,
+            "owner_pid": 987654321,
             "owner_host": "C:\\private\\host",
         },
     }
@@ -157,7 +157,7 @@ def test_safety_status_adds_exact_operator_summary_without_identifier_leaks(
         "trade-secret",
         "offer1qqqq-secret",
         "owner-secret",
-        "4455",
+        "987654321",
         "C:\\private\\host",
         "<img",
         "<script>",

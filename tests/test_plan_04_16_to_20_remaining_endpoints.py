@@ -215,15 +215,21 @@ class TestMarketIntel(_FlaskBase):
         self.assertEqual(Decimal(payload["our_spread_bps"]), expected)
         self.assertEqual(payload["live_book_source"], "wallet_sync")
 
-    def test_slippage_endpoint_defaults_to_one_xch(self):
+    def test_slippage_endpoint_is_retired_without_wallet_or_provider_call(self):
         bot = _make_bot()
-        bot.price_engine.get_tibet_quote.return_value = {"slippage_bps": "10"}
         with patch.object(api_server, "bot", bot):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        bot.price_engine.get_tibet_quote.assert_called_once_with(
-            amount_xch=Decimal("1"), side="buy"
+        bot.price_engine.get_tibet_quote.assert_not_called()
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "available": False,
+                "provider": "tibetswap",
+                "status": "retired",
+                "reason": "TIBETSWAP_SHUTDOWN",
+            },
         )
 
     def test_slippage_endpoint_reports_provider_unavailable_without_http_error(self):
@@ -234,17 +240,11 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.get_json(),
-            {
-                "available": False,
-                "error": "TibetSwap quote unavailable",
-                "provider": "tibetswap",
-            },
-        )
+        self.assertEqual(resp.get_json()["status"], "retired")
+        bot.price_engine.get_tibet_quote.assert_not_called()
 
-    def test_slippage_endpoint_identifies_confirmed_tibetswap_outage(self):
-        """A TibetSwap HTTP failure must not be presented as an absent pool."""
+    def test_slippage_endpoint_ignores_obsolete_tibetswap_health_state(self):
+        """Historical outage state cannot reactivate a retired provider."""
         bot = _make_bot()
         bot._startup_self_test_results = {
             "tibet": {
@@ -259,26 +259,13 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.get_json(),
-            {
-                "available": False,
-                "error": "TibetSwap quote unavailable",
-                "message": (
-                    "TibetSwap outage (HTTP 502): pool depth and slippage are "
-                    "unavailable. CATalyst is using Dexie-only pricing; AMM drift "
-                    "protection is unavailable."
-                ),
-                "provider": "tibetswap",
-                "reason": "provider_outage",
-                "status_code": 502,
-            },
-        )
+        self.assertEqual(resp.get_json()["status"], "retired")
+        self.assertEqual(resp.get_json()["reason"], "TIBETSWAP_SHUTDOWN")
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestMarketSummary(_FlaskBase):
-    def test_identifies_tibetswap_outage_instead_of_zero_pool_and_gap(self):
+    def test_reports_permanent_tibetswap_retirement(self):
         """A confirmed TibetSwap outage must be machine-readable to the UI."""
         bot = _make_bot()
         bot._startup_self_test_results = {
@@ -309,7 +296,6 @@ class TestMarketSummary(_FlaskBase):
             with (
                 patch.object(api_server, "bot", bot),
                 patch("requests.get", return_value=EmptyResponse()),
-                patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
             ):
                 body = self.client.get(
                     "/api/market/summary", environ_base=self._LOOPBACK
@@ -319,17 +305,11 @@ class TestMarketSummary(_FlaskBase):
             api_server._active_cat.update(original_cat)
 
         self.assertIs(body["tibet_available"], False)
-        self.assertEqual(body["tibet_reason"], "provider_outage")
-        self.assertEqual(body["tibet_status_code"], 502)
+        self.assertEqual(body["tibet_reason"], "TIBETSWAP_SHUTDOWN")
+        self.assertEqual(body["tibet_status"], "retired")
+        self.assertIsNone(body["tibet_status_code"])
 
-    def test_reuses_tibet_pairs_for_immediate_dashboard_polls(self):
-        from blueprints import market as market_routes
-
-        with market_routes._TIBET_PAIRS_CACHE_LOCK:
-            market_routes._TIBET_PAIRS_CACHE.update(
-                {"base": "", "fetched_at": 0.0, "pairs": []}
-            )
-
+    def test_dashboard_polls_never_contact_retired_tibetswap(self):
         asset_id = "abc123cat"
         original_cat = dict(api_server._active_cat)
         api_server._active_cat.update(
@@ -376,7 +356,7 @@ class TestMarketSummary(_FlaskBase):
             api_server._active_cat.update(original_cat)
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
-        self.assertEqual(len(tibet_calls), 1)
+        self.assertEqual(tibet_calls, [])
 
 
 # ---------------------------------------------------------------------------

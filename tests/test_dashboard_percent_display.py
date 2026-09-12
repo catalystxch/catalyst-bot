@@ -8,12 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 GUI = ROOT / "bot_gui.html"
 
 
-def test_user_facing_rate_controls_and_diagnostics_are_percent_first():
+def test_user_facing_market_controls_use_offer_book_confidence():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    assert "Arb Alert Threshold (%)" in html
+    assert "Offer-book confidence thresholds are derived automatically" in html
+    assert "minimum attributable depth, movement persistence, churn" in html
+    assert "Offer-book Market Confidence" in html
+    assert "Sources · Dexie / Splash / Sage / chain" in html
+    assert "Arb Alert Threshold (%)" not in html
     assert "Arb Alert Threshold (bps)" not in html
-    assert "Dexie/Tibet gap, as a percentage" in html
+    assert "Dexie/Tibet gap, as a percentage" not in html
     assert "basis points, that marks an arbitrage alert" not in html
     assert "100 bps = 1%" not in html
     assert "return n.toFixed(1) + ' bps';" not in html

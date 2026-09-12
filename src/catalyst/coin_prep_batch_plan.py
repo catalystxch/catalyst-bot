@@ -36,6 +36,7 @@ class BatchConstraints:
     fee_mojos: int
     max_asset_inputs: int = 50
     max_outputs: int = 128
+    allow_bounded_prerequisite: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,7 @@ def plan_batch(
         or constraints.max_asset_inputs < 1
         or type(constraints.max_outputs) is not int
         or constraints.max_outputs < 1
+        or type(constraints.allow_bounded_prerequisite) is not bool
     ):
         return _refuse("INVALID_CONSTRAINTS", "Batch constraints are malformed")
 
@@ -255,6 +257,31 @@ def plan_batch(
             f"No selectable {batch_asset.upper()} source cohort can fund the batch",
         )
     if len(selected) > constraints.max_asset_inputs:
+        if constraints.allow_bounded_prerequisite and batch_asset == "xch":
+            # Consolidate only one bounded cohort into a fresh selectable
+            # source, then let the caller authoritatively refresh and replan.
+            # This is deliberately an XCH-only prerequisite: a fragmented CAT
+            # prerequisite also needs a separately claimed fee source and may
+            # use the compatibility path before any CAT effect instead.
+            selected = candidates[: constraints.max_asset_inputs]
+            selected_total = sum(item.amount_mojos for item in selected)
+            prerequisite_output = selected_total - constraints.fee_mojos
+            if prerequisite_output <= 0:
+                return _refuse(
+                    "PREREQUISITE_FEE_EXHAUSTS_INPUTS",
+                    "The bounded XCH prerequisite cannot fund its fee",
+                )
+            return BatchPlan(
+                asset="xch",
+                source_coin_ids=tuple(sorted(item.coin_id for item in selected)),
+                fee_source_id=None,
+                outputs=(PlannedOutput("xch", "change", prerequisite_output, -1),),
+                reused_coin_ids=tuple(sorted(reused_ids)),
+                reused_target_ids=tuple(
+                    sorted((item.asset, item.ordinal) for item, _ in reused)
+                ),
+                fee_mojos=constraints.fee_mojos,
+            )
         return _refuse(
             "INPUT_CAP_REQUIRES_PREREQUISITE",
             "The next target needs a bounded consolidation prerequisite",

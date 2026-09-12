@@ -398,6 +398,54 @@ class TestAnalyseOrderbook(_MI):
         self.assertEqual(summary["orderbook_source"], "dexie_v3_orderbook")
         self.assertTrue(any("ticker_id" in params for params in calls))
 
+    def test_refresh_requests_best_bid_page_from_reciprocal_dexie_sort(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"success": True, "offers": [], "orderbook": {}}
+
+        calls = []
+
+        def fake_get(_url, params=None, timeout=None):
+            calls.append(dict(params or {}))
+            return FakeResponse()
+
+        self._mi._session.get = fake_get
+
+        self._mi.refresh_orderbook(force=True)
+
+        buy_request = next(params for params in calls if params.get("offered") == "xch")
+        self.assertEqual(buy_request["sort"], "price_asc")
+
+    def test_refresh_does_not_replace_or_retimestamp_book_on_http_failure(self):
+        class FailedResponse:
+            status_code = 503
+            text = "service unavailable"
+
+            def json(self):
+                return {"offers": []}
+
+        existing_buy = self._make_offer("0.00010", "1", side="buy")
+        existing_sell = self._make_offer("0.00011", "1", side="sell")
+        self._mi._orderbook.update(
+            {
+                "exact_buy_offers": [existing_buy],
+                "exact_sell_offers": [existing_sell],
+                "last_refresh": 123.0,
+                "refresh_count": 1,
+            }
+        )
+        self._mi._session.get = lambda *_args, **_kwargs: FailedResponse()
+
+        self._mi.refresh_orderbook(force=True)
+
+        self.assertEqual(self._mi._orderbook["last_refresh"], 123.0)
+        self.assertEqual(self._mi._orderbook["refresh_count"], 1)
+        self.assertEqual(self._mi._orderbook["exact_buy_offers"], [existing_buy])
+        self.assertEqual(self._mi._orderbook["exact_sell_offers"], [existing_sell])
+        self.assertEqual(self._mi._orderbook["errors"], 1)
+
 
 # ===========================================================================
 # State query methods
