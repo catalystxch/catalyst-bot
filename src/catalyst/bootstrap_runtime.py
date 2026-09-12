@@ -13,7 +13,6 @@ from bootstrap_campaign import (
     CampaignSide,
     evaluate_bootstrap_campaign,
 )
-from fill_tracker import derive_bootstrap_settlement_evidence
 import mutation_gate
 from offer_book_policy import derive_bootstrap_plan
 
@@ -132,6 +131,8 @@ def derive_bootstrap_authoritative_evidence(
     include_anchor_proposal: bool = False,
 ) -> BootstrapEvidence:
     """Combine durable Sage fill proof with current attributable public depth."""
+
+    from fill_tracker import derive_bootstrap_settlement_evidence
 
     campaign = campaign_from_record(campaign_record)
     if type(authoritative_fills) is not list or type(intents) is not list:
