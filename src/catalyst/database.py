@@ -3666,6 +3666,102 @@ CREATE TABLE IF NOT EXISTS offer_publication_discoveries (
 );
 CREATE INDEX IF NOT EXISTS idx_offer_publication_discovery_deadline
     ON offer_publication_discoveries(state, deadline_at);
+
+-- Explicit, fixed-budget authority for post-TibetSwap Market Bootstrap.
+-- Decimal values are stored as canonical text so no float conversion can
+-- enlarge a campaign after restart.
+CREATE TABLE IF NOT EXISTS bootstrap_campaigns (
+    campaign_id                    TEXT PRIMARY KEY,
+    network                        TEXT NOT NULL CHECK(network IN ('mainnet','testnet')),
+    wallet_type                    TEXT NOT NULL CHECK(wallet_type='sage'),
+    wallet_fingerprint             INTEGER NOT NULL CHECK(wallet_fingerprint > 0),
+    wallet_id                      INTEGER NOT NULL CHECK(wallet_id > 0),
+    asset_id                       TEXT NOT NULL,
+    anchor_price                   TEXT NOT NULL,
+    minimum_price                  TEXT NOT NULL,
+    maximum_price                  TEXT NOT NULL,
+    xch_budget                     TEXT NOT NULL,
+    cat_budget                     TEXT NOT NULL,
+    fee_budget_xch                 TEXT NOT NULL,
+    subsidy_budget_xch             TEXT NOT NULL,
+    created_at                     TEXT NOT NULL,
+    expires_at                     TEXT NOT NULL,
+    status                         TEXT NOT NULL DEFAULT 'active'
+                                   CHECK(status IN ('active','stopped')),
+    stage                          TEXT NOT NULL DEFAULT 'bootstrap'
+                                   CHECK(stage IN ('bootstrap','discovery_25',
+                                                   'discovery_50','established',
+                                                   'unsafe','stopped')),
+    deployment_fraction            TEXT NOT NULL DEFAULT '0.1',
+    current_anchor_price            TEXT NOT NULL,
+    stable_since                   TEXT,
+    confirmed_fills                INTEGER NOT NULL DEFAULT 0
+                                   CHECK(confirmed_fills >= 0),
+    settlement_clusters            INTEGER NOT NULL DEFAULT 0
+                                   CHECK(settlement_clusters >= 0 AND
+                                         settlement_clusters <= confirmed_fills),
+    independent_depth_sides_json   TEXT NOT NULL DEFAULT '[]'
+                                   CHECK(json_valid(independent_depth_sides_json)),
+    suspected_linked_activity      INTEGER NOT NULL DEFAULT 0
+                                   CHECK(suspected_linked_activity IN (0,1)),
+    adverse_fill_times_json        TEXT NOT NULL DEFAULT '[]'
+                                   CHECK(json_valid(adverse_fill_times_json)),
+    fee_spent_xch                  TEXT NOT NULL DEFAULT '0',
+    realized_loss_xch              TEXT NOT NULL DEFAULT '0',
+    marked_inventory_loss_xch      TEXT NOT NULL DEFAULT '0',
+    revision                       INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    stop_reason                    TEXT,
+    stopped_at                     TEXT,
+    updated_at                     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_campaigns_one_active
+    ON bootstrap_campaigns(network, wallet_fingerprint, asset_id)
+    WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_bootstrap_campaigns_asset_status
+    ON bootstrap_campaigns(asset_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS bootstrap_campaign_events (
+    event_id                       TEXT PRIMARY KEY,
+    campaign_id                    TEXT NOT NULL,
+    event_type                     TEXT NOT NULL,
+    occurred_at                    TEXT NOT NULL,
+    data_json                      TEXT NOT NULL CHECK(json_valid(data_json)),
+    FOREIGN KEY(campaign_id) REFERENCES bootstrap_campaigns(campaign_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_campaign_events_campaign_time
+    ON bootstrap_campaign_events(campaign_id, occurred_at, event_id);
+CREATE TRIGGER IF NOT EXISTS bootstrap_campaign_events_no_update
+BEFORE UPDATE ON bootstrap_campaign_events
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_campaign_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS bootstrap_campaign_events_no_delete
+BEFORE DELETE ON bootstrap_campaign_events
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_campaign_events is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS bootstrap_participation (
+    participation_id              TEXT PRIMARY KEY,
+    campaign_id                   TEXT NOT NULL,
+    report_id                     TEXT NOT NULL,
+    recorded_at                   TEXT NOT NULL,
+    data_json                     TEXT NOT NULL CHECK(json_valid(data_json)),
+    UNIQUE(campaign_id, report_id),
+    FOREIGN KEY(campaign_id) REFERENCES bootstrap_campaigns(campaign_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_participation_campaign_time
+    ON bootstrap_participation(campaign_id, recorded_at, participation_id);
+CREATE TRIGGER IF NOT EXISTS bootstrap_participation_no_update
+BEFORE UPDATE ON bootstrap_participation
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_participation is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS bootstrap_participation_no_delete
+BEFORE DELETE ON bootstrap_participation
+BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_participation is append-only');
+END;
 """
 
 
@@ -4234,6 +4330,54 @@ _STABILITY_REQUIRED_COLUMNS = {
         "recorded_at",
         "resolved_at",
     },
+    "bootstrap_campaigns": {
+        "campaign_id",
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "asset_id",
+        "anchor_price",
+        "minimum_price",
+        "maximum_price",
+        "xch_budget",
+        "cat_budget",
+        "fee_budget_xch",
+        "subsidy_budget_xch",
+        "created_at",
+        "expires_at",
+        "status",
+        "stage",
+        "deployment_fraction",
+        "current_anchor_price",
+        "stable_since",
+        "confirmed_fills",
+        "settlement_clusters",
+        "independent_depth_sides_json",
+        "suspected_linked_activity",
+        "adverse_fill_times_json",
+        "fee_spent_xch",
+        "realized_loss_xch",
+        "marked_inventory_loss_xch",
+        "revision",
+        "stop_reason",
+        "stopped_at",
+        "updated_at",
+    },
+    "bootstrap_campaign_events": {
+        "event_id",
+        "campaign_id",
+        "event_type",
+        "occurred_at",
+        "data_json",
+    },
+    "bootstrap_participation": {
+        "participation_id",
+        "campaign_id",
+        "report_id",
+        "recorded_at",
+        "data_json",
+    },
 }
 
 _STABILITY_INDEXES = {
@@ -4467,6 +4611,34 @@ _STABILITY_INDEXES = {
         False,
         False,
         ("state", "deadline_at"),
+        None,
+    ),
+    "idx_bootstrap_campaigns_one_active": (
+        "bootstrap_campaigns",
+        True,
+        True,
+        ("network", "wallet_fingerprint", "asset_id"),
+        "status='active'",
+    ),
+    "idx_bootstrap_campaigns_asset_status": (
+        "bootstrap_campaigns",
+        False,
+        False,
+        ("asset_id", "status", "updated_at"),
+        None,
+    ),
+    "idx_bootstrap_campaign_events_campaign_time": (
+        "bootstrap_campaign_events",
+        False,
+        False,
+        ("campaign_id", "occurred_at", "event_id"),
+        None,
+    ),
+    "idx_bootstrap_participation_campaign_time": (
+        "bootstrap_participation",
+        False,
+        False,
+        ("campaign_id", "recorded_at", "participation_id"),
         None,
     ),
 }
@@ -4984,6 +5156,9 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("child_intent_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
+    _require_unique_key(
+        conn, "bootstrap_participation", ("campaign_id", "report_id")
+    )
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -32036,3 +32211,627 @@ def save_degraded_market_state(record: Dict[str, Any]) -> None:
         ),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# v1.4 Market Bootstrap campaign authority
+# ---------------------------------------------------------------------------
+
+
+_BOOTSTRAP_CAMPAIGN_FIELDS = {
+    "network",
+    "wallet_type",
+    "wallet_fingerprint",
+    "wallet_id",
+    "asset_id",
+    "anchor_price",
+    "minimum_price",
+    "maximum_price",
+    "xch_budget",
+    "cat_budget",
+    "fee_budget_xch",
+    "subsidy_budget_xch",
+    "created_at",
+    "expires_at",
+}
+_BOOTSTRAP_STATE_FIELDS = {
+    "stage",
+    "deployment_fraction",
+    "current_anchor_price",
+    "stable_since",
+    "confirmed_fills",
+    "settlement_clusters",
+    "independent_depth_sides",
+    "suspected_linked_activity",
+    "adverse_fill_times",
+    "fee_spent_xch",
+    "realized_loss_xch",
+    "marked_inventory_loss_xch",
+    "updated_at",
+}
+_BOOTSTRAP_STAGES = {
+    "bootstrap",
+    "discovery_25",
+    "discovery_50",
+    "established",
+    "unsafe",
+    "stopped",
+}
+_BOOTSTRAP_STOP_REASONS = {
+    "expired",
+    "loss_limit",
+    "fee_reserve",
+    "manual",
+    "identity_mismatch",
+    "unsafe",
+}
+
+
+def _bootstrap_identity(value: Any, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be lowercase sha256 text")
+    text = value.strip().lower()
+    if len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
+        raise ValueError(f"{label} must be lowercase sha256 text")
+    return text
+
+
+def _bootstrap_decimal_text(
+    value: Any,
+    label: str,
+    *,
+    allow_zero: bool,
+) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be canonical decimal text")
+    try:
+        number = Decimal(value)
+    except Exception as exc:
+        raise ValueError(f"{label} must be canonical decimal text") from exc
+    if (
+        not number.is_finite()
+        or number < 0
+        or (not allow_zero and number == 0)
+        or _canonical_decimal_text(number) != value
+    ):
+        raise ValueError(f"{label} must be canonical decimal text")
+    return value
+
+
+def _bootstrap_campaign_material(record: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    if type(record) is not dict or set(record) != _BOOTSTRAP_CAMPAIGN_FIELDS:
+        raise ValueError("Bootstrap campaign fields are invalid")
+    network = _required_stability_text(record["network"], "network").lower()
+    if network not in {"mainnet", "testnet"}:
+        raise ValueError("Bootstrap campaign network is invalid")
+    wallet_type = _required_stability_text(
+        record["wallet_type"], "wallet_type"
+    ).lower()
+    if wallet_type != "sage":
+        raise ValueError("Bootstrap campaign wallet type must be sage")
+    fingerprint = _exact_integer(
+        record["wallet_fingerprint"], "wallet_fingerprint", minimum=1
+    )
+    wallet_id = _exact_integer(record["wallet_id"], "wallet_id", minimum=1)
+    asset_id = _bootstrap_identity(record["asset_id"], "asset_id")
+    normalized = {
+        "network": network,
+        "wallet_type": wallet_type,
+        "wallet_fingerprint": fingerprint,
+        "wallet_id": wallet_id,
+        "asset_id": asset_id,
+        "anchor_price": _bootstrap_decimal_text(
+            record["anchor_price"], "anchor_price", allow_zero=False
+        ),
+        "minimum_price": _bootstrap_decimal_text(
+            record["minimum_price"], "minimum_price", allow_zero=False
+        ),
+        "maximum_price": _bootstrap_decimal_text(
+            record["maximum_price"], "maximum_price", allow_zero=False
+        ),
+        "xch_budget": _bootstrap_decimal_text(
+            record["xch_budget"], "xch_budget", allow_zero=True
+        ),
+        "cat_budget": _bootstrap_decimal_text(
+            record["cat_budget"], "cat_budget", allow_zero=True
+        ),
+        "fee_budget_xch": _bootstrap_decimal_text(
+            record["fee_budget_xch"], "fee_budget_xch", allow_zero=True
+        ),
+        "subsidy_budget_xch": _bootstrap_decimal_text(
+            record["subsidy_budget_xch"],
+            "subsidy_budget_xch",
+            allow_zero=True,
+        ),
+        "created_at": _stability_timestamp(record["created_at"], "created_at"),
+        "expires_at": _stability_timestamp(record["expires_at"], "expires_at"),
+    }
+    anchor = Decimal(normalized["anchor_price"])
+    if not Decimal(normalized["minimum_price"]) <= anchor <= Decimal(
+        normalized["maximum_price"]
+    ):
+        raise ValueError("Bootstrap campaign corridor must contain anchor")
+    if Decimal(normalized["xch_budget"]) == 0 and Decimal(
+        normalized["cat_budget"]
+    ) == 0:
+        raise ValueError("Bootstrap campaign must have a funded side")
+    created = _parse_iso_timestamp(
+        normalized["created_at"], "created_at", require_timezone=True
+    )
+    expires = _parse_iso_timestamp(
+        normalized["expires_at"], "expires_at", require_timezone=True
+    )
+    if expires <= created or expires - created > timedelta(days=7):
+        raise ValueError("Bootstrap campaign expiry is invalid")
+    canonical = _canonical_json_text(
+        normalized,
+        "Bootstrap campaign authority",
+        expected_type=dict,
+        max_bytes=8192,
+    )
+    campaign_id = hashlib.sha256(
+        b"catalyst-bootstrap-campaign-v1\x00" + canonical.encode("utf-8")
+    ).hexdigest()
+    return normalized, campaign_id
+
+
+def _decode_bootstrap_campaign(row: sqlite3.Row) -> Dict[str, Any]:
+    result = dict(row)
+    result["independent_depth_sides"] = json.loads(
+        result.pop("independent_depth_sides_json")
+    )
+    result["adverse_fill_times"] = json.loads(result.pop("adverse_fill_times_json"))
+    result["suspected_linked_activity"] = bool(
+        result["suspected_linked_activity"]
+    )
+    return result
+
+
+def create_bootstrap_campaign(record: Dict[str, Any]) -> str:
+    """Persist fixed campaign authority before any wallet effect."""
+
+    authority, campaign_id = _bootstrap_campaign_material(record)
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT campaign_id FROM bootstrap_campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return campaign_id
+        active = conn.execute(
+            """
+            SELECT campaign_id FROM bootstrap_campaigns
+            WHERE network=? AND wallet_fingerprint=? AND asset_id=?
+              AND status='active'
+            """,
+            (
+                authority["network"],
+                authority["wallet_fingerprint"],
+                authority["asset_id"],
+            ),
+        ).fetchone()
+        if active is not None:
+            raise ValueError(
+                "an active Bootstrap campaign already exists for this wallet and asset"
+            )
+        conn.execute(
+            """
+            INSERT INTO bootstrap_campaigns (
+                campaign_id, network, wallet_type, wallet_fingerprint, wallet_id,
+                asset_id, anchor_price, minimum_price, maximum_price, xch_budget,
+                cat_budget, fee_budget_xch, subsidy_budget_xch, created_at,
+                expires_at, current_anchor_price, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                campaign_id,
+                authority["network"],
+                authority["wallet_type"],
+                authority["wallet_fingerprint"],
+                authority["wallet_id"],
+                authority["asset_id"],
+                authority["anchor_price"],
+                authority["minimum_price"],
+                authority["maximum_price"],
+                authority["xch_budget"],
+                authority["cat_budget"],
+                authority["fee_budget_xch"],
+                authority["subsidy_budget_xch"],
+                authority["created_at"],
+                authority["expires_at"],
+                authority["anchor_price"],
+                authority["created_at"],
+            ),
+        )
+        conn.commit()
+        return campaign_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    row = get_connection().execute(
+        "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_id,)
+    ).fetchone()
+    return _decode_bootstrap_campaign(row) if row is not None else None
+
+
+def get_active_bootstrap_campaign(
+    asset_id: str,
+    fingerprint: int,
+    network: str,
+) -> Optional[Dict[str, Any]]:
+    safe_asset = _bootstrap_identity(asset_id, "asset_id")
+    safe_fingerprint = _exact_integer(fingerprint, "fingerprint", minimum=1)
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("network is invalid")
+    row = get_connection().execute(
+        """
+        SELECT * FROM bootstrap_campaigns
+        WHERE asset_id=? AND wallet_fingerprint=? AND network=? AND status='active'
+        """,
+        (safe_asset, safe_fingerprint, safe_network),
+    ).fetchone()
+    return _decode_bootstrap_campaign(row) if row is not None else None
+
+
+def _bootstrap_state_material(
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    if type(record) is not dict or set(record) != _BOOTSTRAP_STATE_FIELDS:
+        raise ValueError("Bootstrap state fields are invalid")
+    stage = _required_stability_text(record["stage"], "stage").lower()
+    if stage not in _BOOTSTRAP_STAGES:
+        raise ValueError("Bootstrap stage is invalid")
+    deployment = _bootstrap_decimal_text(
+        record["deployment_fraction"],
+        "deployment_fraction",
+        allow_zero=True,
+    )
+    if deployment not in {"0", "0.1", "0.25", "0.5", "1"}:
+        raise ValueError("Bootstrap deployment fraction is invalid")
+    current_anchor = _bootstrap_decimal_text(
+        record["current_anchor_price"],
+        "current_anchor_price",
+        allow_zero=False,
+    )
+    stable_since = (
+        None
+        if record["stable_since"] is None
+        else _stability_timestamp(record["stable_since"], "stable_since")
+    )
+    confirmed_fills = _exact_integer(
+        record["confirmed_fills"], "confirmed_fills", minimum=0
+    )
+    settlement_clusters = _exact_integer(
+        record["settlement_clusters"], "settlement_clusters", minimum=0
+    )
+    if settlement_clusters > confirmed_fills:
+        raise ValueError("settlement clusters cannot exceed confirmed fills")
+    sides = record["independent_depth_sides"]
+    if (
+        type(sides) is not list
+        or sides != sorted(set(sides))
+        or any(side not in {"buy", "sell"} for side in sides)
+    ):
+        raise ValueError("independent depth sides are invalid")
+    sides_json = _canonical_json_text(
+        sides,
+        "independent depth sides",
+        expected_type=list,
+        max_bytes=64,
+    )
+    linked = record["suspected_linked_activity"]
+    if type(linked) is not bool:
+        raise TypeError("suspected_linked_activity must be bool")
+    adverse = record["adverse_fill_times"]
+    if type(adverse) is not list:
+        raise ValueError("adverse fill times must be a list")
+    normalized_adverse = []
+    for item in adverse:
+        if type(item) is not dict or set(item) != {"side", "occurred_at"}:
+            raise ValueError("adverse fill record is invalid")
+        side = _required_stability_text(item["side"], "adverse fill side").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("adverse fill side is invalid")
+        normalized_adverse.append(
+            {
+                "side": side,
+                "occurred_at": _stability_timestamp(
+                    item["occurred_at"], "adverse fill occurred_at"
+                ),
+            }
+        )
+    normalized_adverse.sort(key=lambda item: (item["occurred_at"], item["side"]))
+    adverse_json = _canonical_json_text(
+        normalized_adverse,
+        "adverse fill times",
+        expected_type=list,
+        max_bytes=8192,
+    )
+    return {
+        "stage": stage,
+        "deployment_fraction": deployment,
+        "current_anchor_price": current_anchor,
+        "stable_since": stable_since,
+        "confirmed_fills": confirmed_fills,
+        "settlement_clusters": settlement_clusters,
+        "independent_depth_sides_json": sides_json,
+        "suspected_linked_activity": int(linked),
+        "adverse_fill_times_json": adverse_json,
+        "fee_spent_xch": _bootstrap_decimal_text(
+            record["fee_spent_xch"], "fee_spent_xch", allow_zero=True
+        ),
+        "realized_loss_xch": _bootstrap_decimal_text(
+            record["realized_loss_xch"], "realized_loss_xch", allow_zero=True
+        ),
+        "marked_inventory_loss_xch": _bootstrap_decimal_text(
+            record["marked_inventory_loss_xch"],
+            "marked_inventory_loss_xch",
+            allow_zero=True,
+        ),
+        "updated_at": _stability_timestamp(record["updated_at"], "updated_at"),
+    }
+
+
+def update_bootstrap_campaign_state(
+    campaign_id: str,
+    *,
+    expected_revision: int,
+    record: Dict[str, Any],
+) -> int:
+    """Replace materialized policy state only at the expected revision."""
+
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    revision = _exact_integer(expected_revision, "expected_revision", minimum=0)
+    state = _bootstrap_state_material(record)
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        campaign = conn.execute(
+            """
+            SELECT minimum_price, maximum_price FROM bootstrap_campaigns
+            WHERE campaign_id=? AND status='active'
+            """,
+            (safe_id,),
+        ).fetchone()
+        if campaign is None:
+            raise RuntimeError("Bootstrap campaign is not active")
+        anchor = Decimal(state["current_anchor_price"])
+        if not Decimal(campaign["minimum_price"]) <= anchor <= Decimal(
+            campaign["maximum_price"]
+        ):
+            raise ValueError("current anchor is outside the campaign corridor")
+        cursor = conn.execute(
+            """
+            UPDATE bootstrap_campaigns SET
+                stage=?, deployment_fraction=?, current_anchor_price=?,
+                stable_since=?, confirmed_fills=?, settlement_clusters=?,
+                independent_depth_sides_json=?, suspected_linked_activity=?,
+                adverse_fill_times_json=?, fee_spent_xch=?, realized_loss_xch=?,
+                marked_inventory_loss_xch=?, revision=revision+1, updated_at=?
+            WHERE campaign_id=? AND status='active' AND revision=?
+            """,
+            (
+                state["stage"],
+                state["deployment_fraction"],
+                state["current_anchor_price"],
+                state["stable_since"],
+                state["confirmed_fills"],
+                state["settlement_clusters"],
+                state["independent_depth_sides_json"],
+                state["suspected_linked_activity"],
+                state["adverse_fill_times_json"],
+                state["fee_spent_xch"],
+                state["realized_loss_xch"],
+                state["marked_inventory_loss_xch"],
+                state["updated_at"],
+                safe_id,
+                revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Bootstrap state compare-and-set failed")
+        conn.commit()
+        return revision + 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def stop_bootstrap_campaign(
+    campaign_id: str,
+    reason: str,
+    stopped_at: Any,
+) -> bool:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_reason = _required_stability_text(reason, "stop reason").lower()
+    if safe_reason not in _BOOTSTRAP_STOP_REASONS:
+        raise ValueError("Bootstrap stop reason is invalid")
+    stopped = _stability_timestamp(stopped_at, "stopped_at")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM bootstrap_campaigns WHERE campaign_id=?",
+            (safe_id,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return False
+        if row["status"] == "stopped":
+            conn.commit()
+            return True
+        cursor = conn.execute(
+            """
+            UPDATE bootstrap_campaigns
+            SET status='stopped', stage='stopped', deployment_fraction='0',
+                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1
+            WHERE campaign_id=? AND status='active'
+            """,
+            (safe_reason, stopped, stopped, safe_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def append_bootstrap_campaign_event(record: Dict[str, Any]) -> str:
+    required = {"campaign_id", "event_type", "occurred_at", "data"}
+    if type(record) is not dict or set(record) != required:
+        raise ValueError("Bootstrap event fields are invalid")
+    campaign_id = _bootstrap_identity(record["campaign_id"], "campaign_id")
+    event_type = _required_stability_text(record["event_type"], "event_type")
+    occurred_at = _stability_timestamp(record["occurred_at"], "occurred_at")
+    data_json = _canonical_json_text(
+        record["data"],
+        "Bootstrap event data",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    identity_json = _canonical_json_text(
+        {
+            "campaign_id": campaign_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at,
+            "data": json.loads(data_json),
+        },
+        "Bootstrap event identity",
+        expected_type=dict,
+        max_bytes=65536,
+    )
+    event_id = hashlib.sha256(
+        b"catalyst-bootstrap-event-v1\x00" + identity_json.encode("utf-8")
+    ).hexdigest()
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bootstrap_campaign_events (
+                event_id, campaign_id, event_type, occurred_at, data_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, campaign_id, event_type, occurred_at, data_json),
+        )
+        row = conn.execute(
+            "SELECT * FROM bootstrap_campaign_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if row is None or (
+            row["campaign_id"],
+            row["event_type"],
+            row["occurred_at"],
+            row["data_json"],
+        ) != (campaign_id, event_type, occurred_at, data_json):
+            raise RuntimeError("Bootstrap event identity collision")
+        conn.commit()
+        return event_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_bootstrap_campaign_events(
+    campaign_id: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    rows = get_connection().execute(
+        """
+        SELECT * FROM bootstrap_campaign_events
+        WHERE campaign_id=? ORDER BY occurred_at, event_id LIMIT ?
+        """,
+        (safe_id, safe_limit),
+    ).fetchall()
+    return [
+        {
+            "event_id": row["event_id"],
+            "campaign_id": row["campaign_id"],
+            "event_type": row["event_type"],
+            "occurred_at": row["occurred_at"],
+            "data": json.loads(row["data_json"]),
+        }
+        for row in rows
+    ]
+
+
+def record_bootstrap_participation(record: Dict[str, Any]) -> str:
+    required = {"campaign_id", "report_id", "recorded_at", "data"}
+    if type(record) is not dict or set(record) != required:
+        raise ValueError("Bootstrap participation fields are invalid")
+    campaign_id = _bootstrap_identity(record["campaign_id"], "campaign_id")
+    report_id = _bootstrap_identity(record["report_id"], "report_id")
+    recorded_at = _stability_timestamp(record["recorded_at"], "recorded_at")
+    data_json = _canonical_json_text(
+        record["data"],
+        "Bootstrap participation data",
+        expected_type=dict,
+        max_bytes=262144,
+    )
+    participation_id = hashlib.sha256(
+        b"catalyst-bootstrap-participation-v1\x00"
+        + campaign_id.encode("ascii")
+        + b"\x00"
+        + report_id.encode("ascii")
+    ).hexdigest()
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bootstrap_participation (
+                participation_id, campaign_id, report_id, recorded_at, data_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (participation_id, campaign_id, report_id, recorded_at, data_json),
+        )
+        row = conn.execute(
+            "SELECT * FROM bootstrap_participation WHERE participation_id=?",
+            (participation_id,),
+        ).fetchone()
+        if row is None or (
+            row["campaign_id"],
+            row["report_id"],
+            row["recorded_at"],
+            row["data_json"],
+        ) != (campaign_id, report_id, recorded_at, data_json):
+            raise RuntimeError("Bootstrap participation identity collision")
+        conn.commit()
+        return participation_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_bootstrap_participation(
+    campaign_id: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    safe_limit = _exact_integer(limit, "limit", minimum=1)
+    rows = get_connection().execute(
+        """
+        SELECT * FROM bootstrap_participation
+        WHERE campaign_id=? ORDER BY recorded_at, participation_id LIMIT ?
+        """,
+        (safe_id, safe_limit),
+    ).fetchall()
+    return [
+        {
+            "participation_id": row["participation_id"],
+            "campaign_id": row["campaign_id"],
+            "report_id": row["report_id"],
+            "recorded_at": row["recorded_at"],
+            "data": json.loads(row["data_json"]),
+        }
+        for row in rows
+    ]

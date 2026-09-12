@@ -75,6 +75,17 @@ def _require_utc(value: object, label: str) -> datetime:
     return value
 
 
+def _decimal_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _utc_text(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 @dataclass(frozen=True, slots=True)
 class BootstrapCampaign:
     network: str
@@ -172,6 +183,26 @@ class BootstrapCampaign:
         if self.cat_budget > _ZERO:
             sides.add(CampaignSide.SELL)
         return frozenset(sides)
+
+    def to_record(self) -> dict[str, object]:
+        """Return the exact canonical database authority fields."""
+
+        return {
+            "network": self.network,
+            "wallet_type": self.wallet_type,
+            "wallet_fingerprint": self.wallet_fingerprint,
+            "wallet_id": self.wallet_id,
+            "asset_id": self.asset_id,
+            "anchor_price": _decimal_text(self.anchor_price),
+            "minimum_price": _decimal_text(self.minimum_price),
+            "maximum_price": _decimal_text(self.maximum_price),
+            "xch_budget": _decimal_text(self.xch_budget),
+            "cat_budget": _decimal_text(self.cat_budget),
+            "fee_budget_xch": _decimal_text(self.fee_budget_xch),
+            "subsidy_budget_xch": _decimal_text(self.subsidy_budget_xch),
+            "created_at": _utc_text(self.created_at),
+            "expires_at": _utc_text(self.expires_at),
+        }
 
 
 @dataclass(frozen=True, slots=True)

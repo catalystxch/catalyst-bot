@@ -179,32 +179,32 @@ git commit -m "feat: stage and stop bootstrap exposure"
 
 **Interfaces:**
 - Consumes: canonical dictionaries returned by `BootstrapCampaign.to_record()` and event dictionaries with exact string amounts.
-- Produces: `create_bootstrap_campaign(record) -> str`, `get_bootstrap_campaign(campaign_id) -> dict | None`, `get_active_bootstrap_campaign(asset_id, fingerprint, network) -> dict | None`, `append_bootstrap_campaign_event(record) -> str`, `list_bootstrap_campaign_events(campaign_id) -> list[dict]`, `stop_bootstrap_campaign(campaign_id, reason, stopped_at) -> bool`, and `record_bootstrap_participation(record) -> str`.
+- Produces: `create_bootstrap_campaign(record) -> str`, `get_bootstrap_campaign(campaign_id) -> dict | None`, `get_active_bootstrap_campaign(asset_id, fingerprint, network) -> dict | None`, `update_bootstrap_campaign_state(campaign_id, expected_revision, record) -> int`, `append_bootstrap_campaign_event(record) -> str`, `list_bootstrap_campaign_events(campaign_id) -> list[dict]`, `stop_bootstrap_campaign(campaign_id, reason, stopped_at) -> bool`, `record_bootstrap_participation(record) -> str`, and `list_bootstrap_participation(campaign_id) -> list[dict]`.
 
-- [ ] **Step 1: Write failing idempotent migration and round-trip tests**
+- [x] **Step 1: Write failing idempotent migration and round-trip tests**
 
 Add round-trip assertions for every canonical decimal string, run schema
 initialization twice against the same isolated database, prove a second active
 campaign for the same network/fingerprint/asset compare-and-set is rejected, and
 reopen the database to prove stage, cooldown, fee, and loss state survive restart.
 
-- [ ] **Step 2: Run persistence tests and observe missing schema/accessors**
+- [x] **Step 2: Run persistence tests and observe missing schema/accessors**
 
 Run: `python -m pytest tests/test_bootstrap_campaign_persistence.py -q`
 
 Expected: FAIL on absent database functions.
 
-- [ ] **Step 3: Add additive tables and database-only accessors**
+- [x] **Step 3: Add additive tables and database-only accessors**
 
 Add `bootstrap_campaigns`, `bootstrap_campaign_events`, and `bootstrap_participation` using `CREATE TABLE IF NOT EXISTS`. Store every amount/price as canonical decimal text, timestamps as UTC text, and enforce one active campaign per `(network, wallet_fingerprint, asset_id)` with an application-level compare-and-set under the existing database lock. Do not add raw SQL outside `database.py`.
 
-- [ ] **Step 4: Verify stop and recovery are idempotent**
+- [x] **Step 4: Verify stop and recovery are idempotent**
 
 Run: `python -m pytest tests/test_bootstrap_campaign_persistence.py tests/test_market_evidence_persistence.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit persistence**
+- [x] **Step 5: Commit persistence**
 
 ```powershell
 git add src/catalyst/database.py tests/test_bootstrap_campaign_persistence.py
