@@ -23970,6 +23970,16 @@
         let _lastMarketSummary = null;
         let _lastMarketConfidence = null;
 
+        function formatTrustedRangePrice(value) {
+            const price = Number(String(value ?? '').trim());
+            if (!Number.isFinite(price) || price <= 0) return '';
+            if (price >= 0.00000001 && price < 0.001) return price.toFixed(8);
+            const decimals = price >= 1 ? 4 : price >= 0.001 ? 6 : 12;
+            return price.toFixed(decimals)
+                .replace(/(\.\d*?[1-9])0+$/, '$1')
+                .replace(/\.0+$/, '');
+        }
+
         function renderMarketConfidence(data = {}) {
             _lastMarketConfidence = data;
             const confidence = data.confidence || {};
@@ -23992,7 +24002,12 @@
 
             const bid = confidence.trusted_bid;
             const ask = confidence.trusted_ask;
-            setText('marketTrustedRange', bid && ask ? `${bid} – ${ask} XCH` : 'No tradable range');
+            const displayBid = formatTrustedRangePrice(bid);
+            const displayAsk = formatTrustedRangePrice(ask);
+            setText(
+                'marketTrustedRange',
+                displayBid && displayAsk ? `${displayBid} – ${displayAsk} XCH` : 'No tradable range'
+            );
             const reasons = Array.isArray(confidence.reason_codes)
                 ? confidence.reason_codes.map(code => String(code).replaceAll('_', ' ')).join(' · ')
                 : 'market evidence warming';
@@ -38787,6 +38802,10 @@ function _bootstrapRenderStatus(payload) {
 }
 
 async function bootstrapRefreshStatus() {
+    if (!currentCAT?.asset_id && !bot_state?.current_cat?.asset_id) {
+        _bootstrapRenderStatus({ success: true, active: false, campaign: null });
+        return;
+    }
     try {
         const response = await apiFetch('/api/bootstrap/status', { cache: 'no-store' });
         const payload = await response.json();

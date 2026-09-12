@@ -408,6 +408,29 @@ def test_dashboard_renders_attributable_confidence_depth(page):
     }
 
 
+def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
+    """Trusted CAT prices stay readable while the exact values remain internal."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => window.renderMarketConfidence({
+            confidence: {
+                state: 'AMBER',
+                trusted_bid: '0.0003733333333333333333333333333',
+                trusted_ask: '0.0003852000000000000000000000000',
+                reason_codes: ['single_provider_dependency'],
+            },
+            metrics: {},
+            providers: {},
+        })"""
+    )
+
+    expect(page.locator("#marketTrustedRange")).to_have_text(
+        "0.00037333 – 0.00038520 XCH"
+    )
+
+
 def test_dashboard_market_health_uses_authoritative_confidence_snapshot(page):
     """Health cards must use the durable confidence snapshot, not legacy AMM fields."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -1610,6 +1633,7 @@ def test_cancel_all_timeout_is_visible_and_releases_latch(page):
 def test_no_console_errors_on_initial_load(app_page):
     """Catch JS console errors that fire just from loading the dashboard."""
     errors: list[str] = []
+    client_errors: list[str] = []
     server_errors: list[str] = []
     app_page.on(
         "console",
@@ -1618,10 +1642,10 @@ def test_no_console_errors_on_initial_load(app_page):
     app_page.on(
         "response",
         lambda response: (
-            server_errors.append(
+            (server_errors if response.status >= 500 else client_errors).append(
                 f"{response.status} {response.request.method} {response.url}"
             )
-            if response.status >= 500
+            if response.status >= 400
             else None
         ),
     )
@@ -1641,5 +1665,6 @@ def test_no_console_errors_on_initial_load(app_page):
         and "ERR_NETWORK" not in e
     ]
     assert not real_errors, (
-        f"Unexpected JS console errors: {real_errors}; server errors: {server_errors}"
+        f"Unexpected JS console errors: {real_errors}; "
+        f"client errors: {client_errors}; server errors: {server_errors}"
     )
