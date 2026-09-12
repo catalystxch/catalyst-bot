@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-post-tibetswap-offer-book-design.md`
 
+**Approved extension:** `docs/superpowers/plans/2026-09-12-catalyst-market-bootstrap.md`
+
+The extension implements the amended requirement that any exact CAT can create a
+bounded first market without weakening the existing Market Follow lifecycle.
+
 ## Global Constraints
 
 - Work only on `codex/post-tibetswap-v1-4` in `C:\catalyst\.superpowers\post-tibetswap-v1-4`.

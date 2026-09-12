@@ -1,8 +1,8 @@
 # CATalyst v1.4.0 Post-TibetSwap Offer-Book Design
 
-**Date:** 10 September 2026
+**Date:** 10 September 2026; amended 12 September 2026
 
-**Status:** Approved
+**Status:** Approved, including Market Bootstrap amendment
 
 **Implementation branch:** `codex/post-tibetswap-v1-4`
 
@@ -24,6 +24,13 @@ transaction authority; Dexie and Splash distribute and observe offers;
 Coinset.org and Spacescan provide optional corroborating chain and ecosystem
 evidence. No AMM, swap, DCA, or synthetic replacement for TibetSwap is added.
 
+Because most CAT liquidity previously depended on TibetSwap, an existing
+independent two-sided book cannot be a universal prerequisite. CATalyst therefore
+supports both following an established offer book and deliberately bootstrapping
+the first bounded market for any exact CAT asset ID. Bootstrap authorization is
+explicit, campaign-scoped, non-custodial, and incapable of reaching funds outside
+its fixed budgets.
+
 The redesign preserves the stability-kernel invariants already on `main`, the
 approved direct-batch Coin Prep design, existing settings and accounting history,
 and the user's established mainnet TEST 7 acceptance workflow.
@@ -32,6 +39,12 @@ and the user's established mainnet TEST 7 acceptance workflow.
 
 - Price and manage offers only when CATalyst has a trustworthy, independently
   evidenced offer book.
+- Let a user create a bounded first market for any exact CAT asset ID, including
+  an unlisted or completely illiquid CAT, without presenting the user-supplied
+  launch anchor as independently discovered fair value.
+- Coordinate independent makers through interactively Sage-signed campaign
+  manifests, an optional static public directory, and privacy-bounded
+  participation proofs.
 - Exclude CATalyst's own offers before deriving prices, depth, competition, or
   manipulation signals.
 - Degrade progressively and visibly when market evidence becomes stale,
@@ -49,11 +62,15 @@ and the user's established mainnet TEST 7 acceptance workflow.
 
 - Replacing TibetSwap with another AMM, swap router, DCA service, or unverified
   central price feed.
-- Supporting CHIP-0052 partial offers in 1.4.0. Partial-offer support is deferred
-  until the ecosystem behavior and wallet interfaces are stable.
+- Activating CHIP-0052 partial offers without proven Sage create, cancel, state,
+  lineage, fill, and public-discovery capabilities. An Experimental option is
+  visible but disabled until every capability is available; standard offers
+  remain the default.
 - Treating Dexie, Splash, Coinset.org, or Spacescan as authoritative for wallet
   ownership, signing, offer creation, cancellation, or fill accounting.
-- Allowing a manual price override.
+- Allowing a manual price override in Market Follow mode. A user-supplied anchor
+  is allowed only inside an explicitly authorized Bootstrap campaign and is
+  labelled as maker-provided rather than market-derived.
 - Making confidence/manipulation thresholds directly editable in 1.4.0.
 - Deleting or rewriting historical TibetSwap or sniper records.
 
@@ -65,9 +82,11 @@ invariants are additive:
 1. **Sage is authoritative for effects.** Only fresh Sage state or exact,
    corroborated chain evidence can prove a create, cancel, fill, expiry, input
    spend, or owned output. Distribution providers never authorize wallet state.
-2. **No independent market means no new exposure.** CATalyst never creates or
-   requotes when it cannot prove a fresh, sufficiently deep, independent
-   two-sided book after excluding its own offers.
+2. **No independent market means no unbounded or implicit exposure.** Market
+   Follow never creates or requotes without usable attributable evidence. The
+   only exception is an explicit Bootstrap campaign whose price corridor,
+   asset-side budgets, fee budget, optional subsidy budget, expiry, stage, and
+   stop limits have been accepted by the user and persisted before any effect.
 3. **Own offers never price the bot.** Every exact offer/trade/coin identifier
    known to the durable registry is removed before book aggregation. Anonymous
    aggregate levels cannot independently prove competitor depth.
@@ -87,6 +106,13 @@ invariants are additive:
 10. **UI state is not authority.** Every tab renders the same server-side market
     confidence, offer lifecycle, and safety snapshot. Reload and restart rebuild
     it from durable and authoritative sources.
+11. **Campaign funds are isolated.** Bootstrap may reserve only its exact fixed
+    XCH budget, CAT budget, fee budget, and separately opted-in subsidy budget.
+    Wallet percentages may inform suggestions but can never enlarge a persisted
+    campaign authorization.
+12. **Bootstrap is not a price oracle.** Own offers, own fills, suspected linked
+    activity, anonymous aggregate levels, and the campaign anchor cannot prove
+    independent fair value or unlock additional exposure.
 
 ## Provider-capability architecture
 
@@ -130,6 +156,133 @@ The engine persists material snapshots and state transitions through
 `database.py`. The last trusted price, its exact evidence, and `degraded_since`
 survive restart. A remembered price is display-only unless current policy permits
 the relevant grace-period action.
+
+## Market lifecycle and Bootstrap campaigns
+
+### Operating modes and stages
+
+CATalyst exposes two explicit operating modes:
+
+- **Market Follow:** competes inside a current attributable offer book. Data
+  validity is separate from provider redundancy. One fresh exact Dexie book may
+  authorize restricted staged exposure; a healthy independent Splash book raises
+  confidence and can accelerate capacity, but an enabled-yet-empty Splash node
+  does not make every Dexie market unusable.
+- **Market Bootstrap:** creates the first bounded market from a maker-provided
+  anchor when the book is absent, stale, one-sided, insufficiently deep, or wider
+  than 1,000 basis points. CATalyst suggests this mode and explains why, but never
+  switches into it or creates an offer without explicit confirmation.
+
+The displayed market stage is `BOOTSTRAP`, `DISCOVERY`, `ESTABLISHED`, or
+`UNSAFE`. It is distinct from provider health and from the Green/Amber/Red
+confidence state so a user-supplied launch anchor is never mislabeled as a Green
+independent price. Automatic transition from Bootstrap to Market Follow occurs
+only after the evidence requirements below are durably satisfied; the user is
+notified without interrupting a healthy ladder.
+
+### Campaign authorization and price corridor
+
+A Bootstrap campaign is bound to the verified network, wallet fingerprint,
+wallet type, CAT asset ID, and XCH/CAT pair. Before any Coin Prep or offer effect,
+the user supplies:
+
+- a fixed XCH trading budget and fixed CAT trading budget;
+- an explicit anchor entered as XCH per CAT or derived from CAT supply plus an
+  implied XCH market valuation;
+- hard minimum and maximum prices, with a default suggestion of 50% below and
+  100% above the anchor;
+- a separate fixed fee budget;
+- an optional separate launch-subsidy budget, defaulting to zero;
+- a seven-day expiry and a 5% campaign-value loss stop.
+
+Campaign value is the XCH budget plus the CAT budget valued at the accepted
+anchor. The loss stop includes confirmed realized loss and conservatively marked
+adverse inventory movement. Hitting it cancels all campaign offers through the
+authoritative lifecycle, preserves the evidence, and requires an explicit manual
+restart with a fresh anchor and budget review.
+
+Bootstrap can be two-sided or clearly labelled `BUY_ONLY`/`SELL_ONLY` when the
+maker has only one asset. It never borrows, synthesizes, or crosses the market to
+manufacture the missing side.
+
+### Staged deployment and discovery
+
+Only 10% of each funded trading-side budget is initially deployable. The initial
+ladder contains three ordinary atomic offers per funded side inside the hard
+price corridor. Additional capacity requires both attributable independent maker
+depth and Sage-confirmed third-party settlement evidence:
+
+- 25% capacity: at least two confirmed fills attributed to two distinct on-chain
+  settlement identity clusters;
+- 50% capacity: at least six confirmed fills attributed to three clusters, at
+  least 30 minutes of stable evidence, and current independent depth;
+- 100% capacity: at least twelve confirmed fills attributed to five clusters, at
+  least two hours of stable evidence, and current independent depth.
+
+An identity cluster is an evidence heuristic based on attributable non-maker
+inputs, puzzle hashes, and settlement lineage; it is not a claim that CATalyst
+can prove distinct real-world people. Suspected own or linked activity is excluded
+from price movement, capacity, transition, and incentive proofs and raises a
+visible manipulation flag.
+
+Confirmed activity may move the anchor by at most 5% in any rolling hour and 20%
+in any rolling 24 hours, always remaining inside the hard corridor. An adverse
+fill starts a five-minute cooldown on the affected side while Sage reconciliation
+and the independent book settle. Inventory imbalance first skews remaining quotes
+toward rebalancing, then pauses the depleted side; CATalyst never aggressively
+crosses the market to rebalance.
+
+At 80% fee-budget consumption, new creation and requoting stop. The remaining 20%
+is reserved for safe cancellation and withdrawal. CATalyst never tops up a
+Bootstrap fee budget from unrelated wallet XCH.
+
+### Campaign sharing and incentives
+
+CATalyst exports and imports canonical campaign manifests containing the campaign
+ID, network, exact CAT asset ID, maker-provided anchor, corridor, stage rules,
+expiry, public signing key, and verification status. Wallet proof uses Sage's
+interactive WalletConnect `chia_signMessageByAddress` command. Sage must show the
+message and the user must approve it for each manifest or participation report;
+CATalyst never routes offer, coin, Coin Prep, or bot mutations through
+WalletConnect. The WalletConnect account, chain, and signing address must agree
+with an immediate authoritative Sage RPC identity recheck before the request and
+again before accepting the response.
+
+The standalone Sage RPC does not currently expose this signing command. When a
+free public Reown project ID is not configured, Sage rejects or times out the
+request, the account changes, or signature verification fails, CATalyst keeps
+core Bootstrap available but marks signing `UNAVAILABLE` or `INVALID`. It never
+substitutes an application key or checksum, and it cannot submit that record to
+the verified public directory. A joining maker accepts shared market parameters
+but chooses independent local trading, fee, subsidy, reserve, and loss budgets.
+Imported manifests cannot authorize wallet effects by themselves.
+
+The website may publish a static directory of valid Sage-signed manifests.
+Directory entry proves only that the advertised signing key signed the canonical
+bytes; it is not an endorsement of the CAT, issuer, anchor, or expected return.
+Unsigned manifests remain local/shareable data and are never presented as
+verified directory entries. Unlisted CATs are allowed after strong exact-asset
+confirmation and remain visibly `UNVERIFIED` as assets even when their manifest
+signature is valid.
+
+Participation reports contain only the public signing key, campaign ID, exact
+offer/fill identifiers, and aggregated independent depth, uptime, and competitive
+spread totals. They omit the Sage fingerprint, balances, unrelated transactions,
+and local filesystem identity. Issuer rewards are external in v1.4.0 and should
+score sustained independent depth, uptime, and spread quality rather than volume,
+which is readily wash-traded. Existing Dexie incentive discovery and automatic
+reward claims remain supported.
+
+### Experimental partial-offer capability
+
+Standard Chia Offers remain the only enabled live path by default. Settings show
+an Experimental Partial Offers option but keep it disabled until the active wallet
+and provider adapters prove exact create, cancel, state, lineage, fill, and public
+discovery capabilities. A missing capability returns a stable explanatory reason
+and performs no wallet mutation. There is no force-enable path. When the complete
+capability contract becomes available, partial offers remain separately opt-in and
+must pass the same campaign, budget, evidence, lifecycle, accounting, and recovery
+rules as standard offers.
 
 ## Trusted pricing and manipulation resistance
 
@@ -305,9 +458,12 @@ all values from offer-book evidence:
 - progressive withdrawal and recovery thresholds from the preset without making
   the ten-minute maximum grace less safe.
 
-Smart Settings never uses pool reserves, AMM slippage, arbitrage gap, or a manual
-price. Zero and nonzero reserves remain supported. Existing direct-batch Coin Prep
-requirements are preserved, including dedicated fee coins and exact output
+In Market Follow, Smart Settings never uses pool reserves, AMM slippage, arbitrage
+gap, or a manual price. In Market Bootstrap it consumes only the explicit campaign
+anchor, corridor, fixed budgets, stage decision, and confirmed evidence described
+above. Zero and nonzero wallet reserves remain supported outside the isolated
+campaign budgets. Existing direct-batch Coin Prep requirements are preserved,
+including dedicated fee coins, the 20% cancellation-fee reserve, and exact output
 verification.
 
 ## Persistence, migration, and retention
@@ -344,8 +500,8 @@ All tabs use one server-side market/safety snapshot and preserve HTML escaping:
 
 - **Dashboard:** Market Confidence badge, trusted range, independent bid/ask
   depth, source health/ages, degraded timer/stage, publication health, active
-  offers, wallet balances, and safety status. Remove AMM, pool, arb, and sniper
-  cards.
+  offers, wallet balances, safety status, operating mode, campaign stage, deployed
+  fraction, budget use, and loss/fee stops. Remove AMM, pool, arb, and sniper cards.
 - **Offers:** Sage lifecycle plus per-provider acknowledgement/discovery state,
   fill confidence, lineage, cancellation progress, and exact reason codes.
 - **P&L:** confirmed accounting only; observed/probable activity is separate.
@@ -354,7 +510,9 @@ All tabs use one server-side market/safety snapshot and preserve HTML escaping:
   trades, depth ratios, churn, source agreement, confidence timeline, and provider
   health. Splash, Coinset.org, and Spacescan are represented by capability.
 - **Settings:** offer-book presets, reserves, limits, fees, provider toggles,
-  Coinset.org/Spacescan privacy notice, and visible derived thresholds. Remove live
+  Coinset.org/Spacescan privacy notice, visible derived thresholds, a Bootstrap
+  wizard, signed-manifest import/export, proof-report export, and a visible but
+  capability-disabled Experimental Partial Offers control. Remove live
   TibetSwap/AMM/sniper controls.
 - **Logs:** confidence transitions, source outages/recoveries, withdrawal stages,
   publication/discovery, confirmed effects, migration, and stable reason codes.
@@ -414,6 +572,16 @@ Automated coverage includes:
 - own-offer exclusion and Dexie/Splash/chain deduplication;
 - two-sided depth scaling, movement persistence, settled-trade confirmation,
   volatility caps, churn and manipulation scoring;
+- Follow-versus-Bootstrap suggestion without automatic financial-mode changes;
+- fixed campaign-budget isolation, 10/25/50/100 staged capacity, three offers per
+  funded side, one-sided launch, price corridor, anchor movement caps, cooldown,
+  inventory skew, seven-day expiry, 5% loss stop, and fee-budget withdrawal reserve;
+- suspected self/linked settlement exclusion, identity-cluster limitations,
+  canonical interactive Sage signatures, WalletConnect account/network binding,
+  signing-unavailable behavior, manifest import safety, static-directory trust
+  wording, privacy-bounded participation proofs, and quality-based reward totals;
+- experimental partial-offer capability detection proving a disabled no-effect
+  path when Sage or public distribution support is incomplete;
 - green/amber/red transitions, durable degraded timers, staged withdrawal,
   restart during every stage, and three-refresh/60-second recovery;
 - Sage create through 90-second discovery, one-provider operation, dual-provider
@@ -452,7 +620,10 @@ The release candidate is CATalyst `v1.4.0`. Before public release it must pass:
    `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`;
 7. Smart Settings, changed-size direct Coin Prep, start, creation, publication,
    discovery, fills, stop, native Cancel All, restart, migration, source outage,
-   manipulation, degraded withdrawal, recovery, and every UI tab;
+   manipulation, degraded withdrawal, recovery, Market Follow, new/illiquid-CAT
+   Bootstrap, WalletConnect-signed manifest import/export, participation proof
+   export, signing-unavailable behavior, disabled
+   partial-offer capability behavior, and every UI tab;
 8. 24 continuous hours on both PCs with the started bot, no unresolved effects,
    no incorrect accounting, no identity drift, no stale/false market data, no
    unbounded errors, and reconciled Sage/Dexie/Splash/Coinset.org/Spacescan state.
