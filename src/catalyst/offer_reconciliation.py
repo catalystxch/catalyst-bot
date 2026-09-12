@@ -94,6 +94,49 @@ _MAX_CANONICAL_NODES = 100_000
 _MAX_CANONICAL_TEXT_BYTES = 8 * 1024 * 1024
 
 
+def plan_bootstrap_restart_recovery(
+    *,
+    campaign_record: dict[str, Any],
+    unresolved_trade_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Resume Bootstrap cancellation before any replacement after restart."""
+
+    if type(campaign_record) is not dict:
+        raise TypeError("Bootstrap campaign record must be a dict")
+    if type(unresolved_trade_ids) is not tuple:
+        raise TypeError("unresolved trade IDs must be a tuple")
+    campaign_id = campaign_record.get("campaign_id")
+    revision = campaign_record.get("revision")
+    if type(campaign_id) is not str or type(revision) is not int:
+        raise ValueError("Bootstrap campaign authority is invalid")
+    normalized = []
+    for trade_id in unresolved_trade_ids:
+        if (
+            type(trade_id) is not str
+            or len(trade_id) != 64
+            or any(character not in _HEX for character in trade_id)
+        ):
+            raise ValueError("unresolved Bootstrap trade ID is invalid")
+        normalized.append(trade_id)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("unresolved Bootstrap trade IDs must be unique")
+    if normalized:
+        return {
+            "action": "resume_cancellation",
+            "allow_replacement": False,
+            "campaign_id": campaign_id,
+            "campaign_revision": revision,
+            "trade_ids": tuple(normalized),
+        }
+    return {
+        "action": "continue",
+        "allow_replacement": campaign_record.get("status") == "active",
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+        "trade_ids": (),
+    }
+
+
 class _EvidenceEncodingError(ValueError):
     """Raised when hostile evidence cannot be encoded exactly within bounds."""
 

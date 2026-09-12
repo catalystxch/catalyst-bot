@@ -87,6 +87,7 @@ from amount_utils import (
     format_signed_cat_display_amount,
 )
 from wallet import get_all_offers, get_chia_health
+from bootstrap_campaign import BootstrapDecision
 
 try:
     import mempool_watcher as _mempool_watcher_mod
@@ -104,6 +105,55 @@ DEXIE_STATUS_EXPIRED = 6
 # authoritative cancellation of recovered offers, never for creation or
 # repricing. Conservative opportunity orders now run through OfferManager.
 LEGACY_TIBET_BOOST_RUNTIME_ENABLED = False
+
+
+def plan_bootstrap_runtime_transition(
+    *,
+    campaign_record: dict,
+    decision: BootstrapDecision,
+    unresolved_cancellation_count: int,
+) -> dict:
+    """Plan the next live Bootstrap action without performing a wallet effect."""
+
+    if type(campaign_record) is not dict or type(decision) is not BootstrapDecision:
+        raise TypeError("exact Bootstrap campaign and decision are required")
+    if (
+        type(unresolved_cancellation_count) is not int
+        or unresolved_cancellation_count < 0
+    ):
+        raise ValueError("unresolved cancellation count is invalid")
+    if campaign_record.get("status") != "active":
+        return {
+            "allow_create": False,
+            "allow_requote": False,
+            "cancel_required": unresolved_cancellation_count > 0,
+            "cancel_reason": "bootstrap_campaign_not_active",
+            "manual_restart_required": True,
+        }
+    if unresolved_cancellation_count:
+        return {
+            "allow_create": False,
+            "allow_requote": False,
+            "cancel_required": True,
+            "cancel_reason": "bootstrap_cancellation_recovery",
+            "manual_restart_required": bool(decision.manual_restart_required),
+        }
+    if decision.cancellation_required or not decision.authorized:
+        stop_reason = decision.stop_reason.value if decision.stop_reason else "unsafe"
+        return {
+            "allow_create": False,
+            "allow_requote": False,
+            "cancel_required": True,
+            "cancel_reason": f"bootstrap_{stop_reason}",
+            "manual_restart_required": bool(decision.manual_restart_required),
+        }
+    return {
+        "allow_create": True,
+        "allow_requote": True,
+        "cancel_required": False,
+        "cancel_reason": None,
+        "manual_restart_required": False,
+    }
 
 
 def _bps_to_pct(val):

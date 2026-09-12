@@ -380,7 +380,7 @@ git commit -m "feat: plan bounded bootstrap ladders"
 - Consumes: active persisted campaign ID, exact `BootstrapDecision`, Sage-confirmed effects, and durable offer lifecycle records.
 - Produces: campaign-bound offer intents, exact stage counters, cooldown events, loss/fee stop events, and authoritative cancellation requests.
 
-- [ ] **Step 1: Write failing no-bypass lifecycle tests**
+- [x] **Step 1: Write failing no-bypass lifecycle tests**
 
 Add assertions that Red follow confidence has no bypass without an active exact
 campaign; every Bootstrap intent carries campaign ID and budget revision; expired,
@@ -388,17 +388,17 @@ stopped, or superseded revisions cannot create/requote; the loss stop schedules
 authoritative cancellation and sets manual restart; and restart resumes unresolved
 cancellation without creating replacement offers.
 
-- [ ] **Step 2: Run and observe the current follow-only rejection**
+- [x] **Step 2: Run and observe the current follow-only rejection**
 
 Run: `python -m pytest tests/test_bootstrap_mutation_gate.py tests/test_bootstrap_live_lifecycle.py -q`
 
 Expected: Bootstrap creation fails because the existing gate accepts only Green follow confidence.
 
-- [ ] **Step 3: Add a narrow campaign-authority branch**
+- [x] **Step 3: Add a narrow campaign-authority branch**
 
 The mutation gate accepts either a valid Market Follow authorization or an exact active Bootstrap campaign decision bound to network, fingerprint, wallet ID, CAT asset ID, campaign ID, and revision. It does not weaken identity, ownership, reservation, publication, fill, cancellation, or terminal-proof gates.
 
-- [ ] **Step 4: Count only Sage-confirmed independent settlement evidence**
+- [x] **Step 4: Count only Sage-confirmed independent settlement evidence**
 
 Persist exact confirmed fill/spend identities, compute conservative non-maker clusters, exclude known own/linked activity, apply the five-minute side cooldown, and update stage only through a database compare-and-set. Dexie/Splash disappearance never increments capacity.
 

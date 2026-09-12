@@ -87,7 +87,11 @@ def offer_is_profitable(
     return expected_gross_xch >= required
 
 
-def bootstrap_offer_specs(plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+def bootstrap_offer_specs(
+    plan: dict[str, Any],
+    *,
+    campaign_authority: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], ...]:
     """Flatten one authorized Bootstrap plan into exact offer specifications."""
 
     if type(plan) is not dict or plan.get("authorized") is not True:
@@ -95,6 +99,27 @@ def bootstrap_offer_specs(plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     sides = plan.get("sides")
     if type(sides) is not dict or set(sides) != {"buy", "sell"}:
         raise ValueError("Bootstrap side plan is invalid")
+
+    campaign_fields: dict[str, Any] = {}
+    if campaign_authority is not None:
+        if type(campaign_authority) is not dict:
+            raise ValueError("Bootstrap campaign authority is invalid")
+        campaign_id = campaign_authority.get("campaign_id")
+        revision = campaign_authority.get("revision")
+        if (
+            type(campaign_id) is not str
+            or len(campaign_id) != 64
+            or any(character not in "0123456789abcdef" for character in campaign_id)
+            or type(revision) is not int
+            or revision < 0
+            or campaign_authority.get("status") != "active"
+        ):
+            raise ValueError("Bootstrap campaign authority is invalid")
+        campaign_fields = {
+            "campaign_id": campaign_id,
+            "campaign_revision": revision,
+            "purpose": f"bootstrap:{campaign_id}:revision:{revision}",
+        }
 
     specs: list[dict[str, Any]] = []
     for side in ("buy", "sell"):
@@ -118,11 +143,65 @@ def bootstrap_offer_specs(plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
                     "xch_amount": level["xch_amount"],
                     "cat_amount": level["cat_amount"],
                     "subsidy_xch": level["subsidy_xch"],
+                    **campaign_fields,
                 }
             )
     if not specs:
         raise ValueError("Bootstrap plan has no active offer levels")
     return tuple(specs)
+
+
+def require_active_bootstrap_intent_authority(
+    *,
+    purpose: str,
+    asset_id: str,
+    now: Optional[datetime] = None,
+) -> Optional[dict[str, Any]]:
+    """Re-read the exact campaign revision encoded in a Bootstrap intent."""
+
+    if type(purpose) is not str:
+        raise ValueError("offer purpose must be canonical text")
+    if not purpose.startswith("bootstrap:"):
+        return None
+    parts = purpose.split(":")
+    if len(parts) != 4 or parts[0] != "bootstrap" or parts[2] != "revision":
+        raise ValueError("Bootstrap offer purpose is malformed")
+    campaign_id = parts[1]
+    try:
+        revision = int(parts[3])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bootstrap offer revision is malformed") from exc
+    if (
+        len(campaign_id) != 64
+        or any(character not in "0123456789abcdef" for character in campaign_id)
+        or revision < 0
+        or parts[3] != str(revision)
+    ):
+        raise ValueError("Bootstrap offer authority is malformed")
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    if type(campaign) is not dict or campaign.get("status") != "active":
+        raise ValueError("Bootstrap campaign is not active")
+    if campaign.get("revision") != revision:
+        raise ValueError("Bootstrap campaign revision is no longer active")
+    if campaign.get("asset_id") != asset_id:
+        raise ValueError("Bootstrap campaign asset identity changed")
+    observed_at = now or datetime.now(timezone.utc)
+    if type(observed_at) is not datetime or observed_at.tzinfo is None:
+        raise ValueError("Bootstrap authority time is invalid")
+    expiry = campaign.get("expires_at")
+    try:
+        if type(expiry) is not str or not expiry.endswith("Z"):
+            raise ValueError("noncanonical expiry")
+        expires_at = datetime.fromisoformat(expiry[:-1] + "+00:00")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Bootstrap campaign expiry is malformed") from exc
+    if observed_at.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc):
+        raise ValueError("Bootstrap campaign has expired")
+    return {
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+        "status": "active",
+    }
 
 
 def assess_offer_book_candidate(
@@ -2230,6 +2309,10 @@ class OfferManager:
         ):
             if type(value) is not str or not value or value != value.strip():
                 raise ValueError(f"creation {label} must be canonical text")
+        require_active_bootstrap_intent_authority(
+            purpose=purpose,
+            asset_id=asset_id,
+        )
         if parent_intent_id is not None and (
             type(parent_intent_id) is not str
             or not parent_intent_id
@@ -2833,6 +2916,10 @@ class OfferManager:
         wallet_hash = ""
         network = ""
         try:
+            require_active_bootstrap_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+            )
             continuation = wallet.begin_offer_creation_continuation(
                 operation_id=intent.operation_id,
                 intent_id=intent.intent_id,
@@ -2932,6 +3019,10 @@ class OfferManager:
                     "_catalyst_intent_id": intent.intent_id,
                 }
             self._offer_creation_crash_boundary("before_wallet_call", intent)
+            require_active_bootstrap_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+            )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),

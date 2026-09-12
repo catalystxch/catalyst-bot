@@ -32,6 +32,84 @@ from database import (
     log_event,
     transition_offer,
 )
+from bootstrap_campaign import BootstrapEvidence, CampaignSide
+
+
+def derive_bootstrap_settlement_evidence(
+    rows: list[dict],
+    *,
+    campaign_id: str,
+    own_trade_ids: frozenset[str],
+    linked_cluster_ids: frozenset[str],
+) -> BootstrapEvidence:
+    """Count only exact Sage-proven, independent, nonlinked campaign fills."""
+
+    if type(rows) is not list:
+        raise TypeError("Bootstrap settlement rows must be a list")
+    if type(own_trade_ids) is not frozenset or type(linked_cluster_ids) is not frozenset:
+        raise TypeError("Bootstrap exclusion identities must be frozen sets")
+    if (
+        type(campaign_id) is not str
+        or len(campaign_id) != 64
+        or any(character not in "0123456789abcdef" for character in campaign_id)
+    ):
+        raise ValueError("Bootstrap campaign ID is invalid")
+
+    accepted: dict[str, dict] = {}
+    for row in rows:
+        if type(row) is not dict or row.get("campaign_id") != campaign_id:
+            continue
+        trade_id = row.get("trade_id")
+        cluster = row.get("participant_cluster")
+        settlement = row.get("settlement_identity")
+        if trade_id in own_trade_ids or cluster in linked_cluster_ids:
+            continue
+        if (
+            row.get("verification_status") != "verified_authoritative"
+            or type(row.get("spent_block_height")) is not int
+            or not row.get("receive_coin_id")
+            or type(settlement) is not str
+            or not settlement
+            or type(cluster) is not str
+            or not cluster
+            or row.get("side") not in {"buy", "sell"}
+        ):
+            continue
+        accepted.setdefault(settlement, row)
+
+    clusters = {str(row["participant_cluster"]) for row in accepted.values()}
+    depth_sides = frozenset(
+        CampaignSide(str(row["side"]))
+        for row in accepted.values()
+        if row.get("independent_depth") is True
+        and sum(
+            1
+            for candidate in accepted.values()
+            if candidate.get("side") == row.get("side")
+            and candidate.get("participant_cluster")
+            != row.get("participant_cluster")
+        )
+        > 0
+    )
+    adverse = []
+    for row in accepted.values():
+        if row.get("adverse") is not True:
+            continue
+        filled_at = row.get("filled_at")
+        try:
+            if type(filled_at) is not str or not filled_at.endswith("Z"):
+                continue
+            occurred_at = _dt.datetime.fromisoformat(filled_at[:-1] + "+00:00")
+        except (TypeError, ValueError):
+            continue
+        adverse.append((CampaignSide(str(row["side"])), occurred_at))
+    adverse.sort(key=lambda item: (item[1], item[0].value))
+    return BootstrapEvidence(
+        confirmed_fills=len(accepted),
+        settlement_clusters=len(clusters),
+        independent_depth_sides=depth_sides,
+        adverse_fill_times=tuple(adverse),
+    )
 
 
 def _dexie_asset_key(value) -> str:
