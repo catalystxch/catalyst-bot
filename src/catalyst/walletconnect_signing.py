@@ -22,6 +22,11 @@ from bootstrap_manifest import (
     canonical_manifest_bytes,
     verify_campaign_manifest,
 )
+from bootstrap_proof import (
+    ProofError,
+    canonical_participation_bytes,
+    verify_participation_report,
+)
 
 
 WALLETCONNECT_METHOD = "chia_signMessageByAddress"
@@ -82,7 +87,7 @@ class SigningRequest:
 @dataclass
 class _PendingRequest:
     request: SigningRequest
-    manifest: dict[str, Any]
+    payload: dict[str, Any]
     identity: WalletIdentity
 
 
@@ -147,18 +152,43 @@ class WalletConnectSigningService:
     def begin_manifest_signature(
         self, manifest: dict[str, Any], identity: WalletIdentity
     ) -> SigningRequest:
+        return self._begin_signature(
+            manifest,
+            identity,
+            purpose="bootstrap_manifest",
+            canonicalizer=canonical_manifest_bytes,
+        )
+
+    def begin_participation_signature(
+        self, report: dict[str, Any], identity: WalletIdentity
+    ) -> SigningRequest:
+        return self._begin_signature(
+            report,
+            identity,
+            purpose="bootstrap_participation",
+            canonicalizer=canonical_participation_bytes,
+        )
+
+    def _begin_signature(
+        self,
+        payload: dict[str, Any],
+        identity: WalletIdentity,
+        *,
+        purpose: str,
+        canonicalizer: Callable[[Any], bytes],
+    ) -> SigningRequest:
         if not self._project_id:
             raise SigningError("walletconnect_project_id_missing")
         expected = _validate_identity(identity)
         self._recheck(expected)
         try:
-            message = canonical_manifest_bytes(manifest)
-        except ManifestError as exc:
+            message = canonicalizer(payload)
+        except (ManifestError, ProofError) as exc:
             raise SigningError(exc.code) from exc
         now = self._clock().astimezone(timezone.utc)
         request = SigningRequest(
             request_id=secrets.token_hex(16),
-            purpose="bootstrap_manifest",
+            purpose=purpose,
             method=WALLETCONNECT_METHOD,
             required_methods=(WALLETCONNECT_METHOD,),
             account=expected.account,
@@ -172,7 +202,7 @@ class WalletConnectSigningService:
         with self._lock:
             self._pending[request.request_id] = _PendingRequest(
                 request=request,
-                manifest=deepcopy(manifest),
+                payload=deepcopy(payload),
                 identity=expected,
             )
         return request
@@ -183,10 +213,40 @@ class WalletConnectSigningService:
         response: dict[str, Any],
         identity: WalletIdentity,
     ) -> dict[str, Any]:
+        return self._complete_signature(
+            request_id,
+            response,
+            identity,
+            purpose="bootstrap_manifest",
+        )
+
+    def complete_participation_signature(
+        self,
+        request_id: str,
+        response: dict[str, Any],
+        identity: WalletIdentity,
+    ) -> dict[str, Any]:
+        return self._complete_signature(
+            request_id,
+            response,
+            identity,
+            purpose="bootstrap_participation",
+        )
+
+    def _complete_signature(
+        self,
+        request_id: str,
+        response: dict[str, Any],
+        identity: WalletIdentity,
+        *,
+        purpose: str,
+    ) -> dict[str, Any]:
         with self._lock:
             pending = self._pending.pop(request_id, None)
         if pending is None:
             raise SigningError("signing_request_not_pending")
+        if pending.request.purpose != purpose:
+            raise SigningError("signing_request_purpose_mismatch")
         now = self._clock().astimezone(timezone.utc)
         if now > pending.request.expires_at:
             raise SigningError("signing_request_expired")
@@ -209,17 +269,25 @@ class WalletConnectSigningService:
         for field, required, code in checks:
             if response.get(field) != required:
                 raise SigningError(code)
-        signed = {
-            "manifest": deepcopy(pending.manifest),
-            "signature": {
-                "algorithm": SIGNATURE_ALGORITHM,
-                "signing_address": pending.request.signing_address,
-                "public_key": response.get("publicKey"),
-                "signature": response.get("signature"),
-                "message_digest": pending.request.message_digest,
-            },
+        envelope = {
+            "algorithm": SIGNATURE_ALGORITHM,
+            "signing_address": pending.request.signing_address,
+            "public_key": response.get("publicKey"),
+            "signature": response.get("signature"),
+            "message_digest": pending.request.message_digest,
         }
-        verification = verify_campaign_manifest(signed)
+        if purpose == "bootstrap_manifest":
+            signed = {
+                "manifest": deepcopy(pending.payload),
+                "signature": envelope,
+            }
+            verification = verify_campaign_manifest(signed)
+        else:
+            signed = {
+                "report": deepcopy(pending.payload),
+                "signature": envelope,
+            }
+            verification = verify_participation_report(signed, now=now)
         if verification.status != "VERIFIED":
             raise SigningError(verification.reason_code or "signature_invalid")
         return signed

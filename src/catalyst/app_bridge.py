@@ -607,6 +607,21 @@ class AppBridge:
             resp = api_server.api_bootstrap_manifest_import()
         return _unwrap_flask_response(resp)
 
+    @_safe
+    def export_bootstrap_participation(self, body=None):
+        """Export privacy-bounded campaign evidence for optional Sage signing."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/participation/export",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_participation_export()
+        return _unwrap_flask_response(resp)
+
     # -----------------------------------------------------------------------
     # Dashboard
     # -----------------------------------------------------------------------
@@ -1979,6 +1994,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "is_sage_running",
     "read_clipboard",
     "export_bootstrap_manifest",
+    "export_bootstrap_participation",
     "preview_bootstrap_campaign",
     "refresh_balances",
     "run_doctor",

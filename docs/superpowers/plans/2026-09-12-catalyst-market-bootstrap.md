@@ -452,7 +452,7 @@ Run: `python -m pytest tests/test_bootstrap_api.py tests/test_bootstrap_ui_contr
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit API and UI**
+- [x] **Step 5: Commit API and UI**
 
 ```powershell
 git add src/catalyst/blueprints/bootstrap.py src/catalyst/api_server.py src/catalyst/app_bridge.py bot_gui.html tests/test_bootstrap_api.py tests/test_bootstrap_ui_contract.py
@@ -473,7 +473,7 @@ git commit -m "feat: add market bootstrap wizard"
 - Consumes: campaign public key/ID, exact campaign offer/fill identities, bounded depth/uptime/spread samples, and wallet signature.
 - Produces: `build_participation_report(campaign_id, observations) -> dict`, `sign_participation_report(report, address) -> dict`, and `verify_participation_report(signed_report) -> ProofVerification`.
 
-- [ ] **Step 1: Write failing quality-score, anti-volume, and privacy tests**
+- [x] **Step 1: Write failing quality-score, anti-volume, and privacy tests**
 
 Add deterministic assertions that the quality score changes with eligible depth,
 uptime, and spread but not volume; own/linked observations are excluded; private
@@ -481,17 +481,17 @@ fingerprint, balances, paths, and unrelated history never serialize; and static
 directory validation rejects a bad signature, wrong network, expired record, or
 noncanonical payload.
 
-- [ ] **Step 2: Run and observe missing proof behavior**
+- [x] **Step 2: Run and observe missing proof behavior**
 
 Run: `python -m pytest tests/test_bootstrap_proof.py -q`
 
 Expected: collection fails because `bootstrap_proof` does not exist.
 
-- [ ] **Step 3: Implement deterministic bounded quality totals**
+- [x] **Step 3: Implement deterministic bounded quality totals**
 
 Report exact eligible offer/fill IDs and aggregate time-weighted independent depth, uptime seconds, and within-corridor spread basis points. Do not calculate or promise a reward amount. Sign canonical bytes through the same identity-bound interactive Sage WalletConnect path as manifests.
 
-- [ ] **Step 4: Define the no-cost static directory contract**
+- [x] **Step 4: Define the no-cost static directory contract**
 
 The schema requires canonical signed manifest fields, network, exact asset ID, expiry, signer public key, signature, and explicit asset verification status. Documentation states that inclusion is not endorsement and that every joining wallet chooses its own budgets.
 
@@ -499,7 +499,7 @@ Run: `python -m pytest tests/test_bootstrap_proof.py tests/test_bootstrap_manife
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit proof and directory contracts**
+- [x] **Step 5: Commit proof and directory contracts**
 
 ```powershell
 git add src/catalyst/bootstrap_proof.py src/catalyst/blueprints/bootstrap.py bot_gui.html tests/test_bootstrap_proof.py docs/bootstrap-directory/README.md docs/bootstrap-directory/schema.json

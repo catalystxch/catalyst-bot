@@ -7,6 +7,10 @@ import pytest
 from chia_rs import AugSchemeMPL, Program
 
 from bootstrap_manifest import canonical_manifest_bytes
+from bootstrap_proof import (
+    build_participation_report,
+    canonical_participation_bytes,
+)
 from test_bootstrap_manifest import ADDRESS, make_manifest
 from walletconnect_signing import (
     SigningError,
@@ -48,6 +52,20 @@ def make_service(identity_reader=lambda: IDENTITY, project_id="project-id"):
         identity_reader=identity_reader,
         clock=lambda: NOW,
         request_ttl=timedelta(minutes=2),
+    )
+
+
+def make_participation_report():
+    return build_participation_report(
+        "ab" * 32,
+        {
+            "network": "mainnet",
+            "asset_id": "b8" * 32,
+            "period_start": "2026-09-12T10:00:00.000000Z",
+            "period_end": "2026-09-12T11:00:00.000000Z",
+            "expires_at": "2026-09-19T11:00:00.000000Z",
+            "samples": [],
+        },
     )
 
 
@@ -172,3 +190,45 @@ def test_non_sage_wallet_cannot_begin_walletconnect_signature():
         service.begin_manifest_signature(make_manifest(), identity)
 
     assert error.value.code == "sage_wallet_required"
+
+
+def test_participation_report_uses_same_identity_bound_interactive_path():
+    service = make_service()
+    report = make_participation_report()
+
+    request = service.begin_participation_signature(report, IDENTITY)
+
+    expected_bytes = canonical_participation_bytes(report)
+    assert request.purpose == "bootstrap_participation"
+    assert request.method == "chia_signMessageByAddress"
+    assert request.required_methods == ("chia_signMessageByAddress",)
+    assert request.account == "chia:mainnet:736588221"
+    assert request.signing_address == ADDRESS
+    assert request.message == f"0x{expected_bytes.hex()}"
+    assert request.message_digest == hashlib.sha256(expected_bytes).hexdigest()
+
+    signed = service.complete_participation_signature(
+        request.request_id,
+        response_for(request),
+        IDENTITY,
+    )
+
+    assert signed["report"] == report
+    assert signed["signature"]["message_digest"] == request.message_digest
+    assert service.pending_request_count == 0
+
+
+def test_manifest_completion_cannot_consume_participation_request():
+    service = make_service()
+    request = service.begin_participation_signature(
+        make_participation_report(), IDENTITY
+    )
+
+    with pytest.raises(SigningError) as error:
+        service.complete_manifest_signature(
+            request.request_id,
+            response_for(request),
+            IDENTITY,
+        )
+
+    assert error.value.code == "signing_request_purpose_mismatch"

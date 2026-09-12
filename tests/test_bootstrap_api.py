@@ -131,6 +131,83 @@ def test_start_requires_exact_asset_warning_and_persists_before_coin_prep(
     assert active["campaign_id"] == payload["campaign_id"]
 
 
+def _start_campaign(client):
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    return client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+
+
+def test_participation_export_uses_only_append_only_campaign_samples(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    campaign_id = _start_campaign(client)
+    database.record_bootstrap_participation(
+        {
+            "campaign_id": campaign_id,
+            "report_id": "21" * 32,
+            "recorded_at": datetime(2026, 9, 12, 12, 5, tzinfo=timezone.utc),
+            "data": {
+                "kind": "quality_sample",
+                "duration_seconds": 300,
+                "independent_depth_xch": "2",
+                "spread_bps": "150",
+                "within_corridor": True,
+                "own": False,
+                "linked": False,
+                "offer_ids": ["01" * 32],
+                "fill_ids": ["11" * 32],
+                "wallet_fingerprint": 736588221,
+                "balances": {"xch": "99"},
+                "trade_volume_xch": "1000000",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_utcnow",
+        lambda: datetime(2026, 9, 12, 13, 0, tzinfo=timezone.utc),
+    )
+
+    response = client.post(
+        "/api/bootstrap/participation/export",
+        json={"campaign_id": campaign_id},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["success"] is True
+    assert payload["report"]["eligible_observation_ids"] == ["21" * 32]
+    assert payload["report"]["eligible_offer_ids"] == ["01" * 32]
+    assert payload["report"]["eligible_fill_ids"] == ["11" * 32]
+    serialized = __import__("json").dumps(payload).lower()
+    assert "fingerprint" not in serialized
+    assert "balance" not in serialized
+    assert "volume" not in serialized
+    assert payload["financial_authority"] is False
+
+
+def test_participation_export_rejects_campaign_from_another_wallet(
+    isolated_db, bootstrap_api
+):
+    _bootstrap, client, identity = bootstrap_api
+    campaign_id = _start_campaign(client)
+    identity["wallet_fingerprint"] = 123456789
+
+    response = client.post(
+        "/api/bootstrap/participation/export",
+        json={"campaign_id": campaign_id},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "bootstrap_identity_mismatch"
+
+
 def test_start_rejects_identity_or_asset_changed_after_preview(
     isolated_db, bootstrap_api
 ):

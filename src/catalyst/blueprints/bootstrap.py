@@ -27,6 +27,7 @@ from bootstrap_campaign import (
     evaluate_bootstrap_campaign,
 )
 from bootstrap_manifest import MANIFEST_SCHEMA, ManifestError, safe_import_manifest
+from bootstrap_proof import build_participation_report, participation_report_id
 from config import cfg
 import database
 from offer_book_policy import derive_bootstrap_plan
@@ -623,6 +624,92 @@ def api_bootstrap_manifest_import():
         return _error(exc)
 
 
+def _participation_observations(
+    campaign_id: str,
+    campaign: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Project append-only local samples without copying private fields."""
+
+    created_at = datetime.fromisoformat(campaign["created_at"][:-1] + "+00:00")
+    expires_at = datetime.fromisoformat(campaign["expires_at"][:-1] + "+00:00")
+    if now <= created_at:
+        raise BootstrapApiError("bootstrap_participation_period_empty", 409)
+    if now >= expires_at:
+        raise BootstrapApiError("bootstrap_campaign_expired", 409)
+    samples: list[dict[str, Any]] = []
+    for stored in database.list_bootstrap_participation(campaign_id):
+        data = stored.get("data")
+        if type(data) is not dict or data.get("kind") != "quality_sample":
+            continue
+        # This allow-list is the privacy boundary.  Do not merge ``data`` or
+        # the surrounding database record into the export.
+        samples.append(
+            {
+                "observation_id": stored["report_id"],
+                "observed_at": stored["recorded_at"],
+                "duration_seconds": data.get("duration_seconds"),
+                "independent_depth_xch": data.get("independent_depth_xch"),
+                "spread_bps": data.get("spread_bps"),
+                "within_corridor": data.get("within_corridor"),
+                "own": data.get("own"),
+                "linked": data.get("linked"),
+                "offer_ids": data.get("offer_ids"),
+                "fill_ids": data.get("fill_ids"),
+            }
+        )
+    return {
+        "network": campaign["network"],
+        "asset_id": campaign["asset_id"],
+        "period_start": campaign["created_at"],
+        "period_end": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "expires_at": campaign["expires_at"],
+        "samples": samples,
+    }
+
+
+@bp.post("/api/bootstrap/participation/export")
+def api_bootstrap_participation_export():
+    try:
+        body = _request_body()
+        if set(body) != {"campaign_id"}:
+            raise BootstrapApiError("invalid_participation_export_request")
+        campaign_id = str(body.get("campaign_id") or "").strip().lower()
+        if _ASSET_ID_RE.fullmatch(campaign_id) is None:
+            raise BootstrapApiError("invalid_campaign_id")
+        campaign = database.get_bootstrap_campaign(campaign_id)
+        if campaign is None:
+            raise BootstrapApiError("bootstrap_campaign_not_found", 404)
+        identity = _read_bootstrap_identity()
+        if any(
+            (
+                campaign["network"] != identity["network"],
+                campaign["wallet_fingerprint"] != identity["wallet_fingerprint"],
+                campaign["wallet_id"] != identity["wallet_id"],
+                campaign["asset_id"] != identity["asset_id"],
+            )
+        ):
+            raise BootstrapApiError("bootstrap_identity_mismatch", 409)
+        report = build_participation_report(
+            campaign_id,
+            _participation_observations(campaign_id, campaign, _utcnow()),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "report": report,
+                "report_id": participation_report_id(report),
+                "financial_authority": False,
+                "reward_amount": None,
+                "walletconnect_signing_available": bool(
+                    str(getattr(cfg, "WALLETCONNECT_PROJECT_ID", "") or "").strip()
+                ),
+            }
+        )
+    except Exception as exc:
+        return _error(exc)
+
+
 @bp.get("/api/bootstrap/capabilities/partial-offers")
 @bp.get("/api/bootstrap/partial-capability")
 def api_bootstrap_partial_offer_capability():
@@ -641,6 +728,7 @@ __all__ = [
     "api_bootstrap_manifest_export",
     "api_bootstrap_manifest_import",
     "api_bootstrap_partial_offer_capability",
+    "api_bootstrap_participation_export",
     "api_bootstrap_preview",
     "api_bootstrap_renew",
     "api_bootstrap_start",

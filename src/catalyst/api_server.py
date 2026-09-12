@@ -277,8 +277,11 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
     "api_bootstrap_manifest_sign_begin",
     "api_bootstrap_manifest_sign_complete",
     "api_bootstrap_manifest_sign_fail",
+    "api_bootstrap_participation_sign_begin",
+    "api_bootstrap_participation_sign_complete",
     "bootstrap.api_bootstrap_manifest_export",
     "bootstrap.api_bootstrap_manifest_import",
+    "bootstrap.api_bootstrap_participation_export",
     "bootstrap.api_bootstrap_preview",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
@@ -5154,6 +5157,48 @@ def api_bootstrap_manifest_sign_fail():
     return jsonify({"success": True})
 
 
+@app.route("/api/bootstrap/participation/sign/begin", methods=["POST"])
+def api_bootstrap_participation_sign_begin():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"report"}:
+            raise SigningError("invalid_signing_begin_request")
+        identity = _read_walletconnect_identity()
+        signing_request = (
+            _get_walletconnect_signing_service().begin_participation_signature(
+                body["report"], identity
+            )
+        )
+        return jsonify(
+            {"success": True, "signing_request": signing_request.to_public_dict()}
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/participation/sign/complete", methods=["POST"])
+def api_bootstrap_participation_sign_complete():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "response"}:
+            raise SigningError("invalid_signing_complete_request")
+        if type(body["request_id"]) is not str or type(body["response"]) is not dict:
+            raise SigningError("invalid_signing_complete_request")
+        identity = _read_walletconnect_identity()
+        signed_report = (
+            _get_walletconnect_signing_service().complete_participation_signature(
+                body["request_id"], body["response"], identity
+            )
+        )
+        return jsonify({"success": True, "signed_report": signed_report})
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
 # ---------------------------------------------------------------------------
 # Version check against the signed public update manifest
 # ---------------------------------------------------------------------------
@@ -6286,6 +6331,7 @@ from blueprints.bootstrap import (
     api_bootstrap_manifest_export,
     api_bootstrap_manifest_import,
     api_bootstrap_partial_offer_capability,
+    api_bootstrap_participation_export,
     api_bootstrap_preview,
     api_bootstrap_renew,
     api_bootstrap_start,

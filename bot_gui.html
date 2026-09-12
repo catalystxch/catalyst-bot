@@ -10726,6 +10726,7 @@
                                 <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapManifestExportBtn" onclick="bootstrapExportManifest()" disabled>Export / Sign Manifest</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapParticipationExportBtn" onclick="exportBootstrapParticipationProof()" disabled>Export / Sign Participation Proof</button>
                                 <button type="button" class="btn btn-config btn-secondary" onclick="document.getElementById('bootstrapManifestImportInput').click()">Import Signed Manifest</button>
                                 <input id="bootstrapManifestImportInput" type="file" accept="application/json,.json" style="display:none;" onchange="bootstrapImportManifest(event)">
                             </div>
@@ -12375,8 +12376,8 @@
                     <div class="v4-modal-icon">&#x270D;</div>
                     <div>
                         <div class="v4-modal-kicker">Sage WalletConnect</div>
-                        <h2 class="v4-modal-title">Sign Bootstrap manifest</h2>
-                        <p class="v4-modal-copy">Approve one public, non-financial message in Sage. This connection cannot create offers, sign coin spends, send funds, or cancel offers.</p>
+                        <h2 class="v4-modal-title" id="bootstrapSigningTitle">Sign Bootstrap document</h2>
+                        <p class="v4-modal-copy" id="bootstrapSigningCopy">Approve one public, non-financial message in Sage. This connection cannot create offers, sign coin spends, send funds, or cancel offers.</p>
                     </div>
                 </div>
                 <div class="v4-modal-panel" style="text-align: left;">
@@ -15230,6 +15231,7 @@
             if (m === 'POST' && clean === 'bootstrap/renew') return 'renew_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/manifest/export') return 'export_bootstrap_manifest';
             if (m === 'POST' && clean === 'bootstrap/manifest/import') return 'import_bootstrap_manifest';
+            if (m === 'POST' && clean === 'bootstrap/participation/export') return 'export_bootstrap_participation';
             if (m === 'GET'  && (clean === 'bootstrap/partial-capability' || clean === 'bootstrap/capabilities/partial-offers')) return 'get_bootstrap_partial_offer_capability';
 
             // --- Dashboard / Stats ---
@@ -38533,6 +38535,8 @@ function _bootstrapRenderStatus(payload) {
     }
     if (stop) stop.disabled = !_bootstrapActiveCampaign;
     if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
+    const proofExporter = document.getElementById('bootstrapParticipationExportBtn');
+    if (proofExporter) proofExporter.disabled = !_bootstrapActiveCampaign;
 }
 
 async function bootstrapRefreshStatus() {
@@ -38686,6 +38690,30 @@ async function bootstrapExportManifest() {
     }
 }
 
+async function exportBootstrapParticipationProof() {
+    const campaign = _bootstrapActiveCampaign;
+    if (!campaign) return;
+    try {
+        const response = await apiFetch('/api/bootstrap/participation/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ campaign_id: campaign.campaign_id })
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Participation proof export failed');
+        let documentValue = { report: payload.report, signature: null };
+        let suffix = 'unsigned';
+        if (payload.walletconnect_signing_available) {
+            documentValue = await signBootstrapParticipationReport(payload.report);
+            suffix = 'signed';
+        }
+        _bootstrapDownloadJson(documentValue, `catalyst-bootstrap-participation-${payload.report_id}-${suffix}.json`);
+        showToast(`Participation proof exported (${suffix}); no reward amount is promised`, 'success', 7000);
+    } catch (error) {
+        showToast(error?.message || 'Participation proof export failed', 'error');
+    }
+}
+
 async function bootstrapImportManifest(event) {
     const input = event?.target;
     const file = input?.files?.[0];
@@ -38736,13 +38764,20 @@ function _showBootstrapSigningError(message) {
     el.style.display = 'block';
 }
 
-async function signBootstrapManifest(manifest) {
+async function _signBootstrapDocument(documentValue, kind) {
     const modal = document.getElementById('bootstrapSigningModal');
     const pairing = document.getElementById('bootstrapSigningPairing');
     const error = document.getElementById('bootstrapSigningError');
     if (pairing) pairing.style.display = 'none';
     if (error) error.style.display = 'none';
     if (modal) modal.style.display = 'flex';
+    const isParticipation = kind === 'participation';
+    const signingTitle = document.getElementById('bootstrapSigningTitle');
+    const signingCopy = document.getElementById('bootstrapSigningCopy');
+    if (signingTitle) signingTitle.textContent = isParticipation ? 'Sign participation proof' : 'Sign Bootstrap manifest';
+    if (signingCopy) signingCopy.textContent = isParticipation
+        ? 'Approve one privacy-bounded quality report in Sage. It contains no fingerprint, balances, volume, reward amount, or financial authority.'
+        : 'Approve one public, non-financial manifest in Sage. This connection cannot create offers, sign coin spends, send funds, or cancel offers.';
     _setBootstrapSigningState('initializing');
 
     try {
@@ -38750,10 +38785,12 @@ async function signBootstrapManifest(manifest) {
         const configResponse = await apiFetch('/api/bootstrap/walletconnect/config', { cache: 'no-store' });
         const config = await configResponse.json();
         if (!config.success || !config.enabled) throw new Error('walletconnect_project_id_missing');
-        const beginResponse = await apiFetch('/api/bootstrap/manifest/sign/begin', {
+        const beginPath = isParticipation ? '/api/bootstrap/participation/sign/begin' : '/api/bootstrap/manifest/sign/begin';
+        const completePath = isParticipation ? '/api/bootstrap/participation/sign/complete' : '/api/bootstrap/manifest/sign/complete';
+        const beginResponse = await apiFetch(beginPath, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ manifest })
+            body: JSON.stringify(isParticipation ? { report: documentValue } : { manifest: documentValue })
         });
         const begun = await beginResponse.json();
         if (!begun.success) throw new Error(begun.code || begun.error || 'signing_begin_failed');
@@ -38772,7 +38809,7 @@ async function signBootstrapManifest(manifest) {
             },
             onState: _setBootstrapSigningState
         });
-        const completeResponse = await apiFetch('/api/bootstrap/manifest/sign/complete', {
+        const completeResponse = await apiFetch(completePath, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ request_id: request.request_id, response: walletResponse })
@@ -38782,7 +38819,7 @@ async function signBootstrapManifest(manifest) {
         _bootstrapSigningRequestId = null;
         _setBootstrapSigningState('approved', 'Verified Sage signature');
         setTimeout(() => { if (modal) modal.style.display = 'none'; }, 500);
-        return completed.signed_manifest;
+        return isParticipation ? completed.signed_report : completed.signed_manifest;
     } catch (err) {
         _showBootstrapSigningError(err && err.message ? err.message : err);
         if (_bootstrapSigningRequestId) {
@@ -38796,6 +38833,14 @@ async function signBootstrapManifest(manifest) {
         }
         throw err;
     }
+}
+
+async function signBootstrapManifest(manifest) {
+    return _signBootstrapDocument(manifest, 'manifest');
+}
+
+async function signBootstrapParticipationReport(report) {
+    return _signBootstrapDocument(report, 'participation');
 }
 
 async function cancelBootstrapManifestSigning() {

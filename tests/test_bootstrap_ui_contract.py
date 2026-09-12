@@ -20,6 +20,7 @@ def test_bootstrap_wizard_exposes_reviewed_campaign_controls():
         "bootstrapStopBtn",
         "bootstrapManifestExportBtn",
         "bootstrapManifestImportInput",
+        "bootstrapParticipationExportBtn",
         "bootstrapPartialOffers",
         "bootstrapStatusPanel",
         "bootstrapDashboardStatus",
@@ -35,10 +36,14 @@ def test_bootstrap_ui_calls_every_campaign_route_and_walletconnect_signing():
         "/api/bootstrap/stop",
         "/api/bootstrap/manifest/export",
         "/api/bootstrap/manifest/import",
+        "/api/bootstrap/participation/export",
+        "/api/bootstrap/participation/sign/begin",
+        "/api/bootstrap/participation/sign/complete",
         "/api/bootstrap/partial-capability",
     ):
         assert route in GUI
     assert "signBootstrapManifest" in GUI
+    assert "exportBootstrapParticipationProof" in GUI
 
 
 def test_partial_offers_are_visibly_disabled_with_stable_reason():

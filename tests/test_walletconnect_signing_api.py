@@ -19,6 +19,8 @@ def test_signing_routes_do_not_acquire_financial_mutation_authority():
         "api_bootstrap_manifest_sign_begin",
         "api_bootstrap_manifest_sign_complete",
         "api_bootstrap_manifest_sign_fail",
+        "api_bootstrap_participation_sign_begin",
+        "api_bootstrap_participation_sign_complete",
     ):
         assert api_server._write_endpoint_requires_mutation(endpoint) is False
 
@@ -134,4 +136,59 @@ def test_complete_route_rechecks_identity_through_service(monkeypatch):
     assert response.get_json() == {
         "success": True,
         "signed_manifest": {"manifest": {}, "signature": {}},
+    }
+
+
+def test_participation_signing_routes_share_the_nonfinancial_service(monkeypatch):
+    signing_request = SimpleNamespace(
+        to_public_dict=lambda: {
+            "request_id": "proof-request-1",
+            "purpose": "bootstrap_participation",
+            "method": "chia_signMessageByAddress",
+        }
+    )
+
+    class Service:
+        def begin_participation_signature(self, report, identity):
+            assert report == {"schema": "proof"}
+            assert identity == IDENTITY
+            return signing_request
+
+        def complete_participation_signature(self, request_id, response, identity):
+            assert request_id == "proof-request-1"
+            assert response == {"publicKey": "pk", "signature": "sig"}
+            assert identity == IDENTITY
+            return {"report": {"schema": "proof"}, "signature": {}}
+
+    monkeypatch.setattr(api_server, "_get_walletconnect_signing_service", Service)
+    monkeypatch.setattr(api_server, "_read_walletconnect_identity", lambda: IDENTITY)
+
+    with api_server.app.test_request_context(
+        "/api/bootstrap/participation/sign/begin",
+        method="POST",
+        json={"report": {"schema": "proof"}},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        begin = api_server.api_bootstrap_participation_sign_begin()
+
+    assert begin.get_json()["signing_request"] == {
+        "request_id": "proof-request-1",
+        "purpose": "bootstrap_participation",
+        "method": "chia_signMessageByAddress",
+    }
+
+    with api_server.app.test_request_context(
+        "/api/bootstrap/participation/sign/complete",
+        method="POST",
+        json={
+            "request_id": "proof-request-1",
+            "response": {"publicKey": "pk", "signature": "sig"},
+        },
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        complete = api_server.api_bootstrap_participation_sign_complete()
+
+    assert complete.get_json() == {
+        "success": True,
+        "signed_report": {"report": {"schema": "proof"}, "signature": {}},
     }
