@@ -40,7 +40,7 @@
 - Consumes: timezone-aware UTC `datetime`, exact `Decimal` prices and amounts, integer confirmed-fill counters.
 - Produces: `BootstrapCampaign`, `BootstrapEvidence`, `BootstrapDecision`, `CampaignMode`, `CampaignStage`, `CampaignSide`, `CampaignStopReason`, `derive_anchor_from_valuation()`, and `evaluate_bootstrap_campaign()`.
 
-- [ ] **Step 1: Write the failing validation and default-corridor tests**
+- [x] **Step 1: Write the failing validation and default-corridor tests**
 
 ```python
 def test_campaign_isolated_budgets_and_default_corridor():
@@ -55,13 +55,13 @@ def test_invalid_campaign_cannot_reach_outside_budget():
         make_campaign(xch_budget=Decimal("-1"))
 ```
 
-- [ ] **Step 2: Run the focused tests and observe the missing-module failure**
+- [x] **Step 2: Run the focused tests and observe the missing-module failure**
 
 Run: `python -m pytest tests/test_bootstrap_campaign_policy.py -q`
 
 Expected: collection fails because `bootstrap_campaign` does not exist.
 
-- [ ] **Step 3: Implement exact immutable types and validation**
+- [x] **Step 3: Implement exact immutable types and validation**
 
 ```python
 class CampaignStage(str, Enum):
@@ -88,7 +88,7 @@ class BootstrapDecision:
 
 Reject a non-64-hex asset ID, non-mainnet/testnet network string, missing wallet binding, nonpositive anchor/corridor, corridor excluding the anchor, negative budget, absent funded side, subsidy above its explicit budget, naive timestamps, expiry beyond seven days, and any `float` monetary input.
 
-- [ ] **Step 4: Add and pass exact anchor-valuation tests**
+- [x] **Step 4: Add and pass exact anchor-valuation tests**
 
 ```python
 def test_anchor_from_supply_and_xch_valuation_is_exact():
@@ -102,7 +102,7 @@ Run: `python -m pytest tests/test_bootstrap_campaign_policy.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the pure policy foundation**
+- [x] **Step 5: Commit the pure policy foundation**
 
 ```powershell
 git add src/catalyst/bootstrap_campaign.py tests/test_bootstrap_campaign_policy.py
