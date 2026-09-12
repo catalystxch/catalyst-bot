@@ -833,6 +833,7 @@ def test_authoritative_campaign_fills_and_current_independent_depth_drive_stage(
         {
             "trade_id": "01" * 32,
             "side": "buy",
+            "price_xch": "0.0011",
             "filled_at": "2026-09-12T11:50:00.000000Z",
             "verification_status": "verified_authoritative",
             "spent_block_height": 7000000,
@@ -842,6 +843,7 @@ def test_authoritative_campaign_fills_and_current_independent_depth_drive_stage(
         {
             "trade_id": "02" * 32,
             "side": "sell",
+            "price_xch": "0.00105",
             "filled_at": "2026-09-12T11:51:00.000000Z",
             "verification_status": "verified_authoritative",
             "spent_block_height": 7000001,
@@ -886,6 +888,9 @@ def test_authoritative_campaign_fills_and_current_independent_depth_drive_stage(
     )
     assert evidence.stable_since == NOW
     assert evidence.proposed_anchor_price == Decimal("0.00102")
+    assert evidence.adverse_fill_times == (
+        (CampaignSide.BUY, NOW - timedelta(minutes=10)),
+    )
     assert decision.stage is CampaignStage.DISCOVERY_25
 
     state_update = plan_bootstrap_state_update(

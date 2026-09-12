@@ -164,6 +164,7 @@ def derive_bootstrap_authoritative_evidence(
     )
     rows = []
     suspected_linked = False
+    trusted_midpoint = getattr(market_confidence, "trusted_midpoint", None)
     for fill in authoritative_fills:
         if type(fill) is not dict or fill.get("trade_id") not in campaign_trade_ids:
             continue
@@ -172,6 +173,21 @@ def derive_bootstrap_authoritative_evidence(
         )
         if cluster in excluded_clusters:
             suspected_linked = True
+        adverse = False
+        if (
+            type(trusted_midpoint) is Decimal
+            and trusted_midpoint.is_finite()
+            and trusted_midpoint > 0
+        ):
+            try:
+                fill_price = Decimal(str(fill.get("price_xch")))
+            except Exception:
+                fill_price = Decimal("0")
+            if fill_price.is_finite() and fill_price > 0:
+                adverse = bool(
+                    (fill.get("side") == "buy" and fill_price > trusted_midpoint)
+                    or (fill.get("side") == "sell" and fill_price < trusted_midpoint)
+                )
         rows.append(
             {
                 "campaign_id": campaign_id,
@@ -184,7 +200,7 @@ def derive_bootstrap_authoritative_evidence(
                 "spent_block_height": fill.get("spent_block_height"),
                 "receive_coin_id": fill.get("receive_coin_id"),
                 "independent_depth": False,
-                "adverse": False,
+                "adverse": adverse,
             }
         )
     settlement = derive_bootstrap_settlement_evidence(
@@ -216,7 +232,6 @@ def derive_bootstrap_authoritative_evidence(
     if required_depth_present:
         stable_since = previous.stable_since or now
 
-    trusted_midpoint = getattr(market_confidence, "trusted_midpoint", None)
     proposed_anchor = None
     if (
         include_anchor_proposal
