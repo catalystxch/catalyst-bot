@@ -684,6 +684,91 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     assert queued_splash == queued_dexie
 
 
+def test_live_bot_finalizes_automatic_bootstrap_stop_after_offer_clearance(monkeypatch):
+    import bot_loop
+    import tx_fees
+    import wallet
+
+    campaign = {
+        "campaign_id": "31" * 32,
+        "revision": 4,
+    }
+    stopped = []
+    events = []
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_balance",
+        lambda wallet_id: {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": 1_000_000_000_000
+                if wallet_id == 1
+                else 1_000,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        tx_fees, "get_effective_transaction_fee_mojos", lambda: 10_000_000
+    )
+    monkeypatch.setattr(bot_loop.database, "get_offer_intents_for_registry", lambda: [])
+    monkeypatch.setattr(
+        bot_loop.database,
+        "stop_bootstrap_campaign",
+        lambda campaign_id, reason, stopped_at: (
+            stopped.append((campaign_id, reason, stopped_at)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        bot_loop.database,
+        "append_bootstrap_campaign_event",
+        lambda record: events.append(record) or "event-id",
+    )
+
+    loop = object.__new__(BotLoop)
+    loop._publication_discovery_pending = 0
+    loop._market_confidence_result = None
+    loop.coin_manager = SimpleNamespace(is_busy=lambda: False)
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda *_args, **_kwargs: pytest.fail(
+            "no cancellation call is needed after authoritative offer clearance"
+        )
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": campaign,
+        "identity": {},
+    }
+    loop._refresh_bootstrap_campaign_evidence = lambda **_kwargs: {
+        "campaign": campaign,
+        "runtime": {
+            "transition": {
+                "cancel_required": True,
+                "cancel_reason": "bootstrap_expired",
+            },
+            "decision": SimpleNamespace(
+                stop_reason=CampaignStopReason.EXPIRED,
+            ),
+        },
+        "changed": False,
+    }
+
+    result = loop._route_bootstrap_creation_if_active(
+        current_buy_ids=set(), current_sell_ids=set()
+    )
+
+    assert result == {"buy": set(), "sell": set()}
+    assert [(campaign_id, reason) for campaign_id, reason, _at in stopped] == [
+        ("31" * 32, "expired")
+    ]
+    assert events[0]["event_type"] == "campaign_stopped"
+    assert events[0]["data"] == {
+        "reason": "expired",
+        "cancel_targets": [],
+        "automatic": True,
+    }
+
+
 def test_stages_inventory_anchor_cooldown_and_stops_remain_bounded(bootstrap_app):
     _bootstrap, client, _identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()

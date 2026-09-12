@@ -12514,6 +12514,39 @@ class BotLoop:
                     reason=runtime["transition"]["cancel_reason"],
                     force_storm=True,
                 )
+            else:
+                stop_reason = getattr(runtime.get("decision"), "stop_reason", None)
+                stop_reason_value = getattr(stop_reason, "value", None)
+                if type(stop_reason_value) is str and stop_reason_value:
+                    stopped = database.stop_bootstrap_campaign(
+                        campaign["campaign_id"], stop_reason_value, now
+                    )
+                    if stopped:
+                        occurred_at = now.astimezone(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%S.%fZ"
+                        )
+                        database.append_bootstrap_campaign_event(
+                            {
+                                "campaign_id": campaign["campaign_id"],
+                                "event_type": "campaign_stopped",
+                                "occurred_at": occurred_at,
+                                "data": {
+                                    "reason": stop_reason_value,
+                                    "cancel_targets": [],
+                                    "automatic": True,
+                                },
+                            }
+                        )
+                        log_event(
+                            "warning",
+                            "bootstrap_campaign_stopped_automatically",
+                            "Market Bootstrap stopped after authoritative offer "
+                            f"clearance: {stop_reason_value}",
+                            data={
+                                "campaign_id": campaign["campaign_id"],
+                                "reason": stop_reason_value,
+                            },
+                        )
             return empty
         if runtime["plan"].get("authorized") is not True:
             log_event(
