@@ -13,6 +13,7 @@ from bootstrap_campaign import (
     CampaignSide,
     evaluate_bootstrap_campaign,
 )
+from fill_tracker import derive_bootstrap_settlement_evidence
 import mutation_gate
 from offer_book_policy import derive_bootstrap_plan
 
@@ -119,6 +120,193 @@ def evidence_from_record(record: dict[str, Any]) -> BootstrapEvidence:
         raise ValueError("Bootstrap evidence record is invalid") from exc
 
 
+def derive_bootstrap_authoritative_evidence(
+    *,
+    campaign_record: dict[str, Any],
+    authoritative_fills: list[dict[str, Any]],
+    intents: list[dict[str, Any]],
+    market_confidence: Any,
+    now: datetime,
+    own_participant_clusters: frozenset[str],
+    linked_participant_clusters: frozenset[str],
+    include_anchor_proposal: bool = False,
+) -> BootstrapEvidence:
+    """Combine durable Sage fill proof with current attributable public depth."""
+
+    campaign = campaign_from_record(campaign_record)
+    if type(authoritative_fills) is not list or type(intents) is not list:
+        raise TypeError("Bootstrap fill authority inputs must be lists")
+    if (
+        type(own_participant_clusters) is not frozenset
+        or type(linked_participant_clusters) is not frozenset
+    ):
+        raise TypeError("Bootstrap participant exclusions must be frozen sets")
+    if type(now) is not datetime or now.tzinfo is None:
+        raise ValueError("Bootstrap evidence time is invalid")
+    if type(include_anchor_proposal) is not bool:
+        raise TypeError("Bootstrap anchor-proposal choice must be an exact boolean")
+    now = now.astimezone(timezone.utc)
+
+    campaign_id = str(campaign_record.get("campaign_id") or "")
+    purpose_prefix = f"bootstrap:{campaign_id}:revision:"
+    campaign_trade_ids = {
+        str(intent.get("sage_trade_id") or "")
+        for intent in intents
+        if type(intent) is dict
+        and intent.get("asset_id") == campaign.asset_id
+        and str(intent.get("purpose") or "").startswith(purpose_prefix)
+        and intent.get("sage_trade_id")
+    }
+    excluded_clusters = frozenset(
+        str(cluster).strip().lower().removeprefix("0x")
+        for cluster in own_participant_clusters | linked_participant_clusters
+        if str(cluster).strip()
+    )
+    rows = []
+    suspected_linked = False
+    for fill in authoritative_fills:
+        if type(fill) is not dict or fill.get("trade_id") not in campaign_trade_ids:
+            continue
+        cluster = (
+            str(fill.get("taker_puzzle_hash") or "").strip().lower().removeprefix("0x")
+        )
+        if cluster in excluded_clusters:
+            suspected_linked = True
+        rows.append(
+            {
+                "campaign_id": campaign_id,
+                "trade_id": fill.get("trade_id"),
+                "settlement_identity": fill.get("receive_coin_id"),
+                "participant_cluster": cluster,
+                "side": fill.get("side"),
+                "filled_at": fill.get("filled_at"),
+                "verification_status": fill.get("verification_status"),
+                "spent_block_height": fill.get("spent_block_height"),
+                "receive_coin_id": fill.get("receive_coin_id"),
+                "independent_depth": False,
+                "adverse": False,
+            }
+        )
+    settlement = derive_bootstrap_settlement_evidence(
+        rows,
+        campaign_id=campaign_id,
+        own_trade_ids=frozenset(),
+        linked_cluster_ids=excluded_clusters,
+    )
+
+    depth_sides: set[CampaignSide] = set()
+    data_valid = getattr(market_confidence, "data_valid", False) is True
+    required = getattr(market_confidence, "required_depth_mojos", None)
+    bid_depth = getattr(market_confidence, "independent_bid_depth_mojos", None)
+    ask_depth = getattr(market_confidence, "independent_ask_depth_mojos", None)
+    if (
+        data_valid
+        and type(required) is int
+        and type(bid_depth) is int
+        and type(ask_depth) is int
+        and required >= 0
+    ):
+        if bid_depth > 0 and bid_depth >= required:
+            depth_sides.add(CampaignSide.BUY)
+        if ask_depth > 0 and ask_depth >= required:
+            depth_sides.add(CampaignSide.SELL)
+    required_depth_present = campaign.allowed_sides.issubset(depth_sides)
+    previous = evidence_from_record(campaign_record)
+    stable_since = None
+    if required_depth_present:
+        stable_since = previous.stable_since or now
+
+    trusted_midpoint = getattr(market_confidence, "trusted_midpoint", None)
+    proposed_anchor = None
+    if (
+        include_anchor_proposal
+        and settlement.confirmed_fills > 0
+        and type(trusted_midpoint) is Decimal
+    ):
+        if trusted_midpoint.is_finite() and trusted_midpoint > 0:
+            proposed_anchor = trusted_midpoint
+
+    return BootstrapEvidence(
+        confirmed_fills=settlement.confirmed_fills,
+        settlement_clusters=settlement.settlement_clusters,
+        independent_depth_sides=frozenset(depth_sides),
+        stable_since=stable_since,
+        suspected_linked_activity=suspected_linked,
+        adverse_fill_times=settlement.adverse_fill_times,
+        fee_spent_xch=previous.fee_spent_xch,
+        realized_loss_xch=previous.realized_loss_xch,
+        marked_inventory_loss_xch=previous.marked_inventory_loss_xch,
+        current_anchor_price=previous.current_anchor_price,
+        proposed_anchor_price=proposed_anchor,
+    )
+
+
+def _utc_text(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _decimal_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def plan_bootstrap_state_update(
+    *,
+    campaign_record: dict[str, Any],
+    evidence: BootstrapEvidence,
+    decision: BootstrapDecision,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Materialize only plan-changing or stability-changing evidence."""
+
+    if (
+        type(evidence) is not BootstrapEvidence
+        or type(decision) is not BootstrapDecision
+    ):
+        raise TypeError("Bootstrap evidence and decision are required")
+    if type(now) is not datetime or now.tzinfo is None:
+        raise ValueError("Bootstrap state update time is invalid")
+    now = now.astimezone(timezone.utc)
+    desired_stage = decision.stage.value
+    desired_fraction = _decimal_text(decision.deployment_fraction)
+    desired_stable_since = _utc_text(evidence.stable_since)
+    material_change = any(
+        (
+            campaign_record.get("stage") != desired_stage,
+            str(campaign_record.get("deployment_fraction")) != desired_fraction,
+            campaign_record.get("stable_since") != desired_stable_since,
+            bool(campaign_record.get("suspected_linked_activity"))
+            != evidence.suspected_linked_activity,
+        )
+    )
+    if not material_change:
+        return None
+    return {
+        "stage": desired_stage,
+        "deployment_fraction": desired_fraction,
+        "current_anchor_price": _decimal_text(decision.anchor_price),
+        "stable_since": desired_stable_since,
+        "confirmed_fills": evidence.confirmed_fills,
+        "settlement_clusters": evidence.settlement_clusters,
+        "independent_depth_sides": sorted(
+            side.value for side in evidence.independent_depth_sides
+        ),
+        "suspected_linked_activity": evidence.suspected_linked_activity,
+        "adverse_fill_times": [
+            {"side": side.value, "occurred_at": _utc_text(occurred_at)}
+            for side, occurred_at in evidence.adverse_fill_times
+        ],
+        "fee_spent_xch": _decimal_text(evidence.fee_spent_xch),
+        "realized_loss_xch": _decimal_text(evidence.realized_loss_xch),
+        "marked_inventory_loss_xch": _decimal_text(evidence.marked_inventory_loss_xch),
+        "updated_at": _utc_text(now),
+    }
+
+
 def plan_bootstrap_runtime_transition(
     *,
     campaign_record: dict,
@@ -175,6 +363,7 @@ def derive_bootstrap_runtime(
     balances: dict[str, Any],
     now: datetime,
     unresolved_cancellation_count: int = 0,
+    evidence: BootstrapEvidence | None = None,
 ) -> dict[str, Any]:
     """Derive one exact, identity-bound live campaign decision and plan."""
 
@@ -188,7 +377,10 @@ def derive_bootstrap_runtime(
         raise ValueError("Bootstrap runtime time is invalid")
     now = now.astimezone(timezone.utc)
     campaign = campaign_from_record(campaign_record)
-    evidence = evidence_from_record(campaign_record)
+    if evidence is None:
+        evidence = evidence_from_record(campaign_record)
+    elif type(evidence) is not BootstrapEvidence:
+        raise TypeError("Bootstrap runtime evidence is invalid")
     decision = evaluate_bootstrap_campaign(campaign, evidence, now=now)
     transition = plan_bootstrap_runtime_transition(
         campaign_record=campaign_record,
@@ -251,3 +443,35 @@ def active_bootstrap_levels(
         if side in _SIDES and level in _LEVELS:
             active.add((side, level))
     return frozenset(active)
+
+
+def superseded_bootstrap_trade_ids(
+    intents: list[dict[str, Any]],
+    *,
+    campaign_id: str,
+    revision: int,
+    live_trade_ids: set[str] | frozenset[str],
+) -> tuple[str, ...]:
+    """Return live Sage offers owned by an older campaign revision."""
+
+    if type(intents) is not list:
+        raise TypeError("Bootstrap intents must be a list")
+    if type(campaign_id) is not str or not campaign_id.strip():
+        raise ValueError("Bootstrap campaign id is invalid")
+    if type(revision) is not int or revision < 0:
+        raise ValueError("Bootstrap revision is invalid")
+    if type(live_trade_ids) not in {set, frozenset}:
+        raise TypeError("Bootstrap live trade ids must be a set")
+    campaign_id = campaign_id.strip()
+    prefix = f"bootstrap:{campaign_id}:revision:"
+    current_purpose = f"{prefix}{revision}"
+    live = {str(trade_id).strip() for trade_id in live_trade_ids if trade_id}
+    superseded = {
+        str(intent.get("sage_trade_id") or "").strip()
+        for intent in intents
+        if type(intent) is dict
+        and str(intent.get("purpose") or "").startswith(prefix)
+        and str(intent.get("purpose") or "") != current_purpose
+        and str(intent.get("sage_trade_id") or "").strip() in live
+    }
+    return tuple(sorted(trade_id for trade_id in superseded if trade_id))

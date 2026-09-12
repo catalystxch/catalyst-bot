@@ -117,6 +117,14 @@ if WALLET_TYPE == "chia":
         """Chia backend stub — message signing for Dexie claims is Sage-only."""
         return {"success": False, "error": "claim_unsupported_on_chia_backend"}
 
+    def get_wallet_puzzle_hashes(
+        force: bool = False, max_derivations: int = 5000
+    ) -> set:
+        """Chia backend cannot prove the complete local address set here."""
+
+        del force, max_derivations
+        return set()
+
     def notify_cat_asset_id_changed(asset_id: str) -> None:
         """Chia backend compatibility stub for Sage active CAT cache updates."""
         return None
@@ -215,6 +223,7 @@ else:
         notify_cat_asset_id_changed,
         is_initialized,
         get_wallet_identity,
+        get_wallet_puzzle_hashes,
     )
 
 

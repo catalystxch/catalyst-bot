@@ -90,8 +90,11 @@ from amount_utils import (
 from wallet import get_all_offers, get_chia_health
 from bootstrap_runtime import (
     active_bootstrap_levels,
+    derive_bootstrap_authoritative_evidence,
     derive_bootstrap_runtime,
+    plan_bootstrap_state_update,
     plan_bootstrap_runtime_transition,
+    superseded_bootstrap_trade_ids,
 )
 
 try:
@@ -12222,6 +12225,141 @@ class BotLoop:
 
         return bool(self._bootstrap_campaign_context().get("active"))
 
+    def _refresh_bootstrap_campaign_evidence(
+        self,
+        *,
+        campaign: dict,
+        intents: list,
+        identity: dict,
+        balances: dict,
+        now: datetime,
+    ) -> dict:
+        """Materialize exact fill/depth evidence before deriving a live plan."""
+
+        confidence = getattr(self, "_market_confidence_result", None)
+        if confidence is None:
+            return {
+                "campaign": campaign,
+                "runtime": derive_bootstrap_runtime(
+                    campaign_record=campaign,
+                    identity=identity,
+                    balances=balances,
+                    now=now,
+                ),
+                "changed": False,
+            }
+
+        try:
+            from wallet import get_wallet_puzzle_hashes
+
+            own_clusters = frozenset(
+                str(value).strip().lower().removeprefix("0x")
+                for value in get_wallet_puzzle_hashes()
+                if str(value).strip()
+            )
+        except Exception as exc:
+            own_clusters = frozenset()
+            log_event(
+                "warning",
+                "bootstrap_participant_identity_unavailable",
+                "Market Bootstrap retained its persisted stage because Sage "
+                f"participant identities could not be read: {exc}",
+            )
+        if not own_clusters:
+            log_event(
+                "warning",
+                "bootstrap_participant_identity_unproven",
+                "Market Bootstrap retained its persisted stage because Sage "
+                "did not prove any owned puzzle hashes",
+            )
+            if campaign.get("stage") != "bootstrap":
+                return {
+                    "campaign": campaign,
+                    "runtime": None,
+                    "changed": False,
+                    "blocked": True,
+                }
+            return {
+                "campaign": campaign,
+                "runtime": derive_bootstrap_runtime(
+                    campaign_record=campaign,
+                    identity=identity,
+                    balances=balances,
+                    now=now,
+                ),
+                "changed": False,
+                "blocked": False,
+            }
+
+        fills = database.get_fills(
+            cat_asset_id=campaign["asset_id"],
+            since=campaign["created_at"],
+            limit=10000,
+        )
+        evidence = derive_bootstrap_authoritative_evidence(
+            campaign_record=campaign,
+            authoritative_fills=fills,
+            intents=intents,
+            market_confidence=confidence,
+            now=now,
+            own_participant_clusters=own_clusters,
+            linked_participant_clusters=frozenset(),
+            include_anchor_proposal=False,
+        )
+        runtime = derive_bootstrap_runtime(
+            campaign_record=campaign,
+            identity=identity,
+            balances=balances,
+            now=now,
+            evidence=evidence,
+        )
+        state_update = plan_bootstrap_state_update(
+            campaign_record=campaign,
+            evidence=evidence,
+            decision=runtime["decision"],
+            now=now,
+        )
+        if state_update is None:
+            return {"campaign": campaign, "runtime": runtime, "changed": False}
+
+        revision = database.update_bootstrap_campaign_state(
+            campaign["campaign_id"],
+            expected_revision=campaign["revision"],
+            record=state_update,
+        )
+        occurred_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        database.append_bootstrap_campaign_event(
+            {
+                "campaign_id": campaign["campaign_id"],
+                "event_type": "authoritative_evidence_materialized",
+                "occurred_at": occurred_at,
+                "data": {
+                    "revision": revision,
+                    "stage": state_update["stage"],
+                    "deployment_fraction": state_update["deployment_fraction"],
+                    "confirmed_fills": state_update["confirmed_fills"],
+                    "settlement_clusters": state_update["settlement_clusters"],
+                    "independent_depth_sides": state_update["independent_depth_sides"],
+                    "anchor_moved": False,
+                },
+            }
+        )
+        refreshed = database.get_bootstrap_campaign(campaign["campaign_id"])
+        if type(refreshed) is not dict or refreshed.get("revision") != revision:
+            raise RuntimeError("Bootstrap evidence update could not be reloaded")
+        log_event(
+            "info",
+            "bootstrap_authoritative_evidence_materialized",
+            f"Market Bootstrap advanced to {refreshed['stage']} at revision {revision}",
+            data={
+                "campaign_id": campaign["campaign_id"],
+                "confirmed_fills": refreshed["confirmed_fills"],
+                "settlement_clusters": refreshed["settlement_clusters"],
+                "anchor_moved": False,
+            },
+        )
+        return {"campaign": refreshed, "runtime": None, "changed": True}
+
     def _route_bootstrap_creation_if_active(
         self,
         *,
@@ -12304,18 +12442,51 @@ class BotLoop:
                 getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
             ),
         }
+        intents = database.get_offer_intents_for_registry()
+        now = datetime.now(timezone.utc)
         try:
-            runtime = derive_bootstrap_runtime(
-                campaign_record=campaign,
+            refreshed = self._refresh_bootstrap_campaign_evidence(
+                campaign=campaign,
+                intents=intents,
                 identity=context["identity"],
                 balances=balances,
-                now=datetime.now(timezone.utc),
+                now=now,
             )
+            if refreshed.get("blocked") is True:
+                return empty
+            if refreshed["changed"] is True:
+                return empty
+            campaign = refreshed["campaign"]
+            runtime = refreshed["runtime"]
         except Exception as exc:
             log_event(
                 "error",
                 "bootstrap_runtime_derivation_failed",
                 f"Market Bootstrap runtime derivation failed closed: {exc}",
+            )
+            return empty
+        superseded = superseded_bootstrap_trade_ids(
+            intents,
+            campaign_id=campaign["campaign_id"],
+            revision=campaign["revision"],
+            live_trade_ids=current_buy_ids | current_sell_ids,
+        )
+        if superseded:
+            self.offer_manager.cancel_offers(
+                list(superseded),
+                reason="bootstrap_revision_superseded",
+                force_storm=True,
+            )
+            log_event(
+                "info",
+                "bootstrap_revision_fence",
+                f"Market Bootstrap is clearing {len(superseded)} offer(s) from "
+                "an older campaign revision before replacement",
+                data={
+                    "campaign_id": campaign["campaign_id"],
+                    "revision": campaign["revision"],
+                    "trade_ids": list(superseded),
+                },
             )
             return empty
         if runtime["transition"]["cancel_required"]:
@@ -12345,7 +12516,6 @@ class BotLoop:
             )
             return empty
 
-        intents = database.get_offer_intents_for_registry()
         existing = active_bootstrap_levels(
             intents,
             campaign_id=campaign["campaign_id"],

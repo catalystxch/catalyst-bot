@@ -22,7 +22,10 @@ from bootstrap_manifest import verify_campaign_manifest
 from bootstrap_proof import verify_participation_report
 from bootstrap_runtime import (
     active_bootstrap_levels,
+    derive_bootstrap_authoritative_evidence,
     derive_bootstrap_runtime,
+    plan_bootstrap_state_update,
+    superseded_bootstrap_trade_ids,
 )
 from bot_loop import (
     BotLoop,
@@ -777,6 +780,304 @@ def test_stages_inventory_anchor_cooldown_and_stops_remain_bounded(bootstrap_app
     assert fees.stop_reason is CampaignStopReason.FEE_RESERVE
     assert fees.cancellation_fee_reserve_xch == Decimal("0.01")
     assert expired.stop_reason is CampaignStopReason.EXPIRED
+
+
+def test_authoritative_campaign_fills_and_current_independent_depth_drive_stage(
+    bootstrap_app,
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    intents = [
+        {
+            "sage_trade_id": "01" * 32,
+            "purpose": purpose,
+            "asset_id": ASSET_ID,
+        },
+        {
+            "sage_trade_id": "02" * 32,
+            "purpose": purpose,
+            "asset_id": ASSET_ID,
+        },
+    ]
+    fills = [
+        {
+            "trade_id": "01" * 32,
+            "side": "buy",
+            "filled_at": "2026-09-12T11:50:00.000000Z",
+            "verification_status": "verified_authoritative",
+            "spent_block_height": 7000000,
+            "receive_coin_id": "11" * 32,
+            "taker_puzzle_hash": "21" * 32,
+        },
+        {
+            "trade_id": "02" * 32,
+            "side": "sell",
+            "filled_at": "2026-09-12T11:51:00.000000Z",
+            "verification_status": "verified_authoritative",
+            "spent_block_height": 7000001,
+            "receive_coin_id": "12" * 32,
+            "taker_puzzle_hash": "22" * 32,
+        },
+        {
+            "trade_id": "03" * 32,
+            "side": "buy",
+            "filled_at": "2026-09-12T11:52:00.000000Z",
+            "verification_status": "verified_authoritative",
+            "spent_block_height": 7000002,
+            "receive_coin_id": "13" * 32,
+            "taker_puzzle_hash": "23" * 32,
+        },
+    ]
+    confidence = SimpleNamespace(
+        data_valid=True,
+        trusted_midpoint=Decimal("0.00102"),
+        independent_bid_depth_mojos=100_000_000_000,
+        independent_ask_depth_mojos=100_000_000_000,
+        required_depth_mojos=50_000_000_000,
+    )
+
+    evidence = derive_bootstrap_authoritative_evidence(
+        campaign_record=record,
+        authoritative_fills=fills,
+        intents=intents,
+        market_confidence=confidence,
+        now=NOW,
+        own_participant_clusters=frozenset(),
+        linked_participant_clusters=frozenset(),
+        include_anchor_proposal=True,
+    )
+    campaign = _campaign_from_record(record)
+    decision = evaluate_bootstrap_campaign(campaign, evidence, now=NOW)
+
+    assert evidence.confirmed_fills == 2
+    assert evidence.settlement_clusters == 2
+    assert evidence.independent_depth_sides == frozenset(
+        {CampaignSide.BUY, CampaignSide.SELL}
+    )
+    assert evidence.stable_since == NOW
+    assert evidence.proposed_anchor_price == Decimal("0.00102")
+    assert decision.stage is CampaignStage.DISCOVERY_25
+
+    state_update = plan_bootstrap_state_update(
+        campaign_record=record,
+        evidence=evidence,
+        decision=decision,
+        now=NOW,
+    )
+    assert state_update["stage"] == "discovery_25"
+    assert state_update["deployment_fraction"] == "0.25"
+    assert state_update["confirmed_fills"] == 2
+    assert state_update["settlement_clusters"] == 2
+    assert state_update["stable_since"] == "2026-09-12T12:00:00.000000Z"
+
+    runtime = derive_bootstrap_runtime(
+        campaign_record=record,
+        identity={
+            key: record[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        },
+        balances=_balances(),
+        now=NOW,
+        evidence=evidence,
+    )
+    assert runtime["decision"].stage is CampaignStage.DISCOVERY_25
+    assert runtime["decision"].deployment_fraction == Decimal("0.25")
+
+
+def test_superseded_revision_trade_ids_are_fenced_before_replacement():
+    campaign_id = "ab" * 32
+    live = {"01" * 32, "02" * 32, "03" * 32, "04" * 32}
+    intents = [
+        {
+            "sage_trade_id": "01" * 32,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "created",
+        },
+        {
+            "sage_trade_id": "02" * 32,
+            "purpose": f"bootstrap:{campaign_id}:revision:1",
+            "lifecycle_state": "terminal",
+        },
+        {
+            "sage_trade_id": "03" * 32,
+            "purpose": f"bootstrap:{campaign_id}:revision:2",
+            "lifecycle_state": "created",
+        },
+        {
+            "sage_trade_id": "04" * 32,
+            "purpose": f"bootstrap:{'cd' * 32}:revision:0",
+            "lifecycle_state": "created",
+        },
+        {
+            "sage_trade_id": "05" * 32,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "created",
+        },
+    ]
+
+    assert superseded_bootstrap_trade_ids(
+        intents,
+        campaign_id=campaign_id,
+        revision=2,
+        live_trade_ids=live,
+    ) == ("01" * 32, "02" * 32)
+
+
+def test_live_bot_materializes_authoritative_stage_before_creating(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    intents = [
+        {
+            "sage_trade_id": "01" * 32,
+            "purpose": purpose,
+            "asset_id": ASSET_ID,
+        },
+        {
+            "sage_trade_id": "02" * 32,
+            "purpose": purpose,
+            "asset_id": ASSET_ID,
+        },
+    ]
+    fills = [
+        {
+            "trade_id": "01" * 32,
+            "side": "buy",
+            "filled_at": "2026-09-12T11:50:00.000000Z",
+            "verification_status": "verified_authoritative",
+            "spent_block_height": 7000000,
+            "receive_coin_id": "11" * 32,
+            "taker_puzzle_hash": "21" * 32,
+        },
+        {
+            "trade_id": "02" * 32,
+            "side": "sell",
+            "filled_at": "2026-09-12T11:51:00.000000Z",
+            "verification_status": "verified_authoritative",
+            "spent_block_height": 7000001,
+            "receive_coin_id": "12" * 32,
+            "taker_puzzle_hash": "22" * 32,
+        },
+    ]
+    confidence = SimpleNamespace(
+        data_valid=True,
+        trusted_midpoint=Decimal("0.00102"),
+        independent_bid_depth_mojos=100_000_000_000,
+        independent_ask_depth_mojos=100_000_000_000,
+        required_depth_mojos=50_000_000_000,
+    )
+
+    import bot_loop
+    import wallet
+
+    monkeypatch.setattr(wallet, "get_wallet_puzzle_hashes", lambda: {"99" * 32})
+    monkeypatch.setattr(bot_loop.database, "get_fills", lambda *_args, **_kwargs: fills)
+    loop = object.__new__(BotLoop)
+    loop._market_confidence_result = confidence
+
+    result = loop._refresh_bootstrap_campaign_evidence(
+        campaign=record,
+        intents=intents,
+        identity={
+            key: identity[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        },
+        balances=_balances(),
+        now=NOW,
+    )
+
+    assert result["changed"] is True
+    assert result["runtime"] is None
+    assert result["campaign"]["revision"] == 1
+    assert result["campaign"]["stage"] == "discovery_25"
+    assert result["campaign"]["confirmed_fills"] == 2
+    assert result["campaign"]["settlement_clusters"] == 2
+    assert result["campaign"]["current_anchor_price"] == "0.001"
+    events = database.list_bootstrap_campaign_events(campaign_id)
+    assert events[-1]["event_type"] == "authoritative_evidence_materialized"
+
+
+def test_live_bot_blocks_higher_stage_replacement_without_owned_hash_proof(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    record.update(
+        stage="discovery_25",
+        deployment_fraction="0.25",
+        confirmed_fills=2,
+        settlement_clusters=2,
+        independent_depth_sides=["buy", "sell"],
+        stable_since="2026-09-12T12:00:00.000000Z",
+    )
+
+    import wallet
+
+    monkeypatch.setattr(wallet, "get_wallet_puzzle_hashes", lambda: set())
+    loop = object.__new__(BotLoop)
+    loop._market_confidence_result = SimpleNamespace(data_valid=True)
+    result = loop._refresh_bootstrap_campaign_evidence(
+        campaign=record,
+        intents=[],
+        identity={
+            key: identity[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        },
+        balances=_balances(),
+        now=NOW,
+    )
+
+    assert result == {
+        "campaign": record,
+        "runtime": None,
+        "changed": False,
+        "blocked": True,
+    }
 
 
 def test_interactive_signing_join_and_private_proof_export(bootstrap_app):
