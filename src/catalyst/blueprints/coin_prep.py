@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
@@ -56,6 +57,32 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bp = Blueprint("coin_prep", __name__)
 
 _coin_prep_trigger_lock = threading.Lock()
+
+
+def _coin_prep_wallet_snapshot(
+    get_wallet_balance,
+    get_spendable_coins,
+    xch_wallet_id: int,
+    cat_wallet_id: int,
+) -> tuple:
+    """Fetch independent Sage balance/coin views concurrently.
+
+    Each Sage RPC has its own bounded timeout.  Serial execution made the
+    preflight UI wait for the sum of four network calls, which could leave the
+    operator on an apparently frozen ``Checking...`` screen for nearly a
+    minute.  Result order stays deterministic for the caller.
+    """
+
+    with ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="coin-prep-verify"
+    ) as executor:
+        futures = (
+            executor.submit(get_wallet_balance, xch_wallet_id),
+            executor.submit(get_wallet_balance, cat_wallet_id),
+            executor.submit(get_spendable_coins, xch_wallet_id),
+            executor.submit(get_spendable_coins, cat_wallet_id),
+        )
+        return tuple(future.result() for future in futures)
 
 
 def bootstrap_coin_prep_requirements(plan: dict) -> dict:
@@ -140,8 +167,8 @@ def bootstrap_coin_prep_worker_args(plan: dict) -> dict:
     }
 
 
-def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
-    """Resolve exact Coin Prep inputs for the active, identity-bound campaign."""
+def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
+    """Resolve exact Coin Prep inputs and balances for an active campaign."""
 
     asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
     if len(asset_id) != 64:
@@ -166,8 +193,14 @@ def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
         identity = _read_bootstrap_identity()
     except BootstrapApiError as exc:
         raise ValueError("bootstrap_wallet_identity_unavailable") from exc
-    xch = get_wallet_balance(int(getattr(cfg, "WALLET_ID_XCH", 1) or 1))
-    cat = get_wallet_balance(int(campaign["wallet_id"]))
+    xch_wallet_id = int(getattr(cfg, "WALLET_ID_XCH", 1) or 1)
+    with ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="bootstrap-prep-balance"
+    ) as executor:
+        xch_future = executor.submit(get_wallet_balance, xch_wallet_id)
+        cat_future = executor.submit(get_wallet_balance, int(campaign["wallet_id"]))
+        xch = xch_future.result()
+        cat = cat_future.result()
 
     def _confirmed(result: dict, label: str) -> int:
         if type(result) is not dict or result.get("success") is not True:
@@ -184,9 +217,11 @@ def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
     effective_fee_mojos = get_effective_transaction_fee_mojos()
     if type(effective_fee_mojos) is not int or effective_fee_mojos < 0:
         raise ValueError("bootstrap_network_fee_unavailable")
+    xch_balance_mojos = _confirmed(xch, "xch")
+    cat_balance_mojos = _confirmed(cat, "cat")
     balances = {
-        "xch_available": Decimal(_confirmed(xch, "xch")) / Decimal(10**12),
-        "cat_available": Decimal(_confirmed(cat, "cat")) / Decimal(10**cat_decimals),
+        "xch_available": Decimal(xch_balance_mojos) / Decimal(10**12),
+        "cat_available": Decimal(cat_balance_mojos) / Decimal(10**cat_decimals),
         "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
         "subsidy_spent_xch": Decimal("0"),
         "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),
@@ -210,7 +245,20 @@ def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
     if plan.get("authorized") is not True:
         reasons = ",".join(plan.get("reason_codes") or ("not_authorized",))
         raise ValueError(f"bootstrap_coin_prep_not_authorized:{reasons}")
-    return bootstrap_coin_prep_worker_args(plan)
+    return {
+        "campaign": campaign,
+        "worker_args": bootstrap_coin_prep_worker_args(plan),
+        "xch_balance_mojos": xch_balance_mojos,
+        "cat_balance_mojos": cat_balance_mojos,
+        "cat_decimals": cat_decimals,
+    }
+
+
+def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
+    """Resolve exact Coin Prep worker inputs for the active campaign."""
+
+    context = _active_bootstrap_coin_prep_context(body)
+    return context["worker_args"] if context is not None else None
 
 
 def _wallet_open_offer_snapshot_before_prep() -> dict:
@@ -1600,30 +1648,77 @@ def api_coin_prep_verify():
             or getattr(cfg, "LIQUIDITY_MODE", "two_sided")
             or "two_sided"
         )
+        bootstrap_context = None
+        bootstrap_campaign_id = str(
+            request.args.get("bootstrap_campaign_id") or ""
+        ).strip()
+        if bootstrap_campaign_id:
+            try:
+                bootstrap_revision = int(
+                    request.args.get("bootstrap_campaign_revision", "")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("bootstrap_coin_prep_confirmation_required") from exc
+            bootstrap_context = _active_bootstrap_coin_prep_context(
+                {
+                    "bootstrap_campaign_id": bootstrap_campaign_id,
+                    "bootstrap_campaign_revision": bootstrap_revision,
+                }
+            )
+            if bootstrap_context is None:
+                raise ValueError("bootstrap_coin_prep_confirmation_required")
+            tier_enabled = True
+            liquidity_mode = "two_sided"
         tolerance = 0.05  # 5% tolerance for matching coin sizes
 
         # Fetch wallet balances for sufficiency check
         # Uses CONFIRMED (total) balance, NOT spendable, because coin prep's
         # first step is to cancel all existing offers — so locked coins WILL
         # become available during prep.
-        xch_bal_result = get_wallet_balance(WALLET_ID_XCH)
-        cat_bal_result = get_wallet_balance(cat_wallet_id)
+        if bootstrap_context is not None:
+            xch_balance_mojos = bootstrap_context["xch_balance_mojos"]
+            cat_balance_mojos = bootstrap_context["cat_balance_mojos"]
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="bootstrap-prep-coins"
+            ) as executor:
+                xch_future = executor.submit(get_spendable_coins_rpc, WALLET_ID_XCH)
+                cat_future = executor.submit(get_spendable_coins_rpc, cat_wallet_id)
+                xch_result = xch_future.result()
+                cat_result = cat_future.result()
+            xch_bal_result = None
+            cat_bal_result = None
+        else:
+            (
+                xch_bal_result,
+                cat_bal_result,
+                xch_result,
+                cat_result,
+            ) = _coin_prep_wallet_snapshot(
+                get_wallet_balance,
+                get_spendable_coins_rpc,
+                WALLET_ID_XCH,
+                cat_wallet_id,
+            )
         xch_balance_mojos = 0
         cat_balance_mojos = 0
-        if xch_bal_result and isinstance(xch_bal_result, dict):
+        if (
+            bootstrap_context is None
+            and xch_bal_result
+            and isinstance(xch_bal_result, dict)
+        ):
             wb = xch_bal_result.get("wallet_balance") or xch_bal_result
             xch_balance_mojos = _safe_non_negative_int(
                 wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
             )
-        if cat_bal_result and isinstance(cat_bal_result, dict):
+        if (
+            bootstrap_context is None
+            and cat_bal_result
+            and isinstance(cat_bal_result, dict)
+        ):
             wb = cat_bal_result.get("wallet_balance") or cat_bal_result
             cat_balance_mojos = _safe_non_negative_int(
                 wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
             )
-
-        # Fetch all spendable coins
-        xch_result = get_spendable_coins_rpc(WALLET_ID_XCH)
-        cat_result = get_spendable_coins_rpc(cat_wallet_id)
 
         xch_coins = []
         if xch_result and xch_result.get("success"):
@@ -1649,9 +1744,14 @@ def api_coin_prep_verify():
                 if amt > 0:
                     cat_coins.append(amt)
 
-        cat_decimals = _safe_non_negative_int(
-            api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3),
-            3,
+        cat_decimals = (
+            int(bootstrap_context["cat_decimals"])
+            if bootstrap_context is not None
+            else _safe_non_negative_int(
+                api_server._active_cat.get("decimals")
+                or getattr(cfg, "CAT_DECIMALS", 3),
+                3,
+            )
         )
 
         def count_matching(coins_list, target_mojos, tol):
@@ -1688,15 +1788,59 @@ def api_coin_prep_verify():
 
             return allocated
 
-        if tier_enabled:
-            tiers = [
+        bootstrap_tier_specs = {}
+        if bootstrap_context is not None:
+            worker_args = bootstrap_context["worker_args"]
+
+            def _assignments(value: str, cast):
+                parsed = {}
+                for item in str(value or "").split(","):
+                    if not item:
+                        continue
+                    tier, separator, raw = item.partition("=")
+                    if not separator or not tier:
+                        raise ValueError("bootstrap_coin_prep_plan_invalid")
+                    parsed[tier] = cast(raw)
+                return parsed
+
+            exact_xch = _assignments(worker_args["buy_tier_sizes"], Decimal)
+            exact_cat = _assignments(worker_args["cat_tier_sizes"], Decimal)
+            exact_xch_counts = _assignments(worker_args["tier_counts_xch"], int)
+            exact_cat_counts = _assignments(worker_args["tier_counts_cat"], int)
+            exact_tiers = tuple(
                 tier
-                for tier in ["inner", "mid", "outer", "extreme", "sniper", "fees"]
-                if any(
-                    request.args.get(f"{tier}_{suffix}") is not None
-                    for suffix in ("xch", "cat", "count")
-                )
-            ]
+                for tier in ("inner", "mid", "outer", "fees")
+                if tier in exact_xch or tier in exact_cat
+            )
+            for tier in exact_tiers:
+                xch_count = exact_xch_counts.get(tier, 0)
+                cat_count = exact_cat_counts.get(tier, 0)
+                if xch_count > 0 and cat_count > 0 and xch_count != cat_count:
+                    raise ValueError("bootstrap_coin_prep_plan_invalid")
+                bootstrap_tier_specs[tier] = {
+                    "xch_size": exact_xch.get(tier, Decimal("0")),
+                    "cat_size": exact_cat.get(tier, Decimal("0")),
+                    "needed": max(xch_count, cat_count),
+                }
+
+        if tier_enabled:
+            tiers = list(bootstrap_tier_specs)
+            if not tiers:
+                tiers = [
+                    tier
+                    for tier in [
+                        "inner",
+                        "mid",
+                        "outer",
+                        "extreme",
+                        "sniper",
+                        "fees",
+                    ]
+                    if any(
+                        request.args.get(f"{tier}_{suffix}") is not None
+                        for suffix in ("xch", "cat", "count")
+                    )
+                ]
             if not tiers:
                 tiers = ["inner", "mid", "outer", "extreme"]
             result_tiers = {}
@@ -1706,16 +1850,26 @@ def api_coin_prep_verify():
             cat_requests = []
 
             for tier in tiers:
-                xch_size = float(request.args.get(f"{tier}_xch", "0"))
-                cat_size = float(request.args.get(f"{tier}_cat", "0"))
-                needed = int(request.args.get(f"{tier}_count", "0"))
-                is_xch_only_tier = tier == "fees" or cat_size <= 0
+                exact_spec = bootstrap_tier_specs.get(tier)
+                if exact_spec is not None:
+                    xch_amount = exact_spec["xch_size"]
+                    cat_amount = exact_spec["cat_size"]
+                    needed = exact_spec["needed"]
+                else:
+                    xch_amount = _safe_non_negative_decimal(
+                        request.args.get(f"{tier}_xch", "0")
+                    )
+                    cat_amount = _safe_non_negative_decimal(
+                        request.args.get(f"{tier}_cat", "0")
+                    )
+                    needed = int(request.args.get(f"{tier}_count", "0"))
+                is_xch_only_tier = tier == "fees" or cat_amount <= 0
 
-                xch_mojos = int(xch_size * 1e12)
-                cat_mojos = int(cat_size * (10**cat_decimals))
+                xch_mojos = int(xch_amount * Decimal(10**12))
+                cat_mojos = int(cat_amount * Decimal(10**cat_decimals))
                 tier_specs[tier] = {
-                    "xch_size": xch_size,
-                    "cat_size": cat_size,
+                    "xch_size": float(xch_amount),
+                    "cat_size": float(cat_amount),
                     "needed": needed,
                     "xch_mojos": xch_mojos,
                     "cat_mojos": cat_mojos,
@@ -1771,15 +1925,16 @@ def api_coin_prep_verify():
             total_xch_needed_mojos = 0
             total_cat_needed_mojos = 0
             for tier in tiers:
-                xch_size = float(request.args.get(f"{tier}_xch", "0"))
-                cat_size = float(request.args.get(f"{tier}_cat", "0"))
-                needed = int(request.args.get(f"{tier}_count", "0"))
+                spec = tier_specs[tier]
+                needed = spec["needed"]
                 if liquidity_mode != "sell_only" or tier == "fees":
-                    total_xch_needed_mojos += int(xch_size * 1e12) * needed
-                if liquidity_mode != "buy_only" and tier != "fees" and cat_size > 0:
-                    total_cat_needed_mojos += (
-                        int(cat_size * (10**cat_decimals)) * needed
-                    )
+                    total_xch_needed_mojos += spec["xch_mojos"] * needed
+                if (
+                    liquidity_mode != "buy_only"
+                    and tier != "fees"
+                    and spec["cat_mojos"] > 0
+                ):
+                    total_cat_needed_mojos += spec["cat_mojos"] * needed
 
             xch_balance_sufficient = xch_balance_mojos >= total_xch_needed_mojos
             cat_balance_sufficient = cat_balance_mojos >= total_cat_needed_mojos
@@ -1792,10 +1947,11 @@ def api_coin_prep_verify():
             )
 
             tier_drift = []
-            try:
-                tier_drift = _tier_size_drift_findings()
-            except Exception:
-                tier_drift = []
+            if bootstrap_context is None:
+                try:
+                    tier_drift = _tier_size_drift_findings()
+                except Exception:
+                    tier_drift = []
             if tier_drift:
                 all_sufficient = False
 
@@ -1819,6 +1975,10 @@ def api_coin_prep_verify():
                 "balance_warnings": balance_warnings,
                 "tier_size_drift": tier_drift,
             }
+            if bootstrap_context is not None:
+                campaign = bootstrap_context["campaign"]
+                response["bootstrap_campaign_id"] = campaign["campaign_id"]
+                response["bootstrap_campaign_revision"] = campaign["revision"]
             if tier_drift:
                 _mark_payload_needs_coin_prep_for_drift(response, tier_drift)
             # Response fields are derived from numeric wallet balances and

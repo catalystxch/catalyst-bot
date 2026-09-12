@@ -13835,6 +13835,12 @@
                         const sc = document.getElementById('configCatSelector');
                         if (sc && currentCAT && currentCAT.asset_id) sc.value = currentCAT.asset_id;
 
+                        // /api/config contains the last general-purpose pair's
+                        // rails.  An active Bootstrap campaign is the durable
+                        // authority for its exact pair, so re-apply its corridor
+                        // after the legacy config load and before validation.
+                        hydrateBootstrapCampaignControls(_bootstrapActiveCampaign);
+
                         if (typeof updateCoinPrepPreview === 'function') updateCoinPrepPreview();
                         if (typeof updateTierCountHint === 'function') updateTierCountHint();
                         if (typeof updateTierSpareHint === 'function') updateTierSpareHint();
@@ -19087,6 +19093,9 @@
                 (bot_state && bot_state.running)
                 || _pairSelectedByUser
                 || (_resumeSessionSummary && _resumeSessionSummary.active_cat && _resumeSessionSummary.active_cat.asset_id)
+                || (typeof _bootstrapActiveCampaign !== 'undefined'
+                    && _bootstrapActiveCampaign
+                    && _bootstrapActiveCampaign.asset_id)
             );
         }
 
@@ -22708,6 +22717,41 @@
             return normalized;
         }
 
+        function renderBootstrapCoinPrepPreview(campaign, tokenName) {
+            if (!campaign || !campaign.asset_id) return false;
+            const hasBuyBudget = Number(campaign.xch_budget || 0) > 0;
+            const hasSellBudget = Number(campaign.cat_budget || 0) > 0;
+            const xchCoins = document.getElementById('prepXchCoins');
+            const xchSize = document.getElementById('prepXchSize');
+            const xchTotal = document.getElementById('prepXchTotal');
+            const catCoins = document.getElementById('prepCatCoins');
+            const catSize = document.getElementById('prepCatSize');
+            const catTotal = document.getElementById('prepCatTotal');
+            const warning = document.getElementById('coinPrepWarning');
+
+            if (xchCoins) xchCoins.textContent = hasBuyBudget ? '3 + fees' : 'fees only';
+            if (xchSize) {
+                xchSize.textContent = 'Campaign-bound: three staged offer outputs; exact fee outputs are derived by the backend.';
+            }
+            if (xchTotal) {
+                xchTotal.textContent = `≤ ${campaign.xch_budget} XCH offers + ≤ ${campaign.fee_budget_xch} XCH fees`;
+            }
+            if (catCoins) catCoins.textContent = hasSellBudget ? '3' : '0';
+            if (catSize) {
+                catSize.textContent = hasSellBudget
+                    ? 'Campaign-bound: three staged CAT offer outputs.'
+                    : 'No CAT-funded sell outputs in this campaign.';
+            }
+            if (catTotal) catTotal.textContent = `≤ ${campaign.cat_budget} ${tokenName}`;
+            if (warning) {
+                warning.style.display = 'block';
+                warning.dataset.critical = 'false';
+                warning.textContent = 'Bootstrap campaign active: Coin Prep is bound to the exact saved campaign revision and budgets; the legacy Smart Settings coin plan is bypassed.';
+            }
+            tradingSettingsImpossible = false;
+            return true;
+        }
+
         function updateCoinPrepPreview() {
             const settingsCAT = getSettingsSelectedCAT();
             syncSettingsPairLabels(settingsCAT);
@@ -22744,6 +22788,16 @@
 
             if (settingsCAT?.asset_id && !pairReady) {
                 setCoinPrepPreviewLoading(tokenName);
+                return;
+            }
+
+            if (
+                typeof _bootstrapActiveCampaign !== 'undefined'
+                && _bootstrapActiveCampaign
+                && String(_bootstrapActiveCampaign.asset_id || '').toLowerCase()
+                    === String(settingsCAT?.asset_id || '').toLowerCase()
+                && renderBootstrapCoinPrepPreview(_bootstrapActiveCampaign, tokenName)
+            ) {
                 return;
             }
 
@@ -23612,6 +23666,19 @@
                 // Also populate settings modal selector
                 if (settingsSelector) {
                     settingsSelector.innerHTML = optionsHTML;
+                }
+
+                // loadCATs() rebuilds both <select> elements. Refresh the
+                // durable Bootstrap state immediately afterwards so an active
+                // campaign re-selects its exact CAT before the stopped-bot
+                // explicit-selection gate evaluates the server status. Without
+                // this, recovery depended on the next 30-second status tick.
+                if (typeof bootstrapRefreshStatus === 'function') {
+                    try {
+                        await bootstrapRefreshStatus();
+                    } catch (bootstrapRefreshError) {
+                        debugWarn('[BOOTSTRAP] Pair recovery refresh failed:', bootstrapRefreshError?.message || bootstrapRefreshError);
+                    }
                 }
                 
                 // Restore previously-selected CAT from server state
@@ -34721,6 +34788,13 @@
                 debugLog('[VALIDATION] ✅ Passed');
 
                 if (validationWarnings.length > 0) {
+                    // A validation confirmation must be the only active modal.
+                    // Otherwise the eagerly opened Coin Prep overlay sits on top
+                    // and makes the warning impossible to answer.
+                    if (preopenedCoinPrepLoading) {
+                        dismissCoinPrepConfirmLoading();
+                        preopenedCoinPrepLoading = false;
+                    }
                     const warnItems = validationWarnings
                         .map(w => w.message || w)
                         .map(msg => `• ${escapeHtml(msg)}`)
@@ -34735,9 +34809,12 @@
                         allowHtml: true
                     });
                     if (!proceed) {
-                        if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                         setSaveConfigButtonState(false);
                         return;
+                    }
+                    if (shouldPreopenCoinPrepLoading) {
+                        showCoinPrepConfirmLoading(config);
+                        preopenedCoinPrepLoading = true;
                     }
                 }
                 
@@ -35033,13 +35110,20 @@ function closeCtgErrorModal() {
         async function checkIfCoinPrepNeeded(config) {
             try {
                 config = normalizeConfigForLiquidityMode(config || {});
-                const tierEnabled = !!config.tier_enabled;
-                const liquidityMode = normalizeLiquidityMode(config.liquidity_mode || getLiquidityMode());
+                const bootstrapCampaign = _bootstrapActiveCampaign?.campaign_id
+                    ? _bootstrapActiveCampaign : null;
+                const tierEnabled = bootstrapCampaign ? true : !!config.tier_enabled;
+                const liquidityMode = bootstrapCampaign
+                    ? 'two_sided'
+                    : normalizeLiquidityMode(config.liquidity_mode || getLiquidityMode());
                 const params = new URLSearchParams();
                 params.set('tier_enabled', tierEnabled ? 'true' : 'false');
                 params.set('liquidity_mode', liquidityMode);
 
-                if (tierEnabled) {
+                if (bootstrapCampaign) {
+                    params.set('bootstrap_campaign_id', bootstrapCampaign.campaign_id);
+                    params.set('bootstrap_campaign_revision', String(bootstrapCampaign.revision));
+                } else if (tierEnabled) {
                     const midPrice = Number(bot_state?.pricing?.mid || 0);
                     const tiers = ['inner', 'mid', 'outer', 'extreme'];
                     const sizeKey = (t) => t + '_size_xch';
@@ -35111,7 +35195,27 @@ function closeCtgErrorModal() {
                     if (maxSell > 0) params.set('max_sell', String(maxSell));
                 }
 
-                const resp = await apiFetch(`${API_URL}/coin-prep/verify?${params.toString()}`);
+                const verifyController = typeof AbortController === 'function'
+                    ? new AbortController() : null;
+                let verifyTimeoutId = null;
+                const verifyTimeout = new Promise((_, reject) => {
+                    verifyTimeoutId = setTimeout(() => {
+                        if (verifyController) verifyController.abort();
+                        reject(new Error('Coin Prep verification timed out'));
+                    }, 35000);
+                });
+                let resp;
+                try {
+                    resp = await Promise.race([
+                        apiFetch(
+                            `${API_URL}/coin-prep/verify?${params.toString()}`,
+                            verifyController ? { signal: verifyController.signal } : {}
+                        ),
+                        verifyTimeout,
+                    ]);
+                } finally {
+                    if (verifyTimeoutId !== null) clearTimeout(verifyTimeoutId);
+                }
                 const result = await resp.json();
                 debugLog('[COIN-PREP] verify result:', result);
 
@@ -35136,7 +35240,7 @@ function closeCtgErrorModal() {
                 const reasonMessage = result?.error
                     || result?.message
                     || 'Your wallet needs to be split into the right coin sizes for the new settings.';
-                showCoinPrepConfirm(config, reason, reasonMessage);
+                showCoinPrepConfirm(config, reason, reasonMessage, result);
             } catch (err) {
                 debugWarn('[COIN-PREP] checkIfCoinPrepNeeded failed:', err);
                 // On error, fall back to showing the confirm view so the user
@@ -35152,7 +35256,42 @@ function closeCtgErrorModal() {
             }
         }
 
-        function showCoinPrepConfirm(config, reason, reasonMessage) {
+        function renderBootstrapCoinPrepConfirmation(verification, tokenName) {
+            const campaign = _bootstrapActiveCampaign;
+            if (!campaign || !verification?.bootstrap_campaign_id) return false;
+            if (String(verification.bootstrap_campaign_id) !== String(campaign.campaign_id)
+                || Number(verification.bootstrap_campaign_revision) !== Number(campaign.revision)) {
+                return false;
+            }
+
+            const tiers = verification.tiers || {};
+            const labels = { inner: 'Near', mid: 'Middle', outer: 'Far', fees: 'Fees' };
+            const rowsFor = (side) => Object.entries(tiers)
+                .filter(([, spec]) => Number(spec?.[`${side}_size`] || 0) > 0 && Number(spec?.needed || 0) > 0)
+                .map(([tier, spec]) => `${labels[tier] || tier}: ${Number(spec.needed)} × ${spec[`${side}_size`]}`);
+            const xchRows = rowsFor('xch');
+            const catRows = rowsFor('cat');
+            const xchCoins = Object.values(tiers).reduce(
+                (sum, spec) => sum + (Number(spec?.xch_size || 0) > 0 ? Number(spec?.needed || 0) : 0), 0
+            );
+            const catCoins = Object.values(tiers).reduce(
+                (sum, spec) => sum + (Number(spec?.cat_size || 0) > 0 ? Number(spec?.needed || 0) : 0), 0
+            );
+            const xchTotal = Number(verification.xch_needed_mojos || 0) / 1e12;
+            const catDecimals = Number(currentCAT?.decimals || 3);
+            const catTotal = Number(verification.cat_needed_mojos || 0) / (10 ** catDecimals);
+
+            document.getElementById('cpConfirmXchCoins').textContent = String(xchCoins);
+            document.getElementById('cpConfirmXchSize').textContent = xchRows.join(' · ');
+            document.getElementById('cpConfirmXchTotal').textContent = xchTotal.toLocaleString(undefined, { maximumFractionDigits: 12 });
+            document.getElementById('cpConfirmCatCoins').textContent = String(catCoins);
+            document.getElementById('cpConfirmCatSize').textContent = catRows.join(' · ');
+            document.getElementById('cpConfirmCatTotal').textContent = catTotal.toLocaleString(undefined, { maximumFractionDigits: catDecimals });
+            document.getElementById('cpConfirmCatName').textContent = tokenName;
+            return { buttonText: 'Yes, Prepare Exact Campaign Coins' };
+        }
+
+        function showCoinPrepConfirm(config, reason, reasonMessage, verification = null) {
             config = normalizeConfigForLiquidityMode(config || {});
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (!modal) return;
@@ -35226,15 +35365,18 @@ function closeCtgErrorModal() {
                 ...getFeeOptionsFromConfig(config)
             });
 
-            document.getElementById('cpConfirmXchCoins').textContent = plan.xchCoinsNeeded;
-            document.getElementById('cpConfirmXchSize').innerHTML = buildCoinPrepSizeMarkup(plan, 'xch', 'modal');
-            document.getElementById('cpConfirmXchTotal').textContent = plan.totalXchForCoinPrep.toFixed(4);
-            document.getElementById('cpConfirmCatCoins').textContent = plan.catCoinsNeeded;
-            document.getElementById('cpConfirmCatSize').innerHTML = plan.totalCatForCoinPrep > 0
-                ? buildCoinPrepSizeMarkup(plan, 'cat', 'modal')
-                : '<span class="coin-prep-breakdown-empty">--</span>';
-            document.getElementById('cpConfirmCatTotal').textContent = plan.totalCatForCoinPrep > 0 ? plan.totalCatForCoinPrep.toLocaleString() : '--';
-            document.getElementById('cpConfirmCatName').textContent = catTokenName;
+            const bootstrapRender = renderBootstrapCoinPrepConfirmation(verification, catTokenName);
+            if (!bootstrapRender) {
+                document.getElementById('cpConfirmXchCoins').textContent = plan.xchCoinsNeeded;
+                document.getElementById('cpConfirmXchSize').innerHTML = buildCoinPrepSizeMarkup(plan, 'xch', 'modal');
+                document.getElementById('cpConfirmXchTotal').textContent = plan.totalXchForCoinPrep.toFixed(4);
+                document.getElementById('cpConfirmCatCoins').textContent = plan.catCoinsNeeded;
+                document.getElementById('cpConfirmCatSize').innerHTML = plan.totalCatForCoinPrep > 0
+                    ? buildCoinPrepSizeMarkup(plan, 'cat', 'modal')
+                    : '<span class="coin-prep-breakdown-empty">--</span>';
+                document.getElementById('cpConfirmCatTotal').textContent = plan.totalCatForCoinPrep > 0 ? plan.totalCatForCoinPrep.toLocaleString() : '--';
+                document.getElementById('cpConfirmCatName').textContent = catTokenName;
+            }
 
             const reasonEl = document.getElementById('cpReasonBanner');
             const isError = reason === 'error';
@@ -35266,7 +35408,9 @@ function closeCtgErrorModal() {
                     cpConfirmBtn.style.opacity = '';
                     cpConfirmBtn.style.cursor = '';
                     cpConfirmBtn.title = '';
-                    cpConfirmBtn.textContent = `Yes, Prepare Coins (+${prepHeadroomPct}% headroom)`;
+                    cpConfirmBtn.textContent = bootstrapRender
+                        ? bootstrapRender.buttonText
+                        : `Yes, Prepare Coins (+${prepHeadroomPct}% headroom)`;
                 }
             }
 
@@ -38508,12 +38652,113 @@ function bootstrapModeChanged() {
     bootstrapReviewChanged();
 }
 
+function hydrateBootstrapCampaignControls(campaign) {
+    const mode = document.getElementById('bootstrapModeSelect');
+    const fields = document.getElementById('bootstrapWizardFields');
+    const preview = document.getElementById('bootstrapPreviewBtn');
+    const start = document.getElementById('bootstrapStartBtn');
+    const exactConfirm = document.getElementById('bootstrapExactAssetConfirm');
+    const subsidyEnabled = document.getElementById('bootstrapSubsidyEnabled');
+    const subsidyBudget = document.getElementById('bootstrapSubsidyBudget');
+    const campaignInputs = [
+        document.getElementById('bootstrapAnchorPrice'),
+        document.getElementById('bootstrapExpiryDays'),
+        document.getElementById('bootstrapXchBudget'),
+        document.getElementById('bootstrapCatBudget'),
+        document.getElementById('bootstrapFeeBudget'),
+        document.getElementById('configMinMid'),
+        document.getElementById('configMaxMid'),
+    ];
+
+    if (!campaign) {
+        campaignInputs.forEach((input) => { if (input) input.disabled = false; });
+        if (mode) mode.disabled = false;
+        if (exactConfirm) exactConfirm.disabled = false;
+        if (subsidyEnabled) subsidyEnabled.disabled = false;
+        if (subsidyBudget) subsidyBudget.disabled = !subsidyEnabled?.checked;
+        if (preview) preview.disabled = false;
+        if (start) start.disabled = !_bootstrapPreviewDigest || !exactConfirm?.checked;
+        return;
+    }
+
+    if (mode) {
+        mode.value = 'bootstrap';
+        mode.disabled = true;
+    }
+    if (fields) fields.style.display = 'block';
+    const setValue = (id, value) => {
+        const input = document.getElementById(id);
+        if (input) input.value = String(value == null ? '' : value);
+    };
+    setValue('bootstrapAnchorPrice', campaign.anchor_price);
+    setValue('configMinMid', campaign.minimum_price);
+    setValue('configMaxMid', campaign.maximum_price);
+    setValue('bootstrapXchBudget', campaign.xch_budget);
+    setValue('bootstrapCatBudget', campaign.cat_budget);
+    setValue('bootstrapFeeBudget', campaign.fee_budget_xch);
+    setValue('bootstrapSubsidyBudget', campaign.subsidy_budget_xch);
+
+    const createdMs = Date.parse(campaign.created_at || '');
+    const expiryMs = Date.parse(campaign.expires_at || '');
+    const durationDays = Number.isFinite(createdMs) && Number.isFinite(expiryMs)
+        ? Math.max(1, Math.min(7, Math.ceil((expiryMs - createdMs) / 86400000)))
+        : 7;
+    setValue('bootstrapExpiryDays', durationDays);
+
+    const hasSubsidy = Number(campaign.subsidy_budget_xch || 0) > 0;
+    if (subsidyEnabled) {
+        subsidyEnabled.checked = hasSubsidy;
+        subsidyEnabled.disabled = true;
+    }
+    if (subsidyBudget) subsidyBudget.disabled = true;
+    if (exactConfirm) {
+        exactConfirm.checked = true;
+        exactConfirm.disabled = true;
+    }
+    campaignInputs.forEach((input) => { if (input) input.disabled = true; });
+    if (preview) preview.disabled = true;
+    if (start) start.disabled = true;
+    _bootstrapText(
+        'bootstrapStatusPanel',
+        `Campaign ${campaign.campaign_id} is active and locked to revision ${campaign.revision}. Stop it before changing its saved authority, anchor, or budgets.`
+    );
+}
+
+function syncBootstrapCampaignPairIntoSelectors(payload) {
+    const campaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const identity = payload?.identity || {};
+    const campaignAssetId = String(campaign?.asset_id || '').trim().toLowerCase();
+    const identityAssetId = String(identity?.asset_id || '').trim().toLowerCase();
+    if (!campaignAssetId || identityAssetId !== campaignAssetId) return false;
+
+    // The durable campaign is already bound server-side to this exact wallet,
+    // network, and CAT.  Restore that pair after a browser/app reload so the
+    // stopped-bot fresh-selection gate cannot strand Coin Prep and Start Bot.
+    const listed = getCatMetaByAssetId(campaignAssetId) || {};
+    const catMeta = {
+        ...listed,
+        asset_id: campaignAssetId,
+        wallet_id: Number(identity.wallet_id || listed.wallet_id || 0),
+        decimals: Number(listed.decimals || 3),
+        ticker_id: listed.ticker_id || identity.ticker || '',
+        name: listed.name && listed.name !== 'CAT'
+            ? listed.name
+            : (identity.ticker || 'Bootstrap CAT'),
+    };
+    currentCAT = { ...catMeta };
+    _resumeCandidateCAT = { ...catMeta };
+    syncResumePairIntoSelectors(catMeta);
+    return true;
+}
+
 function _bootstrapRenderStatus(payload) {
     const globalStatus = document.getElementById('bootstrapGlobalStatus');
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    if (_bootstrapActiveCampaign) syncBootstrapCampaignPairIntoSelectors(payload);
+    hydrateBootstrapCampaignControls(_bootstrapActiveCampaign);
     let summary = 'Follow mode · no active Bootstrap campaign';
     if (_bootstrapActiveCampaign) {
         const campaign = _bootstrapActiveCampaign;
