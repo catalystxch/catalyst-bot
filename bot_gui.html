@@ -31325,14 +31325,11 @@
                     // (page refresh).  The running state is correct — no "fresh start"
                     // needed and we must not overwrite the .fresh_start_chosen flag.
                     if (data.reason !== 'bot_already_running') {
-                        try {
-                            await apiFetch(`${API_URL}/session/fresh-start`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' }
-                            });
-                        } catch (resetErr) {
-                            debugWarn('[RESUME] Failed to auto-start fresh session on no-resume path:', resetErr);
-                        }
+                        // A zero-offer startup is observation, not an explicit reset.
+                        // Calling fresh-start here used to produce a 409 on every
+                        // normal reload once durable fill authority existed.  Keep
+                        // the guarded reset exclusively behind the user's explicit
+                        // Start Fresh action.
                         clearResumeSessionSummary();
                         const assetId = currentCAT?.asset_id || '';
                         const reselectingPersistedPair = !!(
