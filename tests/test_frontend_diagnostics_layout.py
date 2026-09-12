@@ -197,7 +197,9 @@ def test_no_resume_startup_path_does_not_request_authoritative_fresh_reset():
     resume_end = html.index("async function resumeSession()", resume_start)
     resume_block = html[resume_start:resume_end]
     no_resume_start = resume_block.index("if (!data.can_resume)")
-    no_resume_end = resume_block.index("setResumeSessionSummary(data);", no_resume_start)
+    no_resume_end = resume_block.index(
+        "setResumeSessionSummary(data);", no_resume_start
+    )
     no_resume_block = resume_block[no_resume_start:no_resume_end]
 
     assert "session/fresh-start" not in no_resume_block
