@@ -269,6 +269,11 @@ _MUTATING_API_ENDPOINTS = {
 }
 
 _READ_ONLY_WRITE_API_ENDPOINTS = {
+    # WalletConnect signs only canonical Bootstrap messages. The browser
+    # namespace deliberately contains no offer, spend, send, or cancel method.
+    "api_bootstrap_manifest_sign_begin",
+    "api_bootstrap_manifest_sign_complete",
+    "api_bootstrap_manifest_sign_fail",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
     # remain available while a wallet effect is being reconciled and must not
@@ -3830,7 +3835,8 @@ def add_no_cache_headers(response):
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' data: https://icons.dexie.space https://*.spacescan.io https://cdn.spacescan.io https://assets.spacescan.io; "
-            "connect-src 'self'; "
+            "connect-src 'self' https://*.walletconnect.com "
+            "wss://*.walletconnect.com https://*.reown.com wss://*.reown.com; "
             "base-uri 'none'; "
             "object-src 'none'; "
             "form-action 'self'; "
@@ -4470,6 +4476,7 @@ def serve_brand_asset(filename: str):
         "monkeyzoo-logo-1.gif": "monkeyzoo-logo-1.gif",
         "spacescan-logo-192.webp": "spacescan-logo-192.webp",
         "sage_rpc_advanced.png": "sage_rpc_advanced.png",
+        "walletconnect-signing.js": "walletconnect-signing.js",
     }
     safe_name = allowed.get(filename)
     if safe_name is None:
@@ -5001,6 +5008,144 @@ def api_crash_log():
             "mtime": st.st_mtime,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Market Bootstrap — non-financial Sage WalletConnect message signing
+# ---------------------------------------------------------------------------
+
+_walletconnect_signing_service = None
+_walletconnect_signing_project_id = None
+
+
+def _read_walletconnect_identity():
+    """Read the current Sage identity and receive address without mutation."""
+
+    from wallet import get_next_address, get_wallet_identity
+    from walletconnect_signing import SigningError, WalletIdentity
+
+    snapshot = get_wallet_identity()
+    if type(snapshot) is not dict or snapshot.get("success") is not True:
+        raise SigningError("wallet_identity_unavailable")
+    if str(snapshot.get("backend") or "").strip().lower() != "sage":
+        raise SigningError("sage_wallet_required")
+    if snapshot.get("has_secrets") is not True:
+        raise SigningError("sage_signing_key_required")
+    fingerprint = snapshot.get("fingerprint")
+    if type(fingerprint) is not int or fingerprint <= 0:
+        raise SigningError("invalid_wallet_fingerprint")
+    raw_network = str(snapshot.get("network_id") or "").strip().lower()
+    if raw_network == "mainnet":
+        network = "mainnet"
+    elif raw_network.startswith("testnet"):
+        network = "testnet"
+    else:
+        raise SigningError("invalid_wallet_network")
+    address_result = get_next_address(
+        int(getattr(cfg, "WALLET_ID_XCH", 1)), new_address=False
+    )
+    if type(address_result) is not dict or address_result.get("success") is not True:
+        raise SigningError("signing_address_unavailable")
+    return WalletIdentity(
+        wallet_type="sage",
+        fingerprint=fingerprint,
+        network=network,
+        signing_address=str(address_result.get("address") or "").strip(),
+    )
+
+
+def _get_walletconnect_signing_service():
+    """Return one process-local one-time request authority for the current ID."""
+
+    global _walletconnect_signing_project_id, _walletconnect_signing_service
+    from walletconnect_signing import WalletConnectSigningService
+
+    project_id = str(getattr(cfg, "WALLETCONNECT_PROJECT_ID", "") or "").strip()
+    if (
+        _walletconnect_signing_service is None
+        or _walletconnect_signing_project_id != project_id
+    ):
+        _walletconnect_signing_service = WalletConnectSigningService(
+            project_id=project_id,
+            identity_reader=_read_walletconnect_identity,
+        )
+        _walletconnect_signing_project_id = project_id
+    return _walletconnect_signing_service
+
+
+def _walletconnect_signing_error(exc):
+    code = str(getattr(exc, "code", "walletconnect_signing_failed") or "")
+    return jsonify({"success": False, "code": code, "error": code}), 400
+
+
+@app.route("/api/bootstrap/walletconnect/config", methods=["GET"])
+def api_bootstrap_walletconnect_config():
+    project_id = str(getattr(cfg, "WALLETCONNECT_PROJECT_ID", "") or "").strip()
+    return jsonify(
+        {
+            "success": True,
+            "enabled": bool(project_id),
+            "project_id": project_id,
+            "allowed_method": "chia_signMessageByAddress",
+            "financial_authority": False,
+        }
+    )
+
+
+@app.route("/api/bootstrap/manifest/sign/begin", methods=["POST"])
+def api_bootstrap_manifest_sign_begin():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"manifest"}:
+            raise SigningError("invalid_signing_begin_request")
+        identity = _read_walletconnect_identity()
+        signing_request = _get_walletconnect_signing_service().begin_manifest_signature(
+            body["manifest"], identity
+        )
+        return jsonify(
+            {"success": True, "signing_request": signing_request.to_public_dict()}
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/manifest/sign/complete", methods=["POST"])
+def api_bootstrap_manifest_sign_complete():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "response"}:
+            raise SigningError("invalid_signing_complete_request")
+        if type(body["request_id"]) is not str or type(body["response"]) is not dict:
+            raise SigningError("invalid_signing_complete_request")
+        identity = _read_walletconnect_identity()
+        signed_manifest = (
+            _get_walletconnect_signing_service().complete_manifest_signature(
+                body["request_id"], body["response"], identity
+            )
+        )
+        return jsonify({"success": True, "signed_manifest": signed_manifest})
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+
+
+@app.route("/api/bootstrap/manifest/sign/fail", methods=["POST"])
+def api_bootstrap_manifest_sign_fail():
+    from walletconnect_signing import SigningError
+
+    try:
+        body = request.get_json(silent=True)
+        if type(body) is not dict or set(body) != {"request_id", "reason"}:
+            raise SigningError("invalid_signing_failure_request")
+        _get_walletconnect_signing_service().fail_request(
+            body["request_id"], body["reason"]
+        )
+    except SigningError as exc:
+        return _walletconnect_signing_error(exc)
+    return jsonify({"success": True})
 
 
 # ---------------------------------------------------------------------------

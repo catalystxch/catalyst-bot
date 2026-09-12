@@ -305,6 +305,9 @@ class Config:
         # (line 416). Kept in cfg for to_dict() exclusion list completeness.
         self.SAGE_FINGERPRINT = _str("SAGE_FINGERPRINT")  # Auto-login fingerprint
         self.SAGE_SET_CHANGE_ADDRESS = _bool("SAGE_SET_CHANGE_ADDRESS", False)
+        # Public Reown identifier used only for interactive, non-financial
+        # Bootstrap manifest/proof signatures through Sage WalletConnect.
+        self.WALLETCONNECT_PROJECT_ID = _str("WALLETCONNECT_PROJECT_ID")
 
         # ----- Wallet Address (for Spacescan self-spend detection) -----
         # Populated dynamically at startup from wallet RPC (get_next_address).

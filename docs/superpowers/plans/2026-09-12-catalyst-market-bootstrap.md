@@ -233,7 +233,7 @@ git commit -m "feat: persist bootstrap campaign authority"
 - Consumes: public campaign fields, an immediately rechecked Sage identity/address, a WalletConnect session restricted to `chia_signMessageByAddress`, and a one-time signing request.
 - Produces: `canonical_manifest_bytes(manifest) -> bytes`, `manifest_campaign_id(manifest) -> str`, `begin_manifest_signature(manifest, identity) -> SigningRequest`, `complete_manifest_signature(request_id, response, identity) -> dict`, `verify_campaign_manifest(signed_manifest) -> ManifestVerification`, and `safe_import_manifest(signed_manifest, expected_network) -> ImportedManifest`.
 
-- [ ] **Step 1: Write failing canonicalization, tamper, and privacy tests**
+- [x] **Step 1: Write failing canonicalization, tamper, and privacy tests**
 
 Add assertions that differently ordered dictionaries produce identical canonical
 bytes and campaign IDs; changing one anchor digit invalidates the BLS signature;
@@ -241,21 +241,21 @@ fingerprint, balances, credentials, unrelated addresses, and local paths are
 rejected fields; and import exposes no remote trading, fee, subsidy, reserve, or
 loss budget.
 
-- [ ] **Step 2: Run tests and observe the missing-module failure**
+- [x] **Step 2: Run tests and observe the missing-module failure**
 
 Run: `python -m pytest tests/test_bootstrap_manifest.py -q`
 
 Expected: collection fails because `bootstrap_manifest` does not exist.
 
-- [ ] **Step 3: Implement canonical JSON and the bundled WalletConnect client**
+- [x] **Step 3: Implement canonical JSON and the bundled WalletConnect client**
 
 Use sorted-key compact UTF-8 JSON and SHA-256 campaign IDs. Bundle a pinned `@walletconnect/sign-client` build locally; do not load executable JavaScript from a CDN. The dApp namespace requests only `chia_signMessageByAddress` on the selected `chia:mainnet` or `chia:testnet` chain. Display the pairing URI/QR, connected Sage account, exact message digest, approval state, timeout, rejection, and disconnect controls. A missing public `WALLETCONNECT_PROJECT_ID` returns stable `walletconnect_project_id_missing` with no network request.
 
-- [ ] **Step 4: Bind and verify the interactive Sage response**
+- [x] **Step 4: Bind and verify the interactive Sage response**
 
 Immediately recheck Sage RPC identity before opening the request and before accepting its response. Require the WalletConnect account fingerprint/network and requested signing address to match that identity. Verify the returned Chia BLS public key/signature against Sage's exact `("Chia Signed Message", decoded_message).tree_hash()` convention using pinned `chia_rs`; reject wrong account, address, request ID, digest, expiry, duplicate response, timeout, disconnect, user rejection, and tampering. Never treat the existing standalone-RPC `sign_message_by_address` 404, a checksum, or a CATalyst-generated key as wallet proof.
 
-- [ ] **Step 5: Verify an imported manifest has no financial authority**
+- [x] **Step 5: Verify an imported manifest has no financial authority**
 
 `safe_import_manifest()` returns network, asset ID, anchor, corridor, expiry, stage rules, signer public key, and `VERIFIED`/`INVALID`/`UNVERIFIED_ASSET` status only. It requires the joining user to create fresh local budgets and acceptance before persistence.
 
@@ -263,7 +263,7 @@ Run: `python -m pytest tests/test_bootstrap_manifest.py tests/test_walletconnect
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit signed manifests**
+- [x] **Step 6: Commit signed manifests**
 
 ```powershell
 git add src/catalyst/bootstrap_manifest.py src/catalyst/walletconnect_signing.py web/walletconnect_signing.ts scripts/build_walletconnect_signing.mjs package.json package-lock.json assets/walletconnect-signing.js src/catalyst/config.py src/catalyst/api_server.py Catalyst.spec bot_gui.html tests/test_bootstrap_manifest.py tests/test_walletconnect_signing.py tests/test_build_release_config.py

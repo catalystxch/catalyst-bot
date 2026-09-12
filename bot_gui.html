@@ -8218,6 +8218,7 @@
         }
 
     </style>
+    <script defer src="/assets/walletconnect-signing.js"></script>
 </head>
 <body>
 
@@ -12281,6 +12282,40 @@
     <!-- ============================================= -->
     <!-- ABOUT MODAL                                   -->
     <!-- ============================================= -->
+    <div class="modal" id="bootstrapSigningModal" style="z-index: 10004;">
+        <div class="modal-content v4-modal-shell v4-modal-shell--info" style="position: relative; max-width: 660px;">
+            <div class="v4-modal-inner">
+                <button class="v4-modal-close" onclick="cancelBootstrapManifestSigning()" aria-label="Cancel signing">&times;</button>
+                <div class="v4-modal-hero">
+                    <div class="v4-modal-icon">&#x270D;</div>
+                    <div>
+                        <div class="v4-modal-kicker">Sage WalletConnect</div>
+                        <h2 class="v4-modal-title">Sign Bootstrap manifest</h2>
+                        <p class="v4-modal-copy">Approve one public, non-financial message in Sage. This connection cannot create offers, sign coin spends, send funds, or cancel offers.</p>
+                    </div>
+                </div>
+                <div class="v4-modal-panel" style="text-align: left;">
+                    <div class="v4-modal-panel-title">Signing request</div>
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 8px; font-size: 0.86em; overflow-wrap: anywhere;">
+                        <span style="color: var(--text-secondary);">Sage account</span><code id="bootstrapSigningAccount">Waiting...</code>
+                        <span style="color: var(--text-secondary);">Message digest</span><code id="bootstrapSigningDigest">Waiting...</code>
+                        <span style="color: var(--text-secondary);">Approval state</span><strong id="bootstrapSigningState">Preparing...</strong>
+                    </div>
+                </div>
+                <div id="bootstrapSigningPairing" class="v4-modal-panel" style="display: none; text-align: center;">
+                    <img id="bootstrapSigningQr" alt="WalletConnect pairing QR code" style="width: 260px; max-width: 100%; background: white; border-radius: 12px; padding: 8px;">
+                    <p style="font-size: 0.84em; color: var(--text-secondary);">Scan in Sage WalletConnect, or copy the pairing URI.</p>
+                    <textarea id="bootstrapSigningUri" readonly style="width: 100%; min-height: 72px; resize: vertical;"></textarea>
+                    <button class="btn btn-secondary" onclick="copyBootstrapSigningUri()">Copy pairing URI</button>
+                </div>
+                <div id="bootstrapSigningError" class="v4-modal-panel v4-modal-panel--danger" style="display: none; text-align: left;"></div>
+                <div class="v4-modal-actions v4-modal-actions--center">
+                    <button class="btn btn-secondary" onclick="cancelBootstrapManifestSigning()">Cancel and disconnect</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="modal" id="aboutModal" style="z-index: 10003;">
         <div class="modal-content v4-modal-shell v4-modal-shell--warning v4-modal-shell--lg" style="position: relative;">
             <div class="v4-modal-inner">
@@ -38250,6 +38285,118 @@ document.addEventListener('DOMContentLoaded', () => {
     document.addEventListener('scroll', _hide, true);
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') _hide(); });
 })();
+</script>
+<script>
+let _bootstrapSigningRequestId = null;
+
+function _setBootstrapSigningState(state, detail) {
+    const labels = {
+        initializing: 'Initializing secure pairing...',
+        awaiting_session_approval: 'Approve the CATalyst connection in Sage',
+        awaiting_message_approval: 'Approve the exact message in Sage',
+        approved: 'Signature approved and being verified',
+        disconnected: 'Disconnected from Sage'
+    };
+    const el = document.getElementById('bootstrapSigningState');
+    if (el) el.textContent = detail || labels[state] || state;
+}
+
+function _showBootstrapSigningError(message) {
+    const el = document.getElementById('bootstrapSigningError');
+    if (!el) return;
+    el.textContent = String(message || 'WalletConnect signing failed');
+    el.style.display = 'block';
+}
+
+async function signBootstrapManifest(manifest) {
+    const modal = document.getElementById('bootstrapSigningModal');
+    const pairing = document.getElementById('bootstrapSigningPairing');
+    const error = document.getElementById('bootstrapSigningError');
+    if (pairing) pairing.style.display = 'none';
+    if (error) error.style.display = 'none';
+    if (modal) modal.style.display = 'flex';
+    _setBootstrapSigningState('initializing');
+
+    try {
+        if (!window.CatalystWalletConnectSigning) throw new Error('walletconnect_bundle_unavailable');
+        const configResponse = await apiFetch('/api/bootstrap/walletconnect/config', { cache: 'no-store' });
+        const config = await configResponse.json();
+        if (!config.success || !config.enabled) throw new Error('walletconnect_project_id_missing');
+        const beginResponse = await apiFetch('/api/bootstrap/manifest/sign/begin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ manifest })
+        });
+        const begun = await beginResponse.json();
+        if (!begun.success) throw new Error(begun.code || begun.error || 'signing_begin_failed');
+        const request = begun.signing_request;
+        _bootstrapSigningRequestId = request.request_id;
+        document.getElementById('bootstrapSigningAccount').textContent = request.account;
+        document.getElementById('bootstrapSigningDigest').textContent = request.message_digest;
+
+        const walletResponse = await window.CatalystWalletConnectSigning.sign({
+            projectId: config.project_id,
+            request,
+            onPairingUri: (uri, qrDataUrl) => {
+                document.getElementById('bootstrapSigningUri').value = uri;
+                document.getElementById('bootstrapSigningQr').src = qrDataUrl;
+                pairing.style.display = 'block';
+            },
+            onState: _setBootstrapSigningState
+        });
+        const completeResponse = await apiFetch('/api/bootstrap/manifest/sign/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_id: request.request_id, response: walletResponse })
+        });
+        const completed = await completeResponse.json();
+        if (!completed.success) throw new Error(completed.code || completed.error || 'signature_verification_failed');
+        _bootstrapSigningRequestId = null;
+        _setBootstrapSigningState('approved', 'Verified Sage signature');
+        setTimeout(() => { if (modal) modal.style.display = 'none'; }, 500);
+        return completed.signed_manifest;
+    } catch (err) {
+        _showBootstrapSigningError(err && err.message ? err.message : err);
+        if (_bootstrapSigningRequestId) {
+            const requestId = _bootstrapSigningRequestId;
+            _bootstrapSigningRequestId = null;
+            apiFetch('/api/bootstrap/manifest/sign/fail', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ request_id: requestId, reason: 'user_rejected' })
+            }).catch(() => {});
+        }
+        throw err;
+    }
+}
+
+async function cancelBootstrapManifestSigning() {
+    const requestId = _bootstrapSigningRequestId;
+    _bootstrapSigningRequestId = null;
+    try { await window.CatalystWalletConnectSigning?.disconnect(); } catch (_) {}
+    if (requestId) {
+        try {
+            await apiFetch('/api/bootstrap/manifest/sign/fail', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ request_id: requestId, reason: 'user_rejected' })
+            });
+        } catch (_) {}
+    }
+    const modal = document.getElementById('bootstrapSigningModal');
+    if (modal) modal.style.display = 'none';
+}
+
+async function copyBootstrapSigningUri() {
+    const uri = document.getElementById('bootstrapSigningUri')?.value || '';
+    if (!uri) return;
+    try {
+        await navigator.clipboard.writeText(uri);
+        showToast('WalletConnect pairing URI copied', 'success');
+    } catch (_) {
+        showToast('Could not copy the pairing URI', 'error');
+    }
+}
 </script>
 </body>
 </html>
