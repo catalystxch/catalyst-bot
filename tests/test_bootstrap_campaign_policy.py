@@ -9,6 +9,7 @@ from bootstrap_campaign import (
     CampaignMode,
     CampaignSide,
     CampaignStage,
+    CampaignStopReason,
     derive_anchor_from_valuation,
     evaluate_bootstrap_campaign,
 )
@@ -132,3 +133,200 @@ def test_invalid_valuation_anchor_inputs_are_rejected(supply, valuation, message
             circulating_supply=supply,
             implied_valuation_xch=valuation,
         )
+
+
+@pytest.mark.parametrize(
+    ("fills", "clusters", "stable_minutes", "fraction", "stage"),
+    [
+        (0, 0, 0, "0.10", CampaignStage.BOOTSTRAP),
+        (2, 2, 0, "0.25", CampaignStage.DISCOVERY_25),
+        (6, 3, 30, "0.50", CampaignStage.DISCOVERY_50),
+        (12, 5, 120, "1.00", CampaignStage.ESTABLISHED),
+    ],
+)
+def test_capacity_requires_approved_fill_cluster_and_depth_thresholds(
+    fills,
+    clusters,
+    stable_minutes,
+    fraction,
+    stage,
+):
+    evidence = BootstrapEvidence(
+        confirmed_fills=fills,
+        settlement_clusters=clusters,
+        independent_depth_sides=frozenset({CampaignSide.BUY, CampaignSide.SELL}),
+        stable_since=NOW - timedelta(minutes=stable_minutes),
+    )
+
+    decision = evaluate_bootstrap_campaign(make_campaign(), evidence, now=NOW)
+
+    assert decision.deployment_fraction == Decimal(fraction)
+    assert decision.stage is stage
+
+
+@pytest.mark.parametrize(
+    "evidence_kwargs",
+    [
+        {
+            "confirmed_fills": 2,
+            "settlement_clusters": 1,
+            "independent_depth_sides": frozenset({CampaignSide.BUY, CampaignSide.SELL}),
+            "stable_since": NOW,
+        },
+        {
+            "confirmed_fills": 2,
+            "settlement_clusters": 2,
+            "independent_depth_sides": frozenset({CampaignSide.BUY}),
+            "stable_since": NOW,
+        },
+        {
+            "confirmed_fills": 6,
+            "settlement_clusters": 3,
+            "independent_depth_sides": frozenset({CampaignSide.BUY, CampaignSide.SELL}),
+            "stable_since": NOW - timedelta(minutes=29, seconds=59),
+        },
+    ],
+)
+def test_capacity_does_not_advance_when_one_required_threshold_is_missing(
+    evidence_kwargs,
+):
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(), BootstrapEvidence(**evidence_kwargs), now=NOW
+    )
+
+    assert decision.deployment_fraction < Decimal("0.50")
+
+
+def test_suspected_linked_activity_cannot_unlock_capacity():
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(),
+        BootstrapEvidence(
+            confirmed_fills=12,
+            settlement_clusters=5,
+            independent_depth_sides=frozenset({CampaignSide.BUY, CampaignSide.SELL}),
+            stable_since=NOW - timedelta(hours=3),
+            suspected_linked_activity=True,
+        ),
+        now=NOW,
+    )
+
+    assert decision.deployment_fraction == Decimal("0.10")
+    assert "linked_activity_excluded" in decision.reason_codes
+
+
+def test_adverse_fill_cools_only_affected_side_for_five_minutes():
+    campaign = make_campaign()
+    before_boundary = evaluate_bootstrap_campaign(
+        campaign,
+        BootstrapEvidence(
+            adverse_fill_times=((CampaignSide.SELL, NOW - timedelta(minutes=4)),)
+        ),
+        now=NOW,
+    )
+    at_boundary = evaluate_bootstrap_campaign(
+        campaign,
+        BootstrapEvidence(
+            adverse_fill_times=((CampaignSide.SELL, NOW - timedelta(minutes=5)),)
+        ),
+        now=NOW,
+    )
+
+    assert before_boundary.cooldown_sides == frozenset({CampaignSide.SELL})
+    assert at_boundary.cooldown_sides == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("proposed", "hour_ago", "day_ago", "expected"),
+    [
+        ("0.02", "0.01", "0.01", "0.0105"),
+        ("0.001", "0.01", "0.01", "0.0095"),
+        ("0.0125", "0.012", "0.01", "0.012"),
+    ],
+)
+def test_anchor_movement_is_capped_hourly_daily_and_by_corridor(
+    proposed,
+    hour_ago,
+    day_ago,
+    expected,
+):
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(),
+        BootstrapEvidence(
+            current_anchor_price=Decimal(hour_ago),
+            proposed_anchor_price=Decimal(proposed),
+            anchor_price_one_hour_ago=Decimal(hour_ago),
+            anchor_price_one_day_ago=Decimal(day_ago),
+        ),
+        now=NOW,
+    )
+
+    assert decision.anchor_price == Decimal(expected)
+    assert "anchor_movement_capped" in decision.reason_codes
+
+
+def test_seven_day_expiry_authorizes_only_cancellation():
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(),
+        BootstrapEvidence(),
+        now=NOW + timedelta(days=7),
+    )
+
+    assert decision.authorized is False
+    assert decision.deployment_fraction == Decimal("0")
+    assert decision.stop_reason is CampaignStopReason.EXPIRED
+    assert decision.cancellation_required is True
+    assert decision.manual_restart_required is True
+
+
+def test_five_percent_campaign_loss_requires_manual_restart():
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(),
+        BootstrapEvidence(
+            realized_loss_xch=Decimal("0.05"),
+            marked_inventory_loss_xch=Decimal("0.05"),
+        ),
+        now=NOW,
+    )
+
+    assert decision.authorized is False
+    assert decision.stop_reason is CampaignStopReason.LOSS_LIMIT
+    assert decision.cancellation_required is True
+    assert decision.manual_restart_required is True
+
+
+def test_fee_eighty_percent_stops_creation_and_preserves_cancellation_reserve():
+    decision = evaluate_bootstrap_campaign(
+        make_campaign(fee_budget_xch=Decimal("0.05")),
+        BootstrapEvidence(fee_spent_xch=Decimal("0.04")),
+        now=NOW,
+    )
+
+    assert decision.authorized is False
+    assert decision.stop_reason is CampaignStopReason.FEE_RESERVE
+    assert decision.cancellation_required is True
+    assert decision.manual_restart_required is False
+    assert decision.cancellation_fee_reserve_xch == Decimal("0.01")
+
+
+@pytest.mark.parametrize(
+    ("evidence_kwargs", "message"),
+    [
+        ({"confirmed_fills": -1}, "confirmed fills"),
+        ({"settlement_clusters": -1}, "settlement clusters"),
+        ({"fee_spent_xch": -1.0}, "Decimal"),
+        ({"realized_loss_xch": Decimal("-1")}, "realized loss"),
+        (
+            {"stable_since": datetime(2026, 9, 12, 11, 0)},
+            "UTC",
+        ),
+        (
+            {"adverse_fill_times": ((CampaignSide.BUY, datetime(2026, 9, 12)),)},
+            "UTC",
+        ),
+        ({"independent_depth_sides": frozenset({"buy"})}, "campaign side"),
+        ({"current_anchor_price": Decimal("0")}, "current anchor"),
+    ],
+)
+def test_invalid_evidence_cannot_change_campaign_authority(evidence_kwargs, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        BootstrapEvidence(**evidence_kwargs)

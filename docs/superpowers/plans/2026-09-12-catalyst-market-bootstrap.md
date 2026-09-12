@@ -119,7 +119,7 @@ git commit -m "feat: define isolated bootstrap campaigns"
 - Consumes: `BootstrapEvidence(confirmed_fills, settlement_clusters, independent_depth_sides, stable_since, hourly_anchor_change, daily_anchor_change, adverse_fill_times, fee_spent_xch, realized_loss_xch, marked_inventory_loss_xch)`.
 - Produces: deterministic decisions with fractions `0.10`, `0.25`, `0.50`, `1.00`, or `0`.
 
-- [ ] **Step 1: Write the failing stage-table tests**
+- [x] **Step 1: Write the failing stage-table tests**
 
 ```python
 @pytest.mark.parametrize(
@@ -140,17 +140,17 @@ def test_capacity_requires_approved_fill_cluster_and_depth_thresholds(
 
 Add boundary failures proving a fill threshold without distinct clusters or current independent depth cannot advance.
 
-- [ ] **Step 2: Run the stage tests and observe incorrect 10% decisions**
+- [x] **Step 2: Run the stage tests and observe incorrect 10% decisions**
 
 Run: `python -m pytest tests/test_bootstrap_campaign_policy.py -k "capacity or stage" -q`
 
 Expected: 25%, 50%, and 100% cases fail before stage logic exists.
 
-- [ ] **Step 3: Implement stage transitions and identity-cluster disclaimers**
+- [x] **Step 3: Implement stage transitions and identity-cluster disclaimers**
 
 Stage decisions require current attributable non-maker depth for every funded side. Treat settlement clusters as conservative on-chain heuristics; any `suspected_linked_activity=True` excludes the related fills and emits `linked_activity_excluded`.
 
-- [ ] **Step 4: Write and pass movement, cooldown, expiry, loss, and fee tests**
+- [x] **Step 4: Write and pass movement, cooldown, expiry, loss, and fee tests**
 
 Add exact boundary tests asserting that an adverse fill cools only its affected
 side until `fill_time + timedelta(minutes=5)`; proposed anchor changes are
@@ -164,7 +164,7 @@ Run: `python -m pytest tests/test_bootstrap_campaign_policy.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the complete pure decision engine**
+- [x] **Step 5: Commit the complete pure decision engine**
 
 ```powershell
 git add src/catalyst/bootstrap_campaign.py tests/test_bootstrap_campaign_policy.py
