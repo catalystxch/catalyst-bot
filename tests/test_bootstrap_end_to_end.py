@@ -616,6 +616,12 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
         },
     )
     monkeypatch.setattr(
+        wallet,
+        "get_wallet_puzzle_hashes",
+        lambda: {"99" * 32},
+    )
+    monkeypatch.setattr(bot_loop.database, "get_fills", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
         tx_fees, "get_effective_transaction_fee_mojos", lambda: 10_000_000
     )
 
@@ -625,6 +631,15 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     loop = object.__new__(BotLoop)
     loop._publication_discovery_pending = 0
     loop._last_bulk_create_time = 0
+    loop._market_confidence_result = SimpleNamespace(
+        data_valid=True,
+        trusted_midpoint=Decimal("0.001"),
+        trusted_bid=Decimal("0.00096"),
+        trusted_ask=Decimal("0.00104"),
+        independent_bid_depth_mojos=0,
+        independent_ask_depth_mojos=0,
+        required_depth_mojos=1,
+    )
     loop.coin_manager = SimpleNamespace(
         is_busy=lambda: False,
         snapshot_coins=lambda reason: created_call.setdefault("snapshot", reason),
@@ -659,6 +674,12 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     assert sum(
         level["xch_amount"] for level in created_call["plan"]["sides"]["buy"]["levels"]
     ) == Decimal("0.1")
+    assert max(
+        level["price"] for level in created_call["plan"]["sides"]["buy"]["levels"]
+    ) <= Decimal("0.00096")
+    assert min(
+        level["price"] for level in created_call["plan"]["sides"]["sell"]["levels"]
+    ) >= Decimal("0.00104")
     assert queued_dexie == [("offer1bootstrap", "61" * 32)]
     assert queued_splash == queued_dexie
 

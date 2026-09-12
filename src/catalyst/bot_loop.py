@@ -12442,6 +12442,14 @@ class BotLoop:
                 getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
             ),
         }
+        confidence = getattr(self, "_market_confidence_result", None)
+        if confidence is not None and getattr(confidence, "data_valid", False) is True:
+            trusted_bid = getattr(confidence, "trusted_bid", None)
+            trusted_ask = getattr(confidence, "trusted_ask", None)
+            if type(trusted_bid) is Decimal:
+                balances["trusted_bid"] = trusted_bid
+            if type(trusted_ask) is Decimal:
+                balances["trusted_ask"] = trusted_ask
         intents = database.get_offer_intents_for_registry()
         now = datetime.now(timezone.utc)
         try:
