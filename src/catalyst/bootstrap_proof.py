@@ -139,8 +139,10 @@ def _canonical_decimal(
         number = Decimal(value)
     except InvalidOperation as exc:
         raise ProofError(f"invalid_{field}") from exc
-    if not number.is_finite() or number < 0 or (
-        maximum is not None and number > maximum
+    if (
+        not number.is_finite()
+        or number < 0
+        or (maximum is not None and number > maximum)
     ):
         raise ProofError(f"invalid_{field}")
     canonical = format(number, "f")
@@ -317,8 +319,7 @@ def canonical_participation_bytes(report: Any) -> bytes:
 
 def participation_report_id(report: Any) -> str:
     return hashlib.sha256(
-        b"catalyst-bootstrap-participation-v1\0"
-        + canonical_participation_bytes(report)
+        b"catalyst-bootstrap-participation-v1\0" + canonical_participation_bytes(report)
     ).hexdigest()
 
 
@@ -342,9 +343,7 @@ def build_participation_report(
     period_start, start = _canonical_timestamp(
         observations.get("period_start"), "period_start"
     )
-    period_end, end = _canonical_timestamp(
-        observations.get("period_end"), "period_end"
-    )
+    period_end, end = _canonical_timestamp(observations.get("period_end"), "period_end")
     expires_at, expiry = _canonical_timestamp(
         observations.get("expires_at"), "expires_at"
     )
@@ -374,9 +373,7 @@ def build_participation_report(
             raise ProofError("invalid_observation_corridor")
         if own or linked or not within_corridor:
             continue
-        observation_id = _hex_id(
-            sample.get("observation_id"), "observation_id"
-        )
+        observation_id = _hex_id(sample.get("observation_id"), "observation_id")
         if observation_id in seen_observation_ids:
             raise ProofError("duplicate_observation_id")
         seen_observation_ids.add(observation_id)
@@ -440,8 +437,8 @@ def build_participation_report(
         average_spread = spread_seconds / uptime
         depth_score = Decimal("40") * average_depth / (average_depth + 1)
         uptime_score = Decimal("35") * Decimal(uptime) / Decimal(period_seconds)
-        spread_score = Decimal("25") * Decimal("1000") / (
-            Decimal("1000") + average_spread
+        spread_score = (
+            Decimal("25") * Decimal("1000") / (Decimal("1000") + average_spread)
         )
         score_parts = tuple(
             value.quantize(_SCORE_QUANTUM, rounding=ROUND_HALF_EVEN)
@@ -460,22 +457,12 @@ def build_participation_report(
         "period_start": period_start,
         "period_end": period_end,
         "expires_at": expires_at,
-        "eligible_observation_ids": sorted(
-            item["observation_id"] for item in eligible
-        ),
+        "eligible_observation_ids": sorted(item["observation_id"] for item in eligible),
         "eligible_offer_ids": sorted(
-            {
-                identifier
-                for item in eligible
-                for identifier in item["offer_ids"]
-            }
+            {identifier for item in eligible for identifier in item["offer_ids"]}
         ),
         "eligible_fill_ids": sorted(
-            {
-                identifier
-                for item in eligible
-                for identifier in item["fill_ids"]
-            }
+            {identifier for item in eligible for identifier in item["fill_ids"]}
         ),
         "quality": {
             "depth_xch_seconds": _decimal_text(depth_seconds),
@@ -552,9 +539,7 @@ def verify_participation_report(
         if expected_network is not None and report["network"] != expected_network:
             raise ProofError("participation_network_mismatch")
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        _expiry_text, expiry = _canonical_timestamp(
-            report["expires_at"], "expires_at"
-        )
+        _expiry_text, expiry = _canonical_timestamp(report["expires_at"], "expires_at")
         if current > expiry:
             raise ProofError("participation_report_expired")
         digest = hashlib.sha256(message).hexdigest()

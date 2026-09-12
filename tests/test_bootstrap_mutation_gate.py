@@ -115,22 +115,28 @@ def test_changed_identity_stopped_expired_and_superseded_authority_fail_closed()
     assert _authorize(campaign, identity=_identity(wallet_id=3))["reason_code"] == (
         "BOOTSTRAP_IDENTITY_MISMATCH"
     )
-    assert _authorize(
-        campaign,
-        bootstrap_campaign=_record(campaign, status="stopped"),
-    )["reason_code"] == "BOOTSTRAP_NOT_ACTIVE"
+    assert (
+        _authorize(
+            campaign,
+            bootstrap_campaign=_record(campaign, status="stopped"),
+        )["reason_code"]
+        == "BOOTSTRAP_NOT_ACTIVE"
+    )
     assert _authorize(campaign, expected_revision=2)["reason_code"] == (
         "BOOTSTRAP_REVISION_SUPERSEDED"
     )
 
     expired = _campaign(expires_at=NOW - timedelta(microseconds=1))
-    assert _authorize(
-        expired,
-        bootstrap_campaign=_record(expired),
-        bootstrap_decision=evaluate_bootstrap_campaign(
-            expired, BootstrapEvidence(), now=NOW
-        ),
-    )["reason_code"] == "BOOTSTRAP_EXPIRED"
+    assert (
+        _authorize(
+            expired,
+            bootstrap_campaign=_record(expired),
+            bootstrap_decision=evaluate_bootstrap_campaign(
+                expired, BootstrapEvidence(), now=NOW
+            ),
+        )["reason_code"]
+        == "BOOTSTRAP_EXPIRED"
+    )
 
 
 def test_valid_follow_authority_does_not_require_a_bootstrap_campaign():

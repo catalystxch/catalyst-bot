@@ -508,9 +508,7 @@ class AppBridge:
         """Report the deliberately disabled partial-offer capability."""
         import api_server
 
-        with api_server.app.test_request_context(
-            "/api/bootstrap/partial-capability"
-        ):
+        with api_server.app.test_request_context("/api/bootstrap/partial-capability"):
             resp = api_server.api_bootstrap_partial_offer_capability()
         return _unwrap_flask_response(resp)
 

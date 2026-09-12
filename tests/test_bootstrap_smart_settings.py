@@ -51,8 +51,7 @@ def _decision(campaign, **overrides):
         "reason_codes": ("bootstrap_capacity_0.10",),
         "cancellation_required": False,
         "manual_restart_required": False,
-        "cancellation_fee_reserve_xch": campaign.fee_budget_xch
-        * Decimal("0.20"),
+        "cancellation_fee_reserve_xch": campaign.fee_budget_xch * Decimal("0.20"),
     }
     values.update(overrides)
     return BootstrapDecision(**values)

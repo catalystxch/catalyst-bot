@@ -50,6 +50,7 @@ def test_campaign_isolated_budgets_and_default_corridor():
     assert campaign.initial_deployment_fraction == Decimal("0.10")
     assert campaign.subsidy_budget_xch == Decimal("0")
 
+
 def test_invalid_campaign_cannot_reach_outside_budget():
     with pytest.raises(ValueError, match="xch budget"):
         make_campaign(xch_budget=Decimal("-1"))
@@ -71,6 +72,7 @@ class CampaignStage(str, Enum):
     ESTABLISHED = "established"
     UNSAFE = "unsafe"
     STOPPED = "stopped"
+
 
 @dataclass(frozen=True, slots=True)
 class BootstrapDecision:
@@ -124,8 +126,12 @@ git commit -m "feat: define isolated bootstrap campaigns"
 ```python
 @pytest.mark.parametrize(
     ("fills", "clusters", "stable_minutes", "depth", "fraction"),
-    [(0, 0, 0, False, "0.10"), (2, 2, 0, True, "0.25"),
-     (6, 3, 30, True, "0.50"), (12, 5, 120, True, "1.00")],
+    [
+        (0, 0, 0, False, "0.10"),
+        (2, 2, 0, True, "0.25"),
+        (6, 3, 30, True, "0.50"),
+        (12, 5, 120, True, "1.00"),
+    ],
 )
 def test_capacity_requires_approved_fill_cluster_and_depth_thresholds(
     fills, clusters, stable_minutes, depth, fraction

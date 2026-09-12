@@ -87,12 +87,11 @@ def test_below_floor_quote_requires_the_exact_separate_subsidy_shortfall():
     assert funded["authorized"] is True
     assert funded["subsidy_used_xch"] > Decimal("0")
     assert funded["subsidy_used_xch"] <= subsidized.subsidy_budget_xch
-    assert any(
-        level["subsidy_xch"] > 0
-        for level in funded["sides"]["buy"]["levels"]
-    )
+    assert any(level["subsidy_xch"] > 0 for level in funded["sides"]["buy"]["levels"])
 
-    too_small = _campaign(subsidy=funded["subsidy_used_xch"] - Decimal("0.000000000001"))
+    too_small = _campaign(
+        subsidy=funded["subsidy_used_xch"] - Decimal("0.000000000001")
+    )
     rejected = derive_bootstrap_plan(
         too_small,
         _decision(too_small),
@@ -121,8 +120,7 @@ def test_coin_prep_projection_contains_only_staged_purpose_separated_outputs():
     assert prep["excluded_xch"] == {
         "campaign_undeployed_xch": Decimal("0.9"),
         "cancellation_fee_reserve_xch": Decimal("0.004"),
-        "subsidy_remaining_xch": campaign.subsidy_budget_xch
-        - plan["subsidy_used_xch"],
+        "subsidy_remaining_xch": campaign.subsidy_budget_xch - plan["subsidy_used_xch"],
     }
 
 
@@ -142,6 +140,4 @@ def test_offer_specs_preserve_exact_bootstrap_level_purpose_and_amounts():
     assert [spec["xch_amount"] for spec in specs] == [
         level["xch_amount"] for level in plan["sides"]["buy"]["levels"]
     ]
-    assert sum(spec["subsidy_xch"] for spec in specs) == plan[
-        "subsidy_used_xch"
-    ]
+    assert sum(spec["subsidy_xch"] for spec in specs) == plan["subsidy_used_xch"]

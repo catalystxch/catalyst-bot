@@ -675,7 +675,9 @@ def _resolve_smart_mid_price(
         price_source = "trusted_offer_book"
         messages.append(f"Price: {mid_price:.8f} (trusted offer book)")
     else:
-        messages.append("Price unavailable: a valid attributable offer book is required")
+        messages.append(
+            "Price unavailable: a valid attributable offer book is required"
+        )
 
     try:
         exact_spacescan_price = Decimal(str(spacescan_price))
@@ -1106,19 +1108,10 @@ def _smart_bootstrap_suggestion_reasons(
         "insufficient_ask_depth",
     }
     raw_reasons = tuple(str(reason) for reason in (field("reason_codes") or ()))
-    reasons = [
-        str(reason)
-        for reason in raw_reasons
-        if str(reason) in triggers
-    ]
+    reasons = [str(reason) for reason in raw_reasons if str(reason) in triggers]
     bid = field("trusted_bid")
     ask = field("trusted_ask")
-    if (
-        type(bid) is Decimal
-        and type(ask) is Decimal
-        and bid > 0
-        and ask >= bid
-    ):
+    if type(bid) is Decimal and type(ask) is Decimal and bid > 0 and ask >= bid:
         midpoint = (bid + ask) / Decimal("2")
         spread_bps = (ask - bid) / midpoint * Decimal("10000")
         if spread_bps > Decimal("1000"):

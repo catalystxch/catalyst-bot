@@ -461,9 +461,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             "has_data": True,
             "api_ok": True,
             "provider_book": {
-                "bids": [
-                    {"offer_id": "bid", "price": "0.1", "amount_mojos": 2_000}
-                ],
+                "bids": [{"offer_id": "bid", "price": "0.1", "amount_mojos": 2_000}],
                 "asks": [],
             },
         }
@@ -471,9 +469,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         with (
             patch("wallet.get_wallet_balance") as wallet_balance,
             patch("database.clear_market_analysis_cache") as clear_cache,
-            patch(
-                "market_data_collector.collect_all_market_data", return_value={}
-            ),
+            patch("market_data_collector.collect_all_market_data", return_value={}),
             patch("market_data_collector.analyze_market_data", return_value={}),
             patch.object(
                 smart_defaults,

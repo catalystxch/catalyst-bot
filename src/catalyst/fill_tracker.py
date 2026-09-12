@@ -46,7 +46,10 @@ def derive_bootstrap_settlement_evidence(
 
     if type(rows) is not list:
         raise TypeError("Bootstrap settlement rows must be a list")
-    if type(own_trade_ids) is not frozenset or type(linked_cluster_ids) is not frozenset:
+    if (
+        type(own_trade_ids) is not frozenset
+        or type(linked_cluster_ids) is not frozenset
+    ):
         raise TypeError("Bootstrap exclusion identities must be frozen sets")
     if (
         type(campaign_id) is not str
@@ -86,8 +89,7 @@ def derive_bootstrap_settlement_evidence(
             1
             for candidate in accepted.values()
             if candidate.get("side") == row.get("side")
-            and candidate.get("participant_cluster")
-            != row.get("participant_cluster")
+            and candidate.get("participant_cluster") != row.get("participant_cluster")
         )
         > 0
     )

@@ -165,10 +165,9 @@ def derive_bootstrap_plan(
         or decision.allowed_sides != campaign.allowed_sides
     ):
         raise ValueError("Bootstrap decision does not match campaign authority")
-    if (
-        type(decision.deployment_fraction) is not Decimal
-        or not Decimal("0") <= decision.deployment_fraction <= Decimal("1")
-    ):
+    if type(decision.deployment_fraction) is not Decimal or not Decimal(
+        "0"
+    ) <= decision.deployment_fraction <= Decimal("1"):
         raise ValueError("Bootstrap deployment fraction is invalid")
 
     xch_available = _bootstrap_decimal(balances, "xch_available")
@@ -185,20 +184,14 @@ def derive_bootstrap_plan(
     mode = (
         "TWO_SIDED"
         if len(campaign.allowed_sides) == 2
-        else (
-            "BUY_ONLY"
-            if CampaignSide.BUY in campaign.allowed_sides
-            else "SELL_ONLY"
-        )
+        else ("BUY_ONLY" if CampaignSide.BUY in campaign.allowed_sides else "SELL_ONLY")
     )
     cancellation_reserve = campaign.fee_budget_xch * Decimal("0.20")
     if decision.cancellation_fee_reserve_xch != cancellation_reserve:
         raise ValueError("Bootstrap cancellation fee reserve is invalid")
     creation_limit = campaign.fee_budget_xch - cancellation_reserve
     creation_fee_available = max(Decimal("0"), creation_limit - fee_spent)
-    subsidy_available = max(
-        Decimal("0"), campaign.subsidy_budget_xch - subsidy_spent
-    )
+    subsidy_available = max(Decimal("0"), campaign.subsidy_budget_xch - subsidy_spent)
 
     plan: dict[str, Any] = {
         "authorized": False,
@@ -270,9 +263,7 @@ def derive_bootstrap_plan(
     inventory_skew = Decimal("0")
     if len(active_sides) == 2:
         inventory_skew = (cat_ratio - xch_ratio) * Decimal("0.02")
-        inventory_skew = min(
-            Decimal("0.02"), max(Decimal("-0.02"), inventory_skew)
-        )
+        inventory_skew = min(Decimal("0.02"), max(Decimal("-0.02"), inventory_skew))
 
     trusted_bid = balances.get("trusted_bid")
     trusted_ask = balances.get("trusted_ask")

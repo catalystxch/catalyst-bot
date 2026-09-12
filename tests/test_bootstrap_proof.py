@@ -181,9 +181,9 @@ def test_private_wallet_fields_never_serialize_into_report_or_signing_request():
         assert forbidden not in serialized
     assert signing_request["method"] == "chia_signMessageByAddress"
     assert signing_request["address"] == ADDRESS
-    assert signing_request["message"] == "0x" + canonical_participation_bytes(
-        report
-    ).hex()
+    assert (
+        signing_request["message"] == "0x" + canonical_participation_bytes(report).hex()
+    )
 
 
 def test_report_is_canonical_deterministic_and_signature_verifies():
@@ -285,9 +285,7 @@ def test_static_directory_record_requires_valid_bound_manifest_and_report():
             "directory_record_expired",
         ),
         (
-            lambda record: record.__setitem__(
-                "expires_at", "2026-09-19T11:00:00Z"
-            ),
+            lambda record: record.__setitem__("expires_at", "2026-09-19T11:00:00Z"),
             "invalid_directory_expires_at",
         ),
     ],
@@ -337,9 +335,9 @@ def test_static_directory_schema_and_docs_are_fail_closed_and_nonendorsing():
             encoding="utf-8"
         )
     )
-    readme = (
-        ROOT / "docs" / "bootstrap-directory" / "README.md"
-    ).read_text(encoding="utf-8")
+    readme = (ROOT / "docs" / "bootstrap-directory" / "README.md").read_text(
+        encoding="utf-8"
+    )
 
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == {
