@@ -3418,8 +3418,10 @@ class OfferManager:
                     or get_offer_bech32(trade_id)
                     or ""
                 )
-                cached = projected and bool(offer_bech32) and update_offer_bech32(
-                    trade_id, offer_bech32
+                cached = (
+                    projected
+                    and bool(offer_bech32)
+                    and update_offer_bech32(trade_id, offer_bech32)
                 )
                 if not projected or not cached:
                     log_event(
@@ -8544,9 +8546,7 @@ class OfferManager:
             return None
         try:
             protocols = {
-                json.loads(event["evidence_json"])["wallet_effect"]["batch"][
-                    "protocol"
-                ]
+                json.loads(event["evidence_json"])["wallet_effect"]["batch"]["protocol"]
                 for event in prepared
             }
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -8774,14 +8774,12 @@ class OfferManager:
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                         manifest = None
                     if manifest is not None:
-                        cancel_context = (
-                            offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
-                                manifest,
-                                blocker_ids,
-                                evidence,
-                                database_module=database,
-                                observed_at=observed_at,
-                            )
+                        cancel_context = offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
+                            manifest,
+                            blocker_ids,
+                            evidence,
+                            database_module=database,
+                            observed_at=observed_at,
                         )
                 classification = offer_reconciliation.classify_terminal_evidence(
                     intent_row,
@@ -8801,8 +8799,7 @@ class OfferManager:
                 ):
                     reconcile_rows = [intent_row]
                     if (
-                        terminal_classification
-                        == offer_reconciliation.CANCELLED_PROVEN
+                        terminal_classification == offer_reconciliation.CANCELLED_PROVEN
                         and type(cancel_context) is dict
                         and len(cancel_context.get("members", [])) > 1
                     ):
@@ -8848,8 +8845,7 @@ class OfferManager:
                             now=observed_at,
                         )
                         if (
-                            reconciled.get("classification")
-                            != terminal_classification
+                            reconciled.get("classification") != terminal_classification
                             or reconciled.get("applied") is not True
                         ):
                             raise ValueError(
@@ -8857,8 +8853,7 @@ class OfferManager:
                             )
                     if (
                         type(reconciled) is dict
-                        and reconciled.get("classification")
-                        == terminal_classification
+                        and reconciled.get("classification") == terminal_classification
                         and reconciled.get("applied") is True
                     ):
                         runtime = mutation_gate.current_runtime()

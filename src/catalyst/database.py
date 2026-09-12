@@ -24031,9 +24031,7 @@ def _validate_reconciliation_cancel_context(
                 recovery_origin = validate_offer_operation_event(
                     dict(recovery_origin_row)
                 )
-                recovery_origin_evidence = json.loads(
-                    recovery_origin["evidence_json"]
-                )
+                recovery_origin_evidence = json.loads(recovery_origin["evidence_json"])
         journaled_unknown_effect = bool(
             recovery_origin["phase"] == "FINALIZED"
             and recovery_origin["outcome"]

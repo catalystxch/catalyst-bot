@@ -1907,9 +1907,7 @@ def _confirmed_external_zero_fee_cohort_evidence(
         row for row in transaction["spent"] if row["coin_id"] != fee_coin_id
     ]
     transaction["created"] = [
-        row
-        for row in transaction["created"]
-        if row["coin_id"] != fee_return_coin_id
+        row for row in transaction["created"] if row["coin_id"] != fee_return_coin_id
     ]
     evidence["coin_records"]["records"].pop(fee_coin_id)
     evidence["coin_records"]["records"].pop(fee_return_coin_id)
@@ -1999,16 +1997,17 @@ def test_proof_only_recovery_settles_external_zero_fee_cancel_of_aborted_cohort(
             "evidence_json"
         ]
     )
-    manifest = database.get_offer_cancel_cohort_manifest(
-        prepared_evidence["cohort_id"]
+    manifest = database.get_offer_cancel_cohort_manifest(prepared_evidence["cohort_id"])
+    assert (
+        offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
+            manifest,
+            [row["operation_id"] for row in blockers],
+            evidence,
+            database_module=database,
+            observed_at=evidence["observed_at"],
+        )
+        is not None
     )
-    assert offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
-        manifest,
-        [row["operation_id"] for row in blockers],
-        evidence,
-        database_module=database,
-        observed_at=evidence["observed_at"],
-    ) is not None
 
     assert manager.reconcile_submitted_cancels_only() == 0
     assert effects == trade_ids[:1]

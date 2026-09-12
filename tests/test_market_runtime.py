@@ -1065,9 +1065,9 @@ def test_bot_refreshes_aging_confidence_before_mutation(monkeypatch):
             can_create=True,
             can_requote=True,
         )
-        loop._market_confidence_valid_until = datetime.now(
-            timezone.utc
-        ) + timedelta(seconds=30)
+        loop._market_confidence_valid_until = datetime.now(timezone.utc) + timedelta(
+            seconds=30
+        )
 
     loop._refresh_offer_book_market = refresh
 

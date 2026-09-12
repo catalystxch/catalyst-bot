@@ -462,9 +462,7 @@ def api_cancel_all():
 
     gate_status = api_server.mutation_gate.read_only_status()
     if getattr(gate_status, "allowed", False) is not True:
-        reason = str(
-            getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED"
-        )
+        reason = str(getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED")
         durable_manager = (
             getattr(bot, "offer_manager", None) if bot is not None else None
         )
@@ -494,9 +492,7 @@ def api_cancel_all():
                 409,
             )
 
-        blocker_ids = tuple(
-            getattr(gate_status, "blocking_operation_ids", ()) or ()
-        )
+        blocker_ids = tuple(getattr(gate_status, "blocking_operation_ids", ()) or ())
         _reset_cancel_all_state(
             running=True,
             complete=False,

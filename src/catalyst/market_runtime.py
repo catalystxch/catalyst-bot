@@ -135,16 +135,13 @@ class OfferBookMarketRuntime:
         valid_observation_deadlines = [
             observation.fresh_until
             for observation in (dexie, splash)
-            if observation.quality.value == "valid"
-            and observation.fresh_until >= now
+            if observation.quality.value == "valid" and observation.fresh_until >= now
         ]
         return OfferBookRuntimeResult(
             confidence=confidence,
             degraded=degraded,
             snapshot_id=snapshot_id,
             valid_until=(
-                min(valid_observation_deadlines)
-                if valid_observation_deadlines
-                else now
+                min(valid_observation_deadlines) if valid_observation_deadlines else now
             ),
         )

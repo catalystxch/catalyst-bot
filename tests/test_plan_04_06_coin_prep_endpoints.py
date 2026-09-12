@@ -354,7 +354,9 @@ class TestCoinPrepStatus(_FlaskBase):
                 ),
                 patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
                 patch("wallet.WALLET_ID_XCH", 1),
-                patch.object(api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}),
+                patch.object(
+                    api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}
+                ),
                 patch("database.get_coin_summary", return_value={}),
                 patch.object(
                     coin_prep_blueprint,

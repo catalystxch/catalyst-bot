@@ -1167,10 +1167,7 @@ class BotLoop:
         confidence_age = (
             current_time - derived_at.astimezone(timezone.utc)
         ).total_seconds()
-        if (
-            confidence_age < -2
-            or current_time > valid_until.astimezone(timezone.utc)
-        ):
+        if confidence_age < -2 or current_time > valid_until.astimezone(timezone.utc):
             self._enforce_market_refresh_failure(
                 now=current_time,
                 error=RuntimeError(
@@ -1212,9 +1209,8 @@ class BotLoop:
         confidence_age = (
             current_time - derived_at.astimezone(timezone.utc)
         ).total_seconds()
-        return (
-            confidence_age >= -2
-            and current_time <= valid_until.astimezone(timezone.utc)
+        return confidence_age >= -2 and current_time <= valid_until.astimezone(
+            timezone.utc
         )
 
     def _remember_splash_confidence_offer(

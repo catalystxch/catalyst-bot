@@ -3496,16 +3496,12 @@ def _derive_aborted_cohort_recovery_cancel_context(
         return None
     blocker_id = blocking_operation_ids[0]
     try:
-        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(
-            manifest
-        )
+        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(manifest)
     except BaseException:
         return None
-    if (
-        exact_manifest["member_count"] < 2
-        or blocker_id
-        not in {member["operation_id"] for member in exact_manifest["members"]}
-    ):
+    if exact_manifest["member_count"] < 2 or blocker_id not in {
+        member["operation_id"] for member in exact_manifest["members"]
+    }:
         return None
 
     durable_members: list[dict[str, Any]] = []
@@ -3543,8 +3539,7 @@ def _derive_aborted_cohort_recovery_cancel_context(
             or type(prepared_evidence) is not dict
             or type(final_evidence) is not dict
             or prepared_evidence.get("cohort_id") != exact_manifest["cohort_id"]
-            or prepared_evidence.get("cohort_size")
-            != exact_manifest["member_count"]
+            or prepared_evidence.get("cohort_size") != exact_manifest["member_count"]
             or prepared_evidence.get("member_id") != member["member_id"]
             or prepared_evidence.get("effect_claim_protocol")
             != "durable_cohort_claim_v1"
@@ -3647,9 +3642,7 @@ def _derive_aborted_cohort_recovery_cancel_context(
                     "transaction_timestamp": transaction["timestamp"],
                     "asset_id": durable["intent"]["asset_id"],
                     "side": durable["intent"]["side"],
-                    "offered_amount_atomic": str(
-                        durable["intent"]["offered_amount"]
-                    ),
+                    "offered_amount_atomic": str(durable["intent"]["offered_amount"]),
                     "requested_amount_atomic": str(
                         durable["intent"]["requested_amount"]
                     ),

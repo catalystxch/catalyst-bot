@@ -2095,9 +2095,7 @@ def test_background_startup_repost_defers_stale_confidence_without_global_failur
         )
         is False
     )
-    assert any(
-        event == "dexie_repost_market_deferred" for _, event, _, _ in events
-    )
+    assert any(event == "dexie_repost_market_deferred" for _, event, _, _ in events)
 
 
 def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch):
@@ -2847,7 +2845,10 @@ def test_startup_defers_durable_publication_drain_until_fresh_cycle():
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
     loop._background_publication_snapshot_ready = lambda: False
     loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
-    loop._run_one_cycle = lambda: (events.append("cycle"), setattr(loop, "_running", False))
+    loop._run_one_cycle = lambda: (
+        events.append("cycle"),
+        setattr(loop, "_running", False),
+    )
     loop._set_state = lambda **kwargs: None
     loop._watcher_event = type(
         "WatcherEvent",

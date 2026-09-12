@@ -1434,9 +1434,7 @@ def api_coin_prep_status():
 
                                 _all_ok = True
                                 if _last.get("tier_enabled"):
-                                    _offer_tsxch = _last.get(
-                                        "offer_tier_sizes_xch"
-                                    )
+                                    _offer_tsxch = _last.get("offer_tier_sizes_xch")
                                     _tsxch = (
                                         _offer_tsxch
                                         if isinstance(_offer_tsxch, dict)
@@ -1484,8 +1482,7 @@ def api_coin_prep_status():
                                     # even when it lies within the historical
                                     # five-percent reuse tolerance.
                                     _strict_bootstrap = bool(
-                                        isinstance(_offer_tsxch, dict)
-                                        and _offer_tsxch
+                                        isinstance(_offer_tsxch, dict) and _offer_tsxch
                                     )
                                     _xa = _alloc_match(
                                         _xch_coins,
@@ -1834,9 +1831,7 @@ def api_coin_prep_verify():
                     idx
                     for idx, amt in enumerate(remaining)
                     if low <= amt <= high
-                    and not (
-                        tier in minimum_target_tiers and amt < target_mojos
-                    )
+                    and not (tier in minimum_target_tiers and amt < target_mojos)
                 ]
                 consume = min(needed, len(matched_positions))
                 allocated[tier] = consume
@@ -1938,7 +1933,9 @@ def api_coin_prep_verify():
                     cat_requests.append((tier, cat_mojos, needed))
 
             strict_xch_tiers = (
-                frozenset(tier for tier, _amount, _needed in xch_requests if tier != "fees")
+                frozenset(
+                    tier for tier, _amount, _needed in xch_requests if tier != "fees"
+                )
                 if bootstrap_context is not None
                 else frozenset()
             )

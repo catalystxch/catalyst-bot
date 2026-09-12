@@ -746,9 +746,7 @@ def recover_legacy_sage_reservations(
                 ] + [intent_id]
             reconciled = None
             for reconcile_intent_id in reconcile_intent_ids:
-                member_intent = database_module.get_offer_intent(
-                    reconcile_intent_id
-                )
+                member_intent = database_module.get_offer_intent(reconcile_intent_id)
                 member_classification = (
                     reconciliation_module.classify_terminal_evidence(
                         member_intent,
@@ -762,9 +760,7 @@ def recover_legacy_sage_reservations(
                     or member_classification.get("classification")
                     != terminal_classification
                 ):
-                    raise ValueError(
-                        "external cohort recovery proof differs by member"
-                    )
+                    raise ValueError("external cohort recovery proof differs by member")
                 reconciled = reconciliation_module.reconcile_offer(
                     reconcile_intent_id,
                     evidence=evidence,
@@ -776,9 +772,7 @@ def recover_legacy_sage_reservations(
                     or reconciled.get("applied") is not True
                     or reconciled.get("classification") != terminal_classification
                 ):
-                    raise ValueError(
-                        "external cohort recovery could not be committed"
-                    )
+                    raise ValueError("external cohort recovery could not be committed")
             if (
                 type(reconciled) is dict
                 and reconciled.get("applied") is True
