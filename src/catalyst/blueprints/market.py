@@ -714,13 +714,13 @@ def _age_confidence_snapshot(
             fresh_books += 1
         elif provider_id in source_health:
             source_health[provider_id] = "unavailable"
-    derived_at = _parse_utc_timestamp(aged.get("derived_at"))
-    if derived_at is not None and (current_time - derived_at).total_seconds() > 20:
-        fresh_books = 0
-        if "confidence_snapshot_expired" not in reasons:
-            reasons.append("confidence_snapshot_expired")
     if fresh_books == 0:
         aged["state"] = "RED"
+        if (
+            aged.get("derived_at") is not None
+            and "confidence_snapshot_expired" not in reasons
+        ):
+            reasons.append("confidence_snapshot_expired")
         if (
             aged.get("derived_at") is not None
             and "market_evidence_expired" not in reasons

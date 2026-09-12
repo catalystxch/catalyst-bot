@@ -531,6 +531,52 @@ class TestCancelOffer(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllPost(_FlaskBase):
+    def test_unresolved_cancel_all_runs_proof_only_reconciliation(self):
+        """The recovery button must remain useful without authorizing a second spend."""
+
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        states = iter(
+            [
+                types.SimpleNamespace(
+                    allowed=False,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    blocking_operation_ids=("cancel:" + "a" * 64,),
+                ),
+                types.SimpleNamespace(
+                    allowed=False,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    blocking_operation_ids=("cancel:" + "a" * 64,),
+                ),
+            ]
+        )
+
+        def run_now(*, target, **_kwargs):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch.object(
+                api_server.mutation_gate,
+                "read_only_status",
+                side_effect=lambda: next(states),
+            ),
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value.start.side_effect = lambda: run_now(
+                target=thread_cls.call_args.kwargs["target"]
+            )
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["reconciliation_only"])
+        self.assertEqual(payload["reason"], "UNRESOLVED_OPERATIONS")
+        stopped.offer_manager.reconcile_submitted_cancels_only.assert_called_once_with()
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
     def test_requires_token(self):
         resp = self._post("/api/offers/cancel_all", auth=False)
         self.assertEqual(resp.status_code, 401)

@@ -3471,6 +3471,207 @@ def _derive_single_cancel_context(
     return contexts[0] if len(contexts) == 1 else None
 
 
+def _derive_aborted_cohort_recovery_cancel_context(
+    manifest: Any,
+    blocking_operation_ids: Any,
+    evidence: Any,
+    *,
+    database_module: Any,
+    observed_at: str,
+) -> dict[str, Any] | None:
+    """Prove one external zero-fee cancel of a serially aborted cohort.
+
+    This is a recovery-only compatibility path for a user cancelling the
+    complete Sage cohort after CATalyst's first serial member crossed the
+    submitted-but-unconfirmed boundary.  It accepts no auxiliary inputs and
+    therefore cannot infer a fee coin or broaden the original authority.
+    """
+
+    if (
+        type(evidence) is not dict
+        or type(blocking_operation_ids) is not list
+        or len(blocking_operation_ids) != 1
+        or type(blocking_operation_ids[0]) is not str
+    ):
+        return None
+    blocker_id = blocking_operation_ids[0]
+    try:
+        exact_manifest = database_module.validate_offer_cancel_cohort_manifest(
+            manifest
+        )
+    except BaseException:
+        return None
+    if (
+        exact_manifest["member_count"] < 2
+        or blocker_id
+        not in {member["operation_id"] for member in exact_manifest["members"]}
+    ):
+        return None
+
+    durable_members: list[dict[str, Any]] = []
+    expected_coin_ids: set[str] = set()
+    shared_wallet_effect = None
+    for member in exact_manifest["members"]:
+        try:
+            events = [
+                database_module.validate_offer_operation_event(row)
+                for row in database_module.get_offer_operation_events(
+                    member["operation_id"]
+                )
+            ]
+            prepared = next(
+                row for row in events if row["event_id"] == member["prepared_event_id"]
+            )
+            latest = events[-1]
+            prepared_evidence = json.loads(prepared["evidence_json"])
+            final_evidence = json.loads(latest["evidence_json"])
+            intent = database_module.get_offer_intent_by_trade_id(member["trade_id"])
+            exact_intent = _exact_intent(intent)
+        except (BaseException, StopIteration):
+            return None
+        if (
+            prepared["operation_id"] != member["operation_id"]
+            or prepared["intent_id"] != member["intent_id"]
+            or prepared["attempt"] != member["attempt"]
+            or prepared["phase"] != "PREPARED"
+            or prepared["outcome"] != "PREPARED"
+            or prepared["blocks_mutation"] != 1
+            or latest["operation_id"] != member["operation_id"]
+            or latest["intent_id"] != member["intent_id"]
+            or latest["attempt"] != member["attempt"]
+            or latest["phase"] != "FINALIZED"
+            or type(prepared_evidence) is not dict
+            or type(final_evidence) is not dict
+            or prepared_evidence.get("cohort_id") != exact_manifest["cohort_id"]
+            or prepared_evidence.get("cohort_size")
+            != exact_manifest["member_count"]
+            or prepared_evidence.get("member_id") != member["member_id"]
+            or prepared_evidence.get("effect_claim_protocol")
+            != "durable_cohort_claim_v1"
+            or final_evidence.get("cohort_id") != exact_manifest["cohort_id"]
+            or final_evidence.get("member_id") != member["member_id"]
+            or final_evidence.get("trade_id") != member["trade_id"]
+            or exact_intent is None
+            or intent.get("intent_id") != member["intent_id"]
+        ):
+            return None
+        wallet_effect = prepared_evidence.get("wallet_effect")
+        if (
+            type(wallet_effect) is not dict
+            or set(wallet_effect) != {"secure", "timeout", "fee_mojos"}
+            or wallet_effect.get("secure") is not True
+            or wallet_effect.get("timeout") != 60
+            or wallet_effect.get("fee_mojos") is not None
+        ):
+            return None
+        if shared_wallet_effect is None:
+            shared_wallet_effect = wallet_effect
+        elif wallet_effect != shared_wallet_effect:
+            return None
+
+        effect_claim = database_module.get_offer_cancel_effect_claim(
+            operation_id=member["operation_id"],
+            attempt=member["attempt"],
+        )
+        if member["operation_id"] == blocker_id:
+            if (
+                latest["outcome"]
+                not in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+                or latest["blocks_mutation"] != 1
+                or final_evidence.get("effect_attempted") is not True
+                or type(effect_claim) is not dict
+                or effect_claim.get("prepared_event_id") != prepared["event_id"]
+            ):
+                return None
+        else:
+            cancel_result = final_evidence.get("cancel_result")
+            if (
+                latest["outcome"] != "CANCEL_FAILED"
+                or latest["blocks_mutation"] != 0
+                or final_evidence.get("effect_attempted") is not False
+                or final_evidence.get("aborted_by_operation_id") != blocker_id
+                or type(cancel_result) is not dict
+                or cancel_result.get("method") != "batch_abort_ambiguous"
+                or effect_claim is not None
+            ):
+                return None
+        selected = list(exact_intent["selected_coin_ids"])
+        if expected_coin_ids.intersection(selected):
+            return None
+        expected_coin_ids.update(selected)
+        durable_members.append(
+            {
+                "manifest": member,
+                "prepared": prepared,
+                "intent": exact_intent,
+                "selected_coin_ids": selected,
+            }
+        )
+
+    transaction_source = evidence.get("transaction_history")
+    transactions = (
+        _transaction_rows(transaction_source)
+        if type(transaction_source) is dict
+        else None
+    )
+    if transactions is None:
+        return None
+    contexts: list[dict[str, Any]] = []
+    representative = database_module.get_offer_intent_by_trade_id(
+        durable_members[0]["manifest"]["trade_id"]
+    )
+    for row in transactions:
+        transaction = _exact_confirmed_transaction(row)
+        if transaction is None:
+            continue
+        spent_ids = {
+            flow[0]
+            for entry in transaction["spent"]
+            if (flow := _flow(entry)) is not None
+        }
+        if spent_ids != expected_coin_ids:
+            continue
+        transaction_id = _hex_id(transaction.get("transaction_id")) or None
+        spend_identity = transaction.get("spend_identity")
+        context = {
+            "cohort_id": exact_manifest["cohort_id"],
+            "manifest_sha256": exact_manifest["manifest_sha256"],
+            "members": [
+                {
+                    "intent_id": durable["manifest"]["intent_id"],
+                    "trade_id": durable["manifest"]["trade_id"],
+                    "member_id": durable["manifest"]["member_id"],
+                    "prepared_event_id": durable["manifest"]["prepared_event_id"],
+                    "selected_coin_ids": list(durable["selected_coin_ids"]),
+                    "request_timestamp": durable["prepared"]["request_timestamp"],
+                    "transaction_timestamp": transaction["timestamp"],
+                    "asset_id": durable["intent"]["asset_id"],
+                    "side": durable["intent"]["side"],
+                    "offered_amount_atomic": str(
+                        durable["intent"]["offered_amount"]
+                    ),
+                    "requested_amount_atomic": str(
+                        durable["intent"]["requested_amount"]
+                    ),
+                    "offer_text_sha256": durable["intent"]["offer_text_sha256"],
+                    "transaction_id": transaction_id,
+                    "spend_identity": spend_identity,
+                }
+                for durable in durable_members
+            ],
+            "auxiliary_coin_ids": [],
+        }
+        proof = _classify_terminal_evidence(
+            representative,
+            evidence,
+            cancel_context=context,
+            now=observed_at,
+        )
+        if proof.get("classification") == CANCELLED_PROVEN:
+            contexts.append(context)
+    return contexts[0] if len(contexts) == 1 else None
+
+
 def _derive_sage_bulk_cancel_context(
     manifest: Any,
     blocking_operation_ids: Any,

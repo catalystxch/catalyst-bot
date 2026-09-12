@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -458,6 +459,142 @@ def api_cancel_all():
                 "requires_stop": True,
             }
         ), 409
+
+    gate_status = api_server.mutation_gate.read_only_status()
+    if getattr(gate_status, "allowed", False) is not True:
+        reason = str(
+            getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED"
+        )
+        durable_manager = (
+            getattr(bot, "offer_manager", None) if bot is not None else None
+        )
+        if reason != "UNRESOLVED_OPERATIONS" or durable_manager is None:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": reason,
+                    }
+                ),
+                423,
+            )
+
+        state = _get_cancel_all_state()
+        if state.get("running"):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Cancel reconciliation is already in progress.",
+                        "reason": reason,
+                        "reconciliation_only": True,
+                    }
+                ),
+                409,
+            )
+
+        blocker_ids = tuple(
+            getattr(gate_status, "blocking_operation_ids", ()) or ()
+        )
+        _reset_cancel_all_state(
+            running=True,
+            complete=False,
+            error=None,
+            phase="reconciling",
+            total=len(blocker_ids),
+            pending=len(blocker_ids),
+            message=(
+                "An earlier cancellation is awaiting authoritative Sage proof. "
+                "Checking it now without submitting another transaction..."
+            ),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+        )
+
+        def _reconcile_existing_cancel():
+            result = durable_manager.reconcile_submitted_cancels_only()
+            refreshed = api_server.mutation_gate.read_only_status()
+            allowed = getattr(refreshed, "allowed", False) is True
+            refreshed_reason = str(
+                getattr(refreshed, "reason_code", "")
+                or ("" if allowed else "UNRESOLVED_OPERATIONS")
+            )
+            if result == 0 and allowed:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=True,
+                    error=None,
+                    phase="reconciled",
+                    pending=0,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message=(
+                        "The earlier cancellation is authoritatively resolved. "
+                        "Cancel All can now be run again for any remaining offers."
+                    ),
+                )
+                return
+            _set_cancel_all_state(
+                running=False,
+                complete=False,
+                error="awaiting_authoritative_cancel_proof",
+                phase="awaiting_authoritative_proof",
+                pending=len(blocker_ids),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=(
+                    "No second cancellation was submitted. The earlier request "
+                    "is still awaiting authoritative Sage confirmation."
+                ),
+            )
+            log_event(
+                "warning",
+                "cancel_all_awaiting_authoritative_proof",
+                "Cancel All remains blocked while the earlier Sage cancellation "
+                "awaits authoritative proof",
+                data={"reason_code": refreshed_reason},
+            )
+
+        recovery_thread = threading.Thread(
+            target=_reconcile_existing_cancel,
+            name="cancel-all-proof-reconciliation",
+            daemon=True,
+        )
+        recovery_thread.start()
+        api_server._cancel_all_thread = recovery_thread
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "async": True,
+                    "reason": reason,
+                    "reconciliation_only": True,
+                    "message": (
+                        "Checking the earlier cancellation for authoritative "
+                        "Sage confirmation; no new transaction was submitted."
+                    ),
+                }
+            ),
+            202,
+        )
+
+    try:
+        mutation_permit = api_server.mutation_gate.enter_mutation(
+            "api:offers.api_cancel_all"
+        )
+    except api_server.mutation_gate.MutationBlocked as exc:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                }
+            ),
+            423,
+        )
+    from flask import g
+
+    g._mutation_permit = mutation_permit
 
     state = _get_cancel_all_state()
     if state.get("running"):

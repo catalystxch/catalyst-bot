@@ -324,8 +324,8 @@ def _atomic_amount(value: Any, scale: Decimal, label: str) -> str:
     return str(int(integral))
 
 
-def _native_bulk_cancel_manifest(blocker: Any, database_module: Any) -> dict | None:
-    """Identify the exact durable Sage bulk cohort owning one blocker."""
+def _cancel_cohort_manifest(blocker: Any, database_module: Any) -> dict | None:
+    """Identify the exact durable cancellation cohort owning one blocker."""
 
     if type(blocker) is not dict:
         return None
@@ -348,7 +348,21 @@ def _native_bulk_cancel_manifest(blocker: Any, database_module: Any) -> dict | N
             not in {member.get("operation_id") for member in manifest["members"]}
         ):
             return None
-        prepared = database_module.get_offer_cancel_cohort_prepared_events(cohort_id)
+        return manifest
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _native_bulk_cancel_manifest(blocker: Any, database_module: Any) -> dict | None:
+    """Identify the exact durable Sage bulk cohort owning one blocker."""
+
+    manifest = _cancel_cohort_manifest(blocker, database_module)
+    if manifest is None:
+        return None
+    try:
+        prepared = database_module.get_offer_cancel_cohort_prepared_events(
+            manifest["cohort_id"]
+        )
         if type(prepared) is not list or len(prepared) != manifest["member_count"]:
             return None
         protocols = []
@@ -647,6 +661,7 @@ def recover_legacy_sage_reservations(
                 evidence.get("observed_at") if type(evidence) is dict else None
             )
             bulk_manifest = _native_bulk_cancel_manifest(blocker, database_module)
+            external_recovery_context = False
             if bulk_manifest is not None:
                 manifest_operation_ids = {
                     member["operation_id"] for member in bulk_manifest["members"]
@@ -672,12 +687,31 @@ def recover_legacy_sage_reservations(
                     result["remaining"] += 1
                     continue
             else:
-                cancel_context = reconciliation_module._derive_single_cancel_context(
-                    intent,
-                    evidence,
-                    database_module=database_module,
-                    observed_at=observed_at,
+                cancel_context = None
+                cohort_manifest = _cancel_cohort_manifest(blocker, database_module)
+                derive_external = getattr(
+                    reconciliation_module,
+                    "_derive_aborted_cohort_recovery_cancel_context",
+                    None,
                 )
+                if cohort_manifest is not None and callable(derive_external):
+                    cancel_context = derive_external(
+                        cohort_manifest,
+                        [blocker["operation_id"]],
+                        evidence,
+                        database_module=database_module,
+                        observed_at=observed_at,
+                    )
+                    external_recovery_context = type(cancel_context) is dict
+                if cancel_context is None:
+                    cancel_context = (
+                        reconciliation_module._derive_single_cancel_context(
+                            intent,
+                            evidence,
+                            database_module=database_module,
+                            observed_at=observed_at,
+                        )
+                    )
             classification = reconciliation_module.classify_terminal_evidence(
                 intent,
                 evidence,
@@ -700,12 +734,51 @@ def recover_legacy_sage_reservations(
             ):
                 result["remaining"] += 1
                 continue
-            reconciled = reconciliation_module.reconcile_offer(
-                intent_id,
-                evidence=evidence,
-                cancel_context=cancel_context,
-                now=observed_at,
-            )
+            reconcile_intent_ids = [intent_id]
+            if (
+                external_recovery_context
+                and terminal_classification == reconciliation_module.CANCELLED_PROVEN
+            ):
+                reconcile_intent_ids = [
+                    member["intent_id"]
+                    for member in cancel_context["members"]
+                    if member["intent_id"] != intent_id
+                ] + [intent_id]
+            reconciled = None
+            for reconcile_intent_id in reconcile_intent_ids:
+                member_intent = database_module.get_offer_intent(
+                    reconcile_intent_id
+                )
+                member_classification = (
+                    reconciliation_module.classify_terminal_evidence(
+                        member_intent,
+                        evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
+                    )
+                )
+                if (
+                    type(member_classification) is not dict
+                    or member_classification.get("classification")
+                    != terminal_classification
+                ):
+                    raise ValueError(
+                        "external cohort recovery proof differs by member"
+                    )
+                reconciled = reconciliation_module.reconcile_offer(
+                    reconcile_intent_id,
+                    evidence=evidence,
+                    cancel_context=cancel_context,
+                    now=observed_at,
+                )
+                if (
+                    type(reconciled) is not dict
+                    or reconciled.get("applied") is not True
+                    or reconciled.get("classification") != terminal_classification
+                ):
+                    raise ValueError(
+                        "external cohort recovery could not be committed"
+                    )
             if (
                 type(reconciled) is dict
                 and reconciled.get("applied") is True

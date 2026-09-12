@@ -30,6 +30,7 @@ class OfferBookRuntimeResult:
     confidence: MarketConfidenceResult
     degraded: DegradedMarketDecision
     snapshot_id: str
+    valid_until: datetime
 
 
 class OfferBookMarketRuntime:
@@ -46,17 +47,20 @@ class OfferBookMarketRuntime:
         fetch_dexie_settled_trades: Callable[[str], list[dict]] | None = None,
         refresh_cadence_seconds: int = 60,
         minimum_provider_count: int = 2,
+        evidence_freshness_seconds: int = 30,
     ) -> None:
         self.asset_id = str(asset_id).strip().lower()
         self._fetch_splash_health = fetch_splash_health
         self._dexie = DexieOrderbookProvider(
             fetch_book=fetch_dexie_book,
             fetch_settled_trades=fetch_dexie_settled_trades,
+            order_book_freshness_seconds=evidence_freshness_seconds,
         )
         self._has_dexie_settled_trades = fetch_dexie_settled_trades is not None
         self._splash = SplashOfferProvider(
             fetch_offers=fetch_splash_offers,
             get_health=fetch_splash_health,
+            order_book_freshness_seconds=evidence_freshness_seconds,
         )
         self._engine = MarketConfidenceEngine(
             risk_preset=risk_preset,
@@ -128,8 +132,19 @@ class OfferBookMarketRuntime:
         snapshot_id = persist_confidence_snapshot(
             snapshot, engine_state=self._engine.export_state()
         )
+        valid_observation_deadlines = [
+            observation.fresh_until
+            for observation in (dexie, splash)
+            if observation.quality.value == "valid"
+            and observation.fresh_until >= now
+        ]
         return OfferBookRuntimeResult(
             confidence=confidence,
             degraded=degraded,
             snapshot_id=snapshot_id,
+            valid_until=(
+                min(valid_observation_deadlines)
+                if valid_observation_deadlines
+                else now
+            ),
         )

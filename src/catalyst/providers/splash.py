@@ -26,9 +26,13 @@ class SplashOfferProvider:
         *,
         fetch_offers: Callable[[str], list[dict[str, Any]]],
         get_health: Callable[[], dict[str, Any]],
+        order_book_freshness_seconds: int = 20,
     ) -> None:
         self._fetch_offers = fetch_offers
         self._get_health = get_health
+        self._order_book_freshness_seconds = max(
+            1, int(order_book_freshness_seconds or 20)
+        )
         # Splash currently observes and relays complete standard offers only;
         # it must not satisfy the independent partial-discovery gate.
         self.capabilities = ProviderCapabilities(
@@ -103,7 +107,7 @@ class SplashOfferProvider:
                 observed_at=observed_at,
                 source_time=min(source_times) if source_times else None,
                 identity_keys=(asset_id.lower(), *sorted(seen)),
-                freshness_seconds=20,
+                freshness_seconds=self._order_book_freshness_seconds,
                 quality=quality,
                 reason_codes=reasons,
             )

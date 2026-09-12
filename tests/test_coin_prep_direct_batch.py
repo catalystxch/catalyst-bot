@@ -164,6 +164,35 @@ def test_direct_batch_never_falls_back_after_a_confirmed_effect(monkeypatch):
         worker._run_direct_batch_prep()
 
 
+def test_submitted_batch_wait_persists_live_confirmation_elapsed(monkeypatch):
+    worker = _worker()
+    clock = {"now": 0.0}
+    persisted = []
+
+    monkeypatch.setattr(coin_prep_worker.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        coin_prep_worker.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    worker._observe_coin_prep_post_effect = lambda _operation: (
+        {"confirmed": True} if clock["now"] >= 15 else None
+    )
+    worker.update_status = lambda **_kwargs: persisted.append(
+        worker.status.confirmation_elapsed_seconds
+    )
+
+    result = worker._wait_for_coin_prep_post_effect(
+        {"operation_id": "coin-prep:" + "1" * 64},
+        timeout_s=30,
+        poll_interval_s=5,
+    )
+
+    assert result == {"confirmed": True}
+    assert persisted == [5, 10, 15]
+    assert worker.status.confirmation_elapsed_seconds == 15
+
+
 def test_direct_batch_uses_bounded_xch_prerequisite_after_cat_is_prepared(
     monkeypatch,
 ):

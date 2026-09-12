@@ -1710,6 +1710,7 @@ def _confirmed_sage_bulk_cancel_evidence(
     fee_coin_id: str,
     transaction_id: str,
     spend_identity: str,
+    transaction_time_offset_seconds: int = 2,
 ) -> dict:
     request_times = [
         datetime.fromisoformat(
@@ -1721,6 +1722,11 @@ def _confirmed_sage_bulk_cancel_evidence(
     ]
     observed_at = (
         (max(request_times) + timedelta(seconds=2))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    transaction_timestamp = (
+        (max(request_times) + timedelta(seconds=transaction_time_offset_seconds))
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
@@ -1866,7 +1872,7 @@ def _confirmed_sage_bulk_cancel_evidence(
                     "spend_identity": spend_identity,
                     "confirmed": True,
                     "confirmed_height": 42,
-                    "timestamp": observed_at,
+                    "timestamp": transaction_timestamp,
                     "spent": spent,
                     "created": created,
                 }
@@ -1876,6 +1882,143 @@ def _confirmed_sage_bulk_cancel_evidence(
         "coin_records": source(coins, "wallet.get_coins_by_ids"),
         "local_expired": False,
     }
+
+
+def _confirmed_external_zero_fee_cohort_evidence(
+    *,
+    trade_ids: list[str],
+    source_coin_ids: list[str],
+    transaction_id: str,
+    spend_identity: str,
+) -> dict:
+    """Build exact proof for a user/Sage zero-fee recovery cancellation."""
+
+    fee_coin_id = f"{0x2000:064x}"
+    fee_return_coin_id = f"{0x4000:064x}"
+    evidence = _confirmed_sage_bulk_cancel_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id=fee_coin_id,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+    transaction = evidence["transaction_history"]["records"][0]
+    transaction["spent"] = [
+        row for row in transaction["spent"] if row["coin_id"] != fee_coin_id
+    ]
+    transaction["created"] = [
+        row
+        for row in transaction["created"]
+        if row["coin_id"] != fee_return_coin_id
+    ]
+    evidence["coin_records"]["records"].pop(fee_coin_id)
+    evidence["coin_records"]["records"].pop(fee_return_coin_id)
+    return evidence
+
+
+def test_proof_only_recovery_settles_external_zero_fee_cancel_of_aborted_cohort(
+    isolated_database,
+    monkeypatch,
+):
+    """A Sage recovery cancel may settle one submitted member and aborted peers."""
+
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    source_coin_ids = ["d" * 64, "e" * 64, "f" * 64]
+    transaction_id = "1" * 64
+    spend_identity = "sha256:" + "2" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"external-recovery-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    effects = []
+
+    def effect(trade_id, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True, "transaction_id": "9" * 64},
+            transaction_id="9" * 64,
+        )
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=effect,
+        identity_count=8,
+    )
+    manager = OfferManager()
+    submitted = manager.cancel_offers(trade_ids, force_storm=True)
+    assert effects == trade_ids[:1]
+    assert submitted[trade_ids[0]]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert all(
+        submitted[trade_id]["method"] == "batch_abort_ambiguous"
+        for trade_id in trade_ids[1:]
+    )
+
+    evidence = _confirmed_external_zero_fee_cohort_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+    import offer_reconciliation
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _intent: evidence,
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "_clock_utc",
+        lambda: evidence["observed_at"],
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+
+    blockers = database.get_unresolved_offer_operation_blockers()
+    prepared_evidence = json.loads(
+        database.get_offer_operation_events(f"cancel:{trade_ids[0]}")[0][
+            "evidence_json"
+        ]
+    )
+    manifest = database.get_offer_cancel_cohort_manifest(
+        prepared_evidence["cohort_id"]
+    )
+    assert offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
+        manifest,
+        [row["operation_id"] for row in blockers],
+        evidence,
+        database_module=database,
+        observed_at=evidence["observed_at"],
+    ) is not None
+
+    assert manager.reconcile_submitted_cancels_only() == 0
+    assert effects == trade_ids[:1]
+    assert database.get_unresolved_offer_operation_blockers() == []
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    for trade_id in trade_ids:
+        assert database.get_offer(trade_id)["status"] == "cancelled"
+        assert database.get_authoritative_terminal_record(trade_id)["outcome"] == (
+            "CANCELLED_PROVEN"
+        )
 
 
 @pytest.mark.parametrize("member_count", [2, 71])
@@ -1942,6 +2085,10 @@ def test_sage_bulk_cancel_accepts_exact_height_evidence_when_sage_omits_txid(
         fee_coin_id=fee_coin_id,
         transaction_id="",
         spend_identity=confirmed_spend_identity,
+        # Chia block timestamps can predate the local cancellation request by
+        # a few seconds.  Recovery must retain the existing bounded skew rule
+        # after the first member of the native bulk cohort is reconciled.
+        transaction_time_offset_seconds=-20,
     )
     blockers = database.get_unresolved_offer_operation_blockers()
     manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)

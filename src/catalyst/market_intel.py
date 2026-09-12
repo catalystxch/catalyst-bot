@@ -170,12 +170,19 @@ class MarketIntel:
 
             resp = self._session.get(url, params=params, timeout=10)
 
-            # Bail early on 429 — don't burn through the buy request too
-            if resp.status_code == 429:
+            # A forced confidence refresh must never make an old cached book
+            # look newly observed.  Treat every non-success response as a
+            # failed refresh and retain the last attributable snapshot.
+            if resp.status_code != 200:
                 log_event(
-                    "warning",
-                    "dexie_rate_limited",
-                    "Dexie orderbook API returned 429 — skipping refresh",
+                    "warning" if resp.status_code == 429 else "debug",
+                    (
+                        "dexie_rate_limited"
+                        if resp.status_code == 429
+                        else "orderbook_http_error"
+                    ),
+                    f"Dexie orderbook API returned HTTP {resp.status_code} — "
+                    "retaining the previous snapshot without refreshing its age",
                 )
                 self._orderbook["errors"] = self._orderbook.get("errors", 0) + 1
                 return self._competitors
@@ -193,12 +200,16 @@ class MarketIntel:
 
             buy_resp = self._session.get(url, params=buy_params, timeout=10)
 
-            # Check buy side for 429 too
-            if buy_resp.status_code == 429:
+            if buy_resp.status_code != 200:
                 log_event(
-                    "warning",
-                    "dexie_rate_limited",
-                    "Dexie orderbook buy API returned 429 — skipping refresh",
+                    "warning" if buy_resp.status_code == 429 else "debug",
+                    (
+                        "dexie_rate_limited"
+                        if buy_resp.status_code == 429
+                        else "orderbook_http_error"
+                    ),
+                    f"Dexie orderbook buy API returned HTTP {buy_resp.status_code} — "
+                    "retaining the previous snapshot without refreshing its age",
                 )
                 self._orderbook["errors"] = self._orderbook.get("errors", 0) + 1
                 return self._competitors
@@ -207,22 +218,20 @@ class MarketIntel:
             buy_offers = []
 
             # Parse sell side (others selling CAT for XCH)
-            if resp.status_code == 200:
-                data = resp.json()
-                offers = data.get("offers", [])
-                for offer in offers:
-                    parsed = self._parse_dexie_offer(offer, "sell")
-                    if parsed:
-                        sell_offers.append(parsed)
+            data = resp.json()
+            offers = data.get("offers", [])
+            for offer in offers:
+                parsed = self._parse_dexie_offer(offer, "sell")
+                if parsed:
+                    sell_offers.append(parsed)
 
             # Parse buy side (others buying CAT with XCH)
-            if buy_resp.status_code == 200:
-                data = buy_resp.json()
-                offers = data.get("offers", [])
-                for offer in offers:
-                    parsed = self._parse_dexie_offer(offer, "buy")
-                    if parsed:
-                        buy_offers.append(parsed)
+            data = buy_resp.json()
+            offers = data.get("offers", [])
+            for offer in offers:
+                parsed = self._parse_dexie_offer(offer, "buy")
+                if parsed:
+                    buy_offers.append(parsed)
 
             # Sort: buys by price descending (best bid first),
             #        sells by price ascending (best ask first)

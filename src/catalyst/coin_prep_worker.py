@@ -1892,7 +1892,9 @@ class CoinPrepWorker:
         # their target size.
         #
         # For XCH, allow a minimum of 10M mojos plus one full configured
-        # transaction-fee delta:
+        # transaction-fee delta.  Only fee-tier outputs may match below their
+        # target: an offer coin even one mojo below its exact spend is unusable
+        # and must be replaced rather than reported as prepared.
         # Sage can spread the fee across the smallest fee-tier outputs, which
         # made two 0.00115 XCH fee coins land as 0.0011369209 XCH.
         fee_abs_tol = 0
@@ -1936,6 +1938,8 @@ class CoinPrepWorker:
             best_diff = None
             for plan_amount, tier_name, _exp in plan_entries:
                 if slots_remaining.get((plan_amount, tier_name), 0) <= 0:
+                    continue
+                if tier_name != get_fee_tier_name() and coin_amount < plan_amount:
                     continue
                 if not _within_tolerance(coin_amount, plan_amount):
                     continue
@@ -3156,9 +3160,15 @@ class CoinPrepWorker:
         return result
 
     def _apply_prep_headroom_xch(self, live_size_xch: Decimal) -> Decimal:
-        """Inflate a live offer size into the prepared coin size."""
+        """Inflate a live offer size without discarding spendable mojos.
+
+        XCH has twelve decimal places.  Quantizing prepared coins to eight
+        places made repeating Bootstrap allocations (for example one third of
+        a stage budget) a few thousand mojos smaller than the exact offer
+        spend, so Sage correctly refused to select them.
+        """
         return (live_size_xch * self.coin_prep_headroom_multiplier).quantize(
-            Decimal("0.00000001")
+            Decimal("0.000000000001")
         )
 
     def _get_fingerprint(self) -> str:
@@ -9429,10 +9439,16 @@ class CoinPrepWorker:
         next_progress_log_s = 30
         while time.monotonic() - started_at < timeout_s:
             time.sleep(poll_interval_s)
+            elapsed_s = int(time.monotonic() - started_at)
+            with self.status_lock:
+                self.status.confirmation_elapsed_seconds = elapsed_s
+            # Persist on every confirmation poll so the GUI proves continued
+            # progress during a slow Sage/network confirmation instead of
+            # appearing frozen at the first observed value.
+            self.update_status()
             observation = self._observe_coin_prep_post_effect(operation)
             if type(observation) is dict:
                 return observation
-            elapsed_s = int(time.monotonic() - started_at)
             if elapsed_s >= next_progress_log_s:
                 self.log(
                     "      Waiting for authoritative confirmation of submitted "

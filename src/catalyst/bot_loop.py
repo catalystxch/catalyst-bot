@@ -488,6 +488,8 @@ class BotLoop:
         self._market_runtime_minimum_provider_count = 0
         self._market_confidence_result = None
         self._market_degraded_decision = None
+        self._market_confidence_valid_until = None
+        self._market_refresh_lock = threading.RLock()
         self._publication_discovery_pending = 0
         self._market_refresh_now = datetime.now(timezone.utc)
         self._splash_confidence_offers: Dict[str, Dict] = {}
@@ -1133,10 +1135,42 @@ class BotLoop:
         current_time = datetime.now(timezone.utc)
         if type(derived_at) is not datetime or derived_at.tzinfo is None:
             return False
+        valid_until = getattr(self, "_market_confidence_valid_until", None)
+        if type(valid_until) is not datetime or valid_until.tzinfo is None:
+            valid_until = derived_at.astimezone(timezone.utc) + timedelta(seconds=30)
+
+        # External evidence is refreshed approximately every five seconds while
+        # offers are live. Refresh once more at a mutation boundary when the
+        # current permit is close to expiry, so a normally long wallet-sync
+        # phase cannot publish or create against an aging book.
+        seconds_remaining = (
+            valid_until.astimezone(timezone.utc) - current_time
+        ).total_seconds()
+        if 0 < seconds_remaining <= 5:
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(now=current_time, error=exc)
+                return False
+            decision = getattr(self, "_market_degraded_decision", None)
+            confidence = getattr(self, "_market_confidence_result", None)
+            derived_at = getattr(confidence, "derived_at", None)
+            valid_until = getattr(self, "_market_confidence_valid_until", None)
+            current_time = datetime.now(timezone.utc)
+            if type(derived_at) is not datetime or derived_at.tzinfo is None:
+                return False
+            if type(valid_until) is not datetime or valid_until.tzinfo is None:
+                valid_until = derived_at.astimezone(timezone.utc) + timedelta(
+                    seconds=30
+                )
+
         confidence_age = (
             current_time - derived_at.astimezone(timezone.utc)
         ).total_seconds()
-        if confidence_age < -2 or confidence_age > 20:
+        if (
+            confidence_age < -2
+            or current_time > valid_until.astimezone(timezone.utc)
+        ):
             self._enforce_market_refresh_failure(
                 now=current_time,
                 error=RuntimeError(
@@ -1149,6 +1183,39 @@ class BotLoop:
         if phase_name in {"create", "publication"}:
             return bool(getattr(decision, "can_create", False))
         return False
+
+    def _background_publication_snapshot_ready(
+        self, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Read-only preflight for asynchronous visibility work.
+
+        Background reposts race the first live cycle during startup.  They must
+        never turn an already-stale snapshot into a new global failure (and
+        thereby withdraw an otherwise valid ladder) before the cycle has had a
+        chance to refresh the market.  The normal mutation phase gate remains
+        authoritative once a fresh, publication-capable snapshot exists.
+        """
+
+        if not bool(getattr(self, "_market_runtime_required", False)):
+            return True
+        decision = getattr(self, "_market_degraded_decision", None)
+        if decision is None or not bool(getattr(decision, "can_create", False)):
+            return False
+        confidence = getattr(self, "_market_confidence_result", None)
+        derived_at = getattr(confidence, "derived_at", None)
+        if type(derived_at) is not datetime or derived_at.tzinfo is None:
+            return False
+        current_time = now or datetime.now(timezone.utc)
+        valid_until = getattr(self, "_market_confidence_valid_until", None)
+        if type(valid_until) is not datetime or valid_until.tzinfo is None:
+            valid_until = derived_at.astimezone(timezone.utc) + timedelta(seconds=30)
+        confidence_age = (
+            current_time - derived_at.astimezone(timezone.utc)
+        ).total_seconds()
+        return (
+            confidence_age >= -2
+            and current_time <= valid_until.astimezone(timezone.utc)
+        )
 
     def _remember_splash_confidence_offer(
         self,
@@ -1501,8 +1568,15 @@ class BotLoop:
         def fetch_dexie(_asset_id: str) -> Dict:
             if _asset_id != asset:
                 raise ValueError("Dexie confidence asset changed during refresh")
+            previous = self.market_intel.get_attributable_orderbook()
+            previous_observed_at = float(previous.get("observed_at_unix", 0) or 0)
             self.market_intel.refresh_orderbook(force=True)
             snapshot = self.market_intel.get_attributable_orderbook()
+            observed_at = float(snapshot.get("observed_at_unix", 0) or 0)
+            if observed_at <= 0 or observed_at <= previous_observed_at:
+                raise RuntimeError(
+                    "forced refresh did not produce fresh Dexie evidence"
+                )
             return {
                 "bids": snapshot["bids"],
                 "asks": snapshot["asks"],
@@ -1552,6 +1626,15 @@ class BotLoop:
         return self._market_runtime
 
     def _refresh_offer_book_market(self, *, now: Optional[datetime] = None):
+        """Serialize confidence-engine refreshes across runtime callers."""
+
+        lock = getattr(self, "_market_refresh_lock", None)
+        if lock is None:
+            return self._refresh_offer_book_market_core(now=now)
+        with lock:
+            return self._refresh_offer_book_market_core(now=now)
+
+    def _refresh_offer_book_market_core(self, *, now: Optional[datetime] = None):
         """Refresh, persist, expose, and enforce one confidence decision."""
 
         asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
@@ -1567,6 +1650,15 @@ class BotLoop:
         )
         self._market_confidence_result = result.confidence
         self._market_degraded_decision = result.degraded
+        confidence_derived_at = getattr(result.confidence, "derived_at", observed_at)
+        self._market_confidence_valid_until = getattr(result, "valid_until", None)
+        if (
+            type(self._market_confidence_valid_until) is not datetime
+            or self._market_confidence_valid_until.tzinfo is None
+        ):
+            self._market_confidence_valid_until = confidence_derived_at.astimezone(
+                timezone.utc
+            ) + timedelta(seconds=30)
         self._market_refresh_failure_since = None
         self._apply_market_withdrawal(result.degraded)
         dexie_snapshot = self.market_intel.get_attributable_orderbook()
@@ -5813,6 +5905,25 @@ class BotLoop:
                     f"Splash node stop raised during shutdown: {e}",
                 )
 
+        if self._thread and self._thread.is_alive():
+            self._set_state(running=False, status="stopping")
+            log_event(
+                "warning",
+                "bot_loop_stop_waiting",
+                "Bot stop is still waiting for the active cycle to finish; "
+                "the app will not report stopped prematurely",
+            )
+            if not (
+                self._stop_finalize_thread and self._stop_finalize_thread.is_alive()
+            ):
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+            return False
+
         self._set_state(status="stopped")
 
         # Clear all operational alerts so they don't linger on the GUI after stop
@@ -5868,6 +5979,18 @@ class BotLoop:
                 and self._thread is not threading.current_thread()
             ):
                 self._thread.join(timeout=30)
+                if self._thread.is_alive():
+                    self._set_state(running=False, status="stopping")
+                    log_event(
+                        "warning",
+                        "bot_loop_stop_waiting",
+                        "Bot stop is still waiting for the active cycle to finish; "
+                        "the app will not report stopped prematurely",
+                    )
+                    # This runs only on the asynchronous stop-finalizer daemon.
+                    # Remain truthful until an in-flight wallet/RPC operation
+                    # returns and the trading thread has actually terminated.
+                    self._thread.join()
 
             if self._splash_receive_thread and self._splash_receive_thread.is_alive():
                 self._splash_receive_thread.join(timeout=5)
@@ -6185,6 +6308,43 @@ class BotLoop:
     # Main loop
     # -------------------------------------------------------------------
 
+    def _market_evidence_poll_interval_seconds(self) -> int:
+        """Poll quickly while capital or unresolved publication is exposed."""
+
+        state = dict(getattr(self, "_bot_state", {}) or {})
+        has_live_offers = (
+            int(state.get("open_buys", 0) or 0) > 0
+            or int(state.get("open_sells", 0) or 0) > 0
+        )
+        pending_publication = (
+            int(getattr(self, "_publication_discovery_pending", 0) or 0) > 0
+        )
+        pending_cancels = bool(self._pending_cancel_settle_counts())
+        return 5 if has_live_offers or pending_publication or pending_cancels else 25
+
+    def _wait_for_watcher_with_market_refresh(self, sleep_seconds: float) -> bool:
+        """Wait for the next cycle while keeping offer-book evidence current."""
+
+        deadline = time.monotonic() + max(0.0, float(sleep_seconds or 0))
+        while self._running:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            wait_seconds = min(
+                remaining, float(self._market_evidence_poll_interval_seconds())
+            )
+            if self._watcher_event.wait(timeout=wait_seconds):
+                return True
+            if not self._running or time.monotonic() >= deadline:
+                return False
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(
+                    now=datetime.now(timezone.utc), error=exc
+                )
+        return False
+
     def _run_loop(self):
         """The main trading loop — runs forever until stopped."""
         log_event("info", "bot_loop_init", "Initialising bot loop...")
@@ -6204,9 +6364,18 @@ class BotLoop:
         )
         self._startup_complete.set()  # Ungate background threads
 
-        # Drain restart-surviving publication work only after read-only startup
-        # recovery has completed and every outbound adapter is claim-backed.
-        self._flush_public_offer_queues()
+        # Drain restart-surviving publication work only when startup recovered a
+        # still-fresh, publication-capable confidence snapshot.  A normal cycle
+        # refreshes market evidence before its own queue drain, so deferring here
+        # avoids turning harmless startup age into a global market failure.
+        if self._background_publication_snapshot_ready():
+            self._flush_public_offer_queues()
+        else:
+            log_event(
+                "info",
+                "publication_outbox_startup_drain_deferred",
+                "Deferred durable publication queue drain until the first fresh market cycle",
+            )
 
         self._set_state(status="running")
 
@@ -6240,7 +6409,7 @@ class BotLoop:
 
             # Sleep until next cycle — OR wake early if price watcher detects a swap
             sleep_time = max(1, cfg.LOOP_SECONDS - self._last_loop_duration)
-            watcher_triggered = self._watcher_event.wait(timeout=sleep_time)
+            watcher_triggered = self._wait_for_watcher_with_market_refresh(sleep_time)
             self._watcher_event.clear()
 
             if watcher_triggered and self._running:
@@ -8111,9 +8280,9 @@ class BotLoop:
 
             # Coin readiness report — shows per-tier availability vs requirements
             # so we know exactly what's available before creating offers
-            readiness = self.coin_manager.coin_readiness_report()
+            readiness = self._startup_coin_readiness_report()
             resumed_live_book = len(wallet_open_ids) > 0
-            if not readiness.get("overall_ready", True):
+            if readiness is not None and not readiness.get("overall_ready", True):
                 status = readiness.get("overall_status", "UNKNOWN")
                 if status == "CRITICAL":
                     # Suppress the warning if coin prep is running or about
@@ -8159,7 +8328,7 @@ class BotLoop:
             # visible rather than silently deferring to "topup when needed."
             try:
                 _tier_low_msgs = []
-                for _tn, _ti in readiness.get("tiers", {}).items():
+                for _tn, _ti in (readiness or {}).get("tiers", {}).items():
                     _xch_rem = _ti.get("xch_spare_remaining", 0)
                     _cat_rem = _ti.get("cat_spare_remaining", 0)
                     _xch_status = _ti.get("xch_status", "READY")
@@ -12225,6 +12394,25 @@ class BotLoop:
 
         return bool(self._bootstrap_campaign_context().get("active"))
 
+    def _startup_coin_readiness_report(self):
+        """Use legacy tier readiness only when no exact Bootstrap plan owns startup."""
+
+        context = self._bootstrap_campaign_context()
+        if context.get("active") is True:
+            campaign = context.get("campaign") or {}
+            log_event(
+                "info",
+                "bootstrap_exact_coin_readiness",
+                "Market Bootstrap uses its exact campaign Coin Prep plan; "
+                "legacy tier targets do not apply",
+                data={
+                    "campaign_id": campaign.get("campaign_id"),
+                    "revision": campaign.get("revision"),
+                },
+            )
+            return None
+        return self.coin_manager.coin_readiness_report()
+
     def _refresh_bootstrap_campaign_evidence(
         self,
         *,
@@ -15330,6 +15518,15 @@ class BotLoop:
             return
         if not self._running:
             return
+        if background and not self._background_publication_snapshot_ready():
+            log_event(
+                "info",
+                "dexie_repost_market_deferred",
+                "Deferred background offer visibility check until a fresh market "
+                "confidence snapshot authorizes publication",
+                data={"reason": reason, "total_offers": int(total_offers or 0)},
+            )
+            return False
         if not self._enter_runtime_effect_phase("publication"):
             log_event(
                 "warning",

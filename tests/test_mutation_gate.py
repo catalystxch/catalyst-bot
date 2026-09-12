@@ -2032,6 +2032,8 @@ def test_api_write_route_classification_is_exhaustive_and_explicit(monkeypatch):
         api_server._MUTATING_API_ENDPOINTS & api_server._READ_ONLY_WRITE_API_ENDPOINTS
     )
     assert "offers.api_cancel_offer" in api_server._MUTATING_API_ENDPOINTS
+    assert "offers.api_cancel_all" in api_server._CONTROL_WRITE_API_ENDPOINTS
+    assert "offers.api_cancel_all" not in api_server._MUTATING_API_ENDPOINTS
     assert "coin_prep.api_coin_prep_trigger" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_begin_startup" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_retry_sage_connect" in api_server._MUTATING_API_ENDPOINTS

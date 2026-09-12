@@ -1,6 +1,7 @@
 """Shared test-only setup for authenticated API mutation contract tests."""
 
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -15,6 +16,15 @@ def _api_mutation_patches(api_server):
             return_value="permit",
         ),
         patch.object(api_server.mutation_gate, "exit_mutation", return_value=True),
+        patch.object(
+            api_server.mutation_gate,
+            "read_only_status",
+            return_value=SimpleNamespace(
+                allowed=True,
+                reason_code="",
+                blocking_operation_ids=(),
+            ),
+        ),
         patch.object(api_server, "start_mutation_thread", return_value=None),
         patch("blueprints.cat._get_dexie_pairs", return_value=[]),
         patch("market_data_collector._fetch_xch_usd_price", return_value=None),

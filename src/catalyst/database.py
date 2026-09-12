@@ -23817,6 +23817,8 @@ def _validate_reconciliation_cancel_context(
     latest_events: dict[str, Dict[str, Any]] = {}
     exact_members: list[Dict[str, Any]] = []
     native_batch_claims: list[Dict[str, Any]] = []
+    external_recovery_blockers: list[str] = []
+    external_recovery_aborted: list[tuple[str, str]] = []
     auxiliary_bare = sorted(
         _reconciliation_coin_identity(value, "Task 8 auxiliary coin")[0]
         for value in context["auxiliary_coin_ids"]
@@ -24014,15 +24016,66 @@ def _validate_reconciliation_cancel_context(
             if latest["phase"] == "FINALIZED"
             else None
         )
+        recovery_origin = latest
+        recovery_origin_evidence = latest_evidence
+        if latest["phase"] == "RECONCILED":
+            recovery_origin_row = conn.execute(
+                """
+                SELECT * FROM offer_operation_journal
+                WHERE operation_id=? AND attempt=? AND phase='FINALIZED'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (f"cancel:{member_trade}", prepared["attempt"]),
+            ).fetchone()
+            if recovery_origin_row is not None:
+                recovery_origin = validate_offer_operation_event(
+                    dict(recovery_origin_row)
+                )
+                recovery_origin_evidence = json.loads(
+                    recovery_origin["evidence_json"]
+                )
         journaled_unknown_effect = bool(
-            latest["phase"] == "FINALIZED"
-            and latest["outcome"] in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
-            and latest["blocks_mutation"] == 1
-            and type(latest_evidence) is dict
-            and latest_evidence.get("effect_attempted") is True
-            and latest_evidence.get("trade_id") == member_trade
-            and latest_evidence.get("cohort_id") == context["cohort_id"]
-            and latest_evidence.get("member_id") == member_id
+            recovery_origin["phase"] == "FINALIZED"
+            and recovery_origin["outcome"]
+            in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+            and recovery_origin["blocks_mutation"] == 1
+            and type(recovery_origin_evidence) is dict
+            and recovery_origin_evidence.get("effect_attempted") is True
+            and recovery_origin_evidence.get("trade_id") == member_trade
+            and recovery_origin_evidence.get("cohort_id") == context["cohort_id"]
+            and recovery_origin_evidence.get("member_id") == member_id
+        )
+        serial_external_recovery_member = bool(
+            len(context["members"]) > 1
+            and not auxiliary_bare
+            and native_batch_for_member is None
+            and type(prepared_evidence) is dict
+            and prepared_evidence.get("cohort_id") == context["cohort_id"]
+            and prepared_evidence.get("cohort_size") == len(context["members"])
+            and prepared_evidence.get("member_id") == member_id
+            and prepared_evidence.get("effect_claim_protocol")
+            == "durable_cohort_claim_v1"
+            and type(prepared_evidence.get("wallet_effect")) is dict
+            and set(prepared_evidence["wallet_effect"])
+            == {"secure", "timeout", "fee_mojos"}
+            and prepared_evidence["wallet_effect"].get("secure") is True
+            and prepared_evidence["wallet_effect"].get("timeout") == 60
+            and prepared_evidence["wallet_effect"].get("fee_mojos") is None
+        )
+        external_recovery_aborted_member = bool(
+            serial_external_recovery_member
+            and recovery_origin["phase"] == "FINALIZED"
+            and recovery_origin["outcome"] == "CANCEL_FAILED"
+            and recovery_origin["blocks_mutation"] == 0
+            and type(recovery_origin_evidence) is dict
+            and recovery_origin_evidence.get("effect_attempted") is False
+            and type(recovery_origin_evidence.get("aborted_by_operation_id")) is str
+            and type(recovery_origin_evidence.get("cancel_result")) is dict
+            and recovery_origin_evidence["cancel_result"].get("method")
+            == "batch_abort_ambiguous"
+            and recovery_origin_evidence.get("cohort_id") == context["cohort_id"]
+            and recovery_origin_evidence.get("member_id") == member_id
+            and recovery_origin_evidence.get("trade_id") == member_trade
         )
         effect_claim_row = conn.execute(
             """
@@ -24054,7 +24107,7 @@ def _validate_reconciliation_cancel_context(
                 <= latest["request_timestamp"]
                 <= transaction_timestamp
             )
-            if not legacy_single_effect:
+            if not legacy_single_effect and not external_recovery_aborted_member:
                 raise ValueError("Task 8 effect claim is missing")
         else:
             try:
@@ -24095,9 +24148,27 @@ def _validate_reconciliation_cancel_context(
                 raise ValueError("Task 8 cancellation attempt state is invalid")
         elif latest["phase"] == "FINALIZED":
             if latest["outcome"] == "CANCEL_FAILED":
-                raise ValueError(
-                    "Task 8 cancellation proof contradicts a no-effect result"
+                if not external_recovery_aborted_member:
+                    raise ValueError(
+                        "Task 8 cancellation proof contradicts a no-effect result"
+                    )
+                external_recovery_aborted.append(
+                    (
+                        member_trade,
+                        recovery_origin_evidence["aborted_by_operation_id"],
+                    )
                 )
+                prepared_events[member_trade] = prepared
+                latest_events[member_trade] = latest
+                exact_members.append(
+                    {
+                        "intent_id": member_intent,
+                        "trade_id": member_trade,
+                        "member_id": member_id,
+                        "prepared_event_id": prepared_event_id,
+                    }
+                )
+                continue
             if (
                 latest["outcome"]
                 not in {
@@ -24134,12 +24205,24 @@ def _validate_reconciliation_cancel_context(
                 and type(latest_evidence) is dict
                 and latest_evidence.get("effect_attempted") is True
             )
+            externally_recovered_after_serial_submission = bool(
+                serial_external_recovery_member
+                and journaled_unknown_effect
+                and effect_claim_row is not None
+                and (
+                    member_transaction_id is not None
+                    or member_spend_identity is not None
+                )
+            )
             if (
                 not identity_matches
                 and not discovered_after_ambiguous_effect
                 and not submitted_txid_confirmed_as_spend_identity
+                and not externally_recovered_after_serial_submission
             ):
                 raise ValueError("Task 8 cancellation result identity is not exact")
+            if externally_recovered_after_serial_submission:
+                external_recovery_blockers.append(member_trade)
             latest_auxiliary = latest_evidence.get("auxiliary_coin_ids")
             if (
                 latest_auxiliary is None
@@ -24270,6 +24353,13 @@ def _validate_reconciliation_cancel_context(
                 or latest["spend_identity"] != member_spend_identity
             ):
                 raise ValueError("Task 8 cancellation confirmation identity differs")
+            if external_recovery_aborted_member:
+                external_recovery_aborted.append(
+                    (
+                        member_trade,
+                        recovery_origin_evidence["aborted_by_operation_id"],
+                    )
+                )
         else:
             raise ValueError("Task 8 cancellation attempt phase is invalid")
         prepared_events[member_trade] = prepared
@@ -24282,6 +24372,19 @@ def _validate_reconciliation_cancel_context(
                 "prepared_event_id": prepared_event_id,
             }
         )
+    external_recovery = bool(
+        len(external_recovery_blockers) == 1
+        and len(external_recovery_aborted) == len(exact_members) - 1
+        and all(
+            aborted_by == f"cancel:{external_recovery_blockers[0]}"
+            for _, aborted_by in external_recovery_aborted
+        )
+    )
+    if external_recovery_blockers or external_recovery_aborted:
+        if not external_recovery:
+            raise ValueError("Task 8 external cohort recovery is not exact")
+        if fee_mojos != 0 or auxiliary_bare:
+            raise ValueError("Task 8 external cohort recovery must be zero-fee")
     if native_batch_claims:
         if len(native_batch_claims) != len(exact_members) or any(
             claim != native_batch_claims[0] for claim in native_batch_claims[1:]
@@ -24364,7 +24467,11 @@ def _validate_reconciliation_cancel_context(
             )
             for member in exact_members
         }
-        if not contextual or not contextual.issubset(manifested):
+        if (
+            not contextual
+            or (external_recovery and contextual != manifested)
+            or (not external_recovery and not contextual.issubset(manifested))
+        ):
             raise ValueError("Task 8 cohort members are not manifest-bound")
         for member in manifest["members"]:
             member_trade = member["trade_id"]
@@ -24407,6 +24514,7 @@ def _validate_reconciliation_cancel_context(
     return {
         "target": target,
         "latest": latest_events[trade_id],
+        "external_recovery": external_recovery,
         "latest_sequences": {
             f"cancel:{member_trade}": event["sequence"]
             for member_trade, event in latest_events.items()
@@ -24954,7 +25062,12 @@ def commit_offer_reconciliation(
                     )
             latest_event = task8["latest"]
             cancel_operation_id = f"cancel:{trade_hint}"
-            if latest_event["blocks_mutation"] == 1:
+            if latest_event["blocks_mutation"] == 1 or (
+                task8["external_recovery"] is True
+                and latest_event["phase"] == "FINALIZED"
+                and latest_event["outcome"] == "CANCEL_FAILED"
+                and latest_event["blocks_mutation"] == 0
+            ):
                 cancel_resolution = {
                     "observed_sequence": latest_event["sequence"],
                     "operation_id": cancel_operation_id,

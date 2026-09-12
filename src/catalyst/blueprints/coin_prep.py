@@ -1399,7 +1399,13 @@ def api_coin_prep_status():
                                     else []
                                 )
 
-                                def _alloc_match(coins_list, requests, tol):
+                                def _alloc_match(
+                                    coins_list,
+                                    requests,
+                                    tol,
+                                    *,
+                                    minimum_target_tiers=frozenset(),
+                                ):
                                     """Allocate coins disjointly to tiers."""
                                     remaining = list(coins_list)
                                     allocated = {}
@@ -1415,6 +1421,10 @@ def api_coin_prep_status():
                                             i
                                             for i, a in enumerate(remaining)
                                             if lo <= a <= hi
+                                            and not (
+                                                tier in minimum_target_tiers
+                                                and a < target_m
+                                            )
                                         ]
                                         take = min(needed, len(hits))
                                         allocated[tier] = take
@@ -1424,7 +1434,15 @@ def api_coin_prep_status():
 
                                 _all_ok = True
                                 if _last.get("tier_enabled"):
-                                    _tsxch = _last.get("tier_sizes_xch", {})
+                                    _offer_tsxch = _last.get(
+                                        "offer_tier_sizes_xch"
+                                    )
+                                    _tsxch = (
+                                        _offer_tsxch
+                                        if isinstance(_offer_tsxch, dict)
+                                        and _offer_tsxch
+                                        else _last.get("tier_sizes_xch", {})
+                                    )
                                     _tscat = _last.get("tier_sizes_cat", {})
                                     _legacy_counts = _last.get("tier_counts", {})
                                     _tcxch = _last.get("tier_counts_xch")
@@ -1459,8 +1477,36 @@ def api_coin_prep_status():
                                                     _cnt,
                                                 )
                                             )
-                                    _xa = _alloc_match(_xch_coins, _xreqs, _tol)
-                                    _ca = _alloc_match(_cat_coins, _creqs, _tol)
+                                    # Bootstrap persists the exact offer spend
+                                    # amounts separately from any presentation-
+                                    # rounded preparation sizes.  A non-fee
+                                    # coin below that exact spend is unusable,
+                                    # even when it lies within the historical
+                                    # five-percent reuse tolerance.
+                                    _strict_bootstrap = bool(
+                                        isinstance(_offer_tsxch, dict)
+                                        and _offer_tsxch
+                                    )
+                                    _xa = _alloc_match(
+                                        _xch_coins,
+                                        _xreqs,
+                                        _tol,
+                                        minimum_target_tiers=(
+                                            frozenset(_tcxch) - {"fees"}
+                                            if _strict_bootstrap
+                                            else frozenset()
+                                        ),
+                                    )
+                                    _ca = _alloc_match(
+                                        _cat_coins,
+                                        _creqs,
+                                        _tol,
+                                        minimum_target_tiers=(
+                                            frozenset(_tccat)
+                                            if _strict_bootstrap
+                                            else frozenset()
+                                        ),
+                                    )
                                     for _t, _cnt in _tcxch.items():
                                         _cnt = int(_cnt or 0)
                                         if _cnt <= 0:
@@ -1760,7 +1806,13 @@ def api_coin_prep_verify():
             high = int(target_mojos * (1 + tol))
             return sum(1 for c in coins_list if low <= c <= high)
 
-        def allocate_matching_counts(coins_list, requests, tol):
+        def allocate_matching_counts(
+            coins_list,
+            requests,
+            tol,
+            *,
+            minimum_target_tiers=frozenset(),
+        ):
             """Allocate matching coins disjointly across tiers.
 
             This avoids double-counting when multiple tiers intentionally share
@@ -1779,7 +1831,12 @@ def api_coin_prep_verify():
                 low = int(target_mojos * (1 - tol))
                 high = int(target_mojos * (1 + tol))
                 matched_positions = [
-                    idx for idx, amt in enumerate(remaining) if low <= amt <= high
+                    idx
+                    for idx, amt in enumerate(remaining)
+                    if low <= amt <= high
+                    and not (
+                        tier in minimum_target_tiers and amt < target_mojos
+                    )
                 ]
                 consume = min(needed, len(matched_positions))
                 allocated[tier] = consume
@@ -1880,8 +1937,28 @@ def api_coin_prep_verify():
                 if not is_xch_only_tier and cat_mojos > 0 and needed > 0:
                     cat_requests.append((tier, cat_mojos, needed))
 
-            xch_allocated = allocate_matching_counts(xch_coins, xch_requests, tolerance)
-            cat_allocated = allocate_matching_counts(cat_coins, cat_requests, tolerance)
+            strict_xch_tiers = (
+                frozenset(tier for tier, _amount, _needed in xch_requests if tier != "fees")
+                if bootstrap_context is not None
+                else frozenset()
+            )
+            strict_cat_tiers = (
+                frozenset(tier for tier, _amount, _needed in cat_requests)
+                if bootstrap_context is not None
+                else frozenset()
+            )
+            xch_allocated = allocate_matching_counts(
+                xch_coins,
+                xch_requests,
+                tolerance,
+                minimum_target_tiers=strict_xch_tiers,
+            )
+            cat_allocated = allocate_matching_counts(
+                cat_coins,
+                cat_requests,
+                tolerance,
+                minimum_target_tiers=strict_cat_tiers,
+            )
 
             for tier in tiers:
                 spec = tier_specs[tier]

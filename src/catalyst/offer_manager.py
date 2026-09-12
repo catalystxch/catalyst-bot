@@ -3340,20 +3340,141 @@ class OfferManager:
                 },
             )
             if result and result.get("success"):
+                trade_record = result.get("trade_record") or {}
+                trade_id = result.get("trade_id") or trade_record.get("trade_id") or ""
+                if not trade_id:
+                    log_event(
+                        "error",
+                        "bootstrap_offer_projection_failed",
+                        "Confirmed Bootstrap offer did not return a Sage trade ID",
+                    )
+                    continue
                 locked_coin_id = result.get("locked_coin_id")
-                if type(locked_coin_id) is str and locked_coin_id:
-                    used_coin_ids.add(locked_coin_id)
-                created.append(
-                    {
-                        **result,
-                        "side": spec["side"],
-                        "level": spec["level"],
-                        "price": spec["price"],
-                        "size_xch": spec["xch_amount"],
-                        "campaign_id": campaign_id,
-                        "campaign_revision": revision,
-                    }
+                verification = result.get("_catalyst_locked_input_verification") or {}
+                verified_locked_coin_ids = (
+                    list(verification.get("locked_coin_ids") or [])
+                    if verification.get("verified") is True
+                    else []
                 )
+                normalized_locked_coin_id = self._normalize_coin_ref(locked_coin_id)
+                normalized_verified = {
+                    self._normalize_coin_ref(coin_id)
+                    for coin_id in verified_locked_coin_ids
+                }
+                if (
+                    normalized_locked_coin_id
+                    and normalized_locked_coin_id in normalized_verified
+                ):
+                    db_coin_id = locked_coin_id
+                elif verified_locked_coin_ids:
+                    db_coin_id = verified_locked_coin_ids[0]
+                else:
+                    db_coin_id = locked_coin_id
+
+                offer_max_time = result.get("offer_max_time", 0)
+                expires_at = (
+                    datetime.fromtimestamp(
+                        int(offer_max_time), tz=timezone.utc
+                    ).isoformat()
+                    if offer_max_time and int(offer_max_time) > 0
+                    else None
+                )
+                existing = database.get_offer(trade_id)
+                if existing is None:
+                    projected = add_offer(
+                        trade_id=trade_id,
+                        side=spec["side"],
+                        price_xch=spec["price"],
+                        size_xch=spec["xch_amount"],
+                        size_cat=spec["cat_amount"],
+                        cat_asset_id=asset_id,
+                        tier=tier,
+                        expires_at=expires_at,
+                        coin_id=db_coin_id,
+                    )
+                else:
+                    try:
+                        projected = (
+                            existing.get("status") == "open"
+                            and existing.get("side") == spec["side"]
+                            and str(existing.get("cat_asset_id") or "").lower()
+                            == asset_id
+                            and Decimal(str(existing.get("price_xch")))
+                            == Decimal(str(spec["price"]))
+                            and Decimal(str(existing.get("size_xch")))
+                            == Decimal(str(spec["xch_amount"]))
+                            and Decimal(str(existing.get("size_cat")))
+                            == Decimal(str(spec["cat_amount"]))
+                            and existing.get("tier") == tier
+                            and self._normalize_coin_ref(existing.get("coin_id"))
+                            == self._normalize_coin_ref(db_coin_id)
+                        )
+                    except (ArithmeticError, TypeError, ValueError):
+                        projected = False
+
+                offer_bech32 = (
+                    result.get("offer")
+                    or result.get("offer_bech32")
+                    or get_offer_bech32(trade_id)
+                    or ""
+                )
+                cached = projected and bool(offer_bech32) and update_offer_bech32(
+                    trade_id, offer_bech32
+                )
+                if not projected or not cached:
+                    log_event(
+                        "error",
+                        "bootstrap_offer_projection_failed",
+                        f"Bootstrap offer {trade_id[:16]}... could not be made "
+                        "claimable by the durable publication outbox; cancelling it",
+                    )
+                    try:
+                        self.cancel_offers(
+                            [trade_id], reason="bootstrap_projection_failed"
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                lock_targets = verified_locked_coin_ids or (
+                    [locked_coin_id] if locked_coin_id else []
+                )
+                for coin_id in lock_targets:
+                    used_coin_ids.add(coin_id)
+                    self._cycle_used_coin_ids.add(coin_id)
+                    try:
+                        lock_coin(coin_id, trade_id)
+                    except Exception as exc:
+                        log_event(
+                            "warning",
+                            "coin_lock_failed",
+                            f"DB coin lock failed for Bootstrap coin "
+                            f"{coin_id[:16]}... (offer {trade_id[:16]}...): {exc}",
+                        )
+
+                offer_detail = {
+                    **result,
+                    "trade_id": trade_id,
+                    "side": spec["side"],
+                    "level": spec["level"],
+                    "price": spec["price"],
+                    "size_xch": spec["xch_amount"],
+                    "size_cat": spec["cat_amount"],
+                    "tier": tier,
+                    "coin_id": db_coin_id,
+                    "offer_bech32": offer_bech32,
+                    "campaign_id": campaign_id,
+                    "campaign_revision": revision,
+                }
+                if verified_locked_coin_ids:
+                    offer_detail["locked_coin_ids"] = verified_locked_coin_ids
+                offer_cache = getattr(self, "_offer_details_cache", None)
+                if isinstance(offer_cache, dict):
+                    offer_cache[trade_id] = offer_detail
+                recently_created = getattr(self, "_recently_created", None)
+                if isinstance(recently_created, dict):
+                    recently_created[trade_id] = time.time()
+                created.append(offer_detail)
         return created
 
     def create_offer_with_retry(
@@ -8408,10 +8529,29 @@ class OfferManager:
                 return None
             manifest = database.get_offer_cancel_cohort_manifest(cohort_ids.pop())
             manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+            prepared = database.get_offer_cancel_cohort_prepared_events(
+                manifest["cohort_id"]
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         manifest_ids = {member["operation_id"] for member in manifest["members"]}
-        if manifest["member_count"] < 2 or not set(blocker_ids).issubset(manifest_ids):
+        if (
+            manifest["member_count"] < 2
+            or not set(blocker_ids).issubset(manifest_ids)
+            or type(prepared) is not list
+            or len(prepared) != manifest["member_count"]
+        ):
+            return None
+        try:
+            protocols = {
+                json.loads(event["evidence_json"])["wallet_effect"]["batch"][
+                    "protocol"
+                ]
+                for event in prepared
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if protocols != {"sage_native_cancel_offers_zero_plus_fee_v1"}:
             return None
         return manifest
 
@@ -8626,6 +8766,23 @@ class OfferManager:
                     database_module=database,
                     observed_at=observed_at,
                 )
+                if cancel_context is None:
+                    try:
+                        blocker_evidence = json.loads(blockers[0]["evidence_json"])
+                        cohort_id = blocker_evidence.get("cohort_id")
+                        manifest = database.get_offer_cancel_cohort_manifest(cohort_id)
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        manifest = None
+                    if manifest is not None:
+                        cancel_context = (
+                            offer_reconciliation._derive_aborted_cohort_recovery_cancel_context(
+                                manifest,
+                                blocker_ids,
+                                evidence,
+                                database_module=database,
+                                observed_at=observed_at,
+                            )
+                        )
                 classification = offer_reconciliation.classify_terminal_evidence(
                     intent_row,
                     evidence,
@@ -8642,14 +8799,66 @@ class OfferManager:
                     terminal_classification != offer_reconciliation.CANCELLED_PROVEN
                     or cancel_context is not None
                 ):
-                    reconciled = offer_reconciliation.reconcile_offer(
-                        intent.intent_id,
-                        evidence=evidence,
-                        cancel_context=cancel_context,
-                        now=observed_at,
-                    )
+                    reconcile_rows = [intent_row]
                     if (
-                        reconciled.get("classification") == terminal_classification
+                        terminal_classification
+                        == offer_reconciliation.CANCELLED_PROVEN
+                        and type(cancel_context) is dict
+                        and len(cancel_context.get("members", [])) > 1
+                    ):
+                        reconcile_rows = []
+                        for member in cancel_context["members"]:
+                            member_intent = database.get_offer_intent(
+                                member["intent_id"]
+                            )
+                            if (
+                                type(member_intent) is not dict
+                                or member_intent.get("sage_trade_id")
+                                != member["trade_id"]
+                            ):
+                                raise ValueError(
+                                    "external cohort recovery intent binding changed"
+                                )
+                            if member_intent["intent_id"] != intent.intent_id:
+                                reconcile_rows.append(member_intent)
+                        # Commit the sole blocking member last so every aborted
+                        # peer is terminal before the durable latch can clear.
+                        reconcile_rows.append(intent_row)
+                    reconciled = None
+                    for reconcile_row in reconcile_rows:
+                        member_classification = (
+                            offer_reconciliation.classify_terminal_evidence(
+                                reconcile_row,
+                                evidence,
+                                cancel_context=cancel_context,
+                                now=observed_at,
+                            )
+                        )
+                        if (
+                            member_classification.get("classification")
+                            != terminal_classification
+                        ):
+                            raise ValueError(
+                                "external cohort recovery proof is incomplete"
+                            )
+                        reconciled = offer_reconciliation.reconcile_offer(
+                            reconcile_row["intent_id"],
+                            evidence=evidence,
+                            cancel_context=cancel_context,
+                            now=observed_at,
+                        )
+                        if (
+                            reconciled.get("classification")
+                            != terminal_classification
+                            or reconciled.get("applied") is not True
+                        ):
+                            raise ValueError(
+                                "external cohort recovery was not committed"
+                            )
+                    if (
+                        type(reconciled) is dict
+                        and reconciled.get("classification")
+                        == terminal_classification
                         and reconciled.get("applied") is True
                     ):
                         runtime = mutation_gate.current_runtime()
@@ -8788,12 +8997,14 @@ class OfferManager:
             )
         return False
 
-    def retry_failed_cancels(self) -> int:
-        """Retry exact durable failures; memory is only a health-reporting cache."""
-        # A batch deliberately aborts later members after one cancellation
-        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
-        # blocker before reading or retrying failed peers; otherwise the retry
-        # attempts a second wallet mutation behind a closed safety gate.
+    def reconcile_submitted_cancels_only(self) -> int:
+        """Settle submitted cancel blockers without initiating a wallet effect.
+
+        This proof-only path is safe to expose while the mutation gate is
+        latched.  It may read Sage evidence and commit an authoritative Task 9
+        terminal result, but it never retries or submits a cancellation.
+        """
+
         try:
             blockers = database.get_unresolved_offer_operation_blockers()
         except Exception as exc:
@@ -8834,6 +9045,16 @@ class OfferManager:
                         return -1
                 finally:
                     self._end_cancel_settlement(intent.operation_id)
+        return 0
+
+    def retry_failed_cancels(self) -> int:
+        """Retry exact durable failures; memory is only a health-reporting cache."""
+        # A batch deliberately aborts later members after one cancellation
+        # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
+        # blocker before reading or retrying failed peers; otherwise the retry
+        # attempts a second wallet mutation behind a closed safety gate.
+        if self.reconcile_submitted_cancels_only() != 0:
+            return -1
 
         try:
             candidates = database.get_retryable_failed_offer_cancels()

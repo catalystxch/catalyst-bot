@@ -340,6 +340,63 @@ def test_market_confidence_endpoint_ages_expired_provider_evidence(monkeypatch):
     assert payload["can_requote"] is False
 
 
+def test_market_confidence_stays_live_for_provider_declared_freshness(monkeypatch):
+    monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
+    monkeypatch.setattr(
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(
+            return_value={
+                "asset_id": ASSET_ID,
+                "state": "GREEN",
+                "derived_at": "2026-09-10T12:00:00.000000Z",
+                "reason_codes": [],
+                "source_health": {"dexie": "valid", "splash": "valid"},
+                "evidence_digests": ["d" * 64],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        market.database, "get_degraded_market_state", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        market.database, "get_post_tibet_migration_report", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        market.database,
+        "get_market_provider_observations",
+        Mock(
+            return_value=[
+                {
+                    "provider_id": provider,
+                    "capability": "order_book",
+                    "quality": "valid",
+                    "observed_at": "2026-09-10T12:00:00.000000Z",
+                    "fresh_until": "2026-09-10T12:00:30.000000Z",
+                    "payload_sha256": "d" * 64,
+                    "reason_codes": [],
+                }
+                for provider in ("dexie", "splash")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        market,
+        "_utc_now",
+        lambda: datetime(2026, 9, 10, 12, 0, 25, tzinfo=timezone.utc),
+        raising=False,
+    )
+
+    with api_server.app.test_request_context("/api/market/confidence"):
+        response = market.api_market_confidence()
+
+    payload = response.get_json()
+    assert payload["confidence"]["state"] == "GREEN"
+    assert payload["confidence"]["data_valid"] is True
+    assert "confidence_snapshot_expired" not in payload["confidence"]["reason_codes"]
+    assert payload["can_create"] is True
+
+
 def test_market_confidence_rejects_newer_observation_not_bound_to_snapshot(
     monkeypatch,
 ):

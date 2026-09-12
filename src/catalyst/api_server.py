@@ -246,7 +246,6 @@ _MUTATING_API_ENDPOINTS = {
     "market.api_dbx_claim",
     "market.api_debug_sage_single_offer_test",
     "market.api_dexie_repost",
-    "offers.api_cancel_all",
     "offers.api_cancel_offer",
     "offers.api_cleanup_orphans",
     "offers.api_pnl_reset",
@@ -304,6 +303,10 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     "bot.api_bot_stop",
     "bot.api_shutdown",
     "coin_prep.api_coin_prep_cancel",
+    # Cancel All performs proof-only reconciliation while an earlier cancel
+    # is unresolved.  The route acquires a normal mutation permit before it
+    # can start any fresh wallet effect.
+    "offers.api_cancel_all",
     "system.api_console_toggle",
     "watchdog.api_watchdog_shape_fix_abort",
 }

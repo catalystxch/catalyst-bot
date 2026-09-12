@@ -936,14 +936,21 @@ def test_bot_dexie_fetch_does_not_claim_local_refresh_time_as_provider_time(
     loop._market_runtime_risk_preset = ""
     loop._market_runtime_refresh_cadence = 0
     loop._market_runtime_minimum_provider_count = 0
+    snapshots = iter(
+        (
+            {**_book(), "observed_at_unix": 123.0},
+            {
+                **_book(),
+                "observed_at_unix": 124.0,
+                # This is CATalyst's local fetch-completion time, not a timestamp
+                # authored by Dexie. It can be later than the cycle observation time.
+                "source_time": (NOW + timedelta(seconds=1)).isoformat(),
+            },
+        )
+    )
     loop.market_intel = SimpleNamespace(
         refresh_orderbook=lambda force=False: None,
-        get_attributable_orderbook=lambda: {
-            **_book(),
-            # This is CATalyst's local fetch-completion time, not a timestamp
-            # authored by Dexie. It can be later than the cycle observation time.
-            "source_time": (NOW + timedelta(seconds=1)).isoformat(),
-        },
+        get_attributable_orderbook=lambda: next(snapshots),
     )
     loop.dexie_manager = object()
     loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
@@ -960,6 +967,46 @@ def test_bot_dexie_fetch_does_not_claim_local_refresh_time_as_provider_time(
     assert "source_time" not in dexie_book
 
 
+def test_bot_dexie_fetch_rejects_cached_book_when_forced_refresh_makes_no_progress(
+    monkeypatch,
+):
+    import bot_loop
+
+    captured = {}
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cached = {
+        **_book(),
+        "observed_at_unix": 123.0,
+        "source_time": "1970-01-01T00:02:03Z",
+    }
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime = None
+    loop._market_runtime_asset_id = ""
+    loop._market_runtime_risk_preset = ""
+    loop._market_runtime_refresh_cadence = 0
+    loop._market_runtime_minimum_provider_count = 0
+    loop.market_intel = SimpleNamespace(
+        refresh_orderbook=lambda force=False: None,
+        get_attributable_orderbook=lambda: dict(cached),
+    )
+    loop.dexie_manager = object()
+    loop._get_fresh_splash_confidence_offers = lambda _asset, now: []
+    loop._splash_confidence_health = lambda: {}
+    monkeypatch.setattr(bot_loop, "OfferBookMarketRuntime", Runtime)
+    monkeypatch.setattr(bot_loop.cfg, "LOOP_SECONDS", 90, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "MARKET_RISK_PRESET", "balanced", raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False, raising=False)
+
+    loop._ensure_market_runtime(ASSET_ID)
+
+    with pytest.raises(RuntimeError, match="fresh Dexie evidence"):
+        captured["fetch_dexie_book"](ASSET_ID)
+
+
 def test_bot_runtime_phase_gate_expires_green_confidence_before_mutation(monkeypatch):
     import bot_loop
 
@@ -971,7 +1018,7 @@ def test_bot_runtime_phase_gate_expires_green_confidence_before_mutation(monkeyp
     )
     loop._market_confidence_result = SimpleNamespace(
         state="GREEN",
-        derived_at=datetime.now(timezone.utc) - timedelta(seconds=21),
+        derived_at=datetime.now(timezone.utc) - timedelta(seconds=31),
     )
     monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
     loop._runtime_recovery_monotonic = lambda: 1
@@ -983,6 +1030,101 @@ def test_bot_runtime_phase_gate_expires_green_confidence_before_mutation(monkeyp
 
     assert loop._enter_runtime_effect_phase("publication") is False
     assert enforced and "expired" in str(enforced[0]["error"])
+
+
+def test_bot_refreshes_aging_confidence_before_mutation(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(
+        can_create=True,
+        can_requote=True,
+    )
+    loop._market_confidence_result = SimpleNamespace(
+        state="GREEN",
+        derived_at=datetime.now(timezone.utc) - timedelta(seconds=26),
+    )
+    loop._market_confidence_valid_until = datetime.now(timezone.utc) + timedelta(
+        seconds=4
+    )
+    monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
+    loop._runtime_recovery_monotonic = lambda: 1
+    loop._runtime_recovery_wall_clock = lambda: NOW
+    loop._runtime_recovery_gap_seconds = 10
+    loop._runtime_recovery_skew_seconds = 2
+    refreshed = []
+
+    def refresh():
+        refreshed.append(True)
+        loop._market_confidence_result = SimpleNamespace(
+            state="GREEN",
+            derived_at=datetime.now(timezone.utc),
+        )
+        loop._market_degraded_decision = SimpleNamespace(
+            can_create=True,
+            can_requote=True,
+        )
+        loop._market_confidence_valid_until = datetime.now(
+            timezone.utc
+        ) + timedelta(seconds=30)
+
+    loop._refresh_offer_book_market = refresh
+
+    assert loop._enter_runtime_effect_phase("publication") is True
+    assert refreshed == [True]
+
+
+def test_active_cycle_wait_refreshes_market_evidence_every_five_seconds(monkeypatch):
+    import bot_loop
+
+    clock = [0.0]
+    waits = []
+    refreshes = []
+
+    class FakeWatcherEvent:
+        def wait(self, timeout):
+            waits.append(timeout)
+            clock[0] += timeout
+            return False
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._watcher_event = FakeWatcherEvent()
+    loop._bot_state = {"open_buys": 1, "open_sells": 0}
+    loop._publication_discovery_pending = 0
+    loop._refresh_offer_book_market = lambda: refreshes.append(clock[0])
+    monkeypatch.setattr(bot_loop.time, "monotonic", lambda: clock[0])
+
+    assert loop._wait_for_watcher_with_market_refresh(12) is False
+    assert waits == [5, 5, 2]
+    assert refreshes == [5, 10]
+
+
+def test_idle_cycle_wait_uses_bounded_twenty_five_second_market_poll(monkeypatch):
+    import bot_loop
+
+    clock = [0.0]
+    waits = []
+    refreshes = []
+
+    class FakeWatcherEvent:
+        def wait(self, timeout):
+            waits.append(timeout)
+            clock[0] += timeout
+            return False
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._watcher_event = FakeWatcherEvent()
+    loop._bot_state = {"open_buys": 0, "open_sells": 0}
+    loop._publication_discovery_pending = 0
+    loop._refresh_offer_book_market = lambda: refreshes.append(clock[0])
+    monkeypatch.setattr(bot_loop.time, "monotonic", lambda: clock[0])
+
+    assert loop._wait_for_watcher_with_market_refresh(30) is False
+    assert waits == [25, 5]
+    assert refreshes == [25]
 
 
 def test_bot_records_exact_splash_offer_for_confidence():

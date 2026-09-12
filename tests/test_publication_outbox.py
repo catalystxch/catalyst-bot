@@ -5,7 +5,9 @@ import json
 import os
 import socket
 import sys
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -2062,6 +2064,42 @@ def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkey
     assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
 
 
+def test_background_startup_repost_defers_stale_confidence_without_global_failure(
+    monkeypatch,
+):
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(can_create=True)
+    loop._market_confidence_result = SimpleNamespace(
+        derived_at=datetime.now(timezone.utc) - timedelta(seconds=31)
+    )
+    loop._enter_runtime_effect_phase = lambda _phase: (_ for _ in ()).throw(
+        AssertionError(
+            "a stale background startup repost must defer before the global phase gate"
+        )
+    )
+    events = []
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event, message, data=None: events.append(
+            (level, event, message, data)
+        ),
+    )
+
+    assert (
+        loop._repost_active_offers_to_dexie(
+            reason="startup_resume", background=True, total_offers=4
+        )
+        is False
+    )
+    assert any(
+        event == "dexie_repost_market_deferred" for _, event, _, _ in events
+    )
+
+
 def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch):
     import wallet
 
@@ -2781,6 +2819,7 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: events.append("startup_recovery")
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
     loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
     loop._set_state = lambda **kwargs: None
 
@@ -2791,6 +2830,41 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
         "enable_outbox",
         "startup_gate",
         "drain_outbox",
+    ]
+
+
+def test_startup_defers_durable_publication_drain_until_fresh_cycle():
+    events = []
+
+    class Gate:
+        def set(self):
+            events.append("startup_gate")
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._startup_complete = Gate()
+    loop._startup_sync = lambda: events.append("startup_recovery")
+    loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: False
+    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._run_one_cycle = lambda: (events.append("cycle"), setattr(loop, "_running", False))
+    loop._set_state = lambda **kwargs: None
+    loop._watcher_event = type(
+        "WatcherEvent",
+        (),
+        {"wait": lambda self, timeout: False, "clear": lambda self: None},
+    )()
+    loop._drain_mempool_signals = lambda **kwargs: None
+    loop._last_loop_duration = 0
+    loop._loop_count = 0
+
+    loop._run_loop()
+
+    assert events == [
+        "startup_recovery",
+        "enable_outbox",
+        "startup_gate",
+        "cycle",
     ]
 
 

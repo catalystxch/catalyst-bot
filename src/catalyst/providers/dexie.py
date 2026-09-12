@@ -29,10 +29,14 @@ class DexieOrderbookProvider:
         fetch_book: Callable[[str], dict[str, Any]],
         fetch_settled_trades: Callable[[str], list[dict[str, Any]]] | None = None,
         fetch_metadata: Callable[[str], dict[str, Any]] | None = None,
+        order_book_freshness_seconds: int = 20,
     ) -> None:
         self._fetch_book = fetch_book
         self._fetch_settled_trades = fetch_settled_trades
         self._fetch_metadata = fetch_metadata
+        self._order_book_freshness_seconds = max(
+            1, int(order_book_freshness_seconds or 20)
+        )
         # These are standard-offer capabilities.  Public partial discovery is
         # intentionally absent until Dexie exposes a proven CHIP-0052 contract.
         self.capabilities = ProviderCapabilities(
@@ -132,7 +136,7 @@ class DexieOrderbookProvider:
                 observed_at=observed_at,
                 source_time=source_datetime(payload.get("source_time")),
                 identity_keys=(asset_id.lower(), *sorted(seen)),
-                freshness_seconds=20,
+                freshness_seconds=self._order_book_freshness_seconds,
                 quality=quality,
                 reason_codes=tuple(reasons),
             )

@@ -299,6 +299,31 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     assert tier_requires_split(1) is False
     assert tier_requires_split(2) is True
 
+    precision_worker = object.__new__(CoinPrepWorker)
+    precision_worker.coin_prep_headroom_multiplier = Decimal("1")
+    prepared_xch = {
+        tier: precision_worker._apply_prep_headroom_xch(amount)
+        for tier, amount in {
+            "inner": Decimal("0.03333333333333333333333333333"),
+            "mid": Decimal("0.03333333333333333333333333333"),
+            "outer": Decimal("0.03333333333333333333333333334"),
+        }.items()
+    }
+    assert prepared_xch == {
+        "inner": Decimal("0.033333333333"),
+        "mid": Decimal("0.033333333333"),
+        "outer": Decimal("0.033333333333"),
+    }
+    assert all(
+        int(prepared_xch[tier] * Decimal("1000000000000"))
+        >= int(live_size * Decimal("1000000000000"))
+        for tier, live_size in {
+            "inner": Decimal("0.03333333333333333333333333333"),
+            "mid": Decimal("0.03333333333333333333333333333"),
+            "outer": Decimal("0.03333333333333333333333333334"),
+        }.items()
+    )
+
     worker = object.__new__(CoinPrepWorker)
     worker.coin_prep_headroom_multiplier = Decimal("1")
     worker.cat_decimals = 3
@@ -410,6 +435,146 @@ def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
     assert all(kwargs["coin_ids_enabled"] is True for _offer, kwargs in calls)
 
 
+def test_bootstrap_offer_is_projected_before_it_can_be_published(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    campaign = _campaign_from_record(record)
+    decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=NOW)
+    plan = derive_bootstrap_plan(campaign, decision, _balances())
+
+    projected = []
+    cached = []
+    locked = []
+    manager = OfferManager()
+
+    def create(_offer_dict, **_kwargs):
+        index = len(projected) + 1
+        trade_id = hashlib.sha256(f"bootstrap-{index}".encode()).hexdigest()
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "offer": f"offer1bootstrap{index}",
+            "locked_coin_id": hashlib.sha256(f"coin-{index}".encode()).hexdigest(),
+            "offer_max_time": int(NOW.timestamp()) + 86_400,
+            "_catalyst_locked_input_verification": {
+                "verified": True,
+                "selected_present": True,
+                "locked_coin_ids": [
+                    hashlib.sha256(f"coin-{index}".encode()).hexdigest()
+                ],
+            },
+        }
+
+    manager.create_offer_with_retry = create
+    monkeypatch.setattr(
+        "offer_manager.add_offer",
+        lambda **kwargs: projected.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        "offer_manager.update_offer_bech32",
+        lambda trade_id, offer: cached.append((trade_id, offer)) or True,
+    )
+    monkeypatch.setattr(
+        "offer_manager.lock_coin",
+        lambda coin_id, trade_id: locked.append((coin_id, trade_id)) or True,
+    )
+
+    created = manager.create_bootstrap_plan(
+        plan,
+        campaign_authority=record,
+        xch_wallet_id=1,
+        cat_wallet_id=2,
+        cat_decimals=3,
+        coin_ids_enabled=True,
+    )
+
+    assert len(created) == len(projected) == len(cached) == 6
+    assert len(locked) == 6
+    for result, projection, (cached_trade_id, cached_offer) in zip(
+        created, projected, cached
+    ):
+        assert projection["trade_id"] == result["trade_id"] == cached_trade_id
+        assert projection["side"] == result["side"]
+        assert projection["price_xch"] == result["price"]
+        assert projection["size_xch"] == result["size_xch"]
+        assert projection["size_cat"] > Decimal("0")
+        assert projection["cat_asset_id"] == ASSET_ID
+        assert projection["coin_id"] == result["locked_coin_id"]
+        assert cached_offer.startswith("offer1bootstrap")
+
+
+def test_bootstrap_offer_rejects_a_mismatched_existing_projection(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    campaign = _campaign_from_record(record)
+    decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=NOW)
+    plan = derive_bootstrap_plan(campaign, decision, _balances())
+
+    trade_id = hashlib.sha256(b"mismatched-projection").hexdigest()
+    coin_id = hashlib.sha256(b"mismatched-coin").hexdigest()
+    manager = OfferManager()
+    manager.create_offer_with_retry = lambda *_args, **_kwargs: {
+        "success": True,
+        "trade_id": trade_id,
+        "offer": "offer1mismatched",
+        "locked_coin_id": coin_id,
+    }
+    cancelled = []
+    manager.cancel_offers = lambda trade_ids, **_kwargs: cancelled.extend(trade_ids)
+    cached = []
+    monkeypatch.setattr(
+        "offer_manager.database.get_offer",
+        lambda _trade_id: {
+            "trade_id": trade_id,
+            "status": "open",
+            "side": "buy",
+            "cat_asset_id": ASSET_ID,
+            "price_xch": "999",
+            "size_xch": "999",
+            "size_cat": "999",
+            "tier": "wrong",
+            "coin_id": "ff" * 32,
+        },
+    )
+    monkeypatch.setattr(
+        "offer_manager.update_offer_bech32",
+        lambda *args: cached.append(args) or True,
+    )
+
+    created = manager.create_bootstrap_plan(
+        plan,
+        campaign_authority=record,
+        xch_wallet_id=1,
+        cat_wallet_id=2,
+        cat_decimals=3,
+        coin_ids_enabled=True,
+    )
+
+    assert created == []
+    assert cancelled == [trade_id] * 6
+    assert cached == []
+
+
 def test_runtime_binds_exact_identity_and_only_creates_missing_levels(bootstrap_app):
     _bootstrap, client, identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -519,6 +684,43 @@ def test_live_bot_routes_bootstrap_before_follow_creation_and_requote():
         create_source.index("unsuspend_slots_if_coins_available")
     )
     assert "_bootstrap_campaign_blocks_follow_mutations" in requote_source
+
+
+def test_bootstrap_startup_skips_legacy_tier_readiness(monkeypatch):
+    loop = object.__new__(BotLoop)
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": {"campaign_id": "campaign-1", "revision": 2},
+    }
+    loop.coin_manager = type(
+        "CoinManager",
+        (),
+        {
+            "coin_readiness_report": lambda _self: (_ for _ in ()).throw(
+                AssertionError("legacy tier readiness must not run for Bootstrap")
+            )
+        },
+    )()
+    events = []
+    monkeypatch.setattr(
+        "bot_loop.log_event",
+        lambda level, event_type, message, data=None: events.append(
+            (level, event_type, message, data)
+        ),
+    )
+
+    readiness = loop._startup_coin_readiness_report()
+
+    assert readiness is None
+    assert events == [
+        (
+            "info",
+            "bootstrap_exact_coin_readiness",
+            "Market Bootstrap uses its exact campaign Coin Prep plan; legacy tier targets do not apply",
+            {"campaign_id": "campaign-1", "revision": 2},
+        )
+    ]
 
 
 def test_active_bootstrap_suppresses_follow_churn_but_keeps_safety_and_recovery():
