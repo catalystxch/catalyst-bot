@@ -91,6 +91,10 @@ class _Offer:
 @dataclass(frozen=True, slots=True)
 class MarketConfidenceResult:
     state: str
+    data_valid: bool
+    provider_redundancy: int
+    follow_capacity_fraction: Decimal
+    market_stage: str
     derived_at: datetime
     trusted_midpoint: Decimal | None
     trusted_bid: Decimal | None
@@ -566,6 +570,16 @@ class MarketConfidenceEngine:
         ):
             reasons.append("single_provider_dependency")
         state = "RED" if fatal else ("AMBER" if amber else "GREEN")
+        data_valid = not fatal
+        if not data_valid:
+            follow_capacity_fraction = Decimal("0")
+            market_stage = "INVALID"
+        elif usable_provider_count < 2:
+            follow_capacity_fraction = Decimal("0.25")
+            market_stage = "FOLLOW_RESTRICTED"
+        else:
+            follow_capacity_fraction = Decimal("1")
+            market_stage = "FOLLOW"
 
         accept_proposed = (
             proposed_midpoint is not None
@@ -585,6 +599,10 @@ class MarketConfidenceEngine:
         self._prior_observed_at = current_time if churn_ids else None
         return MarketConfidenceResult(
             state=state,
+            data_valid=data_valid,
+            provider_redundancy=usable_provider_count,
+            follow_capacity_fraction=follow_capacity_fraction,
+            market_stage=market_stage,
             derived_at=current_time,
             trusted_midpoint=trusted_midpoint,
             trusted_bid=trusted_bid,

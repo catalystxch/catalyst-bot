@@ -80,6 +80,10 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
         "bot",
         SimpleNamespace(
             _market_confidence_result=SimpleNamespace(
+                data_valid=True,
+                provider_redundancy=2,
+                follow_capacity_fraction=Decimal("1"),
+                market_stage="FOLLOW",
                 independent_bid_depth_mojos=2_000_000_000_000,
                 independent_ask_depth_mojos=3_000_000_000_000,
                 required_depth_mojos=1_000_000_000_000,
@@ -105,7 +109,13 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
 
     payload = response.get_json()
     assert payload["market_model"] == "offer_book"
-    assert payload["confidence"] == snapshot
+    assert payload["confidence"] == {
+        **snapshot,
+        "data_valid": True,
+        "provider_redundancy": 2,
+        "follow_capacity_fraction": "1",
+        "market_stage": "FOLLOW",
+    }
     assert payload["degraded"] == degraded
     assert payload["migration"] == migration
     assert payload["providers"]["tibetswap"] == {
@@ -124,7 +134,13 @@ def test_market_confidence_endpoint_exposes_one_coherent_durable_snapshot(monkey
             ],
         },
     }
-    assert payload["can_increase_exposure"] is False
+    assert payload["can_increase_exposure"] is True
+    assert payload["can_create"] is True
+    assert payload["can_requote"] is True
+    assert payload["metrics"]["data_valid"] is True
+    assert payload["metrics"]["provider_redundancy"] == 2
+    assert payload["metrics"]["follow_capacity_fraction"] == "1"
+    assert payload["metrics"]["market_stage"] == "FOLLOW"
     assert payload["metrics"]["independent_bid_depth_xch"] == "2"
     assert payload["metrics"]["independent_ask_depth_xch"] == "3"
     assert payload["metrics"]["required_depth_xch"] == "1"

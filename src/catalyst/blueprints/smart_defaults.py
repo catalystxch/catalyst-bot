@@ -645,11 +645,14 @@ def _resolve_smart_mid_price(
         return getattr(market_confidence, name, None)
 
     state = confidence_field("state")
+    data_valid = confidence_field("data_valid")
+    if data_valid is None:
+        data_valid = state == "GREEN"
     trusted_midpoint = confidence_field("trusted_midpoint")
     trusted_bid = confidence_field("trusted_bid")
     trusted_ask = confidence_field("trusted_ask")
     if (
-        state == "GREEN"
+        data_valid is True
         and type(trusted_midpoint) is Decimal
         and type(trusted_bid) is Decimal
         and type(trusted_ask) is Decimal
@@ -661,7 +664,7 @@ def _resolve_smart_mid_price(
         price_source = "trusted_offer_book"
         messages.append(f"Price: {mid_price:.8f} (trusted offer book)")
     else:
-        messages.append("Price unavailable: GREEN offer-book confidence is required")
+        messages.append("Price unavailable: a valid attributable offer book is required")
 
     try:
         exact_spacescan_price = Decimal(str(spacescan_price))
@@ -1065,13 +1068,53 @@ def _derive_smart_market_confidence(
         ),
         fetch_splash_offers=splash_offers,
         fetch_splash_health=splash_health,
-        minimum_provider_count=2 if getattr(cfg, "SPLASH_ENABLED", False) else 1,
+        minimum_provider_count=2,
     )
     return runtime.refresh(
         own_offer_identities=own_offer_identities,
         configured_offer_size_mojos=size_mojos,
         now=now,
     ).confidence
+
+
+def _smart_bootstrap_suggestion_reasons(
+    market_confidence: object,
+) -> tuple[str, ...]:
+    """Return exact Follow-market conditions that justify Bootstrap guidance."""
+
+    def field(name):
+        if isinstance(market_confidence, dict):
+            return market_confidence.get(name)
+        return getattr(market_confidence, name, None)
+
+    triggers = {
+        "market_data_absent",
+        "stale_provider_data",
+        "one_sided_book",
+        "insufficient_bid_depth",
+        "insufficient_ask_depth",
+    }
+    raw_reasons = tuple(str(reason) for reason in (field("reason_codes") or ()))
+    reasons = [
+        str(reason)
+        for reason in raw_reasons
+        if str(reason) in triggers
+    ]
+    bid = field("trusted_bid")
+    ask = field("trusted_ask")
+    if (
+        type(bid) is Decimal
+        and type(ask) is Decimal
+        and bid > 0
+        and ask >= bid
+    ):
+        midpoint = (bid + ask) / Decimal("2")
+        spread_bps = (ask - bid) / midpoint * Decimal("10000")
+        if spread_bps > Decimal("1000"):
+            reasons.append("wide_offer_book")
+    if reasons and "single_provider_dependency" in raw_reasons:
+        reasons.insert(0, "single_provider_dependency")
+    return tuple(dict.fromkeys(reasons))
 
 
 @bp.route("/api/smart-defaults")
@@ -1278,6 +1321,86 @@ def _calculate_smart_defaults(
     asset_id = normalized_asset_id
 
     trade_size = api_server._safe_float(request.args.get("trade_size", 0))
+    messages = []
+
+    # Validate the current executable Follow market before reading wallet
+    # balances or mutating any Smart Settings cache. An invalid market can
+    # only suggest the separately accepted Bootstrap workflow.
+    own_offer_identities = _smart_market_own_offer_identities(asset_id)
+    orderbook = _fetch_dexie_orderbook_standalone(
+        asset_id, own_offer_identities=own_offer_identities
+    )
+    configured_size_candidates = [
+        Decimal(str(trade_size or 0)),
+        Decimal(str(getattr(cfg, "XCH_COIN_SIZE", 0) or 0)),
+    ]
+    for side in ("BUY", "SELL"):
+        for tier in ("INNER", "MID", "OUTER", "EXTREME"):
+            configured_size_candidates.append(
+                Decimal(str(getattr(cfg, f"{side}_{tier}_SIZE_XCH", 0) or 0))
+            )
+    configured_market_size = max(
+        (value for value in configured_size_candidates if value > 0),
+        default=Decimal("0.005"),
+    )
+    market_confidence = _derive_smart_market_confidence(
+        asset_id=asset_id,
+        risk_profile=_risk_profile_name,
+        provider_book=orderbook.get("provider_book", {"bids": [], "asks": []}),
+        own_offer_identities=own_offer_identities,
+        configured_offer_size_xch=configured_market_size,
+        now=datetime.now(timezone.utc),
+    )
+    data_valid = getattr(
+        market_confidence,
+        "data_valid",
+        market_confidence.state == "GREEN",
+    )
+    bootstrap_reason_codes = _smart_bootstrap_suggestion_reasons(market_confidence)
+    bootstrap_suggested = bool(bootstrap_reason_codes)
+    if data_valid is not True or bootstrap_suggested:
+        reason_codes = list(market_confidence.reason_codes)
+        message = (
+            "Follow market is unsuitable; Bootstrap may be configured separately"
+            if bootstrap_suggested
+            else "Follow market data is invalid"
+        )
+        log_event(
+            "warning",
+            "smart_defaults_market_confidence_blocked",
+            message,
+        )
+        return (
+            jsonify(
+                {
+                    "error": message,
+                    "code": (
+                        "BOOTSTRAP_SUGGESTED"
+                        if bootstrap_suggested
+                        else "MARKET_DATA_INVALID"
+                    ),
+                    "market_confidence": market_confidence.state,
+                    "market_data_valid": data_valid is True,
+                    "provider_redundancy": getattr(
+                        market_confidence, "provider_redundancy", 0
+                    ),
+                    "follow_capacity_fraction": str(
+                        getattr(
+                            market_confidence,
+                            "follow_capacity_fraction",
+                            Decimal("0"),
+                        )
+                    ),
+                    "market_stage": getattr(
+                        market_confidence, "market_stage", "INVALID"
+                    ),
+                    "reason_codes": reason_codes,
+                    "bootstrap_suggested": bootstrap_suggested,
+                    "bootstrap_reason_codes": list(bootstrap_reason_codes),
+                }
+            ),
+            409,
+        )
 
     print("\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
     log_event(
@@ -1285,7 +1408,6 @@ def _calculate_smart_defaults(
         "smart_defaults",
         f"Smart Settings: gathering 30 days of market data for {cat_name}",
     )
-    messages = []
 
     # ---- 1. Wallet balances (same as v1 — always needed) ----
     # F62 (2026-04-09): use UNCONFIRMED (projected post-pending) balance.
@@ -1417,51 +1539,6 @@ def _calculate_smart_defaults(
     quality = analysis.get("data_quality", {})
     risk_level = health.get("risk_level", "moderate")
 
-    # Fetch before price resolution: asset-id orderbook evidence is the
-    # authoritative live market input in the post-TibetSwap model.
-    own_offer_identities = _smart_market_own_offer_identities(asset_id)
-    orderbook = _fetch_dexie_orderbook_standalone(
-        asset_id, own_offer_identities=own_offer_identities
-    )
-    configured_size_candidates = [
-        Decimal(str(trade_size or 0)),
-        Decimal(str(getattr(cfg, "XCH_COIN_SIZE", 0) or 0)),
-    ]
-    for side in ("BUY", "SELL"):
-        for tier in ("INNER", "MID", "OUTER", "EXTREME"):
-            configured_size_candidates.append(
-                Decimal(str(getattr(cfg, f"{side}_{tier}_SIZE_XCH", 0) or 0))
-            )
-    configured_market_size = max(
-        (value for value in configured_size_candidates if value > 0),
-        default=Decimal("0.005"),
-    )
-    market_confidence = _derive_smart_market_confidence(
-        asset_id=asset_id,
-        risk_profile=_risk_profile_name,
-        provider_book=orderbook.get("provider_book", {"bids": [], "asks": []}),
-        own_offer_identities=own_offer_identities,
-        configured_offer_size_xch=configured_market_size,
-        now=datetime.now(timezone.utc),
-    )
-    if market_confidence.state != "GREEN":
-        reason_codes = list(market_confidence.reason_codes)
-        log_event(
-            "warning",
-            "smart_defaults_market_confidence_blocked",
-            "Smart Settings requires GREEN attributable offer-book confidence",
-        )
-        return (
-            jsonify(
-                {
-                    "error": "Smart Settings requires GREEN offer-book confidence",
-                    "code": "MARKET_CONFIDENCE_NOT_GREEN",
-                    "market_confidence": market_confidence.state,
-                    "reason_codes": reason_codes,
-                }
-            ),
-            409,
-        )
     orderbook["best_bid"] = market_confidence.trusted_bid or Decimal("0")
     orderbook["best_ask"] = market_confidence.trusted_ask or Decimal("0")
     orderbook["buy_depth_xch"] = Decimal(
@@ -4242,6 +4319,12 @@ def _calculate_smart_defaults(
         "market_model": "offer_book",
         "market_risk_preset": _risk_profile_name,
         "market_confidence": market_confidence.state,
+        "market_data_valid": market_confidence.data_valid,
+        "market_provider_redundancy": market_confidence.provider_redundancy,
+        "market_follow_capacity_fraction": str(
+            market_confidence.follow_capacity_fraction
+        ),
+        "market_stage": market_confidence.market_stage,
         "market_confidence_reason_codes": list(market_confidence.reason_codes),
         "market_evidence_digests": list(market_confidence.evidence_digests),
         "market_source_health": dict(market_confidence.source_health),

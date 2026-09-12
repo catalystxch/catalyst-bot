@@ -116,7 +116,7 @@ class OfferBookMarketRuntime:
             supporting_evidence_digests=supporting_evidence_digests,
         )
         degraded = self._degraded.update(
-            confidence_state=confidence.state,
+            confidence_state=("GREEN" if confidence.data_valid else confidence.state),
             now=now,
         )
         snapshot = confidence.to_snapshot(

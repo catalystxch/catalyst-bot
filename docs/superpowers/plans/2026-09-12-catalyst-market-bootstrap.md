@@ -286,24 +286,24 @@ git commit -m "feat: sign and verify bootstrap manifests"
 - Consumes: existing exact Dexie/Splash normalized observations plus optional active `BootstrapDecision`.
 - Produces: `MarketConfidenceResult.data_valid`, `provider_redundancy`, `follow_capacity_fraction`, `market_stage`, and reason codes that distinguish invalid data from a single healthy provider.
 
-- [ ] **Step 1: Write the failing single-provider regressions**
+- [x] **Step 1: Write the failing single-provider regressions**
 
 Add assertions that a fresh attributable exact Dexie book remains valid with zero
 Splash peers; its follow capacity is restricted rather than zero; stale or
 crossed data remains unauthorized; and a Red follow market returns an explanatory
 Bootstrap suggestion without settings persistence, Coin Prep, or wallet calls.
 
-- [ ] **Step 2: Prove current behavior fails on `single_provider_dependency`**
+- [x] **Step 2: Prove current behavior fails on `single_provider_dependency`**
 
 Run: `python -m pytest tests/test_market_confidence.py tests/test_plan_04_10_smart_defaults_endpoint.py -k "single_provider or bootstrap_suggested" -q`
 
 Expected: fresh exact Dexie-only scenarios remain Amber/409 before the change.
 
-- [ ] **Step 3: Implement independent validity and redundancy fields**
+- [x] **Step 3: Implement independent validity and redundancy fields**
 
 Keep Green/Amber/Red source health, but do not derive `minimum_provider_count` from `SPLASH_ENABLED`. One valid exact Dexie book sets `data_valid=True` and restricted follow capacity; a second independent exact provider increases redundancy. Missing, stale, crossed, malformed, own-only, or unattributable books remain unauthorized.
 
-- [ ] **Step 4: Return an explicit Bootstrap suggestion without mutation**
+- [x] **Step 4: Return an explicit Bootstrap suggestion without mutation**
 
 When the follow book is absent, stale, one-sided, insufficiently deep, or wider than 1,000 basis points, Smart Settings returns `bootstrap_suggested=true`, exact reason codes, and no settings save, Coin Prep, or offer action. Only a separate accepted campaign permits the Bootstrap path.
 
@@ -311,7 +311,7 @@ Run: `python -m pytest tests/test_market_confidence.py tests/test_market_runtime
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit confidence separation**
+- [x] **Step 5: Commit confidence separation**
 
 ```powershell
 git add src/catalyst/market_confidence.py src/catalyst/market_runtime.py src/catalyst/blueprints/market.py src/catalyst/blueprints/smart_defaults.py src/catalyst/bot_loop.py tests/test_market_confidence.py tests/test_market_runtime.py tests/test_plan_04_10_smart_defaults_endpoint.py

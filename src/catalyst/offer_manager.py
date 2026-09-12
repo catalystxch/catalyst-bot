@@ -99,7 +99,7 @@ def assess_offer_book_candidate(
     now: Optional[datetime] = None,
     max_confidence_age_seconds: int = 20,
 ) -> Dict[str, Any]:
-    """Validate one exact candidate against its attributable GREEN snapshot."""
+    """Validate one exact candidate against attributable, valid book evidence."""
 
     normalized_side = str(side or "").strip().lower()
     if normalized_side not in {"buy", "sell"}:
@@ -116,8 +116,11 @@ def assess_offer_book_candidate(
             return confidence.get(name)
         return getattr(confidence, name, None)
 
-    if field("state") != "GREEN":
-        return {"eligible": False, "reason_code": "market_confidence_not_green"}
+    data_valid = field("data_valid")
+    if data_valid is None:
+        data_valid = field("state") == "GREEN"
+    if data_valid is not True:
+        return {"eligible": False, "reason_code": "market_data_invalid"}
     if now is not None:
         derived_at = field("derived_at")
         if (

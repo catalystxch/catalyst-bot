@@ -149,6 +149,84 @@ def test_configured_dexie_only_mode_can_reach_green_with_deep_two_sided_book():
     assert result.derived_thresholds["minimum_provider_count"] == 1
 
 
+def test_single_exact_provider_is_valid_with_restricted_follow_capacity():
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(_dexie(),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "AMBER"
+    assert result.data_valid is True
+    assert result.provider_redundancy == 1
+    assert result.follow_capacity_fraction == Decimal("0.25")
+    assert result.market_stage == "FOLLOW_RESTRICTED"
+
+
+def test_two_exact_providers_unlock_full_follow_capacity():
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.data_valid is True
+    assert result.provider_redundancy == 2
+    assert result.follow_capacity_fraction == Decimal("1")
+    assert result.market_stage == "FOLLOW"
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        (_dexie(age=21),),
+        (_dexie(bid="0.11", ask="0.10"),),
+        (
+            _observation(
+                "dexie",
+                {
+                    "bids": [
+                        {
+                            "offer_id": "only-bid",
+                            "price": "0.1",
+                            "amount_mojos": 10_000,
+                        }
+                    ],
+                    "asks": [],
+                },
+            ),
+        ),
+    ],
+)
+def test_invalid_follow_books_have_no_capacity(observations):
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=observations,
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.data_valid is False
+    assert result.follow_capacity_fraction == Decimal("0")
+    assert result.market_stage == "INVALID"
+
+
+def test_own_only_book_is_invalid_and_has_no_follow_capacity():
+    result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
+        observations=(_dexie(ids=("ours-b", "ours-a")),),
+        own_offer_identities=frozenset({"ours-b", "ours-a"}),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.data_valid is False
+    assert result.provider_redundancy == 0
+    assert result.follow_capacity_fraction == Decimal("0")
+    assert result.market_stage == "INVALID"
+
+
 def test_own_offers_are_excluded_before_price_and_depth():
     result = MarketConfidenceEngine(risk_preset="balanced").evaluate(
         observations=(

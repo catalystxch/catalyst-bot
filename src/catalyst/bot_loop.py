@@ -132,6 +132,25 @@ _RUNTIME_EFFECT_PHASES = frozenset(
 )
 
 
+def market_follow_offer_target(configured_target: int, confidence) -> int:
+    """Apply the exact provider-redundancy capacity cap to one Follow target."""
+
+    target = max(0, int(configured_target or 0))
+    if confidence is None:
+        return target
+    data_valid = getattr(confidence, "data_valid", None)
+    if data_valid is None:
+        data_valid = getattr(confidence, "state", None) == "GREEN"
+    if data_valid is not True:
+        return 0
+    fraction = getattr(confidence, "follow_capacity_fraction", Decimal("1"))
+    if type(fraction) is not Decimal or not fraction.is_finite() or fraction <= 0:
+        return 0
+    if fraction >= Decimal("1"):
+        return target
+    return max(1, int(Decimal(target) * fraction)) if target else 0
+
+
 def _normalize_coin_id_value(coin_id: object) -> str:
     cid = str(coin_id or "").strip().lower()
     if cid and not cid.startswith("0x"):
@@ -1432,7 +1451,7 @@ class BotLoop:
     def _ensure_market_runtime(self, asset_id: str) -> OfferBookMarketRuntime:
         asset = str(asset_id or "").strip().lower()
         refresh_cadence = max(1, int(getattr(cfg, "LOOP_SECONDS", 90) or 90))
-        minimum_provider_count = 2 if getattr(cfg, "SPLASH_ENABLED", False) else 1
+        minimum_provider_count = 2
         risk_preset = (
             str(getattr(cfg, "MARKET_RISK_PRESET", "balanced") or "balanced")
             .strip()
@@ -1533,6 +1552,12 @@ class BotLoop:
         )
         self._set_state(
             market_confidence=result.confidence.state,
+            market_data_valid=result.confidence.data_valid,
+            market_provider_redundancy=result.confidence.provider_redundancy,
+            market_follow_capacity_fraction=str(
+                result.confidence.follow_capacity_fraction
+            ),
+            market_stage=result.confidence.market_stage,
             market_confidence_reason_codes=list(result.confidence.reason_codes),
             market_withdrawal_stage=result.degraded.stage,
             market_confidence_snapshot_id=result.snapshot_id,
@@ -12282,6 +12307,9 @@ class BotLoop:
                 self._clear_alert(f"{_side}_position_paused")
         buy_target = int(adaptive_targets.get("buy", 0) or 0)
         sell_target = int(adaptive_targets.get("sell", 0) or 0)
+        confidence = getattr(self, "_market_confidence_result", None)
+        buy_target = market_follow_offer_target(buy_target, confidence)
+        sell_target = market_follow_offer_target(sell_target, confidence)
         _buy_under = bool(
             cfg.ENABLE_BUY and not skip_buy and effective_buy_count < buy_target
         )

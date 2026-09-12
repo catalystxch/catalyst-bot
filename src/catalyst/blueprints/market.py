@@ -730,6 +730,17 @@ def _age_confidence_snapshot(
         aged["state"] = "AMBER"
         if "single_provider_dependency" not in reasons:
             reasons.append("single_provider_dependency")
+    data_valid = str(aged.get("state") or "RED").upper() != "RED"
+    aged["data_valid"] = data_valid
+    aged["provider_redundancy"] = fresh_books
+    aged["follow_capacity_fraction"] = (
+        "0" if not data_valid else ("0.25" if fresh_books < 2 else "1")
+    )
+    aged["market_stage"] = (
+        "INVALID"
+        if not data_valid
+        else ("FOLLOW_RESTRICTED" if fresh_books < 2 else "FOLLOW")
+    )
     aged["reason_codes"] = reasons
     aged["source_health"] = source_health
     return aged
@@ -745,6 +756,12 @@ def _runtime_confidence_metrics() -> dict:
         return format_decimal_plain(value)
 
     return {
+        "data_valid": bool(getattr(result, "data_valid", False)),
+        "provider_redundancy": int(getattr(result, "provider_redundancy", 0)),
+        "follow_capacity_fraction": str(
+            getattr(result, "follow_capacity_fraction", "0")
+        ),
+        "market_stage": str(getattr(result, "market_stage", "INVALID")),
         "independent_bid_depth_xch": _xch(
             getattr(result, "independent_bid_depth_mojos", 0)
         ),
@@ -884,8 +901,8 @@ def api_market_confidence():
         if timeline is not None:
             degraded["timeline"] = timeline
     degraded_active = bool(degraded and degraded.get("degraded_since"))
-    can_create = state == "GREEN" and not degraded_active
-    can_requote = state == "GREEN" and not degraded_active
+    can_create = bool(confidence.get("data_valid")) and not degraded_active
+    can_requote = bool(confidence.get("data_valid")) and not degraded_active
     payload = {
         "market_model": "offer_book",
         "asset_id": asset_id,

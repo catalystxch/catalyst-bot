@@ -31,6 +31,8 @@ def isolated_db(tmp_path, monkeypatch):
 def _confidence(**overrides):
     values = {
         "state": "GREEN",
+        "data_valid": True,
+        "follow_capacity_fraction": Decimal("1"),
         "trusted_midpoint": Decimal("0.101"),
         "trusted_bid": Decimal("0.099"),
         "trusted_ask": Decimal("0.103"),
@@ -75,9 +77,9 @@ def test_candidate_profit_floor_uses_directional_exact_final_edge():
     assert wrong_side["reason_code"] == "candidate_outside_profitable_side"
 
 
-def test_candidate_requires_green_exact_snapshot_evidence():
+def test_candidate_requires_valid_exact_snapshot_evidence():
     for confidence in (
-        _confidence(state="AMBER"),
+        _confidence(state="AMBER", data_valid=False),
         _confidence(evidence_digests=()),
         _confidence(trusted_bid=None),
         _confidence(derived_at=NOW - timedelta(seconds=21)),
@@ -93,6 +95,25 @@ def test_candidate_requires_green_exact_snapshot_evidence():
             now=NOW,
         )
         assert result["eligible"] is False
+
+
+def test_candidate_accepts_valid_restricted_single_provider_snapshot():
+    result = assess_offer_book_candidate(
+        side="buy",
+        candidate_price=Decimal("0.1"),
+        size_xch=Decimal("1"),
+        confidence=_confidence(
+            state="AMBER",
+            data_valid=True,
+            follow_capacity_fraction=Decimal("0.25"),
+        ),
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=0,
+        minimum_profit_xch=Decimal("0"),
+        now=NOW,
+    )
+
+    assert result["eligible"] is True
 
 
 def test_profitable_candidate_only_competes_when_it_improves_trusted_book():

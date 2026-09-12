@@ -50,6 +50,10 @@ def _green_market_confidence(
     ask_value = Decimal(str(ask))
     return SimpleNamespace(
         state="GREEN",
+        data_valid=True,
+        provider_redundancy=2,
+        follow_capacity_fraction=Decimal("1"),
+        market_stage="FOLLOW",
         trusted_midpoint=(bid_value + ask_value) / Decimal("2"),
         trusted_bid=bid_value,
         trusted_ask=ask_value,
@@ -348,11 +352,12 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(result["buy_depth_xch"], Decimal("0.9"))
         self.assertEqual(result["provider_book"]["asks"][0]["offer_id"], own_identity)
 
-    def test_smart_mid_uses_only_green_trusted_confidence(self):
+    def test_smart_mid_accepts_valid_restricted_single_provider_confidence(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
 
-        green = {
-            "state": "GREEN",
+        valid = {
+            "state": "AMBER",
+            "data_valid": True,
             "trusted_midpoint": Decimal("0.1000000000000000001"),
             "trusted_bid": Decimal("0.09"),
             "trusted_ask": Decimal("0.11"),
@@ -363,7 +368,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             spacescan={},
             trades={},
             orderbook={"best_bid": Decimal("9"), "best_ask": Decimal("10")},
-            market_confidence=green,
+            market_confidence=valid,
             messages=[],
         )
         rejected = _resolve_smart_mid_price(
@@ -372,13 +377,138 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             spacescan={},
             trades={},
             orderbook={"best_bid": Decimal("0.09"), "best_ask": Decimal("0.11")},
-            market_confidence={**green, "state": "AMBER"},
+            market_confidence={**valid, "data_valid": False},
             messages=[],
         )
 
         self.assertEqual(accepted["mid_price"], Decimal("0.1000000000000000001"))
         self.assertEqual(accepted["price_source"], "trusted_offer_book")
         self.assertEqual(rejected["mid_price"], Decimal("0"))
+
+    def test_smart_confidence_always_measures_provider_redundancy(self):
+        from blueprints import smart_defaults
+        import market_runtime
+
+        captured = {}
+
+        class Runtime:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def refresh(self, **_kwargs):
+                return SimpleNamespace(confidence="confidence")
+
+        with patch.object(market_runtime, "OfferBookMarketRuntime", Runtime):
+            result = smart_defaults._derive_smart_market_confidence(
+                asset_id=self._ASSET_ID,
+                risk_profile="balanced",
+                provider_book={"bids": [], "asks": []},
+                own_offer_identities=frozenset(),
+                configured_offer_size_xch=Decimal("0.005"),
+                now=api_server.datetime.now(api_server.timezone.utc),
+            )
+
+        self.assertEqual(result, "confidence")
+        self.assertEqual(captured["minimum_provider_count"], 2)
+
+    def test_bootstrap_suggestion_reasons_include_wide_follow_book(self):
+        from blueprints.smart_defaults import _smart_bootstrap_suggestion_reasons
+
+        confidence = SimpleNamespace(
+            reason_codes=("single_provider_dependency",),
+            trusted_bid=Decimal("0.09"),
+            trusted_ask=Decimal("0.11"),
+        )
+
+        reasons = _smart_bootstrap_suggestion_reasons(confidence)
+
+        self.assertEqual(
+            reasons,
+            ("single_provider_dependency", "wide_offer_book"),
+        )
+
+    def test_bootstrap_suggestion_reasons_exclude_crossed_book_only_failure(self):
+        from blueprints.smart_defaults import _smart_bootstrap_suggestion_reasons
+
+        confidence = SimpleNamespace(
+            reason_codes=("crossed_book",),
+            trusted_bid=None,
+            trusted_ask=None,
+        )
+
+        self.assertEqual(_smart_bootstrap_suggestion_reasons(confidence), ())
+
+    def test_red_follow_returns_bootstrap_suggestion_before_wallet_or_cache(self):
+        from blueprints import smart_defaults
+
+        confidence = SimpleNamespace(
+            state="RED",
+            data_valid=False,
+            provider_redundancy=0,
+            follow_capacity_fraction=Decimal("0"),
+            market_stage="INVALID",
+            trusted_midpoint=None,
+            trusted_bid=None,
+            trusted_ask=None,
+            independent_bid_depth_mojos=0,
+            independent_ask_depth_mojos=0,
+            manipulation_score=0,
+            reason_codes=("one_sided_book", "insufficient_ask_depth"),
+            evidence_digests=("a" * 64,),
+            source_health={"dexie": "valid"},
+        )
+        orderbook = {
+            "has_data": True,
+            "api_ok": True,
+            "provider_book": {
+                "bids": [
+                    {"offer_id": "bid", "price": "0.1", "amount_mojos": 2_000}
+                ],
+                "asks": [],
+            },
+        }
+
+        with (
+            patch("wallet.get_wallet_balance") as wallet_balance,
+            patch("database.clear_market_analysis_cache") as clear_cache,
+            patch(
+                "market_data_collector.collect_all_market_data", return_value={}
+            ),
+            patch("market_data_collector.analyze_market_data", return_value={}),
+            patch.object(
+                smart_defaults,
+                "_fetch_dexie_orderbook_standalone",
+                return_value=orderbook,
+            ),
+            patch.object(
+                smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=confidence,
+            ),
+        ):
+            with api_server.app.test_request_context("/api/smart-defaults"):
+                response, status = smart_defaults._calculate_smart_defaults(
+                    asset_id=self._ASSET_ID,
+                    cat_wallet_id=2,
+                    cat_decimals=3,
+                    cat_ticker_id="MZ_XCH",
+                    cat_name="Monkeyzoo Token",
+                )
+
+        body = response.get_json()
+        self.assertEqual(status, 409)
+        self.assertTrue(body["bootstrap_suggested"])
+        self.assertEqual(
+            body["bootstrap_reason_codes"],
+            ["one_sided_book", "insufficient_ask_depth"],
+        )
+        wallet_balance.assert_not_called()
+        clear_cache.assert_not_called()
 
     def test_smart_budget_price_math_preserves_decimal_precision(self):
         import inspect
@@ -485,7 +615,9 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         self.assertEqual(resolved["mid_price"], 0)
         self.assertEqual(resolved["dexie_price"], 0)
         self.assertEqual(resolved["price_source"], "")
-        self.assertTrue(any("GREEN" in message for message in messages))
+        self.assertTrue(
+            any("valid attributable offer book" in message for message in messages)
+        )
 
     def test_price_resolver_rejects_one_sided_orderbook(self):
         from blueprints.smart_defaults import _resolve_smart_mid_price
@@ -503,7 +635,9 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
 
         self.assertEqual(resolved["mid_price"], 0)
         self.assertEqual(resolved["price_source"], "")
-        self.assertTrue(any("GREEN" in message for message in messages))
+        self.assertTrue(
+            any("valid attributable offer book" in message for message in messages)
+        )
 
     def test_response_contract_includes_safety_fields(self):
         root = Path(__file__).resolve().parents[1]
@@ -1106,7 +1240,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
                 patch.object(
                     smart_defaults,
                     "_derive_smart_market_confidence",
-                    return_value=_green_market_confidence("0.00009", "0.00011"),
+                    return_value=_green_market_confidence("0.000096", "0.000104"),
                 ),
                 patch.object(
                     smart_defaults,
@@ -1238,7 +1372,7 @@ class TestSmartDefaultsBalanceSizingRegression(_FlaskBase):
             patch.object(
                 smart_defaults,
                 "_derive_smart_market_confidence",
-                return_value=_green_market_confidence("0.00010", "0.00012"),
+                return_value=_green_market_confidence("0.000105", "0.000115"),
             ),
             patch.object(
                 smart_defaults,

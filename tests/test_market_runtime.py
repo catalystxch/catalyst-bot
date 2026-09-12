@@ -89,6 +89,31 @@ def test_runtime_persists_one_coherent_green_decision(isolated_db):
     assert {row["provider_id"] for row in providers} == {"dexie", "splash"}
 
 
+def test_runtime_allows_restricted_creation_from_one_valid_exact_provider(isolated_db):
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda asset_id: _book(),
+        fetch_splash_offers=lambda asset_id: [],
+        fetch_splash_health=lambda: {
+            "running": False,
+            "api_reachable": False,
+            "peers": 0,
+        },
+    )
+
+    result = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+
+    assert result.confidence.state == "AMBER"
+    assert result.confidence.data_valid is True
+    assert result.confidence.follow_capacity_fraction == Decimal("0.25")
+    assert result.degraded.can_create is True
+
+
 def test_runtime_fails_closed_when_only_our_offers_remain(isolated_db):
     runtime = OfferBookMarketRuntime(
         asset_id=ASSET_ID,
@@ -845,12 +870,9 @@ def test_bot_runtime_phase_gate_fails_closed_before_first_confidence_refresh(
     assert loop._enter_runtime_effect_phase("cancel") is True
 
 
-@pytest.mark.parametrize(
-    ("splash_enabled", "expected_minimum"),
-    [(False, 1), (True, 2)],
-)
+@pytest.mark.parametrize("splash_enabled", [False, True])
 def test_bot_market_runtime_matches_provider_requirement_to_splash_configuration(
-    monkeypatch, splash_enabled, expected_minimum
+    monkeypatch, splash_enabled
 ):
     import bot_loop
 
@@ -877,7 +899,24 @@ def test_bot_market_runtime_matches_provider_requirement_to_splash_configuration
 
     loop._ensure_market_runtime(ASSET_ID)
 
-    assert captured["minimum_provider_count"] == expected_minimum
+    assert captured["minimum_provider_count"] == 2
+
+
+def test_follow_capacity_restricts_configured_offer_target():
+    import bot_loop
+
+    restricted = SimpleNamespace(
+        data_valid=True,
+        follow_capacity_fraction=Decimal("0.25"),
+    )
+    invalid = SimpleNamespace(
+        data_valid=False,
+        follow_capacity_fraction=Decimal("0"),
+    )
+
+    assert bot_loop.market_follow_offer_target(23, restricted) == 5
+    assert bot_loop.market_follow_offer_target(23, invalid) == 0
+    assert bot_loop.market_follow_offer_target(23, None) == 23
 
 
 def test_bot_dexie_fetch_does_not_claim_local_refresh_time_as_provider_time(
