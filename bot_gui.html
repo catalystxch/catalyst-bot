@@ -35516,6 +35516,10 @@ function closeCtgErrorModal() {
                     reset_offer_history: !!resets.offers,
                     reset_counters: !!resets.counters,
                 };
+                if (_bootstrapActiveCampaign?.campaign_id) {
+                    prepPayload.bootstrap_campaign_id = _bootstrapActiveCampaign.campaign_id;
+                    prepPayload.bootstrap_campaign_revision = _bootstrapActiveCampaign.revision;
+                }
                 const response = await apiFetch(`${API_URL}/coin-prep/trigger`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },

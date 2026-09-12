@@ -68,3 +68,14 @@ def test_bootstrap_status_is_visible_across_the_main_workflow():
     ):
         assert label in GUI
     assert 'id="bootstrapGlobalStatus"' in GUI
+
+
+def test_coin_prep_binds_the_exact_active_bootstrap_revision():
+    assert (
+        "prepPayload.bootstrap_campaign_id = _bootstrapActiveCampaign.campaign_id"
+        in GUI
+    )
+    assert (
+        "prepPayload.bootstrap_campaign_revision = _bootstrapActiveCampaign.revision"
+        in GUI
+    )

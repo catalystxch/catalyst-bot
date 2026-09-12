@@ -26,6 +26,7 @@ import time
 import threading
 import traceback
 import requests
+import database
 import mutation_gate
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -87,7 +88,11 @@ from amount_utils import (
     format_signed_cat_display_amount,
 )
 from wallet import get_all_offers, get_chia_health
-from bootstrap_campaign import BootstrapDecision
+from bootstrap_runtime import (
+    active_bootstrap_levels,
+    derive_bootstrap_runtime,
+    plan_bootstrap_runtime_transition,
+)
 
 try:
     import mempool_watcher as _mempool_watcher_mod
@@ -107,52 +112,25 @@ DEXIE_STATUS_EXPIRED = 6
 LEGACY_TIBET_BOOST_RUNTIME_ENABLED = False
 
 
-def plan_bootstrap_runtime_transition(
-    *,
-    campaign_record: dict,
-    decision: BootstrapDecision,
-    unresolved_cancellation_count: int,
-) -> dict:
-    """Plan the next live Bootstrap action without performing a wallet effect."""
+def plan_bootstrap_cycle_mutations(*, bootstrap_active: bool) -> dict[str, bool]:
+    """Separate Bootstrap-authorized effects from ordinary Follow churn."""
 
-    if type(campaign_record) is not dict or type(decision) is not BootstrapDecision:
-        raise TypeError("exact Bootstrap campaign and decision are required")
-    if (
-        type(unresolved_cancellation_count) is not int
-        or unresolved_cancellation_count < 0
-    ):
-        raise ValueError("unresolved cancellation count is invalid")
-    if campaign_record.get("status") != "active":
-        return {
-            "allow_create": False,
-            "allow_requote": False,
-            "cancel_required": unresolved_cancellation_count > 0,
-            "cancel_reason": "bootstrap_campaign_not_active",
-            "manual_restart_required": True,
-        }
-    if unresolved_cancellation_count:
-        return {
-            "allow_create": False,
-            "allow_requote": False,
-            "cancel_required": True,
-            "cancel_reason": "bootstrap_cancellation_recovery",
-            "manual_restart_required": bool(decision.manual_restart_required),
-        }
-    if decision.cancellation_required or not decision.authorized:
-        stop_reason = decision.stop_reason.value if decision.stop_reason else "unsafe"
-        return {
-            "allow_create": False,
-            "allow_requote": False,
-            "cancel_required": True,
-            "cancel_reason": f"bootstrap_{stop_reason}",
-            "manual_restart_required": bool(decision.manual_restart_required),
-        }
+    follow_allowed = not bool(bootstrap_active)
     return {
-        "allow_create": True,
-        "allow_requote": True,
-        "cancel_required": False,
-        "cancel_reason": None,
-        "manual_restart_required": False,
+        "toxicity_cancel": follow_allowed,
+        "expiry_refresh": follow_allowed,
+        "emergency_requote": follow_allowed,
+        "sniper_cleanup": follow_allowed,
+        "boost_mutation": follow_allowed,
+        "follow_requote": follow_allowed,
+        "follow_trim": follow_allowed,
+        "follow_recovery_evaluation": follow_allowed,
+        "legacy_coin_topup": follow_allowed,
+        "safety_cancel": True,
+        "cancel_retry": True,
+        "bootstrap_create": True,
+        "publication_reconcile": True,
+        "fill_reconcile": True,
     }
 
 
@@ -9743,11 +9721,16 @@ class BotLoop:
             buy_fills=buy_fills,
             sell_fills=sell_fills,
         )
-        toxicity_cancelled = self._cancel_toxicity_throttled_offers(
-            toxicity_snapshot,
-            current_buy_ids=current_buy_ids,
-            current_sell_ids=current_sell_ids,
+        _bootstrap_cycle_policy = plan_bootstrap_cycle_mutations(
+            bootstrap_active=self._bootstrap_campaign_blocks_follow_mutations()
         )
+        toxicity_cancelled = {"buy": set(), "sell": set()}
+        if _bootstrap_cycle_policy["toxicity_cancel"]:
+            toxicity_cancelled = self._cancel_toxicity_throttled_offers(
+                toxicity_snapshot,
+                current_buy_ids=current_buy_ids,
+                current_sell_ids=current_sell_ids,
+            )
         if toxicity_cancelled["buy"] or toxicity_cancelled["sell"]:
             current_buy_ids -= toxicity_cancelled["buy"]
             current_sell_ids -= toxicity_cancelled["sell"]
@@ -9825,7 +9808,8 @@ class BotLoop:
         # with zero gap in market presence.
         expired = 0
         if (
-            cfg.OFFER_EXPIRY_SECS > 0
+            _bootstrap_cycle_policy["expiry_refresh"]
+            and cfg.OFFER_EXPIRY_SECS > 0
             and not getattr(self, "_graceful_in_progress", False)
             and not self._recovery_is_active()
         ):
@@ -10583,7 +10567,11 @@ class BotLoop:
         emergency_requote_triggered = (
             recent_swap and arb_gap > cfg.ARB_ALERT_THRESHOLD_BPS and mid_price > 0
         )
-        if emergency_requote_triggered and not recovery_active_now:
+        if (
+            _bootstrap_cycle_policy["emergency_requote"]
+            and emergency_requote_triggered
+            and not recovery_active_now
+        ):
             for eq_side in ["sell", "buy"]:
                 if not self._config_enables_side(eq_side):
                     self._force_requote[eq_side] = False
@@ -10780,7 +10768,8 @@ class BotLoop:
             self._probe_state.get("buy_tid") or self._probe_state.get("sell_tid")
         )
         if (
-            not recovery_active_now
+            _bootstrap_cycle_policy["sniper_cleanup"]
+            and not recovery_active_now
             and not self._probe_state.get("active", False)
             and self._probe_state.get("confirmed_price")
             and _has_probe_tid
@@ -10916,6 +10905,7 @@ class BotLoop:
 
         if (
             LEGACY_TIBET_BOOST_RUNTIME_ENABLED
+            and _bootstrap_cycle_policy["boost_mutation"]
             and self.boost_manager._boost_active
             and not recovery_active_now
         ):
@@ -11030,7 +11020,8 @@ class BotLoop:
         force_tag = " FORCED!" if (force_buy or force_sell) else ""
         print(f"   [9] Requote check...{force_tag}", end="", flush=True)
         # step9 detail log removed — the actual requoting info log fires when needed
-        self._handle_requoting(mid_price, current_buy_ids, current_sell_ids)
+        if _bootstrap_cycle_policy["follow_requote"]:
+            self._handle_requoting(mid_price, current_buy_ids, current_sell_ids)
         print(" done", flush=True)
         # step9_done removed
 
@@ -11256,7 +11247,11 @@ class BotLoop:
 
         # ---- Step 12: Coin management ----
         print("   [12] Coin health...", end="", flush=True)
-        self._handle_coins(len(current_buy_ids), len(current_sell_ids))
+        self._handle_coins(
+            len(current_buy_ids),
+            len(current_sell_ids),
+            allow_legacy_topup=_bootstrap_cycle_policy["legacy_coin_topup"],
+        )
         print(" done", flush=True)
         # step12 log removed
 
@@ -11267,75 +11262,70 @@ class BotLoop:
         # the furthest-from-mid offers back down to cap. With Fix 1 in
         # place this should rarely fire — but when it does, it stops the
         # overshoot from accumulating across cycles.
-        try:
-            # Filter out zombie wallet offers (cancelled in DB but still active in
-            # Sage) before passing to trim so the trim doesn't count those against
-            # the cap and cancel freshly-created real offers.
-            _db_filtered_buys = [
-                o for o in open_buys if o.get("trade_id") in _db_open_buy_ids
-            ]
-            _db_filtered_sells = [
-                o for o in open_sells if o.get("trade_id") in _db_open_sell_ids
-            ]
-            if not self._enter_runtime_effect_phase("trim"):
-                return False
-            trimmed = self.offer_manager.trim_excess_offers(
-                mid_price,
-                wallet_buys=_db_filtered_buys,
-                wallet_sells=_db_filtered_sells,
-            )
-            if trimmed > 0:
-                log_event(
-                    "info",
-                    "trim_excess_done",
-                    f"Trim pass cancelled {trimmed} excess offer(s)",
+        if _bootstrap_cycle_policy["follow_trim"]:
+            try:
+                # Filter out zombie wallet offers (cancelled in DB but still active
+                # in Sage) before passing to trim so the trim doesn't count those
+                # against the cap and cancel freshly-created real offers.
+                _db_filtered_buys = [
+                    o for o in open_buys if o.get("trade_id") in _db_open_buy_ids
+                ]
+                _db_filtered_sells = [
+                    o for o in open_sells if o.get("trade_id") in _db_open_sell_ids
+                ]
+                if not self._enter_runtime_effect_phase("trim"):
+                    return False
+                trimmed = self.offer_manager.trim_excess_offers(
+                    mid_price,
+                    wallet_buys=_db_filtered_buys,
+                    wallet_sells=_db_filtered_sells,
                 )
-                # F14 fix (2026-04-08): track trim activity. Repeated trim
-                # firing means create-first requote is leaving offers
-                # behind faster than they can be cancelled — likely a
-                # wallet sync issue or aggressive requote schedule. Alert
-                # if we trim >5 cycles in a row.
-                self._trim_streak = getattr(self, "_trim_streak", 0) + 1
-                if self._trim_streak >= 5:
+                if trimmed > 0:
                     log_event(
-                        "warning",
-                        "trim_excess_sustained",
-                        f"Trim pass has fired for {self._trim_streak} "
-                        f"consecutive cycles — create-first requote may "
-                        f"be leaking offers. Investigate cancel latency "
-                        f"or pause requotes.",
+                        "info",
+                        "trim_excess_done",
+                        f"Trim pass cancelled {trimmed} excess offer(s)",
                     )
-                    self._emit_alert(
-                        "trim_sustained",
-                        "warning",
-                        "Offer Cleanup Lag",
-                        f"The create-first requote dance has been over-creating "
-                        f"offers for {self._trim_streak} cycles in a row. The "
-                        f"trim pass is cleaning up but cancel latency seems high.",
-                    )
-            else:
-                # Reset streak when a clean cycle happens
-                if getattr(self, "_trim_streak", 0) > 0:
+                    self._trim_streak = getattr(self, "_trim_streak", 0) + 1
+                    if self._trim_streak >= 5:
+                        log_event(
+                            "warning",
+                            "trim_excess_sustained",
+                            f"Trim pass has fired for {self._trim_streak} "
+                            f"consecutive cycles — create-first requote may "
+                            f"be leaking offers. Investigate cancel latency "
+                            f"or pause requotes.",
+                        )
+                        self._emit_alert(
+                            "trim_sustained",
+                            "warning",
+                            "Offer Cleanup Lag",
+                            f"The create-first requote dance has been over-creating "
+                            f"offers for {self._trim_streak} cycles in a row. The "
+                            f"trim pass is cleaning up but cancel latency seems high.",
+                        )
+                elif getattr(self, "_trim_streak", 0) > 0:
                     self._trim_streak = 0
                     self._clear_alert("trim_sustained")
-        except Exception as e:
-            log_event(
-                "warning",
-                "trim_excess_error",
-                f"Trim excess pass failed (non-fatal): {e}",
-            )
+            except Exception as e:
+                log_event(
+                    "warning",
+                    "trim_excess_error",
+                    f"Trim excess pass failed (non-fatal): {e}",
+                )
 
         # ---- Step 12b: Recovery mode evaluation ----
         # Subtract any confirmed probe slots so the probe offer doesn't inflate
         # the apparent buy count and mask a genuine under-target condition.
-        _probe_offsets = self._confirmed_probe_slot_offsets(
-            current_buy_ids, current_sell_ids
-        )
-        self._evaluate_recovery_mode(
-            mid_price,
-            max(0, len(current_buy_ids) - _probe_offsets["buy"]),
-            max(0, len(current_sell_ids) - _probe_offsets["sell"]),
-        )
+        if _bootstrap_cycle_policy["follow_recovery_evaluation"]:
+            _probe_offsets = self._confirmed_probe_slot_offsets(
+                current_buy_ids, current_sell_ids
+            )
+            self._evaluate_recovery_mode(
+                mid_price,
+                max(0, len(current_buy_ids) - _probe_offsets["buy"]),
+                max(0, len(current_sell_ids) - _probe_offsets["sell"]),
+            )
 
         # ---- Step 13: Housekeeping ----
         print("   [13-15] Housekeeping + inventory + GUI push...", end="", flush=True)
@@ -11524,6 +11514,15 @@ class BotLoop:
     ):
         """Check if offers need requoting due to price movement or forced convergence."""
         if not cfg.AUTO_REQUOTE:
+            return
+
+        if self._bootstrap_campaign_blocks_follow_mutations():
+            log_event(
+                "debug",
+                "bootstrap_follow_requote_blocked",
+                "Active Market Bootstrap campaign owns repricing; ordinary Follow "
+                "requote is disabled",
+            )
             return
 
         if self._recovery_is_active():
@@ -12146,6 +12145,242 @@ class BotLoop:
     # Offer creation
     # -------------------------------------------------------------------
 
+    def _bootstrap_campaign_context(self) -> dict:
+        """Resolve local Bootstrap ownership before any Follow mutation."""
+
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) != 64:
+            return {"active": False}
+        try:
+            campaigns = database.list_active_bootstrap_campaigns_for_asset(asset_id)
+        except Exception as exc:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_authority_read_failed",
+                "detail": str(exc),
+            }
+        if not campaigns:
+            return {"active": False}
+        if len(campaigns) != 1:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_authority_ambiguous",
+            }
+        try:
+            from wallet import get_wallet_identity
+
+            snapshot = get_wallet_identity()
+        except Exception as exc:
+            snapshot = {"success": False, "error": str(exc)}
+        if type(snapshot) is not dict or snapshot.get("success") is not True:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_wallet_identity_unavailable",
+            }
+        network_id = str(snapshot.get("network_id") or "").strip().lower()
+        network = (
+            "mainnet"
+            if network_id == "mainnet"
+            else "testnet"
+            if network_id.startswith("testnet")
+            else ""
+        )
+        identity = {
+            "network": network,
+            "wallet_type": str(snapshot.get("backend") or "").strip().lower(),
+            "wallet_fingerprint": snapshot.get("fingerprint"),
+            "wallet_id": getattr(cfg, "CAT_WALLET_ID", None),
+            "asset_id": asset_id,
+        }
+        campaign = campaigns[0]
+        if any(campaign.get(key) != identity.get(key) for key in identity):
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_identity_mismatch",
+                "campaign": campaign,
+            }
+        if snapshot.get("has_secrets") is not True:
+            return {
+                "active": True,
+                "blocked": True,
+                "reason": "bootstrap_wallet_not_signing",
+                "campaign": campaign,
+            }
+        return {
+            "active": True,
+            "blocked": False,
+            "campaign": campaign,
+            "identity": identity,
+        }
+
+    def _bootstrap_campaign_blocks_follow_mutations(self) -> bool:
+        """Fail closed whenever any active local Bootstrap authority exists."""
+
+        return bool(self._bootstrap_campaign_context().get("active"))
+
+    def _route_bootstrap_creation_if_active(
+        self,
+        *,
+        current_buy_ids: set,
+        current_sell_ids: set,
+    ):
+        """Create only missing exact campaign levels, or return None for Follow."""
+
+        context = self._bootstrap_campaign_context()
+        if context.get("active") is not True:
+            return None
+        empty = {"buy": set(), "sell": set()}
+        if context.get("blocked") is True:
+            log_event(
+                "error",
+                "bootstrap_runtime_blocked",
+                "Market Bootstrap blocked before wallet mutation: "
+                f"{context.get('reason')}",
+            )
+            return empty
+        if self.coin_manager.is_busy():
+            log_event(
+                "info",
+                "bootstrap_create_wait_coin_manager",
+                "Market Bootstrap waiting for Coin Prep or coin maintenance",
+            )
+            return empty
+        if int(getattr(self, "_publication_discovery_pending", 0) or 0) > 0:
+            log_event(
+                "info",
+                "bootstrap_create_wait_discovery",
+                "Market Bootstrap waiting for exact public rediscovery before "
+                "creating another level",
+            )
+            return empty
+
+        from tx_fees import get_effective_transaction_fee_mojos
+        from wallet import get_wallet_balance
+
+        try:
+            xch = _extract_wallet_balance_or_defer(
+                get_wallet_balance(int(getattr(cfg, "WALLET_ID_XCH", 1)))
+            )
+            cat = _extract_wallet_balance_or_defer(
+                get_wallet_balance(int(getattr(cfg, "CAT_WALLET_ID", 0)))
+            )
+            # Campaign capacity is bound to its fixed budget and the wallet's
+            # total confirmed inventory.  Existing campaign offers temporarily
+            # reduce spendable balance; using that view here would shrink the
+            # deterministic plan and mis-size replacement levels after a fill.
+            xch_atomic = xch["confirmed_wallet_balance"]
+            cat_atomic = cat["confirmed_wallet_balance"]
+            xch_available = Decimal(str(xch_atomic)) / Decimal("1000000000000")
+            cat_available = Decimal(str(cat_atomic)) / (
+                Decimal(10) ** int(getattr(cfg, "CAT_DECIMALS", 3))
+            )
+        except (KeyError, TypeError, ValueError, _ReserveCheckDeferred) as exc:
+            log_event(
+                "warning",
+                "bootstrap_balance_unavailable",
+                f"Market Bootstrap balance proof unavailable: {exc}",
+            )
+            return empty
+
+        campaign = context["campaign"]
+        balances = {
+            "xch_available": xch_available,
+            "cat_available": cat_available,
+            "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
+            "subsidy_spent_xch": Decimal("0"),
+            "network_fee_xch": Decimal(get_effective_transaction_fee_mojos())
+            / Decimal("1000000000000"),
+            "minimum_profit_xch": Decimal(
+                str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0")))
+            ),
+            "fee_coin_size_xch": Decimal(
+                str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0")))
+            ),
+            "expected_cancel_requotes": int(
+                getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
+            ),
+        }
+        try:
+            runtime = derive_bootstrap_runtime(
+                campaign_record=campaign,
+                identity=context["identity"],
+                balances=balances,
+                now=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            log_event(
+                "error",
+                "bootstrap_runtime_derivation_failed",
+                f"Market Bootstrap runtime derivation failed closed: {exc}",
+            )
+            return empty
+        if runtime["transition"]["cancel_required"]:
+            prefix = f"bootstrap:{campaign['campaign_id']}:revision:"
+            trade_ids = sorted(
+                {
+                    str(intent.get("sage_trade_id") or "")
+                    for intent in database.get_offer_intents_for_registry()
+                    if str(intent.get("purpose") or "").startswith(prefix)
+                    and str(intent.get("sage_trade_id") or "")
+                    in (current_buy_ids | current_sell_ids)
+                }
+            )
+            if trade_ids:
+                self.offer_manager.cancel_offers(
+                    trade_ids,
+                    reason=runtime["transition"]["cancel_reason"],
+                    force_storm=True,
+                )
+            return empty
+        if runtime["plan"].get("authorized") is not True:
+            log_event(
+                "warning",
+                "bootstrap_plan_not_authorized",
+                "Market Bootstrap has no currently authorized levels",
+                data={"reason_codes": list(runtime["plan"].get("reason_codes", ()))},
+            )
+            return empty
+
+        intents = database.get_offer_intents_for_registry()
+        existing = active_bootstrap_levels(
+            intents,
+            campaign_id=campaign["campaign_id"],
+            revision=campaign["revision"],
+        )
+        if len(existing) >= sum(
+            len(runtime["plan"]["sides"][side]["levels"]) for side in ("buy", "sell")
+        ):
+            return empty
+        created = self.offer_manager.create_bootstrap_plan(
+            runtime["plan"],
+            campaign_authority=campaign,
+            xch_wallet_id=int(getattr(cfg, "WALLET_ID_XCH", 1)),
+            cat_wallet_id=int(getattr(cfg, "CAT_WALLET_ID", 0)),
+            cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+            coin_ids_enabled=bool(getattr(cfg, "COIN_IDS_ENABLED", False)),
+            existing_levels=existing,
+        )
+        created_ids = {"buy": set(), "sell": set()}
+        for offer in created:
+            side = offer.get("side")
+            trade_id = str(offer.get("trade_id") or "")
+            bech32 = str(offer.get("offer_bech32") or "")
+            if side in created_ids and trade_id:
+                created_ids[side].add(trade_id)
+            if bech32 and trade_id:
+                self.dexie_manager.queue_post(bech32, trade_id)
+                if getattr(cfg, "SPLASH_ENABLED", False):
+                    self.splash_manager.queue_post(bech32, trade_id)
+        if created:
+            self.coin_manager.snapshot_coins("bootstrap_offer_created")
+            self._emit_coin_update("bootstrap_offer_created")
+            self._last_bulk_create_time = time.time()
+        return created_ids
+
     def _log_create_disabled_under_target(
         self,
         side: str,
@@ -12209,6 +12444,12 @@ class BotLoop:
         """Create new offers if we're below target count."""
         if not self._enter_runtime_effect_phase("create"):
             return False
+        bootstrap_result = self._route_bootstrap_creation_if_active(
+            current_buy_ids=set(current_buy_ids or set()),
+            current_sell_ids=set(current_sell_ids or set()),
+        )
+        if bootstrap_result is not None:
+            return bootstrap_result
         recovery_active = self._recovery_is_active()
 
         # Fix F: check if suspended slots can be unsuspended (coins available)
@@ -13118,7 +13359,13 @@ class BotLoop:
             )
             return False
 
-    def _handle_coins(self, active_buy_count: int, active_sell_count: int):
+    def _handle_coins(
+        self,
+        active_buy_count: int,
+        active_sell_count: int,
+        *,
+        allow_legacy_topup: bool = True,
+    ):
         """Handle coin counting, topup, and prep.
 
         Three-tier checking (V1 parity):
@@ -13126,6 +13373,13 @@ class BotLoop:
         2. needs_topup() — FREE coins low → lightweight split
         3. check_runtime_health() — every 5 loops, independent free coin check
         """
+        if not allow_legacy_topup:
+            status = self.coin_manager.check_coin_prep_status()
+            if status.get("cancelled_ids"):
+                for tid in status["cancelled_ids"]:
+                    self.offer_manager._bot_cancelled_ids.add(tid)
+            return
+
         if not self._enter_runtime_effect_phase("coin_prep"):
             return False
         if self._reclaim_oversized_locked_offers():

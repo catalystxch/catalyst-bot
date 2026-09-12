@@ -204,6 +204,14 @@ def require_active_bootstrap_intent_authority(
     }
 
 
+def _bootstrap_level_tier(level: str) -> str:
+    tiers = {"near": "inner", "middle": "mid", "far": "outer"}
+    try:
+        return tiers[level]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Bootstrap offer level is invalid") from exc
+
+
 def assess_offer_book_candidate(
     *,
     side: str,
@@ -3236,6 +3244,117 @@ class OfferManager:
                     # Cleanup is best-effort and must never replace the stable
                     # durable result (or the original pre-prepare exception).
                     pass
+
+    def create_bootstrap_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        campaign_authority: dict[str, Any],
+        xch_wallet_id: int,
+        cat_wallet_id: int,
+        cat_decimals: int,
+        coin_ids_enabled: bool,
+        existing_levels: frozenset[tuple[str, str]] = frozenset(),
+    ) -> list[dict[str, Any]]:
+        """Create only the exact standard offers authorized by a Bootstrap plan.
+
+        This deliberately bypasses ordinary ladder interpolation, adaptive
+        targets, and Follow-market repricing.  Each wallet mutation is still
+        journalled by ``create_offer_with_retry`` and rechecks the exact active
+        campaign revision at that final boundary.
+        """
+
+        if type(xch_wallet_id) is not int or xch_wallet_id <= 0:
+            raise ValueError("Bootstrap XCH wallet ID is invalid")
+        if type(cat_wallet_id) is not int or cat_wallet_id <= 0:
+            raise ValueError("Bootstrap CAT wallet ID is invalid")
+        if xch_wallet_id == cat_wallet_id:
+            raise ValueError("Bootstrap wallet IDs must be distinct")
+        if type(cat_decimals) is not int or not 0 <= cat_decimals <= 12:
+            raise ValueError("Bootstrap CAT decimals are invalid")
+        if type(coin_ids_enabled) is not bool:
+            raise TypeError("Bootstrap coin selection flag must be a bool")
+        if type(existing_levels) is not frozenset or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] not in {"buy", "sell"}
+            or item[1] not in {"near", "middle", "far"}
+            for item in existing_levels
+        ):
+            raise ValueError("Bootstrap existing levels are invalid")
+
+        specs = bootstrap_offer_specs(
+            plan,
+            campaign_authority=campaign_authority,
+        )
+        campaign_id = campaign_authority["campaign_id"]
+        revision = campaign_authority["revision"]
+        asset_id = str(plan.get("coin_prep", {}).get("campaign_asset_id") or "")
+        created: list[dict[str, Any]] = []
+        used_coin_ids: set[str] = set()
+        for index, spec in enumerate(specs):
+            if (spec["side"], spec["level"]) in existing_levels:
+                continue
+            if getattr(self, "_stop_requested", False):
+                break
+            xch_mojos = xch_to_mojos(spec["xch_amount"])
+            cat_mojos = cat_to_mojos(spec["cat_amount"], cat_decimals)
+            if xch_mojos <= 0 or cat_mojos <= 0:
+                raise ValueError("Bootstrap offer amount rounds to zero")
+            if spec["side"] == "buy":
+                offer_dict = {
+                    str(xch_wallet_id): -xch_mojos,
+                    str(cat_wallet_id): cat_mojos,
+                }
+            else:
+                offer_dict = {
+                    str(cat_wallet_id): -cat_mojos,
+                    str(xch_wallet_id): xch_mojos,
+                }
+            tier = _bootstrap_level_tier(spec["level"])
+            result = self.create_offer_with_retry(
+                offer_dict,
+                expiry_offset=index,
+                used_coins=used_coin_ids,
+                coin_ids_enabled=coin_ids_enabled,
+                preferred_tier=tier,
+                creation_context={
+                    "slot_key": (
+                        f"bootstrap:{campaign_id}:{revision}:"
+                        f"{spec['side']}:{spec['level']}"
+                    ),
+                    "select_next_generation": True,
+                    "asset_id": asset_id,
+                    "side": spec["side"],
+                    "tier": tier,
+                    "purpose": spec["purpose"],
+                    "offer_size_uniqueness": {
+                        "campaign_id": campaign_id,
+                        "campaign_revision": revision,
+                        "side": spec["side"],
+                        "level": spec["level"],
+                        "requested_amount_atomic": str(
+                            next(amount for amount in offer_dict.values() if amount > 0)
+                        ),
+                    },
+                },
+            )
+            if result and result.get("success"):
+                locked_coin_id = result.get("locked_coin_id")
+                if type(locked_coin_id) is str and locked_coin_id:
+                    used_coin_ids.add(locked_coin_id)
+                created.append(
+                    {
+                        **result,
+                        "side": spec["side"],
+                        "level": spec["level"],
+                        "price": spec["price"],
+                        "size_xch": spec["xch_amount"],
+                        "campaign_id": campaign_id,
+                        "campaign_revision": revision,
+                    }
+                )
+        return created
 
     def create_offer_with_retry(
         self,

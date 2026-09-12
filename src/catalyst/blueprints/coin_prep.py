@@ -40,6 +40,7 @@ from database import (
     get_open_offers,
     get_stats,
     guarded_reset_authoritative_state,
+    list_active_bootstrap_campaigns_for_asset,
     log_event,
 )
 from pc_diagnostics import collect_pc_diagnostics as _collect_pc_diagnostics
@@ -83,6 +84,133 @@ def bootstrap_coin_prep_requirements(plan: dict) -> dict:
         "excluded_xch": dict(prep["excluded_xch"]),
         "excluded_purposes": tuple(prep["excluded_purposes"]),
     }
+
+
+def bootstrap_coin_prep_worker_args(plan: dict) -> dict:
+    """Translate one authorized Bootstrap plan into exact worker overrides."""
+
+    prep = bootstrap_coin_prep_requirements(plan)
+    level_to_tier = {"near": "inner", "middle": "mid", "far": "outer"}
+
+    def _sizes(rows: list, amount_key: str) -> dict[str, Decimal]:
+        values: dict[str, Decimal] = {}
+        for row in rows:
+            if type(row) is not dict or row.get("level") not in level_to_tier:
+                raise ValueError("Bootstrap Coin Prep level is invalid")
+            amount = Decimal(str(row.get(amount_key)))
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError("Bootstrap Coin Prep amount is invalid")
+            tier = level_to_tier[row["level"]]
+            if tier in values:
+                raise ValueError("Bootstrap Coin Prep level is duplicated")
+            values[tier] = amount
+        return values
+
+    xch_sizes = _sizes(prep["xch_offer_coins"], "amount_xch")
+    cat_sizes = _sizes(prep["cat_offer_coins"], "amount_cat")
+    fee_sizes = {
+        Decimal(str(row.get("amount_xch")))
+        for row in prep["fee_coins"]
+        if type(row) is dict
+    }
+    if prep["fee_coins"] and (len(fee_sizes) != 1 or next(iter(fee_sizes)) <= 0):
+        raise ValueError("Bootstrap fee coin sizes must be one positive amount")
+    if prep["fee_coins"]:
+        xch_sizes["fees"] = next(iter(fee_sizes))
+
+    tier_order = ("inner", "mid", "outer", "fees")
+
+    def _spec(values: dict[str, Decimal | int]) -> str:
+        return ",".join(
+            f"{tier}={values[tier]}" for tier in tier_order if tier in values
+        )
+
+    xch_counts = {tier: 1 for tier in xch_sizes if tier != "fees"}
+    if prep["fee_coins"]:
+        xch_counts["fees"] = len(prep["fee_coins"])
+    cat_counts = {tier: 1 for tier in cat_sizes}
+    return {
+        "xch_target": sum(xch_counts.values()),
+        "cat_target": sum(cat_counts.values()),
+        "buy_tier_sizes": _spec(xch_sizes),
+        "cat_tier_sizes": _spec(cat_sizes),
+        "tier_counts_xch": _spec(xch_counts),
+        "tier_counts_cat": _spec(cat_counts),
+        "prep_headroom_pct": "0",
+    }
+
+
+def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
+    """Resolve exact Coin Prep inputs for the active, identity-bound campaign."""
+
+    asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+    if len(asset_id) != 64:
+        return None
+    active = list_active_bootstrap_campaigns_for_asset(asset_id)
+    if not active:
+        return None
+    if len(active) != 1:
+        raise ValueError("bootstrap_campaign_authority_ambiguous")
+    campaign = active[0]
+    if body.get("bootstrap_campaign_id") != campaign.get("campaign_id") or body.get(
+        "bootstrap_campaign_revision"
+    ) != campaign.get("revision"):
+        raise ValueError("bootstrap_coin_prep_confirmation_required")
+
+    from blueprints.bootstrap import BootstrapApiError, _read_bootstrap_identity
+    from bootstrap_runtime import derive_bootstrap_runtime
+    from tx_fees import get_effective_transaction_fee_mojos
+    from wallet import get_wallet_balance
+
+    try:
+        identity = _read_bootstrap_identity()
+    except BootstrapApiError as exc:
+        raise ValueError("bootstrap_wallet_identity_unavailable") from exc
+    xch = get_wallet_balance(int(getattr(cfg, "WALLET_ID_XCH", 1) or 1))
+    cat = get_wallet_balance(int(campaign["wallet_id"]))
+
+    def _confirmed(result: dict, label: str) -> int:
+        if type(result) is not dict or result.get("success") is not True:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        wallet_balance = result.get("wallet_balance")
+        if type(wallet_balance) is not dict:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        value = wallet_balance.get("confirmed_wallet_balance")
+        if type(value) is not int or value < 0:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        return value
+
+    cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+    effective_fee_mojos = get_effective_transaction_fee_mojos()
+    if type(effective_fee_mojos) is not int or effective_fee_mojos < 0:
+        raise ValueError("bootstrap_network_fee_unavailable")
+    balances = {
+        "xch_available": Decimal(_confirmed(xch, "xch")) / Decimal(10**12),
+        "cat_available": Decimal(_confirmed(cat, "cat")) / Decimal(10**cat_decimals),
+        "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
+        "subsidy_spent_xch": Decimal("0"),
+        "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),
+        "minimum_profit_xch": Decimal(
+            str(getattr(cfg, "MINIMUM_PROFIT_XCH", "0") or "0")
+        ),
+        "fee_coin_size_xch": Decimal(
+            str(getattr(cfg, "FEE_COIN_SIZE_XCH", "0.001") or "0.001")
+        ),
+        "expected_cancel_requotes": int(
+            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 1) or 1
+        ),
+    }
+    runtime = derive_bootstrap_runtime(
+        campaign_record=campaign,
+        identity=identity,
+        balances=balances,
+        now=datetime.now(timezone.utc),
+    )
+    plan = runtime["plan"]
+    if plan.get("authorized") is not True:
+        reasons = ",".join(plan.get("reason_codes") or ("not_authorized",))
+        raise ValueError(f"bootstrap_coin_prep_not_authorized:{reasons}")
+    return bootstrap_coin_prep_worker_args(plan)
 
 
 def _wallet_open_offer_snapshot_before_prep() -> dict:
@@ -1798,6 +1926,27 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
+        try:
+            _bootstrap_worker_args = _active_bootstrap_coin_prep_worker_args(
+                _prep_req_data
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            log_event(
+                "warning",
+                "bootstrap_coin_prep_blocked",
+                f"Bootstrap Coin Prep blocked safely: {reason}",
+            )
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": reason.split(":", 1)[0],
+                        "reason": reason,
+                    }
+                ),
+                409,
+            )
         # Historical flag: full_reset=True means "Start Fresh" and requests
         # the broad legacy reset. The authoritative-state guard refuses it
         # without mutation when fills, protected offers, intents, or locks
@@ -2199,7 +2348,45 @@ def _api_coin_prep_trigger_locked():
                 max_sell = getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25)
                 trade_xch = str(getattr(cfg, "DEFAULT_TRADE_XCH", "0.5"))
 
-                if getattr(cfg, "TIER_ENABLED", False):
+                if _bootstrap_worker_args is not None:
+                    exact = _bootstrap_worker_args
+                    total_coins = exact["xch_target"] + exact["cat_target"]
+                    cmd = [
+                        *worker_cmd,
+                        "--xch-target",
+                        str(exact["xch_target"]),
+                        "--cat-target",
+                        str(exact["cat_target"]),
+                        "--buy-tier-sizes",
+                        exact["buy_tier_sizes"],
+                        "--sell-tier-sizes",
+                        exact["buy_tier_sizes"],
+                        "--cat-tier-sizes",
+                        exact["cat_tier_sizes"],
+                        "--tier-counts-xch",
+                        exact["tier_counts_xch"],
+                        "--tier-counts-cat",
+                        exact["tier_counts_cat"],
+                        "--prep-headroom-pct",
+                        exact["prep_headroom_pct"],
+                        "--run-id",
+                        run_id,
+                    ]
+                    log_event(
+                        "info",
+                        "bootstrap_coin_prep_config",
+                        "Bootstrap Coin Prep is using exact campaign-bound XCH, "
+                        "CAT, and fee-coin outputs with zero sizing headroom",
+                        data={
+                            "campaign_id": _prep_req_data.get("bootstrap_campaign_id"),
+                            "campaign_revision": _prep_req_data.get(
+                                "bootstrap_campaign_revision"
+                            ),
+                            "xch_target": exact["xch_target"],
+                            "cat_target": exact["cat_target"],
+                        },
+                    )
+                elif getattr(cfg, "TIER_ENABLED", False):
                     # Tier-aware coin prep with PER-SIDE counts. Buy ladder is XCH-funded
                     # (BUY_*_TIER_COUNT + spares); sell ladder is CAT-funded (SELL_*_TIER_COUNT
                     # + spares). The worker uses these independently, so asymmetric ladders

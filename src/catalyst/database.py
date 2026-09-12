@@ -5156,9 +5156,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("child_intent_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
-    _require_unique_key(
-        conn, "bootstrap_participation", ("campaign_id", "report_id")
-    )
+    _require_unique_key(conn, "bootstrap_participation", ("campaign_id", "report_id"))
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -32304,9 +32302,7 @@ def _bootstrap_campaign_material(record: Dict[str, Any]) -> tuple[Dict[str, Any]
     network = _required_stability_text(record["network"], "network").lower()
     if network not in {"mainnet", "testnet"}:
         raise ValueError("Bootstrap campaign network is invalid")
-    wallet_type = _required_stability_text(
-        record["wallet_type"], "wallet_type"
-    ).lower()
+    wallet_type = _required_stability_text(record["wallet_type"], "wallet_type").lower()
     if wallet_type != "sage":
         raise ValueError("Bootstrap campaign wallet type must be sage")
     fingerprint = _exact_integer(
@@ -32347,13 +32343,16 @@ def _bootstrap_campaign_material(record: Dict[str, Any]) -> tuple[Dict[str, Any]
         "expires_at": _stability_timestamp(record["expires_at"], "expires_at"),
     }
     anchor = Decimal(normalized["anchor_price"])
-    if not Decimal(normalized["minimum_price"]) <= anchor <= Decimal(
-        normalized["maximum_price"]
+    if (
+        not Decimal(normalized["minimum_price"])
+        <= anchor
+        <= Decimal(normalized["maximum_price"])
     ):
         raise ValueError("Bootstrap campaign corridor must contain anchor")
-    if Decimal(normalized["xch_budget"]) == 0 and Decimal(
-        normalized["cat_budget"]
-    ) == 0:
+    if (
+        Decimal(normalized["xch_budget"]) == 0
+        and Decimal(normalized["cat_budget"]) == 0
+    ):
         raise ValueError("Bootstrap campaign must have a funded side")
     created = _parse_iso_timestamp(
         normalized["created_at"], "created_at", require_timezone=True
@@ -32381,9 +32380,7 @@ def _decode_bootstrap_campaign(row: sqlite3.Row) -> Dict[str, Any]:
         result.pop("independent_depth_sides_json")
     )
     result["adverse_fill_times"] = json.loads(result.pop("adverse_fill_times_json"))
-    result["suspected_linked_activity"] = bool(
-        result["suspected_linked_activity"]
-    )
+    result["suspected_linked_activity"] = bool(result["suspected_linked_activity"])
     return result
 
 
@@ -32455,9 +32452,11 @@ def create_bootstrap_campaign(record: Dict[str, Any]) -> str:
 
 def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
-    row = get_connection().execute(
-        "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_id,)
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_id,))
+        .fetchone()
+    )
     return _decode_bootstrap_campaign(row) if row is not None else None
 
 
@@ -32471,14 +32470,37 @@ def get_active_bootstrap_campaign(
     safe_network = _required_stability_text(network, "network").lower()
     if safe_network not in {"mainnet", "testnet"}:
         raise ValueError("network is invalid")
-    row = get_connection().execute(
-        """
+    row = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM bootstrap_campaigns
         WHERE asset_id=? AND wallet_fingerprint=? AND network=? AND status='active'
         """,
-        (safe_asset, safe_fingerprint, safe_network),
-    ).fetchone()
+            (safe_asset, safe_fingerprint, safe_network),
+        )
+        .fetchone()
+    )
     return _decode_bootstrap_campaign(row) if row is not None else None
+
+
+def list_active_bootstrap_campaigns_for_asset(asset_id: str) -> List[Dict[str, Any]]:
+    """Return every active local authority for one exact CAT asset."""
+
+    safe_asset = _bootstrap_identity(asset_id, "asset_id")
+    rows = (
+        get_connection()
+        .execute(
+            """
+        SELECT * FROM bootstrap_campaigns
+        WHERE asset_id=? AND status='active'
+        ORDER BY created_at, campaign_id
+        """,
+            (safe_asset,),
+        )
+        .fetchall()
+    )
+    return [_decode_bootstrap_campaign(row) for row in rows]
 
 
 def _bootstrap_state_material(
@@ -32604,8 +32626,10 @@ def update_bootstrap_campaign_state(
         if campaign is None:
             raise RuntimeError("Bootstrap campaign is not active")
         anchor = Decimal(state["current_anchor_price"])
-        if not Decimal(campaign["minimum_price"]) <= anchor <= Decimal(
-            campaign["maximum_price"]
+        if (
+            not Decimal(campaign["minimum_price"])
+            <= anchor
+            <= Decimal(campaign["maximum_price"])
         ):
             raise ValueError("current anchor is outside the campaign corridor")
         cursor = conn.execute(
@@ -32745,13 +32769,17 @@ def list_bootstrap_campaign_events(
 ) -> List[Dict[str, Any]]:
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
     safe_limit = _exact_integer(limit, "limit", minimum=1)
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM bootstrap_campaign_events
         WHERE campaign_id=? ORDER BY occurred_at, event_id LIMIT ?
         """,
-        (safe_id, safe_limit),
-    ).fetchall()
+            (safe_id, safe_limit),
+        )
+        .fetchall()
+    )
     return [
         {
             "event_id": row["event_id"],
@@ -32818,13 +32846,17 @@ def list_bootstrap_participation(
 ) -> List[Dict[str, Any]]:
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
     safe_limit = _exact_integer(limit, "limit", minimum=1)
-    rows = get_connection().execute(
-        """
+    rows = (
+        get_connection()
+        .execute(
+            """
         SELECT * FROM bootstrap_participation
         WHERE campaign_id=? ORDER BY recorded_at, participation_id LIMIT ?
         """,
-        (safe_id, safe_limit),
-    ).fetchall()
+            (safe_id, safe_limit),
+        )
+        .fetchall()
+    )
     return [
         {
             "participation_id": row["participation_id"],
