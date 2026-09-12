@@ -5658,6 +5658,13 @@ _POST_TIBET_SCHEMA_TABLES = frozenset(
         "offer_publication_discoveries",
     }
 )
+_BOOTSTRAP_SCHEMA_TABLES = frozenset(
+    {
+        "bootstrap_campaigns",
+        "bootstrap_campaign_events",
+        "bootstrap_participation",
+    }
+)
 
 
 def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
@@ -6486,6 +6493,7 @@ def _migrate_stability_schema() -> None:
                 "runtime_quarantine_resolutions",
             }
             | _POST_TIBET_SCHEMA_TABLES
+            | _BOOTSTRAP_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")

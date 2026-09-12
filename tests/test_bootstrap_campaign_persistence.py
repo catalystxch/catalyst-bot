@@ -72,6 +72,35 @@ def test_second_schema_initialization_is_idempotent(isolated_db):
     assert database.get_bootstrap_campaign(campaign_id) is not None
 
 
+def test_v13_stability_watermark_allows_first_bootstrap_schema_install(isolated_db):
+    """A pre-Bootstrap profile must not treat new v1.4 tables as corruption."""
+
+    conn = database.get_connection()
+    for table_name in (
+        "bootstrap_participation",
+        "bootstrap_campaign_events",
+        "bootstrap_campaigns",
+    ):
+        conn.execute(f"DROP TABLE {table_name}")
+    conn.commit()
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    conn = database.get_connection()
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {
+        "bootstrap_campaigns",
+        "bootstrap_campaign_events",
+        "bootstrap_participation",
+    } <= tables
+
+
 def test_only_one_active_campaign_exists_per_wallet_network_and_asset(isolated_db):
     first_id = database.create_bootstrap_campaign(make_campaign().to_record())
 
